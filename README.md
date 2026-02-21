@@ -10,6 +10,55 @@ While dxvk-remix is a fork of DXVK, please report bugs encountered with dxvk-rem
 
 dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 bit games to communicate with the 64 bit dxvk-remix runtime.
 
+## WIP fork containing Mirror's Edge/UE3 specific modifications
+
+### 1) Mirror's Edge (UE3/D3D9) compatibility improvements
+
+- Improved pixel shader sampler semantic classification to better distinguish material textures from engine auxiliary buffers (shadow/post-process/UI/scene textures) to reduce wrong diffuse/albedo picks.
+- Expanded texcoord inference for legacy D3D9 opcodes (`TexBem`, `TexReg2*`, `TexM3x*`, `TexDp3Tex` etc.)
+- Added extra material semantic hints (normal/specular/roughness/opacity/mask map categories) to improve slot-0 material scoring + texture selection.
+- Strengthened UE3 vertex shader CTAB parsing, additional vertex factory hint extraction (decal/lightmap/wind/view to local patterns).
+- Updated packed UV heuristics for UE3 vertex factory styles (terrain, decal etc.) to reduce false penalties + improve UV promotion behavior.
+
+### 2) Mirror's Edge game profile/launch args and patches
+
+- Added a new Remix Mirror's Edge profile in `src/util/config/config.cpp`
+- Game setup/requirements:
+	- The game's lightmaps need to be disabled. This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
+	- The game needs to be configured to use unlit rendering, no occlusion-based culling etc. Fortunately UE3 is quite flexible with commands which allows us to do this. The simplest way to set this up is to:
+		1. Make a text file titled "remix" (no extension) and paste the following:
+		```
+		scale set TdBicubicFiltering false
+		scale set MaxMultisamples 0
+		scale set DynamicLights false
+		scale set DynamicShadows false
+		scale set AmbientOcclusion false
+		scale set DepthOfField false
+		scale set Bloom false
+		scale set LightEnvironmentShadows false
+		scale set FogVolumes false
+		scale set TdSunHaze false
+		scale set TdMotionBlur false
+		toggleocclusion
+		viewmode unlit
+		set SceneCaptureComponent FrameRate 0
+		```
+		2. Place the text file in `<path-to-game>\Binaries`
+	 	3. Type "remix" into the CmdLineArg patcher in Mirror's Edge Tweaks
+		4. Launch the game via the args shortcut in Mirror's Edge Tweaks, or add "-CmdLineArgs" as a launch argument to the Steam client/other shortcuts.
+	- UE3 employs frustum culling in native land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
+ 		- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`.
+
+### 3) Shadow enhancements
+
+Refined shadow visibility behavior. Includes better handling at grazing light angles
+
+Also includes smooth shadow shading for normals. This is targeted at the shadow level and is not a change to the renderer's mesh shading mode.
+
+### 4) Acknowledgements
+- sambow23 for their physically based sky implementation.
+- xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
+
 ## Build instructions
 
 ### Requirements:
