@@ -51,6 +51,7 @@ namespace dxvk {
 
       Constant constant;
       constant.name = std::string(pStart + info.Name);
+      constant.registerSet = info.RegisterSet;
       constant.registerIndex = info.RegisterIndex;
       constant.registerCount = info.RegisterCount;
 

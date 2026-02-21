@@ -51,6 +51,13 @@ namespace dxvk {
     MemberCount
   };
 
+  // flags for D3D9RtxVertexCaptureData::flags
+  static constexpr uint32_t kVertexCaptureFlag_NormalFromColor0 = 1u;
+  static constexpr uint32_t kVertexCaptureFlag_NormalBoneSkinning = 1u << 1;
+  static constexpr uint32_t kVertexCaptureFlag_NormalInputEncodedUByte4 = 1u << 2;
+  static constexpr uint32_t kVertexCaptureFlag_BlendIndicesInputNormalized = 1u << 3;
+  static constexpr uint32_t kVertexCaptureFlag_BlendWeightsInputUnnormalized = 1u << 4;
+
   struct D3D9RtxVertexCaptureData {
     Matrix4 normalTransform;
     Matrix4 customWorldToProjection;
@@ -60,7 +67,12 @@ namespace dxvk {
     uint32_t baseVertex = 0;
     float jitterX;
     float jitterY;
-    uint32_t padding;
+    uint32_t flags = 0;
+    uint32_t boneMatricesBaseReg = 0;
+    uint32_t boneCount = 0;
+    uint32_t texcoordOutputRegister = 0xffffffffu;
+    uint32_t texcoordCompU = 0;
+    uint32_t texcoordCompV = 1;
   };
 
   enum class D3D9RtxVertexCaptureMembers {
@@ -72,6 +84,12 @@ namespace dxvk {
     BaseVertex,
     JitterX,
     JitterY,
+    Flags,
+    BoneMatricesBaseReg,
+    BoneCount,
+    TexcoordOutputRegister,
+    TexcoordCompU,
+    TexcoordCompV,
 
     MemberCount
   };

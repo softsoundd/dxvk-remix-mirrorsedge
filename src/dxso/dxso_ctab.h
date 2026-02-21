@@ -30,6 +30,7 @@ namespace dxvk {
 
     struct Constant {
       std::string name;
+      uint16_t registerSet = 0;
       uint32_t registerIndex;
       uint32_t registerCount;
     };

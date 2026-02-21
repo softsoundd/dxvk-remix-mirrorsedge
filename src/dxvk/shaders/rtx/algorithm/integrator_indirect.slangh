@@ -34,6 +34,99 @@
 #include "rtx/algorithm/integrator.slangh"
 #include "rtx/concept/surface_material/opaque_surface_material_interaction.slangh"
 #include "rtx/pass/nrc/nrc_integrator_utilities.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+
+// Evaluate direct sun lighting for secondary bounces (atmosphere mode) with soft shadows
+bool evalAtmosphereSunNEESecondary(
+  Ray ray,
+  MinimalRayInteraction rayInteraction,
+  MinimalSurfaceInteraction surfaceInteraction,
+  OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
+  uint8_t rayMask,
+  PortalSpace2BitsType portalSpace,
+  bool pomOpaqueSurfaceEncountered,
+  uint16_t surfaceIndex,
+  float2 texcoords,
+  AtmosphereArgs atmosphereArgs,
+  bool isZUp,
+  inout RNG randomState,
+  inout vec3 diffuseLight,
+  inout vec3 specularLight)
+{
+  AtmosphereSunSample sunSample = sampleAtmosphereSunLight(
+    surfaceInteraction.position,
+    opaqueSurfaceMaterialInteraction.shadingNormal,
+    atmosphereArgs,
+    isZUp);
+
+  if (!sunSample.valid) {
+    return false;
+  }
+
+  float NdotL = dot(opaqueSurfaceMaterialInteraction.shadingNormal, sunSample.direction);
+  if (NdotL <= 0.0f) {
+    return false;
+  }
+
+  uint8_t shadowMask = OBJECT_MASK_OPAQUE | (rayMask & OBJECT_MASK_ALL_DYNAMIC);
+  shadowMask |= (cb.enableIndirectTranslucentShadows) ? OBJECT_MASK_TRANSLUCENT : 0;
+  shadowMask |= (cb.enableIndirectAlphaBlendShadows) ? OBJECT_MASK_ALPHA_BLEND : 0;
+
+  const bool isThinOpaqueSubsurface = isThinOpaqueSubsurfaceMaterial(opaqueSurfaceMaterialInteraction);
+  const bool isViewModel = rayMask & OBJECT_MASK_ALL_VIEWMODEL;
+
+  const float sunRayLength = 1000000.0f;
+  float visibilitySum = 0.0f;
+  vec3 attenuationSum = vec3(0.0f);
+  int numSamples = sunSample.numSamples;
+
+  for (int i = 0; i < numSamples; i++) {
+    float u1 = getNextSampleBlueNoise(randomState);
+    float u2 = getNextSampleBlueNoise(randomState);
+    vec3 jitteredDir = getJitteredSunDirection(sunSample.direction, sunSample.coneAngle, u1, u2);
+
+    float jitteredNdotL = dot(opaqueSurfaceMaterialInteraction.shadingNormal, jitteredDir);
+    if (jitteredNdotL <= 0.0f) {
+      continue;
+    }
+
+    vec3 sunTargetPos = surfaceInteraction.position + jitteredDir * sunRayLength;
+
+    VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials>(
+      surfaceInteraction,
+      sunTargetPos, shadowMask,
+      invalidRayPortalIndex, portalSpace, pomOpaqueSurfaceEncountered,
+      rayInteraction.coneRadius, ray.spreadAngle, 1.0, isViewModel, false,
+      surfaceIndex, texcoords,
+      isThinOpaqueSubsurface,
+      opaqueSurfaceMaterialInteraction.shadingNormal);
+
+    if (!visibility.hasOpaqueHit) {
+      visibilitySum += 1.0f;
+      attenuationSum += vec3(visibility.attenuation);
+    }
+  }
+
+  if (visibilitySum <= 0.0f) {
+    return false;
+  }
+
+  float avgVisibility = visibilitySum / float(numSamples);
+  vec3 avgAttenuation = attenuationSum / float(numSamples);
+
+  SurfaceMaterialInteractionSplitWeight splitWeight =
+    opaqueSurfaceMaterialInteractionCalcProjectedWeight(
+      opaqueSurfaceMaterialInteraction, rayInteraction, f16vec3(sunSample.direction));
+
+  vec3 commonLightThroughput = avgAttenuation * avgVisibility;
+  vec3 diffuseLobeWeight = vec3(splitWeight.diffuseReflectionWeight + splitWeight.diffuseTransmissionWeight);
+  vec3 specularLobeWeight = vec3(splitWeight.specularReflectionWeight);
+
+  diffuseLight += sunSample.radiance * diffuseLobeWeight * commonLightThroughput;
+  specularLight += sunSample.radiance * specularLobeWeight * commonLightThroughput;
+
+  return true;
+}
 
 // Input specular signal of low roughness material into restir gi
 static const uint kRestirGIAcceptLowRoughnessInput = false;
@@ -367,8 +460,16 @@ void integratePathVertex(
     {
       skyRadiance = cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, pathState.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform);
     }
+#ifdef ATMOSPHERE_AVAILABLE
+    else if (cb.skyMode == 1)
+    {
+      // Physical atmosphere mode
+      skyRadiance = evalSkyRadiance(pathState.direction, cb.atmosphereArgs, cb.isZUp != 0);
+    }
+#endif
     else
     {
+      // Skybox rasterization mode
       skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(pathState.direction, 0);
     }
     
@@ -730,6 +831,25 @@ void integratePathVertex(
       
           updateReSTIRGIHitDistance(oldLuminance, calcBt709Luminance(pathState.radiance), restirHitT, min(hitT, float16Max));
         }
+      }
+    }
+
+    // Evaluate direct sun lighting from physical atmosphere for secondary bounces
+    if (cb.skyMode == 1 && isNeeEnabledOnBounce) // Physical atmosphere mode
+    {
+      vec3 sunDiffuse = vec3(0.0f);
+      vec3 sunSpecular = vec3(0.0f);
+
+      if (evalAtmosphereSunNEESecondary(
+            ray, rayInteraction, surfaceInteraction, opaqueSurfaceMaterialInteraction,
+            pathState.rayMask, pathState.portalSpace, pomOpaqueSurfaceEncountered,
+            rayInteraction.surfaceIndex, surfaceInteraction.textureCoordinates,
+            cb.atmosphereArgs, cb.isZUp != 0,
+            randomState,
+            sunDiffuse, sunSpecular))
+      {
+        vec3 sunLight = sunDiffuse + sunSpecular;
+        accumulateRadiance(pathState, sunLight);
       }
     }
 

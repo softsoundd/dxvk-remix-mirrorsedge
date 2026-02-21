@@ -37,6 +37,97 @@
 #include "rtx/algorithm/visibility.slangh"
 #include "rtx/algorithm/rtxcr/rtxcr_material.slangh"
 #include "integrator.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+
+// Evaluate direct sun lighting from physical atmosphere with soft shadows
+// Returns true if sun contribution was added (not fully occluded)
+bool evalAtmosphereSunNEE(
+  vec3 throughput,
+  ivec2 pixelCoordinate,
+  inout vec3 diffuseLobeRadiance,
+  inout vec3 specularLobeRadiance,
+  GeometryFlags geometryFlags,
+  Ray viewRay,
+  MinimalRayInteraction minimalRayInteraction,
+  MinimalSurfaceInteraction minimalSurfaceInteraction,
+  OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
+  AtmosphereArgs atmosphereArgs,
+  bool isZUp,
+  inout RNG randomState)
+{
+  AtmosphereSunSample sunSample = sampleAtmosphereSunLight(
+    minimalSurfaceInteraction.position,
+    opaqueSurfaceMaterialInteraction.shadingNormal,
+    atmosphereArgs,
+    isZUp);
+
+  if (!sunSample.valid) {
+    return false;
+  }
+
+  float NdotL = dot(opaqueSurfaceMaterialInteraction.shadingNormal, sunSample.direction);
+  if (NdotL <= 0.0f) {
+    return false;
+  }
+
+  uint8_t rayMask = OBJECT_MASK_OPAQUE | (geometryFlags.objectMask & OBJECT_MASK_ALL_DYNAMIC);
+  rayMask |= (cb.enableDirectTranslucentShadows) ? OBJECT_MASK_TRANSLUCENT : 0;
+  rayMask |= (cb.enableDirectAlphaBlendShadows) ? OBJECT_MASK_ALPHA_BLEND : 0;
+
+  const bool isThinOpaqueSubsurface = isThinOpaqueSubsurfaceMaterial(opaqueSurfaceMaterialInteraction);
+  const bool pomOpaqueSurfaceEncountered = geometryFlags.pomOpaqueSurfaceEncountered && cb.pomEnableDirectLighting;
+  const uint16_t primarySurfaceIndex = pomOpaqueSurfaceEncountered ? uint16_t(SharedSurfaceIndex[pixelCoordinate]) : BINDING_INDEX_INVALID;
+
+  const float sunRayLength = 1000000.0f;
+
+  float visibilitySum = 0.0f;
+  vec3 attenuationSum = vec3(0.0f);
+  int numSamples = sunSample.numSamples;
+
+  for (int i = 0; i < numSamples; i++) {
+    float u1 = getNextSampleBlueNoise(randomState);
+    float u2 = getNextSampleBlueNoise(randomState);
+    vec3 jitteredDir = getJitteredSunDirection(sunSample.direction, sunSample.coneAngle, u1, u2);
+
+    float jitteredNdotL = dot(opaqueSurfaceMaterialInteraction.shadingNormal, jitteredDir);
+    if (jitteredNdotL <= 0.0f) {
+      continue;
+    }
+
+    vec3 sunTargetPos = minimalSurfaceInteraction.position + jitteredDir * sunRayLength;
+
+    VisibilityResult visibility = traceVisibilityRay<visibilityModeEnablePom | visibilityModeEnableTranslucentMaterials>(
+      minimalSurfaceInteraction,
+      sunTargetPos, rayMask,
+      invalidRayPortalIndex, geometryFlags.portalSpace, pomOpaqueSurfaceEncountered,
+      minimalRayInteraction.coneRadius, viewRay.spreadAngle, 1.0, geometryFlags.isViewModel, false,
+      primarySurfaceIndex, SharedTextureCoord[pixelCoordinate],
+      isThinOpaqueSubsurface,
+      opaqueSurfaceMaterialInteraction.shadingNormal);
+
+    if (!visibility.hasOpaqueHit) {
+      visibilitySum += 1.0f;
+      attenuationSum += vec3(visibility.attenuation);
+    }
+  }
+
+  if (visibilitySum <= 0.0f) {
+    return false;
+  }
+
+  float avgVisibility = visibilitySum / float(numSamples);
+  vec3 avgAttenuation = attenuationSum / float(numSamples);
+
+  const SurfaceMaterialInteractionSplitWeight splitWeight =
+    opaqueSurfaceMaterialInteractionCalcProjectedWeight(
+      opaqueSurfaceMaterialInteraction, minimalRayInteraction, f16vec3(sunSample.direction));
+
+  const vec3 sunThroughput = avgAttenuation * avgVisibility;
+  diffuseLobeRadiance += throughput * sunSample.radiance * vec3(splitWeight.diffuseReflectionWeight + splitWeight.diffuseTransmissionWeight) * sunThroughput;
+  specularLobeRadiance += throughput * sunSample.radiance * vec3(splitWeight.specularReflectionWeight) * sunThroughput;
+
+  return true;
+}
 
 void evalNEEPrimary(
   vec3 throughput,
@@ -425,6 +516,20 @@ void integrateDirectPath(
 
         RAB_StoreReservoir(reservoir, pixelCoordinate, RTXDI_GetSpatialOutputPage());
       }
+    }
+
+    // Evaluate direct sun lighting from physical atmosphere
+    if (cb.skyMode == 1) // Physical atmosphere mode
+    {
+      evalAtmosphereSunNEE(
+        throughput, pixelCoordinate,
+        diffuseLobeRadiance, specularLobeRadiance,
+        geometryFlags,
+        primaryRay, primaryMinimalRayInteraction, primarySurfaceInteraction,
+        opaqueSurfaceMaterialInteraction,
+        cb.atmosphereArgs,
+        cb.isZUp != 0,
+        randomState);
     }
   }
 

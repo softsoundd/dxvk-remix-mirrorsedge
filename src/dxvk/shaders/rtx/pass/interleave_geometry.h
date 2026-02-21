@@ -42,13 +42,68 @@ namespace interleaver {
 
     // Passthrough format mapping
     VK_FORMAT_B8G8R8A8_UNORM = 44,
+    VK_FORMAT_R16G16_SFLOAT = 83,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
+    VK_FORMAT_R16G16B16A16_SFLOAT = 97,
   };
+
+#ifdef __cplusplus
+  // HLSL provides a f16tof32 intrinsic,  provide a compatible implementation for CPU execution
+  static inline float f16tof32(uint32_t h) {
+    const uint32_t sign = (h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = (h & 0x03FFu);
+
+    uint32_t out;
+
+    if (exp == 0) {
+      // zero / subnormal
+      if (mant == 0) {
+        out = sign;
+      } else {
+        // normalise the subnormal number
+        exp = 1;
+        while ((mant & 0x0400u) == 0) {
+          mant <<= 1;
+          exp--;
+        }
+        mant &= 0x03FFu;
+
+        const uint32_t exp32 = exp + (127u - 15u);
+        out = sign | (exp32 << 23) | (mant << 13);
+      }
+    } else if (exp == 31) {
+      // inf / NaN
+      out = sign | 0x7F800000u | (mant << 13);
+    } else {
+      // normalised
+      const uint32_t exp32 = exp + (127u - 15u);
+      out = sign | (exp32 << 23) | (mant << 13);
+    }
+
+    return asfloat(out);
+  }
+#endif
+
+  static inline int signExtend10(uint x) {
+    // keep lower 10 bits and sign extend to 32-bit integer
+    return (int(x << 22)) >> 22;
+  }
+
+  static inline float snorm10ToF32_packed(uint x) {
+    const int v = signExtend10(x);
+    float f = float(v) / 511.0f;
+    // clamp to [-1, 1] (since -512 / 511 < -1)
+    f = (f < -1.0f) ? -1.0f : ((f > 1.0f) ? 1.0f : f);
+    return f;
+  }
 
   bool formatConversionFloatSupported(uint32_t format) {
     switch (format) {
+    case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
@@ -71,6 +126,22 @@ namespace interleaver {
 
   float3 convert(uint32_t format, ReadBuffer(float) input, uint32_t index) {
     switch (format) {
+    case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    {
+      uint data = asuint(input[index]);
+      float x = f16tof32(data & 0xffff);
+      float y = f16tof32(data >> 16);
+      return float3(x, y, 0);
+    }
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
+    {
+      uint data0 = asuint(input[index + 0]);
+      uint data1 = asuint(input[index + 1]);
+      float x = f16tof32(data0 & 0xffff);
+      float y = f16tof32(data0 >> 16);
+      float z = f16tof32(data1 & 0xffff);
+      return float3(x, y, z);
+    }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
       return float3(input[index + 0], input[index + 1], 0);
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
@@ -87,9 +158,9 @@ namespace interleaver {
     case SupportedVkFormats::VK_FORMAT_A2B10G10R10_SNORM_PACK32:
     {
       uint data = asuint(input[index]);
-      float b = unorm10ToF32(data >> 20);
-      float g = unorm10ToF32(data >> 10);
-      float r = unorm10ToF32(data >> 0);
+      float b = snorm10ToF32_packed(data >> 20);
+      float g = snorm10ToF32_packed(data >> 10);
+      float r = snorm10ToF32_packed(data >> 0);
       return float3(r, g, b);
     }
     }

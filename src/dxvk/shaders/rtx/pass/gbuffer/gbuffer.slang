@@ -35,11 +35,13 @@
 
 //!variant gbuffer_rayquery.comp
 //!>       RAY_TRACING_PRIMARY_RAY
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!variant gbuffer_rayquery_raygen.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       RAY_PIPELINE
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!variant gbuffer_psr_raygen.rgen
@@ -60,12 +62,14 @@
 //!variant gbuffer_psr_rayquery.comp
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       GBUFFER_PSR
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!variant gbuffer_psr_rayquery_raygen.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       RAY_PIPELINE
 //!>       GBUFFER_PSR
+//!>       ATMOSPHERE_AVAILABLE
 
 
 /* NRC */
@@ -88,12 +92,14 @@
 //!variant gbuffer_rayquery_nrc.comp
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       ENABLE_NRC=1
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!variant gbuffer_rayquery_raygen_nrc.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       RAY_PIPELINE
 //!>       ENABLE_NRC=1
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!variant gbuffer_psr_raygen_nrc.rgen
@@ -117,6 +123,7 @@
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       GBUFFER_PSR
 //!>       ENABLE_NRC=1
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!variant gbuffer_psr_rayquery_raygen_nrc.rgen
@@ -124,6 +131,7 @@
 //!>       RAY_PIPELINE
 //!>       GBUFFER_PSR
 //!>       ENABLE_NRC=1
+//!>       ATMOSPHERE_AVAILABLE
 
 
 
@@ -145,11 +153,13 @@
 //!variant gbuffer_rayquery_wboit.comp
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 //!variant gbuffer_rayquery_raygen_wboit.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       RAY_PIPELINE
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 //!variant gbuffer_psr_raygen_wboit.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
@@ -170,12 +180,14 @@
 //!>       RAY_TRACING_PRIMARY_RAY 
 //!>       GBUFFER_PSR
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 //!variant gbuffer_psr_rayquery_raygen_wboit.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       RAY_PIPELINE
 //!>       GBUFFER_PSR
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 /* NRC */
 
@@ -198,12 +210,14 @@
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       ENABLE_NRC=1
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 //!variant gbuffer_rayquery_raygen_nrc_wboit.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
 //!>       RAY_PIPELINE
 //!>       ENABLE_NRC=1
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 //!variant gbuffer_psr_raygen_nrc_wboit.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
@@ -227,6 +241,7 @@
 //!>       GBUFFER_PSR
 //!>       ENABLE_NRC=1
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 //!variant gbuffer_psr_rayquery_raygen_nrc_wboit.rgen
 //!>       RAY_TRACING_PRIMARY_RAY
@@ -234,6 +249,7 @@
 //!>       GBUFFER_PSR
 //!>       ENABLE_NRC=1
 //!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
 
 
 //!end-variants

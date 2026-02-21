@@ -40,6 +40,18 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useVertexCapture, true, "When enabled, injects code into the original vertex shader to capture final shaded vertex positions.  Is useful for games using simple vertex shaders, that still also set the fixed function transform matrices.");
     RTX_OPTION("rtx", bool, useVertexCapturedNormals, true, "When enabled, vertex normals are read from the input assembler and used in raytracing.  This doesn't always work as normals can be in any coordinate space, but can help sometimes.");
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
+    RTX_OPTION("rtx.d3d9", bool, ue3CameraFromShaderConstants, false,
+               "UE3 compat: derive World/View and View/Projection matrices from UE3 reserved shader constants.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ObjectToWorldFromShaderConstants, false,
+               "UE3 compat: extract LocalToWorld from vertex shader constants using shader CTAB and use it for object transforms.");
+    RTX_OPTION("rtx.d3d9", bool, autoRaytracedRenderTargetFromFullscreenComposite, false,
+               "D3D9 compat: auto-detect an offscreen render target being used as the main scene (sampled in a fullscreen composite pass) "
+               "and treat it as a raytraced render target to capture the correct geometry in games that upscale/composite to the backbuffer.");
+    RTX_OPTION("rtx.d3d9", bool, rasterizeFullscreenCompositeToPrimary, false,
+               "D3D9 compat: rasterise likely fullscreen composite/postprocess passes to the primary render target. Helps avoid raytracing a fullscreen quad.");
+    RTX_OPTION("rtx.d3d9", bool, shaderPathTexcoordIndexFromPixelShader, false,
+               "Shader-path compat: infer TEXCOORD set used by pixel shader rather than trusting D3DTSS_TEXCOORDINDEX. "
+               "Helps UE3 games where fixed-function stage state is stale or incorrect when shaders are active.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -199,13 +211,95 @@ namespace dxvk {
     const bool m_enableDrawCallConversion;
     bool m_rtxInjectTriggered = false;
     bool m_forceGeometryCopy = false;
+    bool m_forceIaTexcoordForOutlier = false;
     DWORD m_texcoordIndex = 0;
+    uint8_t m_texcoordCompU = 0;
+    uint8_t m_texcoordCompV = 1;
 
     int m_activeOcclusionQueries = 0;
 
     Rc<DxvkBuffer> m_vsVertexCaptureData;
 
     fast_unordered_cache<Rc<DxvkSampler>> m_samplerCache;
+
+    struct Ue3VsShaderCtabInfo {
+      bool initialized = false;
+      bool hasLocalToWorld = false;
+      uint32_t localToWorldRegisterIndex = 0;
+      uint32_t localToWorldRegisterCount = 0;
+
+      bool hasWorldToLocal = false;
+      uint32_t worldToLocalRegisterIndex = 0;
+      uint32_t worldToLocalRegisterCount = 0;
+
+      bool hasViewProjectionMatrix = false;
+      uint32_t viewProjectionMatrixRegisterIndex = 0;
+      uint32_t viewProjectionMatrixRegisterCount = 0;
+
+      bool hasCameraPosition = false;
+      uint32_t cameraPositionRegisterIndex = 0;
+      uint32_t cameraPositionRegisterCount = 0;
+
+      bool hasBoneMatrices = false;
+      uint32_t boneMatricesRegisterIndex = 0;
+      uint32_t boneMatricesRegisterCount = 0;
+
+      // vertex-factory style hints inferred from VS CTAB constant names
+      // these are used to relax/adjust shader-path UV heuristics where packed UVs
+      // and UV offsets are expected (decal/terrain/speedtree paths)
+      bool hasDecalTransform = false;
+      bool hasDecalLocation = false;
+      bool hasDecalOffset = false;
+      bool hasTextureCoordinateScaleBias = false;
+      bool hasLightMapCoordinateScaleBias = false;
+      bool hasShadowCoordinateScaleBias = false;
+      bool hasViewToLocal = false;
+      bool hasWindMatrices = false;
+    };
+
+    // keyed by XXH3 hash of the vertex shader DXSO bytecode
+    fast_unordered_cache<Ue3VsShaderCtabInfo> m_ue3VsShaderCtabCache;
+    std::optional<Ue3VsShaderCtabInfo> m_currentUe3CtabInfo;
+
+    struct Ue3CameraConstantsCache {
+      XXH64_hash_t hash = 0;
+      bool valid = false;
+      bool usedTranspose = false;
+      Matrix4 worldToView;
+      Matrix4 viewToProjection;
+    };
+
+    Ue3CameraConstantsCache m_ue3CameraConstantsCache;
+
+    // pixel shader texcoord inference cache (for shader-path UV selection)
+    struct PsSamplerTexcoordEntry {
+      bool initialized = false;
+      std::array<int8_t, caps::MaxTexturesPS> samplerToTexcoord;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompValid;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompU;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerSemanticFlags;
+      std::array<uint16_t, caps::MaxTexturesPS> samplerSampleCount;
+      std::array<int16_t, caps::MaxTexturesPS> samplerScaleConstReg;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompU;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompV;
+      std::array<float, caps::MaxTexturesPS> samplerScaleFactorU;
+      std::array<float, caps::MaxTexturesPS> samplerScaleFactorV;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerScaleImmediateValid;
+      std::array<float, caps::MaxTexturesPS> samplerScaleImmediateU;
+      std::array<float, caps::MaxTexturesPS> samplerScaleImmediateV;
+      std::array<int16_t, caps::MaxTexturesPS> samplerOffsetConstReg;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetConstCompU;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetConstCompV;
+      std::array<float, caps::MaxTexturesPS> samplerOffsetFactorU;
+      std::array<float, caps::MaxTexturesPS> samplerOffsetFactorV;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetImmediateValid;
+      std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateU;
+      std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateV;
+    };
+    fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
+    fast_unordered_set m_loggedPsSamplerTexcoordInference;
+    fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
 
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,
@@ -240,7 +334,7 @@ namespace dxvk {
     template<typename T>
     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
 
-    void prepareVertexCapture(const int vertexIndexOffset);
+    bool prepareVertexCapture(const int vertexIndexOffset);
 
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 

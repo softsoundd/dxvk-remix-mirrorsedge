@@ -49,6 +49,29 @@ vec3 rayOffsetSurfaceOriginHelper(MinimalSurfaceInteraction minimalSurfaceIntera
   return minimalSurfaceInteraction.position + calculateRayOffset(minimalSurfaceInteraction.positionError, effectiveTriangleNormal);
 }
 
+// cariant of rayOffsetSurfaceOriginHelper that can bias the offset direction toward a provided shading normal
+// this mitigates hard shadow terminator artifacts on smooth surfaces at grazing light angles while preserving
+// geometric normal based behavior in most other cases
+vec3 rayOffsetSurfaceOriginHelper(
+  MinimalSurfaceInteraction minimalSurfaceInteraction, bool penetrateSurface, f16vec3 shadingNormal)
+{
+  const f16vec3 geometricNormal = penetrateSurface ? -minimalSurfaceInteraction.triangleNormal : minimalSurfaceInteraction.triangleNormal;
+
+  // keep shading normal on the same hemisphere as geometric normal.
+  const f16vec3 orientedShadingNormal =
+    dot(shadingNormal, geometricNormal) >= float16_t(0.0) ? shadingNormal : -shadingNormal;
+
+  // if shading and geometric normals are strongly divergent reduce this correction to avoid excessive light leaking
+  const float16_t alignment = saturate(dot(orientedShadingNormal, geometricNormal));
+  const float16_t alignmentWeight = saturate((alignment - float16_t(0.25)) / float16_t(0.75));
+
+  // only bend the offset direction toward the shading normal when there is a valid + sufficiently aligned shading normal, keep geometric normal as fallback for other cases
+  const f16vec3 offsetNormal =
+    safeNormalize(lerp(geometricNormal, orientedShadingNormal, alignmentWeight), geometricNormal);
+
+  return minimalSurfaceInteraction.position + calculateRayOffset(minimalSurfaceInteraction.positionError, offsetNormal);
+}
+
 Ray rayCreateEmpty()
 {
   Ray ret;
@@ -160,6 +183,84 @@ Ray rayCreatePosition(
   const float tMax = length(rayVector);
 
   return rayCreateInternal(minimalRayInteraction, minimalSurfaceInteraction, viewRay, direction, tMax, penetrateSurface);
+}
+
+// shading normal aware variant used by visibility rays to reduce shadow terminator artifacts
+Ray rayCreatePosition(
+  MinimalRayInteraction minimalRayInteraction, MinimalSurfaceInteraction minimalSurfaceInteraction, Ray viewRay,
+  vec3 targetPosition, bool penetrateSurface, f16vec3 shadingNormal)
+{
+  const vec3 rayVector = targetPosition - minimalSurfaceInteraction.position;
+  const f16vec3 direction = f16vec3(safeNormalize(rayVector, vec3(0.0f, 0.0f, 1.0f)));
+  const float tMax = length(rayVector);
+
+  const f16vec3 geometricNormal = penetrateSurface ? -minimalSurfaceInteraction.triangleNormal : minimalSurfaceInteraction.triangleNormal;
+  const f16vec3 orientedShadingNormal =
+    dot(shadingNormal, geometricNormal) >= float16_t(0.0) ? shadingNormal : -shadingNormal;
+
+  // fade out the correction when shading normal diverges strongly from geometry normal
+  // usually due to high-frequency normal maps to avoid excessive light leaks
+  const float16_t alignment = saturate(dot(orientedShadingNormal, geometricNormal));
+  const float16_t alignmentWeight = saturate((alignment - float16_t(0.2)) / float16_t(0.8));
+
+  // apply correction when shading normal opens up relative to geometry normal and also for pure
+  // geometric grazing regions where faceting can still cause hard terminator artifacts on smooth meshes
+  const float16_t geomNoL = max(float16_t(0.0), dot(geometricNormal, direction));
+  const float16_t shadeNoL = max(float16_t(0.0), dot(orientedShadingNormal, direction));
+  const float16_t openingWeight = saturate((shadeNoL - geomNoL) * float16_t(8.0));
+  const float16_t grazingWeight = saturate((float16_t(0.45) - geomNoL) / float16_t(0.45));
+  const float16_t litWeight = saturate(shadeNoL * float16_t(8.0));
+
+  const float16_t blend = alignmentWeight * litWeight * max(openingWeight, grazingWeight);
+  const f16vec3 offsetNormal =
+    safeNormalize(lerp(geometricNormal, orientedShadingNormal, blend), geometricNormal);
+
+  const vec3 geometricNormalF32 = vec3(geometricNormal);
+  const vec3 geometricRayOffset = calculateRayOffset(minimalSurfaceInteraction.positionError, geometricNormal);
+  vec3 rayOffset = calculateRayOffset(minimalSurfaceInteraction.positionError, offsetNormal);
+
+  // prevent shading normal correction from introducing large lateral origin drift (contact detachment / leaks)
+  const float geometricOffsetLength = length(geometricRayOffset);
+  const float geometricNormalOffset = dot(geometricRayOffset, geometricNormalF32);
+  float normalOffset = dot(rayOffset, geometricNormalF32);
+  vec3 tangentOffset = rayOffset - geometricNormalF32 * normalOffset;
+  const float tangentOffsetLength = length(tangentOffset);
+  const float tangentLimit = max(
+    max(geometricOffsetLength, abs(geometricNormalOffset)) * (0.2f + 0.6f * float(blend)),
+    minimalSurfaceInteraction.positionError * 2.0f);
+  if (tangentOffsetLength > tangentLimit && tangentOffsetLength > 0.0f)
+  {
+    tangentOffset *= tangentLimit / tangentOffsetLength;
+  }
+
+  // keep at least the geometric normal baseline offset
+  normalOffset = max(normalOffset, geometricNormalOffset);
+
+  // use an additional geometric normal lift in severe mismatch/grazing cases instead of pushing along
+  // the light direction - this preserves seam mitigation while avoiding contact-point drift/leaks
+  const float16_t mismatchWeight = saturate((shadeNoL - geomNoL) * float16_t(2.0));
+  const float16_t seamMitigationWeight = alignmentWeight * max(mismatchWeight, grazingWeight);
+  const float extraNormalLift = geometricOffsetLength * min(0.5f, 0.35f * float(seamMitigationWeight));
+  normalOffset += extraNormalLift;
+
+  rayOffset = geometricNormalF32 * normalOffset + tangentOffset;
+
+  // cap overall growth relative to geometric baseline to preserve prior leak improvements
+  const float maxAllowedOffsetLength = geometricOffsetLength * (1.0f + 1.25f * float(blend));
+  const float currentOffsetLength = length(rayOffset);
+  if (currentOffsetLength > maxAllowedOffsetLength && currentOffsetLength > 0.0f)
+  {
+    rayOffset *= (maxAllowedOffsetLength / currentOffsetLength);
+  }
+
+  Ray ray;
+  ray.origin = minimalSurfaceInteraction.position + rayOffset;
+  ray.coneRadius = minimalRayInteraction.coneRadius;
+  ray.spreadAngle = viewRay.spreadAngle;
+  ray.direction = direction;
+  ray.tMax = tMax;
+
+  return ray;
 }
 
 Ray rayCreatePosition(

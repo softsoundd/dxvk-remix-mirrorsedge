@@ -391,6 +391,7 @@ namespace dxvk {
 
     switch (RtxOptions::renderPassGBufferRaytraceMode()) {
     case RaytraceMode::RayQuery:
+    {
       VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
@@ -415,6 +416,7 @@ namespace dxvk {
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
       break;
+    }
 
       case RaytraceMode::RayQueryRayGen:
       {

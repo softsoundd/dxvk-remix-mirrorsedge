@@ -61,6 +61,11 @@ namespace dxvk {
     m_vs.oPos        = DxsoRegisterPointer{ };
     m_fog            = DxsoRegisterPointer{ };
     m_vs.oPSize      = DxsoRegisterPointer{ };
+    m_vs.oTex0       = DxsoRegisterPointer{ };
+    m_vs.oNormal0    = DxsoRegisterPointer{ };
+    m_vs.oColor0     = DxsoRegisterPointer{ };
+    m_vs.oBlendWeight0 = DxsoRegisterPointer{ };
+    m_vs.oBlendIndices0 = DxsoRegisterPointer{ };
 
     for (uint32_t i = 0; i < m_ps.oColor.size(); i++)
       m_ps.oColor.at(i) = DxsoRegisterPointer{ };
@@ -498,11 +503,15 @@ namespace dxvk {
         uintType, // baseVertex
         floatType,// jitterX
         floatType,// jitterY
-        uintType  // padding
+        uintType, // flags
+        uintType, // boneMatricesBaseReg
+        uintType, // boneCount
+        uintType, // texcoordOutputRegister
+        uintType, // texcoordCompU
+        uintType  // texcoordCompV
       };
 
-      // NOTE: enum doesn't include 'padding', so +1 here
-      static_assert(uint32_t(D3D9RtxVertexCaptureMembers::MemberCount) + 1 == std::size(members), "Member count mismatch with D3D9RtxVertexCaptureData");
+      static_assert(uint32_t(D3D9RtxVertexCaptureMembers::MemberCount) == std::size(members), "Member count mismatch with D3D9RtxVertexCaptureData");
 
       const uint32_t structType = m_module.defStructType(std::size(members), members);
 
@@ -529,7 +538,12 @@ namespace dxvk {
       SetMemberName("baseVertex", offsetof(D3D9RtxVertexCaptureData, baseVertex));
       SetMemberName("jitterX",  offsetof(D3D9RtxVertexCaptureData, jitterX));
       SetMemberName("jitterY", offsetof(D3D9RtxVertexCaptureData, jitterY));
-      SetMemberName("padding", offsetof(D3D9RtxVertexCaptureData, padding));
+      SetMemberName("flags", offsetof(D3D9RtxVertexCaptureData, flags));
+      SetMemberName("boneMatricesBaseReg", offsetof(D3D9RtxVertexCaptureData, boneMatricesBaseReg));
+      SetMemberName("boneCount", offsetof(D3D9RtxVertexCaptureData, boneCount));
+      SetMemberName("texcoordOutputRegister", offsetof(D3D9RtxVertexCaptureData, texcoordOutputRegister));
+      SetMemberName("texcoordCompU", offsetof(D3D9RtxVertexCaptureData, texcoordCompU));
+      SetMemberName("texcoordCompV", offsetof(D3D9RtxVertexCaptureData, texcoordCompV));
 
       m_vs.vertexCaptureConstants = m_module.newVar(
         m_module.defPointerType(structType, spv::StorageClassUniform),
@@ -3705,6 +3719,12 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       if (m_programInfo.type() == DxsoProgramType::VertexShader && elem.semantic.usage == DxsoUsage::Normal && elem.semantic.usageIndex == 0) {
         m_vs.oNormal0 = indexPtr;
       }
+      if (m_programInfo.type() == DxsoProgramType::VertexShader && elem.semantic.usage == DxsoUsage::BlendWeight && elem.semantic.usageIndex == 0) {
+        m_vs.oBlendWeight0 = indexPtr;
+      }
+      if (m_programInfo.type() == DxsoProgramType::VertexShader && elem.semantic.usage == DxsoUsage::BlendIndices && elem.semantic.usageIndex == 0) {
+        m_vs.oBlendIndices0 = indexPtr;
+      }
       // NV-DXVK end
     }
   }
@@ -3782,7 +3802,9 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     const uint32_t wComp = m_module.opCompositeExtract(floatType, viewH, 1, &lit3);
     const uint32_t invW = m_module.opFDiv(floatType, oneF, wComp);
 
-    const uint32_t view3 = m_module.opVectorShuffle(vec3TypeId, viewH, viewH, 3, lit012);
+    uint32_t view3 = m_module.opVectorShuffle(vec3TypeId, viewH, viewH, 3, lit012);
+    // perspective divide (view.xyz /= view.w)
+    view3 = m_module.opVectorTimesScalar(vec3TypeId, view3, invW);
 
     const uint32_t vx = m_module.opCompositeExtract(floatType, view3, 1, &lit0);
     const uint32_t vy = m_module.opCompositeExtract(floatType, view3, 1, &lit1);
@@ -3813,25 +3835,112 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     
     // Write texcoord
     {
-      uint32_t tex2 = m_module.constvec2f32(0.0f, 0.0f);
+      const uint32_t boolTypeId = m_module.defBoolType();
+      const uint32_t vec2TypeId = getVectorTypeId({ DxsoScalarType::Float32, 2 });
+      const uint32_t bvec4TypeId = m_module.defVectorType(boolTypeId, 4);
+      uint32_t tex4 = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
+
       if (m_vs.oTex0.id > 0) {
-        const uint32_t tex4 = m_module.opLoad(vec4TypeId, m_vs.oTex0.id);
-        const uint32_t lit01[2] = { 0, 1 };
-        const uint32_t vec2TypeId = getVectorTypeId({ DxsoScalarType::Float32, 2 });
-        tex2 = m_module.opVectorShuffle(vec2TypeId, tex4, tex4, 2, lit01);
+        tex4 = m_module.opLoad(vec4TypeId, m_vs.oTex0.id);
       }
-      // tex0.xy (vec2) @ member 1
+
+      // prefer the explicitly requested VS TEXCOORD output register/components
+      const uint32_t texcoordOutputReg = LoadConstant(uintType, (uint32_t)D3D9RtxVertexCaptureMembers::TexcoordOutputRegister);
+      const uint32_t texcoordCompU = m_module.opBitwiseAnd(
+        uintType, LoadConstant(uintType, (uint32_t)D3D9RtxVertexCaptureMembers::TexcoordCompU), m_module.constu32(3u));
+      const uint32_t texcoordCompV = m_module.opBitwiseAnd(
+        uintType, LoadConstant(uintType, (uint32_t)D3D9RtxVertexCaptureMembers::TexcoordCompV), m_module.constu32(3u));
+      const uint32_t regInBounds = m_module.opULessThan(boolTypeId, texcoordOutputReg, m_module.constu32(DxsoMaxInterfaceRegs));
+      const uint32_t safeOutputReg = m_module.opSelect(uintType, regInBounds, texcoordOutputReg, m_module.constu32(0u));
+
+      const uint32_t ptrTypeId = m_module.defPointerType(vec4TypeId, spv::StorageClassPrivate);
+      const uint32_t texRegPtr = m_module.opAccessChain(ptrTypeId, m_oArray, 1, &safeOutputReg);
+      const uint32_t tex4FromReg = m_module.opLoad(vec4TypeId, texRegPtr);
+
+      const std::array<uint32_t, 4> inBoundsVec = { regInBounds, regInBounds, regInBounds, regInBounds };
+      const uint32_t inBoundsMask4 = m_module.opCompositeConstruct(bvec4TypeId, inBoundsVec.size(), inBoundsVec.data());
+      tex4 = m_module.opSelect(vec4TypeId, inBoundsMask4, tex4FromReg, tex4);
+
+      const uint32_t texU = m_module.opVectorExtractDynamic(floatType, tex4, texcoordCompU);
+      const uint32_t texV = m_module.opVectorExtractDynamic(floatType, tex4, texcoordCompV);
+      const uint32_t tex2 = m_module.opCompositeConstruct(vec2TypeId, 2, std::array<uint32_t, 2>{ texU, texV }.data());
+
       emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Texcoord0, tex2, getVectorTypeId({ DxsoScalarType::Float32, 2 }));
     }
 
     if (m_vs.oNormal0.id > 0) {
-      // Load normal matrix from constants
+      const uint32_t boolTypeId = m_module.defBoolType();
+      const uint32_t floatTypeId = getScalarTypeId(DxsoScalarType::Float32);
       const uint32_t vec3typeId = getVectorTypeId({ DxsoScalarType::Float32, 3 });
+      const uint32_t vec4typeId = getVectorTypeId({ DxsoScalarType::Float32, 4 });
+      const uint32_t bvec3TypeId = m_module.defVectorType(boolTypeId, 3);
+      const uint32_t bvec4TypeId = m_module.defVectorType(boolTypeId, 4);
+      const uint32_t zeroF = m_module.constf32(0.0f);
+      const uint32_t oneFLocal = m_module.constf32(1.0f);
+
+      std::array<uint32_t, 4> indices = { 0, 1, 2, 3 };
+
+      auto splatBool3 = [&](uint32_t cond) {
+        const std::array<uint32_t, 3> conds = { cond, cond, cond };
+        return m_module.opCompositeConstruct(bvec3TypeId, conds.size(), conds.data());
+      };
+      auto splatBool4 = [&](uint32_t cond) {
+        const std::array<uint32_t, 4> conds = { cond, cond, cond, cond };
+        return m_module.opCompositeConstruct(bvec4TypeId, conds.size(), conds.data());
+      };
+
+      auto LoadVsConstantByIndex = [&](uint32_t regIndex) -> uint32_t {
+        const uint32_t structIdx = isSwvp() ? m_module.constu32(0) : m_module.constu32(1);
+        const uint32_t cBufferId = isSwvp() ? m_cFloatBuffer : m_cBuffer;
+
+        std::array<uint32_t, 2> cIndices = { structIdx, regIndex };
+        const uint32_t ptrId = m_module.opAccessChain(
+          m_module.defPointerType(vec4typeId, spv::StorageClassUniform),
+          cBufferId, cIndices.size(), cIndices.data());
+
+        uint32_t value = m_module.opLoad(vec4typeId, ptrId);
+
+        if (!m_moduleInfo.options.robustness2Supported) {
+          const uint32_t constCount = m_module.constu32(m_layout->floatCount);
+          const uint32_t inBounds = m_module.opULessThan(boolTypeId, regIndex, constCount);
+          const std::array<uint32_t, 4> conds = { inBounds, inBounds, inBounds, inBounds };
+          const uint32_t inBounds4 = m_module.opCompositeConstruct(bvec4TypeId, conds.size(), conds.data());
+          value = m_module.opSelect(vec4typeId, inBounds4, value, m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f));
+        }
+
+        return value;
+      };
+
+      const uint32_t flagsId = LoadConstant(uintType, (uint32_t)(D3D9RtxVertexCaptureMembers::Flags));
+      const uint32_t normalFromColor0Bit = m_module.constu32(kVertexCaptureFlag_NormalFromColor0);
+      const uint32_t normalBoneSkinningBit = m_module.constu32(kVertexCaptureFlag_NormalBoneSkinning);
+      const uint32_t normalInputEncodedUByte4Bit = m_module.constu32(kVertexCaptureFlag_NormalInputEncodedUByte4);
+      const uint32_t blendIndicesInputNormalizedBit = m_module.constu32(kVertexCaptureFlag_BlendIndicesInputNormalized);
+      const uint32_t blendWeightsInputUnnormalizedBit = m_module.constu32(kVertexCaptureFlag_BlendWeightsInputUnnormalized);
+
+      const uint32_t hasNormalFromColor0FlagId = m_module.opINotEqual(boolTypeId,
+        m_module.opBitwiseAnd(uintType, flagsId, normalFromColor0Bit),
+        m_module.constu32(0));
+      const uint32_t hasNormalBoneSkinningFlagId = m_module.opINotEqual(boolTypeId,
+        m_module.opBitwiseAnd(uintType, flagsId, normalBoneSkinningBit),
+        m_module.constu32(0));
+      const uint32_t hasNormalInputEncodedUByte4FlagId = m_module.opINotEqual(boolTypeId,
+        m_module.opBitwiseAnd(uintType, flagsId, normalInputEncodedUByte4Bit),
+        m_module.constu32(0));
+      const uint32_t hasBlendIndicesInputNormalizedFlagId = m_module.opINotEqual(boolTypeId,
+        m_module.opBitwiseAnd(uintType, flagsId, blendIndicesInputNormalizedBit),
+        m_module.constu32(0));
+      const uint32_t hasBlendWeightsInputUnnormalizedFlagId = m_module.opINotEqual(boolTypeId,
+        m_module.opBitwiseAnd(uintType, flagsId, blendWeightsInputUnnormalizedBit),
+        m_module.constu32(0));
+
+      const uint32_t normalVarPtr = m_module.newVar(
+        m_module.defPointerType(vec3typeId, spv::StorageClassFunction), spv::StorageClassFunction);
+      m_module.setDebugName(normalVarPtr, "capturedNormal");
+
       const uint32_t mat3typeId = m_module.defMatrixType(vec3typeId, 3);
       uint32_t normalTransformId = LoadConstant(mat4TypeId, (uint32_t) (D3D9RtxVertexCaptureMembers::NormalTransform));
 
-      // Convert to float3x3
-      std::array<uint32_t, 4> indices = { 0, 1, 2, 3 };
       std::array<uint32_t, 3> mtxIndices;
       for (uint32_t i = 0; i < 3; i++) {
         mtxIndices[i] = m_module.opCompositeExtract(vec4TypeId, normalTransformId, 1, &i);
@@ -3839,34 +3948,188 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       }
       normalTransformId = m_module.opCompositeConstruct(mat3typeId, mtxIndices.size(), mtxIndices.data());
 
-      // Load normals from input assembler into float3
-      const uint32_t floatTypeId = getScalarTypeId(DxsoScalarType::Float32);
-      uint32_t normal0 = m_module.opLoad(vec4TypeId, m_vs.oNormal0.id);
-      {
-        std::array<uint32_t, 3> normalIndices = {
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[0]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[1]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[2]),
-        };
-        normal0 = m_module.opCompositeConstruct(vec3typeId, normalIndices.size(), normalIndices.data());
+      const uint32_t normal4 = m_module.opLoad(vec4TypeId, m_vs.oNormal0.id);
+      const std::array<uint32_t, 3> normalIndices = {
+        m_module.opCompositeExtract(floatTypeId, normal4, 1, &indices[0]),
+        m_module.opCompositeExtract(floatTypeId, normal4, 1, &indices[1]),
+        m_module.opCompositeExtract(floatTypeId, normal4, 1, &indices[2]),
+      };
+      const uint32_t inputNormal = m_module.opCompositeConstruct(vec3typeId, normalIndices.size(), normalIndices.data());
+      const uint32_t defaultNormal = m_module.opMatrixTimesVector(vec3typeId, normalTransformId, inputNormal);
+      m_module.opStore(normalVarPtr, defaultNormal);
+
+      // optional overide - COLOR0 carries UE3 skinned normal encoded as normal * 0.5 + 0.5
+      if (m_vs.oColor0.id > 0) {
+        const uint32_t useColorLabel = m_module.allocateId();
+        const uint32_t skipColorLabel = m_module.allocateId();
+        const uint32_t mergeColorLabel = m_module.allocateId();
+
+        m_module.opSelectionMerge(mergeColorLabel, 0);
+        m_module.opBranchConditional(hasNormalFromColor0FlagId, useColorLabel, skipColorLabel);
+
+        m_module.opLabel(useColorLabel);
+        {
+          const uint32_t c4 = m_module.opLoad(vec4TypeId, m_vs.oColor0.id);
+          const uint32_t two = m_module.constf32(2.0f);
+          const uint32_t one = m_module.constf32(1.0f);
+          uint32_t cx = m_module.opCompositeExtract(floatTypeId, c4, 1, &indices[0]);
+          uint32_t cy = m_module.opCompositeExtract(floatTypeId, c4, 1, &indices[1]);
+          uint32_t cz = m_module.opCompositeExtract(floatTypeId, c4, 1, &indices[2]);
+          cx = m_module.opFSub(floatTypeId, m_module.opFMul(floatTypeId, cx, two), one);
+          cy = m_module.opFSub(floatTypeId, m_module.opFMul(floatTypeId, cy, two), one);
+          cz = m_module.opFSub(floatTypeId, m_module.opFMul(floatTypeId, cz, two), one);
+          const uint32_t normalFromColor = m_module.opCompositeConstruct(
+            vec3typeId, 3, std::array<uint32_t, 3>{ cx, cy, cz }.data());
+          m_module.opStore(normalVarPtr, normalFromColor);
+        }
+        m_module.opBranch(mergeColorLabel);
+
+        m_module.opLabel(skipColorLabel);
+        m_module.opBranch(mergeColorLabel);
+
+        m_module.opLabel(mergeColorLabel);
       }
 
-      // Transform the normal
-      normal0 = m_module.opMatrixTimesVector(vec3typeId, normalTransformId, normal0);
+      // Optional override 2 - GPU skinning path without COLOR0 output
+      if (m_vs.oBlendWeight0.id > 0 || m_vs.oBlendIndices0.id > 0) {
+        const uint32_t useBoneLabel = m_module.allocateId();
+        const uint32_t skipBoneLabel = m_module.allocateId();
+        const uint32_t mergeBoneLabel = m_module.allocateId();
 
-      // Expand to vec4
-      {
-        std::array<uint32_t, 4> normalIndices = {
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[0]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[1]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[2]),
-          m_module.opCompositeExtract(floatTypeId, normal0, 1, &indices[2]),
-        };
-        normal0 = m_module.opCompositeConstruct(vec4TypeId, normalIndices.size(), normalIndices.data());
+        m_module.opSelectionMerge(mergeBoneLabel, 0);
+        m_module.opBranchConditional(hasNormalBoneSkinningFlagId, useBoneLabel, skipBoneLabel);
+
+        m_module.opLabel(useBoneLabel);
+        {
+          const uint32_t boneBaseRegId = LoadConstant(uintType, (uint32_t)D3D9RtxVertexCaptureMembers::BoneMatricesBaseReg);
+          const uint32_t boneCountId = LoadConstant(uintType, (uint32_t)D3D9RtxVertexCaptureMembers::BoneCount);
+
+          auto decodePackedNormalComp = [&](uint32_t c) {
+            return m_module.opFSub(
+              floatTypeId,
+              m_module.opFMul(floatTypeId, c, m_module.constf32(2.0f / 255.0f)),
+              oneFLocal);
+          };
+
+          uint32_t nX = m_module.opCompositeExtract(floatTypeId, inputNormal, 1, &lit0);
+          uint32_t nY = m_module.opCompositeExtract(floatTypeId, inputNormal, 1, &lit1);
+          uint32_t nZ = m_module.opCompositeExtract(floatTypeId, inputNormal, 1, &lit2);
+          const uint32_t decodedInputNormal = m_module.opCompositeConstruct(
+            vec3typeId, 3,
+            std::array<uint32_t, 3>{
+              decodePackedNormalComp(nX),
+              decodePackedNormalComp(nY),
+              decodePackedNormalComp(nZ) }.data());
+          const uint32_t sourceNormal = m_module.opSelect(
+            vec3typeId, splatBool3(hasNormalInputEncodedUByte4FlagId), decodedInputNormal, inputNormal);
+
+          uint32_t blendWeight4 = m_vs.oBlendWeight0.id > 0
+            ? m_module.opLoad(vec4TypeId, m_vs.oBlendWeight0.id)
+            : m_module.constvec4f32(1.0f, 0.0f, 0.0f, 0.0f);
+          if (m_vs.oBlendWeight0.id > 0) {
+            const uint32_t blendWeight4Unnormalized =
+              m_module.opVectorTimesScalar(vec4TypeId, blendWeight4, m_module.constf32(1.0f / 255.0f));
+            blendWeight4 = m_module.opSelect(
+              vec4TypeId,
+              splatBool4(hasBlendWeightsInputUnnormalizedFlagId),
+              blendWeight4Unnormalized,
+              blendWeight4);
+          }
+
+          uint32_t blendIndices4 = m_vs.oBlendIndices0.id > 0
+            ? m_module.opLoad(vec4TypeId, m_vs.oBlendIndices0.id)
+            : m_module.constvec4f32(0.0f, 1.0f, 2.0f, 3.0f);
+          if (m_vs.oBlendIndices0.id > 0) {
+            const uint32_t blendIndices4Scaled =
+              m_module.opVectorTimesScalar(vec4TypeId, blendIndices4, m_module.constf32(255.0f));
+            blendIndices4 = m_module.opSelect(
+              vec4TypeId,
+              splatBool4(hasBlendIndicesInputNormalizedFlagId),
+              blendIndices4Scaled,
+              blendIndices4);
+          }
+
+          uint32_t w0 = m_module.opCompositeExtract(floatTypeId, blendWeight4, 1, &lit0);
+          uint32_t w1 = m_module.opCompositeExtract(floatTypeId, blendWeight4, 1, &lit1);
+          uint32_t w2 = m_module.opCompositeExtract(floatTypeId, blendWeight4, 1, &lit2);
+          uint32_t w3 = m_module.opCompositeExtract(floatTypeId, blendWeight4, 1, &lit3);
+          w0 = m_module.opFMax(floatTypeId, w0, zeroF);
+          w1 = m_module.opFMax(floatTypeId, w1, zeroF);
+          w2 = m_module.opFMax(floatTypeId, w2, zeroF);
+          w3 = m_module.opFMax(floatTypeId, w3, zeroF);
+
+          const uint32_t wSum = m_module.opFAdd(floatTypeId, m_module.opFAdd(floatTypeId, w0, w1), m_module.opFAdd(floatTypeId, w2, w3));
+          const uint32_t safeWSum = m_module.opFMax(floatTypeId, wSum, m_module.constf32(1e-5f));
+          const uint32_t invWSum = m_module.opFDiv(floatTypeId, oneFLocal, safeWSum);
+          w0 = m_module.opFMul(floatTypeId, w0, invWSum);
+          w1 = m_module.opFMul(floatTypeId, w1, invWSum);
+          w2 = m_module.opFMul(floatTypeId, w2, invWSum);
+          w3 = m_module.opFMul(floatTypeId, w3, invWSum);
+
+          auto decodeBlendIndex = [&](uint32_t c) {
+            c = m_module.opFMax(floatTypeId, c, zeroF);
+            const uint32_t rounded = m_module.opRound(floatTypeId, c);
+            return m_module.opConvertFtoU(uintType, rounded);
+          };
+
+          const uint32_t i0 = decodeBlendIndex(m_module.opCompositeExtract(floatTypeId, blendIndices4, 1, &lit0));
+          const uint32_t i1 = decodeBlendIndex(m_module.opCompositeExtract(floatTypeId, blendIndices4, 1, &lit1));
+          const uint32_t i2 = decodeBlendIndex(m_module.opCompositeExtract(floatTypeId, blendIndices4, 1, &lit2));
+          const uint32_t i3 = decodeBlendIndex(m_module.opCompositeExtract(floatTypeId, blendIndices4, 1, &lit3));
+
+          uint32_t accumulatedNormal = m_module.constvec3f32(0.0f, 0.0f, 0.0f);
+          const uint32_t threeU = m_module.constu32(3u);
+
+          auto accumulateInfluence = [&](uint32_t weight, uint32_t boneIndex) {
+            const uint32_t indexInRange = m_module.opULessThan(boolTypeId, boneIndex, boneCountId);
+            const uint32_t safeBoneIndex = m_module.opSelect(uintType, indexInRange, boneIndex, m_module.constu32(0u));
+            const uint32_t effectiveWeight = m_module.opSelect(floatTypeId, indexInRange, weight, zeroF);
+
+            const uint32_t boneRegBase = m_module.opIAdd(
+              uintType, boneBaseRegId, m_module.opIMul(uintType, safeBoneIndex, threeU));
+            const uint32_t boneReg0 = boneRegBase;
+            const uint32_t boneReg1 = m_module.opIAdd(uintType, boneRegBase, m_module.constu32(1u));
+            const uint32_t boneReg2 = m_module.opIAdd(uintType, boneRegBase, m_module.constu32(2u));
+
+            const uint32_t row0 = LoadVsConstantByIndex(boneReg0);
+            const uint32_t row1 = LoadVsConstantByIndex(boneReg1);
+            const uint32_t row2 = LoadVsConstantByIndex(boneReg2);
+            const uint32_t row0xyz = m_module.opVectorShuffle(vec3typeId, row0, row0, 3, lit012);
+            const uint32_t row1xyz = m_module.opVectorShuffle(vec3typeId, row1, row1, 3, lit012);
+            const uint32_t row2xyz = m_module.opVectorShuffle(vec3typeId, row2, row2, 3, lit012);
+
+            const uint32_t t0 = m_module.opDot(floatTypeId, row0xyz, sourceNormal);
+            const uint32_t t1 = m_module.opDot(floatTypeId, row1xyz, sourceNormal);
+            const uint32_t t2 = m_module.opDot(floatTypeId, row2xyz, sourceNormal);
+            const uint32_t transformed = m_module.opCompositeConstruct(
+              vec3typeId, 3, std::array<uint32_t, 3>{ t0, t1, t2 }.data());
+
+            const uint32_t weighted = m_module.opVectorTimesScalar(vec3typeId, transformed, effectiveWeight);
+            accumulatedNormal = m_module.opFAdd(vec3typeId, accumulatedNormal, weighted);
+          };
+
+          accumulateInfluence(w0, i0);
+          accumulateInfluence(w1, i1);
+          accumulateInfluence(w2, i2);
+          accumulateInfluence(w3, i3);
+
+          const uint32_t hasSkinnedNormal = m_module.opFOrdGreaterThan(
+            boolTypeId, m_module.opLength(floatTypeId, accumulatedNormal), m_module.constf32(1e-5f));
+          const uint32_t normalizedSkinned = m_module.opNormalize(vec3typeId, accumulatedNormal);
+          const uint32_t finalSkinnedNormal = m_module.opSelect(
+            vec3typeId, splatBool3(hasSkinnedNormal), normalizedSkinned, sourceNormal);
+          m_module.opStore(normalVarPtr, finalSkinnedNormal);
+        }
+        m_module.opBranch(mergeBoneLabel);
+
+        m_module.opLabel(skipBoneLabel);
+        m_module.opBranch(mergeBoneLabel);
+
+        m_module.opLabel(mergeBoneLabel);
       }
 
-      // Ensure normal0 is vec3 here
-      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Normal0, normal0, getVectorTypeId({ DxsoScalarType::Float32, 3 }));
+      const uint32_t finalNormal = m_module.opLoad(vec3typeId, normalVarPtr);
+      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Normal0, finalNormal, vec3typeId);
     }
 
     // COLOR0 packed to D3D9 ARGB 0xAARRGGBB @ member 3

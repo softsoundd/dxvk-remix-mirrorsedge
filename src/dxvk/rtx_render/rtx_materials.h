@@ -102,7 +102,7 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
-    // NOTE: Spare flags bits here
+    flags0 |= colorTextureIsSrgb ? (1 << 2) : 0;
 
     writeGPUHelper(data, offset, flags0);
 
@@ -292,6 +292,7 @@ struct RtSurface {
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+  bool colorTextureIsSrgb = false;
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
   bool isInsideFrustum = false;
@@ -1601,6 +1602,7 @@ struct LegacyMaterialData {
   D3DMATERIAL9 d3dMaterial = {};
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
+  bool colorTextureIsSrgb = false;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

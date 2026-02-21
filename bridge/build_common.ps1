@@ -69,6 +69,18 @@ function SetupVS {
 	  Pop-Location
 	  Write-Host "Visual Studio Command Prompt variables set." -ForegroundColor Yellow
 	#}
+
+	try {
+		if ($pyCmd = Get-Command "py" -ErrorAction SilentlyContinue) {
+			$userScriptsDir = & $pyCmd.Source -3 -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
+			if ($userScriptsDir -and (Test-Path $userScriptsDir)) {
+				if (-not ($env:PATH -like "*$userScriptsDir*")) {
+					$env:PATH = "$env:PATH;$userScriptsDir"
+				}
+			}
+		}
+	} catch {
+	}
 }
 
 function PerformBuild {

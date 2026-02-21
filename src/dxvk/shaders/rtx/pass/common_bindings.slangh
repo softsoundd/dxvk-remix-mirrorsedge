@@ -114,3 +114,13 @@ Sampler3D<float4> ValueNoiseSampler;
 
 layout(binding = BINDING_SAMPLER_READBACK_BUFFER) 
 RWStructuredBuffer<uint32_t> SamplerFeedbackBuffer;
+
+// Atmosphere LUTs.
+layout(binding = BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)
+Texture2D AtmosphereTransmittanceLut;
+
+layout(binding = BINDING_ATMOSPHERE_MULTISCATTERING_LUT)
+Texture2D AtmosphereMultiscatteringLut;
+
+layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_LUT)
+Texture2D AtmosphereSkyViewLut;

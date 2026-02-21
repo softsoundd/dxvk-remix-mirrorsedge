@@ -182,6 +182,8 @@ namespace dxvk {
     DxsoRegisterPointer oTex0;
     DxsoRegisterPointer oNormal0;
     DxsoRegisterPointer oColor0;
+    DxsoRegisterPointer oBlendWeight0;
+    DxsoRegisterPointer oBlendIndices0;
     // NV-DXVK end
   };
 

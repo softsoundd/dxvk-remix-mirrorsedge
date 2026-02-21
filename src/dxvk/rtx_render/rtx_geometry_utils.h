@@ -64,7 +64,14 @@ namespace dxvk {
      * \brief Currently we only support these texcoord formats...
      */
     static bool isTexcoordFormatValid(VkFormat format) {
-      return format == VK_FORMAT_R32G32B32A32_SFLOAT || format == VK_FORMAT_R32G32B32_SFLOAT || format == VK_FORMAT_R32G32_SFLOAT;
+      // note FP16 texcoords are common in UE3/D3D9 (e.g. D3DDECLTYPE_FLOAT16_2 -> VK_FORMAT_R16G16_SFLOAT)
+      // the geometry interleaver supports these formats so we should consider them valid to avoid forcing vertex-capture
+      // TEXCOORD output which may not correspond to material UVs in engines that repurpose TEXCOORD0
+      return format == VK_FORMAT_R32G32B32A32_SFLOAT ||
+             format == VK_FORMAT_R32G32B32_SFLOAT ||
+             format == VK_FORMAT_R32G32_SFLOAT ||
+             format == VK_FORMAT_R16G16_SFLOAT ||
+             format == VK_FORMAT_R16G16B16A16_SFLOAT;
     }
 
     /**

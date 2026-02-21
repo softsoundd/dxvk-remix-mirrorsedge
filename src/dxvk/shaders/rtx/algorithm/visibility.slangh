@@ -274,7 +274,10 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   // ViewModel instances are not to occlude anything but rays originating from a ViewModel surface
   bool hasRayOriginatedFromViewModel = false,
   bool usePreviousTLAS = false,
-  bool clearOpaqueHitAttenuation = true)
+  bool clearOpaqueHitAttenuation = true,
+  float selfHitBypassThreshold = 0.0f,
+  float16_t selfHitBypassWeight = float16_t(0.0),
+  f16vec3 selfHitBypassPushDirection = f16vec3(0.0h))
 {
   // Exclude the portals from the ray mask because we have special handling for them.
   rayMask &= ~OBJECT_MASK_PORTAL;
@@ -323,6 +326,18 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
       ? 0
       : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
   }
+
+  // for high-risk shadow-terminator rays we force backface culling even when secondary culling is globally off
+  // restrict this to longer rays to avoid light leaks on very short contact rays
+  if (selfHitBypassWeight >= float16_t(0.35) &&
+      selfHitBypassThreshold > 0.0f &&
+      visibilityRay.tMax > selfHitBypassThreshold * 8.0f &&
+      (VisibilityMode & visibilityModeDisableCulling) == 0)
+  {
+    rayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+  }
+
+  uint selfHitBypassCount = 0;
 
   while (true)
   {
@@ -374,11 +389,45 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 
     if (rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
+      const float committedHitT = rayQuery.CommittedRayT();
+      if (selfHitBypassWeight > float16_t(0.02) &&
+          committedHitT > 0.0f &&
+          committedHitT <= selfHitBypassThreshold &&
+          selfHitBypassCount < 4)
+      {
+        const float scaledThreshold = selfHitBypassThreshold * (0.85f + 0.3f * float(selfHitBypassCount));
+        float pushDistance = max(
+          committedHitT * (1.1f + 0.1f * float(selfHitBypassWeight)),
+          scaledThreshold);
+        pushDistance = min(pushDistance, selfHitBypassThreshold * 1.75f);
+        pushDistance = min(pushDistance, visibilityRay.tMax * 0.1f);
+
+        vec3 bypassDirection = vec3(visibilityRay.direction);
+        if (dot(selfHitBypassPushDirection, selfHitBypassPushDirection) > float16_t(0.0))
+        {
+          const f16vec3 orientedBypassPushDirection =
+            dot(selfHitBypassPushDirection, visibilityRay.direction) >= float16_t(0.0)
+              ? selfHitBypassPushDirection
+              : -selfHitBypassPushDirection;
+          const float16_t severeGrazingWeight = saturate((selfHitBypassWeight - float16_t(0.6)) / float16_t(0.4));
+          const f16vec3 blendedBypassDirection = safeNormalize(
+            lerp(orientedBypassPushDirection, visibilityRay.direction, severeGrazingWeight),
+            visibilityRay.direction);
+          bypassDirection = vec3(blendedBypassDirection);
+        }
+
+        visibilityRay.origin += bypassDirection * pushDistance;
+        const float projectedPushDistance = max(0.0f, dot(vec3(visibilityRay.direction), bypassDirection) * pushDistance);
+        visibilityRay.tMax = max(0.0f, visibilityRay.tMax - projectedPushDistance);
+        selfHitBypassCount++;
+        continue;
+      }
+
       if (clearOpaqueHitAttenuation)
       {
         result.attenuation = f16vec3(0.0);
       }
-      result.hitDistance = rayQuery.CommittedRayT();
+      result.hitDistance = committedHitT;
       result.hasOpaqueHit = true;
 
       // If we already went through a portal, add the path segment before the portal
@@ -436,9 +485,19 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   viewRay.spreadAngle = spreadAngle;
 
   Ray visibilityRay;
+  const bool hasShadingNormal = dot(shadingNormal, shadingNormal) > float16_t(0.0);
   if (!isThinOpaqueSubsurface)
   {
-    visibilityRay = rayCreatePosition( minimalRayInteraction, minimalSurfaceInteraction, viewRay, targetPosition, false);
+    if (hasShadingNormal)
+    {
+      visibilityRay = rayCreatePosition(
+        minimalRayInteraction, minimalSurfaceInteraction, viewRay, targetPosition, false, shadingNormal);
+    }
+    else
+    {
+      visibilityRay = rayCreatePosition(
+        minimalRayInteraction, minimalSurfaceInteraction, viewRay, targetPosition, false);
+    }
   }
   else
   {
@@ -447,6 +506,34 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   }
 
   visibilityRay.tMax *= tMaxFactor;
+
+  // shadow terminator mitigation for smooth shading on coarse geometry
+  // in grazing/mismatch regions allow a small number of retries if the first hit is extremely close
+  // to the ray origin (likely self intersection on the source surface)
+  const float16_t geomNoLForBypass = max(float16_t(0.0), dot(minimalSurfaceInteraction.triangleNormal, visibilityRay.direction));
+  const float16_t shadeNoLForBypass = hasShadingNormal
+    ? max(float16_t(0.0), dot(shadingNormal, visibilityRay.direction))
+    : geomNoLForBypass;
+  const float16_t mismatchWeightForBypass = hasShadingNormal
+    ? saturate((shadeNoLForBypass - geomNoLForBypass) * float16_t(8.0))
+    : float16_t(0.0);
+  const float16_t grazingWeightForBypass = hasShadingNormal
+    ? saturate((float16_t(0.45) - geomNoLForBypass) / float16_t(0.45))
+    : float16_t(0.0);
+  const float16_t selfHitBypassWeight = max(mismatchWeightForBypass, grazingWeightForBypass);
+  const float baseRayOffsetLength = length(calculateRayOffset(minimalSurfaceInteraction.positionError, minimalSurfaceInteraction.triangleNormal));
+  const float thresholdFromOffset = baseRayOffsetLength * (12.0f + 96.0f * float(selfHitBypassWeight));
+  const float thresholdFromError = minimalSurfaceInteraction.positionError * (6.0f + 48.0f * float(selfHitBypassWeight));
+  const float unclampedBypassThreshold = max(max(thresholdFromOffset, thresholdFromError), 0.003f);
+  // Keep stronger seam mitigation for long/grazing rays while protecting short contact rays from over-bypass leaks.
+  const float tMaxRelativeBypassCap = max(0.002f, visibilityRay.tMax * (0.005f + 0.02f * float(selfHitBypassWeight)));
+  const float selfHitBypassThreshold = min(0.35f, min(unclampedBypassThreshold, tMaxRelativeBypassCap));
+
+  f16vec3 selfHitBypassPushDirection = minimalSurfaceInteraction.triangleNormal;
+  if (dot(selfHitBypassPushDirection, visibilityRay.direction) < float16_t(0.0))
+  {
+    selfHitBypassPushDirection = -selfHitBypassPushDirection;
+  }
 
 #ifdef OPAQUE_MATERIAL_USE_POM
 
@@ -509,7 +596,10 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   }
 #endif
 
-  VisibilityResult result = traceVisibilityRay<VisibilityMode>(visibilityRay, rayMask, expectedRayPortalIndex, rayOriginPortalSpace, hasRayOriginatedFromViewModel, usePreviousTLAS, clearOpaqueHitAttenuation);
+  VisibilityResult result = traceVisibilityRay<VisibilityMode>(
+    visibilityRay, rayMask, expectedRayPortalIndex, rayOriginPortalSpace,
+    hasRayOriginatedFromViewModel, usePreviousTLAS, clearOpaqueHitAttenuation,
+    selfHitBypassThreshold, selfHitBypassWeight, selfHitBypassPushDirection);
 
   // We want to calculate the attenuation from the light to the surface - which is why we use targetPosition (light) and neg-direction (light to surface)
   result.attenuation *= calcVolumetricAttenuation(cb.volumeArgs, none, false, result.hitDistance, targetPosition, -visibilityRay.direction);

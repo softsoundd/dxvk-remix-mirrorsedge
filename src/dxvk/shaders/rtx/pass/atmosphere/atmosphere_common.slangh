@@ -1,0 +1,817 @@
+/*
+* Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Hillaire Physically-Based Atmospheric Scattering
+// Based on "Physically Based Sky, Atmosphere and Cloud Rendering in Frostbite" by Sebastien Hillaire (2016)
+
+#include "rtx/utility/common.slangh"
+#include "rtx/utility/math.slangh"
+#include "rtx/pass/atmosphere/atmosphere_args.h"
+
+// Constants
+static const float kAtmosphereEpsilon = 1e-3f;
+static const float kPi = 3.14159265358979323846f;
+
+// Rayleigh phase function (isotropic scattering for molecules)
+float rayleighPhase(float cosTheta) {
+  float factor = 3.0f / (16.0f * kPi);
+  return factor * (1.0f + cosTheta * cosTheta);
+}
+
+// Henyey-Greenstein phase function (anisotropic scattering for aerosols)
+float hgPhase(float cosTheta, float g) {
+  // Clamp g to prevent numerical issues and complete extinction at g=1.0
+  // At g=1.0, the phase function becomes 0 everywhere, making Mie scattering invisible
+  g = min(g, 0.999f);
+  
+  float g2 = g * g;
+  float numerator = 1.0f - g2;
+  float denominator = 4.0f * kPi * pow(1.0f + g2 - 2.0f * g * cosTheta, 1.5f);
+  return numerator / max(denominator, kAtmosphereEpsilon);
+}
+
+// Exponential density profile
+// altitude in km, returns normalized density [0, 1]
+float exponentialDensity(float altitude, float scaleHeight) {
+  return exp(-max(0.0f, altitude) / scaleHeight);
+}
+
+// Get atmospheric density at given altitude
+// Uses standard exponential falloff with configurable scale height
+float rayleighDensity(float altitude, AtmosphereArgs args) {
+  return exponentialDensity(altitude, args.rayleighScaleHeight);
+}
+
+float mieDensity(float altitude, AtmosphereArgs args) {
+  return exponentialDensity(altitude, args.mieScaleHeight);
+}
+
+// Ozone density profile - concentrated in a layer (Hillaire paper Section 3.4)
+// Uses a simple Gaussian profile centered at the ozone layer altitude
+float ozoneDensity(float altitude, AtmosphereArgs args) {
+  // Ozone is concentrated in a layer, typically around 25km altitude
+  // Use a simple Gaussian profile for predictable behavior
+  
+  float distFromCenter = abs(altitude - args.ozoneLayerAltitude);
+  float sigma = args.ozoneLayerWidth * 0.4f;  // Width parameter
+  
+  // Gaussian falloff
+  float density = exp(-distFromCenter * distFromCenter / (2.0f * sigma * sigma));
+  
+  // Scale down the overall ozone effect to prevent excessive purple at sunset
+  // The absorption coefficients in rtx_options.h are already quite strong
+  return density * 0.5f;
+}
+
+// Ray-sphere intersection with improved numerical stability
+// Returns true if intersection exists, outputs near and far intersection distances
+bool intersectSphere(vec3 origin, vec3 direction, vec3 center, float radius, out float t0, out float t1) {
+  vec3 oc = origin - center;
+  float a = dot(direction, direction);
+  float b = 2.0f * dot(oc, direction);
+  float c = dot(oc, oc) - radius * radius;
+  float discriminant = b * b - 4.0f * a * c;
+  
+  // Use a small positive threshold to handle grazing angles more robustly
+  // This prevents precision issues when ray is nearly tangent to sphere
+  const float kDiscriminantEpsilon = 1e-6f;
+  if (discriminant < -kDiscriminantEpsilon) {
+    t0 = t1 = -1.0f;
+    return false;
+  }
+  
+  // Clamp discriminant to zero for near-tangent cases
+  discriminant = max(0.0f, discriminant);
+  
+  float sqrtDiscriminant = sqrt(discriminant);
+  float inv2A = 0.5f / max(a, 1e-7f);  // Prevent division by zero
+  
+  // Use numerically stable formula to avoid catastrophic cancellation
+  // When b > 0, use t0 = (-b - sqrt(disc)) / 2a, then t1 = c / (a * t0)
+  // When b < 0, use t1 = (-b + sqrt(disc)) / 2a, then t0 = c / (a * t1)
+  if (b > 0.0f) {
+    t0 = (-b - sqrtDiscriminant) * inv2A;
+    t1 = (abs(t0) > 1e-6f) ? (c / (a * t0)) : ((-b + sqrtDiscriminant) * inv2A);
+  } else {
+    t1 = (-b + sqrtDiscriminant) * inv2A;
+    t0 = (abs(t1) > 1e-6f) ? (c / (a * t1)) : ((-b - sqrtDiscriminant) * inv2A);
+  }
+  
+  // Ensure t0 <= t1
+  if (t0 > t1) {
+    float temp = t0;
+    t0 = t1;
+    t1 = temp;
+  }
+  
+  return true;
+}
+
+// Convert UV coordinates to atmosphere parameters for transmittance LUT
+// uv: [0, 1]^2
+// Returns (viewZenithCosAngle, altitude in km)
+void uvToTransmittanceLutParams(vec2 uv, AtmosphereArgs args, out float viewZenithCosAngle, out float altitude) {
+  float H = sqrt(args.atmosphereRadius * args.atmosphereRadius - args.planetRadius * args.planetRadius);
+  float rho = H * uv.y;
+  altitude = sqrt(rho * rho + args.planetRadius * args.planetRadius) - args.planetRadius;
+  
+  float dMin = args.atmosphereRadius - altitude - args.planetRadius;
+  float dMax = rho + H;
+  float d = dMin + uv.x * (dMax - dMin);
+  
+  if (d == 0.0f) {
+    viewZenithCosAngle = 1.0f;
+  } else {
+    float r = altitude + args.planetRadius;
+    viewZenithCosAngle = (H * H - rho * rho - d * d) / (2.0f * r * d);
+    viewZenithCosAngle = clamp(viewZenithCosAngle, -1.0f, 1.0f);
+  }
+}
+
+// Convert atmosphere parameters to UV coordinates for transmittance LUT
+vec2 transmittanceLutParamsToUv(float altitude, float viewZenithCosAngle, AtmosphereArgs args) {
+  float H = sqrt(max(0.0f, args.atmosphereRadius * args.atmosphereRadius - args.planetRadius * args.planetRadius));
+  float rho = sqrt(max(0.0f, altitude * altitude + 2.0f * args.planetRadius * altitude));
+  
+  float discriminant = altitude * altitude - args.planetRadius * args.planetRadius + args.atmosphereRadius * args.atmosphereRadius;
+  float dMin = max(0.0f, args.atmosphereRadius - altitude - args.planetRadius);
+  float dMax = rho + H;
+  
+  float r = altitude + args.planetRadius;
+  float mu = clamp(viewZenithCosAngle, -1.0f, 1.0f);
+  float d = max(0.0f, (-r * mu + sqrt(max(0.0f, r * r * (mu * mu - 1.0f) + args.atmosphereRadius * args.atmosphereRadius))));
+  
+  float u = clamp((d - dMin) / max(dMax - dMin, 1e-6f), 0.0f, 1.0f);
+  float v = clamp(rho / max(H, 1e-6f), 0.0f, 1.0f);
+  
+  return vec2(u, v);
+}
+
+// Sample transmittance LUT
+vec3 sampleTransmittanceLut(Texture2D transmittanceLut, SamplerState lutSampler, float altitude, float viewZenithCosAngle, AtmosphereArgs args) {
+  vec2 uv = transmittanceLutParamsToUv(altitude, viewZenithCosAngle, args);
+  return transmittanceLut.SampleLevel(lutSampler, uv, 0).rgb;
+}
+
+// Sample multiscattering LUT
+// The LUT stores second-order and higher scattering contribution
+// Parameterized by altitude and sun zenith angle cosine
+vec3 sampleMultiscatteringLut(Texture2D multiscatteringLut, SamplerState lutSampler, float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  // LUT layout:
+  // X axis: sun zenith angle cosine [-1, 1] -> [0, 1]
+  // Y axis: altitude [0, atmosphereThickness] -> [0, 1]
+  float u = (sunZenithCosAngle + 1.0f) * 0.5f;  // Map [-1, 1] to [0, 1]
+  float v = saturate(altitude / args.atmosphereThickness);
+  
+  return multiscatteringLut.SampleLevel(lutSampler, vec2(u, v), 0).rgb;
+}
+
+// Convert UV coordinates to sky view LUT parameters
+// Returns view direction in atmosphere space
+vec3 uvToSkyViewLutParams(vec2 uv, vec3 viewDir, vec3 sunDir, vec3 cameraPos, AtmosphereArgs args) {
+  // Sky view LUT stores a hemisphere view from camera position
+  // uv.x maps to azimuth angle around the sun direction
+  // uv.y maps to elevation angle from horizon to zenith
+  
+  float azimuth = uv.x * 2.0f * kPi;
+  float elevation = uv.y * kPi - kPi * 0.5f;
+  
+  // Build coordinate system with sun direction
+  vec3 up = normalize(cameraPos);
+  vec3 sunRight = normalize(cross(up, sunDir));
+  vec3 sunUp = cross(sunDir, sunRight);
+  
+  // Rotate view direction
+  float cosElevation = cos(elevation);
+  vec3 dir = sunDir * sin(elevation) + 
+             cosElevation * (sunRight * cos(azimuth) + sunUp * sin(azimuth));
+  
+  return normalize(dir);
+}
+
+// Evaluate atmosphere radiance along a ray with multiscattering
+// This is used in direct evaluation
+vec3 evalAtmosphereRadiance(
+  vec3 rayOrigin,
+  vec3 rayDir,
+  vec3 sunDir,
+  AtmosphereArgs args,
+  int numSamples = 32
+) {
+  // Intersect ray with atmosphere
+  vec3 planetCenter = vec3(0.0f, -args.planetRadius, 0.0f);
+  float t0, t1;
+  
+  // Check if we're inside or outside the atmosphere
+  float distToCenter = length(rayOrigin - planetCenter);
+  bool insideAtmosphere = distToCenter < args.atmosphereRadius;
+  
+  // Check if ray intersects atmosphere
+  if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
+    return vec3(0.0f);  // No intersection - shouldn't happen if inside
+  }
+  
+  // If inside atmosphere, start from ray origin (t0 might be negative)
+  if (insideAtmosphere) {
+    t0 = 0.0f;  // Start from camera position
+  }
+  
+  // Check if ray intersects planet
+  float tPlanet0, tPlanet1;
+  bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
+  
+  // Clamp to valid range
+  t0 = max(0.0f, t0);
+  if (hitsPlanet && tPlanet0 > 0.0f) {
+    t1 = tPlanet0;  // Stop at planet surface
+  }
+  
+  if (t1 <= t0) {
+    return vec3(0.0f);
+  }
+  
+  // Use FIXED physical step size instead of dividing ray into equal parts
+  // This eliminates artifacts caused by certain ray lengths producing bad step sizes
+  const float fixedStepSize = 2.0f;  // 2 km per step
+  int actualSamples = max(1, int(ceil((t1 - t0) / fixedStepSize)));
+  float dt = (t1 - t0) / float(actualSamples);
+  
+  vec3 L = vec3(0.0f);
+  vec3 transmittance = vec3(1.0f);
+  
+  float cosTheta = dot(rayDir, sunDir);
+  float phaseR = rayleighPhase(cosTheta);
+  float phaseM = hgPhase(cosTheta, args.mieAnisotropy);
+  
+  for (int i = 0; i < actualSamples && i < 512; ++i) {
+    float t = t0 + (float(i) + 0.5f) * dt;
+    vec3 samplePos = rayOrigin + rayDir * t;
+    float altitude = length(samplePos - planetCenter) - args.planetRadius;
+    
+    // Clamp altitude to valid range to prevent artifacts
+    altitude = clamp(altitude, 0.0f, args.atmosphereThickness);
+    
+    // Sample atmospheric density
+    float densityR = rayleighDensity(altitude, args);
+    float densityM = mieDensity(altitude, args);
+    float densityO3 = ozoneDensity(altitude, args);
+    
+    // Compute scattering coefficients at this point
+    vec3 scatteringR = args.rayleighScattering * densityR;
+    vec3 scatteringM = args.mieScattering * densityM;
+    vec3 scattering = scatteringR + scatteringM;
+    
+    // Ozone absorption (Hillaire paper Section 3.4)
+    // Ozone only absorbs, it doesn't scatter
+    vec3 ozoneAbsorption = args.ozoneAbsorption * densityO3;
+    
+    // Extinction = scattering (Rayleigh + Mie) + absorption (Ozone)
+    vec3 extinction = scattering + ozoneAbsorption;
+    
+    // BYPASS TRANSMITTANCE LUT - compute sun transmittance analytically
+    // This eliminates quantization artifacts from the transmittance LUT
+    vec3 sunDir_normalized = normalize(sunDir);
+    vec3 up = normalize(samplePos - planetCenter);
+    float sunZenithCosAngle = dot(up, sunDir_normalized);
+    
+    // Improved analytical transmittance following Blender's approach
+    // Key insight: when sun is at horizon, light still travels through atmosphere
+    // - it just has to traverse a VERY long path (the "air mass" factor)
+    float H = args.rayleighScaleHeight;
+    
+    // Air mass factor: how much atmosphere the sun ray traverses relative to zenith
+    // At zenith (cos=1): air mass = 1
+    // At horizon (cos=0): air mass → very large (we use Kasten-Young formula for accuracy)
+    // Below horizon: continue increasing for twilight
+    
+    // Kasten-Young approximation for air mass, extended for negative sun angles
+    // Original: 1 / (cos(z) + 0.50572*(96.07995 - z)^-1.6364)
+    // We use a simpler but robust approximation that handles the full range
+    float sunElevationRad = acos(clamp(sunZenithCosAngle, -1.0f, 1.0f));  // 0 = zenith, π/2 = horizon, π = nadir
+    float sunElevationDeg = degrees(sunElevationRad);
+    
+    // Modified air mass that smoothly increases past horizon for twilight
+    // At zenith (0°): ~1, at horizon (90°): ~40, at -10° below: ~100
+    float airMass;
+    if (sunZenithCosAngle > 0.01f) {
+      // Above horizon: standard air mass calculation
+      airMass = 1.0f / (sunZenithCosAngle + 0.15f * pow(93.885f - sunElevationDeg, -1.253f));
+    } else {
+      // At/below horizon: smoothly extended air mass
+      // Uses exponential growth past horizon for physically plausible twilight
+      float horizonAirMass = 40.0f;  // Air mass at exact horizon
+      float belowHorizonFactor = exp(-sunZenithCosAngle * 10.0f);  // Grows exponentially below
+      airMass = horizonAirMass * belowHorizonFactor;
+    }
+    
+    // Clamp air mass to prevent numerical issues while allowing strong twilight
+    airMass = min(airMass, 200.0f);
+    
+    // Optical depth scales with air mass and altitude-dependent density
+    float opticalDepthToSun = H * exp(-altitude / H) * airMass;
+    
+    // Include ozone absorption in sun transmittance
+    // Ozone path is weighted by the ozone density profile - reduced to prevent purple cast
+    float ozonePathLength = ozoneDensity(args.ozoneLayerAltitude, args) * airMass;
+    vec3 sunTransmittance = exp(-args.rayleighScattering * opticalDepthToSun - 
+                                 args.ozoneAbsorption * ozonePathLength * 0.15f);  // Reduced from 0.3
+    
+    // Twilight fade: sky should go dark by -15 degrees below horizon
+    // Civil twilight ends around -6°, nautical twilight at -12°, astronomical at -18°
+    // Apply exponential falloff below horizon for realistic darkening
+    float twilightFactor;
+    if (sunZenithCosAngle >= 0.0f) {
+      // Above horizon: full brightness
+      twilightFactor = 1.0f;
+    } else {
+      // Below horizon: exponential fade
+      // At -15° (cos ≈ -0.259), should be ~0.01 (nearly dark)
+      // At -90° (cos = 0), should be ~0.0001 (essentially black)
+      float angleBelow = -sunZenithCosAngle;  // 0 at horizon, positive below
+      twilightFactor = exp(-angleBelow * 15.0f);  // Exponential falloff
+    }
+    
+    // Apply twilight fade to sun transmittance
+    sunTransmittance *= twilightFactor;
+    
+    // Single scattering contribution
+    vec3 singleScatter = args.sunIlluminance * sunTransmittance * 
+                          (scatteringR * phaseR + scatteringM * phaseM);
+    
+    // Multiscattering contribution
+    // Use high-accuracy analytical approximation instead of LUT
+    vec3 multiScatter = getAnalyticalMultiscattering(altitude, sunZenithCosAngle, args);
+    // Modulate by local scattering coefficient and sun illuminance
+    // Multiscattering is isotropic (phase = 1/4π, integrated gives 1) so we use total scattering
+    vec3 multiScatterContrib = args.sunIlluminance * multiScatter * scattering;
+    
+    // Combined scattering
+    vec3 scatteredLight = singleScatter + multiScatterContrib;
+    
+    // Apply twilight fade to ALL scattering (not just sun transmittance)
+    // This ensures the entire sky darkens uniformly below horizon
+    scatteredLight *= twilightFactor;
+    
+    // Energy-conserving analytical integration (Hillaire paper Section 5.6.3, Equation 17)
+    // This is crucial for correct behavior in thick media
+    // Formula: ∫exp(-σt*x) * S dx = (S - S*exp(-σt*d)) / σt
+    vec3 sampleTransmittance = exp(-extinction * dt);
+    sampleTransmittance = clamp(sampleTransmittance, vec3(0.0f), vec3(1.0f));
+    scatteredLight = max(scatteredLight, vec3(0.0f));
+    
+    // Clamp extinction to avoid division by zero
+    // Use component-wise max for proper RGB handling
+    vec3 clampedExtinction = max(extinction, vec3(1e-7f));
+    
+    // Energy-conserving integration per Hillaire Equation 17:
+    // integScatt = (S - S * transmittance) / extinction
+    vec3 integScatt = (scatteredLight - scatteredLight * sampleTransmittance) / clampedExtinction;
+    
+    // Check for NaN/Inf and skip this sample if invalid
+    // This prevents black spots from numerical edge cases
+    vec3 contribution = transmittance * integScatt;
+    if (any(isnan(contribution)) || any(isinf(contribution))) {
+      continue;  // Skip invalid samples
+    }
+    
+    L += contribution;
+    transmittance *= sampleTransmittance;
+    
+    // Early exit if transmittance becomes negligible
+    if (all(transmittance < vec3(1e-4f))) {
+      break;
+    }
+  }
+  
+  // Final sanitization: replace any NaN/Inf with zero
+  L = max(L, vec3(0.0f));
+  if (any(isnan(L)) || any(isinf(L))) {
+    L = vec3(0.0f);
+  }
+  
+  // BLUE TWILIGHT HAZE (added outside loop for proper falloff)
+  // When sun is below horizon (-15° to 0°), add blue ambient glow from high-altitude scattering
+  // This is view-independent and fades out properly with sun elevation
+  float sunElevation = dot(normalize(sunDir), vec3(0.0f, 1.0f, 0.0f));
+  
+  const float kTwilightStart = -0.01f;       // Starts just below horizon
+  const float kTwilightPeak  = -0.04f;       // Peaks at ~ -2.3 degrees (earlier peak to blend better)
+  const float kTwilightEnd   = -0.20f;       // Ends at ~ -11.5 degrees
+  
+  if (sunElevation < kTwilightStart && sunElevation > kTwilightEnd) {
+    // Calculate strength using a triangle/bell curve: 0 -> 1 -> 0
+    float blueTwilightStrength = 0.0f;
+    
+    if (sunElevation > kTwilightPeak) {
+      // Ramping UP from Horizon to Peak
+      // Map [kTwilightStart, kTwilightPeak] -> [0, 1]
+      blueTwilightStrength = smoothstep(kTwilightStart, kTwilightPeak, sunElevation);
+    } else {
+      // Ramping DOWN from Peak to Deep Night
+      // Map [kTwilightPeak, kTwilightEnd] -> [1, 0]
+      blueTwilightStrength = smoothstep(kTwilightEnd, kTwilightPeak, sunElevation);
+    }
+    
+    blueTwilightStrength = pow(blueTwilightStrength, 1.0f);  // Linear fade
+    
+    // Add subtle blue ambient term (view-independent)
+    // This represents light scattered from high altitude where sun is still visible
+    vec3 blueTwilight = vec3(0.5f, 0.7f, 1.0f) * blueTwilightStrength * 0.015f;
+    L += args.sunIlluminance * blueTwilight;
+  }
+  
+  return L;
+}
+
+// Sun disk angular radius is now dynamic (args.sunAngularRadius)
+// static const float kSunAngularRadius = 0.00873f;
+
+// Compute transmittance from a point to the sun (simplified for ground-level surfaces)
+// Must match the ray-marching in evalAtmosphereRadiance() to avoid color mismatch
+// between the sky and cast sunlight.
+vec3 getTransmittanceToSun(vec3 worldPos, AtmosphereArgs args, bool isZUp = false) {
+  // Transform sun direction to Y-up space for horizon check
+  vec3 sunDirYUp = args.sunDirection;
+  float sunZenithCosAngle = sunDirYUp.y;  // In Y-up space, Y component is zenith angle
+  
+  // Exponential twilight fade matching the ray marching
+  float twilightFade;
+  if (sunZenithCosAngle >= 0.0f) {
+    twilightFade = 1.0f;
+  } else {
+    float angleBelow = -sunZenithCosAngle;
+    twilightFade = exp(-angleBelow * 15.0f);
+  }
+  
+  // Compute air mass using the same method as the ray-marching path.
+  // Air mass = how many vertical atmosphere columns the sunlight traverses.
+  float sunElevationRad = acos(clamp(sunZenithCosAngle, -1.0f, 1.0f));
+  float sunElevationDeg = degrees(sunElevationRad);
+  
+  float airMass;
+  if (sunZenithCosAngle > 0.01f) {
+    // Kasten-Young approximation for air mass (matches ray-marching)
+    airMass = 1.0f / (sunZenithCosAngle + 0.15f * pow(93.885f - sunElevationDeg, -1.253f));
+  } else {
+    // At/below horizon: smoothly extended air mass (matches ray-marching)
+    float horizonAirMass = 40.0f;
+    float belowHorizonFactor = exp(-sunZenithCosAngle * 10.0f);
+    airMass = horizonAirMass * belowHorizonFactor;
+  }
+  airMass = min(airMass, 200.0f);
+  
+  // Optical depth = scatteringCoefficient * scaleHeight * airMass
+  // The scale height is the integral of the exponential density profile over the
+  // full atmosphere column. Without it, extinction is underestimated by ~8x for
+  // Rayleigh, causing transmitted sunlight to be far too white/orange instead of
+  // matching the red/pink sunset colors in the sky.
+  float H_R = args.rayleighScaleHeight;  // ~8 km for Earth
+  float H_M = args.mieScaleHeight;       // ~1.2 km for Earth
+  
+  float rayleighOpticalDepth = H_R * airMass;  // at ground level, exp(-0/H) = 1
+  float mieOpticalDepth = H_M * airMass;
+  float ozonePathLength = ozoneDensity(args.ozoneLayerAltitude, args) * airMass;
+  
+  vec3 extinction = args.rayleighScattering * rayleighOpticalDepth +
+                    args.mieScattering * mieOpticalDepth +
+                    args.ozoneAbsorption * ozonePathLength * 0.15f;  // matches ray-marching
+  
+  vec3 transmittance = exp(-extinction);
+  
+  // Fade out smoothly during twilight instead of hard cutoff
+  return transmittance * twilightFade;
+}
+
+// Evaluate sun disk contribution (for sky miss shaders)
+vec3 evalSunDisk(vec3 viewDir, AtmosphereArgs args, bool isZUp = false) {
+  // Transform view direction to Y-up space
+  vec3 viewDirYUp = isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir;
+  viewDirYUp = normalize(viewDirYUp);
+  
+  // Check if sun is above horizon - sun disk should NOT be visible when sun is below horizon
+  // The sun direction Y component represents elevation (positive = above horizon)
+  float sunElevation = args.sunDirection.y;
+  
+  // Sun disk MUST be fully gone by 0° elevation (horizon line)
+  // Start fading at +2° so it disappears smoothly, fully invisible at 0° and below
+  const float kSunsetStart = 0.035f;   // ~2 degrees above horizon - start fading
+  const float kSunsetEnd = 0.0f;       // 0 degrees = horizon - fully invisible
+  float sunsetFade = smoothstep(kSunsetEnd, kSunsetStart, sunElevation);
+  
+  // Early exit if sun is at/below horizon
+  if (sunElevation <= 0.0f || sunsetFade <= 0.001f) {
+    return vec3(0.0f);  // Sun has set
+  }
+  
+  float cosAngle = dot(viewDirYUp, args.sunDirection);
+  float sunCosRadius = cos(args.sunAngularRadius);
+  
+  if (cosAngle >= sunCosRadius) {
+    // Looking at the sun disk - apply limb darkening
+    float normalizedAngle = acos(cosAngle) / args.sunAngularRadius;
+    float limbDarkening = 1.0f - 0.6f * normalizedAngle * normalizedAngle;
+    limbDarkening = max(limbDarkening, 0.0f);
+    
+    // Get transmittance from camera to sun through atmosphere
+    vec3 transmittance = getTransmittanceToSun(vec3(0.0f), args, false);
+    
+    // Sun disk is extremely bright relative to sky
+    // Apply sunset fade so sun dims and disappears as it sets
+    return args.sunIlluminance * transmittance * limbDarkening * sunsetFade * 100.0f;
+  }
+  return vec3(0.0f);
+}
+
+// Structure for direct sun lighting sample (NEE)
+struct AtmosphereSunSample {
+  vec3 direction;       // Direction TO the sun (normalized), in world space
+  vec3 radiance;        // Sun radiance reaching the surface (with transmittance)
+  float solidAnglePdf;  // Solid angle PDF (effectively 1.0 for directional light)
+  bool valid;           // True if sun is above horizon
+  float coneAngle;      // Half-angle of the sun cone for soft shadows (radians)
+  int numSamples;       // Number of shadow samples to take for soft shadows
+};
+
+// Get the sun cone angle and sample count based on Mie anisotropy
+// High anisotropy = sharp sun = small cone, few samples
+// Low anisotropy = diffuse sun = large cone, many samples
+void getSunSoftShadowParams(float mieAnisotropy, out float coneAngle, out int numSamples) {
+  // Work across the full [0.0, 1.0] range
+  float normalizedG = saturate(mieAnisotropy);
+  
+  // Map anisotropy [0, 1] to cone angle [0.6, 0.008] radians (~34° to ~0.46°)
+  // Avoid exactly hitting the early-exit threshold at g=1.0
+  // g = 1.0  -> 0.008 rad (~0.46°) = very sharp sun, hard shadows
+  // g = 0.8  -> 0.03 rad (~1.7°) = clear sun, slightly soft
+  // g = 0.5  -> 0.15 rad (~8.5°) = diffuse sun, soft shadows
+  // g = 0.0  -> 0.6 rad (~34°) = extremely diffuse sun, very soft shadows
+  coneAngle = mix(0.6f, 0.008f, normalizedG * normalizedG);  // Quadratic falloff for smoother transition
+  
+  // Map to sample count: more samples for softer shadows
+  // g = 1.0  -> 1 sample (hard shadows)
+  // g = 0.8  -> 2 samples (slightly soft)
+  // g = 0.5  -> 4 samples (medium soft)
+  // g = 0.0  -> 12 samples (very soft, diffuse)
+  numSamples = int(mix(12.0f, 1.0f, normalizedG * normalizedG));
+  numSamples = max(1, numSamples);
+}
+
+// Generate a direction jittered within a cone around the main direction
+// Uses a simple but effective disk sampling approach
+vec3 getJitteredSunDirection(vec3 sunDir, float coneAngle, float u1, float u2) {
+  if (coneAngle < 0.005f) {
+    return sunDir;  // No jitter for very small cones
+  }
+  
+  // Create orthonormal basis around sun direction
+  vec3 up = abs(sunDir.y) < 0.999f ? vec3(0.0f, 1.0f, 0.0f) : vec3(1.0f, 0.0f, 0.0f);
+  vec3 tangent = normalize(cross(up, sunDir));
+  vec3 bitangent = cross(sunDir, tangent);
+  
+  // Sample a point on a disk and project to cone
+  float r = sqrt(u1) * tan(coneAngle);  // Radius on disk
+  float phi = u2 * 2.0f * kPi;          // Angle around disk
+  
+  // Offset direction
+  vec3 offset = tangent * (r * cos(phi)) + bitangent * (r * sin(phi));
+  
+  return normalize(sunDir + offset);
+}
+
+// Sample direct sun lighting for NEE at a surface point
+AtmosphereSunSample sampleAtmosphereSunLight(vec3 surfacePos, vec3 surfaceNormal, AtmosphereArgs args, bool isZUp = false) {
+  AtmosphereSunSample result;
+  
+  // Get sun direction in world space
+  // args.sunDirection is in Y-up space, convert if needed
+  if (isZUp) {
+    // Convert from Y-up to Z-up: (x, y, z) -> (x, z, y)
+    // Y-up: X=right, Y=up, Z=forward
+    // Z-up: X=right, Y=forward, Z=up
+    // So: X stays, Y->Z, Z->Y
+    result.direction = normalize(vec3(args.sunDirection.x, args.sunDirection.z, args.sunDirection.y));
+  } else {
+    result.direction = normalize(args.sunDirection);
+  }
+  
+  // Check if sun is above the surface horizon
+  float NdotL = dot(surfaceNormal, result.direction);
+  if (NdotL <= 0.0f) {
+    result.valid = false;
+    result.radiance = vec3(0.0f);
+    result.solidAnglePdf = 1.0f;
+    return result;
+  }
+  
+  // Compute transmittance from surface to sun
+  vec3 transmittance = getTransmittanceToSun(surfacePos, args, isZUp);
+  
+  // Apply Mie anisotropy to simulate atmospheric scattering effects
+  // High anisotropy = sharp, concentrated sun (forward scattering dominant)
+  // Low anisotropy = diffuse sun (scattered in all directions, faint but still present)
+  
+  // Sun visibility fade: smoothly fade direct lighting as sun becomes more diffuse
+  // g >= 0.80: Sun is sharp and bright (full intensity)
+  // g = 0.00-0.80: Sun becomes progressively more diffuse and dim
+  // g = 0.00: Sun is extremely diffuse but still contributing some light
+  const float kSunFullyVisible = 0.80f;
+  
+  // Smooth visibility fade using smoothstep, but never fully off
+  // Maps [0.0, 0.8] to [0.05, 1.0] - even at g=0, sun contributes 5% light (very diffuse)
+  float sunVisibility = mix(0.05f, 1.0f, smoothstep(0.0f, kSunFullyVisible, args.mieAnisotropy));
+  
+  // Brightness modulation: sharper sun = brighter direct light
+  // Map anisotropy [0.0, 1.0] to brightness multiplier [0.3, 2.0]
+  // g = 1.0  -> 2.0x (very sharp, bright sun)
+  // g = 0.8  -> 1.5x (clear sun, full visibility)
+  // g = 0.5  -> 0.8x (diffuse sun)
+  // g = 0.0  -> 0.3x (very diffuse, faint sun)
+  float mieModulation = mix(0.3f, 2.0f, args.mieAnisotropy);
+  
+  // Sun radiance = illuminance * transmittance * Mie modulation * visibility fade * user brightness
+  // The 0.5x factor provides a baseline reduction, then user can adjust with sunRayBrightness
+  result.radiance = args.sunIlluminance * transmittance * mieModulation * sunVisibility * args.sunRayBrightness * 0.5f;
+  result.solidAnglePdf = 1.0f;  // Directional light has delta PDF, but we use 1.0 for math
+  result.valid = any(transmittance > vec3(0.0f));
+  
+  // Get soft shadow parameters based on Mie anisotropy
+  getSunSoftShadowParams(args.mieAnisotropy, result.coneAngle, result.numSamples);
+  
+  return result;
+}
+
+// Structure for volumetric sun light sample
+struct AtmosphereVolumeSunSample {
+  vec3 direction;       // Direction TO the sun (normalized), in world space
+  vec3 radiance;        // Sun radiance reaching the volume sample point
+  bool valid;           // True if sun is above horizon
+};
+
+// Sample direct sun lighting for volumetrics at a volume position
+// Unlike surface lighting, volumetrics use a phase function instead of BRDF.
+// IMPORTANT: Do NOT bake in a phase function here. The radiance stored in the
+// froxel SH is raw incoming radiance. The phase function is applied later when
+// the SH is evaluated with evaluateHenyeyGreenstein() during volumetric compositing.
+// Baking it in here would cause double-application of the phase function.
+AtmosphereVolumeSunSample sampleAtmosphereSunLightVolume(vec3 volumePos, vec3 viewDir, AtmosphereArgs args, bool isZUp = false) {
+  AtmosphereVolumeSunSample result;
+  
+  // Get sun direction in world space
+  if (isZUp) {
+    result.direction = normalize(vec3(args.sunDirection.x, args.sunDirection.z, args.sunDirection.y));
+  } else {
+    result.direction = normalize(args.sunDirection);
+  }
+  
+  // Check if sun is contributing light (tighten twilight range)
+  // Match the atmospheric scattering twilight cutoff at -15°
+  const float kTwilightThreshold = -0.259f;  // -15 degrees below horizon
+  if (args.sunDirection.y < kTwilightThreshold) {
+    result.valid = false;
+    result.radiance = vec3(0.0f);
+    return result;
+  }
+  
+  // Get transmittance to sun
+  vec3 transmittance = getTransmittanceToSun(volumePos, args, isZUp);
+  
+  // Store sun radiance reaching this point for the froxel SH.
+  // IMPORTANT: Do NOT bake in a phase function here -- the SH evaluation in the
+  // composite (evaluateHenyeyGreenstein) applies the phase function once already.
+  //
+  // sunIlluminance is an irradiance-like quantity (relatively low magnitude). Regular
+  // distant lights store concentrated radiance (divided by sin²(halfAngle)), giving them
+  // strong directional signal in the SH. We need a similar boost so the sun doesn't get
+  // drowned out by ambient/sky contributions, but we can't use the full solid angle
+  // concentration (1/sin² ~ 44000x for a 0.5° sun) as sunIlluminance isn't raw radiance.
+  // Instead, use a moderate directional boost that preserves the sun's warm color in
+  // the volumetric fog without blowing out the firefly filter.
+  result.radiance = args.sunIlluminance * transmittance * args.sunRayBrightness * 4.0f;
+  result.valid = any(transmittance > vec3(0.0f));
+  
+  return result;
+}
+
+// 1. Analytical Ground Reflection (Replaces LUT-based version)
+vec3 computeGroundReflectionAnalytical(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  // Ground parameters
+  const vec3 GROUND_ALBEDO = vec3(0.3f, 0.3f, 0.3f);
+  const float PHASE_ISOTROPIC = 1.0f / (4.0f * kPi);
+
+  // A. Sun -> Ground Transmittance
+  // We can reuse the high-quality analytical transmittance function
+  // Ground is at altitude 0
+  vec3 T_sun_to_ground = getTransmittanceToSun(vec3(0.0f), args, false);
+
+  // B. Ground -> Sample Transmittance
+  // Calculate optical depth analytically for the vertical-ish path from ground to sample
+  // OpticalDepth(h1, h2) = H * (exp(-h1/H) - exp(-h2/H))
+  // Here h1 = 0, h2 = altitude
+  
+  float H_R = args.rayleighScaleHeight;
+  float H_M = args.mieScaleHeight;
+  
+  float od_R = H_R * (1.0f - exp(-altitude / H_R));
+  float od_M = H_M * (1.0f - exp(-altitude / H_M));
+  
+  // Approximate ozone absorption (uniform distribution approximation for this short path)
+  float od_O3 = args.ozoneLayerWidth * 0.1f * (altitude / args.atmosphereThickness);
+
+  vec3 extinction = args.rayleighScattering * od_R + 
+                    args.mieScattering * od_M + 
+                    args.ozoneAbsorption * od_O3;
+                    
+  vec3 T_ground_to_sample = exp(-max(extinction, vec3(0.0f)));
+
+  // C. Geometric Factor (Solid Angle of Planet)
+  // How much of the sphere around the sample is covered by the planet?
+  float d = args.planetRadius + altitude;
+  float ratio = args.planetRadius / d;
+  float omega = 2.0f * kPi * (1.0f - sqrt(max(0.0f, 1.0f - ratio * ratio)));
+
+  // Combine: Incoming Sun * Albedo * Phase * SolidAngle * PathTransmittance
+  float cosTheta = max(sunZenithCosAngle, 0.0f); // Sun must be above horizon for ground bounce
+  
+  return args.sunIlluminance * T_sun_to_ground * (GROUND_ALBEDO / kPi) * omega * PHASE_ISOTROPIC * T_ground_to_sample * cosTheta;
+}
+
+// 2. Accurate Analytical Air Multiscattering (Replaces static curve fit)
+vec3 computeAirMultiscatteringAnalytical(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  // A. Dynamic Color
+  // Multiscattering is dominated by Rayleigh (blue/white) because Mie scatters forward.
+  // We mix them based on their scattering strength.
+  vec3 totalScattering = args.rayleighScattering + args.mieScattering * 0.1f;
+  
+  // B. Altitude Attenuation
+  // Multiscattering is strong at the bottom of the atmosphere, weak at the top.
+  // Use an average scale height to fade it out.
+  float avgScaleHeight = (args.rayleighScaleHeight + args.mieScaleHeight) * 0.5f;
+  float densityFade = exp(-altitude / avgScaleHeight);
+  
+  // C. Sun Angle Factor (The "Curve")
+  // This sigmoid approximates the integral of light entering the atmosphere hemisphere.
+  // It effectively models "how much atmosphere is lit" based on sun angle.
+  float sunFactor = 1.0f / (1.0f + 5.0f * exp(-17.92f * sunZenithCosAngle));
+  
+  // D. Calibration Scalar
+  // Derived to match the Monte Carlo reference magnitude
+  const float MS_STRENGTH = 0.5f; 
+  
+  return args.sunIlluminance * totalScattering * densityFade * sunFactor * MS_STRENGTH;
+}
+
+// Combined Analytical Multiscattering (Use this to replace LUT sampling)
+vec3 getAnalyticalMultiscattering(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  vec3 groundReflect = computeGroundReflectionAnalytical(altitude, sunZenithCosAngle, args);
+  vec3 airScatter = computeAirMultiscatteringAnalytical(altitude, sunZenithCosAngle, args);
+  
+  return groundReflect + airScatter;
+}
+
+// Main evaluation function - computes atmosphere directly instead of using sky view LUT
+vec3 evalSkyRadiance(
+  vec3 viewDir,
+  AtmosphereArgs args,
+  bool isZUp = false
+) {
+  // Transform view direction to Y-up space if needed
+  vec3 viewDirYUp = isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir;
+  viewDirYUp = normalize(viewDirYUp);
+  vec3 sunDir = args.sunDirection;
+  
+  // Compute atmosphere directly with fixed step size
+  vec3 cameraPos = vec3(0.0f, 0.0f, 0.0f);  // Ground level in Y-up space
+  
+  // Compute scattered sky radiance with multiscattering
+  vec3 radiance = evalAtmosphereRadiance(
+    cameraPos,
+    viewDirYUp,
+    sunDir,
+    args,
+    32  // numSamples hint (now using fixed physical step size)
+  );
+  
+  // Note: Sun disk rendering removed - direct lighting handles sun contribution
+  
+  return max(radiance, vec3(0.0f));
+}

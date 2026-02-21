@@ -37,7 +37,23 @@ namespace dxvk {
 
   bool CameraManager::isCameraValid(CameraType::Enum cameraType) const {
     assert(cameraType < CameraType::Enum::Count);
-    return accessCamera(*this, cameraType).isValid(m_device->getCurrentFrameId());
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    const RtCamera& camera = accessCamera(*this, cameraType);
+    if (camera.isValid(frameId))
+      return true;
+
+    // keep main camera usable for a rejection frame so raytracing doesn't disengage
+    // while we wait for a suspicious jump candidate to prove persistence todo: fix this later
+    if (cameraType == CameraType::Main &&
+        guardMainCameraFromOutliers() &&
+        m_pendingMainJumpCandidate.valid &&
+        m_pendingMainJumpCandidate.frameId == frameId &&
+        frameId > 0 &&
+        camera.isValid(frameId - 1)) {
+      return true;
+    }
+
+    return false;
   }
 
   void CameraManager::onFrameEnd() {
@@ -132,6 +148,98 @@ namespace dxvk {
     bool isCameraCut = false;
     Matrix4 worldToView = input.getTransformData().worldToView;
     Matrix4 viewToProjection = input.getTransformData().viewToProjection;
+
+    if (guardMainCameraFromOutliers() && shouldUpdateMainCamera && frameId > 0 && getCamera(CameraType::Main).isValid(frameId - 1)) {
+      const RtCamera& prevMain = getCamera(CameraType::Main);
+
+      const float prevAspect = prevMain.getAspectRatio();
+      const float prevFov = prevMain.getFov();
+
+      const float aspectRelDiff =
+        prevAspect > 1e-6f
+          ? std::abs(decomposeProjectionParams.aspectRatio - prevAspect) / prevAspect
+          : 0.0f;
+
+      Vector3 candDir(0.0f);
+      Vector3 candPos(0.0f);
+      {
+        const Matrix4 viewToWorld = inverseAffine(worldToView);
+        candDir = Vector3 { viewToWorld[2].xyz() };
+        candPos = Vector3 { viewToWorld[3].xyz() };
+        if (!decomposeProjectionParams.isLHS)
+          candDir = -candDir;
+
+        const float len = length(candDir);
+        if (len > 0.0f)
+          candDir /= len;
+      }
+
+      Vector3 prevDir = prevMain.getDirection(false);
+      const float prevLen = length(prevDir);
+      if (prevLen > 0.0f)
+        prevDir /= prevLen;
+
+      const float dirDot = dot(candDir, prevDir);
+      const float fovDiff = std::abs(decomposeProjectionParams.fov - prevFov);
+
+      // reject if aspect ratio is way off or if both fov and direction are strong outliers
+      constexpr float kAspectRelDiffThreshold = 0.10f;
+      constexpr float kFovDiffThreshold = 0.35f;
+      constexpr float kDirDotThreshold = 0.20f;
+
+      const bool rejectedByAspectOrDirection =
+        aspectRelDiff > kAspectRelDiffThreshold ||
+        (fovDiff > kFovDiffThreshold && dirDot < kDirDotThreshold);
+
+      if (rejectedByAspectOrDirection) {
+        m_pendingMainJumpCandidate.valid = false;
+        ONCE(Logger::warn("[RTX-Compatibility] CameraManager: rejected outlier Main camera candidate (likely shadow/utility camera)."));
+        return CameraType::Unknown;
+      }
+
+      // reject the bad camera frame spikes but accept persistent jumps
+      // on the next frame so real teleports/loads still converge to the new camera
+      {
+        const float posJumpDistSqr = lengthSqr(candPos - prevMain.getPosition(false));
+        const float suspiciousJumpThresholdSqr = RtxOptions::getUniqueObjectDistanceSqr() * 4.0f;
+        const bool isSuspiciousJump = posJumpDistSqr > suspiciousJumpThresholdSqr;
+
+        if (isSuspiciousJump) {
+          bool isPersistentJump = false;
+          if (m_pendingMainJumpCandidate.valid &&
+              (m_pendingMainJumpCandidate.frameId == frameId ||
+               m_pendingMainJumpCandidate.frameId + 1 == frameId)) {
+            const float repeatPosDistSqr = lengthSqr(candPos - m_pendingMainJumpCandidate.position);
+            const float repeatDirDot = dot(candDir, m_pendingMainJumpCandidate.direction);
+            const float repeatFovDiff = std::abs(decomposeProjectionParams.fov - m_pendingMainJumpCandidate.fov);
+            const float repeatAspectRelDiff =
+              m_pendingMainJumpCandidate.aspectRatio > 1e-6f
+                ? std::abs(decomposeProjectionParams.aspectRatio - m_pendingMainJumpCandidate.aspectRatio) / m_pendingMainJumpCandidate.aspectRatio
+                : 0.0f;
+
+            isPersistentJump =
+              repeatPosDistSqr <= RtxOptions::getUniqueObjectDistanceSqr() &&
+              repeatDirDot > 0.85f &&
+              repeatFovDiff < 0.10f &&
+              repeatAspectRelDiff < 0.05f;
+          }
+
+          if (!isPersistentJump) {
+            m_pendingMainJumpCandidate.valid = true;
+            m_pendingMainJumpCandidate.frameId = frameId;
+            m_pendingMainJumpCandidate.position = candPos;
+            m_pendingMainJumpCandidate.direction = candDir;
+            m_pendingMainJumpCandidate.fov = decomposeProjectionParams.fov;
+            m_pendingMainJumpCandidate.aspectRatio = decomposeProjectionParams.aspectRatio;
+            ONCE(Logger::warn("[RTX-Compatibility] CameraManager: rejected provisional large-jump Main camera candidate."));
+            return CameraType::Unknown;
+          }
+        }
+
+        m_pendingMainJumpCandidate.valid = false;
+      }
+    }
+
     if (isPlaying || isBrowsing) {
       if (shouldUpdateMainCamera) {
         RtCamera::RtCameraSetting setting;

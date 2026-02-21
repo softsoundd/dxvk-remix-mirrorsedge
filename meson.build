@@ -816,6 +816,8 @@ if dxvk_is_ninja
   endif
 endif # dxvk_is_ninja
 
-if fs.is_dir('nv-private')
+# softosund note -some checkouts may contain the `nv-private` runtime assets directory without the
+# corresponding meson build scripts, only include the subdir when a `meson.build` is present
+if fs.is_file('nv-private/meson.build')
   subdir('nv-private')
 endif

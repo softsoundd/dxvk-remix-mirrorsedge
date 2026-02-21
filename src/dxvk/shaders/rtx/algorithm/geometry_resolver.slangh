@@ -37,6 +37,7 @@
 #include "rtx/concept/light/light.slangh"
 #include "rtx/algorithm/resolve.slangh"
 #include "rtx/algorithm/volume_lighting.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/pass/post_fx/post_fx_motion_blur_geometry_flags.slangh"
 #include "rtx/algorithm/nee_cache_light.slangh"
 #include "rtx/utility/gpu_printing.slangh"
@@ -1554,6 +1555,27 @@ void geometryResolverVertex(
   // Output a miss
   if (!rayInteractionHasHit(rayInteraction))
   {
+    // Get sky radiance to blend with
+    vec3 skyRadiance;
+    if (cb.domeLightArgs.active)
+    {
+      skyRadiance = cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, ray.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform);
+    }
+#ifdef ATMOSPHERE_AVAILABLE
+    else if (cb.skyMode == 1)
+    {
+      // Physical atmosphere mode
+      skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+    }
+#endif
+    else
+    {
+      // Skybox rasterization mode
+      skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
+    }
+
+    geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
+
     updateNrcOnGBufferMiss(geometryResolverState.pixelCoordinate, cb.nrcArgs);
 
     // Note: Always write to primary surface for initial misses, 
@@ -2136,9 +2158,17 @@ void geometryPSRResolverVertex(
     {
        emissiveRadiance += cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, ray.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform) * radianceAttenuation;
     }
+#ifdef ATMOSPHERE_AVAILABLE
+    else if (cb.skyMode == 1)
+    {
+      // Physical atmosphere mode.
+      vec3 skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      emissiveRadiance += skyRadiance * radianceAttenuation;
+    }
+#endif
     else
     {
-      // Output radiance from sky probe
+      // Skybox rasterization mode.
        emissiveRadiance += cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0) * radianceAttenuation;
     }
   }

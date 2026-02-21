@@ -145,6 +145,12 @@ namespace dxvk {
 dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawParameters* originalParams,
                                                                     DrawCallState* originalDrawCallState) {
 
+  // Skip all sky geometry when using physical atmosphere mode
+  if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky &&
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+    return TryHandleSkyResult::SkipSubmit;
+  }
+
   if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky) {
 
     // Initialize the sky render targets

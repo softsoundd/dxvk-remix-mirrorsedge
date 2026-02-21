@@ -354,9 +354,11 @@ float RAB_GetLightSampleTargetPdfForSurface(RAB_LightSample lightSample, RAB_Sur
     return 0;
 
   f16vec3 L = f16vec3(normalize(lightSample.position - surface.minimalSurfaceInteraction.position));
+  const float16_t shadingNoL = dot(L, surface.opaqueSurfaceMaterialInteraction.shadingNormal);
 
-  // Need to compute the transmission pdf if the ray interact with SSS surface
-  if (dot(L, surface.minimalSurfaceInteraction.triangleNormal) <= float16_t(0) &&
+  // use shading normal for the hemisphere gate to avoid hard per-triangle grazing cutoffs
+  // thin-opaque subsurface still allows transmission-like behavior through the opposite side
+  if (shadingNoL <= float16_t(0) &&
       (!cb.sssArgs.enableThinOpaque || !isThinOpaqueSubsurfaceMaterial(surface.opaqueSurfaceMaterialInteraction)))
   {
     return 0;
@@ -386,7 +388,8 @@ SurfaceMaterialInteractionSplitWeight RAB_CalculateBRDF(vec3 L, RAB_Surface surf
   weight.specularReflectionWeight = f16vec3(0);
   weight.diffuseTransmissionWeight = f16vec3(0);
 
-  if (dot(L, surface.minimalSurfaceInteraction.triangleNormal) <= float16_t(0) &&
+  const float16_t shadingNoL = dot(L, surface.opaqueSurfaceMaterialInteraction.shadingNormal);
+  if (shadingNoL <= float16_t(0) &&
       (!cb.sssArgs.enableThinOpaque || !isThinOpaqueSubsurfaceMaterial(surface.opaqueSurfaceMaterialInteraction)))
   {
     return weight;
@@ -400,9 +403,9 @@ SurfaceMaterialInteractionSplitWeight RAB_CalculateBRDF(vec3 L, RAB_Surface surf
 float RAB_GetGITargetPdfForSurface(vec3 radiance, vec3 position, RAB_Surface surface)
 {
   f16vec3 L = f16vec3(normalize(position - surface.minimalSurfaceInteraction.position));
+  const float16_t shadingNoL = dot(L, surface.opaqueSurfaceMaterialInteraction.shadingNormal);
 
-  if ((dot(L, surface.minimalSurfaceInteraction.triangleNormal) <= float16_t(0) ||
-       dot(L, surface.opaqueSurfaceMaterialInteraction.shadingNormal) <= float16_t(0)) &&
+  if (shadingNoL <= float16_t(0) &&
       (!cb.sssArgs.enableThinOpaque || !isThinOpaqueSubsurfaceMaterial(surface.opaqueSurfaceMaterialInteraction)))
   {
     return 0;

@@ -25,10 +25,12 @@
 #include "rtx_resources.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_camera_manager.h"
+#include "rtx_atmosphere.h"
 #include "rtx/pass/nrd_args.h"
 
 #include <cstdint>
 #include <chrono>
+#include <memory>
 #include "rtx_options.h"
 
 struct VolumeArgs;
@@ -229,6 +231,9 @@ namespace dxvk {
     VkFormat m_skyRtColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkClearValue m_skyClearValue;
     bool m_skyClearDirty = false;
+    SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
+
+    std::unique_ptr<RtxAtmosphere> m_atmosphere;
 
     bool shouldUseDLSS() const;
     bool shouldUseRayReconstruction() const;

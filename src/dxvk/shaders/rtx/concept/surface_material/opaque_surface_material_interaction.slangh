@@ -670,10 +670,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opacity = 1.h;
   }
   
-  // Note: Gamma correct albedo input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
-  // automatically do this conversion.
-  // Todo: Disable this for when a sRGB texture is the source of the albedo.
+  // avoid double gamma conversion for legacy color textures that are already sampled through sRGB views
+  if (!surface.colorTextureIsSrgb)
+  {
   albedo = gammaToLinear(albedo);
+  }
   
   // Note: Gamma correct emissive color input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
   // automatically do this conversion.

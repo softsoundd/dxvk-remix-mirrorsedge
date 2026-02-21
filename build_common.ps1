@@ -20,59 +20,81 @@
   DEALINGS IN THE SOFTWARE.
 #>
 
-#
-# Find vswhere (installed with recent Visual Studio versions).
-#
-If ($vsWhere = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue) {
-  $vsWhere = $vsWhere.Path
-} ElseIf (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe") {
-  $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-}
- Else {
-  Write-Error "vswhere not found. Aborting." -ErrorAction Stop
-}
-Write-Host "vswhere found at: $vsWhere" -ForegroundColor Yellow
-
-
-#
-# Get path to Visual Studio installation using vswhere.
-#
-$vsPath = &$vsWhere -latest -version "[16.0,18.0)" -products * `
- -requires Microsoft.Component.MSBuild `
- -property installationPath
-If ([string]::IsNullOrEmpty("$vsPath")) {
-  Write-Error "Failed to find Visual Studio 2019 installation. Aborting." -ErrorAction Stop
-}
-Write-Host "Using Visual Studio installation at: ${vsPath}" -ForegroundColor Yellow
-
-
-#
-# Make sure the Visual Studio Command Prompt variables are set.
-#
-If (Test-Path env:LIBPATH) {
-  Write-Host "Visual Studio Command Prompt variables already set." -ForegroundColor Yellow
-} Else {
-  # Load VC vars
-  Push-Location "${vsPath}\VC\Auxiliary\Build"
-  cmd /c "vcvarsall.bat x64&set" |
-	ForEach-Object {
-	  # Due to some odd behavior with how powershell core (pwsh) (powershell 5.X not tested) interprets a specific
-	  # predefined gitlab CI variable (in this case CI_MERGE_REQUEST_DESCRIPTION) with a value that includes ===  
-	  # The `Contains` method is used to ignore the string === to prevent pwsh from erroneously encountering an error.
-	  If ($_ -match "=") {
-		  If (-not ($_.Contains('==='))) {
-			  $v = $_.split("="); Set-Item -Force -Path "ENV:\$($v[0])" -Value "$($v[1])"
-		  }
-	  }
+function SetupVS {
+	param(
+		[Parameter(Mandatory)]
+		[string]$Platform
+	)
+	If ($vsWhere = Get-Command "vswhere.exe" -ErrorAction SilentlyContinue) {
+	  $vsWhere = $vsWhere.Path
+	} ElseIf (Test-Path "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe") {
+	  $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 	}
-  Pop-Location
-  Write-Host "Visual Studio Command Prompt variables set." -ForegroundColor Yellow
+	 Else {
+	  Write-Error "vswhere not found. Aborting." -ErrorAction Stop
+	}
+	Write-Host "vswhere found at: $vsWhere" -ForegroundColor Yellow
+
+
+	$vsPath = &$vsWhere -latest -version "[16.0,18.0)" -products * `
+	 -requires Microsoft.Component.MSBuild `
+	 -property installationPath
+	If ([string]::IsNullOrEmpty("$vsPath")) {
+	  Write-Error "Failed to find a supported Visual Studio installation. Aborting." -ErrorAction Stop
+	}
+	Write-Host "Using Visual Studio installation at: ${vsPath}" -ForegroundColor Yellow
+
+
+	Push-Location "${vsPath}\VC\Auxiliary\Build"
+	cmd /c "vcvarsall.bat $Platform&set" |
+		ForEach-Object {
+		  If ($_ -match "=") {
+			  If (-not ($_.Contains('==='))) {
+				  $v = $_.split("="); Set-Item -Force -Path "ENV:\$($v[0])" -Value "$($v[1])"
+			  }
+		  }
+		}
+	Pop-Location
+	Write-Host "Visual Studio Command Prompt variables set ($Platform)." -ForegroundColor Yellow
+
+	try {
+		if ($pyCmd = Get-Command "py" -ErrorAction SilentlyContinue) {
+			$userScriptsDir = & $pyCmd.Source -3 -c "import sysconfig; print(sysconfig.get_path('scripts', scheme='nt_user'))"
+			if ($userScriptsDir -and (Test-Path $userScriptsDir)) {
+				if (-not ($env:PATH -like "*$userScriptsDir*")) {
+					$env:PATH = "$env:PATH;$userScriptsDir"
+				}
+			}
+		}
+	} catch {
+	}
+}
+
+function Invoke-Meson {
+	param(
+		[Parameter(Mandatory)]
+		[string[]]$MesonArgs
+	)
+
+	if ($mesonCmd = Get-Command "meson" -ErrorAction SilentlyContinue) {
+		& $mesonCmd.Source @MesonArgs
+		return
+	}
+
+	if ($pyCmd = Get-Command "py" -ErrorAction SilentlyContinue) {
+		& $pyCmd.Source -3 -m mesonbuild.mesonmain @MesonArgs
+		return
+	}
+
+	Write-Error "meson not found, install meson  or add it to PATH." -ErrorAction Stop
 }
 
 function PerformBuild {
 	param(
 		[Parameter(Mandatory)]
 		[string]$Backend,
+
+		[string]$Platform = "x64",
 
 		[Parameter(Mandatory)]
 		[string]$BuildFlavour,
@@ -92,16 +114,23 @@ function PerformBuild {
 		[bool]$ShadersOnly = $false
 	)
 
+	SetupVS -Platform $Platform
+
 	$CurrentDir = Get-Location
-	$OutputDir = [IO.Path]::Combine($CurrentDir, "_output")
 	$BuildDir = [IO.Path]::Combine($CurrentDir, $BuildSubDir)
 
 	Push-Location $CurrentDir
-		$mesonArgs = "setup --buildtype `"$BuildFlavour`" --backend `"$Backend`" -Denable_tracy=`"$EnableTracy`" `"$BuildSubDir`""
+		$setupArgs = @(
+			"setup",
+			"--buildtype", $BuildFlavour,
+			"--backend", $Backend,
+			("-Denable_tracy=$EnableTracy"),
+			$BuildSubDir
+		)
 		if ( $ShadersOnly ) {
-			$mesonArgs = "$mesonArgs -Ddownload_apics=False"
+			$setupArgs += "-Ddownload_apics=False"
 		}
-		Start-Process "meson" -NoNewWindow -ArgumentList $mesonArgs -wait
+		Invoke-Meson -MesonArgs $setupArgs
 	Pop-Location
 
 	if ( $LASTEXITCODE -ne 0 ) {
@@ -111,23 +140,22 @@ function PerformBuild {
 
 	if ($ShadersOnly) {
 		Push-Location $BuildDir
-		$mesonArgs = "compile rtx_shaders"
-		Start-Process "meson" -NoNewWindow -ArgumentList $mesonArgs -wait
+		Invoke-Meson -MesonArgs @("compile", "rtx_shaders")
 		Pop-Location
 		exit $LASTEXITCODE
 	}
 
 	if (!$ConfigureOnly) {
 		Push-Location $BuildDir
-			& meson compile -v 
+			Invoke-Meson -MesonArgs @("compile", "-v")
 
 			if ($InstallTags -and $InstallTags.Count -gt 0) {
 				# join array into comma-separated list
 				$tagList = $InstallTags -join ','
-				& meson install --tags $tagList
+				Invoke-Meson -MesonArgs @("install", "--tags", $tagList)
 			}
 			else {
-				& meson install
+				Invoke-Meson -MesonArgs @("install")
 			}
 		Pop-Location
 
