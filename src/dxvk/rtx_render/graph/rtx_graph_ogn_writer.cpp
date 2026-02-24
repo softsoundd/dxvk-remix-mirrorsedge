@@ -242,11 +242,18 @@ void writePropertyToOGN(std::ofstream& outputFile, const RtComponentSpec& spec, 
   // For flexible types, don't add color metadata (since they can resolve to any type)
   bool isColorType = !isFlexibleType && prop.treatAsColor && 
                      (prop.type == RtComponentPropertyType::Float3 || prop.type == RtComponentPropertyType::Float4);
+  const bool isNumericType = (prop.type == RtComponentPropertyType::Float ||
+                              prop.type == RtComponentPropertyType::Float2 ||
+                              prop.type == RtComponentPropertyType::Float3 ||
+                              prop.type == RtComponentPropertyType::Float4);
+  const bool hasLimitMetadata = isNumericType && (prop.hardMin != kFalsePropertyValue || prop.hardMax != kFalsePropertyValue ||
+                                                   prop.softMin != kFalsePropertyValue || prop.softMax != kFalsePropertyValue ||
+                                                   prop.uiStep != kFalsePropertyValue);
   
   // Check if we have any metadata to add
   if (!prop.enumValues.empty() || isColorType
       || prop.isSettableOutput || !prop.allowedPrimTypes.empty()
-      || isTokenType) {
+      || isTokenType || hasLimitMetadata) {
     
     outputFile << "        \"metadata\": {" << std::endl;
     
@@ -308,6 +315,43 @@ void writePropertyToOGN(std::ofstream& outputFile, const RtComponentSpec& spec, 
         outputFile << "," << std::endl;
       }
       outputFile << "          \"tokenCategory\": \"" << prop.type << "\"";
+      hasMetadata = true;
+    }
+    
+    // Add value limit metadata for numeric types (softMin, softMax, hardMin, hardMax, uiStep)
+    if (prop.hardMin != kFalsePropertyValue) {
+      if (hasMetadata) {
+        outputFile << "," << std::endl;
+      }
+      outputFile << "          \"hardMin\": " << getDefaultValueAsJson(prop.hardMin, prop.type);
+      hasMetadata = true;
+    }
+    if (prop.hardMax != kFalsePropertyValue) {
+      if (hasMetadata) {
+        outputFile << "," << std::endl;
+      }
+      outputFile << "          \"hardMax\": " << getDefaultValueAsJson(prop.hardMax, prop.type);
+      hasMetadata = true;
+    }
+    if (prop.softMin != kFalsePropertyValue) {
+      if (hasMetadata) {
+        outputFile << "," << std::endl;
+      }
+      outputFile << "          \"softMin\": " << getDefaultValueAsJson(prop.softMin, prop.type);
+      hasMetadata = true;
+    }
+    if (prop.softMax != kFalsePropertyValue) {
+      if (hasMetadata) {
+        outputFile << "," << std::endl;
+      }
+      outputFile << "          \"softMax\": " << getDefaultValueAsJson(prop.softMax, prop.type);
+      hasMetadata = true;
+    }
+    if (prop.uiStep != kFalsePropertyValue) {
+      if (hasMetadata) {
+        outputFile << "," << std::endl;
+      }
+      outputFile << "          \"uiStep\": " << getDefaultValueAsJson(prop.uiStep, prop.type);
       hasMetadata = true;
     }
     

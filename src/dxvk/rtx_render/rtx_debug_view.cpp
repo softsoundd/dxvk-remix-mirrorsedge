@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -637,11 +637,9 @@ namespace dxvk {
       m_composite.lastCompositeViewIdx = static_cast<CompositeDebugView>(Composite::compositeViewIdx());
     }
 
-    displayType.setDeferred(static_cast<DebugViewDisplayType>(std::min(static_cast<uint32_t>(displayType()), static_cast<uint32_t>(DebugViewDisplayType::Count) - 1)));
-  
     const uint32_t bufferLength = kMaxFramesInFlight;
 
-    DxvkBufferCreateInfo statisticsBufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    DxvkBufferCreateInfo statisticsBufferInfo;
     statisticsBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     statisticsBufferInfo.stages = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
     statisticsBufferInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
@@ -992,7 +990,7 @@ namespace dxvk {
   }
 
   void DebugView::createConstantsBuffer() {
-    DxvkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;

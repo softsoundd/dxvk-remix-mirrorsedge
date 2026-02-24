@@ -107,6 +107,18 @@ struct SssArgs {
   u16vec2 diffusionProfileDebuggingPixel;
 };
 
+struct EyeArgs {
+  uint  enableEyes;
+  float normalBendingEyeball;
+  float normalBendingCornea;
+  float whitesAlbedoScale;
+
+  float irisRadius;
+  float irisDepth;
+  uint  pad0;
+  uint  pad1;
+};
+
 #define OBJECT_PICKING_INVALID (cb.clearColorPicking)
 
 // Constant buffer
@@ -140,6 +152,7 @@ struct RaytraceArgs {
   NrcArgs nrcArgs;
   SssArgs sssArgs;
   AtmosphereArgs atmosphereArgs;
+  EyeArgs eyeArgs;
 
   Camera renderTargetCamera;
 
@@ -345,7 +358,7 @@ struct RaytraceArgs {
   float resolveStochasticAlphaBlendThreshold;
   float translucentDecalAlbedoFactor;
 
-  float pad;
+  uint enableHeuristicSingleScatteringTransmission;
 
   float skyBrightness;
   uint skyMode;  // 0 = skybox rasterization, 1 = physical atmosphere
@@ -384,7 +397,7 @@ struct RaytraceArgs {
   uint allowNrcTraining;
 
   float vertexColorStrength;
-  uint pad0;
+  float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
 
   float wboitEnergyLossCompensation;
   float wboitDepthWeightTuning;

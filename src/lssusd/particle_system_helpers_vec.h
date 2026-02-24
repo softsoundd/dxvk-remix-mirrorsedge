@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -22,22 +22,28 @@
 
 #pragma once
 
-#include "../../rtx_option.h"
+// This header provides vec2/vec3/vec4 specializations of AssignFromPrimvar.
+// Include this AFTER both particle_system_helpers.h and shader_types.h are included.
+// Do NOT include this in HdRemix code as it requires MathLib.
 
-namespace dxvk {
-namespace components {
+#include "particle_system_helpers.h"
+#include "../dxvk/shaders/rtx/utility/shader_types.h"
 
-// Shared constants for RtxOptionLayer components
-static constexpr uint32_t kMaxComponentRtxOptionLayerPriority = RtxOptionLayer::s_runtimeOptionLayerPriority - 1;
-static constexpr uint32_t kMinComponentRtxOptionLayerPriority = RtxOptionLayer::s_userOptionLayerOffset + 1;
-static constexpr uint32_t kDefaultComponentRtxOptionLayerPriority = 10000;
+namespace lss {
 
-// Helper function to convert and clamp RtxOptionLayer priority value for components
-inline uint32_t getRtxOptionLayerComponentClampedPriority(float priorityValue) {
-  uint32_t priority = static_cast<uint32_t>(std::round(priorityValue));
-  return std::clamp(priority, kMinComponentRtxOptionLayerPriority, kMaxComponentRtxOptionLayerPriority);
+  template<>
+  inline vec4 AssignFromPrimvar<vec4, pxr::GfVec4f>(const pxr::GfVec4f& src) {
+    return vec4(src[0], src[1], src[2], src[3]);
+  }
+
+  template<>
+  inline vec3 AssignFromPrimvar<vec3, pxr::GfVec3f>(const pxr::GfVec3f& src) {
+    return vec3(src[0], src[1], src[2]);
+  }
+
+  template<>
+  inline vec2 AssignFromPrimvar<vec2, pxr::GfVec2f>(const pxr::GfVec2f& src) {
+    return vec2(src[0], src[1]);
+  }
+
 }
-
-}  // namespace components
-}  // namespace dxvk
-

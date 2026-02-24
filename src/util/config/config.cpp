@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2019-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -903,6 +903,8 @@ namespace dxvk {
                                                 "vertexlayout" },
         { "rtx.allowCubemaps",                  "True" },
       { "rtx.showLegacyACESOption",                             "True"   },
+      { "rtx.eye.showOptions",              "True" },
+      { "rtx.eye.enable",                   "True" },
     }} },
     /* Kohan II                                  */
     { R"(\\k2\.exe$)", {{
@@ -1303,20 +1305,24 @@ namespace dxvk {
     Vector2i& result) {
     std::stringstream ss(value);
     std::string s;
-    for (int i = 0; i < 2; ++i) {
-      if (!std::getline(ss, s, ',')) {
-        return false;
-      }
 
-      int value;
-      if (!parseOptionValue(s, value)) {
-        return false;
-      }
+    // NV-DXVK start: promote scalar to vectors
+    if (!std::getline(ss, s, ',') || !parseOptionValue(s, result[0])) {
+      return false;
+    }
 
-      result[i] = value;
+    // If there is only a single value in the config for this vector, copy it to the other channels
+    if (!std::getline(ss, s, ',')) {
+      result = Vector2i(result[0]);
+      return true;
+    }
+
+    if (!parseOptionValue(s, result[1])) {
+      return false;
     }
 
     return true;
+    // NV-DXVK end
   }
 
   // NV-DXVK start: added a variant
@@ -1325,17 +1331,18 @@ namespace dxvk {
     Vector2& result) {
     std::stringstream ss(value);
     std::string s;
-    for (int i = 0; i < 2; ++i) {
-      if (!std::getline(ss, s, ',')) {
-        return false;
-      }
 
-      float value;
-      if (!parseOptionValue(s, value)) {
-        return false;
-      }
+    if (!std::getline(ss, s, ',') || !parseOptionValue(s, result[0])) {
+      return false;
+    }
 
-      result[i] = value;
+    // If there is only a single value in the config for this vector, copy it to the other channels
+    if (!std::getline(ss, s, ',')) {
+      result = Vector2(result[0]);
+      return true;
+    }
+    if (!parseOptionValue(s, result[1])) {
+      return false;
     }
 
     return true;
@@ -1346,17 +1353,21 @@ namespace dxvk {
     Vector4& result) {
     std::stringstream ss(value);
     std::string s;
-    for (int i = 0; i < 4; ++i) {
-      if (!std::getline(ss, s, ',')) {
-        return false;
-      }
 
-      float value;
-      if (!parseOptionValue(s, value)) {
-        return false;
-      }
+    if (!std::getline(ss, s, ',') || !parseOptionValue(s, result[0])) {
+      return false;
+    }
 
-      result[i] = value;
+    // If there is only a single value in the config for this vector, copy it to the other channels
+    if (!std::getline(ss, s, ',')) {
+      result = Vector4(result[0]);
+      return true;
+    }
+
+    if (!parseOptionValue(s, result[1]) ||
+        !std::getline(ss, s, ',') || !parseOptionValue(s, result[2]) ||
+        !std::getline(ss, s, ',') || !parseOptionValue(s, result[3])) {
+      return false;
     }
 
     return true;
@@ -1368,22 +1379,27 @@ namespace dxvk {
     Vector3& result) {
     std::stringstream ss(value);
     std::string s;
-    for (int i = 0; i < 3; ++i) {
-      if (!std::getline(ss, s, ',')) {
-        return false;
-      }
 
-      float value;
-      if (!parseOptionValue(s, value)) {
-        return false;
-      }
+    // NV-DXVK start: promote scalar to vectors
+    if (!std::getline(ss, s, ',') || !parseOptionValue(s, result[0])) {
+      return false;
+    }
 
-      result[i] = value;
+    // If there is only a single value in the config for this vector, copy it to the other channels
+    if (!std::getline(ss, s, ',')) {
+      result = Vector3(result[0]);
+      return true;
+    }
+
+    if (!parseOptionValue(s, result[1]) ||
+        !std::getline(ss, s, ',') || !parseOptionValue(s, result[2])) {
+      return false;
     }
 
     return true;
+    // NV-DXVK end
   }
-  
+
   bool Config::parseOptionValue(
     const std::string& value,
     VirtualKeys& result) {
@@ -1455,49 +1471,7 @@ namespace dxvk {
     return false;
   }
 
-  // NV-DXVK start: Generic config parsing, reduce duped code
-  template<Config::Type type>
-  Config Config::getConfig(const std::string& configPath) {
-    const Desc& desc = getDesc(type);
-    const std::string envVarName(desc.env);
-    const std::string envVarPath = !envVarName.empty() ? env::getEnvVar(envVarName.c_str()) : "";
-    Logger::info(str::format("Looking for config: ", desc.name));
-    // Getting a default "App" Config doesn't require parsing a file.
-    if constexpr(type == Type_App) {
-      const auto exePath = env::getExePath();
-      if (envVarPath.empty()) {
-        return getAppConfig(exePath);
-      } else {
-        return getAppConfig(envVarPath);
-      }
-    // A previous conf file has explicitly stated a future conf file must be used...
-    } else if(!configPath.empty()) {
-      const std::string filePath = configPath + "/" + desc.confName;
-      Logger::info(str::format("Attempting to parse: ", filePath, "..."));
-      return parseConfigFile(filePath);
-    // A relevant env var has been set
-    } else if (!envVarPath.empty()) {
-      std::stringstream filePathsSS(envVarPath);
-      Logger::info(str::format("Env[", desc.env, "]: ", filePathsSS.str()));
-      std::string filePath;
-      Config config;
-      while(std::getline(filePathsSS, filePath, ',')) {
-        Logger::info(str::format("Attempting to parse: ", filePath, "..."));
-        config.merge(parseConfigFile(filePath));
-      }
-      return config;
-    // As a last resort, look in the CWD for the conf file
-    } else {
-      Logger::info(str::format("Attempting to parse: ", desc.confName,
-                               " at CWD(", std::filesystem::current_path(), ")..."));
-      return parseConfigFile(desc.confName);
-    }
-  }
-  template Config Config::getConfig<Config::Type_User>(const std::string& adtlPath);
-  template Config Config::getConfig<Config::Type_App>(const std::string& adtlPath);
-  template Config Config::getConfig<Config::Type_RtxUser>(const std::string& adtlPath);
-  template Config Config::getConfig<Config::Type_RtxMod>(const std::string& adtlPath);
-
+  // NV-DXVK start: Config file loading
   Config Config::getOptionLayerConfig(const std::string& configPath) {
     Logger::info(str::format("Attempting to parse option layer: ", configPath, "..."));
     return parseConfigFile(configPath);
@@ -1532,7 +1506,8 @@ namespace dxvk {
     Logger::info(str::format("Serializing config file: ", filePath));
 
     for (const auto& line : config.m_options) {
-      if (!filterStr.empty() && line.first.find(filterStr) != std::string::npos)
+      // Write if no filter specified, or if key matches the filter
+      if (filterStr.empty() || line.first.find(filterStr) != std::string::npos)
         stream << line.first << " = " << line.second << std::endl;
     }
   }

@@ -53,7 +53,7 @@
 #define REMIXAPI_VERSION_GET_PATCH(version) (((uint64_t)(version)      ) & (uint64_t)0xFFFF)
 
 #define REMIXAPI_VERSION_MAJOR 0
-#define REMIXAPI_VERSION_MINOR 5
+#define REMIXAPI_VERSION_MINOR 6
 #define REMIXAPI_VERSION_PATCH 2
 
 
@@ -92,7 +92,9 @@ extern "C" {
     REMIXAPI_STRUCT_TYPE_LIGHT_INFO_USD_EXT                   = 21,
     REMIXAPI_STRUCT_TYPE_STARTUP_INFO                         = 22,
     REMIXAPI_STRUCT_TYPE_PRESENT_INFO                         = 23,
-    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 24,
+    REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM    = 24,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 25,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT    = 26,
     // NOTE: if adding a new struct, register it in 'rtx_remix_specialization.inl'
     //       and only extend this enum by appending, never adjust the order of these 
     //       as that will break backwards compatibility.
@@ -424,47 +426,84 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL      = 1 << 21,
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
     REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER          = 1 << 23,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
   } remixapi_InstanceCategoryBit;
 
   typedef uint32_t remixapi_InstanceCategoryFlags;
 
+
+  typedef struct remixapi_AnimatedFloat1D {
+    float*     pData;
+    uint32_t   numberElements;
+  } remixapi_AnimatedFloat1D;
+  
+  typedef struct remixapi_AnimatedFloat2D {
+    remixapi_Float2D*   pData;
+    uint32_t            numberElements;
+  } remixapi_AnimatedFloat2D;
+  
+  typedef struct remixapi_AnimatedFloat3D {
+    remixapi_Float3D*   pData;
+    uint32_t            numberElements;
+  } remixapi_AnimatedFloat3D;
+
+  typedef struct remixapi_AnimatedFloat4D {
+    remixapi_Float4D*   pData;
+    uint32_t            numberElements;
+  } remixapi_AnimatedFloat4D;
+
+
+  // New particle system struct with animated curve support
   typedef struct remixapi_InstanceInfoParticleSystemEXT {
-    remixapi_StructType      sType;
-    void*                    pNext;
-    uint32_t         maxNumParticles;
-    remixapi_Bool    useTurbulence;
-    remixapi_Bool    alignParticlesToVelocity;
-    remixapi_Bool    useSpawnTexcoords;
-    remixapi_Bool    enableCollisionDetection;
-    remixapi_Bool    enableMotionTrail;
-    remixapi_Bool    hideEmitter;
-    remixapi_Float4D minSpawnColor;
-    remixapi_Float4D maxSpawnColor;
-    float            minTimeToLive;
-    float            maxTimeToLive;
-    float            initialVelocityFromNormal;
-    float            initialVelocityConeAngleDegrees;
-    float            minSpawnSize;
-    float            maxSpawnSize;
-    float            gravityForce;
-    float            maxSpeed;
-    float            turbulenceFrequency;
-    float            turbulenceForce;
-    float            minSpawnRotationSpeed;
-    float            maxSpawnRotationSpeed;
-    float            spawnRatePerSecond;
-    float            collisionThickness;
-    float            collisionRestitution;
-    float            motionTrailMultiplier;
-    float            initialVelocityFromMotion;
-    float            minTargetSize;
-    float            maxTargetSize;
-    float            minTargetRotationSpeed;
-    float            maxTargetRotationSpeed;
-    remixapi_Float4D minTargetColor;
-    remixapi_Float4D maxTargetColor;
-    uint32_t         billboardType;
+    remixapi_StructType sType;
+    void*               pNext;
+    uint32_t            maxNumParticles;
+    remixapi_Bool       useTurbulence;
+    remixapi_Bool       alignParticlesToVelocity;
+    remixapi_Bool       useSpawnTexcoords;
+    remixapi_Bool       enableCollisionDetection;
+    remixapi_Bool       enableMotionTrail;
+    remixapi_Bool       hideEmitter;
+    remixapi_Bool       restrictVelocityX;
+    remixapi_Bool       restrictVelocityY;
+    remixapi_Bool       restrictVelocityZ;
+    remixapi_AnimatedFloat4D   minColor;
+    remixapi_AnimatedFloat4D   maxColor;
+    remixapi_AnimatedFloat1D   minRotationSpeed;
+    remixapi_AnimatedFloat1D   maxRotationSpeed;
+    remixapi_AnimatedFloat2D   minSize;
+    remixapi_AnimatedFloat2D   maxSize;
+    remixapi_AnimatedFloat3D   maxVelocity;
+    remixapi_Float3D    attractorPosition;
+    float               minTimeToLive;
+    float               maxTimeToLive;
+    float               initialVelocityFromNormal;
+    float               initialVelocityConeAngleDegrees;
+    float               dragCoefficient;
+    float               initialRotationDeviationDegrees;
+    float               gravityForce;
+    float               turbulenceFrequency;
+    float               turbulenceForce;
+    float               spawnRatePerSecond;
+    float               collisionThickness;
+    float               collisionRestitution;
+    float               motionTrailMultiplier;
+    float               initialVelocityFromMotion;
+    float               spawnBurstDuration;
+    float               attractorRadius;
+    float               attractorForce;
+    uint8_t             billboardType;
+    uint8_t             spriteSheetMode;
+    uint8_t             collisionMode;
+    uint8_t             randomFlipAxis;
   } remixapi_InstanceInfoParticleSystemEXT;
+
+  typedef struct remixapi_InstanceInfoGpuInstancingEXT {
+    remixapi_StructType       sType;
+    void*                     pNext;
+    const remixapi_Transform* instanceTransforms_values;
+    uint32_t                  instanceTransforms_count;
+  } remixapi_InstanceInfoGpuInstancingEXT;
 
   typedef struct remixapi_InstanceInfo {
     remixapi_StructType            sType;
@@ -477,7 +516,6 @@ extern "C" {
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_DrawInstance)(
     const remixapi_InstanceInfo* info);
-
 
 
   typedef struct remixapi_LightInfoLightShaping {

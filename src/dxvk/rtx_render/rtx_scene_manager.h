@@ -21,12 +21,12 @@
 */
 #pragma once
 
+#include <deque>
 #include <mutex>
 #include <vector>
 #include <set>
 #include <unordered_set>
 #include <unordered_map>
-#include <list>
 #include <variant>
 
 #include "../dxvk_buffer.h"
@@ -109,6 +109,7 @@ struct ExternalDrawState {
   CategoryFlags categories {};
   bool doubleSided {};
   const std::optional<RtxParticleSystemDesc> optionalParticleDesc {};
+  std::vector<Matrix4> gpuInstancingTransforms {};
 };
 
 // Scene manager is a super manager, it's the interface between rendering and world state
@@ -182,7 +183,6 @@ public:
   const FogState& getFogState() const { return m_fog; }
   FogState& getFogState() { return m_fog; }
   const fast_unordered_cache<FogState>& getFogStates() const { return m_fogStates; }
-  void clearFogState();
 
   uint32_t getStartInMediumMaterialIndex() { return m_startInMediumMaterialIndex; }
   
@@ -196,8 +196,7 @@ public:
   void garbageCollection();
   void prepareSceneData(Rc<RtxContext> ctx, class DxvkBarrierSet& execBarriers);
 
-  void onFrameEnd(Rc<DxvkContext> ctx);
-  void onFrameEndNoRTX();
+  void onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame);
 
   // GameCapturer
   void triggerUsdCapture() const;
@@ -361,6 +360,9 @@ private:
 
   // Mesh hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
+
+  // Using std::deque for pointer stability: push_back doesn't invalidate existing pointers
+  std::deque<std::vector<Matrix4>> m_externalGpuInstancingTransforms;
 };
 
 }  // namespace nvvk

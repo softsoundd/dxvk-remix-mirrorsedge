@@ -219,6 +219,10 @@ struct RaytraceGeometry {
   Rc<DxvkBuffer> historyBuffer[2] = {nullptr};
   Rc<DxvkBuffer> indexCacheBuffer = nullptr;
 
+  // Set to true after the smooth normals compute pass has been applied to this geometry.
+  // Used to avoid redundant recomputation on subsequent frames for static geometry.
+  bool smoothNormalsApplied = false;
+
   bool usesIndices() const { 
     return indexBuffer.defined();
   }
@@ -515,6 +519,7 @@ enum class InstanceCategories : uint32_t {
   IgnoreBakedLighting,
   IgnoreTransparencyLayer,
   ParticleEmitter,
+  SmoothNormals,
 
   Count,
 };
@@ -567,6 +572,7 @@ struct DrawCallState {
   bool hasTextureCoordinates() const {
     return getGeometryData().texcoordBuffer.defined() || getTransformData().texgenMode != TexGenMode::None;
   }
+  bool isEye() const;
 
   bool stencilEnabled = false;
 
@@ -824,6 +830,7 @@ struct Tlas {
   enum Type : size_t {
     Opaque,
     Unordered,
+    SSS,
 
     Count
   };

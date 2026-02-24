@@ -2488,8 +2488,9 @@ namespace dxvk {
     const uint32_t usedSamplerMask = m_parent->m_psShaderMasks.samplerMask | m_parent->m_vsShaderMasks.samplerMask;
     const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask;
     for (uint32_t idx : bit::BitMask(usedTextureMask)) {
-      if (!d3d9State().textures[idx])
+      if (!d3d9State().textures[idx]) {
         continue;
+      }
 
       auto texture = GetCommonTexture(d3d9State().textures[idx]);
 
@@ -3579,6 +3580,9 @@ namespace dxvk {
       // Track the texture hash before checking if it should be ignored
       // This ensures we track all textures sent by the game, not just the ones that are actually rendered.
       const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+
+      // Flag smooth normals category at the d3d9 layer
+      m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash));
       if (textureHash != kEmptyHash) {
         m_parent->EmitCs([textureHash](DxvkContext* ctx) {
           static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(textureHash);

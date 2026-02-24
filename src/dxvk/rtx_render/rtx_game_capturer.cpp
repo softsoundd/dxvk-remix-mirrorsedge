@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -189,6 +189,7 @@ namespace dxvk {
     m_state.set<State::Capturing, true>();
     m_state.set<State::Initializing, false>();
     m_state.set<State::Complete, false>();
+    m_state.set<State::Failed, false>();
   }
   
   void GameCapturer::prepareInstanceStage(const Rc<DxvkContext> ctx) {
@@ -964,8 +965,16 @@ namespace dxvk {
       pState->set<State::Exporting, true>();
 
       Logger::info("[GameCapturer][" + cap.idStr + "] Begin USD export");
-      lss::GameExporter::exportUsd(exportPrep);
+      const bool exportOk = lss::GameExporter::exportUsd(exportPrep);
       Logger::info("[GameCapturer][" + cap.idStr + "] End USD export");
+
+      if (!exportOk) {
+        complete->stageName = cap.instance.stageName;
+        complete->stagePath = cap.instance.stagePath;
+        pState->set<State::Exporting, false>();
+        pState->set<State::Failed, true>();
+        return;
+      }
 
       // Necessary step for being able to properly diff and check for regressions
       const auto flattenCaptureEnvStr = env::getEnvVar("DXVK_CAPTURE_FLATTEN");
@@ -1029,8 +1038,8 @@ namespace dxvk {
     exportPrep.meta.bReduceMeshBuffers = true;
     exportPrep.meta.isZUp = RtxOptions::zUp();
     if (s_captureRemixConfigs) {
-      for (auto& pair : RtxOptionImpl::getGlobalRtxOptionMap()) {
-        exportPrep.meta.renderingSettingsDict[pair.second->getFullName()] = pair.second->genericValueToString(RtxOptionImpl::ValueType::Value);
+      for (auto& pair : RtxOptionImpl::getGlobalOptionMap()) {
+        exportPrep.meta.renderingSettingsDict[pair.second->getFullName()] = pair.second->getResolvedValueAsString();
       }
     }
     exportPrep.meta.bCorrectBakedTransforms = false;

@@ -30,9 +30,6 @@ namespace RemixGui {
     bool clipPushed = false;
     bool channelsSplit = false;
 
-    // Add this member to the struct:
-// bool channelsSplit = false;
-
     explicit RtxOptionUxWrapper(dxvk::RtxOption<T>* rtxOption)
       : option(rtxOption) {
       window = ImGui::GetCurrentWindow();
@@ -138,22 +135,48 @@ namespace RemixGui {
 
         id = window->GetID((void*) option);
 
+        bool resetButtonHovered = false;
         if (ImGui::ItemAdd(hitBb, id)) {
-          bool hovered = false;
           bool held = false;
-          bool pressed = ImGui::ButtonBehavior(hitBb, id, &hovered, &held, ImGuiButtonFlags_PressedOnClick);
+          bool pressed = ImGui::ButtonBehavior(hitBb, id, &resetButtonHovered, &held, ImGuiButtonFlags_PressedOnClick);
           if (pressed) {
             option->resetToDefault();
           }
 
           const ImU32 fill = isNonDefault ? ImGui::GetColorU32((ImU32) 0xFFffc734) : ImGui::GetColorU32((ImU32) 0xFF464646);
-          const ImU32 outline = ImGui::GetColorU32(hovered ? ImGuiCol_Text : ImGuiCol_Border);
+          const ImU32 outline = ImGui::GetColorU32(resetButtonHovered ? ImGuiCol_Text : ImGuiCol_Border);
 
           window->DrawList->AddCircleFilled(circleCenter, circleRadius, fill);
           window->DrawList->AddCircle(circleCenter, circleRadius, outline, 0, 1.0f);
 
-          if (hovered) {
-            ImGui::SetTooltip("Reset to default (%s)", option->getName().c_str());
+          if (resetButtonHovered) {
+            ImGui::SetTooltip("Reset to default (%s)", option->getName());
+          }
+        }
+
+        // Show RtxOption tooltip when hovering over label/widget area (but not if another tooltip is already shown)
+        const float x0 = window->WorkRect.Min.x;
+        const float x1 = prevWorkRectMaxX - reservedRightW;
+        const float y0 = startCursorPos.y;
+        const float y1 = startCursorPos.y + lineHeight;
+        
+        if (!resetButtonHovered && ImGui::IsMouseHoveringRect(ImVec2(x0, y0), ImVec2(x1, y1))) {
+          // Check if any tooltip window was created (by code between the construction and destruction of this wrapper)
+          bool tooltipAlreadyShown = false;
+          for (int i = 0; i <= g.TooltipOverrideCount; i++) {
+            char window_name[16];
+            ImFormatString(window_name, 16, "##Tooltip_%02d", i);
+            ImGuiWindow* tooltip_window = ImGui::FindWindowByName(window_name);
+            if (tooltip_window && tooltip_window->Active && !tooltip_window->Hidden) {
+              tooltipAlreadyShown = true;
+              break;
+            }
+          }
+
+          if (!tooltipAlreadyShown) {
+            // Only build the tooltip when actually hovering (BuildRtxOptionTooltip is expensive)
+            std::string tooltipText = RemixGui::BuildRtxOptionTooltip(option);
+            RemixGui::SetTooltipUnformatted(tooltipText.c_str());
           }
         }
       }
@@ -173,7 +196,6 @@ namespace RemixGui {
   bool SliderInt3(const char* label, int v[3], int v_min, int v_max, const char* format = "%d", ImGuiSliderFlags flags = 0, float overlayAlpha = 0.8f);
   bool SliderInt4(const char* label, int v[4], int v_min, int v_max, const char* format = "%d", ImGuiSliderFlags flags = 0, float overlayAlpha = 0.8f);
   
-  bool Checkbox(const char* label, dxvk::RtxOption<bool>* rtxOption);
   bool Checkbox(const char* label, bool* v, float boxScale = .9f);
 
   bool InputFloat(const char* label, float* v, float step = 0.0f, float step_fast = 0.0f, const char* format = "%.3f", ImGuiInputTextFlags flags = 0);
@@ -196,6 +218,7 @@ namespace RemixGui {
   bool DragInt3(const char* label, int v[3], float v_speed = 1.0f, int v_min = 0, int v_max = 0, const char* format = "%d", ImGuiSliderFlags flags = 0);
   bool DragInt4(const char* label, int v[4], float v_speed = 1.0f, int v_min = 0, int v_max = 0, const char* format = "%d", ImGuiSliderFlags flags = 0);
   bool DragIntRange2(const char* label, int* v_current_min, int* v_current_max, float v_speed = 1.0f, int v_min = 0, int v_max = 0, const char* format = "%d", const char* format_max = NULL, ImGuiSliderFlags flags = 0);
+  bool OptionalDragFloat(const char* label, float enabledValue, float defaultValue, float* v, float boxScale = .9f, float vSpeed = 1.0f, float vMin = 0.0f, float vMax = 0.0f, const char* format = "%.3f", ImGuiSliderFlags flags = 0);
   
   bool Combo(const char* label, int* current_item, const char* const items[], int items_count, int popup_max_height_in_items = -1);
   bool Combo(const char* label, int* current_item, const char* items_separated_by_zeros, int popup_max_height_in_items = -1);

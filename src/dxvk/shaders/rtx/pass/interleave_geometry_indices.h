@@ -44,6 +44,7 @@ struct InterleaveGeometryArgs {
   uint32_t minVertexIndex;
   uint32_t outputStride;
   uint32_t vertexCount;
+  uint32_t forceNormals; // When set, reserve normal space in output even if hasNormals is false (writes zeros)
 };
 
 #define INTERLEAVE_GEOMETRY_BINDING_OUTPUT           0

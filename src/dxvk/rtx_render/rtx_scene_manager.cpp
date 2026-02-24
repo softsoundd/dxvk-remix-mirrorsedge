@@ -362,7 +362,25 @@ namespace dxvk {
     // Assume we won't need this, and update the value if required
     output.previousPositionBuffer = RaytraceBuffer();
 
-    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()) ? input.positionBuffer.stride() : RtxGeometryUtils::computeOptimalVertexStride(input);
+    // When the SmoothNormals category is set and the input has no normals, force the interleaved
+    // vertex layout to include space for normals. The smooth normals compute pass will fill them in later.
+    const bool needsSmoothNormals = drawCallState.categories.test(InstanceCategories::SmoothNormals);
+    const bool forceNormals = needsSmoothNormals && !input.normalBuffer.defined();
+
+    // When smooth normals state changes (added or removed), promote to kUpdateBVH so the vertex
+    // data is re-interleaved and the smooth normals dispatch runs (or original normals are restored).
+    if (needsSmoothNormals != output.smoothNormalsApplied && result == ObjectCacheState::kUpdateInstance) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+    if (!needsSmoothNormals) {
+      output.smoothNormalsApplied = false;
+    }
+
+    // If forceNormals is true, we can't use the fast "already interleaved" path since
+    // we need to change the layout to include normal space.
+    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals)
+      ? input.positionBuffer.stride()
+      : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
 
     switch (result) {
       case ObjectCacheState::KBuildBVH: {
@@ -380,7 +398,7 @@ namespace dxvk {
         assert(output.indexCacheBuffer == nullptr && output.historyBuffer[0] == nullptr);
 
         // Create a index buffer and vertex buffer we can use for raytracing.
-        DxvkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        DxvkBufferCreateInfo info;
         info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
         info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -398,7 +416,7 @@ namespace dxvk {
         info.size = align(vertexBufferSize, CACHE_LINE_SIZE);
         output.historyBuffer[0] = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
 
-        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output);
+        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
         break;
       }
@@ -426,7 +444,7 @@ namespace dxvk {
           output.historyBuffer[0] = m_device->createBuffer(output.historyBuffer[1]->info(), memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
         } 
 
-        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output);
+        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
         // Sometimes, we need to invalidate history, do that here by copying the current buffer to the previous..
         if (invalidateHistory) {
@@ -464,7 +482,7 @@ namespace dxvk {
   }
 
 
-  void SceneManager::onFrameEnd(Rc<DxvkContext> ctx) {
+  void SceneManager::onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame) {
     ScopedCpuProfileZone();
 
     manageTextureVram();
@@ -476,10 +494,11 @@ namespace dxvk {
 
     m_cameraManager.onFrameEnd();
     m_instanceManager.onFrameEnd();
-    m_previousFrameSceneAvailable = RtxOptions::enablePreviousTLAS();
+    m_previousFrameSceneAvailable = raytracedThisFrame && RtxOptions::enablePreviousTLAS();
 
     m_bufferCache.clear();
-    {
+    m_externalGpuInstancingTransforms.clear();
+    if (raytracedThisFrame){
       std::lock_guard lock { m_drawCallMeta.mutex };
       const uint8_t curTick = m_drawCallMeta.ticker;
       const uint8_t nextTick = (m_drawCallMeta.ticker + 1) % m_drawCallMeta.MaxTicks;
@@ -514,19 +533,20 @@ namespace dxvk {
 
     // execute graph updates after all garbage collection is complete (to avoid updating graphs that will just be deleted)
     // RtxOptions will still be pending, so any changes to them will apply next frame.
-    m_graphManager.update(ctx);
+    if (raytracedThisFrame){
+      m_graphManager.update(ctx);
+    }
 
     // Clear replacement material hashes before the next frame.  These are used by components, so must clear after graphManager updates.
     clearFrameReplacementMaterialHashes();
     
     // Clear mesh hashes before the next frame.  These are used by components, so must clear after graphManager updates.
     clearFrameMeshHashes();
-  }
-
-  void SceneManager::onFrameEndNoRTX() {
-    m_cameraManager.onFrameEnd();
-    m_instanceManager.onFrameEnd();
-    manageTextureVram();
+    
+    // Reset the fog state to get it re-discovered on the next frame
+    ImGUI::SetFogStates(m_fogStates, m_fog.getHash());
+    m_fog = FogState();
+    m_fogStates.clear();
   }
 
   std::unordered_set<XXH64_hash_t> uniqueHashes;
@@ -628,7 +648,7 @@ namespace dxvk {
     // TODO: Once the vertex hash only uses vertices referenced by the index buffer, this should be removed.
     const bool highlightUnsafeAnchor = RtxOptions::useHighlightUnsafeAnchorMode() && input.getGeometryData().indexBuffer.defined() && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
     if (highlightUnsafeAnchor) {
-      const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
+      const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
                                                                           0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
                                                                           lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
       return sHighlightMaterialData;
@@ -752,7 +772,7 @@ namespace dxvk {
           renderMaterialData = *replacement.materialData;
         }
         if (highlightUnsafeReplacement) {
-          const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
+          const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
               0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.f, 0.1f, 0.1f, Vector3(1.f, 0.f, 0.f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
               lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
@@ -833,12 +853,6 @@ namespace dxvk {
         }
       }
     }
-  }
-
-  void SceneManager::clearFogState() {
-    ImGUI::SetFogStates(m_fogStates, m_fog.getHash());
-    m_fog = FogState();
-    m_fogStates.clear();
   }
 
   void SceneManager::updateBufferCache(RaytraceGeometry& newGeoData) {
@@ -997,6 +1011,19 @@ namespace dxvk {
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
 
+    // Generate smooth normals for geometry that is flagged via the SmoothNormals texture category.
+    // This is useful for older D3D9 games where geometry may lack smooth normals, especially
+    // when using the VertexShader Capture mechanism. The smooth normals are computed on the GPU
+    // from the triangle mesh (area-weighted) and written into the normal buffer.
+    // Only dispatch on BVH build/update — for static geometry, positions don't change so
+    // the normals computed on the first pass remain valid for subsequent frames.
+    if (drawCallState.categories.test(InstanceCategories::SmoothNormals) &&
+        (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
+      m_device->getCommon()->metaGeometryUtils().dispatchSmoothNormals(ctx, drawCallState.getGeometryData(), pBlas->modifiedGeometryData);
+      pBlas->modifiedGeometryData.smoothNormalsApplied = true;
+      pBlas->frameLastUpdated = pBlas->frameLastTouched;
+    }
+
     if (drawCallState.getSkinningState().numBones > 0 &&
         drawCallState.getGeometryData().numBonesPerVertex > 0 &&
         (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
@@ -1041,11 +1068,13 @@ namespace dxvk {
     // Priority ordering for particle system descriptors is: Mesh, Material, Texture.  This matches the implementation in toolkit.
     // By this point, pParticleSystemDesc will contain the information from a mesh replacement (if one exists), so we just handle
     // materials replacements, and texture taggin categories below.
+    RtxParticleSystemDesc globalParticleDesc; // Storage for global desc if needed
     if (!pParticleSystemDesc) {
       pParticleSystemDesc = renderMaterialData.getParticleSystemDesc();
     }
     if (!pParticleSystemDesc && drawCallState.categories.test(InstanceCategories::ParticleEmitter)) {
-      pParticleSystemDesc = &RtxParticleSystemManager::createGlobalParticleSystemDesc();
+      globalParticleDesc = RtxParticleSystemManager::createGlobalParticleSystemDesc();
+      pParticleSystemDesc = &globalParticleDesc;
     }
     if (instance && pParticleSystemDesc) {
       RtxParticleSystemManager& particleSystem = device()->getCommon()->metaParticleSystem();
@@ -1082,6 +1111,16 @@ namespace dxvk {
                              samplerInfo.addressModeU, samplerInfo.addressModeV, samplerInfo.addressModeW,
                              samplerInfo.borderColor);
     }
+    if (drawCallState.isEye()) {
+      // force eye whites and iris to not repeat
+      sampler = patchSampler(
+        VK_FILTER_LINEAR,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        {}
+      );
+    }
     uint32_t samplerIndex = trackSampler(sampler);
     uint32_t samplerIndex2 = UINT32_MAX;
     if (renderMaterialDataType == MaterialDataType::RayPortal) {
@@ -1106,6 +1145,7 @@ namespace dxvk {
 
     if (renderMaterialDataType == MaterialDataType::Opaque || drawCallState.isUsingRaytracedRenderTarget) {
       uint32_t albedoOpacityTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t secondaryTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t normalTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t tangentTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t heightTextureIndex = kSurfaceMaterialInvalidTextureIndex;
@@ -1158,6 +1198,7 @@ namespace dxvk {
         trackTexture(opaqueMaterialData.getAlbedoOpacityTexture(), albedoOpacityTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
 
         albedoOpacityConstant.xyz() = opaqueMaterialData.getAlbedoConstant();
         albedoOpacityConstant.w = opaqueMaterialData.getOpacityConstant();
@@ -1252,6 +1293,7 @@ namespace dxvk {
         thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut, 
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
+        secondaryTextureIndex
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {
@@ -1565,7 +1607,7 @@ namespace dxvk {
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
     {
       // Allocate the instance buffer and copy its contents from host to device memory
-      DxvkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+      DxvkBufferCreateInfo info;
       info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
       info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
       info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1724,6 +1766,11 @@ namespace dxvk {
       state.drawCall.transformData.worldToView = Matrix4 { rtCamera.getWorldToView() };
       state.drawCall.transformData.viewToProjection = Matrix4 { rtCamera.getViewToProjection() };
       state.drawCall.transformData.objectToView = state.drawCall.transformData.worldToView * state.drawCall.transformData.objectToWorld;
+    }
+
+    if (!state.gpuInstancingTransforms.empty()) {
+      m_externalGpuInstancingTransforms.push_back(std::move(state.gpuInstancingTransforms));
+      state.drawCall.transformData.instancesToObject = &m_externalGpuInstancingTransforms.back();
     }
 
     for (const RasterGeometry& submesh : m_pReplacer->accessExternalMesh(state.mesh)) {

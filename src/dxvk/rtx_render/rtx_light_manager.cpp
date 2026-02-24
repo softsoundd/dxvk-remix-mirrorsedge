@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -77,11 +77,6 @@ namespace dxvk {
 
   LightManager::LightManager(DxvkDevice* device)
     : CommonDeviceObject(device) {
-    // Legacy light translation Options
-    fallbackLightRadiance.setDeferred(Vector3(
-      std::max(fallbackLightRadiance().x, 0.0f),
-      std::max(fallbackLightRadiance().y, 0.0f),
-      std::max(fallbackLightRadiance().z, 0.0f)));
   }
 
   LightManager::~LightManager() {
@@ -454,7 +449,7 @@ namespace dxvk {
     }
 
     // Allocate the light buffer and copy its contents from host to device memory
-    DxvkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
     info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;

@@ -158,7 +158,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 728, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 768, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1069,7 +1069,20 @@ namespace dxvk {
 
         currentInstance.surface.blendModeState = drawCall.getMaterialData().blendMode;
 
+        if (drawCall.isEye()) {
+          // assume that the texture transform has eye parameters encoded
+          const Matrix4& texTransform = drawCall.getTransformData().textureTransform;
+          RtEyeParams eyeParams{};
+          eyeParams.eyeballOrigin = Vector3{ texTransform.data[0].w, texTransform.data[1].w, texTransform.data[2].w };
+          eyeParams.eyeRightU = Vector3{ texTransform.data[0].x, texTransform.data[1].x, texTransform.data[2].x };
+          eyeParams.eyeUpV = Vector3{ texTransform.data[0].y, texTransform.data[1].y, texTransform.data[2].y };
+          currentInstance.surface.eyeParams = eyeParams;
+        }
+
         uint8_t spriteSheetRows = 0, spriteSheetCols = 0, spriteSheetFPS = 0;
+        materialData.getSpriteSheetData(currentInstance.surface.spriteSheetRows, currentInstance.surface.spriteSheetCols, currentInstance.surface.spriteSheetFPS);
+        currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
+        currentInstance.surface.objectPickingValue = drawCall.drawCallID;
 
         // Note: Extract spritesheet information from the associated material data as it ends up stored in the Surface
         // not in the Surface Material like most material information.
@@ -1092,7 +1105,9 @@ namespace dxvk {
             materialData.getOpaqueMaterialData().setEnableEmission(true);
             materialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
             materialData.getOpaqueMaterialData().setEmissiveColorTexture(materialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
-          } 
+          }
+
+          currentInstance.m_isSubsurface = materialData.getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
 
           break;
         }
@@ -1113,13 +1128,6 @@ namespace dxvk {
           assert(0);
           break;
         }
-
-        currentInstance.surface.spriteSheetRows = spriteSheetRows;
-        currentInstance.surface.spriteSheetCols = spriteSheetCols;
-        currentInstance.surface.spriteSheetFPS = spriteSheetFPS;
-
-        currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
-        currentInstance.surface.objectPickingValue = drawCall.drawCallID;
       }
 
       // Update transform

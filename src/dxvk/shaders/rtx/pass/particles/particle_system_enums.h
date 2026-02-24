@@ -27,3 +27,22 @@ enum ParticleBillboardType : uint8_t {
   FaceCamera_Position,        // camera->particle vector
   FaceWorldUp,                // horizontal plane (face up axis)
 };
+
+enum ParticleSpriteSheetMode : uint8_t {
+  UseMaterialSpriteSheet = 0, // use the regular sprite sheet params from material
+  OverrideMaterial_Lifetime,  // frame 0 at birth, last frame at death.
+  OverrideMaterial_Random,    // pick one frame and keep it for the particle's life.
+};
+
+enum ParticleCollisionMode : uint8_t {
+  Bounce = 0, // particle should bounce following collision
+  Stop,       // stop all motion for the particle on collision
+  Kill,       // kill the particle immediately on collision
+};
+
+enum ParticleRandomFlipAxis : uint8_t {
+  None = 0,
+  Horizontal,
+  Vertical,
+  Both
+};

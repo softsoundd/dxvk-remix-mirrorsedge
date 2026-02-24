@@ -127,6 +127,7 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
     g_remix.SetupCamera(&cameraInfo);
   }
   {
+    // Base mesh - positioned at z=5 so it's clearly visible
     remixapi_InstanceInfo meshInstanceInfo = {
       .sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO,
       .categoryFlags = 0,
@@ -134,11 +135,17 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
       .transform = { {
         {1,0,0,0},
         {0,1,0,0},
-        {0,0,1,0},
+        {0,0,1,5},
       } },
       .doubleSided = 1,
     };
     g_remix.DrawInstance(&meshInstanceInfo);
+
+    remixapi_Float4D particleMinColor[] = { { 1.f, 1.f, 1.f, 1.f } };
+    remixapi_Float4D particleMaxColor[] = { { 1.f, 1.f, 1.f, 1.f } };
+    remixapi_Float2D particleMinSize[] = { { 1.f, 1.f } };
+    remixapi_Float2D particleMaxSize[] = { { 2.f, 2.f } };
+    remixapi_Float3D particleMaxVelocity[] = { { 1.f, 1.f, 1.f } };
 
     remixapi_InstanceInfoParticleSystemEXT particleInfo = {
       .sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT,
@@ -146,16 +153,45 @@ void render(uint32_t windowWidth, uint32_t windowHeight) {
       .spawnRatePerSecond = 10.f,
       .hideEmitter = 0,
       .gravityForce = 1.f,
-      .maxSpeed = 1.f,
-      .minSpawnSize = 1.f,
-      .maxSpawnSize = 2.f,
+      .minSize = { particleMinSize, 1 },
+      .maxSize = { particleMaxSize, 1 },
       .minTimeToLive = 1.f,
       .maxTimeToLive = 10.f,
-      .minSpawnColor = { 1.f, 1.f, 1.f, 1.f },
-      .maxSpawnColor = { 1.f, 1.f, 1.f, 1.f },
+      .minColor = { particleMinColor, 1 },
+      .maxColor = { particleMaxColor, 1 },
+      .maxVelocity = { particleMaxVelocity, 1 },
     };
     meshInstanceInfo.pNext = &particleInfo;
     g_remix.DrawInstance(&meshInstanceInfo);
+
+    // GPU Instancing example: render 5 instances of the mesh in a row at around z=10
+    // Spread horizontally so they don't overlap
+    remixapi_Transform gpuInstanceTransforms[5] = {
+      { {{ 1,0,0,-6 }, { 0,1,0,0 }, { 0,0,1,10.0f }} },
+      { {{ 1,0,0,-3 }, { 0,1,0,0 }, { 0,0,1,9.3f }} },
+      { {{ 1,0,0, 0 }, { 0,1,0,2 }, { 0,0,1,10.6f }} },  // Center one raised on Y
+      { {{ 1,0,0, 3 }, { 0,1,0,0 }, { 0,0,1,12.0f }} },
+      { {{ 1,0,0, 6 }, { 0,1,0,0 }, { 0,0,1,10.3f }} },
+    };
+    remixapi_InstanceInfoGpuInstancingEXT gpuInstancingInfo = {
+      .sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT,
+      .pNext = NULL,
+      .instanceTransforms_values = gpuInstanceTransforms,
+      .instanceTransforms_count = 5,
+    };
+    remixapi_InstanceInfo gpuInstancedMesh = {
+      .sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO,
+      .pNext = &gpuInstancingInfo,
+      .categoryFlags = 0,
+      .mesh = g_scene_mesh,
+      .transform = { {  // Base transform (identity)
+        {1,0,0,0},
+        {0,1,0,0},
+        {0,0,1,0},
+      } },
+      .doubleSided = 1,
+    };
+    g_remix.DrawInstance(&gpuInstancedMesh);
   }
   {
     g_remix.DrawLightInstance(g_scene_light);
