@@ -139,6 +139,11 @@ namespace dxvk {
       // textures/UVs
       // enable PS driven texcoord inference for better UV selection on skeletal meshes and shader driven geometry
       { "rtx.d3d9.shaderPathTexcoordIndexFromPixelShader", "True" },
+      // medge billboard materials sample dirt masks alongside ad textures
+      // give lower priority to known mask textures during albedo stage inference //todo - revisit this
+      { "rtx.albedoMaskTextures", "8BC96DE2A6824697" },
+      // enable UE3 MaterialInstanceConstant (child level) material hashing/tagging
+      { "rtx.d3d9.ue3MaterialInstanceConstantHash",      "True" },
       // UE3 bakes vertex lighting into COLOR vertex elements - tell Remix to ignore it for RT
       { "rtx.ignoreAllVertexColorBakedLighting",         "True" },
       { "rtx.legacyMaterial.roughnessConstant",          "0.5" },

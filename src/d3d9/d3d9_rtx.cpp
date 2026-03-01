@@ -16,7 +16,9 @@
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
 #include "../dxso/dxso_decoder.h"
+#include "../util/xxHash/xxhash.h"
 
+#include <algorithm>
 #include <cctype>
 
 namespace dxvk {
@@ -60,12 +62,127 @@ namespace dxvk {
       return XXH3_64bits(bytecode.data(), bytecode.size());
     }
 
+    // UE3 reserves PS constants c0, c1, c2 (PSR_ColorBiasFactor, PSR_ScreenPositionScaleBias, PSR_MinZ_MaxZ_Ratio)
+    // material params (VectorParameterValues e.g. DiffuseColor, ScalarParameterValues) live in UniformVector_* and UniformScalar_*
+    // we parse the shader CTAB to find their register indices, fallback to fixed range if CTAB is empty/stripped
+    constexpr uint32_t kUe3PsMaterialConstantsStart = 3;
+    constexpr uint32_t kUe3PsMaterialConstantsCount = 77;
+
+    using Ue3PsMaterialConstRanges = std::vector<std::pair<uint32_t, uint32_t>>;
+
+    static Ue3PsMaterialConstRanges parseUe3PsMaterialConstRangesFromCtab(const std::vector<uint8_t>& bytecode) {
+      Ue3PsMaterialConstRanges ranges;
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return ranges;
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      const uint32_t headerToken = tokens[0];
+      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
+      if (headerTypeMask != 0xffff0000u)
+        return ranges;
+
+      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
+      const uint32_t minorVersion = headerToken & 0xffu;
+      DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, minorVersion, majorVersion);
+
+      DxsoDecodeContext decoder(programInfo);
+      DxsoCodeIter iter(tokens + 1);
+      while (decoder.decodeInstruction(iter)) {
+        if (decoder.getCtabInfo().m_size != 0)
+          break;
+      }
+
+      const DxsoCtab& ctab = decoder.getCtabInfo();
+      if (ctab.m_size == 0 || ctab.m_constantData.empty())
+        return ranges;
+
+      auto lower = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (const char c : s)
+          out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+        return out;
+      };
+
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        const std::string name = lower(c.name);
+        const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
+        const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
+        if (!isUniformVector && !isUniformScalar)
+          continue;
+        if (c.registerSet > 2u || c.registerCount == 0)
+          continue;
+        if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
+          continue;
+        ranges.emplace_back(c.registerIndex, c.registerCount);
+      }
+
+      if (ranges.empty())
+        return ranges;
+
+      std::sort(ranges.begin(), ranges.end());
+      Ue3PsMaterialConstRanges merged;
+      for (const auto& r : ranges) {
+        if (merged.empty() || r.first > merged.back().first + merged.back().second) {
+          merged.push_back(r);
+        } else {
+          const uint32_t end = std::max(merged.back().first + merged.back().second, r.first + r.second);
+          merged.back().second = end - merged.back().first;
+        }
+      }
+      return merged;
+    }
+
+    static XXH64_hash_t hashUe3PixelShaderMaterialConstantsWithRanges(
+        const Vector4* fConsts,
+        const Ue3PsMaterialConstRanges& ranges) {
+      if (ranges.empty())
+        return XXH3_64bits(&fConsts[kUe3PsMaterialConstantsStart], kUe3PsMaterialConstantsCount * sizeof(Vector4));
+
+      XXH3_state_t* const state = XXH3_createState();
+      if (!state)
+        return XXH3_64bits(&fConsts[kUe3PsMaterialConstantsStart], kUe3PsMaterialConstantsCount * sizeof(Vector4));
+      XXH3_64bits_reset(state);
+      for (const auto& r : ranges) {
+        const uint32_t start = r.first;
+        const uint32_t count = r.second;
+        if (start + count <= caps::MaxFloatConstantsPS)
+          XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
+      }
+      const XXH64_hash_t result = XXH3_64bits_digest(state);
+      XXH3_freeState(state);
+      return result;
+    }
+
+    static fast_unordered_cache<Ue3PsMaterialConstRanges> s_ue3PsMaterialConstRangesCache;
+
+    static XXH64_hash_t hashUe3PixelShaderMaterialConstants(
+        const std::vector<uint8_t>& bytecode,
+        const Vector4* fConsts) {
+      const XXH64_hash_t psHash = hashDxsoBytecode(bytecode);
+      auto it = s_ue3PsMaterialConstRangesCache.find(psHash);
+      if (it == s_ue3PsMaterialConstRangesCache.end()) {
+        it = s_ue3PsMaterialConstRangesCache.emplace(psHash, parseUe3PsMaterialConstRangesFromCtab(bytecode)).first;
+      }
+      return hashUe3PixelShaderMaterialConstantsWithRanges(fConsts, it->second);
+    }
+
     constexpr uint16_t kD3dxRegisterSetSampler = 3u;
 
     constexpr uint8_t kPsSamplerSemanticEngineAuxiliary = 1u << 0;
     constexpr uint8_t kPsSamplerSemanticLightmap        = 1u << 1;
     constexpr uint8_t kPsSamplerSemanticMaterialTexture = 1u << 2;
     constexpr uint8_t kPsSamplerSemanticNonDiffuse      = 1u << 3;
+
+    // expression-level hints inferred from shader opcode/dataflow around a sampler's UV path
+    constexpr uint8_t kPsSamplerExprUvTransform = 1u << 0;
+    constexpr uint8_t kPsSamplerExprUvOffset    = 1u << 1;
+    constexpr uint8_t kPsSamplerExprUvAnimated  = 1u << 2;
+    constexpr uint8_t kPsSamplerExprBlendMath   = 1u << 3;
+    constexpr uint8_t kPsSamplerExprUvTimeDriven = 1u << 4;
+    constexpr uint8_t kPsSamplerExprViewDependent = 1u << 5;
+    constexpr uint8_t kPsSamplerExprMaskControl = 1u << 6;
+    constexpr uint8_t kPsSamplerExprColorContribution = 1u << 7;
 
     static uint8_t classifyPixelSamplerSemanticFlags(const std::string& samplerName) {
       std::string lowerName;
@@ -80,7 +197,16 @@ namespace dxvk {
       uint8_t flags = 0;
 
       if (contains("texture2d_") || contains("texturecube_") || contains("texture3d_") ||
-          contains("materialtexture") || contains("materialsampler")) {
+          contains("materialtexture") || contains("materialsampler") ||
+          contains("textureparameter") || contains("texturesample") ||
+          contains("texturesampleparameter2d") || contains("texturesampleparametercube") ||
+          contains("texturesampleparametermovie") || contains("texturesampleparametersubuv") ||
+          contains("fontsampleparameter") || contains("movie") ||
+          contains("albedo") || contains("diffuse") || contains("basecolor") ||
+          contains("base_color") || contains("billboard") || contains("advert") ||
+          contains("poster") || contains("decal") || contains("fontsample") ||
+          contains("subuv") || contains("flipbook") || contains("particlesubuv") ||
+          contains("meshsubuv") || contains("cubemap")) {
         flags |= kPsSamplerSemanticMaterialTexture;
       }
 
@@ -98,6 +224,11 @@ namespace dxvk {
           contains("accumulateddistortiontexture") || contains("accumulatedfrontfaceslineintegraltexture") ||
           contains("accumulatedbackfaceslineintegraltexture") || contains("scenecoloruitexture") ||
           contains("blurreduitexture") || contains("sceneblurtexture") ||
+          contains("destdepth") || contains("destcolor") ||
+          contains("pixeldepth") || contains("scenetexture") ||
+          contains("depthbias") || contains("depthbiased") ||
+          contains("lensflare") || contains("lens_flare") ||
+          contains("screenposition") || contains("screen_position") ||
           contains("masktexture")) {
         flags |= kPsSamplerSemanticEngineAuxiliary;
       }
@@ -111,8 +242,62 @@ namespace dxvk {
           contains("gloss") || contains("metallic") || contains("metalness") ||
           contains("ambientocclusion") || contains("_ao") || contains("ao_") ||
           contains("heightmap") || contains("height") || contains("bump") ||
-          contains("opacity") || contains("alphamask") || contains("mask")) {
+          contains("opacity") || contains("alphamask") || contains("mask") ||
+          contains("dirt") || contains("grunge") || contains("detailmask") ||
+          contains("blendmask") || contains("lookup") ||
+          contains("reflection") || contains("reflectionvector") ||
+          contains("fresnel") || contains("cameravector") ||
+          contains("lightvector") || contains("envmap") ||
+          contains("specularcube")) {
         flags |= kPsSamplerSemanticNonDiffuse;
+      }
+
+      return flags;
+    }
+
+    static uint8_t classifyPixelSamplerExpressionFlagsFromName(const std::string& samplerName) {
+      std::string lowerName;
+      lowerName.reserve(samplerName.size());
+      for (const char c : samplerName)
+        lowerName.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+
+      auto contains = [&](const char* token) {
+        return lowerName.find(token) != std::string::npos;
+      };
+
+      uint8_t flags = 0;
+
+      if (contains("time") || contains("gametime") || contains("realtime") ||
+          contains("panner") || contains("rotator") || contains("rotation") ||
+          contains("flipbook") || contains("subuv") || contains("phase") ||
+          contains("sine") || contains("cosine")) {
+        flags |= kPsSamplerExprUvTimeDriven;
+        flags |= kPsSamplerExprUvAnimated;
+        flags |= kPsSamplerExprUvOffset;
+      }
+
+      if (contains("reflection") || contains("reflectionvector") ||
+          contains("fresnel") || contains("cameravector") ||
+          contains("lightvector") || contains("envmap") ||
+          contains("specularcube")) {
+        flags |= kPsSamplerExprViewDependent;
+      }
+
+      if (contains("mask") || contains("alphamask") || contains("opacity") ||
+          contains("componentmask") || contains("staticcomponentmask") ||
+          contains("switch") || contains("staticswitch") ||
+          contains("blendmask") || contains("lookup") ||
+          contains("dirt") || contains("grunge")) {
+        flags |= kPsSamplerExprMaskControl;
+      }
+
+      if (contains("lerp") || contains("blend") || contains("interpolate"))
+        flags |= kPsSamplerExprBlendMath;
+
+      if (contains("albedo") || contains("diffuse") || contains("basecolor") ||
+          contains("base_color") || contains("billboard") || contains("advert") ||
+          contains("poster") || contains("decal") || contains("fontsample")) {
+        flags |= kPsSamplerExprColorContribution;
       }
 
       return flags;
@@ -125,6 +310,7 @@ namespace dxvk {
       uint8_t coordCompV = 1;
       uint16_t sampleCount = 0;
       uint8_t semanticFlags = 0;
+      uint8_t expressionFlags = 0;
       int32_t scaleConstReg = -1;
       uint8_t scaleConstCompU = 0;
       uint8_t scaleConstCompV = 1;
@@ -235,6 +421,10 @@ namespace dxvk {
       std::array<PsTexcoordScaleHint, 64> tempToScaleHint = {};
       std::array<uint8_t, 64> tempCoordProvenance = {};
       tempCoordProvenance.fill(0);
+      std::array<uint8_t, 64> tempCoordExpressionFlags = {};
+      tempCoordExpressionFlags.fill(0);
+      std::array<uint8_t, 64> tempSamplerValueRole = {};
+      tempSamplerValueRole.fill(0);
 
       constexpr uint8_t kCoordProvTexcoord = 1u << 0;
       constexpr uint8_t kCoordProvNonTexcoord = 1u << 1;
@@ -286,6 +476,51 @@ namespace dxvk {
         default:
           return 0u;
         }
+      };
+
+      auto getCoordExpressionFlagsFromRegister = [&](const DxsoRegister& r) -> uint8_t {
+        switch (r.id.type) {
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          return (r.id.num < tempCoordExpressionFlags.size())
+            ? tempCoordExpressionFlags[r.id.num]
+            : 0u;
+        default:
+          return 0u;
+        }
+      };
+
+      constexpr uint8_t kSamplerValueRoleColor = 1u << 0;
+      constexpr uint8_t kSamplerValueRoleControl = 1u << 1;
+      auto getSamplerValueRoleFromRegister = [&](const DxsoRegister& r) -> uint8_t {
+        switch (r.id.type) {
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          return (r.id.num < tempSamplerValueRole.size())
+            ? tempSamplerValueRole[r.id.num]
+            : 0u;
+        default:
+          return 0u;
+        }
+      };
+      auto isScalarSwizzle = [](const DxsoRegister& r) {
+        const uint8_t c0 = r.swizzle[0] & 0x3u;
+        return c0 == (r.swizzle[1] & 0x3u) &&
+               c0 == (r.swizzle[2] & 0x3u) &&
+               c0 == (r.swizzle[3] & 0x3u);
+      };
+      auto isAlphaScalarSwizzle = [&](const DxsoRegister& r) {
+        return isScalarSwizzle(r) && ((r.swizzle[0] & 0x3u) == 3u);
+      };
+      auto classifySamplerValueRoleWithSwizzle = [&](const DxsoRegister& r) -> uint8_t {
+        const uint8_t baseRole = getSamplerValueRoleFromRegister(r);
+        if (baseRole == 0u)
+          return 0u;
+
+        if (isAlphaScalarSwizzle(r))
+          return uint8_t(baseRole | kSamplerValueRoleControl);
+
+        return baseRole;
       };
 
       auto getScaleHintFromRegister = [&](const DxsoRegister& r, PsTexcoordScaleHint& outHint) -> bool {
@@ -447,6 +682,7 @@ namespace dxvk {
       std::array<ScaleHintAgg, 8> perTexcoordScaleHints = {};
       uint32_t texcoordDerivedSampleCount = 0;
       uint32_t nonTexcoordDerivedSampleCount = 0;
+      uint8_t sampledCoordExpressionFlags = 0;
 
       while (decoder.decodeInstruction(iter)) {
         const auto& ctx = decoder.getInstructionContext();
@@ -468,11 +704,18 @@ namespace dxvk {
           int32_t derived = -1;
           bool writesTrackedTemp = false;
           PsTexcoordScaleHint derivedScaleHint;
+          uint8_t derivedExpressionFlags =
+            getCoordExpressionFlagsFromRegister(ctx.src[0]) |
+            getCoordExpressionFlagsFromRegister(ctx.src[1]) |
+            getCoordExpressionFlagsFromRegister(ctx.src[2]);
+          uint8_t derivedSamplerValueRole = 0;
           bool hasConstOnlyHint = false;
           PsTexcoordScaleHint constOnlyHint;
 
           auto assignFromSource = [&](const DxsoRegister& srcReg) {
             derived = getTexcoordFromRegister(srcReg);
+            derivedExpressionFlags |= getCoordExpressionFlagsFromRegister(srcReg);
+            derivedSamplerValueRole |= classifySamplerValueRoleWithSwizzle(srcReg);
             if (derived < 0)
               return;
 
@@ -487,12 +730,29 @@ namespace dxvk {
           case DxsoOpcode::Exp:
           case DxsoOpcode::Log:
           case DxsoOpcode::Frc:
+          case DxsoOpcode::SinCos:
           case DxsoOpcode::Abs:
           case DxsoOpcode::Nrm:
           case DxsoOpcode::DsX:
           case DxsoOpcode::DsY:
             writesTrackedTemp = true;
             assignFromSource(ctx.src[0]);
+            if (op != DxsoOpcode::Mov)
+              derivedExpressionFlags |= kPsSamplerExprBlendMath;
+            if (op == DxsoOpcode::Rcp || op == DxsoOpcode::Rsq ||
+                op == DxsoOpcode::Exp || op == DxsoOpcode::Log ||
+                op == DxsoOpcode::Abs || op == DxsoOpcode::Nrm) {
+              derivedExpressionFlags |= kPsSamplerExprUvTransform;
+            }
+            if (op == DxsoOpcode::Frc || op == DxsoOpcode::SinCos)
+              derivedExpressionFlags |= kPsSamplerExprUvAnimated;
+            if (op == DxsoOpcode::Nrm) {
+              const uint8_t src0Prov = getCoordProvenanceFromRegister(ctx.src[0]);
+              if ((src0Prov & kCoordProvNonTexcoord) != 0 &&
+                  (src0Prov & kCoordProvTexcoord) == 0) {
+                derivedExpressionFlags |= kPsSamplerExprViewDependent;
+              }
+            }
             if (derived < 0) {
               hasConstOnlyHint = loadScaleHintFromConstant(ctx.src[0], constOnlyHint);
               if (!hasConstOnlyHint) {
@@ -508,17 +768,21 @@ namespace dxvk {
           case DxsoOpcode::Add:
           case DxsoOpcode::Sub: {
             writesTrackedTemp = true;
+            derivedExpressionFlags |= kPsSamplerExprBlendMath;
             const int32_t tc0 = getTexcoordFromRegister(ctx.src[0]);
             const int32_t tc1 = getTexcoordFromRegister(ctx.src[1]);
 
             if (tc0 >= 0 && tc1 < 0) {
               assignFromSource(ctx.src[0]);
               if (derived >= 0) {
+                derivedExpressionFlags |= kPsSamplerExprUvOffset;
+                bool hasKnownOffsetHint = false;
                 const float sign = (op == DxsoOpcode::Sub) ? -1.0f : 1.0f;
                 if (!applyOffsetFromConstant(ctx.src[1], derivedScaleHint, sign)) {
                   PsTexcoordScaleHint tempHint;
                   if (getScaleHintFromRegister(ctx.src[1], tempHint)) {
                     if (tempHint.constReg >= 0 || tempHint.immediateValid) {
+                      hasKnownOffsetHint = true;
                       derivedScaleHint.offsetConstReg = tempHint.constReg;
                       derivedScaleHint.offsetCompU = tempHint.compU;
                       derivedScaleHint.offsetCompV = tempHint.compV;
@@ -530,6 +794,7 @@ namespace dxvk {
                         derivedScaleHint.offsetImmediateV = sign * tempHint.immediateV;
                       }
                     } else if (tempHint.offsetConstReg >= 0 || tempHint.offsetImmediateValid) {
+                      hasKnownOffsetHint = true;
                       derivedScaleHint.offsetConstReg = tempHint.offsetConstReg;
                       derivedScaleHint.offsetCompU = tempHint.offsetCompU;
                       derivedScaleHint.offsetCompV = tempHint.offsetCompV;
@@ -542,16 +807,28 @@ namespace dxvk {
                       }
                     }
                   }
+                } else {
+                  hasKnownOffsetHint = true;
                 }
+
+                const bool rhsLooksNonTexcoord =
+                  (getCoordProvenanceFromRegister(ctx.src[1]) & kCoordProvNonTexcoord) != 0;
+                if (!hasKnownOffsetHint && rhsLooksNonTexcoord)
+                  derivedExpressionFlags |= kPsSamplerExprUvAnimated;
+                else if (!hasKnownOffsetHint)
+                  derivedExpressionFlags |= kPsSamplerExprBlendMath;
               }
             } else if (tc1 >= 0 && tc0 < 0) {
               assignFromSource(ctx.src[1]);
               if (derived >= 0) {
+                derivedExpressionFlags |= kPsSamplerExprUvOffset;
+                bool hasKnownOffsetHint = false;
                 if (op == DxsoOpcode::Add) {
                   if (!applyOffsetFromConstant(ctx.src[0], derivedScaleHint, +1.0f)) {
                     PsTexcoordScaleHint tempHint;
                     if (getScaleHintFromRegister(ctx.src[0], tempHint)) {
                       if (tempHint.constReg >= 0 || tempHint.immediateValid) {
+                        hasKnownOffsetHint = true;
                         derivedScaleHint.offsetConstReg = tempHint.constReg;
                         derivedScaleHint.offsetCompU = tempHint.compU;
                         derivedScaleHint.offsetCompV = tempHint.compV;
@@ -563,6 +840,7 @@ namespace dxvk {
                           derivedScaleHint.offsetImmediateV = tempHint.immediateV;
                         }
                       } else if (tempHint.offsetConstReg >= 0 || tempHint.offsetImmediateValid) {
+                        hasKnownOffsetHint = true;
                         derivedScaleHint.offsetConstReg = tempHint.offsetConstReg;
                         derivedScaleHint.offsetCompU = tempHint.offsetCompU;
                         derivedScaleHint.offsetCompV = tempHint.offsetCompV;
@@ -575,10 +853,13 @@ namespace dxvk {
                         }
                       }
                     }
+                  } else {
+                    hasKnownOffsetHint = true;
                   }
                 } else {
                   // handle `const - uv` as mirrored UV with offset
                   if (derivedScaleHint.constReg < 0 && !derivedScaleHint.immediateValid) {
+                    derivedExpressionFlags |= kPsSamplerExprUvTransform;
                     derivedScaleHint.immediateValid = true;
                     derivedScaleHint.immediateU = -1.0f;
                     derivedScaleHint.immediateV = -1.0f;
@@ -588,6 +869,13 @@ namespace dxvk {
                     derivedScaleHint = PsTexcoordScaleHint{};
                   }
                 }
+
+                const bool lhsLooksNonTexcoord =
+                  (getCoordProvenanceFromRegister(ctx.src[0]) & kCoordProvNonTexcoord) != 0;
+                if (!hasKnownOffsetHint && lhsLooksNonTexcoord)
+                  derivedExpressionFlags |= kPsSamplerExprUvAnimated;
+                else if (!hasKnownOffsetHint)
+                  derivedExpressionFlags |= kPsSamplerExprBlendMath;
               }
             } else {
               derived = mergeSingle({ tc0, tc1 });
@@ -608,6 +896,7 @@ namespace dxvk {
           case DxsoOpcode::M3x3:
           case DxsoOpcode::M3x2: {
             writesTrackedTemp = true;
+            derivedExpressionFlags |= kPsSamplerExprBlendMath;
             const int32_t tc0 = getTexcoordFromRegister(ctx.src[0]);
             const int32_t tc1 = getTexcoordFromRegister(ctx.src[1]);
             if (tc0 >= 0 && tc1 < 0) {
@@ -617,10 +906,29 @@ namespace dxvk {
             } else {
               derived = mergeSingle({ tc0, tc1 });
             }
+            if (derived >= 0 &&
+                (op == DxsoOpcode::Dp3 || op == DxsoOpcode::Dp4 ||
+                 op == DxsoOpcode::Pow || op == DxsoOpcode::Crs ||
+                 op == DxsoOpcode::M4x4 || op == DxsoOpcode::M4x3 ||
+                 op == DxsoOpcode::M3x4 || op == DxsoOpcode::M3x3 ||
+                 op == DxsoOpcode::M3x2)) {
+              derivedExpressionFlags |= kPsSamplerExprUvTransform;
+            }
+            if (op == DxsoOpcode::Dp3 || op == DxsoOpcode::Dp4 ||
+                op == DxsoOpcode::Pow || op == DxsoOpcode::Crs) {
+              const uint8_t srcProv =
+                getCoordProvenanceFromRegister(ctx.src[0]) |
+                getCoordProvenanceFromRegister(ctx.src[1]);
+              if ((srcProv & kCoordProvNonTexcoord) != 0 &&
+                  (srcProv & kCoordProvTexcoord) == 0) {
+                derivedExpressionFlags |= kPsSamplerExprViewDependent;
+              }
+            }
             break;
           }
           case DxsoOpcode::Mul: {
             writesTrackedTemp = true;
+            derivedExpressionFlags |= kPsSamplerExprBlendMath;
             const int32_t tc0 = getTexcoordFromRegister(ctx.src[0]);
             const int32_t tc1 = getTexcoordFromRegister(ctx.src[1]);
             const bool src0Const = isFloatConstantRegisterType(ctx.src[0].id.type);
@@ -628,12 +936,16 @@ namespace dxvk {
 
             if (tc0 >= 0 && tc1 < 0 && src1Const) {
               assignFromSource(ctx.src[0]);
-              if (derived >= 0)
+              if (derived >= 0) {
+                derivedExpressionFlags |= kPsSamplerExprUvTransform;
                 loadScaleHintFromConstant(ctx.src[1], derivedScaleHint);
+              }
             } else if (tc1 >= 0 && tc0 < 0 && src0Const) {
               assignFromSource(ctx.src[1]);
-              if (derived >= 0)
+              if (derived >= 0) {
+                derivedExpressionFlags |= kPsSamplerExprUvTransform;
                 loadScaleHintFromConstant(ctx.src[0], derivedScaleHint);
+              }
             } else {
               derived = mergeSingle({ tc0, tc1 });
               if (derived < 0) {
@@ -645,10 +957,13 @@ namespace dxvk {
                 }
               }
             }
+            if (derived >= 0)
+              derivedExpressionFlags |= kPsSamplerExprUvTransform;
             break;
           }
           case DxsoOpcode::Mad: {
             writesTrackedTemp = true;
+            derivedExpressionFlags |= kPsSamplerExprBlendMath;
             const int32_t tc0 = getTexcoordFromRegister(ctx.src[0]);
             const int32_t tc1 = getTexcoordFromRegister(ctx.src[1]);
             const int32_t tc2 = getTexcoordFromRegister(ctx.src[2]);
@@ -659,16 +974,22 @@ namespace dxvk {
             if (tc0 >= 0 && tc1 < 0 && src1Const) {
               assignFromSource(ctx.src[0]);
               if (derived >= 0) {
+                derivedExpressionFlags |= kPsSamplerExprUvTransform;
                 loadScaleHintFromConstant(ctx.src[1], derivedScaleHint);
-                if (src2Const)
+                if (src2Const) {
+                  derivedExpressionFlags |= kPsSamplerExprUvOffset;
                   applyOffsetFromConstant(ctx.src[2], derivedScaleHint, +1.0f);
+                }
               }
             } else if (tc1 >= 0 && tc0 < 0 && src0Const) {
               assignFromSource(ctx.src[1]);
               if (derived >= 0) {
+                derivedExpressionFlags |= kPsSamplerExprUvTransform;
                 loadScaleHintFromConstant(ctx.src[0], derivedScaleHint);
-                if (src2Const)
+                if (src2Const) {
+                  derivedExpressionFlags |= kPsSamplerExprUvOffset;
                   applyOffsetFromConstant(ctx.src[2], derivedScaleHint, +1.0f);
+                }
               }
             } else if (tc2 >= 0 && tc0 < 0 && tc1 < 0) {
               assignFromSource(ctx.src[2]);
@@ -679,6 +1000,7 @@ namespace dxvk {
                     tryLoadConstantLikeHint(ctx.src[1], h1) &&
                     combineMulHints(h0, h1, mulHint)) {
                   if (mulHint.constReg >= 0 || mulHint.immediateValid) {
+                    derivedExpressionFlags |= kPsSamplerExprUvOffset;
                     derivedScaleHint.offsetConstReg = mulHint.constReg;
                     derivedScaleHint.offsetCompU = mulHint.compU;
                     derivedScaleHint.offsetCompV = mulHint.compV;
@@ -695,6 +1017,8 @@ namespace dxvk {
             } else {
               derived = mergeSingle({ tc0, tc1, tc2 });
             }
+            if (derived >= 0)
+              derivedExpressionFlags |= kPsSamplerExprUvTransform;
             break;
           }
           case DxsoOpcode::Lrp:
@@ -705,14 +1029,89 @@ namespace dxvk {
               getTexcoordFromRegister(ctx.src[0]),
               getTexcoordFromRegister(ctx.src[1]),
               getTexcoordFromRegister(ctx.src[2]) });
+            if (derived >= 0)
+              derivedExpressionFlags |= kPsSamplerExprBlendMath;
             break;
           }
           default:
             break;
           }
 
+          const uint8_t srcSamplerRole0 = classifySamplerValueRoleWithSwizzle(ctx.src[0]);
+          const uint8_t srcSamplerRole1 = classifySamplerValueRoleWithSwizzle(ctx.src[1]);
+          const uint8_t srcSamplerRole2 = classifySamplerValueRoleWithSwizzle(ctx.src[2]);
+          const bool src0UsesSamplerValue = srcSamplerRole0 != 0;
+          const bool src1UsesSamplerValue = srcSamplerRole1 != 0;
+          const bool src2UsesSamplerValue = srcSamplerRole2 != 0;
+          const bool src0Control = (srcSamplerRole0 & kSamplerValueRoleControl) != 0;
+          const bool src1Control = (srcSamplerRole1 & kSamplerValueRoleControl) != 0;
+          const bool src2Control = (srcSamplerRole2 & kSamplerValueRoleControl) != 0;
+          const bool src0Color = (srcSamplerRole0 & kSamplerValueRoleColor) != 0;
+          const bool src1Color = (srcSamplerRole1 & kSamplerValueRoleColor) != 0;
+          const bool src2Color = (srcSamplerRole2 & kSamplerValueRoleColor) != 0;
+          if (src0UsesSamplerValue || src1UsesSamplerValue || src2UsesSamplerValue) {
+            switch (op) {
+            case DxsoOpcode::Lrp:
+            case DxsoOpcode::Cmp:
+            case DxsoOpcode::Cnd:
+              if (src0UsesSamplerValue &&
+                  (src0Control || isScalarSwizzle(ctx.src[0]) || isAlphaScalarSwizzle(ctx.src[0]))) {
+                derivedExpressionFlags |= kPsSamplerExprMaskControl;
+                derivedSamplerValueRole |= kSamplerValueRoleControl;
+              }
+              if ((src1UsesSamplerValue && src1Color) || (src2UsesSamplerValue && src2Color)) {
+                derivedExpressionFlags |= kPsSamplerExprColorContribution;
+                derivedSamplerValueRole |= kSamplerValueRoleColor;
+              }
+              if ((src1UsesSamplerValue && !src1Color) || (src2UsesSamplerValue && !src2Color)) {
+                derivedExpressionFlags |= kPsSamplerExprMaskControl;
+                derivedSamplerValueRole |= kSamplerValueRoleControl;
+              }
+              break;
+            case DxsoOpcode::Slt:
+            case DxsoOpcode::Sge:
+            case DxsoOpcode::TexKill:
+              if (src0Control || src1Control || src2Control ||
+                  isAlphaScalarSwizzle(ctx.src[0]) ||
+                  isAlphaScalarSwizzle(ctx.src[1]) ||
+                  isAlphaScalarSwizzle(ctx.src[2])) {
+                derivedExpressionFlags |= kPsSamplerExprMaskControl;
+                derivedSamplerValueRole |= kSamplerValueRoleControl;
+              } else {
+                derivedExpressionFlags |= kPsSamplerExprColorContribution;
+                derivedSamplerValueRole |= kSamplerValueRoleColor;
+              }
+              break;
+            case DxsoOpcode::Mul:
+            case DxsoOpcode::Mad:
+            case DxsoOpcode::Add:
+            case DxsoOpcode::Sub: {
+              const bool hasControl = src0Control || src1Control || src2Control;
+              const bool hasColor = src0Color || src1Color || src2Color;
+              if (hasControl && !hasColor) {
+                derivedExpressionFlags |= kPsSamplerExprMaskControl;
+                derivedSamplerValueRole |= kSamplerValueRoleControl;
+              } else if (hasControl && hasColor) {
+                derivedExpressionFlags |= kPsSamplerExprMaskControl;
+                derivedExpressionFlags |= kPsSamplerExprColorContribution;
+                derivedSamplerValueRole |= uint8_t(kSamplerValueRoleControl | kSamplerValueRoleColor);
+              } else {
+                derivedExpressionFlags |= kPsSamplerExprColorContribution;
+                derivedSamplerValueRole |= kSamplerValueRoleColor;
+              }
+              break;
+            }
+            default:
+              derivedExpressionFlags |= kPsSamplerExprColorContribution;
+              derivedSamplerValueRole |= kSamplerValueRoleColor;
+              break;
+            }
+          }
+
           if (derived >= 0) {
             tempToTexcoord[ctx.dst.id.num] = int8_t(derived);
+            tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
+            tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
             tempCoordProvenance[ctx.dst.id.num] =
               getCoordProvenanceFromRegister(ctx.src[0]) |
               getCoordProvenanceFromRegister(ctx.src[1]) |
@@ -725,6 +1124,8 @@ namespace dxvk {
               tempToScaleHint[ctx.dst.id.num] = PsTexcoordScaleHint{};
           } else if (writesTrackedTemp) {
             tempToTexcoord[ctx.dst.id.num] = -1;
+            tempCoordExpressionFlags[ctx.dst.id.num] = derivedExpressionFlags;
+            tempSamplerValueRole[ctx.dst.id.num] = derivedSamplerValueRole;
             tempCoordProvenance[ctx.dst.id.num] =
               getCoordProvenanceFromRegister(ctx.src[0]) |
               getCoordProvenanceFromRegister(ctx.src[1]) |
@@ -739,6 +1140,8 @@ namespace dxvk {
         }
 
         uint32_t sampledSampler = ~0u;
+        uint8_t sampleOpSemanticFlags = 0;
+        uint8_t sampleOpExpressionFlags = 0;
         DxsoRegister coordRegStorage;
         const DxsoRegister* coordReg = nullptr;
         switch (op) {
@@ -762,6 +1165,7 @@ namespace dxvk {
         case DxsoOpcode::TexLdl:
           sampledSampler = ctx.src[1].id.num;
           coordReg = &ctx.src[0];
+          sampleOpExpressionFlags |= kPsSamplerExprBlendMath;
           break;
         case DxsoOpcode::TexBem:
         case DxsoOpcode::TexBemL:
@@ -771,20 +1175,36 @@ namespace dxvk {
           coordRegStorage.id.num = ctx.dst.id.num;
           coordRegStorage.swizzle = DxsoRegSwizzle(0, 1, 2, 3);
           coordReg = &coordRegStorage;
+          sampleOpSemanticFlags |= kPsSamplerSemanticNonDiffuse;
+          sampleOpExpressionFlags |= kPsSamplerExprUvOffset;
           break;
         case DxsoOpcode::TexReg2Ar:
         case DxsoOpcode::TexReg2Gb:
         case DxsoOpcode::TexReg2Rgb:
           sampledSampler = ctx.dst.id.num;
           coordReg = &ctx.src[0];
+          sampleOpExpressionFlags |= kPsSamplerExprUvTransform;
           break;
         case DxsoOpcode::TexM3x2Tex:
         case DxsoOpcode::TexM3x3Tex:
-        case DxsoOpcode::TexM3x3Spec:
-        case DxsoOpcode::TexM3x3VSpec:
         case DxsoOpcode::TexDp3Tex:
           sampledSampler = ctx.dst.id.num;
           coordReg = &ctx.src[0];
+          sampleOpExpressionFlags |= kPsSamplerExprUvTransform;
+          break;
+        case DxsoOpcode::TexM3x3Spec:
+        case DxsoOpcode::TexM3x3VSpec:
+          sampledSampler = ctx.dst.id.num;
+          coordReg = &ctx.src[0];
+          sampleOpSemanticFlags |= kPsSamplerSemanticNonDiffuse;
+          sampleOpExpressionFlags |= kPsSamplerExprUvTransform;
+          sampleOpExpressionFlags |= kPsSamplerExprViewDependent;
+          break;
+        case DxsoOpcode::TexM3x2Depth:
+        case DxsoOpcode::TexDepth:
+          sampledSampler = ctx.dst.id.num;
+          coordReg = &ctx.src[0];
+          sampleOpSemanticFlags |= kPsSamplerSemanticEngineAuxiliary;
           break;
         default:
           break;
@@ -795,17 +1215,33 @@ namespace dxvk {
             ? uint16_t(result.sampleCount + 1u)
             : std::numeric_limits<uint16_t>::max();
 
+          if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
+              ctx.dst.id.num < tempSamplerValueRole.size()) {
+            uint8_t sampleRole = kSamplerValueRoleColor;
+            if ((sampleOpSemanticFlags & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticNonDiffuse)) != 0)
+              sampleRole |= kSamplerValueRoleControl;
+            tempSamplerValueRole[ctx.dst.id.num] = sampleRole;
+          }
+
           const DxsoRegister* swizzleReg = coordReg;
           int32_t tc = getTexcoordFromRegister(*swizzleReg);
           uint8_t coordProvenance = getCoordProvenanceFromRegister(*coordReg);
+          uint8_t coordExpressionFlags =
+            uint8_t(getCoordExpressionFlagsFromRegister(*coordReg) | sampleOpExpressionFlags);
+          if ((sampleOpSemanticFlags & kPsSamplerSemanticNonDiffuse) != 0)
+            coordExpressionFlags |= kPsSamplerExprMaskControl;
+          if ((sampleOpSemanticFlags & kPsSamplerSemanticEngineAuxiliary) == 0)
+            coordExpressionFlags |= kPsSamplerExprColorContribution;
+          result.semanticFlags |= sampleOpSemanticFlags;
 
           const std::array<DxsoRegister, 4> fallbackRegs = {
             ctx.src[0], ctx.src[1], ctx.src[2], ctx.dst
           };
 
-          if ((coordProvenance & kCoordProvTexcoord) == 0) {
+          if ((coordProvenance & kCoordProvTexcoord) == 0 || coordExpressionFlags == 0) {
             for (const DxsoRegister& fallbackReg : fallbackRegs) {
               coordProvenance |= getCoordProvenanceFromRegister(fallbackReg);
+              coordExpressionFlags |= getCoordExpressionFlagsFromRegister(fallbackReg);
               if ((coordProvenance & kCoordProvTexcoord) != 0)
                 break;
             }
@@ -827,6 +1263,11 @@ namespace dxvk {
           else if ((coordProvenance & kCoordProvNonTexcoord) != 0)
             nonTexcoordDerivedSampleCount++;
 
+          const bool coordUsesTexcoord = (coordProvenance & kCoordProvTexcoord) != 0;
+          const bool coordUsesNonTexcoord = (coordProvenance & kCoordProvNonTexcoord) != 0;
+          if (coordUsesNonTexcoord && !coordUsesTexcoord)
+            coordExpressionFlags |= kPsSamplerExprViewDependent;
+
           if (tc >= 0) {
             if (uint32_t(tc) < texcoordUseCount.size()) {
               texcoordUseCount[uint32_t(tc)]++;
@@ -844,6 +1285,10 @@ namespace dxvk {
           PsTexcoordScaleHint sampleScaleHint;
           if (tc >= 0 && uint32_t(tc) < perTexcoordScaleHints.size() &&
               getScaleHintFromRegister(*coordReg, sampleScaleHint)) {
+            if (sampleScaleHint.constReg >= 0 || sampleScaleHint.immediateValid)
+              coordExpressionFlags |= kPsSamplerExprUvTransform;
+            if (sampleScaleHint.offsetConstReg >= 0 || sampleScaleHint.offsetImmediateValid)
+              coordExpressionFlags |= kPsSamplerExprUvOffset;
             auto& agg = perTexcoordScaleHints[uint32_t(tc)];
             if (!agg.valid) {
               agg.valid = true;
@@ -852,6 +1297,8 @@ namespace dxvk {
               agg.conflict = true;
             }
           }
+
+          sampledCoordExpressionFlags |= coordExpressionFlags;
         }
       }
 
@@ -946,6 +1393,26 @@ namespace dxvk {
         }
       }
 
+      result.expressionFlags = sampledCoordExpressionFlags;
+      if (result.scaleConstReg >= 0 || result.scaleImmediateValid)
+        result.expressionFlags |= kPsSamplerExprUvTransform;
+      if (result.offsetConstReg >= 0 || result.offsetImmediateValid)
+        result.expressionFlags |= kPsSamplerExprUvOffset;
+      if (result.coordCompValid && (result.coordCompU != 0 || result.coordCompV != 1))
+        result.expressionFlags |= kPsSamplerExprUvTransform;
+      if ((result.expressionFlags & (kPsSamplerExprUvTransform | kPsSamplerExprUvOffset)) != 0 &&
+          result.sampleCount >= 2) {
+        result.expressionFlags |= kPsSamplerExprUvAnimated;
+      }
+      if ((result.expressionFlags & kPsSamplerExprMaskControl) != 0 &&
+          (result.semanticFlags & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticLightmap)) == 0) {
+        result.semanticFlags |= kPsSamplerSemanticNonDiffuse;
+      }
+      if ((result.expressionFlags & kPsSamplerExprViewDependent) != 0 &&
+          (result.semanticFlags & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticLightmap)) == 0) {
+        result.semanticFlags |= kPsSamplerSemanticNonDiffuse;
+      }
+
       {
         const auto& ctab = decoder.getCtabInfo();
         if (ctab.m_size != 0) {
@@ -955,10 +1422,78 @@ namespace dxvk {
 
             const uint64_t regBegin = c.registerIndex;
             const uint64_t regEnd = regBegin + c.registerCount;
-            if (uint64_t(samplerIdx) >= regBegin && uint64_t(samplerIdx) < regEnd)
-              result.semanticFlags |= classifyPixelSamplerSemanticFlags(c.name);
+            if (uint64_t(samplerIdx) >= regBegin && uint64_t(samplerIdx) < regEnd) {
+              const uint8_t semanticFlagsFromName = classifyPixelSamplerSemanticFlags(c.name);
+              result.semanticFlags |= semanticFlagsFromName;
+              result.expressionFlags |= classifyPixelSamplerExpressionFlagsFromName(c.name);
+              if ((semanticFlagsFromName & kPsSamplerSemanticMaterialTexture) != 0)
+                result.expressionFlags |= kPsSamplerExprColorContribution;
+              if ((semanticFlagsFromName & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticNonDiffuse)) != 0)
+                result.expressionFlags |= kPsSamplerExprMaskControl;
+            }
+          }
+
+          if (result.scaleConstReg >= 0 || result.offsetConstReg >= 0) {
+            auto toLower = [](const std::string& s) {
+              std::string out;
+              out.reserve(s.size());
+              for (const char c : s)
+                out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+              return out;
+            };
+            auto contains = [](const std::string& s, const char* token) {
+              return s.find(token) != std::string::npos;
+            };
+            auto isLikelyTimeDrivenName = [&](const std::string& lowerName) {
+              return
+                contains(lowerName, "time") ||
+                contains(lowerName, "gametime") ||
+                contains(lowerName, "realtime") ||
+                contains(lowerName, "sine") ||
+                contains(lowerName, "cosine") ||
+                contains(lowerName, "panner") ||
+                contains(lowerName, "rotator") ||
+                contains(lowerName, "rotation") ||
+                contains(lowerName, "flipbook") ||
+                contains(lowerName, "subuv") ||
+                contains(lowerName, "phase") ||
+                contains(lowerName, "oscillat") ||
+                contains(lowerName, "wind");
+            };
+            auto constantRangeContainsRegister = [](const DxsoCtab::Constant& c, const int32_t reg) {
+              if (reg < 0 || c.registerCount == 0 || c.registerSet > 2u)
+                return false;
+              const int64_t begin = int64_t(c.registerIndex);
+              const int64_t end = begin + int64_t(c.registerCount);
+              const int64_t r = int64_t(reg);
+              return r >= begin && r < end;
+            };
+
+            for (const auto& c : ctab.m_constantData) {
+              if (!isLikelyTimeDrivenName(toLower(c.name)))
+                continue;
+              if (constantRangeContainsRegister(c, result.scaleConstReg) ||
+                  constantRangeContainsRegister(c, result.offsetConstReg)) {
+                result.expressionFlags |= kPsSamplerExprUvTimeDriven;
+                result.expressionFlags |= kPsSamplerExprUvAnimated;
+                break;
+              }
+            }
           }
         }
+      }
+
+      // expression fallback tagging for generic/stripped sampler names
+      //if the coordinate path clearly looks like UV math and originates from TEXCOORD
+      // treat it as a material texture path unless already identified as aux/lightmap
+      const bool hasUvExpression =
+        (result.expressionFlags &
+         (kPsSamplerExprUvTransform | kPsSamplerExprUvOffset | kPsSamplerExprUvAnimated)) != 0;
+      if (result.sampleCount > 0 &&
+          result.texcoord >= 0 &&
+          hasUvExpression &&
+          (result.semanticFlags & (kPsSamplerSemanticEngineAuxiliary | kPsSamplerSemanticLightmap)) == 0) {
+        result.semanticFlags |= kPsSamplerSemanticMaterialTexture;
       }
 
       // fallback semantic tagging for shaders that use generic/stripped sampler names
@@ -3082,6 +3617,7 @@ namespace dxvk {
         entry.samplerCoordCompU.fill(0);
         entry.samplerCoordCompV.fill(1);
         entry.samplerSemanticFlags.fill(0);
+        entry.samplerExpressionFlags.fill(0);
         entry.samplerSampleCount.fill(0);
         entry.samplerScaleConstReg.fill(-1);
         entry.samplerScaleConstCompU.fill(0);
@@ -3106,6 +3642,7 @@ namespace dxvk {
           entry.samplerCoordCompU[s] = inferred.coordCompU;
           entry.samplerCoordCompV[s] = inferred.coordCompV;
           entry.samplerSemanticFlags[s] = inferred.semanticFlags;
+          entry.samplerExpressionFlags[s] = inferred.expressionFlags;
           entry.samplerSampleCount[s] = inferred.sampleCount;
           entry.samplerScaleConstReg[s] = int16_t(inferred.scaleConstReg);
           entry.samplerScaleConstCompU[s] = inferred.scaleConstCompU;
@@ -3136,26 +3673,33 @@ namespace dxvk {
       }
     }
 
+    auto getRemixSampleView = [](D3D9CommonTexture* texture, const bool srgb) -> Rc<DxvkImageView> {
+      if (texture == nullptr)
+        return nullptr;
+      // legacy Remix albedo path is 2D oriented so for cubemap albedo slots,
+      // bind a face view to avoid falling back to white placeholders
+      if (texture->GetType() == D3DRTYPE_CUBETEXTURE) {
+        return texture->CreateView(0, 0, VK_IMAGE_USAGE_SAMPLED_BIT, srgb);
+      }
+      return texture->GetSampleView(srgb);
+    };
+
     if constexpr (FixedFunction) {
-      for (uint32_t idx = 0, textureID = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
+      uint32_t textureID = 0;
+      for (uint32_t idx = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
         const uint8_t stage = texcoordIndexToStage[idx];
         if (stage == kInvalidStage || d3d9State().textures[stage] == nullptr)
           continue;
 
         D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
         assert(pTexInfo != nullptr);
+        const XXH64_hash_t texHash = pTexInfo->GetImage()->getHash();
 
-        // Send the texture stage state for first texture slot (or 0th stage if no texture)
-        if (textureID == 0) {
-          // ColorTexture2 is optional and currently only used as RayPortal material, the material type will be checked in the submitDrawState.
-          // So we don't use it to check valid drawcall or not here.
-          if (pTexInfo->GetImage()->getHash() == kEmptyHash) {
-            ONCE(Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall."));
-            return false;
-          }
+        if (texHash == kEmptyHash)
+          continue;
 
+        if (textureID == 0)
           firstStage = stage;
-        }
 
         D3D9SamplerKey key = m_parent->CreateSamplerKey(stage);
         XXH64_hash_t samplerHash = D3D9SamplerKeyHash{}(key);
@@ -3172,7 +3716,10 @@ namespace dxvk {
 
         // Cache the slot we want to bind
         const bool srgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
-        m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(pTexInfo->GetSampleView(srgb));
+        Rc<DxvkImageView> sampleView = getRemixSampleView(pTexInfo, srgb);
+        if (sampleView == nullptr)
+          continue;
+        m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(sampleView);
         m_activeDrawCallState.materialData.samplers[textureID] = sampler;
         if (textureID == 0)
           m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
@@ -3187,6 +3734,8 @@ namespace dxvk {
       // we prefer sRGB textures for the first slot since normal maps/masks are usually sampled in linear space
       uint8_t chosenStages[LegacyMaterialData::kMaxSupportedTextures] = { kInvalidStage, kInvalidStage };
       int64_t chosenScore[LegacyMaterialData::kMaxSupportedTextures] = { std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::min() };
+      uint8_t strictCubemapFallbackStage = kInvalidStage;
+      int32_t strictCubemapFallbackScore = std::numeric_limits<int32_t>::min();
 
       const uint32_t usedSamplerMask = m_parent->m_psShaderMasks.samplerMask;
       const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask;
@@ -3199,12 +3748,16 @@ namespace dxvk {
         if (!texture)
           continue;
 
-        if (texture->GetType() != D3DRTYPE_TEXTURE && (!allowCubemaps() || texture->GetType() != D3DRTYPE_CUBETEXTURE))
+        const D3DRESOURCETYPE textureType = texture->GetType();
+        const bool is2DTexture = textureType == D3DRTYPE_TEXTURE;
+        const bool isCubeTexture = textureType == D3DRTYPE_CUBETEXTURE;
+        if (!is2DTexture && !isCubeTexture)
           continue;
 
         const XXH64_hash_t texHash = texture->GetSampleView(false)->image()->getHash();
         if (lookupHash(RtxOptions::lightmapTextures(), texHash))
           continue;
+        const bool isKnownAlbedoMask = lookupHash(RtxOptions::albedoMaskTextures(), texHash);
 
         const bool srgb = (d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1) != 0;
         const bool isRenderTarget = texture->IsRenderTarget();
@@ -3216,10 +3769,19 @@ namespace dxvk {
         bool hasInferredUvHint = false;
         int8_t inferredTexcoordIdx = -1;
         uint8_t inferredSamplerSemanticFlags = 0;
+        uint8_t inferredSamplerExpressionFlags = 0;
         bool inferredSamplerLooksEngineAuxiliary = false;
         bool inferredSamplerLooksMaterialTexture = false;
         bool inferredSamplerLooksLightmap = false;
         bool inferredSamplerLooksNonDiffuse = false;
+        bool inferredSamplerExprUvTransform = false;
+        bool inferredSamplerExprUvOffset = false;
+        bool inferredSamplerExprUvAnimated = false;
+        bool inferredSamplerExprUvTimeDriven = false;
+        bool inferredSamplerExprViewDependent = false;
+        bool inferredSamplerExprMaskControl = false;
+        bool inferredSamplerExprColorContribution = false;
+        bool inferredSamplerExprBlendMath = false;
         bool inferredUsesZw = false;
         bool inferredUsesWz = false;
         bool inferredUsesXy = false;
@@ -3229,16 +3791,26 @@ namespace dxvk {
           sampleCount = inferredPsEntry->samplerSampleCount[stage];
           inferredTexcoordIdx = inferredPsEntry->samplerToTexcoord[stage];
           inferredSamplerSemanticFlags = inferredPsEntry->samplerSemanticFlags[stage];
+          inferredSamplerExpressionFlags = inferredPsEntry->samplerExpressionFlags[stage];
           inferredSamplerLooksEngineAuxiliary = (inferredSamplerSemanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
           inferredSamplerLooksMaterialTexture = (inferredSamplerSemanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
           inferredSamplerLooksLightmap = (inferredSamplerSemanticFlags & kPsSamplerSemanticLightmap) != 0;
           inferredSamplerLooksNonDiffuse = (inferredSamplerSemanticFlags & kPsSamplerSemanticNonDiffuse) != 0;
+          inferredSamplerExprUvTransform = (inferredSamplerExpressionFlags & kPsSamplerExprUvTransform) != 0;
+          inferredSamplerExprUvOffset = (inferredSamplerExpressionFlags & kPsSamplerExprUvOffset) != 0;
+          inferredSamplerExprUvAnimated = (inferredSamplerExpressionFlags & kPsSamplerExprUvAnimated) != 0;
+          inferredSamplerExprUvTimeDriven = (inferredSamplerExpressionFlags & kPsSamplerExprUvTimeDriven) != 0;
+          inferredSamplerExprViewDependent = (inferredSamplerExpressionFlags & kPsSamplerExprViewDependent) != 0;
+          inferredSamplerExprMaskControl = (inferredSamplerExpressionFlags & kPsSamplerExprMaskControl) != 0;
+          inferredSamplerExprColorContribution = (inferredSamplerExpressionFlags & kPsSamplerExprColorContribution) != 0;
+          inferredSamplerExprBlendMath = (inferredSamplerExpressionFlags & kPsSamplerExprBlendMath) != 0;
           hasInferredTexcoord = inferredTexcoordIdx >= 0;
           hasInferredUvHint =
             inferredPsEntry->samplerScaleImmediateValid[stage] != 0 ||
             inferredPsEntry->samplerOffsetImmediateValid[stage] != 0 ||
             inferredPsEntry->samplerScaleConstReg[stage] >= 0 ||
-            inferredPsEntry->samplerOffsetConstReg[stage] >= 0;
+            inferredPsEntry->samplerOffsetConstReg[stage] >= 0 ||
+            (inferredSamplerExpressionFlags & (kPsSamplerExprUvTransform | kPsSamplerExprUvOffset)) != 0;
           inferredUsesZw =
             inferredPsEntry->samplerCoordCompValid[stage] != 0 &&
             inferredPsEntry->samplerCoordCompU[stage] == 2 &&
@@ -3253,6 +3825,34 @@ namespace dxvk {
             inferredPsEntry->samplerCoordCompV[stage] == 1;
           inferredUsesPackedSecondary = inferredUsesWz || inferredUsesZw;
           hasNonZeroInferredOffset = hasNonZeroInferredSamplerOffset(inferredPsEntry, stage);
+        }
+
+        if (isCubeTexture && !allowCubemaps()) {
+          const bool looksMaterialCubemap =
+            sampleCount > 0 &&
+            !isRenderTarget &&
+            !inferredSamplerLooksEngineAuxiliary &&
+            !inferredSamplerLooksLightmap &&
+            !inferredSamplerLooksNonDiffuse &&
+            !inferredSamplerExprViewDependent &&
+            !inferredSamplerExprMaskControl &&
+            !isKnownAlbedoMask &&
+            (inferredSamplerLooksMaterialTexture || inferredSamplerSemanticFlags == 0);
+
+          if (looksMaterialCubemap) {
+            int32_t cubeScore = 0;
+            cubeScore += int32_t(std::min<uint16_t>(sampleCount, 16u)) * 64;
+            cubeScore += hasInferredTexcoord ? 256 : 0;
+            cubeScore -= hasNonZeroInferredOffset ? 96 : 0;
+            cubeScore -= int32_t(stage);
+
+            if (cubeScore > strictCubemapFallbackScore) {
+              strictCubemapFallbackScore = cubeScore;
+              strictCubemapFallbackStage = uint8_t(stage);
+            }
+          }
+
+          continue;
         }
 
         // heuristics
@@ -3272,6 +3872,23 @@ namespace dxvk {
         score -= inferredSamplerLooksEngineAuxiliary ? 420'000 : 0;
         score -= inferredSamplerLooksLightmap ? 280'000 : 0;
         score -= inferredSamplerLooksNonDiffuse ? 220'000 : 0;
+        score -= inferredSamplerExprViewDependent ? 260'000 : 0;
+        score -= inferredSamplerExprMaskControl ? 320'000 : 0;
+        score -= isKnownAlbedoMask ? 6'000'000 : 0;
+        const bool looksExpressionDrivenMaterial =
+          !inferredSamplerLooksEngineAuxiliary &&
+          !inferredSamplerLooksLightmap &&
+          !inferredSamplerLooksNonDiffuse &&
+          !inferredSamplerExprViewDependent &&
+          !inferredSamplerExprMaskControl &&
+          !isKnownAlbedoMask &&
+          (inferredSamplerLooksMaterialTexture || inferredSamplerSemanticFlags == 0);
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTransform) ? 95'000 : 0;
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprUvOffset) ? 52'000 : 0;
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprUvAnimated) ? 115'000 : 0;
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTimeDriven && sampleCount >= 2u) ? 140'000 : 0;
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprColorContribution) ? 65'000 : 0;
+        score += (looksExpressionDrivenMaterial && inferredSamplerExprBlendMath && sampleCount >= 2u) ? 60'000 : 0;
         score += int64_t(std::min<uint64_t>(area, 16ull * 1024ull * 1024ull));
         score -= int64_t(stage);
         if (likelyPackedUvConventions) {
@@ -3299,6 +3916,14 @@ namespace dxvk {
             : (inferredSamplerLooksEngineAuxiliary ? 180'000ll
                : (inferredSamplerLooksMaterialTexture ? 12'000ll : 45'000ll));
           const int64_t auxiliaryPenalty = likelyGpuSkinnedMesh ? 120'000ll : 70'000ll;
+          const bool looksUvAnimatedMaterialTexture =
+            inferredSamplerLooksMaterialTexture &&
+            !inferredSamplerLooksEngineAuxiliary &&
+            !inferredSamplerLooksNonDiffuse &&
+            sampleCount >= 2u;
+          const int64_t adjustedOffsetPenalty = looksUvAnimatedMaterialTexture
+            ? std::max<int64_t>(offsetPenalty / 6ll, 2'000ll)
+            : offsetPenalty;
 
           if (inferredTexcoordIdx == 0)
             score += uv0Bonus;
@@ -3316,7 +3941,7 @@ namespace dxvk {
             score -= packedSecondaryPenalty;
 
           if (hasNonZeroInferredOffset)
-            score -= offsetPenalty;
+            score -= adjustedOffsetPenalty;
 
           if (inferredSamplerLooksEngineAuxiliary)
             score -= auxiliaryPenalty;
@@ -3348,6 +3973,10 @@ namespace dxvk {
         }
       }
 
+      if (chosenStages[0] == kInvalidStage && strictCubemapFallbackStage != kInvalidStage) {
+        chosenStages[0] = strictCubemapFallbackStage;
+      }
+
       // default to stage 0 if we couldn't find any used textures (should be rare)
       if (chosenStages[0] == kInvalidStage)
         chosenStages[0] = 0;
@@ -3374,6 +4003,10 @@ namespace dxvk {
           (inferredPsEntry->samplerSemanticFlags[primaryStage] & kPsSamplerSemanticEngineAuxiliary) != 0;
         const bool primaryLooksMaterialTexture =
           (inferredPsEntry->samplerSemanticFlags[primaryStage] & kPsSamplerSemanticMaterialTexture) != 0;
+        const bool primaryLooksViewDependent =
+          (inferredPsEntry->samplerExpressionFlags[primaryStage] & kPsSamplerExprViewDependent) != 0;
+        const bool primaryLooksMaskControl =
+          (inferredPsEntry->samplerExpressionFlags[primaryStage] & kPsSamplerExprMaskControl) != 0;
         const bool primaryPackedPairSuspicious =
           primaryUsesPackedSecondary &&
           (primaryLooksEngineAuxiliary ||
@@ -3384,6 +4017,8 @@ namespace dxvk {
           (likelyGpuSkinnedMesh || primaryLooksEngineAuxiliary);
         const bool primarySuspicious =
           primaryLooksEngineAuxiliary ||
+          primaryLooksViewDependent ||
+          primaryLooksMaskControl ||
           primaryPackedPairSuspicious ||
           primaryOffsetSuspicious ||
           (likelyGpuSkinnedMesh && primaryTexcoord > 0);
@@ -3414,9 +4049,18 @@ namespace dxvk {
               score -= nonUv0Penalty;
 
             const uint8_t semanticFlags = inferredPsEntry->samplerSemanticFlags[stage];
+            const uint8_t expressionFlags = inferredPsEntry->samplerExpressionFlags[stage];
             const bool looksMaterialTexture = (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
             const bool looksEngineAuxiliary = (semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
             const bool looksNonDiffuse = (semanticFlags & kPsSamplerSemanticNonDiffuse) != 0;
+            const bool looksExprUvTransform = (expressionFlags & kPsSamplerExprUvTransform) != 0;
+            const bool looksExprUvOffset = (expressionFlags & kPsSamplerExprUvOffset) != 0;
+            const bool looksExprUvAnimated = (expressionFlags & kPsSamplerExprUvAnimated) != 0;
+            const bool looksExprUvTimeDriven = (expressionFlags & kPsSamplerExprUvTimeDriven) != 0;
+            const bool looksExprViewDependent = (expressionFlags & kPsSamplerExprViewDependent) != 0;
+            const bool looksExprMaskControl = (expressionFlags & kPsSamplerExprMaskControl) != 0;
+            const bool looksExprColorContribution = (expressionFlags & kPsSamplerExprColorContribution) != 0;
+            const bool looksExprBlendMath = (expressionFlags & kPsSamplerExprBlendMath) != 0;
             if ((semanticFlags & kPsSamplerSemanticMaterialTexture) != 0)
               score += 180;
             if ((semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0)
@@ -3425,6 +4069,30 @@ namespace dxvk {
               score -= 260;
             if (looksNonDiffuse)
               score -= 220;
+            if (looksExprViewDependent)
+              score -= 240;
+            if (looksExprMaskControl)
+              score -= 280;
+            const bool looksExpressionDrivenMaterial =
+              !looksEngineAuxiliary &&
+              !looksNonDiffuse &&
+              !looksExprViewDependent &&
+              !looksExprMaskControl &&
+              (looksMaterialTexture || semanticFlags == 0);
+            if (looksExpressionDrivenMaterial && looksExprUvTransform)
+              score += 95;
+            if (looksExpressionDrivenMaterial && looksExprUvOffset)
+              score += 55;
+            if (looksExpressionDrivenMaterial && looksExprUvAnimated)
+              score += 125;
+            if (looksExpressionDrivenMaterial && looksExprUvTimeDriven &&
+                inferredPsEntry->samplerSampleCount[stage] >= 2u)
+              score += 70;
+            if (looksExpressionDrivenMaterial && looksExprColorContribution)
+              score += 30;
+            if (looksExpressionDrivenMaterial && looksExprBlendMath &&
+                inferredPsEntry->samplerSampleCount[stage] >= 2u)
+              score += 45;
 
             const bool candidateHasNonZeroOffset = hasNonZeroInferredSamplerOffset(inferredPsEntry, stage);
             const bool candidatePackedPairSuspicious =
@@ -3440,6 +4108,14 @@ namespace dxvk {
             const int32_t offsetPenalty = likelyGpuSkinnedMesh
               ? 320
               : (looksEngineAuxiliary ? 220 : (looksMaterialTexture ? 20 : 60));
+            const bool candidateLooksUvAnimatedMaterialTexture =
+              looksMaterialTexture &&
+              !looksEngineAuxiliary &&
+              !looksNonDiffuse &&
+              inferredPsEntry->samplerSampleCount[stage] >= 2u;
+            const int32_t adjustedOffsetPenalty = candidateLooksUvAnimatedMaterialTexture
+              ? std::max(offsetPenalty / 6, 8)
+              : offsetPenalty;
 
             if (inferredPsEntry->samplerCoordCompValid[stage]) {
               const uint8_t compU = inferredPsEntry->samplerCoordCompU[stage] & 0x3u;
@@ -3453,7 +4129,7 @@ namespace dxvk {
             }
 
             if (candidateHasNonZeroOffset)
-              score -= offsetPenalty;
+              score -= adjustedOffsetPenalty;
 
             if (!likelyGpuSkinnedMesh &&
                 likelyUe3FlexiblePackedUvPath &&
@@ -3510,22 +4186,23 @@ namespace dxvk {
         }
       }
 
-      firstStage = chosenStages[0];
-
-      for (uint32_t textureID = 0; textureID < LegacyMaterialData::kMaxSupportedTextures; textureID++) {
-        const uint8_t stage = chosenStages[textureID];
+      uint32_t textureID = 0;
+      for (uint32_t stageIdx = 0; stageIdx < LegacyMaterialData::kMaxSupportedTextures && textureID < LegacyMaterialData::kMaxSupportedTextures; stageIdx++) {
+        const uint8_t stage = chosenStages[stageIdx];
         if (stage == kInvalidStage || stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
           continue;
 
         D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
         assert(pTexInfo != nullptr);
+        const XXH64_hash_t texHash = pTexInfo->GetImage()->getHash();
+        const bool allowHashlessCubemap =
+          pTexInfo->GetType() == D3DRTYPE_CUBETEXTURE && stage == strictCubemapFallbackStage;
 
-        if (textureID == 0) {
-          if (pTexInfo->GetImage()->getHash() == kEmptyHash) {
-            ONCE(Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall."));
-            return false;
-          }
-        }
+        if (texHash == kEmptyHash && !allowHashlessCubemap)
+          continue;
+
+        if (textureID == 0)
+          firstStage = stage;
 
         D3D9SamplerKey key = m_parent->CreateSamplerKey(stage);
         XXH64_hash_t samplerHash = D3D9SamplerKeyHash{}(key);
@@ -3541,13 +4218,52 @@ namespace dxvk {
         }
 
         const bool srgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
-        m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(pTexInfo->GetSampleView(srgb));
+        Rc<DxvkImageView> sampleView = getRemixSampleView(pTexInfo, srgb);
+        if (sampleView == nullptr)
+          continue;
+        m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(sampleView);
         m_activeDrawCallState.materialData.samplers[textureID] = sampler;
         if (textureID == 0)
           m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
 
         auto shaderSampler = RemapStateSamplerShader(stage);
         m_activeDrawCallState.materialData.colorTextureSlot[textureID] = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
+        ++textureID;
+      }
+
+      if (textureID == 0 &&
+          strictCubemapFallbackStage != kInvalidStage &&
+          strictCubemapFallbackStage < SamplerCount &&
+          d3d9State().textures[strictCubemapFallbackStage] != nullptr) {
+        D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[strictCubemapFallbackStage]);
+        if (pTexInfo != nullptr && pTexInfo->GetImage() != nullptr) {
+          firstStage = strictCubemapFallbackStage;
+
+          D3D9SamplerKey key = m_parent->CreateSamplerKey(firstStage);
+          XXH64_hash_t samplerHash = D3D9SamplerKeyHash{}(key);
+
+          Rc<DxvkSampler> sampler;
+          auto samplerIt = m_samplerCache.find(samplerHash);
+          if (samplerIt != m_samplerCache.end()) {
+            sampler = samplerIt->second;
+          } else {
+            const auto samplerInfo = m_parent->DecodeSamplerKey(key);
+            sampler = m_parent->GetDXVKDevice()->createSampler(samplerInfo);
+            m_samplerCache.insert(std::make_pair(samplerHash, sampler));
+          }
+
+          const bool srgb = d3d9State().samplerStates[firstStage][D3DSAMP_SRGBTEXTURE] & 0x1;
+          Rc<DxvkImageView> sampleView = getRemixSampleView(pTexInfo, srgb);
+          if (sampleView != nullptr) {
+            m_activeDrawCallState.materialData.colorTextures[0] = TextureRef(sampleView);
+            m_activeDrawCallState.materialData.samplers[0] = sampler;
+            m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
+
+            auto shaderSampler = RemapStateSamplerShader(firstStage);
+            m_activeDrawCallState.materialData.colorTextureSlot[0] =
+              computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
+          }
+        }
       }
     }
 
@@ -3575,17 +4291,36 @@ namespace dxvk {
     }
 
     if (d3d9State().textures[firstStage]) {
+      // UE3 MaterialInstanceConstant compat - include pixel shader hash and constants for child-level material tagging
+      // this differentiates instances that share parent but have different VectorParameterValues (e.g. DiffuseColor)
+      // ScalarParameterValues, or StaticSwitchParameterValues
+      // must run before setupCategoriesForTexture so category lookups use the full material hash
+      if constexpr (!FixedFunction) {
+        if (ue3MaterialInstanceConstantHash() && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+          const auto& bytecode = d3d9State().pixelShader->GetCommonShader()->GetBytecode();
+          const XXH64_hash_t psHash = hashDxsoBytecode(bytecode);
+          if (psHash != 0) {
+            m_activeDrawCallState.materialData.setPixelShaderHashForMaterialInstance(psHash);
+            // include PS constants for material params (DiffuseColor, etc.) - parse CTAB for UniformVector_*/UniformScalar_* or fallback to c3..c79
+            const XXH64_hash_t psConstsHash = hashUe3PixelShaderMaterialConstants(bytecode, d3d9State().psConsts.fConsts);
+            m_activeDrawCallState.materialData.setPixelShaderConstantsHashForMaterialInstance(psConstsHash);
+          }
+        }
+      }
+      m_activeDrawCallState.materialData.updateCachedHash();
+
       m_activeDrawCallState.setupCategoriesForTexture();
 
-      // Track the texture hash before checking if it should be ignored
-      // This ensures we track all textures sent by the game, not just the ones that are actually rendered.
+      // Track the material hash before checking if it should be ignored
+      // This ensures we track all materials sent by the game, not just the ones that are actually rendered.
       const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+      const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
 
       // Flag smooth normals category at the d3d9 layer
-      m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash));
-      if (textureHash != kEmptyHash) {
-        m_parent->EmitCs([textureHash](DxvkContext* ctx) {
-          static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(textureHash);
+      m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(RtxOptions::smoothNormalsTextures(), textureHash) || lookupHash(RtxOptions::smoothNormalsTextures(), materialHash));
+      if (materialHash != kEmptyHash) {
+        m_parent->EmitCs([materialHash](DxvkContext* ctx) {
+          static_cast<RtxContext*>(ctx)->getSceneManager().trackReplacementMaterialHash(materialHash);
         });
       }
       

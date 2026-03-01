@@ -358,6 +358,14 @@ private:
   // Replacement material hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameReplacementMaterialHashes;
 
+  // UE3 MaterialInstanceConstant - track texture+shader keys whose constant hashes are unstable over time
+  // used to selectively allow parent texture fallback only where child constants are known to vary
+  std::unordered_map<XXH64_hash_t, XXH64_hash_t> m_ue3MiFirstConstantsByTextureShaderHash;
+  std::unordered_set<XXH64_hash_t> m_ue3MiUnstableTextureShaderHashes;
+  std::unordered_map<XXH64_hash_t, XXH64_hash_t> m_ue3MiFirstMaterialHashByGeometryTexture;
+  std::unordered_set<XXH64_hash_t> m_ue3MiUnstableGeometryTextureKeys;
+  std::unordered_map<XXH64_hash_t, XXH64_hash_t> m_ue3MiSpecificReplacementHashByGeometryTexture;
+
   // Mesh hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
 

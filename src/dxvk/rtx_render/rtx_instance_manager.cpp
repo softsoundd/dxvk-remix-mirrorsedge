@@ -32,6 +32,7 @@
 #include "rtx_terrain_baker.h"
 
 #include "../d3d9/d3d9_state.h"
+#include "../dxvk_format.h"
 #include "rtx_matrix_helpers.h"
 #include "dxvk_scoped_annotation.h"
 
@@ -46,6 +47,24 @@ namespace dxvk {
     // (x cross y) through the series of transformations
     Vector3 x(m[0].data), y(m[1].data), z(m[2].data);
     return dot(cross(x, y), z) < 0;
+  }
+
+  static bool isTextureRefSrgb(const TextureRef& textureRef) {
+    auto formatIsSrgb = [](VkFormat format) {
+      const DxvkFormatInfo* formatInfo = imageFormatInfo(format);
+      return formatInfo != nullptr && formatInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+    };
+
+    if (const DxvkImageView* imageView = textureRef.getImageView()) {
+      return formatIsSrgb(imageView->info().format);
+    }
+
+    const Rc<ManagedTexture>& managedTexture = textureRef.getManagedTexture();
+    if (managedTexture != nullptr) {
+      return formatIsSrgb(managedTexture->imageCreateInfo().format);
+    }
+
+    return false;
   }
 
   static uint32_t determineInstanceFlags(const DrawCallState& drawCall, const RtSurface& surface) {
@@ -1058,7 +1077,14 @@ namespace dxvk {
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
-        currentInstance.surface.colorTextureIsSrgb = drawCall.getMaterialData().colorTextureIsSrgb;
+        bool colorTextureIsSrgb = drawCall.getMaterialData().colorTextureIsSrgb;
+        if (materialData.getType() == MaterialDataType::Opaque) {
+          const TextureRef& albedoTexture = materialData.getOpaqueMaterialData().getAlbedoOpacityTexture();
+          if (albedoTexture.isValid()) {
+            colorTextureIsSrgb = isTextureRefSrgb(albedoTexture);
+          }
+        }
+        currentInstance.surface.colorTextureIsSrgb = colorTextureIsSrgb;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
         currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
 

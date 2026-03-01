@@ -655,7 +655,9 @@ namespace dxvk {
     if (nullptr == source)
       return;
 
-    if (m_type != D3DRTYPE_TEXTURE || (m_desc.Usage & D3DUSAGE_DEPTHSTENCIL))
+    const bool is2DTexture = m_type == D3DRTYPE_TEXTURE;
+    const bool isCubeTexture = m_type == D3DRTYPE_CUBETEXTURE;
+    if ((!is2DTexture && !isCubeTexture) || (m_desc.Usage & D3DUSAGE_DEPTHSTENCIL))
       return;
 
     if (m_image->getHash() != 0) {
@@ -663,36 +665,56 @@ namespace dxvk {
       return;
     }
 
-    // Use subresource 0 for hashing
-    constexpr uint32_t subresource = 0;
-    const auto& buffer = source->m_buffers[subresource];
+    XXH64_hash_t imageHash = kEmptyHash;
+    Rc<DxvkImageView> texturePickerView = m_sampleView.Color;
 
-    // Data may not be there yet
-    if (nullptr == buffer.ptr())
-      return;
+    if (is2DTexture) {
+      constexpr uint32_t subresource = 0;
+      const auto& buffer = source->m_buffers[subresource];
 
-    const bool useObsoleteHashMethod = NeedsUpload(subresource) &&
-      RtxOptions::useObsoleteHashOnTextureUpload();
+      if (nullptr == buffer.ptr())
+        return;
 
-    // Generate hash from CPU buffer
-    XXH64_hash_t imageHash;
+      const bool useObsoleteHashMethod = NeedsUpload(subresource) &&
+        RtxOptions::useObsoleteHashOnTextureUpload();
 
-    if (unlikely(useObsoleteHashMethod)) {
-      imageHash = XXH64(buffer->mapPtr(0), buffer->info().size, 0);
+      if (unlikely(useObsoleteHashMethod)) {
+        imageHash = XXH64(buffer->mapPtr(0), buffer->info().size, 0);
+      } else {
+        imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+      }
     } else {
-      imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+      // resolve cubemap albedo materials
+      bool hasAnyData = false;
+      for (uint32_t face = 0; face < 6; face++) {
+        const auto& buffer = source->m_buffers[CalcSubresource(face, 0)];
+        if (buffer.ptr() == nullptr)
+          continue;
+
+        hasAnyData = true;
+        const XXH64_hash_t subHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+        imageHash = XXH3_64bits_withSeed(&subHash, sizeof(subHash), imageHash);
+      }
+
+      if (!hasAnyData)
+        return;
+
+      texturePickerView = CreateView(0, 0, VK_IMAGE_USAGE_SAMPLED_BIT, false);
+      if (texturePickerView == nullptr)
+        texturePickerView = m_sampleView.Color;
     }
+
     // save hash to dxvkImage
     m_image->setHash(imageHash);
 
     // Let ImGUI know about this texture
-    ImGUI::AddTexture(imageHash, m_sampleView.Color, ImGUI::kTextureFlagsDefault);
+    ImGUI::AddTexture(imageHash, texturePickerView, ImGUI::kTextureFlagsDefault);
     if (IsRenderTarget()) {
       // Generate descriptor hash from the image properties (not including actual pixel data)
       XXH64_hash_t descriptorHash = m_desc.CalculateHash();
       m_image->setDescriptorHash(descriptorHash);
 
-      ImGUI::AddTexture(descriptorHash, m_sampleView.Color, ImGUI::kTextureFlagsRenderTarget);
+      ImGUI::AddTexture(descriptorHash, texturePickerView, ImGUI::kTextureFlagsRenderTarget);
     }
   }
 

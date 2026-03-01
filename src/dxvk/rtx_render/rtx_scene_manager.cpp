@@ -635,7 +635,87 @@ namespace dxvk {
     } 
 
     // test if any direct material replacements exist
-    MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(input.getMaterialData().getHash());
+    const LegacyMaterialData& inputMaterial = input.getMaterialData();
+    const XXH64_hash_t materialHash = inputMaterial.getHash();
+    const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
+    const XXH64_hash_t shaderHash = inputMaterial.m_pixelShaderHashForMaterialInstance;
+    const XXH64_hash_t shaderConstantsHash = inputMaterial.m_pixelShaderConstantsHashForMaterialInstance;
+    const XXH64_hash_t textureAndShaderHash =
+      (shaderHash != kEmptyHash && textureHash != kEmptyHash)
+        ? XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), shaderHash)
+        : kEmptyHash;
+    const XXH64_hash_t geometryHash = input.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+    const XXH64_hash_t geometryTextureKey =
+      (textureHash != kEmptyHash)
+        ? XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), geometryHash)
+        : kEmptyHash;
+    const bool isPotentiallyUnstableAnchor = input.getGeometryData().indexBuffer.defined()
+      && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
+
+    if (textureAndShaderHash != kEmptyHash && shaderConstantsHash != kEmptyHash) {
+      const auto [it, isNew] =
+        m_ue3MiFirstConstantsByTextureShaderHash.emplace(textureAndShaderHash, shaderConstantsHash);
+      if (!isNew && it->second != shaderConstantsHash) {
+        m_ue3MiUnstableTextureShaderHashes.insert(textureAndShaderHash);
+      }
+    }
+    const bool hasUnstableConstantsForTextureShader =
+      textureAndShaderHash != kEmptyHash &&
+      m_ue3MiUnstableTextureShaderHashes.find(textureAndShaderHash) != m_ue3MiUnstableTextureShaderHashes.end();
+    if (geometryTextureKey != kEmptyHash && materialHash != kEmptyHash) {
+      const auto [it, isNew] =
+        m_ue3MiFirstMaterialHashByGeometryTexture.emplace(geometryTextureKey, materialHash);
+      if (!isNew && it->second != materialHash) {
+        m_ue3MiUnstableGeometryTextureKeys.insert(geometryTextureKey);
+      }
+    }
+    const bool hasUnstableMaterialForGeometryTexture =
+      geometryTextureKey != kEmptyHash &&
+      m_ue3MiUnstableGeometryTextureKeys.find(geometryTextureKey) != m_ue3MiUnstableGeometryTextureKeys.end();
+
+    MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(materialHash);
+    XXH64_hash_t matchedSpecificReplacementHash = kEmptyHash;
+    if (pReplacementMaterial != nullptr && materialHash != textureHash) {
+      matchedSpecificReplacementHash = materialHash;
+    }
+
+    // UE3 MaterialInstanceConstant fallback path
+    // first try texture+shader to preserve child vs parent separation and avoid wrong texture routing
+    if (pReplacementMaterial == nullptr && textureAndShaderHash != kEmptyHash) {
+      if (textureAndShaderHash != materialHash) {
+        pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureAndShaderHash);
+        if (pReplacementMaterial != nullptr) {
+          matchedSpecificReplacementHash = textureAndShaderHash;
+        }
+      }
+    }
+
+    if (matchedSpecificReplacementHash != kEmptyHash && geometryTextureKey != kEmptyHash) {
+      m_ue3MiSpecificReplacementHashByGeometryTexture[geometryTextureKey] = matchedSpecificReplacementHash;
+    }
+
+    // prefer sticky specific replacement for this geometry+texture key if we already discovered one
+    if (pReplacementMaterial == nullptr && geometryTextureKey != kEmptyHash) {
+      auto it = m_ue3MiSpecificReplacementHashByGeometryTexture.find(geometryTextureKey);
+      if (it != m_ue3MiSpecificReplacementHashByGeometryTexture.end()) {
+        pReplacementMaterial = m_pReplacer->getReplacementMaterial(it->second);
+      }
+    }
+
+    const bool hasSpecificReplacementForGeometryTexture =
+      geometryTextureKey != kEmptyHash &&
+      m_ue3MiSpecificReplacementHashByGeometryTexture.find(geometryTextureKey) != m_ue3MiSpecificReplacementHashByGeometryTexture.end();
+
+    // allow texture only fallback only when instability is observed on the current surface family
+    // and we already know this geometry+texture has a specific replacement
+    if (pReplacementMaterial == nullptr
+        && hasSpecificReplacementForGeometryTexture
+        && (hasUnstableConstantsForTextureShader || (hasUnstableMaterialForGeometryTexture && isPotentiallyUnstableAnchor))
+        && materialHash != textureHash
+        && textureHash != kEmptyHash) {
+      pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureHash);
+    }
+
     if (pReplacementMaterial != nullptr) {
       // Make a copy - dont modify the replacement data.
       MaterialData renderMaterialData = *pReplacementMaterial;
@@ -646,7 +726,7 @@ namespace dxvk {
 
     // Detect meshes that would have unstable hashes due to the vertex hash using vertex data from a shared vertex buffer.
     // TODO: Once the vertex hash only uses vertices referenced by the index buffer, this should be removed.
-    const bool highlightUnsafeAnchor = RtxOptions::useHighlightUnsafeAnchorMode() && input.getGeometryData().indexBuffer.defined() && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
+    const bool highlightUnsafeAnchor = RtxOptions::useHighlightUnsafeAnchorMode() && isPotentiallyUnstableAnchor;
     if (highlightUnsafeAnchor) {
       const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
                                                                           0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,

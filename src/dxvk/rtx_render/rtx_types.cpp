@@ -348,39 +348,45 @@ namespace dxvk {
   void DrawCallState::setupCategoriesForTexture() {
     // TODO (REMIX-231): It would probably be much more efficient to use a map of texture hash to category flags, rather
     //                   than doing N lookups per texture hash for each category.
-    const XXH64_hash_t& textureHash = materialData.getColorTexture().getImageHash();
+    // support both parent level and child level tagging for UE3 MaterialInstanceConstant
+    const XXH64_hash_t textureHash = materialData.getColorTexture().getImageHash();
+    const XXH64_hash_t materialHash = materialData.getHash();
 
-    setCategory(InstanceCategories::WorldUI, lookupHash(RtxOptions::worldSpaceUiTextures(), textureHash));
-    setCategory(InstanceCategories::WorldMatte, lookupHash(RtxOptions::worldSpaceUiBackgroundTextures(), textureHash));
+    auto lookupMaterialOrTexture = [&](const fast_unordered_set& hashSet) {
+      return lookupHash(hashSet, materialHash) || lookupHash(hashSet, textureHash);
+    };
 
-    setCategory(InstanceCategories::Ignore, lookupHash(RtxOptions::ignoreTextures(), textureHash));
-    setCategory(InstanceCategories::IgnoreLights, lookupHash(RtxOptions::ignoreLights(), textureHash));
-    setCategory(InstanceCategories::IgnoreAntiCulling, lookupHash(RtxOptions::antiCullingTextures(), textureHash));
-    setCategory(InstanceCategories::IgnoreMotionBlur, lookupHash(RtxOptions::motionBlurMaskOutTextures(), textureHash));
-    setCategory(InstanceCategories::IgnoreOpacityMicromap, lookupHash(RtxOptions::opacityMicromapIgnoreTextures(), textureHash) || isUsingRaytracedRenderTarget);
-    setCategory(InstanceCategories::IgnoreAlphaChannel, lookupHash(RtxOptions::ignoreAlphaOnTextures(), textureHash));
-    setCategory(InstanceCategories::IgnoreBakedLighting, lookupHash(RtxOptions::ignoreBakedLightingTextures(), textureHash));
+    setCategory(InstanceCategories::WorldUI, lookupMaterialOrTexture(RtxOptions::worldSpaceUiTextures()));
+    setCategory(InstanceCategories::WorldMatte, lookupMaterialOrTexture(RtxOptions::worldSpaceUiBackgroundTextures()));
 
-    setCategory(InstanceCategories::Hidden, lookupHash(RtxOptions::hideInstanceTextures(), textureHash));
+    setCategory(InstanceCategories::Ignore, lookupMaterialOrTexture(RtxOptions::ignoreTextures()));
+    setCategory(InstanceCategories::IgnoreLights, lookupMaterialOrTexture(RtxOptions::ignoreLights()));
+    setCategory(InstanceCategories::IgnoreAntiCulling, lookupMaterialOrTexture(RtxOptions::antiCullingTextures()));
+    setCategory(InstanceCategories::IgnoreMotionBlur, lookupMaterialOrTexture(RtxOptions::motionBlurMaskOutTextures()));
+    setCategory(InstanceCategories::IgnoreOpacityMicromap, lookupHash(RtxOptions::opacityMicromapIgnoreTextures(), materialHash) || lookupHash(RtxOptions::opacityMicromapIgnoreTextures(), textureHash) || isUsingRaytracedRenderTarget);
+    setCategory(InstanceCategories::IgnoreAlphaChannel, lookupMaterialOrTexture(RtxOptions::ignoreAlphaOnTextures()));
+    setCategory(InstanceCategories::IgnoreBakedLighting, lookupMaterialOrTexture(RtxOptions::ignoreBakedLightingTextures()));
 
-    setCategory(InstanceCategories::Particle, lookupHash(RtxOptions::particleTextures(), textureHash));
-    setCategory(InstanceCategories::Beam, lookupHash(RtxOptions::beamTextures(), textureHash));
-    setCategory(InstanceCategories::IgnoreTransparencyLayer, lookupHash(RtxOptions::ignoreTransparencyLayerTextures(), textureHash));
+    setCategory(InstanceCategories::Hidden, lookupMaterialOrTexture(RtxOptions::hideInstanceTextures()));
 
-    setCategory(InstanceCategories::DecalStatic, lookupHash(RtxOptions::decalTextures(), textureHash));
-    setCategory(InstanceCategories::DecalDynamic, lookupHash(RtxOptions::dynamicDecalTextures(), textureHash));
-    setCategory(InstanceCategories::DecalSingleOffset, lookupHash(RtxOptions::singleOffsetDecalTextures(), textureHash));
-    setCategory(InstanceCategories::DecalNoOffset, lookupHash(RtxOptions::nonOffsetDecalTextures(), textureHash));
+    setCategory(InstanceCategories::Particle, lookupMaterialOrTexture(RtxOptions::particleTextures()));
+    setCategory(InstanceCategories::Beam, lookupMaterialOrTexture(RtxOptions::beamTextures()));
+    setCategory(InstanceCategories::IgnoreTransparencyLayer, lookupMaterialOrTexture(RtxOptions::ignoreTransparencyLayerTextures()));
 
-    setCategory(InstanceCategories::AnimatedWater, lookupHash(RtxOptions::animatedWaterTextures(), textureHash));
+    setCategory(InstanceCategories::DecalStatic, lookupMaterialOrTexture(RtxOptions::decalTextures()));
+    setCategory(InstanceCategories::DecalDynamic, lookupMaterialOrTexture(RtxOptions::dynamicDecalTextures()));
+    setCategory(InstanceCategories::DecalSingleOffset, lookupMaterialOrTexture(RtxOptions::singleOffsetDecalTextures()));
+    setCategory(InstanceCategories::DecalNoOffset, lookupMaterialOrTexture(RtxOptions::nonOffsetDecalTextures()));
 
-    setCategory(InstanceCategories::ThirdPersonPlayerModel, lookupHash(RtxOptions::playerModelTextures(), textureHash));
-    setCategory(InstanceCategories::ThirdPersonPlayerBody, lookupHash(RtxOptions::playerModelBodyTextures(), textureHash));
+    setCategory(InstanceCategories::AnimatedWater, lookupMaterialOrTexture(RtxOptions::animatedWaterTextures()));
 
-    setCategory(InstanceCategories::Terrain, lookupHash(RtxOptions::terrainTextures(), textureHash));
-    setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxTextures(), textureHash));
+    setCategory(InstanceCategories::ThirdPersonPlayerModel, lookupMaterialOrTexture(RtxOptions::playerModelTextures()));
+    setCategory(InstanceCategories::ThirdPersonPlayerBody, lookupMaterialOrTexture(RtxOptions::playerModelBodyTextures()));
 
-    setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
+    setCategory(InstanceCategories::Terrain, lookupMaterialOrTexture(RtxOptions::terrainTextures()));
+    setCategory(InstanceCategories::Sky, lookupMaterialOrTexture(RtxOptions::skyBoxTextures()));
+
+    setCategory(InstanceCategories::ParticleEmitter, lookupMaterialOrTexture(RtxOptions::particleEmitterTextures()));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {
@@ -516,10 +522,6 @@ namespace dxvk {
     if (drawCallState.minZ >= RtxOptions::skyMinZThreshold()) {
       return true;
     }
-
-    // NOTE: we use color texture hash for sky detection, however the replacement is hashed with
-    // the whole legacy material hash (which, as of 12/9/2022, equals to color texture hash). Adding a check just in case.
-    assert(drawCallState.getMaterialData().getColorTexture().getImageHash() == drawCallState.getMaterialData().getHash() && "Texture or material hash method changed!");
 
     if (drawCallState.getMaterialData().usesTexture()) {
       if (lookupHash(RtxOptions::skyBoxTextures(), drawCallState.getMaterialData().getHash())) {

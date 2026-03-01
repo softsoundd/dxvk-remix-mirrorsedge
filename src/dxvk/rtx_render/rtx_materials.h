@@ -1722,6 +1722,16 @@ struct LegacyMaterialData {
     m_cachedHash = hash;
   }
 
+  // UE3 MaterialInstanceConstant compat - when set, material hashes include shader identity
+  // in addition to the base color texture hash
+  void setPixelShaderHashForMaterialInstance(XXH64_hash_t hash) {
+    m_pixelShaderHashForMaterialInstance = hash;
+  }
+
+  void setPixelShaderConstantsHashForMaterialInstance(XXH64_hash_t hash) {
+    m_pixelShaderConstantsHashForMaterialInstance = hash;
+  }
+
 private:
   friend class RtxContext;
   friend struct D3D9Rtx;
@@ -1730,11 +1740,22 @@ private:
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
-    // Note: Currently only based on the color texture's data hash. This may have to be changed later to
-    // incorporate more textures used to identify a material uniquely. Note this is not the same as the
-    // plain data hash used by the RtSurfaceMaterial for storage in map-like data structures, but rather
-    // one used to identify a material and compare to user-provided hashes.
-    m_cachedHash = colorTextures[0].getImageHash();
+    // note - by default this is based on the color texture hash
+    // for UE3 MaterialInstanceConstant compat we optionally fold in shader identity and
+    // stable material constants so child instances can be tagged independently from parent materials
+    const XXH64_hash_t textureHash = colorTextures[0].getImageHash();
+    if (m_pixelShaderHashForMaterialInstance != kEmptyHash) {
+      XXH64_hash_t hash = XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), m_pixelShaderHashForMaterialInstance);
+      if (m_pixelShaderConstantsHashForMaterialInstance != kEmptyHash) {
+        hash = XXH3_64bits_withSeed(
+          &m_pixelShaderConstantsHashForMaterialInstance,
+          sizeof(m_pixelShaderConstantsHashForMaterialInstance),
+          hash);
+      }
+      m_cachedHash = hash;
+    } else {
+      m_cachedHash = textureHash;
+    }
   }
 
   const static uint32_t kMaxSupportedTextures = 2;
@@ -1744,6 +1765,8 @@ private:
   uint32_t colorTextureSlot[kMaxSupportedTextures] = { kInvalidResourceSlot };
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
+  XXH64_hash_t m_pixelShaderHashForMaterialInstance = kEmptyHash;
+  XXH64_hash_t m_pixelShaderConstantsHashForMaterialInstance = kEmptyHash;
 };
 
 struct MaterialData {

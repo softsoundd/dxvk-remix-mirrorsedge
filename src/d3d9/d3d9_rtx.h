@@ -52,6 +52,9 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, shaderPathTexcoordIndexFromPixelShader, false,
                "Shader-path compat: infer TEXCOORD set used by pixel shader rather than trusting D3DTSS_TEXCOORDINDEX. "
                "Helps UE3 games where fixed-function stage state is stale or incorrect when shaders are active.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MaterialInstanceConstantHash, false,
+               "UE3 MaterialInstanceConstant support: include pixel shader hash in material identification to enable "
+               "tagging at the child level instead of broadly at the parent level. ");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -279,6 +282,7 @@ namespace dxvk {
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompU;
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
       std::array<uint8_t, caps::MaxTexturesPS> samplerSemanticFlags;
+      std::array<uint8_t, caps::MaxTexturesPS> samplerExpressionFlags;
       std::array<uint16_t, caps::MaxTexturesPS> samplerSampleCount;
       std::array<int16_t, caps::MaxTexturesPS> samplerScaleConstReg;
       std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompU;
