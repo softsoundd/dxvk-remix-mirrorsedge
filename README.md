@@ -44,7 +44,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 		set SceneCaptureComponent FrameRate 0
 		```
 		2. Place the text file in `<path-to-game>\Binaries`
-	 	3. Type "remix" into the CmdLineArg patcher in Mirror's Edge Tweaks
+	 	3. Type "exec=remix" into the CmdLineArg patcher in Mirror's Edge Tweaks
 		4. Launch the game via the args shortcut in Mirror's Edge Tweaks, or add "-CmdLineArgs" as a launch argument to the Steam client/other shortcuts.
 	- UE3 employs frustum culling in native land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
  		- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`.
