@@ -147,7 +147,7 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
 
   // Skip all sky geometry when using physical atmosphere mode
   if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky &&
-      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+      RtxOptions::skyMode() == SkyMode::Numos) {
     return TryHandleSkyResult::SkipSubmit;
   }
 

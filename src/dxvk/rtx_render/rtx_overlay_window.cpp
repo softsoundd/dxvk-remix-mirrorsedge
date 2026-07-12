@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <algorithm>
+#include "rtx_fork_hooks.h"
 #include "rtx_overlay_window.h"
 #include "../imgui/dxvk_imgui.h"
 #include "imgui/imgui_impl_win32.h"
@@ -154,6 +155,8 @@ void GameOverlay::gameWndProcHandler(HWND gameHwnd, UINT msg, WPARAM wParam, LPA
   if (gameHwnd != m_gameHwnd) {
     return;
   }
+
+  fork_hooks::overlayInputForward(*this, gameHwnd, msg, wParam, lParam);
 
   auto postShowMsg = [this] { PostMessage(hwnd(), WM_REMIX_SHOW_OVERLAY, 0, 0); };
   auto postHideMsg = [this] { PostMessage(hwnd(), WM_REMIX_HIDE_OVERLAY, 0, 0); };
@@ -314,8 +317,17 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
   case WM_INPUT:
   {
+    // Stamp raw-input recency for the gate read by overlayInputForward.
+    // Stamped on every WM_INPUT regardless of foreground/inside-overlay state
+    // — what matters is that Path B's raw-input path is alive at all, not
+    // that it produced a usable event. Stamping before the foreground early-
+    // out avoids a race where the game wnd proc's Path A would erroneously
+    // forward mouse during the brief window where the game is foreground
+    // but Path B has already declined to act on the event.
+    m_lastRawInputTickMs.store(GetTickCount64(), std::memory_order_relaxed);
+
     if (!isOurForeground()) {
-      if (m_mouseInsideOverlay) { 
+      if (m_mouseInsideOverlay) {
         m_mouseInsideOverlay = false;
         ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
       }

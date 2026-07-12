@@ -97,9 +97,21 @@ struct VolumeArgs {
 
   float maxAttenuationDistanceForNoAtmosphere;
   uint resetHistory;
+  // Upstream translucent-shadow support for volumetrics.
   uint16_t enableTranslucentShadows;
   uint16_t pad0;
+  // Gain on the sun term inside the volumetric integral (fork).
+  float fogSunVisibilityGain;
+  // Gain on the volumetric froxel cache as read by surface consumers
+  // (particles/decals/PSR/SAB Path B) via evalVolumetricNEE (fork — issue #36).
+  // Was a hardcoded 0.0 ("kConsumerMultiplier") that left alpha-blended
+  // particles unlit.
+  float volumetricConsumerGain;
+  // Pad the merged (upstream + fork) tail back to a 16-byte boundary so the
+  // shared C++/shader CB layout keeps sizeof(VolumeArgs) % 16 == 0.
   uint pad1;
+  uint pad2;
+  uint pad3;
 };
 
 #ifdef __cplusplus

@@ -47,7 +47,6 @@
 #include "rtx_render/rtx_taa.h"
 #include "rtx_render/rtx_auto_exposure.h"
 #include "rtx_render/rtx_tone_mapping.h"
-#include "rtx_render/rtx_local_tone_mapping.h"
 #include "rtx_render/rtx_bloom.h"
 #include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_image_utils.h"
@@ -250,10 +249,6 @@ namespace dxvk {
       return m_toneMapping.get();
     }
 
-    DxvkLocalToneMapping& metaLocalToneMapping() {
-      return m_localToneMapping.get();
-    }
-
     DxvkBloom& metaBloom() {
       return m_bloom.get();
     }
@@ -394,7 +389,6 @@ namespace dxvk {
     Active<DebugView>                       m_debug_view;
     Active<DxvkAutoExposure>                m_autoExposure;
     Active<DxvkToneMapping>                 m_toneMapping;
-    Active<DxvkLocalToneMapping>            m_localToneMapping;
     Active<DxvkBloom>                       m_bloom;
     Active<RtxGeometryUtils>                m_geometryUtils;
     Active<RtxImageUtils>                   m_imageUtils;

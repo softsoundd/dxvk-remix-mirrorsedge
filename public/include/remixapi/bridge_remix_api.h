@@ -41,7 +41,10 @@
   #define DLLEXPORT __declspec(dllexport)
 #endif
 
-typedef void(__cdecl* PFN_remixapi_BridgeCallback)(void);
+// PFN_remixapi_BridgeCallback is declared in <remix/remix_c.h> (included above)
+// as __stdcall. The previous local __cdecl typedef conflicted on MSVC and also
+// disagreed with the server side's calling convention at runtime; the canonical
+// definition is now the only one in scope.
 typedef remixapi_ErrorCode(DLLEXPORT REMIXAPI_CALL* PFN_remixapi_RegisterCallbacks)(
   PFN_remixapi_BridgeCallback beginSceneCallback,
   PFN_remixapi_BridgeCallback endSceneCallback,

@@ -34,13 +34,36 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
 
+#ifndef REMIXAPI_LIGHTHANDLE_DEFINED
+#define REMIXAPI_LIGHTHANDLE_DEFINED
 using remixapi_LightHandle = struct remixapi_LightHandle_T*;
+#endif
 
 struct RaytraceArgs;
 
 namespace dxvk {
 class DxvkContext;
 class DxvkDevice;
+struct RtLight;
+struct LightManager;
+
+// Forward declarations of fork_hooks functions that require friend access to
+// LightManager private members. Implementations live in rtx_fork_light.cpp.
+namespace fork_hooks {
+  void flushPendingLightMutations(LightManager& mgr);
+  void updateLightStaticSleep(RtLight* light, const RtLight& newLight,
+                              DxvkDevice* device, uint64_t externalId);
+  void setExternalLightEmplace(LightManager& mgr,
+                               remixapi_LightHandle handle,
+                               const RtLight& rtlight);
+  void disableExternalLightQueue(LightManager& mgr,
+                                 remixapi_LightHandle handle);
+  void registerPersistentLight(LightManager& mgr,
+                               remixapi_LightHandle handle);
+  void unregisterPersistentLight(LightManager& mgr,
+                                 remixapi_LightHandle handle);
+  void queueAutoInstancePersistent(LightManager& mgr);
+} // namespace fork_hooks
 
 struct LightRange {
   uint32_t offset;
@@ -48,6 +71,19 @@ struct LightRange {
 };
 
 struct LightManager : public CommonDeviceObject {
+  // Grant fork_hooks functions access to private members used from
+  // rtx_fork_light.cpp (m_externalLights, m_externalDomeLights,
+  // m_externalActiveLightList, m_externalActiveDomeLight,
+  // m_pendingExternalLightErases, m_pendingExternalLightUpdates,
+  // m_pendingExternalActiveLights, m_persistentExternalLights).
+  friend void fork_hooks::flushPendingLightMutations(LightManager&);
+  friend void fork_hooks::updateLightStaticSleep(RtLight*, const RtLight&, DxvkDevice*, uint64_t);
+  friend void fork_hooks::setExternalLightEmplace(LightManager&, remixapi_LightHandle, const RtLight&);
+  friend void fork_hooks::disableExternalLightQueue(LightManager&, remixapi_LightHandle);
+  friend void fork_hooks::registerPersistentLight(LightManager&, remixapi_LightHandle);
+  friend void fork_hooks::unregisterPersistentLight(LightManager&, remixapi_LightHandle);
+  friend void fork_hooks::queueAutoInstancePersistent(LightManager&);
+
 public:
   enum class FallbackLightMode : int {
     Never = 0,
@@ -76,7 +112,7 @@ public:
   const Rc<DxvkBuffer> getPreviousLightBuffer() const { return m_previousLightBuffer.ptr() ? m_previousLightBuffer : m_lightBuffer; }
   const Rc<DxvkBuffer> getLightMappingBuffer() const { return m_lightMappingBuffer; }
   const uint32_t getActiveCount() const { return m_currentActiveLightCount; }
-  const DomeLightArgs& getDomeLightArgs();
+  const DomeLightArgs& getDomeLightArgs() const { return m_gpuDomeLightArgs; }
 
   void clear();
   void clearFromUIThread();
@@ -100,6 +136,10 @@ public:
   void addExternalDomeLight(remixapi_LightHandle handle, const DomeLight& domeLight);
   void removeExternalLight(remixapi_LightHandle handle);
   void addExternalLightInstance(remixapi_LightHandle enabledLight);
+  // Remix API integration helpers
+  void registerPersistentExternalLight(remixapi_LightHandle handle);
+  void unregisterPersistentExternalLight(remixapi_LightHandle handle);
+  void queueAutoInstancePersistent();
 
   void setRaytraceArgs(RaytraceArgs& raytraceArgs, uint32_t rtxdiInitialLightSamples, uint32_t volumeRISInitialLightSamples, uint32_t risLightSamples) const;
   
@@ -123,6 +163,12 @@ private:
   std::unordered_set<remixapi_LightHandle> m_externalActiveLightList;
   remixapi_LightHandle m_externalActiveDomeLight = nullptr;
   DomeLightArgs m_gpuDomeLightArgs;
+
+  // Pending external light mutations to be applied at the start of the frame
+  std::vector<remixapi_LightHandle> m_pendingExternalLightErases{};
+  std::vector<std::pair<remixapi_LightHandle, RtLight>> m_pendingExternalLightUpdates{};
+  std::unordered_set<remixapi_LightHandle> m_pendingExternalActiveLights{};
+  std::unordered_set<remixapi_LightHandle> m_persistentExternalLights{};
 
   Rc<DxvkBuffer> m_lightBuffer;
   Rc<DxvkBuffer> m_previousLightBuffer;

@@ -43,7 +43,8 @@ static const uint16_t kInvalidLightIdx = 0xffff;
 bool sampleLightRTXDI(
   ivec2 pixelCoordinate,
   MinimalSurfaceInteraction primarySurfaceInteraction,
-  inout LightSample lightSample, inout float inverseSelectionPdf, inout uint8_t portalID, inout uint16_t lightIdx)
+  inout LightSample lightSample, inout float inverseSelectionPdf, inout uint8_t portalID, inout uint16_t lightIdx,
+  uint customIndex = 0)
 {
   // Load the reservoir for this pixel from RTXDI
 
@@ -53,6 +54,18 @@ bool sampleLightRTXDI(
   if (!RTXDI_IsValidReservoir(reservoir))
   {
     return false;
+  }
+
+  // When sampling for a view model context, skip lights flagged as ignoreViewModel.
+  if ((customIndex & CUSTOM_INDEX_IS_VIEW_MODEL) != 0)
+  {
+    MemoryPolymorphicLight memoryPolymorphicLight = lights[reservoir.lightIdx];
+    DecodedPolymorphicLight decodedLight = decodePolymorphicLight(memoryPolymorphicLight);
+
+    if (decodedLight.ignoreViewModel)
+    {
+      return false;
+    }
   }
 
   // Get a light sample in portal space
@@ -184,7 +197,8 @@ bool sampleLightAdvancedRIS(
   MinimalSurfaceInteraction surfaceInteraction,
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
   vec3 viewDirection,
-  inout LightSample lightSample, inout float inverseSelectionPdf, inout uint16_t outLightIndex)
+  inout LightSample lightSample, inout float inverseSelectionPdf, inout uint16_t outLightIndex,
+  uint customIndex = 0)
 {
   if (cb.risTotalSampleCount == 0) {
     return false;
@@ -222,6 +236,13 @@ bool sampleLightAdvancedRIS(
       // can effectively unroll the loop and remove the switch from decodedPolymorphicLightCalcWeight
       DecodedPolymorphicLight decodedPolymorphicLight = decodePolymorphicLight(memoryPolymorphicLight);
       decodedPolymorphicLight.polymorphicType = lightType;
+
+      // Skip lights with ignoreViewModel flag when sampling for view model geometry.
+      if (decodedPolymorphicLight.ignoreViewModel && (customIndex & CUSTOM_INDEX_IS_VIEW_MODEL))
+      {
+        continue;
+      }
+
       LightSample candidateSample = decodedPolymorphicLightSampleArea(decodedPolymorphicLight, sampleCoordinates, surfaceInteraction);
 
       // Calculate the weight (targetPdf)
@@ -306,14 +327,15 @@ bool sampleLightRIS(
   MinimalSurfaceInteraction surfaceInteraction,
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
   vec3 viewDirection,
-  inout LightSample lightSample, inout float inverseSelectionPdf, inout uint16_t lightIndex)
+  inout LightSample lightSample, inout float inverseSelectionPdf, inout uint16_t lightIndex,
+  uint customIndex = 0)
 {
   switch(kSurfaceRISType)
   {
   case 0:
     return sampleLightBasicRIS(randomState, surfaceInteraction, opaqueSurfaceMaterialInteraction, lightSample, inverseSelectionPdf);
-  case 1:    
-    return sampleLightAdvancedRIS(randomState, surfaceInteraction, opaqueSurfaceMaterialInteraction, viewDirection, lightSample, inverseSelectionPdf, lightIndex);
+  case 1:
+    return sampleLightAdvancedRIS(randomState, surfaceInteraction, opaqueSurfaceMaterialInteraction, viewDirection, lightSample, inverseSelectionPdf, lightIndex, customIndex);
   case 2:
     return sampleLightNaive(randomState, surfaceInteraction, lightSample, inverseSelectionPdf, lightIndex);
   default:

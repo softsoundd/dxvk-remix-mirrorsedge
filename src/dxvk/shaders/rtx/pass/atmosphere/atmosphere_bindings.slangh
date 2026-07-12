@@ -26,9 +26,54 @@
 // Atmosphere LUT bindings - only include in shaders that need atmosphere rendering
 layout(binding = BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)
 Texture2D AtmosphereTransmittanceLut;
+// Signals to atmosphere_common.slangh that AtmosphereTransmittanceLut is bound.
+// Mirrors the define in common_bindings.slangh; atmosphere-only compute passes
+// (LUT bakers, cloud_render) do not include this file and therefore fall back
+// to the analytical path inside getAtmosphericTransmittanceForDir.
+#define ATMOSPHERE_TRANSMITTANCE_LUT_AVAILABLE
 
 layout(binding = BINDING_ATMOSPHERE_MULTISCATTERING_LUT)
 Texture2D AtmosphereMultiscatteringLut;
 
 layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_LUT)
 Texture2D AtmosphereSkyViewLut;
+
+// Linear sampler matched to the sky-view LUT parameterization:
+// REPEAT-U for azimuth wrap at 0/2π, CLAMP-V for elevation so the bilinear
+// at the pole rows doesn't mix horizon values across zenith/nadir.
+layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER)
+SamplerState AtmosphereSkyViewSampler;
+
+layout(binding = BINDING_ATMOSPHERE_CLOUD_NOISE_3D)
+Texture3D<float> AtmosphereCloudNoise3D;
+
+layout(binding = BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER)
+SamplerState AtmosphereCloudNoise3DSampler;
+
+layout(binding = BINDING_ATMOSPHERE_FAST_NOISE)
+Texture2DArray<float2> AtmosphereFastNoise;
+
+// Cloud history textures (fork). Read view is the previous frame's accumulated
+// cloud (rgb = premultiplied radiance, a = alpha); write view is the current
+// frame's accumulator. Used by the temporal-smoothing path inside
+// evalSkyRadiance to kill DLSS-perceived flatness from per-frame FAST jitter.
+layout(rgba16f, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_PREV)
+Texture2D<float4> AtmosphereCloudHistoryPrev;
+
+layout(rgba16f, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_CURR)
+RWTexture2D<float4> AtmosphereCloudHistoryCurr;
+
+// Cloud history frame-id ping-pong (fork). R16_UINT companion textures
+// carrying the frame index at which each pixel of the color buffer above was
+// last written by the sky-miss path. Read at lookup time to reject stale
+// history from pixels that were foreground-occluded last frame — those
+// pixels' color slots retain pre-occlusion radiance because the sky-miss
+// path didn't run there, so the alpha-only disocclusion guard would
+// otherwise treat a multi-frame-old bright cloud as valid history and
+// produce long bright trails when the foreground moves away. Cleared to
+// 0xFFFF (UINT16_MAX) at allocation as a "never-written" sentinel.
+layout(r16ui, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV)
+Texture2D<uint> AtmosphereCloudHistoryFrameIdPrev;
+
+layout(r16ui, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR)
+RWTexture2D<uint> AtmosphereCloudHistoryFrameIdCurr;

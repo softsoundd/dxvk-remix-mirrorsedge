@@ -1,0 +1,52 @@
+// Perceptual eye-adaptation helpers — v1
+//
+// Tiny helper namespace for asymmetric exponential adaptation in
+// luminance / exposure space.  The eye dims down quickly when a scene
+// brightens (photopic / light_tau, ~0.10-0.20 s) and brightens slowly
+// when it dims (scotopic / dark_tau, ~0.50-1.50 s).  These helpers
+// provide the temporal smoothing primitive used by the auto-exposure
+// resolve pass.
+//
+// ---------------------------------------------------------------------------
+// Source attribution
+// ---------------------------------------------------------------------------
+// The asymmetric exponential-blend approach mirrors the eye-adaptation
+// helpers from the renodx project by Carlos Lopez Jr., released under
+// the MIT License. The renodx MIT notice (reproduced in full in
+// psycho17.slangh in this directory) applies to the renodx-derived
+// portions of this file.
+//
+// Original reference:
+//   https://github.com/clshortfuse/renodx
+//
+//   MIT License
+//   Copyright (c) 2025 Carlos Lopez Jr.
+// ---------------------------------------------------------------------------
+
+#ifndef ADAPTATION_V1_SLANGH
+#define ADAPTATION_V1_SLANGH
+
+namespace adaptation {
+namespace v1 {
+
+// Exponential approach toward target_value with time constant tau_seconds.
+float ExponentialBlend(float current_value, float target_value,
+                       float delta_time, float tau_seconds) {
+  if (tau_seconds <= 0.0f) return target_value;
+  float alpha = 1.0f - exp(-max(delta_time, 0.0f) / tau_seconds);
+  return lerp(current_value, target_value, saturate(alpha));
+}
+
+// Asymmetric adaptation: use light_tau when scene brightens, dark_tau when it dims.
+float AdaptAsymmetric(float current_lum, float target_lum,
+                      float delta_time,
+                      float light_tau_seconds, float dark_tau_seconds) {
+  return (target_lum > current_lum)
+      ? ExponentialBlend(current_lum, target_lum, delta_time, light_tau_seconds)
+      : ExponentialBlend(current_lum, target_lum, delta_time, dark_tau_seconds);
+}
+
+} // namespace v1
+} // namespace adaptation
+
+#endif // ADAPTATION_V1_SLANGH

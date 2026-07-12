@@ -172,14 +172,6 @@ namespace dxvk {
 
   RtxGlobalVolumetrics::RtxGlobalVolumetrics(DxvkDevice* device) : CommonDeviceObject(device), RtxPass(device) {}
 
-  void RtxGlobalVolumetrics::onFroxelResourceOptionsChanged(DxvkDevice* device) {
-    if (device == nullptr) {
-      return;
-    }
-
-    device->getCommon()->metaGlobalVolumetrics().m_rebuildFroxels = true;
-  }
-
   // Quality level presets, x component controls the froxelGridResolutionScale and the y component controls the froxelDepthSlices settings.
   static const int2 qualityModes[RtxGlobalVolumetrics::QualityLevel::QualityCount] = {
     int2(32, 48),
@@ -236,8 +228,8 @@ namespace dxvk {
       RemixGui::Checkbox("Show Advanced Options", &showAdvanced);
 
       if (showAdvanced) {
-        RemixGui::DragInt("Froxel Grid Resolution Scale", &froxelGridResolutionScaleObject(), 0.1f, 1);
-        RemixGui::DragInt("Froxel Depth Slices", &froxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
+        m_rebuildFroxels |= RemixGui::DragInt("Froxel Grid Resolution Scale", &froxelGridResolutionScaleObject(), 0.1f, 1);
+        m_rebuildFroxels |= RemixGui::DragInt("Froxel Depth Slices", &froxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
         RemixGui::DragInt("Max Accumulation Frames", &maxAccumulationFramesObject(), 0.1f, 1, UINT8_MAX);
         RemixGui::DragFloat("Froxel Depth Slice Distribution Exponent", &froxelDepthSliceDistributionExponentObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Max Distance", &froxelMaxDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -250,8 +242,8 @@ namespace dxvk {
 
         ImGui::BeginDisabled(enableReferenceMode());
 
-        RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1);
-        RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
+        m_rebuildFroxels |= RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1);
+        m_rebuildFroxels |= RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
         RemixGui::DragFloat("Restir Guard Band Scale Factor", &restirGridGuardBandFactorObject(), 0.1f, 1.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 
         RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX);
@@ -321,10 +313,14 @@ namespace dxvk {
 
         if (showAdvanced) {
           RemixGui::Checkbox("Enable Translucent Shadows", &enableTranslucentShadowsObject());
-          RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f");
+          RemixGui::ColorEdit3("Transmittance Color", &transmittanceColorObject());
           RemixGui::DragFloat("Transmittance Measurement Distance", &transmittanceMeasurementDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f");
+          RemixGui::ColorEdit3("Single Scattering Albedo", &singleScatteringAlbedoObject());
           RemixGui::DragFloat("Anisotropy", &anisotropyObject(), 0.01f, -.99f, .99f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Fog Sun Visibility Gain", &fogSunVisibilityGainObject(), 0.05f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          // Sun-only counterpart to the gain above (issue #35): scales just the
+          // atmosphere sun's fog contribution, leaving scene-light fog untouched.
+          RemixGui::DragFloat("Atmosphere Sun Fog Scale", &RtxOptions::atmosphereSunVolumetricRadianceScaleObject(), 0.05f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Depth Offset", &depthOffsetObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
           RemixGui::Separator();
@@ -412,8 +408,24 @@ namespace dxvk {
       qualityPreset = qualityModes[desiredQualityLevel];
     }
 
-    froxelGridResolutionScale.setDeferred(static_cast<uint32_t>(qualityPreset.x));
-    froxelDepthSlices.setDeferred(static_cast<uint16_t>(qualityPreset.y));
+    // Set new values based on preset values and cache old values
+
+    const auto newFroxelGridResolutionScale = qualityPreset.x;
+    const auto newFroxelDepthSlices = qualityPreset.y;
+    const auto oldFroxelGridResolutionScale = froxelGridResolutionScale();
+    const auto oldFroxelDepthSlices = froxelDepthSlices();
+
+    froxelGridResolutionScale.setDeferred(newFroxelGridResolutionScale);
+    froxelDepthSlices.setDeferred(newFroxelDepthSlices);
+
+    // Indicate that the froxel resources should be rebuilt if any relevant values changed
+
+    if (
+      newFroxelGridResolutionScale != oldFroxelGridResolutionScale ||
+      newFroxelDepthSlices != oldFroxelDepthSlices
+    ) {
+      m_rebuildFroxels = true;
+    }
   }
 
   void RtxGlobalVolumetrics::setPreset(const PresetType presetType) {
@@ -592,6 +604,8 @@ namespace dxvk {
     volumeArgs.multiScatteringEstimate = multiScatteringEstimate;
     volumeArgs.enableReferenceMode = enableReferenceMode();
     volumeArgs.volumetricFogAnisotropy = anisotropy();
+    volumeArgs.fogSunVisibilityGain = fogSunVisibilityGain();
+    volumeArgs.volumetricConsumerGain = volumetricConsumerGain();
 
     volumeArgs.enableNoiseFieldDensity = enableHeterogeneousFog();
     volumeArgs.noiseFieldSubStepSize = noiseFieldSubStepSizeMeters() * RtxOptions::getMeterToWorldUnitScale();
@@ -790,6 +804,7 @@ namespace dxvk {
 
     if (m_rebuildFroxels) {
       createDownscaledResource(ctx, frameBeginCtx.downscaledExtent);
+      m_rebuildFroxels = false;
     }
   }
 
@@ -823,8 +838,6 @@ namespace dxvk {
 
     m_volumeReservoirs[0] = Resources::createImageResource(ctx, "volume reservoir 0", restirFroxelGridFullDimensions, VK_FORMAT_R32G32B32A32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeReservoirs[1] = Resources::createImageResource(ctx, "volume reservoir 1", restirFroxelGridFullDimensions, VK_FORMAT_R32G32B32A32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
-
-    m_rebuildFroxels = false;
   }
 
   void RtxGlobalVolumetrics::releaseDownscaledResource() {

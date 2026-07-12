@@ -450,6 +450,20 @@ extern "C" {
       interf.SetConfigVariable = remixapi_SetConfigVariable;
       interf.dxvk_CreateD3D9 = remixapi_dxvk_CreateD3D9;
       interf.dxvk_RegisterD3D9Device = remixapi_dxvk_RegisterD3D9Device;
+      // Fork-added Remix API entry points. dxvk-remix's d3d9.dll implements
+      // these for real (rtx_remix_api.cpp:2244+ / 2357+ / 2409+ / 2413+), but
+      // they are not yet plumbed through the bridge IPC channel. Without a
+      // populated function pointer here the slots are NULL and 32-bit clients
+      // crash the moment they call interf.GetUIState() / SetUIState() /
+      // AutoInstancePersistentLights() / UpdateLightDefinition(). The stubs
+      // below return safe defaults so the bridge stays alive; full IPC
+      // forwarding is a follow-up task tracked separately.
+      interf.GetUIState                   = remixapi_GetUIState;
+      interf.SetUIState                   = remixapi_SetUIState;
+      interf.AutoInstancePersistentLights = remixapi_AutoInstancePersistentLights;
+      interf.UpdateLightDefinition        = remixapi_UpdateLightDefinition;
+      interf.SetGameValue                 = remixapi_SetGameValue;
+      interf.GetGameValue                 = remixapi_GetGameValue;
       // interf.dxvk_GetExternalSwapchain = remixapi_dxvk_GetExternalSwapchain;
       // interf.dxvk_GetVkImage = remixapi_dxvk_GetVkImage;
       // interf.dxvk_CopyRenderingOutput = remixapi_dxvk_CopyRenderingOutput;
@@ -476,6 +490,121 @@ extern "C" {
     remixapi::g_endSceneCallback = endSceneCallback;
     remixapi::g_presentCallback = presentCallback;
     return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // ---- Fork-added Remix API entry points (client-side stubs) ----
+  // Mirror the surface dxvk-remix exposes (rtx_remix_api.cpp ~2244, ~2357,
+  // ~2409, ~2413) so the function pointers in remixapi_Interface aren't NULL
+  // for 32-bit clients. These stubs do NOT forward over IPC yet — full
+  // plumbing is a follow-up. Each logs once the first time it's called so
+  // the user sees that the feature isn't reachable through the bridge.
+
+  DLLEXPORT remixapi_UIState __stdcall remixapi_GetUIState(void) {
+    static bool warned = false;
+    if (!warned) {
+      Logger::warn("[remixapi_GetUIState] Bridge stub: returning REMIXAPI_UI_STATE_NONE. "
+                   "Remix UI state queries are not yet plumbed through the bridge.");
+      warned = true;
+    }
+    return REMIXAPI_UI_STATE_NONE;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_SetUIState(remixapi_UIState state) {
+    (void) state;
+    static bool warned = false;
+    if (!warned) {
+      Logger::warn("[remixapi_SetUIState] Bridge stub: no-op. "
+                   "Remix UI state changes are not yet plumbed through the bridge.");
+      warned = true;
+    }
+    return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_AutoInstancePersistentLights(void) {
+    static bool warned = false;
+    if (!warned) {
+      Logger::warn("[remixapi_AutoInstancePersistentLights] Bridge stub: no-op. "
+                   "Persistent-light auto-instancing is not yet plumbed through the bridge.");
+      warned = true;
+    }
+    return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_UpdateLightDefinition(
+    remixapi_LightHandle      handle,
+    const remixapi_LightInfo* info) {
+    (void) handle;
+    (void) info;
+    static bool warned = false;
+    if (!warned) {
+      Logger::warn("[remixapi_UpdateLightDefinition] Bridge stub: no-op. "
+                   "Light-definition updates are not yet plumbed through the bridge — "
+                   "lights created via CreateLight cannot be updated from 32-bit clients yet.");
+      warned = true;
+    }
+    return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_SetGameValue(
+    const char* key,
+    const char* value) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_SetGameValue);
+    if (key == nullptr || key[0] == '\0') {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (value == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_SetGameValue);
+      currentUID = c.get_uid();
+      send(c, key);
+      send(c, value);
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_SetGameValue", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
+    DeviceBridge::pop_front();
+    return result;
+  }
+
+  DLLEXPORT remixapi_ErrorCode __stdcall remixapi_GetGameValue(
+    const char* key,
+    char*       out_buffer,
+    uint32_t    in_buffer_size,
+    uint32_t*   out_actual_size) {
+    ASSERT_REMIXAPI_PFN_TYPE(remixapi_GetGameValue);
+    if (key == nullptr || key[0] == '\0') {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (out_actual_size == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (in_buffer_size > 0 && out_buffer == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    UID currentUID = 0;
+    {
+      ClientMessage c(Commands::RemixApi_GetGameValue);
+      currentUID = c.get_uid();
+      send(c, key);
+      c.send_data(in_buffer_size);
+    }
+    WAIT_FOR_SERVER_RESPONSE("remixapi_GetGameValue", REMIXAPI_ERROR_CODE_GENERAL_FAILURE, currentUID);
+    const remixapi_ErrorCode result = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
+    const uint32_t actual = DeviceBridge::get_data();
+    *out_actual_size = actual;
+    if (actual > 0 && in_buffer_size >= actual) {
+      // Server sent the value bytes when the caller's buffer was large enough.
+      void* value_ptr = nullptr;
+      const uint32_t value_size = DeviceBridge::get_data(&value_ptr);
+      (void) value_size;
+      memcpy(out_buffer, value_ptr, actual);
+    }
+    DeviceBridge::pop_front();
+    return result;
   }
 
 }

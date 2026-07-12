@@ -231,13 +231,14 @@
 #define RAB_HAS_PREVIOUS_GBUFFER 1
 #define RAB_HAS_RTXDI_RESERVOIRS 1
 
-// Note: ReSTIR GI Reservoirs are not available with NRC enabled, but 
+// Note: ReSTIR GI Reservoirs are not available with NRC enabled, but
 // the usage of the reservoirs is gated on ReSTIR GI being enabled
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat
 // important in reflections off shiny surfaces (as without this it can make areas with many particles look weird in reflections).
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1
 #define RESOLVER_USE_VOLUMETRIC_ATTENUATION 1
+#define ATMOSPHERE_AVAILABLE
 
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/common_bindings.slangh"

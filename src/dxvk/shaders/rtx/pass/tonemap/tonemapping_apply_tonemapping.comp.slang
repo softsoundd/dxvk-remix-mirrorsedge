@@ -20,14 +20,16 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
+#include "rtx/pass/tonemap/tonemapping_noise.slangh"
+#include "rtx/pass/tonemap/fork_tonemap_operators.slangh"
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/color.slangh"
 
+[[vk::binding(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT)]]
+Texture2DArray BlueNoise;
+
 [[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT)]]
 RWTexture2D<float4> InColorBuffer;
-
-[[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT)]]
-Sampler1D<float> InToneCurve;
 
 [[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT)]]
 RWTexture1D<float> InExposure;
@@ -38,136 +40,87 @@ RWTexture2D<float4> OutColorBuffer;
 layout(push_constant)
 ConstantBuffer<ToneMappingApplyToneMappingArgs> cb;
 
-float lumaAverage(float3 color) 
+// Apply post-tonemap color grading: tint, contrast, saturation.
+float3 colorGrading(float3 inputColor)
 {
-  return dot(color, float3(1.f / 3.f));
-}
-
-float3 setSaturation(float3 color, float saturation) 
-{
-  return mix(float3(calcBt709Luminance(color)), color, saturation);
-}
-
-float3 setSaturationAverage(float3 color, float saturation) 
-{
-  return mix(float3(lumaAverage(color)), color, saturation);
-}
-
-float3 colorGrading(float3 inputColor) 
-{
-  // Apply color temperature & tint
+  // Tint.
   inputColor = inputColor * cb.colorBalance;
-  
-  // Adjust contrast & saturation
-  inputColor = saturate((cb.contrast * (inputColor - 0.18f)) + 0.18f); // 0.18 = Mid level grey
-  inputColor = setSaturation(inputColor, cb.saturation);
-  
+
+  // Contrast around 18% mid grey.
+  inputColor = saturate((cb.contrast * (inputColor - 0.18f)) + 0.18f);
+
+  // Saturation around BT.709 luminance.
+  inputColor = mix(float3(calcBt709Luminance(inputColor)), inputColor, cb.saturation);
+
   return inputColor;
-}
-
-// Photographic Tone Reproduction for Digital Images
-// http://www.cs.utah.edu/~reinhard/cdrom/tonemap.pdf
-float3 reinhardToneMapper(float3 inputColor) 
-{
-  float inputLuminance = calcBt709Luminance(inputColor);
-  
-  // (Eq. 4) Scale the luminance down to compress bright highlights to representable LDR values
-  float outputLuminance = inputLuminance / (1.0f + inputLuminance);
-  
-  // (Not Reinhard Operator) Make the curve S-shaped to boost shadow contrast
-  // Should only activate when outputLuminance < e^gToneMappingShadowContrastEnd
-  outputLuminance *= pow(min(1.0f, outputLuminance * exp(-cb.shadowContrastEnd)), cb.shadowContrast);
-  
-  // Apply output luminance to the input
-  return inputColor * (outputLuminance / inputLuminance);  
-}
-
-// Heji and Burgess-Dawson tone curve, from
-// http://filmicworlds.com/blog/filmic-tonemapping-operators/
-float3 filmicToneMapper(float3 inputColor) 
-{
-  float3 x = max(float3(0), inputColor - float3(0.004));
-  x = (x * (6.2f * x + 0.5f)) / (x * (6.2f * x + 1.7f) + 0.06f);
-  
-  return pow(x, float3(2.2));
-}
-
-
-// Dynamic tone mapper based on Eilertsen, Mantiuk, and Unger's paper
-// *Real-time noise-aware tone mapping*. Applies a luminance-based tone 
-// curve and then applies filmic saturation emulation.
-float3 dynamicToneMapper(float3 inputColor) 
-{
-  // Calculate luminance of color, and avoid values that would result in computing the log of 0:
-  float luminance = max(calcBt709Luminance(inputColor), exp2(cb.toneCurveMinStops));
-  
-  // Map to the space the tone curve uses:
-  const float logLuminance = log2(luminance);
-  const float biasedLuminance = (logLuminance - cb.toneCurveMinStops) / (cb.toneCurveMaxStops - cb.toneCurveMinStops);
-  
-  // We can now use the sampler to perform linear interpolation!
-  // Note that we're doing this on a log-log chart of the tone curve.
-  const float outLogLuminance = InToneCurve.SampleLevel(biasedLuminance, 0).r;  
-  float outLuminance = exp2(outLogLuminance);
-    
-  // Apply the luminance shift to the color:
-  float3 mappedColor = inputColor * outLuminance / luminance;
-  
-  return mappedColor;
 }
 
 float3 applyToneMapping(float3 color, uint2 pixelPosition)
 {
   color *= getExposure(InExposure, cb.enableAutoExposure, cb.exposureFactor);
 
-  if (cb.toneMappingEnabled != 0) 
+  if (cb.toneMappingEnabled != 0)
   {
-    if (cb.debugMode == 0) 
-    {
-      // Normal tone mapping
-      color = dynamicToneMapper(color);
-      
-      if (cb.finalizeWithACES)
-      {
-        color = ACESFilm(color, cb.useLegacyACES);
-      }
-    } 
-    else
-    {
-      // Debug mode
-      float2 texCoord = pixelPosition / float2(imageSize(InColorBuffer));
-      
-      // Show tonemapped result on one side of screen
-      if (texCoord.x > 0.475f) 
-      {
-        color = dynamicToneMapper(color);
-      }
-      
-      // Plot the tone curve
-      float histogramValue = InToneCurve.SampleLevel(texCoord.x, 0).r;
-      
-      // Division by 15.5876 makes it so that the bottom of the screen corresponds to a value of 1/255 on an 8-bit sRGB monitor, 
-      // and the top of the screen corresponds to a value of 255/255 
-      const float curveScale = 0.5; // additional scale to display a wider range of curve values
-      float plotValue = 1.0 + histogramValue * curveScale / 15.5876; // 15.5876 = log_2(255^2.2)
-      plotValue = 1.0f - plotValue / 1.0;  // Reverse Y coordinate to plot from bottom-up of the image
-      float width = 0.01f;
-      
-      if (texCoord.y >= plotValue - width/2 && texCoord.y <= plotValue + width/2) 
-      {
-        color = mix(color, float3(1.0f, 1.0f, 1.0f), 0.5f);
-      }
-    }
+    // Observer adaptive state passed to psycho17; all other operators
+    // ignore this parameter. Fixed at the renodx reference mid-gray
+    // (0.18, 0.18, 0.18) unconditionally — AE state is not wired in.
+    const float3 adaptiveStateBT709 = float3(0.18f, 0.18f, 0.18f);
+
+    color = applyTonemapOperator(cb.tonemapOperator, color, /*suppressBlackLevelClamp=*/false,
+                                 cb.hableExposureBias,
+                                 cb.hableShoulderStrength,
+                                 cb.hableLinearStrength,
+                                 cb.hableLinearAngle,
+                                 cb.hableToeStrength,
+                                 cb.hableToeNumerator,
+                                 cb.hableToeDenominator,
+                                 cb.hableWhitePoint,
+                                 cb.agxSaturation,
+                                 cb.agxLook,
+                                 cb.psycho17PeakValue,
+                                 cb.psycho17Exposure,
+                                 cb.psycho17Highlights,
+                                 cb.psycho17Shadows,
+                                 cb.psycho17Contrast,
+                                 cb.psycho17PurityScale,
+                                 cb.psycho17BleachingIntensity,
+                                 cb.psycho17ClipPoint,
+                                 cb.psycho17HueRestore,
+                                 cb.psycho17AdaptationContrast,
+                                 cb.psycho17WhiteCurveMode,
+                                 cb.psycho17ConeResponseExponent,
+                                 cb.psycho17GamutCompression,
+                                 cb.psycho17GamutCompressionMode,
+                                 adaptiveStateBT709);
   }
-  
+
   if (cb.colorGradingEnabled > 0)
   {
     color = colorGrading(color);
   }
 
-  // sRGB conversion and dithering are now performed by the final output pass,
-  // which runs after all post-process effects (lens effects, etc.).
-  return color;
+  if (cb.performSRGBConversion > 0)
+  {
+    color = linearToGamma(color);
+  }
+
+  // Apply dithering to the output to break up banding artifacts. First-order
+  // only; ideally we would dither in linear space using sRGB range info, but
+  // the resulting error is small.
+  // fork — 2026-06-27 (experimental): only dither when this pass actually
+  // encoded to gamma. The fork's tonemap refactor defers sRGB conversion to the
+  // dedicated srgb_dither pass (performSRGBConversion=false here), so dithering
+  // here would add the ±0.5/255 perturbation in LINEAR space — which the later
+  // linearToGamma in srgb_dither amplifies ~13x in the near-black toe, producing
+  // a heavy boiling grain only in dark regions (plus a redundant double-dither).
+  // Gating on performSRGBConversion ties the dither to the space it is valid in.
+  return ditherTo8Bit(
+    color,
+    pixelPosition,
+    cb.frameIndex,
+    cb.performSRGBConversion > 0 && cb.ditherMode != ditherModeNone,
+    cb.ditherMode == ditherModeSpatialTemporal
+  );
 }
 
 [shader("compute")]
@@ -178,7 +131,7 @@ void main(uint2 threadId : SV_DispatchThreadID)
 
   float3 outputColor = applyToneMapping(inputColor, threadId);
 
-  // clamp outputColor to avoid problems with NIS
+  // Clamp outputColor to avoid problems with NIS.
   outputColor = saturate(outputColor);
 
   OutColorBuffer[threadId] = vec4(outputColor, 1.0f);

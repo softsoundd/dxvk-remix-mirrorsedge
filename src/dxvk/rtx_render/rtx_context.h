@@ -32,6 +32,7 @@
 #include <chrono>
 #include <memory>
 #include <array>
+#include <optional>
 #include "rtx_options.h"
 
 struct VolumeArgs;
@@ -54,6 +55,26 @@ namespace dxvk {
     uint32_t firstIndex = 0;
     uint32_t vertexOffset = 0;
   };
+
+  // Forward declarations of fork_hooks functions that require friend access to
+  // RtxContext private members, so the friend declarations inside the class body
+  // can name them. See rtx_fork_hooks.h for the full hook catalogue.
+  class RtxContext;
+  namespace fork_weather {
+    class WeatherBlender;
+  } // namespace fork_weather
+  namespace fork_hooks {
+    void initAtmosphere(RtxContext&);
+    void updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
+    void bindAtmosphereLuts(RtxContext&);
+    void dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
+    void updateWeatherBlender(RtxContext& ctx, float deltaTimeSeconds);
+    Resources::Resource getCloudSkyTransmittanceLut(RtxContext& ctx);
+    Resources::Resource getCloudDSun(RtxContext& ctx);
+    Resources::Resource getCloudDAmbient(RtxContext& ctx);
+    Resources::Resource getCloudRenderRT(RtxContext& ctx);
+  } // namespace fork_hooks
+
   /** 
    * \brief RTX context
    * 
@@ -114,7 +135,7 @@ namespace dxvk {
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
 
     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
-    void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
+    void commitExternalGeometryToRT(ExternalDrawState&& state);
 
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
@@ -125,6 +146,9 @@ namespace dxvk {
   
     static void triggerScreenshot() { s_triggerScreenshot = true; }
     static void triggerUsdCapture() { s_triggerUsdCapture = true; }
+
+    // Used by remixapi_DrawScreenOverlay. Ownership of stagingBuffer transfers here.
+    void setScreenOverlayData(Rc<DxvkBuffer> stagingBuffer, uint32_t width, uint32_t height, VkFormat format, float opacity);
 
     void bindCommonRayTracingResources(const Resources::RaytracingOutput& rtOutput);
 
@@ -207,6 +231,7 @@ namespace dxvk {
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
     void dispatchDLFG();
+    void dispatchScreenOverlay(Resources::RaytracingOutput& rtOutput);
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
     void initSkyProbe();
@@ -237,6 +262,7 @@ namespace dxvk {
     SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
 
     std::unique_ptr<RtxAtmosphere> m_atmosphere;
+    std::unique_ptr<fork_weather::WeatherBlender> m_weatherBlender;
 
     bool shouldUseDLSS() const;
     bool shouldUseRayReconstruction() const;
@@ -276,6 +302,22 @@ namespace dxvk {
 
     std::vector<DrawCallState> m_delayedRayTracedSky;
 
+    // Screen overlay state - populated by remixapi_DrawScreenOverlay via setScreenOverlayData,
+    // consumed and cleared by dispatchScreenOverlay once per frame.
+    struct ScreenOverlayFrame {
+      Rc<DxvkBuffer> stagingBuffer;
+      uint32_t width = 0;
+      uint32_t height = 0;
+      VkFormat format = VK_FORMAT_UNDEFINED;
+      float opacity = 1.0f;
+    };
+    std::optional<ScreenOverlayFrame> m_pendingScreenOverlay;
+    Rc<DxvkImage> m_screenOverlayImage;
+    Rc<DxvkImageView> m_screenOverlayView;
+    uint32_t m_screenOverlayWidth = 0;
+    uint32_t m_screenOverlayHeight = 0;
+    VkFormat m_screenOverlayFormat = VK_FORMAT_UNDEFINED;
+
 #ifdef REMIX_DEVELOPMENT
     void queryAvailableResourceAliasing();
     void clearResourceAliasingCache();
@@ -294,5 +336,15 @@ namespace dxvk {
 
     RtxFramePassStage m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
+
+    friend void fork_hooks::initAtmosphere(RtxContext&);
+    friend void fork_hooks::updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
+    friend void fork_hooks::bindAtmosphereLuts(RtxContext&);
+    friend void fork_hooks::dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
+    friend void fork_hooks::updateWeatherBlender(RtxContext& ctx, float deltaTimeSeconds);
+    friend Resources::Resource fork_hooks::getCloudSkyTransmittanceLut(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudDSun(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudDAmbient(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudRenderRT(RtxContext& ctx);
   };
 } // namespace dxvk

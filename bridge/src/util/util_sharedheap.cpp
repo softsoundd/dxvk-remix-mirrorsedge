@@ -91,7 +91,8 @@ bool SharedHeap::Instance::addNewHeapSegment() {
   const std::string shMemName =
     std::string("SharedHeap_data_") + std::to_string(m_segments.size());
   bool bSuccess = false;
-  const size_t segmentSizeUnaligned = std::min((kMax32BitHeapSize - getTotalHeapSize()), m_defaultSegmentSize);
+  const size_t remainingHeap = static_cast<size_t>(kMax32BitHeapSize) - getTotalHeapSize();
+  const size_t segmentSizeUnaligned = std::min(remainingHeap, static_cast<size_t>(m_defaultSegmentSize));
   // Align segment size to chunk size
   size_t segmentSize = segmentSizeUnaligned & ~(m_chunkSize - 1);
   Logger::debug("[SharedHeap][addNewHeapSegment] Attempting to create new SharedHeap segment.");

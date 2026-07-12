@@ -1,0 +1,119 @@
+/*
+* Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Source attribution
+// ---------------------------------------------------------------------------
+// This file is a Slang port of the renodx "Neutwo" max-channel pre-scale
+// helper, intended as a reusable LUT/curve normalization wrapper for any
+// tonemap operator that expects [0, 1] input (e.g. AgX).
+//
+// Original implementation:
+//   https://github.com/clshortfuse/renodx
+//   src/shaders/tonemap/neutwo.hlsl
+//     - renodx::tonemap::Neutwo(x)                 (single-argument variant)
+//     - renodx::tonemap::neutwo::ComputeMaxChannelScale(float3)
+//
+// Reference usage pattern (renodx):
+//   float scale = renodx::tonemap::neutwo::ComputeMaxChannelScale(color);
+//   color *= scale;
+//   color  = applyLUT(color);   // or any [0,1]-domain tone curve
+//   color  = color / scale;
+//
+// The renodx project is released under the MIT License. The license text
+// applicable to all renodx-derived code in this file is reproduced
+// verbatim below, as required by the MIT License's permission clause:
+//
+//   MIT License
+//
+//   Copyright (c) 2025 Carlos Lopez Jr.
+//
+//   Permission is hereby granted, free of charge, to any person obtaining
+//   a copy of this software and associated documentation files (the
+//   "Software"), to deal in the Software without restriction, including
+//   without limitation the rights to use, copy, modify, merge, publish,
+//   distribute, sublicense, and/or sell copies of the Software, and to
+//   permit persons to whom the Software is furnished to do so, subject
+//   to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be
+//   included in all copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+//   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+//   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+//   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+//   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+//   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+//
+// Port notes (dxvk-remix fork):
+// - Only the single-argument Neutwo curve and the float3 variant of
+//   ComputeMaxChannelScale are ported here; the peak / clip overloads
+//   from renodx are not currently needed by any consumer.
+// - Symbols use a neutwo_ prefix to stay self-contained and to avoid
+//   colliding with other tonemap helpers.
+
+// Neutwo(x) = x * rsqrt(x*x + 1)
+//
+// A smooth, monotonically-increasing saturation curve that maps
+// [0, +inf) -> [0, 1). Used both as a standalone tonemap and as the
+// kernel for ComputeMaxChannelScale below.
+float neutwo_Neutwo(float x)
+{
+  return x * rsqrt(x * x + 1.0f);
+}
+
+// neutwo_ComputeMaxChannelScale(color)
+//
+// Returns a single channel-coherent scale `s` such that `max_channel * s`
+// lies in [0, 1]. Multiplying the input by `s` before a [0,1]-domain
+// curve (LUT, AgX, etc.) and dividing the output by `s` afterwards lets
+// the curve operate on a normalized input and then restores the input's
+// HDR-ish dynamic range without per-channel hue shifts.
+//
+// Returns 1.0 when the input is exactly zero (degenerate case).
+float neutwo_ComputeMaxChannelScale(float3 color)
+{
+  float maxCh = max(max(abs(color.r), abs(color.g)), abs(color.b));
+  float newMax = neutwo_Neutwo(maxCh);
+  return maxCh != 0.0f ? (newMax / maxCh) : 1.0f;
+}
+
+float3 neutwo_MaxChannel(float3 x)
+{
+    float maxCh = max(max(abs(x.r), abs(x.g)), abs(x.b));
+    float scaled = neutwo_Neutwo(maxCh);
+    return x * (scaled / maxCh);
+}
+
+float3 neutwo_PerChannel(float3 x)
+{
+    float3 scaled;
+    scaled.r = neutwo_Neutwo(x.r);
+    scaled.g = neutwo_Neutwo(x.g);
+    scaled.b = neutwo_Neutwo(x.b);
+    return scaled;
+}

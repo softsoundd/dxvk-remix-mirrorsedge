@@ -70,12 +70,12 @@
 #endif
 #endif
 
+#if !defined(REMIX_BRIDGE_CLIENT) && !defined(REMIX_BRIDGE_SERVER)
 #ifndef _WIN64
-#undef REMIX_BRIDGE_CLIENT
 #define REMIX_BRIDGE_CLIENT
 #else
-#undef REMIX_BRIDGE_SERVER
 #define REMIX_BRIDGE_SERVER
+#endif
 #endif
 
 #if defined(__GNUC__)

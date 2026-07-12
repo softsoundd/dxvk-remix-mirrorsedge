@@ -40,18 +40,24 @@ SamplerState lutSampler;
 layout(binding = 4, rgba16f)
 RWTexture2D<float4> skyViewLutOutput;
 
-// Compute sky color for a given view direction
-vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
+// Compute sky color for a given view direction.
+// transmittanceLut and multiscatteringLut are forwarded to evalAtmosphereRadiance
+// so the full LUT-driven scattering path is used instead of analytical fallbacks.
+vec3 computeSkyView(vec2 uv, AtmosphereArgs args,
+                    Texture2D<float4> transmittanceLut,
+                    SamplerState lutSampler,
+                    Texture2D<float4> multiscatteringLut) {
   // Assume camera at ground level
   float cameraAltitude = 0.0f;
   vec3 cameraPos = vec3(0.0f, cameraAltitude, 0.0f);
-  
-  // Convert UV to spherical coordinates
-  // uv.x: azimuth [0, 2π]
-  // uv.y: elevation [-π/2, π/2] mapped from [0, 1]
+
+  // Non-linear elevation encoding (matches reference bufferB.glsl):
+  // l*l*sign(l) concentrates texels near the horizon where color gradients
+  // are steepest; sampleSkyViewLutForRay inverts this transform on lookup.
   float azimuth = uv.x * 2.0f * kPi;
-  float elevation = (uv.y - 0.5f) * kPi;
-  
+  float l = uv.y * 2.0f - 1.0f;
+  float elevation = l * l * sign(l) * kPi * 0.5f;  // [-π/2, π/2], non-linear
+
   // Construct view direction
   float cosElevation = cos(elevation);
   float sinElevation = sin(elevation);
@@ -61,17 +67,20 @@ vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
     cosElevation * sin(azimuth)
   );
   viewDir = normalize(viewDir);
-  
-  // Compute atmosphere radiance along this ray
+
+  // Compute atmosphere radiance along this ray using precomputed LUTs
   vec3 sunDir = args.sunDirection;
   vec3 radiance = evalAtmosphereRadiance(
     cameraPos,
     viewDir,
     sunDir,
     args,
+    transmittanceLut,
+    lutSampler,
+    multiscatteringLut,
     32  // numSamples
   );
-  
+
   return radiance;
 }
 
@@ -89,7 +98,7 @@ void main(uint2 threadId : SV_DispatchThreadID) {
   vec2 uv = (vec2(threadId) + 0.5f) / vec2(args.skyViewLutWidth, args.skyViewLutHeight);
   
   // Compute sky appearance for this direction
-  vec3 skyColor = computeSkyView(uv, args);
+  vec3 skyColor = computeSkyView(uv, args, transmittanceLutInput, lutSampler, multiscatteringLutInput);
   
   // Write result
   skyViewLutOutput[threadId] = float4(skyColor, 1.0f);

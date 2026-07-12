@@ -1,0 +1,1082 @@
+/*
+* Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Hillaire Physically-Based Atmospheric Scattering — sky-path evaluators.
+// View-direction functions composed into evalSkyRadiance: clouds, moons,
+// night sky (stars + galactic band + shooting stars + airglow), sun disk.
+// Closesthit and integrate paths that don't sample sky radiance keep their
+// existing atmosphere_common.slangh include only — the sky-only functions
+// here then never end up in their compiled SPIR-V.
+//
+// Cloud and atmosphere helpers used by both the sky path and the ground
+// shadow term (intersectSphere, cloudPlanetRadius, computeCloudHeightFraction,
+// sampleCloudDensityTextured, intersectCloudLayer, evalCloudGroundShadow,
+// getTransmittanceToSun, evalAtmosphereRadiance, hash31, fbmNoise2D, etc.)
+// stay in atmosphere_common.slangh and are pulled in via the include below.
+
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+
+// ============================================================================
+// Night sky — stars, galactic band, shooting stars, airglow
+// ============================================================================
+// Composited inside the Numos sky path; users on the default
+// Skybox Rasterization sky mode see no behavior change.
+
+// 3-component integer-lattice hash (sky-only — the cloud layer doesn't need
+// a 3-vector hash, it uses hash31 for sample-seam jitter).
+vec3 hash33(vec3 p) {
+  // Integer hash — avoids sin() which creates visible patterns on GPU
+  uvec3 q = uvec3(int(p.x * 1597.0f), int(p.y * 2549.0f), int(p.z * 3571.0f));
+  q = (q.x ^ q.y ^ q.z) * uvec3(2654435761u, 2246822519u, 3266489917u);
+  q = (q >> 16u) ^ q;
+  return vec3(float(q.x), float(q.y), float(q.z)) / 4294967296.0f;
+}
+
+// Generate star brightness for a given sky direction
+// Returns star color (white-blue-orange based on temperature) and brightness
+vec3 evalStarField(vec3 viewDir, AtmosphereArgs args) {
+  vec3 totalStars = vec3(0.0f);
+  vec3 dir = normalize(viewDir);
+
+  // Sidereal rotation: rotate the sample direction around the celestial pole
+  // by args.starRotation degrees, then continue with the rotated direction
+  // for galactic-band placement, cube-face indexing, and twinkle phase. The
+  // whole pattern (band, individual stars, color temperatures) rotates as
+  // one rigid body, matching real-sky behavior.
+  //
+  // Default axis (elevation 90, azimuth 0) places the celestial pole at +Y
+  // (zenith). Combined with starRotation = 0, the Rodrigues formula below
+  // reduces to the identity, so unrotated callers see the original pattern
+  // unchanged.
+  {
+    const float kDegToRad = 3.14159265358979323846f / 180.0f;
+    float poleElev = args.starAxisElevation * kDegToRad;
+    float poleAzi  = args.starAxisRotation  * kDegToRad;
+    vec3 axis = vec3(cos(poleElev) * sin(poleAzi),
+                     sin(poleElev),
+                     cos(poleElev) * cos(poleAzi));
+
+    float rotRad = args.starRotation * kDegToRad;
+    float c = cos(rotRad);
+    float s = sin(rotRad);
+    // Rodrigues' rotation: v_rot = v*c + (k × v)*s + k*(k·v)*(1 - c)
+    dir = dir * c + cross(axis, dir) * s + axis * dot(axis, dir) * (1.0f - c);
+  }
+
+  float theta = acos(clamp(dir.y, -1.0f, 1.0f));
+  float phi = atan2(dir.z, dir.x);
+
+  // Galactic plane: compute distance from the galactic band
+  // Band tilted ~60° from vertical, meandering slightly.
+  //
+  // Fork (root cause of the long-standing "diagonal streaks across the band"
+  // artifact): the meander was previously smoothNoise2D on (phi*2, theta*0.5)
+  // amplitude 0.08. smoothNoise2D scales inputs by 100 internally, so cells
+  // were ~0.005 rad in phi vs ~0.02 rad in theta -- 4x narrower in phi than
+  // in theta, with amplitude 0.08 roughly TWO band-sigmas (band half-width
+  // sigma ~= 0.041 from galacticCore's exp(-galacticDist^2 * 300)). The
+  // centerline swept back-and-forth along fine phi-aligned ridges, which
+  // because the band is tilted ~30deg off horizontal projected as diagonal
+  // striations PERPENDICULAR to the band -- exactly the rain-streak artifact.
+  //
+  // Fixed: isotropic 3D FBM on the view direction (same approach used for the
+  // bandVariation modulation below) with amplitude reduced to one band-sigma
+  // so the centerline meanders organically without re-introducing high-
+  // contrast ridges.
+  float galacticLat = dir.x * 0.866f + dir.y * 0.5f;
+  float meander = fbmNoise3D(dir * 3.0f, 3, 200.0f) * 0.04f;
+  galacticLat += meander;
+  float galacticDist = abs(galacticLat);
+
+  // Galactic density: more stars near the galactic plane.
+  // Gated on milkyWayEnabled — when off, galacticDensity stays 0 and all
+  // downstream effects (band density boost, band-specific star color shift,
+  // background glow) zero out, leaving a uniform star field.
+  //
+  // Fork: bandVariation switched from anisotropic 2D smoothNoise2D on
+  // (phi*3, galacticLat*10) to isotropic 3D Perlin gradient noise sampled
+  // on the view direction. The prior 2D noise had cells 10x narrower across
+  // the band than along it (the `galacticLat * 10` factor), which mapped to
+  // visible diagonal streaks perpendicular to the band -- exactly the
+  // "pixelated streaks across the glow" artifact. Sampling on dir is
+  // isotropic on the sphere with no axis preference, so density variation
+  // forms organic patches at the same scale in every direction.
+  float galacticDensity = 0.0f;
+  if (args.milkyWayEnabled > 0.5f) {
+    float galacticCore = exp(-galacticDist * galacticDist * 300.0f);
+    float galacticHalo = exp(-galacticDist * galacticDist * 80.0f);
+    galacticDensity = galacticCore * 0.5f + galacticHalo * 0.25f;
+
+    // perlinNoise3D returns [-1, 1] — remap to [0, 1] before the (0.5 + 0.5x)
+    // amplitude shape that already lives in this expression.
+    float bandVariation = perlinNoise3D(dir * 5.0f) * 0.5f + 0.5f;
+    galacticDensity *= (0.5f + 0.5f * bandVariation);
+  }
+
+  // Density slider re-mapping (fork). The prior code used args.starDensity
+  // directly as the threshold (0.98 = top 2% of cells, 1.0 = no stars at all).
+  // The useful range was crammed into the top ~5% of slider travel, which made
+  // the slider unusable. Map the slider through pow(d, 4) * kMaxStarFraction
+  // so the visible-star fraction sweeps the slider linearly in perceptual feel:
+  //   starDensity=0.0 -> 0% stars
+  //   starDensity=0.5 -> ~0.3% stars
+  //   starDensity=0.7 -> ~1.2%
+  //   starDensity=1.0 -> ~5% (matches the upper end of the old useful range)
+  // Threshold = 1 - starFraction. milkyWayDensityBoost lowers the threshold
+  // further inside the galactic band.
+  const float kMaxStarFraction = 0.05f;
+  float starFraction = pow(saturate(args.starDensity), 4.0f) * kMaxStarFraction;
+  float baseThreshold = 1.0f - starFraction;
+
+  // 3D cube-face grid: project direction onto the dominant axis face of a cube,
+  // then use the other two axes as a 2D grid. This gives uniform cell sizes
+  // across the entire sphere with no pole singularities or view-dependent artifacts.
+  vec3 absDir = abs(dir);
+  float maxComp = max(absDir.x, max(absDir.y, absDir.z));
+
+  // Determine which cube face we're on and get 2D coordinates
+  vec2 faceUV;
+  float faceId;
+  if (maxComp == absDir.x) {
+    faceUV = dir.yz / absDir.x;
+    faceId = dir.x > 0.0f ? 0.0f : 1.0f;
+  } else if (maxComp == absDir.y) {
+    faceUV = dir.xz / absDir.y;
+    faceId = dir.y > 0.0f ? 2.0f : 3.0f;
+  } else {
+    faceUV = dir.xy / absDir.z;
+    faceId = dir.z > 0.0f ? 4.0f : 5.0f;
+  }
+
+  // Scale to grid resolution (faceUV ranges from -1 to 1, so 400 gives ~800 cells across)
+  float gridScale = 400.0f;
+  vec2 gridUV = faceUV * gridScale;
+  vec2 gridCell = floor(gridUV);
+  vec2 gridFrac = fract(gridUV);
+
+  // Check this cell and neighbors for star centers
+  for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+      vec2 neighbor = vec2(float(dx), float(dy));
+      vec2 cell = gridCell + neighbor;
+
+      // Include faceId in hash to avoid star patterns repeating across cube faces
+      vec3 cellHash = hash33(vec3(cell, faceId));
+      vec2 starPos = neighbor + cellHash.xy - gridFrac;
+
+      // Distance to star center
+      float dist = length(starPos);
+
+      // Star brightness from hash (most cells have no visible star)
+      float starMag = cellHash.z;
+
+      // Density threshold: lower in the galactic band = more stars visible.
+      // milkyWayDensityBoost (was hardcoded 0.15) controls the band enhancement;
+      // galacticDensity is already 0 when milkyWayEnabled is off.
+      float localThreshold = saturate(baseThreshold - galacticDensity * args.milkyWayDensityBoost);
+      if (starMag < localThreshold) continue;
+
+      // Remap magnitude above threshold to brightness.
+      // Fork: floor on localThreshold (not the un-boosted args.starDensity) so
+      // band-only stars don't end up with negative (starMag - args.starDensity)
+      // squared into massive brightness -- the prior remap quirk made galactic-
+      // band stars explosively bright and was the root cause of the over-
+      // dominant Milky Way look. Now band stars sit in the same [0, 1]
+      // brightness range as non-band stars, controlled via starBrightness.
+      float brightness = (starMag - localThreshold) / max(1.0f - localThreshold, 0.001f);
+      brightness = brightness * brightness;  // Quadratic falloff for natural magnitude distribution
+
+      // Star point spread function (Gaussian, sharpness exposed as RTX_OPTION).
+      // Default 20 gives ~1-pixel-FWHM at 1080p/90° FOV, which anti-aliases the
+      // per-frame "star center crosses pixel boundary" flicker on camera motion.
+      // Hardcoded 800 (the prior value) made each star sub-pixel (~0.08 px FWHM)
+      // and shimmered severely as rotation moved stars across the pixel grid.
+      float psf = exp(-dist * dist * args.starPsfSharpness);
+
+      // Star color based on temperature (hash-derived)
+      // In the galactic band, shift colors toward warm amber/gold core
+      // with cooler purple/blue at the edges — matching real Galactic Center
+      float temp = hash31(vec3(cell, 1.0f));
+      vec3 starColor;
+
+      // Galactic band color gradient: warm core → cool edges
+      // galacticDist is 0 at center, increases outward.
+      // Fork: gated on milkyWayEnabled so the band-specific palette goes away
+      // entirely when the Milky Way is toggled off (otherwise stars near the
+      // band direction would still pick up the warm/cool gradient despite no
+      // density boost or background glow, giving an inconsistent half-off look).
+      float bandInfluence = (args.milkyWayEnabled > 0.5f)
+        ? exp(-galacticDist * galacticDist * 120.0f)
+        : 0.0f;
+
+      if (bandInfluence > 0.05f) {
+        // Inside the galactic band: warm amber/gold/pink gradient
+        // Core (bandInfluence ~1.0): warm gold/amber
+        // Mid-band: dusty rose/pink
+        // Edge (bandInfluence ~0.05): cool blue-purple
+        float coreToEdge = 1.0f - bandInfluence;  // 0 = core, 1 = edge
+
+        if (temp > 0.6f) {
+          // Warm gold/amber stars (dominant in core)
+          vec3 coreColor = vec3(1.0f, 0.82f, 0.45f);    // Warm amber-gold
+          vec3 edgeColor = vec3(0.55f, 0.45f, 0.85f);    // Cool blue-purple
+          starColor = mix(coreColor, edgeColor, coreToEdge * coreToEdge);
+        } else if (temp > 0.25f) {
+          // Dusty rose/pink stars (mid-band)
+          vec3 coreColor = vec3(0.95f, 0.60f, 0.55f);    // Dusty rose-pink
+          vec3 edgeColor = vec3(0.50f, 0.40f, 0.75f);    // Muted purple
+          starColor = mix(coreColor, edgeColor, coreToEdge);
+        } else {
+          // Reddish-orange stars (scattered throughout)
+          vec3 coreColor = vec3(1.0f, 0.55f, 0.30f);     // Deep orange-red
+          vec3 edgeColor = vec3(0.60f, 0.50f, 0.80f);     // Lavender
+          starColor = mix(coreColor, edgeColor, coreToEdge);
+        }
+      } else {
+        // Outside the galactic band: normal star colors
+        if (temp > 0.7f) {
+          starColor = vec3(0.7f, 0.8f, 1.0f);   // Blue-white (O/B type)
+        } else if (temp > 0.3f) {
+          starColor = vec3(1.0f, 1.0f, 0.95f);   // White-yellow (F/G type)
+        } else {
+          starColor = vec3(1.0f, 0.85f, 0.7f);   // Orange (K type)
+        }
+      }
+
+      // Twinkling: subtle brightness variation over time
+      float twinkle = 1.0f;
+      if (args.starTwinkleSpeed > 0.0f) {
+        float twinklePhase = hash31(vec3(cell, 2.0f)) * 6.283f;
+        float twinkleFreq = 0.5f + hash31(vec3(cell, 3.0f)) * 2.0f;
+        twinkle = 0.7f + 0.3f * sin(args.timeSeconds * twinkleFreq * args.starTwinkleSpeed + twinklePhase);
+      }
+
+      totalStars += starColor * brightness * psf * twinkle;
+    }
+  }
+
+  // Milky Way diffuse background glow (fork). Real Milky Way photos show
+  // three distinct color zones: warm yellow-cream core (galactic center),
+  // dark red-brown dust lanes weaving through the band, and a cool blue
+  // outer halo from young stars along the spiral arms. The glow blends
+  // these via per-pixel multi-octave 3D Perlin FBM (fbmNoise3D) sampled
+  // directly on the view direction vector so the result has internal
+  // structure with NO axis-aligned streaking.
+  //
+  // Earlier 2D-UV revisions used (phi, galacticLat) for the noise UV. That
+  // mapping has severe anisotropic stretch -- phi and galacticLat aren't
+  // orthogonal in sky angles, so the noise lattice cells appeared as
+  // parallel streaks running diagonally across the band. Sampling 3D Perlin
+  // on dir avoids the issue entirely: dir is isotropic on the unit sphere
+  // and continuous everywhere (no antimeridian seam like phi has).
+  //
+  // Gated on milkyWayEnabled via galacticDensity (which is already 0 when
+  // the master toggle is off). Independent of starBrightness so it doesn't
+  // get dragged by game-driven star fades.
+  vec3 milkyWayGlow = vec3(0.0f);
+  if (galacticDensity > 0.0f) {
+    // Intensity FBM — 5 octaves of 3D Perlin gradient noise centered around
+    // 1.0. base-freq 4 spreads ~8 lobes across the sphere; octaves add fine
+    // detail down to ~1/128 of a sphere. Range ~[0.5, 1.5] after centering.
+    float intensityFbm = 0.5f + fbmNoise3D(dir * 4.0f, 5, 311.0f);
+
+    // Dust-lane FBM — independent seed, slightly lower base frequency so
+    // dust patches are larger than intensity variation (matches real photos
+    // where dust lanes are coarser than star-density flickers).
+    float dustFbm  = fbmNoise3D(dir * 2.5f, 4, 321.0f);
+    // Perlin range is [-1, 1] so we remap to [0, 1] before the smoothstep
+    // gate that creates discrete dust patches.
+    float dustMask = smoothstep(-0.15f, 0.15f, dustFbm);
+
+    // Core proximity — bright warm peak around galactic-band centerline.
+    // Tight Gaussian (k=400) keeps the core narrow; the surrounding band
+    // gets the cool outer tint via the mix below.
+    float coreProximity = exp(-galacticDist * galacticDist * 400.0f);
+
+    // Color blend: outer (cool blue) -> core (warm cream) -> dust (red-brown).
+    // Dust is the last overlay because it should darken everything beneath.
+    vec3 baseColor  = mix(args.milkyWayBackgroundColor, args.milkyWayCoreColor, coreProximity);
+    vec3 finalColor = mix(baseColor, args.milkyWayDustColor,
+                          dustMask * args.milkyWayDustAmount);
+
+    // Density modulation: galacticDensity (radial falloff across the band's
+    // narrow strip) × intensityFbm (longitudinal variation along the band).
+    float glowDensity = galacticDensity * intensityFbm;
+
+    milkyWayGlow = finalColor * glowDensity * args.milkyWayBackgroundBrightness;
+  }
+
+  return totalStars * args.starBrightness + milkyWayGlow;
+}
+
+// Compute night sky contribution split into two layers:
+//   - starsOut: discrete star field + shooting stars (HDR point-source content
+//     that needs steeper extinction through clouds, applied by the caller via
+//     pow(cloud_T, starCloudExtinctionPower)).
+//   - airglowOut: diffuse ambient airglow + zodiacal light (treated like the
+//     atmosphere background; standard alpha-composite with clouds is fine).
+// Caller composites moons separately after this.
+void evalNightSky(vec3 viewDir, AtmosphereArgs args,
+                  out vec3 starsOut, out vec3 airglowOut) {
+  starsOut   = vec3(0.0f);
+  airglowOut = vec3(0.0f);
+
+  float sunElevation = args.sunDirection.y;
+
+  // Night sky visibility: fade in during twilight, full at night
+  // Civil twilight ends at -6° (sunDirection.y ≈ -0.105)
+  // Stars become visible around nautical twilight
+  // sunElevation is sunDirection.y: negative = below horizon
+  const float kStarFadeStart = 0.02f;   // Stars start appearing when sun is 1° below horizon
+  const float kStarFadeFull = 0.15f;    // Full star brightness when sun is ~8.5° below
+
+  // -sunElevation is positive when sun is below horizon
+  float belowHorizon = -sunElevation;
+  float nightFactor = smoothstep(kStarFadeStart, kStarFadeFull, belowHorizon);
+  if (nightFactor <= 0.0f) return;
+
+  // Atmospheric extinction for stars near horizon — gentle fade only
+  float viewElevation = viewDir.y;
+  float horizonExtinction = smoothstep(-0.02f, 0.1f, viewElevation);
+
+  // Star field (includes galactic density band — no separate nebula overlay needed)
+  vec3 stars = evalStarField(viewDir, args) * horizonExtinction;
+
+  // Shooting stars — thin streaks with fading tail
+  {
+    float slotTime = floor(args.timeSeconds / 4.0f);
+    float slotFrac = fract(args.timeSeconds / 4.0f);
+
+    float slotHash = hash31(vec3(slotTime, 0.0f, 42.0f));
+    if (slotHash > 0.92f) {
+      float startTheta = hash31(vec3(slotTime, 1.0f, 42.0f)) * kPi * 0.5f + 0.3f;
+      float startPhi = hash31(vec3(slotTime, 2.0f, 42.0f)) * 2.0f * kPi;
+
+      vec3 streakStart = vec3(
+        sin(startTheta) * cos(startPhi),
+        cos(startTheta),
+        sin(startTheta) * sin(startPhi)
+      );
+
+      float streakAng = hash31(vec3(slotTime, 3.0f, 42.0f)) * kPi;
+      vec3 streakMoveDir = normalize(vec3(cos(streakAng) * 0.3f, -0.4f, sin(streakAng) * 0.3f));
+
+      float streakLen = 0.05f;  // Longer tail
+      vec3 headPos = normalize(streakStart + streakMoveDir * slotFrac * 0.4f);  // Faster travel
+      vec3 tailPos = normalize(streakStart + streakMoveDir * (slotFrac * 0.4f - streakLen));
+
+      vec3 v = normalize(viewDir);
+      vec3 segVec = headPos - tailPos;
+      float segLen = length(segVec);
+      if (segLen > 0.001f) {
+        vec3 segNorm = segVec / segLen;
+        float t = dot(v - tailPos, segNorm);
+        t = clamp(t, 0.0f, segLen);
+        vec3 closest = tailPos + segNorm * t;
+        float dist = length(v - closest);
+
+        // Thinner streak — tighter Gaussian falloff
+        float streakBright = exp(-dist * dist * 18000000.0f);
+
+        // Tail gradient: bright head fading to dim tail
+        float tailFade = t / max(segLen, 0.001f);
+        tailFade = pow(tailFade, 1.5f);
+
+        float timeFade = sin(slotFrac * kPi);
+
+        stars += vec3(1.0f, 0.95f, 0.85f) * streakBright * tailFade * timeFade * 2.0f;
+      }
+    }
+  }
+
+  // Airglow: faint ambient glow of the night sky
+  // Slightly brighter near the horizon (van Rhijn effect)
+  float airglowHorizonBoost = 1.0f + 0.5f * exp(-viewElevation * 5.0f);
+  vec3 airglow = args.nightSkyColor * args.nightSkyBrightness * airglowHorizonBoost;
+
+  starsOut   = stars   * nightFactor;
+  airglowOut = airglow * nightFactor;
+}
+
+// ============================================================================
+// Moon shading
+// ============================================================================
+// One unified moon disk evaluator that loops over args.moons[MAX_MOONS] in
+// the caller. Surface shading is dispatched by MoonParams::surfaceStyle:
+//   0 = Rocky    (pale-grey, craters, maria, ray patterns)
+//   1 = Volcanic (warm-red, veins, large impact craters, dusty rose terrain)
+
+// 2D disk-space phase illumination — produces a CURVED (elliptical) terminator
+// like a real sphere shadow, not a straight line. diskX must be oriented so
+// positive X points toward the sun (the caller builds a sun-oriented frame).
+//
+// phase: 0 = new, 0.25 = first quarter, 0.5 = full, 0.75 = third quarter
+// diskX, diskY: position on the disk [-1, 1], X axis toward the sun
+// Returns illumination factor [0, 1].
+float getPhaseIllumination(float phase, float diskX, float diskY) {
+  // The terminator on a sphere projects as an ellipse on the disk.
+  //   phase 0.0 (new)  -> terminatorX = +1 (boundary at right edge = all dark)
+  //   phase 0.25 (1Q)  -> terminatorX =  0 (boundary at center = right half lit)
+  //   phase 0.5 (full) -> terminatorX = -1 (boundary at left edge = all lit)
+  //   phase 0.75 (3Q)  -> terminatorX =  0 (boundary at center = right half lit)
+  //   phase 1.0 (new)  -> terminatorX = +1 (back to all dark)
+  float terminatorX = cos(phase * 2.0f * kPi);
+
+  float diskR = length(vec2(diskX, diskY));
+  if (diskR > 1.0f) return 0.0f;
+
+  // Sphere-projected terminator position at this Y coordinate
+  float sphereWidth = sqrt(max(0.0f, 1.0f - diskY * diskY));
+  float localTerminator = terminatorX * sphereWidth;
+
+  // Lit side is always at diskX > localTerminator.
+  return smoothstep(localTerminator - 0.03f, localTerminator + 0.03f, diskX);
+}
+
+// Rocky surface shader — pale-grey procedural surface (craters, maria, ray patterns).
+// Knob mapping:
+//   m.surfaceNoiseScale → multiplies UV scale (feature size)
+//   m.surfaceContrast   → multiplies maria-darken weight, ray amplitude
+//   m.craterDensity     → multiplies large + small crater contribution
+//   m.roughnessAmount   → multiplies micro-roughness amplitude
+void computeRockySurfaceDetail(float diskX, float diskY, MoonParams m,
+                               out float surfaceDetail, out vec3 surfaceColor) {
+  float uvScale = 8.0f * m.surfaceNoiseScale;
+  vec2 moonUV = vec2(diskX, diskY) * uvScale;
+
+  // Maria (dark basaltic plains) — smooth multi-octave noise
+  float maria = fbmNoise2D(moonUV * 0.4f + vec2(3.7f, 1.2f), 4, 10.0f);
+  maria = smoothstep(0.25f, 0.55f, maria);
+
+  // Highland base brightness (maria darken weighted by surfaceContrast)
+  float highland = 1.0f - maria * 0.5f * m.surfaceContrast;
+
+  // Large craters — fixed positions with dark interiors and bright rims
+  float craters = 0.0f;
+  vec2 craterPositions[7];
+  craterPositions[0] = vec2(-0.25f, 0.3f);
+  craterPositions[1] = vec2(0.35f, -0.15f);
+  craterPositions[2] = vec2(-0.1f, -0.35f);
+  craterPositions[3] = vec2(0.2f, 0.25f);
+  craterPositions[4] = vec2(-0.3f, -0.1f);
+  craterPositions[5] = vec2(0.15f, -0.3f);
+  craterPositions[6] = vec2(-0.35f, 0.15f);
+  float craterSizes[7];
+  craterSizes[0] = 0.12f;
+  craterSizes[1] = 0.09f;
+  craterSizes[2] = 0.15f;
+  craterSizes[3] = 0.07f;
+  craterSizes[4] = 0.10f;
+  craterSizes[5] = 0.06f;
+  craterSizes[6] = 0.08f;
+
+  for (int ci = 0; ci < 7; ci++) {
+    float crDist = length(vec2(diskX, diskY) - craterPositions[ci]);
+    float craterRadius = craterSizes[ci];
+
+    float bowl = 1.0f - smoothstep(craterRadius * 0.3f, craterRadius * 0.9f, crDist);
+    float craterShadow = 0.5f;
+    float rim = smoothstep(craterRadius * 0.75f, craterRadius * 0.9f, crDist) *
+                (1.0f - smoothstep(craterRadius * 0.9f, craterRadius * 1.15f, crDist));
+
+    craters += bowl * 0.3f * craterShadow - rim * 0.1f;
+  }
+  craters *= m.craterDensity;
+
+  // Small craters — smooth noise threshold
+  float smallCraterNoise = fbmNoise2D(moonUV * 2.5f + vec2(7.3f, 2.1f), 3, 20.0f);
+  float smallCraters = smoothstep(0.62f, 0.72f, smallCraterNoise) * 0.2f * m.craterDensity;
+
+  // Surface roughness — fine detail
+  float roughness = fbmNoise2D(moonUV * 4.0f + vec2(11.1f, 5.5f), 2, 30.0f) * 0.15f * m.roughnessAmount;
+
+  // Streaks/rays from impacts
+  float rays = fbmNoise2D(moonUV * 1.5f + vec2(2.3f, 8.7f), 2, 40.0f);
+  rays = smoothstep(0.5f, 0.65f, rays) * 0.12f * m.surfaceContrast;
+
+  float detail = highland - craters - smallCraters + roughness + rays;
+  surfaceDetail = clamp(detail, 0.3f, 1.15f);
+
+  // Color: maria are warm grey-brown, highlands cool light grey
+  surfaceColor = mix(
+    vec3(0.78f, 0.76f, 0.72f),  // Maria: warm grey-brown
+    vec3(0.95f, 0.94f, 0.92f),  // Highlands: cool light grey
+    1.0f - maria
+  );
+}
+
+// Volcanic surface shader — warm-red procedural surface (veins, large impact
+// craters, dusty rose terrain). Same knob mapping rules as the rocky helper.
+void computeVolcanicSurfaceDetail(float diskX, float diskY, MoonParams m,
+                                  out float surfaceDetail, out vec3 surfaceColor) {
+  float uvScale = 6.0f * m.surfaceNoiseScale;
+  vec2 surfUV = vec2(diskX, diskY) * uvScale;
+
+  // Large dark volcanic basins
+  float volcanic = fbmNoise2D(surfUV * 0.5f + vec2(5.1f, 3.3f), 4, 50.0f);
+  volcanic = smoothstep(0.2f, 0.55f, volcanic) * 0.45f * m.surfaceContrast;
+
+  // Surface terrain — medium scale
+  float terrain = fbmNoise2D(surfUV * 1.2f + vec2(11.0f, 7.0f), 3, 60.0f) * 0.2f * m.surfaceContrast;
+
+  // Dark veins/canyons
+  float veins = fbmNoise2D(surfUV * 2.0f + vec2(7.0f, 3.0f), 3, 70.0f);
+  veins = smoothstep(0.55f, 0.68f, veins) * 0.25f * m.surfaceContrast;
+
+  // Fine surface texture (micro-roughness)
+  float fineDetail = fbmNoise2D(surfUV * 3.5f + vec2(13.0f, 9.0f), 2, 80.0f) * 0.08f * m.roughnessAmount;
+
+  // Large impact craters — fixed positions
+  float craters = 0.0f;
+  vec2 craterPos[4];
+  craterPos[0] = vec2(-0.2f, -0.25f);
+  craterPos[1] = vec2(0.25f, 0.15f);
+  craterPos[2] = vec2(-0.15f, 0.3f);
+  craterPos[3] = vec2(0.3f, -0.2f);
+  float craterSz[4];
+  craterSz[0] = 0.15f;
+  craterSz[1] = 0.12f;
+  craterSz[2] = 0.10f;
+  craterSz[3] = 0.08f;
+
+  for (int mci = 0; mci < 4; mci++) {
+    float dist = length(vec2(diskX, diskY) - craterPos[mci]);
+    float cr = craterSz[mci];
+    float interior = 1.0f - smoothstep(cr * 0.5f, cr * 0.85f, dist);
+    craters += interior * 0.2f;
+  }
+  craters *= m.craterDensity;
+
+  float detail = 1.0f - volcanic - veins - craters + terrain + fineDetail;
+  surfaceDetail = clamp(detail, 0.35f, 1.1f);
+
+  // Color: dark volcanic basins → deep crimson-purple, lighter terrain → dusty rose
+  surfaceColor = mix(
+    vec3(0.30f, 0.08f, 0.12f),
+    vec3(0.70f, 0.28f, 0.32f),
+    clamp(detail, 0.0f, 1.0f)
+  );
+}
+
+// Render moon disk for moonIdx in args.moons[]. Returns radiance contribution
+// for this pixel and writes diskCoverage in [0,1] indicating disk opacity at
+// this view direction. Caller composites moons over the night sky using
+// `radiance = mix(radiance, moonContrib, coverage)` so opaque parts of the
+// disk replace the background (atmosphere + stars) cleanly.
+vec3 evalMoonDisk(vec3 viewDir, uint moonIdx, AtmosphereArgs args, out float diskCoverage) {
+  diskCoverage = 0.0f;
+  if (moonIdx >= MAX_MOONS) return vec3(0.0f);
+
+  MoonParams m = args.moons[moonIdx];
+  if (m.enabled < 0.5f) return vec3(0.0f);
+
+  vec3 moonDir = normalize(m.direction);
+  if (dot(moonDir, moonDir) < 0.5f) {
+    moonDir = normalize(vec3(0.5f, 0.7f, 0.5f));
+  }
+
+  float cosAngle = dot(viewDir, moonDir);
+  float moonCosRadius = cos(m.angularRadius);
+  if (m.angularRadius < 0.001f) {
+    moonCosRadius = cos(0.5f * kPi / 180.0f);
+  }
+  if (cosAngle < moonCosRadius) return vec3(0.0f);
+
+  // Inside the moon disk — fully opaque, blocks stars and atmosphere behind it
+  diskCoverage = 1.0f;
+
+  float normalizedAngle = acos(clamp(cosAngle, -1.0f, 1.0f)) / m.angularRadius;
+
+  // Soft edge at disk boundary to avoid hard aliased circle
+  float edgeSoftness = smoothstep(1.0f, 0.97f, normalizedAngle);
+  diskCoverage *= edgeSoftness;
+
+  float limbDarkening = 1.0f - 0.3f * normalizedAngle * normalizedAngle;
+  limbDarkening = max(limbDarkening, 0.0f);
+
+  // Disk-local frame — diskX horizontal, diskY vertical (world-up basis)
+  vec3 upVec = abs(moonDir.y) < 0.999f ? vec3(0.0f, 1.0f, 0.0f) : vec3(1.0f, 0.0f, 0.0f);
+  vec3 moonRight = normalize(cross(upVec, moonDir));
+  vec3 moonUp    = cross(moonDir, moonRight);
+
+  vec3 toView = normalize(viewDir - moonDir * cosAngle);
+  float diskX = dot(toView, moonRight) * normalizedAngle;
+  float diskY = dot(toView, moonUp)    * normalizedAngle;
+
+  float illumination = getPhaseIllumination(m.phase, diskX, diskY);
+  float diffuse = 0.7f + 0.3f * (1.0f - normalizedAngle);
+
+  // Surface shading dispatched by style preset
+  float surfaceDetail = 1.0f;
+  vec3 surfaceColor = m.color;
+  switch (m.surfaceStyle) {
+  case 0u:
+    computeRockySurfaceDetail(diskX, diskY, m, surfaceDetail, surfaceColor);
+    break;
+  case 1u:
+    computeVolcanicSurfaceDetail(diskX, diskY, m, surfaceDetail, surfaceColor);
+    break;
+  default:
+    surfaceDetail = 1.0f;
+    surfaceColor = m.color;
+    break;
+  }
+
+  // Phase 2 (2026-05-08): unified physical irradiance scaffold.
+  // Replaces the prior magic-number scaffolding:
+  //   litRadiance = m.color × surfaceColor × m.brightness × limbDark × surfaceDetail × diffuse × moonAirTrans
+  // (effectively m.color² × m.brightness × ...) which made disk visibility depend
+  // on m.color magnitude squared and the m.brightness=4.0 default. The disk
+  // didn't multiply by args.sunIlluminance at all, divorcing disk magnitude from
+  // the rest of the lighting pipeline.
+  //
+  // New: sharedFactor = sunIlluminance × surfaceColor × moonAirTrans × m.brightness / π
+  // Albedo (surfaceColor — perturbed by surface noise per pixel) appears
+  // exactly once, properly multiplied by sun irradiance. The per-pixel
+  // diffuse cosine integrates to phaseGlow × π over the disk, so phase
+  // emerges naturally without an explicit phaseGlow multiplier.
+  //
+  // Magnitude at FNV defaults (m.brightness=1.0, m.color=0.12, central pixel):
+  //   sharedFactor ≈ 20 × 0.12 × 0.97 × 1.0 / π ≈ 0.74 per channel
+  //   litRadiance  ≈ 0.74 (vs prior ~3.0) -- 4× drop. Recoverable via
+  //   m.brightness if user prefers current visual.
+  vec3 sharedFactor = computeMoonSharedFactor(m, args, surfaceColor);
+
+  // Lit side: full surface detail × per-pixel diffuse × limb darkening.
+  vec3 litRadiance = sharedFactor * surfaceDetail * diffuse * limbDarkening;
+
+  // Dark side: stylistic earthshine-fill, anchored to the same sharedFactor
+  // so it tracks sun changes proportionally. m.darkSideBrightness retains
+  // its prior semantics (default 0.005 = ~0.5% of fully-lit moon).
+  vec3 darkRadiance = sharedFactor * m.darkSideBrightness * limbDarkening;
+
+  // Blend lit and dark by phase illumination
+  vec3 moonRadiance = mix(darkRadiance, litRadiance, illumination);
+  return max(moonRadiance, vec3(0.0f));
+}
+
+// ============================================================================
+// Sky entry point
+// ============================================================================
+
+// Main evaluation function - computes atmosphere directly instead of using sky view LUT.
+//
+// `enableCloudTemporalSmoothing` (fork) — when true, the cloud layer alpha
+// blends against the previous frame's screen-space cloud history at the same
+// pixel coordinate before compositing. Kills the DLSS-perceived flatness that
+// the per-frame FAST-noise jitter (added in commits 148e3fa5 and d327f3d8)
+// otherwise produces. The blend uses a fixed history weight (0.92) which
+// matches the volumetric system's age-EMA settled state after ~10 frames.
+//
+// History rejection: a history sample is discarded — and the raw current
+// value used in its place — when ANY of the following hold:
+//   1. The reprojected previous coordinate falls off-screen.
+//   2. The history slot's frame-id (companion R16_UINT ping-pong) does not
+//      equal `(frameIdx - 1) & 0xFFFFu`. This catches stale history at
+//      pixels that were foreground-occluded last frame and so were not
+//      refreshed by the sky-miss path — the cause of the bright trailing
+//      ghosts addressed in the 2026-05-13 follow-up.
+//   3. Previous-alpha is near zero (no cloud history at this position).
+//
+// Pass true ONLY from the primary view ray (geometry_resolver miss path).
+// PSR / indirect / NRC paths must pass false — they call evalSkyRadiance with
+// non-primary directions, so the screen-space history at their pixelCoord
+// would be visually wrong (would smear primary cloud into reflections).
+//
+// `isPrimaryRay` (fork — 2026-05-12, C5) — when true AND
+// args.cloudRenderRTEnable != 0, the cloud layer is read from the prerendered
+// AtmosphereCloudRender RT (written each frame by cloud_render.comp.slang
+// with Nubis Cubed 2023 lighting). The RT is at primary-ray pixel coordinates
+// — sampling it from a PSR / indirect / reflection ray would return the wrong
+// cloud (different view direction at the same pixel), so non-primary call
+// sites pass false and read the secondary dome LUT instead. The
+// temporal-smoothing path applies on top of either source uniformly because
+// both produce the same (rgb-pre-step, opacity) shape; see the
+// alpha-convention note at the branch.
+vec3 evalSkyRadiance(
+  vec3 viewDir,
+  AtmosphereArgs args,
+  uint2 pixelCoord,
+  uint frameIdx,
+  bool isZUp = false,
+  bool enableCloudTemporalSmoothing = false,
+  vec2 motionVectorPixels = vec2(0.0f, 0.0f),
+  uint2 historyResolution = uint2(0u, 0u),
+  bool isPrimaryRay = false,
+  // Opt-in: scale the result by args.skyIndirectRadianceScale. Only diffuse
+  // indirect sky-gather call sites pass true (see integrator_indirect). Primary,
+  // PSR, and specular/refraction/cutout misses leave it false so the sky they
+  // show stays at physical brightness and matches the visible sky.
+  bool applySkyIndirectRadianceScale = false
+) {
+  // Perf bisect (fork — 2026-06-11, diagnostic): flat sky miss. Returns a
+  // constant mid-grey immediately so a live session can read the full
+  // per-ray miss-path cost (LUT taps + night sky + moons + cloud composite
+  // + temporal-smoothing I/O) off the frame-time delta. The skipped history
+  // write self-heals on re-enable via the frame-id age check. Always 0 in
+  // production.
+  if ((args.debugSkyBisectFlags & 2u) != 0u) {
+    return vec3(0.5f, 0.5f, 0.5f);
+  }
+
+  // Transform view direction to Y-up space if needed
+  vec3 viewDirYUp = isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir;
+  viewDirYUp = normalize(viewDirYUp);
+
+  // Sample the pre-baked sky-view LUT instead of marching the atmosphere live.
+  // sky_view_lut.comp.slang bakes evalAtmosphereRadiance from cameraPos =
+  // (0,0,0) with identical args and identical 32-sample step shape — and we
+  // were calling evalAtmosphereRadiance with cameraPos = (0,0,0) here too, so
+  // the LUT result equals the live march to within bilinear filter precision.
+  // The cache gate in RtxAtmosphere covers every arg that feeds the integral;
+  // sun / atmosphere / moon-coupling changes invalidate the LUT same-frame
+  // before raygen samples it.
+  vec3 radiance = sampleSkyViewLutForRay(viewDirYUp, AtmosphereSkyViewLut, AtmosphereSkyViewSampler);
+
+  // Suppress residual atmosphere glow at deep night.
+  // The ray marching and multiscattering approximation produce small non-zero
+  // values even when the sun is well below the horizon. These wash out dim stars
+  // and create view-dependent dark blobs in the star field. Fade the atmosphere
+  // contribution to zero once the sun is more than ~5° below the horizon.
+  {
+    float sunElev = args.sunDirection.y;
+    float atmosphereFade = smoothstep(-0.09f, 0.0f, sunElev);
+    radiance *= atmosphereFade;
+  }
+
+  // Add night-sky contribution split into two layers (fork):
+  //   - airglow joins `radiance` (diffuse; standard alpha-composite with clouds).
+  //   - stars are held aside and composited AFTER the cloud composite below
+  //     using pow(cloud_T, starCloudExtinctionPower) so HDR point-stars die
+  //     through cumulus cores instead of pinpointing through them.
+  // Note: Sun disk rendering removed - direct lighting handles sun contribution.
+  vec3 starLayer    = vec3(0.0f);
+  vec3 airglowLayer = vec3(0.0f);
+  evalNightSky(viewDirYUp, args, starLayer, airglowLayer);
+  radiance += airglowLayer;
+
+  // Moons composite over the night sky and atmosphere — only visible at night,
+  // fade in during twilight. Each moon disk REPLACES the background where
+  // it covers (so dark-side stars don't bleed through). Loop over moons in
+  // array order: later array indices render on top of earlier ones.
+  //
+  // Fork: stars are now composited separately AFTER clouds (see below), so we
+  // also track the combined moon-disk transmittance per pixel (`starThroughMoons`)
+  // and use it to attenuate the separately-composited star layer. Without this,
+  // stars would render on top of the moon disk after the moon-replace mix below
+  // (since stars are not in `radiance` here).
+  float starThroughMoons = 1.0f;
+  float moonFade = smoothstep(0.0f, -0.09f, args.sunDirection.y);
+  if (moonFade > 0.001f) {
+    // Moon glow/halo: soft radial Gaussian falloff around each enabled moon,
+    // additive. Rendered before the opaque disks so each disk cleanly
+    // replaces the glow under it.
+    for (uint gi = 0u; gi < MAX_MOONS; ++gi) {
+      MoonParams m = args.moons[gi];
+      if (m.enabled < 0.5f) continue;
+      vec3 moonDir = normalize(m.direction);
+      float cosAngle = dot(viewDirYUp, moonDir);
+      float angularDist = acos(clamp(cosAngle, -1.0f, 1.0f));
+      // Glow extends to ~2.5x the moon radius with tight Gaussian falloff
+      float glowRadius = m.angularRadius * 2.5f;
+      if (angularDist < glowRadius) {
+        float glowFalloff = angularDist / glowRadius;
+        float glow = exp(-glowFalloff * glowFalloff * 6.0f);  // Tighter Gaussian
+        // Scale by brightness and phase (fuller = brighter glow)
+        // phaseGlow: full at full moon (0.5), zero at new (0 / 1).
+        float phaseGlow = 0.5f - 0.5f * cos(m.phase * 2.0f * kPi);
+        phaseGlow = max(phaseGlow, 0.05f);  // minimal glow at new moon
+        // Phase 2 (2026-05-08): halo magnitude scaffold uses sharedFactor
+        // for sun-following-ness consistency. kHaloMagnitude (= 0.0015,
+        // preserved from 27c69c6d's post-phaseGlow-fix tuning) is the
+        // stylistic Gaussian-glow strength -- the halo is a stylized
+        // diffraction effect, not a strict physics term, so no
+        // moonSolidAngleSr factor.
+        //
+        // Magnitude at FNV defaults (full moon, zenith, m.brightness=1.0):
+        //   sharedFactor × 0.0015 × glow ≈ 0.74 × 0.0015 × glow ≈ 1.1e-3 × glow
+        // vs prior:
+        //   m.color × m.brightness × 0.0015 ≈ 0.88 × 4.0 × 0.0015 ≈ 5.3e-3 × glow
+        // Halo drops ~5× at default m.brightness. Recoverable via
+        // m.brightness=4.0 if user prefers current visual.
+        // Phase 3 Task 2 (2026-05-08): exposed as args.moonHaloMagnitude.
+        const float kHaloMagnitude = args.moonHaloMagnitude;
+        // Phase 3 (2026-05-08): args.haloMoonBrightness is the per-path stylistic
+        // multiplier on halo glow (default 5.0 = matches pre-Phase-2 halo magnitude
+        // at m.brightness=1.0 under FNV tonemapper).
+        vec3 sharedFactor = computeMoonSharedFactor(m, args, m.color);
+        vec3 glowColor = sharedFactor * phaseGlow * glow * kHaloMagnitude
+                       * args.haloMoonBrightness * moonFade;
+        radiance += glowColor;
+      }
+    }
+
+    for (uint i = 0u; i < MAX_MOONS; ++i) {
+      float coverage = 0.0f;
+      vec3 moonContrib = evalMoonDisk(viewDirYUp, i, args, coverage);
+      coverage *= moonFade;
+      radiance = mix(radiance, moonContrib, coverage);
+      starThroughMoons *= (1.0f - coverage);
+    }
+  }
+
+  // Clouds render on top of everything (atmosphere + stars + moons). They
+  // occlude whatever is behind them based on their alpha.
+  //
+  // C5 (fork — 2026-05-12): primary-ray-only branch reads the prerendered
+  // AtmosphereCloudRender RT (and non-primary rays the secondary dome LUT).
+  // Both store vec4(premultiplied_rgb, view_transmittance) — alpha is
+  // TRANSMITTANCE, whereas the downstream composite expects OPACITY.
+  // We invert the alpha (opacity = 1 - transmittance) so the downstream
+  // temporal-smoothing / mix composite operations apply uniformly to either
+  // source: both paths are accumulated as `radiance += stepRadiance * T_so_far`,
+  // so the rgb-channel semantics match once the alpha convention is reconciled.
+  vec4 cloudLayer;
+  if (args.cloudRenderRTEnable != 0u && isPrimaryRay) {
+    // Half-res cloud RT upsample (fork — 2026-06-11, perf). The cloud RT may
+    // be allocated at a fraction of the downscale extent
+    // (cloudRenderResolutionScale); pixelCoord is in DOWNSCALE coordinates,
+    // so normalize by the full extent published in args and bilinearly
+    // sample. At scale 1.0 the uv lands on texel centers of the same-size
+    // RT, so the filter returns the texel value — matching the legacy Load
+    // to float precision. uv is clamped a half-texel inside the RT so the
+    // border rows don't blend with the REPEAT-U wrap of the shared sky-view
+    // sampler (screen-space content must not wrap). Zero dims = extent not
+    // yet known (first frames) -> legacy Load.
+    vec4 cloudRT;
+    if (args.cloudRenderFullDimX != 0u && args.cloudRenderFullDimY != 0u) {
+      vec2 uv = (vec2(pixelCoord) + 0.5f)
+              / vec2(float(args.cloudRenderFullDimX), float(args.cloudRenderFullDimY));
+      uint2 rtDim;
+      AtmosphereCloudRender.GetDimensions(rtDim.x, rtDim.y);
+      vec2 halfTexel = 0.5f / vec2(rtDim);
+      uv = clamp(uv, halfTexel, vec2(1.0f) - halfTexel);
+      cloudRT = AtmosphereCloudRender.SampleLevel(AtmosphereSkyViewSampler, uv, 0.0f);
+    } else {
+      cloudRT = AtmosphereCloudRender.Load(int3(pixelCoord, 0));
+    }
+    cloudLayer = vec4(cloudRT.rgb, 1.0f - cloudRT.a);
+  } else if (args.cloudSecondaryLutEnable != 0u && !isPrimaryRay) {
+    // Secondary-ray cloud LUT (fork — 2026-06-10, perf). Indirect / PSR /
+    // reflection sky-miss rays read the per-frame 256x128 dome LUT baked by
+    // cloud_secondary_lut.comp.slang instead of a full per-ray cloud march —
+    // that hidden march cost (back when these rays ran the now-removed
+    // analytical view-march) rivaled the visible cloud pass. The LUT replaced
+    // it. The LUT stores the same (premultiplied rgb, TRANSMITTANCE)
+    // convention as the cloud RT above, so the same alpha reconciliation
+    // applies. Parallax from the ray origin being a surface point rather
+    // than the camera is negligible (scene-scale offsets vs km-scale cloud
+    // distances). Deliberate look change vs legacy: secondary rays now see
+    // the same Nubis Cubed clouds the primary rays see, not the legacy
+    // Wrenninge analytical approximation. Below-horizon directions clamp to
+    // the horizon row via cloudDomeDirToUv's y-clamp — downward sky-miss
+    // rays are horizon-adjacent in practice. Azimuth seam wraps via the
+    // sampler's REPEAT-U address mode.
+    vec2 domeUv = cloudDomeDirToUv(viewDirYUp);
+    vec4 lut = AtmosphereCloudSecondaryLut.SampleLevel(AtmosphereSkyViewSampler, domeUv, 0.0f);
+    cloudLayer = vec4(lut.rgb, 1.0f - lut.a);
+  } else {
+    // No cloud source for this ray (fork — 2026-06-19). Reached only when
+    // cloudRenderRTEnable (primary) or cloudSecondaryLutEnable (non-primary)
+    // is OFF. The legacy analytical evalClouds view-march that used to back
+    // this branch was removed — clouds now come exclusively from the
+    // cloud_render compute pass (primary) and the secondary dome LUT
+    // (indirect/PSR/reflection), so with both disabled the sky is cloudless.
+    cloudLayer = vec4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+
+  // Sky <- clouds bleed (fork — 2026-06-19, sky-reflects-clouds coupling).
+  // The visible sky and the cloud layer are otherwise composited independently,
+  // so a colored deck (orange sunset cumulus, grey overcast) never tints the
+  // clear sky around it — leaving vivid blue gaps between warm clouds. Here the
+  // sky picks up a fraction of the LOCAL cloud radiance as colored inscatter.
+  // Source is the secondary cloud dome LUT: it is low-res (256x128) and so
+  // inherently smooth, giving a neighborhood-averaged cloud color per view
+  // direction — bright/colored next to a cloud, ~0 in open sky far from any —
+  // exactly the spatial falloff a bleed wants, with no extra blur pass. The
+  // bleed is added to `radiance` BEFORE the cloud composite below, so the
+  // composite's own (1 - cloudAlpha) factor keeps it in the visible-sky
+  // fraction and out of opaque cloud cores. Gated on the secondary LUT being
+  // baked (it is, by default); 0 strength = no coupling (legacy).
+  if (args.cloudSkyBleedStrength > 0.0f && args.cloudSecondaryLutEnable != 0u) {
+    vec2 bleedUv = cloudDomeDirToUv(viewDirYUp);
+    // Sample a COARSE mip of the secondary cloud dome LUT (fork — 2026-06-19):
+    // a wide neighborhood blur in one tap. Sampling mip 0 here showed the LUT's
+    // coarse 256x128 texels as faceted cloud edges, and gave ~0 in true gaps
+    // (no spread). The blurred mip both removes the facets and spreads cloud
+    // color smoothly into the open sky next to clouds. Mip 4 = 16x8 (~16x blur).
+    // Requires the LUT's mip chain (RtxAtmosphere::dispatchCloudSecondaryLut)
+    // and a sampler with mipmapLodMax > 0 (the shared sky-view sampler sets it).
+    const float kBleedMip = 4.0f;
+    vec4 bleedCloud = AtmosphereCloudSecondaryLut.SampleLevel(AtmosphereSkyViewSampler, bleedUv, kBleedMip);
+    // Fade the bleed out toward the zenith (fork — 2026-06-27, experimental).
+    // cloudDomeDirToUv's azimuth (atan2(x,z)) is singular as the ray approaches
+    // vertical — all azimuths converge to the pole, so adjacent near-zenith
+    // pixels read very different LUT columns. Sampled at a coarse mip this is an
+    // azimuthal pinwheel/funnel that the bleed strength amplifies (the "weird
+    // artifact at the top of the sky" when Sky Cloud Bleed is turned up). The
+    // secondary LUT only has 6 mips (max 8x4), so it can't be blurred
+    // azimuth-flat at the pole; instead fade the contribution over the top of
+    // the dome, where the slab is thinnest (≈4 km edge-on, the least cloud color
+    // to bleed) and the singularity lives. viewDirYUp.y = sin(elevation): the
+    // band 0.95..0.9995 is ≈72°..88° elevation.
+    const float zenithFade = 1.0f - smoothstep(0.95f, 0.9995f, viewDirYUp.y);
+    // bleedCloud.rgb is premultiplied (now wide-blurred) cloud radiance; the blur
+    // makes it non-zero in gaps near clouds, so the sky picks up their color.
+    radiance += (args.cloudSkyBleedStrength * zenithFade) * bleedCloud.rgb;
+  }
+
+  // Temporal cloud smoothing (fork). Per-frame FAST-noise jitter on the cloud
+  // ray-march (commits 148e3fa5 / d327f3d8) creates brightness variance that
+  // DLSS sees as noise and averages out, producing visible flatness. We blend
+  // the raw current cloud against a screen-space history at the reprojected
+  // previous-frame pixel to give DLSS a stable signal while preserving the
+  // jitter's anti-banding benefits.
+  //
+  // Algorithm shape mirrors the volumetric system's age-EMA (see
+  // submodules/rtxdi/.../volume_integrator.slangh:125-142). Fixed history
+  // weight (0.92) matches the volumetric EMA's settled state after ~10
+  // frames.
+  //
+  // Storage convention: AtmosphereCloudHistory stores
+  //   (rgb = cloudLayer.rgb * cloudLayer.a, a = cloudLayer.a)
+  // — premultiplied radiance. This means an off-screen / disocclusion fallback
+  // (zero history) blends to "no clouds" cleanly, and the final composite is
+  // `radiance + smoothed.rgb - radiance * smoothed.a` which equals
+  // `mix(radiance, smoothed.rgb / max(smoothed.a, eps), smoothed.a)` for
+  // smoothed.a > 0 and `radiance` otherwise. We use the additive form to
+  // skip the divide.
+  //
+  // Age-channel disocclusion (fork — 2026-05-13). The color slot above is
+  // ONLY written from the sky-miss branch — when a pixel is occluded by
+  // foreground geometry the slot retains pre-occlusion radiance for as long
+  // as the occlusion lasts, because nothing else writes there. The legacy
+  // alpha-only disocclusion guard could not distinguish "valid sky cloud
+  // from last frame" from "stale bright cloud from N frames ago, currently
+  // occluded but uncovered this frame" — both have alpha > 0 — and so
+  // produced ~30-frame bright ghost trails when foreground moved through
+  // bright sky or near emissive surfaces. The companion R16_UINT
+  // AtmosphereCloudHistoryFrameId{Prev,Curr} pair carries the frame index
+  // at which each slot was last refreshed; the read site below rejects any
+  // history whose stored frame-id != `(frameIdx - 1) & 0xFFFFu`. Sentinel
+  // 0xFFFF is cleared into the buffer at allocation; the wrap once every
+  // 65536 frames and frame-0 startup both collide harmlessly with the
+  // sentinel for a single one-frame rejection (~18 min cadence at 60fps).
+  vec4 smoothedCloud = cloudLayer;  // default: no smoothing
+  if (enableCloudTemporalSmoothing && all(historyResolution > uint2(0u, 0u))) {
+    vec4 currentPremul = vec4(cloudLayer.rgb * cloudLayer.a, cloudLayer.a);
+
+    // Reproject: previous-frame pixel = current pixel + motion-vector (in pixels).
+    // calcMotionVectorForRayMiss returns NDC-delta * resolution, so adding it
+    // to the current pixel yields the previous frame's screen-space pixel.
+    vec2 prevPixelF = vec2(pixelCoord) + motionVectorPixels;
+    int2 prevPixel = int2(floor(prevPixelF + 0.5f));
+
+    bool reprojValid = all(prevPixel >= int2(0, 0))
+                    && all(prevPixel < int2(historyResolution));
+
+    if (reprojValid) {
+      vec4 history = AtmosphereCloudHistoryPrev[prevPixel];
+
+      // Age check (fork — 2026-05-13). Reject history whose stored frame-id
+      // doesn't match the immediately previous frame. The sentinel 0xFFFF
+      // collides with the underflow of `0u - 1u` at startup (correct: no
+      // history exists yet) and once per 16-bit wrap (~18 min at 60fps,
+      // a single rejected blend on affected pixels — imperceptible).
+      uint historyFrameId = AtmosphereCloudHistoryFrameIdPrev[prevPixel];
+      uint expectedPrevFrameId = (frameIdx - 1u) & 0xFFFFu;
+      bool ageValid = (historyFrameId == expectedPrevFrameId)
+                   && (historyFrameId != 0xFFFFu);
+
+      // Disocclusion guard: stale-age short-circuits to "use raw current
+      // sample." Past that, the legacy alpha-based gate handles the
+      // "no cloud here either way" case (both lerp terms zero, blend is
+      // zero — still valid). The 0.001 threshold matches the early-exit
+      // gate inside the cloud march (cloud_march_common.slangh).
+      bool historyValid = ageValid
+                       && ((history.a > 0.001f) || (currentPremul.a < 0.001f));
+      if (historyValid) {
+        // Fixed history weight. Higher = smoother but slower to respond to
+        // genuine sky changes (sun motion, weather preset changes); lower =
+        // less smoothing benefit. 0.92 was picked to settle to within 1% of
+        // a stable signal in ~30 frames at 60Hz (~0.5s) while still strongly
+        // suppressing the per-frame jitter variance DLSS sees.
+        const float kHistoryWeight = 0.92f;
+        vec4 blended = lerp(currentPremul, history, kHistoryWeight);
+        smoothedCloud = vec4(blended.rgb, blended.a);
+      } else {
+        smoothedCloud = currentPremul;
+      }
+    } else {
+      smoothedCloud = currentPremul;
+    }
+
+    // Write current frame's premultiplied accumulator + frame-id for next
+    // frame to read. The frame-id write is what makes the age check above
+    // work: any pixel that does NOT reach this write site this frame keeps
+    // its old (or sentinel) frame-id and will fail next-frame's age check.
+    AtmosphereCloudHistoryCurr[pixelCoord] = smoothedCloud;
+    AtmosphereCloudHistoryFrameIdCurr[pixelCoord] = frameIdx & 0xFFFFu;
+
+    // Composite: smoothedCloud is premultiplied, so the standard "over" op
+    // is `radiance * (1 - alpha) + premul.rgb`.
+    radiance = radiance * (1.0f - smoothedCloud.a) + smoothedCloud.rgb;
+  } else {
+    // No temporal smoothing — original composite path.
+    radiance = mix(radiance, cloudLayer.rgb, cloudLayer.a);
+  }
+
+  // Star composite (fork). Stars were held out of `radiance` above so they
+  // could be attenuated by cloud view-transmittance raised to a tunable power
+  // (mirrors what the moon "integration" relies on visually: cumulus near the
+  // moon gets bright enough that the disk doesn't pinpoint through partial
+  // alpha). Standard alpha-composite (T^1) leaves HDR star pinpoints visible
+  // through cumulus cores because cloud T rarely reaches 0; raising the
+  // extinction to T^k with k>1 kills star contribution far faster while
+  // leaving clear sky (T=1) unchanged.
+  //
+  // Source convention: cloudLayer.a is opacity for both the RT and secondary
+  // dome-LUT paths (the branch up top maps view_transmittance -> opacity).
+  // Temporal smoothing keeps the same alpha convention in smoothedCloud, so
+  // smoothedCloud.a == cloudLayer.a outside the smoothing branch (default
+  // assignment at the top of the smoothing block) and the temporally-blended
+  // opacity inside it. Using smoothedCloud.a gives a temporally-stable
+  // extinction signal when smoothing is enabled.
+  //
+  // starThroughMoons attenuates stars by the combined moon-disk coverage so
+  // stars don't punch through opaque moon disks (they're no longer composited
+  // into `radiance` before the moon mix, so the disk's REPLACE semantics no
+  // longer hide them — we re-apply the equivalent of that occlusion here).
+  {
+    float cloudViewT = saturate(1.0f - smoothedCloud.a);
+    float starExt    = pow(cloudViewT, args.starCloudExtinctionPower);
+    radiance += starLayer * starThroughMoons * starExt;
+  }
+
+  radiance = max(radiance, vec3(0.0f));
+  if (applySkyIndirectRadianceScale) {
+    radiance *= max(args.skyIndirectRadianceScale, 0.0f);
+  }
+
+  return radiance;
+}

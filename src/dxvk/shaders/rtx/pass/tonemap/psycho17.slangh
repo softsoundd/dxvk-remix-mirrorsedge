@@ -1,0 +1,754 @@
+/*
+* Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// ---------------------------------------------------------------------------
+// Source attribution
+// ---------------------------------------------------------------------------
+// This file is a self-contained port of the renodx "Psycho Test 17"
+// tonemap operator and its required color-pipeline dependencies
+// (Stockman-Sharpe LMS, CIE 170-2 MacLeod-Boynton, CIE 170-2 gamut,
+// Naka-Rushton, color grading) into Slang for the dxvk-remix runtime.
+//
+// Original implementation:
+//   https://github.com/clshortfuse/renodx
+//   src/games/crimsondesert/psycho_test17_custom.hlsl
+//   src/shaders/color/rgb.hlsl
+//   src/shaders/color/macleod_boynton.hlsl
+//   src/shaders/color/gamut.hlsl
+//   src/shaders/colorgrade.hlsl
+//   src/shaders/tonemap/naka_rushton.hlsl
+//
+// The renodx project is released under the MIT License. The license text
+// applicable to all renodx-derived code in this file is reproduced
+// verbatim below, as required by the MIT License's permission clause:
+//
+//   MIT License
+//
+//   Copyright (c) 2025 Carlos Lopez Jr.
+//
+//   Permission is hereby granted, free of charge, to any person obtaining
+//   a copy of this software and associated documentation files (the
+//   "Software"), to deal in the Software without restriction, including
+//   without limitation the rights to use, copy, modify, merge, publish,
+//   distribute, sublicense, and/or sell copies of the Software, and to
+//   permit persons to whom the Software is furnished to do so, subject
+//   to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be
+//   included in all copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+//   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+//   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+//   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+//   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+//   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+//   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+//
+// Port notes (dxvk-remix fork):
+// - All renodx helpers used by psychotm_test17 are inlined here with a
+//   psycho17_ prefix so this single header has no cross-file dependencies
+//   beyond the Slang built-ins. This mirrors the pattern established by
+//   psycho11.slangh and keeps the operator self-contained.
+// - The dead `if (true) { /* noop */ } else if (...) {...}` input
+//   gamut-compression branch from the renodx reference is omitted; only
+//   the live output gamut-compression branch is ported.
+// - The `current_adaptive_state_bt709`, `current_background_state_bt709`,
+//   and `adaptive_normalization` parameters of the renodx reference are
+//   defaulted to 0.18 / 0.18 / 1.0 by the dispatcher (see
+//   fork_tonemap_operators.slangh) and are not currently CB-exposed.
+//
+// ---------------------------------------------------------------------------
+
+#ifndef RENODX_SHADERS_TONEMAP_PSYCHO_TEST17_HLSL_
+#define RENODX_SHADERS_TONEMAP_PSYCHO_TEST17_HLSL_
+
+namespace renodx {
+namespace tonemap {
+namespace psycho {
+
+// ===========================================================================
+// Constants
+// ===========================================================================
+
+static const float kPsycho17Eps             = 1e-6f;
+static const float kPsycho17GamutEps        = 1e-20f;
+static const float kPsycho17MBNearWhiteEps  = 1e-14f;
+static const float kPsycho17RayTMax         = 1e20f;
+static const float kPsycho17IntervalMax     = 3.402823466e+38f;
+
+static const float3x3 PSYCHO17_BT709_TO_XYZ_MAT = float3x3(
+    0.4123907993f, 0.3575843394f, 0.1804807884f,
+    0.2126390059f, 0.7151686788f, 0.0721923154f,
+    0.0193308187f, 0.1191947798f, 0.9505321522f);
+
+static const float3x3 PSYCHO17_XYZ_TO_BT709_MAT = float3x3(
+    3.2409699419f, -1.5373831776f, -0.4986107603f,
+    -0.9692436363f, 1.8759675015f, 0.0415550574f,
+    0.0556300797f, -0.2039769589f, 1.0569715142f);
+
+static const float3x3 PSYCHO17_BT2020_TO_XYZ_MAT = float3x3(
+    0.6369580483f, 0.1446169036f, 0.1688809752f,
+    0.2627002120f, 0.6779980715f, 0.0593017165f,
+    0.0000000000f, 0.0280726930f, 1.0609850577f);
+
+// Stockman & Sharpe 2-deg fundamentals (CIE 170-2 fit), XYZ -> LMS.
+static const float3x3 PSYCHO17_XYZ_TO_LMS_MAT = float3x3(
+    0.2670502842655792f, 0.8471990148492798f, -0.03470416612462053f,
+    -0.38706882411220156f, 1.165429935890458f, 0.10302286696614202f,
+    0.026727793989083093f, -0.02729131667566509f, 0.5333267257603284f);
+
+// Inverse of PSYCHO17_XYZ_TO_LMS_MAT (precomputed in double precision).
+static const float3x3 PSYCHO17_LMS_TO_XYZ_MAT = float3x3(
+    1.9473468516370196f, -1.4144713011057995f, 0.36476246933878747f,
+    0.6899026758456162f, 0.34832189649915386f, 0.0f,
+    0.0f, 0.0f, 1.8748538815158594f);
+
+// MacLeod-Boynton weights (CIE 170-2 fit), see renodx rgb.hlsl
+// `CIE1702_MB_CIE_WEIGHTS`. (LMS -> XfYfZf) row 1, plus a fixed S weight.
+static const float3 PSYCHO17_MB_WEIGHTS = float3(0.68990272f, 0.34832189f, 0.0371597069161f);
+
+// CIE 1931 D65 white point chromaticity.
+static const float2 PSYCHO17_WHITE_POINT_D65 = float2(0.31272f, 0.32903f);
+
+// CIE 170-2 spectrum locus halfspace representation (7 edges), from
+// renodx gamut.hlsl `CIE1702_HALFSPACE_*`. Used by RayExitTCIE1702.
+static const int kPsycho17CIE1702EdgeCount = 7;
+static const float2 PSYCHO17_CIE1702_HALFSPACE_NORMALS[7] = {
+  float2(-0.043889f, -0.006807f),
+  float2(-0.007821f, -0.008564f),
+  float2(-0.000604f, -0.007942f),
+  float2(0.f, -0.080835f),
+  float2(0.953597f, 0.307020f),
+  float2(-0.060969f, 0.019752f),
+  float2(-0.106895f, 0.004035f),
+};
+static const float PSYCHO17_CIE1702_HALFSPACE_NUMERATORS[7] = {
+  0.0065035249f,
+  0.00104900495f,
+  0.000207697044f,
+  0.00165556648f,
+  0.252472349f,
+  0.0241967351f,
+  0.0199621232f,
+};
+
+// ===========================================================================
+// Math helpers
+// ===========================================================================
+
+float psycho17_DivideSafe(float a, float b, float fallback) {
+  return b == 0.f ? fallback : (a / b);
+}
+
+float3 psycho17_DivideSafe(float3 a, float3 b, float3 fallback) {
+  return float3(
+      b.x == 0.f ? fallback.x : (a.x / b.x),
+      b.y == 0.f ? fallback.y : (a.y / b.y),
+      b.z == 0.f ? fallback.z : (a.z / b.z));
+}
+
+float psycho17_Sign(float x) {
+  return x < 0.f ? -1.f : (x > 0.f ? 1.f : 0.f);
+}
+
+float3 psycho17_Sign(float3 x) {
+  return float3(psycho17_Sign(x.x), psycho17_Sign(x.y), psycho17_Sign(x.z));
+}
+
+float psycho17_SignPow(float x, float e) {
+  return psycho17_Sign(x) * pow(abs(x), e);
+}
+
+float3 psycho17_SignPow(float3 x, float3 e) {
+  return float3(
+      psycho17_SignPow(x.x, e.x),
+      psycho17_SignPow(x.y, e.y),
+      psycho17_SignPow(x.z, e.z));
+}
+
+float psycho17_Cross2(float2 a, float2 b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+// ===========================================================================
+// Color-space conversions
+// ===========================================================================
+
+namespace lms {
+float3 from_BT709(float3 bt709) {
+  return mul(PSYCHO17_XYZ_TO_LMS_MAT, mul(PSYCHO17_BT709_TO_XYZ_MAT, bt709));
+}
+}  // namespace lms
+
+namespace bt709 {
+float3 from_LMS(float3 lms) {
+  return mul(PSYCHO17_XYZ_TO_BT709_MAT, mul(PSYCHO17_LMS_TO_XYZ_MAT, lms));
+}
+}  // namespace bt709
+
+// Lazy composed matrices (Slang accepts `mul()` of constant matrices inside
+// function bodies; in some configurations it does not accept it in static
+// const initializers, so we keep the composition local to helpers).
+float3x3 psycho17_LMSWeightedFromXYZMatrix() {
+  return float3x3(
+      PSYCHO17_MB_WEIGHTS.x * PSYCHO17_XYZ_TO_LMS_MAT[0][0],
+      PSYCHO17_MB_WEIGHTS.x * PSYCHO17_XYZ_TO_LMS_MAT[0][1],
+      PSYCHO17_MB_WEIGHTS.x * PSYCHO17_XYZ_TO_LMS_MAT[0][2],
+      PSYCHO17_MB_WEIGHTS.y * PSYCHO17_XYZ_TO_LMS_MAT[1][0],
+      PSYCHO17_MB_WEIGHTS.y * PSYCHO17_XYZ_TO_LMS_MAT[1][1],
+      PSYCHO17_MB_WEIGHTS.y * PSYCHO17_XYZ_TO_LMS_MAT[1][2],
+      PSYCHO17_MB_WEIGHTS.z * PSYCHO17_XYZ_TO_LMS_MAT[2][0],
+      PSYCHO17_MB_WEIGHTS.z * PSYCHO17_XYZ_TO_LMS_MAT[2][1],
+      PSYCHO17_MB_WEIGHTS.z * PSYCHO17_XYZ_TO_LMS_MAT[2][2]);
+}
+
+float3x3 psycho17_LMSWeightedFromBT709Matrix() {
+  return mul(psycho17_LMSWeightedFromXYZMatrix(), PSYCHO17_BT709_TO_XYZ_MAT);
+}
+
+float3x3 psycho17_LMSWeightedFromBT2020Matrix() {
+  return mul(psycho17_LMSWeightedFromXYZMatrix(), PSYCHO17_BT2020_TO_XYZ_MAT);
+}
+
+namespace yf {
+// Yf from LMS using the Stockman LMS -> Yf row.
+float from_LMS(float3 lms) {
+  return PSYCHO17_MB_WEIGHTS.x * lms.x + PSYCHO17_MB_WEIGHTS.y * lms.y;
+}
+
+float from_BT709(float3 bt709) {
+  return from_LMS(lms::from_BT709(bt709));
+}
+}  // namespace yf
+
+// ===========================================================================
+// MacLeod-Boynton
+// ===========================================================================
+
+namespace macleod_boynton {
+float3 WeighLMS(float3 lms) {
+  return lms * PSYCHO17_MB_WEIGHTS;
+}
+
+float3 UnweighLMS(float3 lms_weighted) {
+  return lms_weighted / PSYCHO17_MB_WEIGHTS;
+}
+
+// Convert weighted LMS -> MB (l, s, y) where y = Lw + Mw.
+float3 from_WeightedLMS(float3 lms_weighted) {
+  float weighted_l = lms_weighted.x;
+  float weighted_m = lms_weighted.y;
+  float y_mb = max(weighted_l + weighted_m, 0.f);
+  float inv = psycho17_DivideSafe(1.f, y_mb, 0.f);
+  return float3(weighted_l * inv, lms_weighted.z * inv, y_mb);
+}
+
+float3 from_LMS(float3 lms) {
+  return from_WeightedLMS(WeighLMS(lms));
+}
+
+// Reconstruct weighted LMS from MB (l, s, y).
+float3 WeightedLMSFromMB(float2 mb_ls, float y_mb) {
+  return float3(mb_ls.x, (1.f - mb_ls.x), mb_ls.y) * y_mb;
+}
+
+float3 WeightedLMSFromMB(float3 mb_lsy) {
+  return WeightedLMSFromMB(mb_lsy.xy, mb_lsy.z);
+}
+
+// xyY -> XYZ -> weighted LMS -> MB.xy.
+float2 D65XY() {
+  // xyY(D65, Y=1) -> XYZ.
+  float2 xy = PSYCHO17_WHITE_POINT_D65;
+  float3 xyz;
+  xyz.xz = float2(xy.x, (1.f - xy.x - xy.y)) / xy.y;
+  xyz.y = 1.f;
+  float3 lms = mul(PSYCHO17_XYZ_TO_LMS_MAT, xyz);
+  return from_LMS(lms).xy;
+}
+}  // namespace macleod_boynton
+
+namespace lms {
+// MB -> LMS.
+float3 from_MacLeodBoynton(float3 mb_lsy) {
+  return macleod_boynton::WeightedLMSFromMB(mb_lsy.xy, mb_lsy.z) / PSYCHO17_MB_WEIGHTS;
+}
+}  // namespace lms
+
+// ===========================================================================
+// Color grading (Highlights / Shadows / Contrast, renodx v3 forms)
+// ===========================================================================
+
+namespace grade {
+float ContrastSafe(float x, float contrast, float mid_gray) {
+  return psycho17_SignPow(x / mid_gray, contrast) * mid_gray;
+}
+
+float Highlights(float x, float highlights, float mid_gray) {
+  if (highlights > 1.f) {
+    return max(x, lerp(x, mid_gray * pow(x / mid_gray, highlights), x));
+  }
+  if (highlights < 1.f) {
+    return min(x, x / (1.f + mid_gray * pow(x / mid_gray, 2.f - highlights) - x));
+  }
+  return x;
+}
+
+float Shadows(float x, float shadows, float mid_gray) {
+  if (shadows > 1.f) {
+    return max(x, x * (1.f + (x * mid_gray / pow(x / mid_gray, shadows))));
+  }
+  if (shadows < 1.f) {
+    return clamp(x * (1.f - (x * mid_gray / pow(x / mid_gray, 2.f - shadows))), 0.f, x);
+  }
+  return x;
+}
+}  // namespace grade
+
+// ===========================================================================
+// Naka-Rushton (vec3 anchored form).
+// ===========================================================================
+
+float3 NakaRushton(float3 x, float3 peak, float3 anchor_in, float3 anchor_out, float cone_response_exponent) {
+  float3 peak_minus_anchor_out = peak - anchor_out;
+  float3 n = cone_response_exponent * peak / peak_minus_anchor_out;
+  float3 a_n = pow(anchor_in, n);
+  float3 sign_x = psycho17_Sign(x);
+  float3 x_n = pow(abs(x), n);
+  float3 x_n_anchor_out = x_n * anchor_out;
+  float3 num = peak * x_n_anchor_out;
+  float3 den = mad(a_n, peak_minus_anchor_out, x_n_anchor_out);
+  return sign_x * num / den;
+}
+
+// ===========================================================================
+// Gamut compression (CIE 170-2 / RGB triangle in MB)
+// ===========================================================================
+
+namespace gamut {
+// White-rooted CIE 170-2 boundary ray-exit.
+float RayExitTCIE1702(float2 origin, float2 direction) {
+  if (dot(direction, direction) <= kPsycho17MBNearWhiteEps) {
+    return kPsycho17RayTMax;
+  }
+  float2 white_to_origin = macleod_boynton::D65XY() - origin;
+  float t_best = kPsycho17RayTMax;
+  bool hit_any = false;
+  [unroll]
+  for (int i = 0; i < kPsycho17CIE1702EdgeCount; ++i) {
+    float2 n = PSYCHO17_CIE1702_HALFSPACE_NORMALS[i];
+    float denom = dot(n, direction);
+    float numerator = PSYCHO17_CIE1702_HALFSPACE_NUMERATORS[i] + dot(n, white_to_origin);
+    float t = denom > 1e-8f ? numerator * rcp(denom) : kPsycho17RayTMax;
+    t_best = min(t_best, t);
+    hit_any = hit_any || (denom > 1e-8f);
+  }
+  return hit_any ? max(t_best, 0.f) : kPsycho17RayTMax;
+}
+
+float RayExitTCIE1702D(float2 direction) {
+  return RayExitTCIE1702(macleod_boynton::D65XY(), direction);
+}
+
+bool RaySegmentHit2D(float2 origin, float2 direction, float2 a, float2 b, out float t_hit) {
+  t_hit = 0.f;
+  float2 e = b - a;
+  float denom = psycho17_Cross2(direction, e);
+  if (abs(denom) <= kPsycho17GamutEps) return false;
+  float2 ao = a - origin;
+  float t = psycho17_Cross2(ao, e) / denom;
+  float u = psycho17_Cross2(ao, direction) / denom;
+  if (t < 0.f || u < 0.f || u > 1.f) return false;
+  t_hit = t;
+  return true;
+}
+
+// Extract MB.xy from a single weighted LMS primary column.
+float2 MBFromWeightedPrimary(float3 weighted_lms_primary) {
+  return macleod_boynton::from_WeightedLMS(weighted_lms_primary).xy;
+}
+
+float3 RGBToWeightedLMSPrimaryColumn(float3x3 rgb_to_lms_weighted_mat, uint primary_index) {
+  return float3(
+      rgb_to_lms_weighted_mat[0][primary_index],
+      rgb_to_lms_weighted_mat[1][primary_index],
+      rgb_to_lms_weighted_mat[2][primary_index]);
+}
+
+float3 RGBToAdaptiveWeightedLMSPrimaryColumn(
+    float3x3 rgb_to_lms_weighted_mat,
+    uint primary_index,
+    float3 adaptive_state_lms) {
+  return RGBToWeightedLMSPrimaryColumn(rgb_to_lms_weighted_mat, primary_index) / adaptive_state_lms;
+}
+
+void MakeRGBTriangleInMBAdaptiveWeighted(
+    float3x3 rgb_to_lms_weighted_mat,
+    float3 adaptive_state_lms,
+    out float2 r,
+    out float2 g,
+    out float2 b) {
+  r = MBFromWeightedPrimary(RGBToAdaptiveWeightedLMSPrimaryColumn(rgb_to_lms_weighted_mat, 0, adaptive_state_lms));
+  g = MBFromWeightedPrimary(RGBToAdaptiveWeightedLMSPrimaryColumn(rgb_to_lms_weighted_mat, 1, adaptive_state_lms));
+  b = MBFromWeightedPrimary(RGBToAdaptiveWeightedLMSPrimaryColumn(rgb_to_lms_weighted_mat, 2, adaptive_state_lms));
+}
+
+float RayMaxT_RGBTriangleInMB(
+    float2 origin,
+    float2 direction,
+    float2 r,
+    float2 g,
+    float2 b,
+    out bool has_solution) {
+  has_solution = false;
+  if (dot(direction, direction) <= kPsycho17MBNearWhiteEps) return 0.f;
+  float t_best = kPsycho17IntervalMax;
+  float t_hit;
+  bool hit_any = false;
+  if (RaySegmentHit2D(origin, direction, r, g, t_hit)) {
+    t_best = min(t_best, t_hit);
+    hit_any = true;
+  }
+  if (RaySegmentHit2D(origin, direction, g, b, t_hit)) {
+    t_best = min(t_best, t_hit);
+    hit_any = true;
+  }
+  if (RaySegmentHit2D(origin, direction, b, r, t_hit)) {
+    t_best = min(t_best, t_hit);
+    hit_any = true;
+  }
+  has_solution = hit_any;
+  return hit_any ? max(t_best, 0.f) : 0.f;
+}
+
+float NeutwoPeakClip(float x, float peak, float clip) {
+  float peak_safe = max(peak, 0.f);
+  float clip_safe = max(clip, peak_safe);
+  float x2 = x * x;
+  float clip2 = clip_safe * clip_safe;
+  float peak2 = peak_safe * peak_safe;
+  float denom2 = mad(x2, (clip2 - peak2), clip2 * peak2);
+  return (clip_safe * peak_safe * x) * rsqrt(max(denom2, kPsycho17GamutEps));
+}
+
+float NeutwoScaleFromRayT(float t_peak, float t_clip) {
+  float tp = max(t_peak, 0.f);
+  float tc = max(t_clip, tp);
+  return saturate(NeutwoPeakClip(1.f, tp, tc));
+}
+
+float SoftCompressionActivationFromRayT(float t_peak, float knee) {
+  float outside = 1.f - saturate(t_peak);
+  return psycho17_DivideSafe(outside, outside + max(knee, 1e-6f), 0.f);
+}
+
+float3 ClampWeightedLMSToCIE1702(float3 lms_weighted_input, float purity_max) {
+  float3 lms_weighted_clamped = max(lms_weighted_input, 0.f);
+  float3 mb = macleod_boynton::from_WeightedLMS(lms_weighted_clamped);
+  float y_mb = mb.z;
+  float2 ls = mb.xy;
+  if (!(y_mb > kPsycho17GamutEps)) {
+    return float3(lms_weighted_clamped.x, lms_weighted_clamped.y, 0.f);
+  }
+  float2 mb_white = macleod_boynton::D65XY();
+  float2 direction = ls - mb_white;
+  if (dot(direction, direction) <= kPsycho17MBNearWhiteEps) {
+    return lms_weighted_clamped;
+  }
+  float t_clip = RayExitTCIE1702D(direction);
+  float t_final = min(1.f, max(purity_max, 0.f) * t_clip);
+  float2 ls_out = mb_white + direction * t_final;
+  return macleod_boynton::WeightedLMSFromMB(ls_out, y_mb);
+}
+
+// Core compression that takes pre-built RGB-triangle vertices in MB.
+float3 GamutCompressWeightedLMSCoreRGBBoundFromWeightedInput(
+    float3 lms_weighted_input,
+    float2 bound_r,
+    float2 bound_g,
+    float2 bound_b,
+    float strength) {
+  float3 lms_weighted_clamped = ClampWeightedLMSToCIE1702(max(lms_weighted_input, 0.f), 1.f);
+  float3 mb = macleod_boynton::from_WeightedLMS(lms_weighted_clamped);
+  float y_mb = mb.z;
+  float2 ls = mb.xy;
+  if (!(y_mb > kPsycho17GamutEps)) {
+    return float3(lms_weighted_clamped.x, lms_weighted_clamped.y, 0.f);
+  }
+  float2 mb_white = macleod_boynton::D65XY();
+  float2 direction = ls - mb_white;
+  if (dot(direction, direction) <= kPsycho17MBNearWhiteEps) {
+    return lms_weighted_clamped;
+  }
+  bool has_peak = false;
+  float t_peak = RayMaxT_RGBTriangleInMB(mb_white, direction, bound_r, bound_g, bound_b, has_peak);
+  float t_clip = RayExitTCIE1702D(direction);
+  if (!has_peak) {
+    t_peak = t_clip;
+  }
+  float t_hard = saturate(t_peak);
+  float t_soft = NeutwoScaleFromRayT(min(t_peak, t_clip), t_clip);
+  float soft_mix = saturate(strength) * SoftCompressionActivationFromRayT(t_peak, 0.08f);
+  float t_final = lerp(t_hard, t_soft, soft_mix);
+  float2 ls_out = mb_white + t_final * direction;
+  return macleod_boynton::WeightedLMSFromMB(ls_out, y_mb);
+}
+
+float3 GamutCompressWeightedLMSCoreRGBBoundFromAdaptiveWeightedInput(
+    float3 lms_weighted_input,
+    float3 adaptive_state_lms,
+    float3x3 bound_rgb_to_lms_weighted_mat,
+    float strength) {
+  float2 br, bg, bb;
+  MakeRGBTriangleInMBAdaptiveWeighted(
+      bound_rgb_to_lms_weighted_mat, adaptive_state_lms, br, bg, bb);
+  return GamutCompressWeightedLMSCoreRGBBoundFromWeightedInput(
+      lms_weighted_input, br, bg, bb, strength);
+}
+}  // namespace gamut
+
+// ===========================================================================
+// psycho17-local helpers (adaptive-relative encoding + hue sensitivity)
+// ===========================================================================
+
+float psycho17_RayExitTCIE1702(float2 origin, float2 direction) {
+  return gamut::RayExitTCIE1702(origin, direction);
+}
+
+float psycho17_HueRelativePuritySignalFromTClip(float t_clip) {
+  return saturate(psycho17_DivideSafe(1.f, t_clip, 0.f));
+}
+
+float psycho17_AdaptiveHueSensitivityFromTClip(float t_clip) {
+  static const float kMeanD65RayDistance = 0.20139844f;
+  static const float kMaxD65RayDistance  = 1.02634534f;
+  static const float kMinSensitivity     = 0.35f;
+
+  float long_ray_weight = saturate(psycho17_DivideSafe(
+      t_clip - kMeanD65RayDistance,
+      kMaxD65RayDistance - kMeanD65RayDistance,
+      0.f));
+  return lerp(1.f, kMinSensitivity, long_ray_weight);
+}
+
+float3 psycho17_ToAdaptiveRelativeLMS(float3 lms, float3 adaptive_state_lms) {
+  return psycho17_DivideSafe(lms, adaptive_state_lms, float3(0.f, 0.f, 0.f));
+}
+
+float3 psycho17_FromAdaptiveRelativeLMS(float3 lms_rel, float3 adaptive_state_lms) {
+  return lms_rel * max(adaptive_state_lms, float3(1e-6f, 1e-6f, 1e-6f));
+}
+
+float3 psycho17_ToAdaptiveRelativeWeightedLMS(float3 lms, float3 adaptive_state_lms) {
+  return psycho17_DivideSafe(
+      macleod_boynton::WeighLMS(lms),
+      adaptive_state_lms,
+      float3(0.f, 0.f, 0.f));
+}
+
+float3 psycho17_FromAdaptiveRelativeWeightedLMS(float3 lmsw_rel, float3 adaptive_state_lms) {
+  return lmsw_rel * max(adaptive_state_lms, float3(1e-6f, 1e-6f, 1e-6f));
+}
+
+float3 psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
+    float3 lmsw_rel,
+    float3 adaptive_state_lms,
+    float3x3 bound_rgb_to_lms_weighted_mat,
+    float strength) {
+  return gamut::GamutCompressWeightedLMSCoreRGBBoundFromAdaptiveWeightedInput(
+      lmsw_rel,
+      adaptive_state_lms,
+      bound_rgb_to_lms_weighted_mat,
+      strength);
+}
+
+// ===========================================================================
+// psychotm_test17 — the operator itself.
+// ===========================================================================
+//
+// Ported from renodx (Carlos Lopez Jr., MIT). The reference's
+// `current_adaptive_state_bt709` / `current_background_state_bt709` /
+// `adaptive_normalization` parameters are not currently CB-exposed;
+// the dispatcher passes defaults (0.18, 0.18, 1.0) matching the
+// reference's diffuse-gray adapted state.
+float3 psychotm_test17(
+    float3 bt709_linear_input,
+    float peak_value,
+    float exposure,
+    float highlights,
+    float shadows,
+    float contrast,
+    float purity_scale,
+    float bleaching_intensity,
+    float clip_point,
+    float hue_restore,
+    float adaptation_contrast,
+    int white_curve_mode,
+    float cone_response_exponent,
+    float3 current_adaptive_state_bt709,
+    float3 current_background_state_bt709,
+    float gamut_compression,
+    int gamut_compression_mode,
+    float adaptive_normalization)
+{
+  float3 bt709_scene = bt709_linear_input * exposure;
+
+  float3 lms_in              = lms::from_BT709(bt709_scene);
+  float3 lms_peak            = lms::from_BT709(float3(peak_value, peak_value, peak_value));
+  float3 adaptive_state_lms  = lms::from_BT709(current_adaptive_state_bt709);
+  float3 background_state_lms = lms::from_BT709(current_background_state_bt709);
+
+  // Input gamut-compression branch in the renodx reference is `if (true)
+  // { /* noop */ } else if (...)` — dead. Keep the live identity path only.
+  float3 lms_working = lms_in;
+
+  float yf_input   = yf::from_LMS(lms_working);
+  float yf_midgray = yf::from_BT709(float3(0.18f, 0.18f, 0.18f));
+  float yf_target  = yf_input;
+
+  // Stage 1: UI highlight / shadow / contrast in luminosity space.
+  if (highlights != 1.f) {
+    yf_target = grade::Highlights(yf_target, highlights, yf_midgray);
+  }
+  if (shadows != 1.f) {
+    yf_target = grade::Shadows(yf_target, shadows, yf_midgray);
+  }
+  if (contrast != 1.f) {
+    yf_target = grade::ContrastSafe(yf_target, contrast, yf_midgray);
+  }
+
+  float yf_scale = psycho17_DivideSafe(yf_target, yf_input, 1.f);
+
+  float3 lms_graded = lms_working * yf_scale;
+  if (purity_scale != 1.f) {
+    float3 lms_graded_rel = psycho17_ToAdaptiveRelativeLMS(lms_graded, adaptive_state_lms);
+    float3 mb = macleod_boynton::from_LMS(lms_graded_rel);
+    float2 mb_white = macleod_boynton::from_LMS(float3(1.f, 1.f, 1.f)).xy;
+    float2 mb_scaled = lerp(mb_white, mb.xy, purity_scale);
+    lms_graded = psycho17_FromAdaptiveRelativeLMS(
+        lms::from_MacLeodBoynton(float3(mb_scaled, mb.z)),
+        adaptive_state_lms);
+  }
+
+  float3 lms_cones = lms_graded;
+
+  if (bleaching_intensity != 0.f) {
+    float3 stimulus_trolands = max(adaptive_state_lms, 0.f) * 203.f * 4.f;
+    float3 availability = float3(1.f, 1.f, 1.f) / (float3(1.f, 1.f, 1.f) + stimulus_trolands / 20000.f);
+    availability = lerp(float3(1.f, 1.f, 1.f), availability, bleaching_intensity);
+
+    float y = lms_cones.x + lms_cones.y;
+    float white_y = adaptive_state_lms.x + adaptive_state_lms.y;
+    float3 white_at_y = adaptive_state_lms * (y / white_y);
+    float3 delta = (lms_cones - white_at_y) * availability;
+    lms_cones = white_at_y + delta;
+  }
+
+  // Scale-equivariant Naka-Rushton in absolute LMS.
+  float3 display_scaled = NakaRushton(
+      lms_cones,
+      lms_peak,
+      adaptive_state_lms,
+      background_state_lms,
+      cone_response_exponent);
+
+  float3 display_scaled_rel_w = psycho17_ToAdaptiveRelativeWeightedLMS(
+      display_scaled, adaptive_state_lms);
+
+  if (hue_restore > 0.f) {
+    float3 lms_cones_rel_w = psycho17_ToAdaptiveRelativeWeightedLMS(
+        lms_cones, adaptive_state_lms);
+    float3 mb_source         = macleod_boynton::from_WeightedLMS(lms_cones_rel_w);
+    float3 mb_display_target = macleod_boynton::from_WeightedLMS(display_scaled_rel_w);
+    float3 mb_adapted_bg     = macleod_boynton::from_LMS(float3(1.f, 1.f, 1.f));
+
+    float2 source_offset = mb_source.xy - mb_adapted_bg.xy;
+    float2 target_offset = mb_display_target.xy - mb_adapted_bg.xy;
+    float src2 = dot(source_offset, source_offset);
+    float tgt2 = dot(target_offset, target_offset);
+    if (src2 > 1e-7f && tgt2 > 1e-7f) {
+      float inv_target_radius = rsqrt(tgt2);
+      float target_radius = tgt2 * inv_target_radius;
+      float source_t_clip  = psycho17_RayExitTCIE1702(mb_adapted_bg.xy, source_offset);
+      float display_t_clip = psycho17_RayExitTCIE1702(mb_adapted_bg.xy, target_offset);
+      float source_purity  = psycho17_HueRelativePuritySignalFromTClip(source_t_clip);
+      float display_purity = psycho17_HueRelativePuritySignalFromTClip(display_t_clip);
+      float purity_loss    = saturate(display_purity / source_purity);
+      float hue_sensitivity = psycho17_AdaptiveHueSensitivityFromTClip(display_t_clip);
+      float restore_weight = 1.f * hue_sensitivity * hue_restore * purity_loss;
+      if (restore_weight > 0.f) {
+        float inv_source_radius = rsqrt(src2);
+        float2 source_dir = source_offset * inv_source_radius;
+        float2 target_dir = target_offset * inv_target_radius;
+        float2 blended_dir = lerp(target_dir, source_dir, restore_weight);
+        float blended_len2 = dot(blended_dir, blended_dir);
+        if (blended_len2 > 1e-7f) {
+          blended_dir *= rsqrt(blended_len2);
+        } else {
+          blended_dir = target_dir;
+        }
+        float2 mb_restored_xy = mb_adapted_bg.xy + blended_dir * target_radius;
+        float3 mb_restored = float3(mb_restored_xy, mb_display_target.z);
+        display_scaled_rel_w = macleod_boynton::WeightedLMSFromMB(mb_restored);
+      }
+    }
+  }
+
+  if (gamut_compression != 0.f) {
+    if (gamut_compression_mode == 0) {
+      display_scaled_rel_w = psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
+          display_scaled_rel_w,
+          adaptive_state_lms,
+          psycho17_LMSWeightedFromBT709Matrix(),
+          gamut_compression);
+    } else if (gamut_compression_mode == 1) {
+      display_scaled_rel_w = psycho17_GamutCompressAdaptiveRelativeWeightedLMSBound(
+          display_scaled_rel_w,
+          adaptive_state_lms,
+          psycho17_LMSWeightedFromBT2020Matrix(),
+          gamut_compression);
+    }
+  }
+
+  // Scale back from first-site adaptation and emit BT.709.
+  float3 final_bt709 = bt709::from_LMS(
+      macleod_boynton::UnweighLMS(
+          psycho17_FromAdaptiveRelativeWeightedLMS(
+              display_scaled_rel_w,
+              adaptive_state_lms)));
+
+  // white_curve_mode / clip_point / adaptation_contrast /
+  // adaptive_normalization are accepted for parity with the psycho11 surface
+  // but are unused by psycho17 (the reference implementation bakes its peak /
+  // white behavior into the Naka-Rushton stage above). Suppress unused-var
+  // diagnostics by reading them into a discarded sum.
+  float unused_sum = (float)white_curve_mode + clip_point + adaptation_contrast + adaptive_normalization;
+  return final_bt709 + 0.f * float3(unused_sum, unused_sum, unused_sum);
+}
+
+}  // namespace psycho
+}  // namespace tonemap
+}  // namespace renodx
+
+#endif  // RENODX_SHADERS_TONEMAP_PSYCHO_TEST17_HLSL_

@@ -1,0 +1,26 @@
+/*
+ * Hable Filmic (Uncharted 2) tonemapping operator.
+ *
+ * Reference: http://filmicworlds.com/blog/filmic-tonemapping-operators/
+ * A..F are the shoulder/linear/toe parameters; W is the linear-scene white point.
+ */
+
+#ifndef RTX_PASS_TONEMAP_HABLE_SLANGH
+#define RTX_PASS_TONEMAP_HABLE_SLANGH
+
+float3 hablePartial(float3 x, float A, float B, float C, float D, float E, float F)
+{
+  return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 hableFilmicToneMapping(float3 color,
+                              float exposureBias,
+                              float A, float B, float C, float D, float E, float F,
+                              float W)
+{
+  float3 curr = hablePartial(exposureBias * color, A, B, C, D, E, F);
+  float3 whiteScale = float3(1.0f) / hablePartial(float3(W, W, W), A, B, C, D, E, F);
+  return curr * whiteScale;
+}
+
+#endif // RTX_PASS_TONEMAP_HABLE_SLANGH

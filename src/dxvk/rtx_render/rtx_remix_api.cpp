@@ -25,25 +25,38 @@
 #include "rtx_asset_data_manager.h"
 #include "rtx_asset_replacer.h"
 #include "rtx_light_manager.h"
+#include "rtx_lights.h"
 #include "rtx_objectpicking.h"
 #include "rtx_option.h"
 #include "rtx_globals.h"
 #include "rtx_options.h"
 #include "rtx_debug_view.h"
+#include "rtx_fork_game_state.h"
 
 #include "../dxvk_device.h"
+#include "../dxvk_objects.h"
+#include "../imgui/dxvk_imgui.h"
+#include "rtx_context.h"
 #include "rtx_texture_manager.h"
 
 #include <remix/remix_c.h>
 #include "rtx_remix_pnext.h"
 
 #include "../dxvk_image.h"
+#include "../dxvk_util.h"
 
 #include "../../util/util_math.h"
 #include "../../util/util_vector.h"
 #include "../../util/util_string.h"
 
 #include "../../d3d9/d3d9_swapchain.h"
+#include "../../d3d9/d3d9_texture.h"
+
+#include "rtx_option_layer.h"
+#include "../../util/util_hash_set_layer.h"
+#include "../../util/xxHash/xxhash.h"
+
+#include "rtx_fork_hooks.h"
 
 #include "../../lssusd/usd_include_begin.h"
 #include <src/usd-plugins/RemixParticleSystem/ParticleSystemAPI.h>
@@ -51,7 +64,11 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <atomic>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace dxvk {
   HRESULT CreateD3D9(
@@ -70,7 +87,7 @@ namespace dxvk {
 namespace dxvk {
   // Because DrawCallState/LegacyMaterialData hide needed fields as private
   struct RemixAPIPrivateAccessor {
-    static std::unique_ptr<ExternalDrawState> toRtDrawState(const remixapi_InstanceInfo& info);
+    static ExternalDrawState toRtDrawState(const remixapi_InstanceInfo& info);
   };
 }
 
@@ -78,7 +95,74 @@ namespace {
   uint64_t s_apiVersion{ 0 };
   IDirect3D9Ex* s_dxvkD3D9 { nullptr };
   dxvk::D3D9DeviceEx* s_dxvkDevice { nullptr };
+  // Lock order invariant:
+  //   s_mutex is taken BEFORE dxvk::RtxOptionImpl::getUpdateMutex().
+  // Any code path that needs both must respect this order. RtxOption mutators
+  // (setValue / addHash / clearHash / removeHash and friends) internally
+  // acquire the RtxOption update mutex, so callers that already hold s_mutex
+  // (e.g. mutateTextureHashOption via remixapi_AddTextureHash /
+  // remixapi_RemoveTextureHash) must not invert this order. Conversely, any
+  // lambda enqueued via EmitCs that runs under the RtxOption update mutex
+  // must not re-enter s_mutex.
   dxvk::mutex s_mutex {};
+
+  // Frame-boundary callback state removed in migration #7c.
+  // s_inFrame, s_beginCallback, s_endCallback, s_presentCallback now live in
+  // rtx_fork_api_entry.cpp (anonymous namespace). Access via fork_hooks:
+  //   notifyBeginScene()        — DrawInstance / DrawLightInstance call sites
+  //   registerCallbacks()       — remixapi_RegisterCallbacks body
+  //   shutdownCallbacks()       — remixapi_Shutdown
+  //   presentCallbackDispatch() — remixapi_Present after native Present call
+
+  // Global pending queues; applied to the device at safe points (frame/present)
+  struct PendingLightUpdate { remixapi_LightHandle handle; std::optional<dxvk::RtLight> rtLight; };
+  struct PendingDomeUpdate {
+    remixapi_LightHandle handle;
+    dxvk::Matrix4        transform;
+    std::filesystem::path texturePath;
+    dxvk::Vector3        radiance;
+  };
+  struct PendingLightCreate {
+    remixapi_LightHandle handle;
+    std::optional<dxvk::RtLight> rtLight;
+    bool isDome;
+    dxvk::Vector3 radiance;
+    dxvk::Matrix4 transform;
+    std::filesystem::path texturePath;
+  };
+  // Owned copy of a mesh surface buffered by remixapi_CreateMeshBatched
+  // so the source pointers can safely go out of scope before the render
+  // thread consumes them.
+  struct OwnedSurface {
+    std::vector<remixapi_HardcodedVertex> vertices;
+    std::vector<uint32_t> indices;
+    bool hasSkinning;
+    uint32_t bonesPerVertex;
+    std::vector<float> blendWeights;
+    std::vector<uint32_t> blendIndices;
+    remixapi_MaterialHandle material;
+  };
+  struct PendingMeshCreate {
+    remixapi_MeshHandle handle;
+    uint64_t hash;
+    std::vector<OwnedSurface> surfaces;
+  };
+  // PendingScreenOverlay struct and s_pendingScreenOverlay optional were removed
+  // in migration #7b. They now live exclusively in rtx_fork_api_entry.cpp
+  // (anonymous namespace), where both the writer (fork_hooks::drawScreenOverlay)
+  // and reader (fork_hooks::presentScreenOverlayFlush) reside.
+  std::vector<PendingLightCreate> s_pendingLightCreates;
+  std::vector<PendingLightUpdate> s_pendingLightUpdates;
+  std::vector<PendingDomeUpdate>  s_pendingDomeUpdates;
+  std::vector<remixapi_LightHandle> s_pendingLightDestroys;
+  std::vector<PendingMeshCreate>    s_pendingMeshCreates;
+  // Track handles that were updated or created this frame to prevent re-adding after deletion in the same frame
+  std::unordered_set<remixapi_LightHandle> s_handlesDeletedThisFrame;
+  // Sticky: set once any external (C-API) light is registered. Used to gate the
+  // per-frame persistent-light re-instancing on the native-D3D9 present path so
+  // native-only consumers (no C-API lights) skip it entirely. See
+  // remixapi_AutoInstancePersistentLights.
+  std::atomic<bool> s_externalLightApiUsed { false };
 
 
   dxvk::D3D9DeviceEx* tryAsDxvk() {
@@ -278,6 +362,14 @@ namespace {
         if (path.empty()) {
           return {};
         }
+
+        // Fork hook: support "0x<hex>" pseudo-paths that refer to API-uploaded
+        // textures (remixapi_CreateTexture) by image hash.
+        TextureRef hashRef;
+        if (dxvk::fork_hooks::textureHashPathLookup(ctx, path, hashRef)) {
+          return hashRef;
+        }
+
         auto assetData = AssetDataManager::get().findAsset(path.string());
         if (assetData == nullptr) {
           return {};
@@ -666,7 +758,7 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING    ){ result.set(InstanceCategories::IgnoreBakedLighting   ); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER){ result.set(InstanceCategories::IgnoreTransparencyLayer); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
-      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)           { result.set(InstanceCategories::SmoothNormals); }
       
       static_assert((int)InstanceCategories::Count == 25, "Instance categories changed, please update Remix SDK");
       return result;
@@ -782,21 +874,22 @@ namespace {
       return desc;
     }
 
-    std::unique_ptr<dxvk::ExternalDrawState> toRtDrawState(const remixapi_InstanceInfo& info) {
+    ExternalDrawState toRtDrawState(const remixapi_InstanceInfo& info) {
       return RemixAPIPrivateAccessor::toRtDrawState(info);
     }
   }
 }
 
-std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remixapi_InstanceInfo& info)
+dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remixapi_InstanceInfo& info)
 {
-  auto state = std::make_unique<dxvk::ExternalDrawState>();
-
-  auto& prototype = state->drawCall;
+  auto prototype = DrawCallState {};
   {
     prototype.cameraType = CameraType::Main;
     prototype.transformData.objectToWorld = convert::tomat4(info.transform);
+    prototype.transformData.textureTransform = Matrix4 {};
     prototype.transformData.texgenMode = TexGenMode::None;
+    prototype.materialData.colorTextures[0] = TextureRef {};
+    prototype.materialData.colorTextures[1] = TextureRef {};
     prototype.categories = convert::toRtCategories(info.categoryFlags);
   }
 
@@ -810,7 +903,7 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
       extBones->boneTransforms_count : REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT;
     prototype.skinningData.minBoneIndex = 0;
     prototype.skinningData.numBones = boneCount;
-    prototype.skinningData.numBonesPerVertex = prototype.getGeometryData().numBonesPerVertex;
+    prototype.skinningData.numBonesPerVertex = prototype.geometryData.numBonesPerVertex;
     prototype.skinningData.pBoneMatrices.resize(boneCount);
     for (uint32_t boneIdx = 0; boneIdx < boneCount; boneIdx++) {
       prototype.skinningData.pBoneMatrices[boneIdx] = convert::tomat4(extBones->boneTransforms_values[boneIdx]);
@@ -841,16 +934,17 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
     prototype.materialData.blendMode.writeMask = (VkColorComponentFlags) extBlend->writeMask;
   }
 
+  std::optional<RtxParticleSystemDesc> optParticles;
   if (auto extParticles = pnext::find<remixapi_InstanceInfoParticleSystemEXT>(&info)) {
-    state->optionalParticleDesc.emplace(convert::toRtParticleDesc(*extParticles));
+    optParticles.emplace(convert::toRtParticleDesc(*extParticles));
   }
   if (auto extParticles = pnext::find<remixapi_InstanceInfoParticleSystemLegacyEXT>(&info)) {
-    state->optionalParticleDesc.emplace(convert::toRtParticleDesc(*extParticles));
+    optParticles.emplace(convert::toRtParticleDesc(*extParticles));
   }
 
+  std::vector<Matrix4> gpuInstancingTransforms;
   if (auto extInstancing = pnext::find<remixapi_InstanceInfoGpuInstancingEXT>(&info)) {
     if (extInstancing->instanceTransforms_count > 0 && extInstancing->instanceTransforms_values) {
-      auto& gpuInstancingTransforms = state->gpuInstancingTransforms;
       gpuInstancingTransforms.reserve(extInstancing->instanceTransforms_count);
       for (uint32_t i = 0; i < extInstancing->instanceTransforms_count; ++i) {
         gpuInstancingTransforms.push_back(convert::tomat4(extInstancing->instanceTransforms_values[i]));
@@ -858,12 +952,15 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
     }
   }
 
-  state->mesh = info.mesh;
-  state->cameraType = convert::categoryToCameraType(info.categoryFlags);
-  state->categories = convert::toRtCategories(info.categoryFlags);
-  state->doubleSided = convert::tobool(info.doubleSided);
-
-  return state;
+  return ExternalDrawState {
+    prototype,
+    info.mesh,
+    convert::categoryToCameraType(info.categoryFlags),
+    convert::toRtCategories(info.categoryFlags),
+    convert::tobool(info.doubleSided),
+    optParticles,
+    std::move(gpuInstancingTransforms)
+  };
 }
 
 namespace {
@@ -1014,8 +1111,8 @@ namespace {
         dst.color0Buffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, color), sizeof(remixapi_HardcodedVertex), VK_FORMAT_B8G8R8A8_UNORM };
         if (src.skinning_hasvalue) {
           dst.numBonesPerVertex = src.skinning_value.bonesPerVertex;
-          dst.blendWeightBuffer = dxvk::RasterBuffer { blendWeightsSlice, 0, sizeof(float), VK_FORMAT_R32_SFLOAT };;
-          dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, sizeof(uint32_t), VK_FORMAT_R8G8B8A8_USCALED };
+          dst.blendWeightBuffer = dxvk::RasterBuffer { blendWeightsSlice, 0, uint32_t(sizeof(float) * src.skinning_value.bonesPerVertex), VK_FORMAT_R32_SFLOAT };
+          dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, uint32_t(sizeof(uint32_t) * dxvk::divCeil(src.skinning_value.bonesPerVertex, 4u)), VK_FORMAT_R8G8B8A8_USCALED };
         }
 
         dst.indexCount = src.indices_count;
@@ -1036,6 +1133,208 @@ namespace {
       auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
       assets->registerExternalMesh(cHandle, std::move(cSurfaces));
     });
+
+    *out_handle = handle;
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  // Shared builder used by both the synchronous remixapi_CreateMesh path and
+  // the batched path (remixapi_CreateMeshBatched) when the render thread
+  // materializes deferred pending mesh creates. Allocates host-visible DXVK
+  // buffers, memcpys owned vertex/index/skinning data, and fills a vector of
+  // dxvk::RasterGeometry ready for registerExternalMesh().
+  std::vector<dxvk::RasterGeometry> buildExternalMeshSurfacesFromOwned(
+      const std::vector<OwnedSurface>& surfaces) {
+    auto allocatedSurfaces = std::vector<dxvk::RasterGeometry> {};
+    allocatedSurfaces.reserve(surfaces.size());
+
+    auto allocBuffer = [](dxvk::D3D9DeviceEx* device, size_t sizeInBytes) -> dxvk::Rc<dxvk::DxvkBuffer> {
+      if (sizeInBytes == 0) {
+        return {};
+      }
+      auto bufferInfo = dxvk::DxvkBufferCreateInfo {};
+      bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+      bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+      bufferInfo.size = dxvk::align(sizeInBytes, dxvk::CACHE_LINE_SIZE);
+      return device->GetDXVKDevice()->createBuffer(
+          bufferInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          dxvk::DxvkMemoryStats::Category::RTXBuffer,
+          "Remix API mesh buffer");
+    };
+
+    for (const OwnedSurface& src : surfaces) {
+      const size_t vertexDataSize = sizeInBytes(src.vertices.data(), src.vertices.size());
+      const size_t indexDataSize = sizeInBytes(src.indices.data(), src.indices.size());
+
+      dxvk::Rc<dxvk::DxvkBuffer> vertexBuffer = allocBuffer(s_dxvkDevice, vertexDataSize);
+      dxvk::Rc<dxvk::DxvkBuffer> indexBuffer = allocBuffer(s_dxvkDevice, indexDataSize);
+      dxvk::Rc<dxvk::DxvkBuffer> skinningBuffer = nullptr;
+
+      auto vertexSlice = dxvk::DxvkBufferSlice { vertexBuffer };
+      if (vertexDataSize > 0) {
+        memcpy(vertexSlice.mapPtr(0), src.vertices.data(), vertexDataSize);
+      }
+
+      auto indexSlice = dxvk::DxvkBufferSlice {};
+      if (indexDataSize > 0) {
+        indexSlice = dxvk::DxvkBufferSlice { indexBuffer };
+        memcpy(indexSlice.mapPtr(0), src.indices.data(), indexDataSize);
+      }
+
+      auto blendWeightsSlice = dxvk::DxvkBufferSlice {};
+      auto blendIndicesSlice = dxvk::DxvkBufferSlice {};
+      if (src.hasSkinning) {
+        size_t wordsPerCompressedTuple = dxvk::divCeil(src.bonesPerVertex, 4u);
+        size_t sizeInBytes_weights = sizeInBytes(src.blendWeights.data(), src.blendWeights.size());
+        size_t sizeInBytes_indices = src.vertices.size() * wordsPerCompressedTuple * sizeof(uint32_t);
+
+        skinningBuffer = allocBuffer(s_dxvkDevice, sizeInBytes_weights + sizeInBytes_indices);
+
+        auto compressedBlendIndices = std::vector<uint32_t> {};
+        compressedBlendIndices.resize(src.vertices.size() * wordsPerCompressedTuple);
+        for (size_t vert = 0; vert < src.vertices.size(); vert++) {
+          uint32_t* dstCompressed = &compressedBlendIndices[vert * wordsPerCompressedTuple];
+          const uint32_t* blendIndicesStorage = &src.blendIndices[vert * src.bonesPerVertex];
+          for (uint32_t j = 0; j < src.bonesPerVertex; j += 4) {
+            uint32_t vertIndices = 0;
+            for (uint32_t k = 0; k < 4 && j + k < src.bonesPerVertex; ++k) {
+              vertIndices |= blendIndicesStorage[j + k] << 8 * k;
+            }
+            dstCompressed[j / 4] = vertIndices;
+          }
+        }
+        assert(sizeInBytes_indices == compressedBlendIndices.size() * sizeof(compressedBlendIndices[0]));
+
+        blendWeightsSlice = dxvk::DxvkBufferSlice { skinningBuffer, 0, sizeInBytes_weights };
+        blendIndicesSlice = dxvk::DxvkBufferSlice { skinningBuffer, sizeInBytes_weights, sizeInBytes_indices };
+        memcpy(blendWeightsSlice.mapPtr(0), src.blendWeights.data(), sizeInBytes_weights);
+        memcpy(blendIndicesSlice.mapPtr(0), compressedBlendIndices.data(), sizeInBytes_indices);
+      }
+
+      auto dst = dxvk::RasterGeometry {};
+      dst.externalMaterial = src.material;
+      dst.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+      dst.cullMode = VK_CULL_MODE_NONE; // this will be overwritten by the instance info at draw time
+      dst.frontFace = VK_FRONT_FACE_CLOCKWISE;
+      dst.vertexCount = static_cast<uint32_t>(src.vertices.size());
+      assert(src.vertices.size() < std::numeric_limits<uint32_t>::max());
+      dst.positionBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, position), sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32B32_SFLOAT };
+      dst.normalBuffer   = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, normal),   sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32B32_SFLOAT };
+      dst.texcoordBuffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, texcoord), sizeof(remixapi_HardcodedVertex), VK_FORMAT_R32G32_SFLOAT };
+      dst.color0Buffer   = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, color),    sizeof(remixapi_HardcodedVertex), VK_FORMAT_B8G8R8A8_UNORM };
+      if (src.hasSkinning) {
+        dst.numBonesPerVertex = src.bonesPerVertex;
+        dst.blendWeightBuffer  = dxvk::RasterBuffer { blendWeightsSlice, 0, uint32_t(sizeof(float) * src.bonesPerVertex), VK_FORMAT_R32_SFLOAT };
+        dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, uint32_t(sizeof(uint32_t) * dxvk::divCeil(src.bonesPerVertex, 4u)), VK_FORMAT_R8G8B8A8_USCALED };
+      }
+      dst.indexCount = static_cast<uint32_t>(src.indices.size());
+      dst.indexBuffer = dxvk::RasterBuffer { indexSlice, 0, sizeof(uint32_t), VK_INDEX_TYPE_UINT32 };
+      // look comments in UsdMod::Impl::processMesh, rtx_mod_usd.cpp
+      dst.hashes[dxvk::HashComponents::Indices] = dst.hashes[dxvk::HashComponents::VertexPosition] = hack_getNextGeomHash();
+      dst.hashes[dxvk::HashComponents::VertexTexcoord] = hack_getNextGeomHash();
+      dst.hashes[dxvk::HashComponents::GeometryDescriptor] = hack_getNextGeomHash();
+      dst.hashes[dxvk::HashComponents::VertexLayout] = hack_getNextGeomHash();
+      dst.hashes.precombine();
+
+      allocatedSurfaces.push_back(std::move(dst));
+    }
+    return allocatedSurfaces;
+  }
+
+  // Drain s_pendingMeshCreates and register each pending mesh with the asset
+  // replacer. Must be called on the render (CS) thread; accepts a DxvkContext.
+  void applyPendingMeshCreatesOnCs(dxvk::DxvkContext* ctx, std::vector<PendingMeshCreate>& meshCreates) {
+    if (meshCreates.empty()) {
+      return;
+    }
+    auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
+    for (auto& mesh : meshCreates) {
+      auto allocatedSurfaces = buildExternalMeshSurfacesFromOwned(mesh.surfaces);
+      assets->registerExternalMesh(mesh.handle, std::move(allocatedSurfaces));
+    }
+  }
+
+  // Flush pending mesh creates immediately on the calling thread via EmitCs.
+  // Used from the DrawInstance path to make batched meshes available before
+  // the first draw that references them.
+  void flushPendingMeshes(dxvk::D3D9DeviceEx* remixDevice) {
+    std::vector<PendingMeshCreate> meshCreates;
+    {
+      std::lock_guard lock { s_mutex };
+      if (s_pendingMeshCreates.empty()) {
+        return;
+      }
+      meshCreates.swap(s_pendingMeshCreates);
+    }
+
+    auto devLock = remixDevice->LockDevice();
+    remixDevice->EmitCs([meshCreates = std::move(meshCreates)](dxvk::DxvkContext* ctx) mutable {
+      applyPendingMeshCreatesOnCs(ctx, meshCreates);
+    });
+  }
+
+  // Batched mesh creation. Unlike remixapi_CreateMesh, this does not allocate
+  // DXVK buffers or emit a CS command right away; it instead deep-copies the
+  // caller-owned vertex/index/skinning data into s_pendingMeshCreates and
+  // lets a later flush (DrawInstance / Present / AutoInstancePersistentLights)
+  // materialize the mesh on the render thread. This lets API consumers submit
+  // meshes outside a frame boundary without taking the device lock per mesh.
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMeshBatched(
+    const remixapi_MeshInfo* info,
+    remixapi_MeshHandle* out_handle) {
+    if (!out_handle || !info || info->sType != REMIXAPI_STRUCT_TYPE_MESH_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    static_assert(sizeof(remixapi_MeshHandle) == sizeof(info->hash));
+    auto handle = reinterpret_cast<remixapi_MeshHandle>(info->hash);
+    if (!handle) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    PendingMeshCreate pending;
+    pending.handle = handle;
+    pending.hash = info->hash;
+    pending.surfaces.reserve(info->surfaces_count);
+
+    for (uint32_t i = 0; i < info->surfaces_count; i++) {
+      const auto& src = info->surfaces_values[i];
+      OwnedSurface dst;
+      dst.material = src.material;
+
+      dst.vertices.resize(src.vertices_count);
+      if (src.vertices_count > 0) {
+        memcpy(dst.vertices.data(), src.vertices_values, src.vertices_count * sizeof(remixapi_HardcodedVertex));
+      }
+
+      dst.indices.resize(src.indices_count);
+      if (src.indices_count > 0) {
+        memcpy(dst.indices.data(), src.indices_values, src.indices_count * sizeof(uint32_t));
+      }
+
+      dst.hasSkinning = src.skinning_hasvalue;
+      if (src.skinning_hasvalue) {
+        dst.bonesPerVertex = src.skinning_value.bonesPerVertex;
+        dst.blendWeights.resize(src.skinning_value.blendWeights_count);
+        if (src.skinning_value.blendWeights_count > 0) {
+          memcpy(dst.blendWeights.data(), src.skinning_value.blendWeights_values, src.skinning_value.blendWeights_count * sizeof(float));
+        }
+        dst.blendIndices.resize(src.skinning_value.blendIndices_count);
+        if (src.skinning_value.blendIndices_count > 0) {
+          memcpy(dst.blendIndices.data(), src.skinning_value.blendIndices_values, src.skinning_value.blendIndices_count * sizeof(uint32_t));
+        }
+      } else {
+        dst.bonesPerVertex = 0;
+      }
+
+      pending.surfaces.push_back(std::move(dst));
+    }
+
+    {
+      std::lock_guard lock { s_mutex };
+      s_pendingMeshCreates.push_back(std::move(pending));
+    }
 
     *out_handle = handle;
     return REMIXAPI_ERROR_CODE_SUCCESS;
@@ -1071,6 +1370,7 @@ namespace {
       assert(0);
       const_cast<bool&>(dxvk::RtxOptions::enableNearPlaneOverride()) = false;
     }
+    auto devLock = remixDevice->LockDevice();
     remixDevice->EmitCs([cRtCamera = convert::toRtCamera(*info)](dxvk::DxvkContext* ctx) {
       ctx->getCommonObjects()->getSceneManager().getCameraManager()
         .processExternalCamera(cRtCamera.type, cRtCamera.worldToView, cRtCamera.viewToProjection);
@@ -1119,16 +1419,20 @@ namespace {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
-    ScopedCpuProfileZone();
+    // beginScene on first draw per frame (callback state lives in fork file)
+    dxvk::fork_hooks::notifyBeginScene();
 
-    // Hoist conversion outside of mutex
-    auto drawState = convert::toRtDrawState(*info);
+    // Ensure any meshes queued via remixapi_CreateMeshBatched are registered
+    // with the asset replacer before this draw references them.
+    flushPendingMeshes(remixDevice);
 
-    std::lock_guard lock { s_mutex };
-    remixDevice->EmitCs<false>([cRtDrawState = std::move(drawState)](dxvk::DxvkContext* dxvkCtx) mutable {
-      auto* ctx = static_cast<dxvk::RtxContext*>(dxvkCtx);
-      ctx->commitExternalGeometryToRT(std::move(cRtDrawState));
-    });
+    {
+      auto devLock = remixDevice->LockDevice();
+      remixDevice->EmitCs([cRtDrawState = convert::toRtDrawState(*info)](dxvk::DxvkContext* dxvkCtx) mutable {
+        auto* ctx = static_cast<dxvk::RtxContext*>(dxvkCtx);
+        ctx->commitExternalGeometryToRT(std::move(cRtDrawState));
+      });
+    }
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1152,9 +1456,10 @@ namespace {
     std::lock_guard lock { s_mutex };
     if (auto src = pnext::find<remixapi_LightInfoDomeEXT>(info)) {
       // Special case for dome lights
-      remixDevice->EmitCs([cHandle = handle, 
-                          cRadiance = convert::tovec3(info->radiance), 
-                          cTransform = convert::tomat4(src->transform), 
+      auto devLock = remixDevice->LockDevice();
+      remixDevice->EmitCs([cHandle = handle,
+                          cRadiance = convert::tovec3(info->radiance),
+                          cTransform = convert::tomat4(src->transform),
                           cTexturePath = convert::topath(src->colorTexture)]
                           (dxvk::DxvkContext* ctx) {
         auto preloadTexture = [&ctx](const std::filesystem::path& path)->dxvk::TextureRef {
@@ -1184,7 +1489,7 @@ namespace {
       });
     } else {
       // Regular analytical light handling
-      const auto rtLight = convert::toRtLight(*info);
+      auto rtLight = convert::toRtLight(*info);
 
       // Note: If the toRtLight conversion process returns an empty optional, the specified LightInfo did
       // not contain the proper arguments to create a light with.
@@ -1192,6 +1497,13 @@ namespace {
         return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
       }
 
+      // Set the isDynamic flag from the LightInfo
+      rtLight->isDynamic = info->isDynamic;
+
+      // Set the ignoreViewModel flag from the LightInfo
+      rtLight->ignoreViewModel = info->ignoreViewModel;
+
+      auto devLock = remixDevice->LockDevice();
       remixDevice->EmitCs([cHandle = handle, cRtLight = *rtLight](dxvk::DxvkContext* ctx) {
         auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
         lightMgr.addExternalLight(cHandle, cRtLight);
@@ -1199,6 +1511,65 @@ namespace {
     }
 
     *out_handle = handle;
+    // Auto-register for persistent instancing on device
+    {
+      auto devLock = remixDevice->LockDevice();
+      remixDevice->EmitCs([cHandle = handle](dxvk::DxvkContext* ctx) {
+        auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
+        lightMgr.registerPersistentExternalLight(cHandle);
+      });
+    }
+    s_externalLightApiUsed.store(true, std::memory_order_relaxed);
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateLightBatched(
+    const remixapi_LightInfo* info,
+    remixapi_LightHandle* out_handle) {
+    // Validate inputs
+    if (!out_handle || !info || info->sType != REMIXAPI_STRUCT_TYPE_LIGHT_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    static_assert(sizeof(remixapi_LightHandle) == sizeof(info->hash));
+    auto handle = reinterpret_cast<remixapi_LightHandle>(info->hash);
+    if (!handle) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    // Queue the light creation for batched processing at Present time
+    std::lock_guard lock { s_mutex };
+
+    PendingLightCreate pending;
+    pending.handle = handle;
+
+    if (auto src = pnext::find<remixapi_LightInfoDomeEXT>(info)) {
+      // Dome light
+      pending.isDome = true;
+      pending.radiance = convert::tovec3(info->radiance);
+      pending.transform = convert::tomat4(src->transform);
+      pending.texturePath = convert::topath(src->colorTexture);
+    } else {
+      // Analytical light
+      pending.isDome = false;
+      auto rtLight = convert::toRtLight(*info);
+
+      if (!rtLight.has_value()) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+
+      // Set the isDynamic flag from the LightInfo
+      rtLight->isDynamic = info->isDynamic;
+
+      // Set the ignoreViewModel flag from the LightInfo
+      rtLight->ignoreViewModel = info->ignoreViewModel;
+
+      pending.rtLight = std::move(rtLight);
+    }
+
+    s_pendingLightCreates.push_back(std::move(pending));
+    *out_handle = handle;
+
+    s_externalLightApiUsed.store(true, std::memory_order_relaxed);
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1208,11 +1579,10 @@ namespace {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
-    std::lock_guard lock { s_mutex };
-    remixDevice->EmitCs([cHandle = handle](dxvk::DxvkContext* ctx) {
-      auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
-      lightMgr.removeExternalLight(cHandle);
-    });
+    {
+      std::lock_guard lock { s_mutex };
+      s_pendingLightDestroys.push_back(handle);
+    }
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1226,6 +1596,9 @@ namespace {
     if (!lightHandle) {
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
+
+    // beginScene on first API submission per frame (lights-only frames)
+    dxvk::fork_hooks::notifyBeginScene();
 
     // async load
     std::lock_guard lock { s_mutex };
@@ -1258,6 +1631,59 @@ namespace {
     option->readOption(newSetting, dxvk::RtxOptionLayer::getUserLayer());
 
     return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_RequestVramCompaction() {
+    return dxvk::fork_hooks::requestVramCompaction(tryAsDxvk());
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_RequestTextureVramFree() {
+    return dxvk::fork_hooks::requestTextureVramFree(tryAsDxvk());
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_GetVramStats(
+      remixapi_VramStats* out_stats) {
+    return dxvk::fork_hooks::getVramStats(tryAsDxvk(), out_stats);
+  }
+
+  // Fork-owned helper body lives in rtx_fork_api_entry.cpp as
+  // fork_hooks::mutateTextureHashOption (add flag replaces the local
+  // TextureHashMutation enum). Both call sites hold s_mutex across the call
+  // per the lock-ordering rule documented alongside s_mutex.
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_AddTextureHash(
+    const char* textureCategory,
+    const char* textureHash) {
+    std::lock_guard lock { s_mutex };
+    return dxvk::fork_hooks::mutateTextureHashOption(textureCategory, textureHash, /*add*/ true);
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_RemoveTextureHash(
+    const char* textureCategory,
+    const char* textureHash) {
+    std::lock_guard lock { s_mutex };
+    return dxvk::fork_hooks::mutateTextureHashOption(textureCategory, textureHash, /*add*/ false);
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_GetTextureHash(
+    IDirect3DTexture9* texture,
+    uint64_t* out_hash) {
+    return dxvk::fork_hooks::dxvkGetTextureHash(texture, out_hash);
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateTexture(
+    const remixapi_TextureInfo* info,
+    remixapi_TextureHandle* out_handle) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    std::lock_guard lock { s_mutex };
+    return dxvk::fork_hooks::createTexture(remixDevice, info, out_handle);
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_DestroyTexture(
+    remixapi_TextureHandle handle) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    std::lock_guard lock { s_mutex };
+    return dxvk::fork_hooks::destroyTexture(remixDevice, handle);
   }
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_pick_RequestObjectPicking(
@@ -1409,6 +1835,14 @@ namespace {
       return REMIXAPI_ERROR_CODE_SUCCESS;
     }
     return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_GetSharedD3D11TextureHandle(
+    void** out_sharedHandle,
+    uint32_t* out_width,
+    uint32_t* out_height) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    return dxvk::fork_hooks::getSharedD3D11TextureHandle(remixDevice, out_sharedHandle, out_width, out_height);
   }
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_GetVkImage(
@@ -1618,6 +2052,8 @@ namespace {
   }
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
+    // Clear fork-owned callback state (lives in rtx_fork_api_entry.cpp)
+    dxvk::fork_hooks::shutdownCallbacks();
     if (s_dxvkDevice) {
       while (true) {
         ULONG left = s_dxvkDevice->Release();
@@ -1644,10 +2080,130 @@ namespace {
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
+    // Apply pending creates, updates and auto-instance persistent lights once per frame
+    std::vector<PendingLightCreate> creates;
+    std::vector<PendingLightUpdate> updates;
+    std::vector<PendingDomeUpdate> domeUpdates;
+    std::vector<remixapi_LightHandle> destroys;
+    std::vector<PendingMeshCreate> meshCreates;
+    {
+      std::lock_guard lock { s_mutex };
+      creates.swap(s_pendingLightCreates);
+      updates.swap(s_pendingLightUpdates);
+      domeUpdates.swap(s_pendingDomeUpdates);
+      destroys.swap(s_pendingLightDestroys);
+      meshCreates.swap(s_pendingMeshCreates);
+    }
+    // Build tombstone set for this frame to avoid re-adding deleted lights
+    std::unordered_set<remixapi_LightHandle> tombstones;
+    tombstones.insert(destroys.begin(), destroys.end());
+
+    auto devLock = remixDevice->LockDevice();
+    remixDevice->EmitCs([creates = std::move(creates), updates = std::move(updates), domeUpdates = std::move(domeUpdates), destroys = std::move(destroys), tombstones = std::move(tombstones), meshCreates = std::move(meshCreates)](dxvk::DxvkContext* ctx) mutable {
+      auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
+      // Apply destroys first
+      for (auto h : destroys) {
+        if (h) {
+          lightMgr.unregisterPersistentExternalLight(h);
+          lightMgr.removeExternalLight(h);
+        }
+      }
+      // Apply creates (skip if in tombstone set - deleted in same frame)
+      for (auto& create : creates) {
+        if (tombstones.find(create.handle) != tombstones.end()) {
+          continue; // Skip if deleted in same frame
+        }
+
+        if (create.isDome) {
+          // Build dome light on the render thread
+          auto preloadTexture = [ctx](const std::filesystem::path& path) {
+            if (path.empty()) {
+              return dxvk::TextureRef{};
+            }
+            auto assetData = dxvk::AssetDataManager::get().findAsset(path.string().c_str());
+            if (assetData == nullptr) {
+              return dxvk::TextureRef{};
+            }
+            auto uploadedTexture = ctx->getCommonObjects()->getTextureManager()
+              .preloadTextureAsset(assetData, dxvk::ColorSpace::AUTO, true);
+            return dxvk::TextureRef{ uploadedTexture };
+          };
+
+          dxvk::DomeLight domeLight;
+          domeLight.radiance = create.radiance;
+          domeLight.worldToLight = inverse(create.transform);
+          domeLight.texture = preloadTexture(create.texturePath);
+
+          uint32_t unused;
+          ctx->getCommonObjects()->getSceneManager().trackTexture(domeLight.texture, unused, true, true);
+
+          lightMgr.addExternalDomeLight(create.handle, domeLight);
+        } else if (create.rtLight.has_value()) {
+          // Analytical light
+          lightMgr.addExternalLight(create.handle, *create.rtLight);
+        }
+        // Register all created lights as persistent
+        lightMgr.registerPersistentExternalLight(create.handle);
+        lightMgr.addExternalLightInstance(create.handle);
+      }
+      // Apply updates (skip if in tombstone set)
+      for (auto& upd : updates) {
+        if (upd.rtLight.has_value() && tombstones.find(upd.handle) == tombstones.end()) {
+          lightMgr.registerPersistentExternalLight(upd.handle);
+          lightMgr.addExternalLight(upd.handle, *upd.rtLight);
+          lightMgr.addExternalLightInstance(upd.handle);
+        }
+      }
+      for (auto& du : domeUpdates) {
+        if (tombstones.find(du.handle) != tombstones.end()) {
+          continue;
+        }
+        // Build dome light on the render thread to safely access managers
+        auto preloadTexture = [ctx](const std::filesystem::path& path) {
+          if (path.empty()) {
+            return dxvk::TextureRef{};
+          }
+          auto assetData = dxvk::AssetDataManager::get().findAsset(path.string().c_str());
+          if (assetData == nullptr) {
+            return dxvk::TextureRef{};
+          }
+          auto uploadedTexture = ctx->getCommonObjects()->getTextureManager()
+            .preloadTextureAsset(assetData, dxvk::ColorSpace::AUTO, true);
+          return dxvk::TextureRef{ uploadedTexture };
+        };
+
+        dxvk::DomeLight domeLight;
+        domeLight.radiance = du.radiance;
+        domeLight.worldToLight = inverse(du.transform);
+        domeLight.texture = preloadTexture(du.texturePath);
+
+        uint32_t unused;
+        ctx->getCommonObjects()->getSceneManager().trackTexture(domeLight.texture, unused, true, true);
+
+        lightMgr.registerPersistentExternalLight(du.handle);
+        lightMgr.addExternalDomeLight(du.handle, domeLight);
+        lightMgr.addExternalLightInstance(du.handle);
+      }
+
+      // Apply any mesh creates not already flushed by remixapi_DrawInstance
+      applyPendingMeshCreatesOnCs(ctx, meshCreates);
+
+      lightMgr.queueAutoInstancePersistent();
+    });
+
+    // Forward any pending screen overlay to the render thread for this frame.
+    dxvk::fork_hooks::presentScreenOverlayFlush(remixDevice);
+
+    // endScene callback before native present (fork-owned state)
+    dxvk::fork_hooks::presentEndSceneDispatch();
+
     HRESULT hr = remixDevice->Present(NULL, NULL, info ? info->hwndOverride : NULL, NULL);
     if (FAILED(hr)) {
       return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     }
+
+    // present callback + s_inFrame reset after successful native present
+    dxvk::fork_hooks::presentCallbackDispatch();
 
     UINT windowWidth = 0, windowHeight = 0;
     {
@@ -1710,6 +2266,261 @@ namespace {
 
 extern "C"
 {
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_AutoInstancePersistentLights(void) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    // Drain pending work and apply on render thread at a safe point
+    std::vector<PendingLightCreate> creates;
+    std::vector<PendingLightUpdate> updates;
+    std::vector<PendingDomeUpdate> domeUpdates;
+    std::vector<remixapi_LightHandle> destroys;
+    std::vector<PendingMeshCreate> meshCreates;
+    {
+      std::lock_guard lock { s_mutex };
+      s_handlesDeletedThisFrame.clear();
+      creates.swap(s_pendingLightCreates);
+      updates.swap(s_pendingLightUpdates);
+      domeUpdates.swap(s_pendingDomeUpdates);
+      destroys.swap(s_pendingLightDestroys);
+      meshCreates.swap(s_pendingMeshCreates);
+    }
+    // Native-present fast path. If no C-API scene work is queued this frame and
+    // no external light has ever been registered, there is nothing to apply or
+    // re-instance. Emitting an empty CS chunk (plus an extra LockDevice) on every
+    // native D3D9 Present is what disturbed the light pipeline for native-only
+    // consumers — the "persistent lights break all lights / flicker" report.
+    // Skip straight to the (self-gating) overlay flush. Genuine C-API light
+    // consumers set s_externalLightApiUsed and keep the per-frame path.
+    const bool hasPendingApiWork =
+        !creates.empty() || !updates.empty() || !domeUpdates.empty() ||
+        !destroys.empty() || !meshCreates.empty();
+    if (!hasPendingApiWork && !s_externalLightApiUsed.load(std::memory_order_relaxed)) {
+      dxvk::fork_hooks::presentScreenOverlayFlush(remixDevice);
+      return REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+    auto devLock = remixDevice->LockDevice();
+    remixDevice->EmitCs([creates = std::move(creates), updates = std::move(updates), domeUpdates = std::move(domeUpdates), destroys = std::move(destroys), meshCreates = std::move(meshCreates)](dxvk::DxvkContext* ctx) mutable {
+      auto& lightMgr = ctx->getCommonObjects()->getSceneManager().getLightManager();
+      // Apply destroys first
+      for (auto h : destroys) {
+        if (h) {
+          lightMgr.unregisterPersistentExternalLight(h);
+          lightMgr.removeExternalLight(h);
+        }
+      }
+      // Apply creates
+      for (auto& create : creates) {
+        if (create.isDome) {
+          // Build dome light on the render thread
+          auto preloadTexture = [ctx](const std::filesystem::path& path) {
+            if (path.empty()) {
+              return dxvk::TextureRef{};
+            }
+            auto assetData = dxvk::AssetDataManager::get().findAsset(path.string().c_str());
+            if (assetData == nullptr) {
+              return dxvk::TextureRef{};
+            }
+            auto uploadedTexture = ctx->getCommonObjects()->getTextureManager()
+              .preloadTextureAsset(assetData, dxvk::ColorSpace::AUTO, true);
+            return dxvk::TextureRef{ uploadedTexture };
+          };
+
+          dxvk::DomeLight domeLight;
+          domeLight.radiance = create.radiance;
+          domeLight.worldToLight = inverse(create.transform);
+          domeLight.texture = preloadTexture(create.texturePath);
+
+          uint32_t unused;
+          ctx->getCommonObjects()->getSceneManager().trackTexture(domeLight.texture, unused, true, true);
+
+          lightMgr.addExternalDomeLight(create.handle, domeLight);
+        } else if (create.rtLight.has_value()) {
+          // Analytical light
+          lightMgr.addExternalLight(create.handle, *create.rtLight);
+        }
+        // Register all created lights as persistent
+        lightMgr.registerPersistentExternalLight(create.handle);
+        lightMgr.addExternalLightInstance(create.handle);
+      }
+      // Apply analytical updates
+      for (auto& upd : updates) {
+        if (upd.rtLight.has_value()) {
+          lightMgr.registerPersistentExternalLight(upd.handle);
+          lightMgr.addExternalLight(upd.handle, *upd.rtLight);
+          lightMgr.addExternalLightInstance(upd.handle);
+        }
+      }
+      // Apply dome updates
+      for (auto& du : domeUpdates) {
+        auto preloadTexture = [ctx](const std::filesystem::path& path) {
+          if (path.empty()) {
+            return dxvk::TextureRef{};
+          }
+          auto assetData = dxvk::AssetDataManager::get().findAsset(path.string().c_str());
+          if (assetData == nullptr) {
+            return dxvk::TextureRef{};
+          }
+          auto uploadedTexture = ctx->getCommonObjects()->getTextureManager()
+            .preloadTextureAsset(assetData, dxvk::ColorSpace::AUTO, true);
+          return dxvk::TextureRef{ uploadedTexture };
+        };
+
+        dxvk::DomeLight domeLight;
+        domeLight.radiance = du.radiance;
+        domeLight.worldToLight = inverse(du.transform);
+        domeLight.texture = preloadTexture(du.texturePath);
+
+        uint32_t unused;
+        ctx->getCommonObjects()->getSceneManager().trackTexture(domeLight.texture, unused, true, true);
+
+        lightMgr.registerPersistentExternalLight(du.handle);
+        lightMgr.addExternalDomeLight(du.handle, domeLight);
+        lightMgr.addExternalLightInstance(du.handle);
+      }
+
+      // Apply any mesh creates not already flushed by remixapi_DrawInstance
+      applyPendingMeshCreatesOnCs(ctx, meshCreates);
+
+      // Ensure persistent auto-instancing happens every frame
+      lightMgr.queueAutoInstancePersistent();
+    });
+
+    // Forward any pending screen overlay to the render thread for this frame.
+    dxvk::fork_hooks::presentScreenOverlayFlush(remixDevice);
+
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_UpdateLightDefinition(
+    remixapi_LightHandle handle,
+    const remixapi_LightInfo* info) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!handle || !info) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    // An update can create-or-replace an external light, so treat it as
+    // external-light usage for the persistent re-instancing gate.
+    s_externalLightApiUsed.store(true, std::memory_order_relaxed);
+    // Handle dome light update if present in pNext chain
+    if (auto extDome = pnext::find<remixapi_LightInfoDomeEXT>(info)) {
+      auto cTransform = convert::tomat4(extDome->transform);
+      auto cTexturePath = convert::topath(extDome->colorTexture);
+      auto cRadiance = convert::tovec3(info->radiance);
+      {
+        std::lock_guard lock { s_mutex };
+        s_pendingDomeUpdates.push_back(PendingDomeUpdate{ handle, cTransform, cTexturePath, cRadiance });
+      }
+      return REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    // For analytical lights require base LightInfo; convert immediately
+    if (info->sType != REMIXAPI_STRUCT_TYPE_LIGHT_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    auto rt = convert::toRtLight(*info);
+    if (!rt.has_value()) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    // Set the isDynamic flag from the LightInfo
+    rt->isDynamic = info->isDynamic;
+
+    // Set the ignoreViewModel flag from the LightInfo
+    rt->ignoreViewModel = info->ignoreViewModel;
+
+    {
+      std::lock_guard lock { s_mutex };
+      s_pendingLightUpdates.push_back(PendingLightUpdate{ handle, std::move(rt) });
+    }
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_RegisterCallbacks(
+    PFN_remixapi_BridgeCallback beginSceneCallback,
+    PFN_remixapi_BridgeCallback endSceneCallback,
+    PFN_remixapi_BridgeCallback presentCallback) {
+    dxvk::fork_hooks::registerCallbacks(beginSceneCallback, endSceneCallback, presentCallback);
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_UIState REMIXAPI_CALL remixapi_GetUIState(void) {
+    return dxvk::fork_hooks::getUiState(tryAsDxvk());
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_SetUIState(remixapi_UIState state) {
+    return dxvk::fork_hooks::setUiState(tryAsDxvk(), state);
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawScreenOverlay(
+    const void*     pPixelData,
+    uint32_t        width,
+    uint32_t        height,
+    remixapi_Format format,
+    float           opacity) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    std::lock_guard lock { s_mutex };
+    return dxvk::fork_hooks::drawScreenOverlay(remixDevice, pPixelData, width, height, format, opacity);
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_SetGameValue(
+    const char* key,
+    const char* value) {
+    if (!key || key[0] == '\0' || !value) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    // The game-state store owns its own mutex. s_mutex is deliberately NOT
+    // taken here: funnelling high-frequency plugin writes through the same
+    // lock as the rest of the API has no benefit and would add contention.
+    dxvk::fork_game_state::GameStateStore::get().set(
+      std::string{ key }, std::string{ value });
+
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_GetGameValue(
+    const char* key,
+    char*       out_buffer,
+    uint32_t    in_buffer_size,
+    uint32_t*   out_actual_size) {
+    if (key == nullptr || key[0] == '\0') {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (out_actual_size == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    if (in_buffer_size > 0 && out_buffer == nullptr) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    // Like SetGameValue, rely on GameStateStore's internal mutex.
+    // s_mutex is deliberately NOT taken here to avoid contention on
+    // high-frequency reads from plugin threads.
+    std::string value;
+    if (!dxvk::fork_game_state::GameStateStore::get().tryGet(std::string{ key }, value)) {
+      *out_actual_size = 0;
+      return REMIXAPI_ERROR_CODE_SUCCESS;
+    }
+
+    const uint32_t needed = static_cast<uint32_t>(value.size()) + 1u;
+    *out_actual_size = needed;
+
+    if (in_buffer_size >= needed) {
+      memcpy(out_buffer, value.data(), value.size());
+      out_buffer[value.size()] = '\0';
+    }
+
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(const remixapi_InitializeLibraryInfo* info,
                                                                        remixapi_Interface* out_result) {
     if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO) {
@@ -1725,6 +2536,7 @@ extern "C"
 
     auto interf = remixapi_Interface {};
     {
+      // Upstream vtable slots
       interf.Startup = remixapi_Startup;
       interf.Shutdown = remixapi_Shutdown;
       interf.Present = remixapi_Present;
@@ -1747,8 +2559,27 @@ extern "C"
       interf.dxvk_SetDefaultOutput = remixapi_dxvk_SetDefaultOutput;
       interf.pick_RequestObjectPicking = remixapi_pick_RequestObjectPicking;
       interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
+      // Fork-added vtable slots (anonymous-namespace; must be assigned here where they're visible)
+      interf.CreateMeshBatched = remixapi_CreateMeshBatched;
+      interf.AddTextureHash = remixapi_AddTextureHash;
+      interf.RemoveTextureHash = remixapi_RemoveTextureHash;
+      interf.CreateTexture = remixapi_CreateTexture;
+      interf.DestroyTexture = remixapi_DestroyTexture;
+      interf.dxvk_GetTextureHash = remixapi_dxvk_GetTextureHash;
+      interf.dxvk_GetSharedD3D11TextureHandle = remixapi_dxvk_GetSharedD3D11TextureHandle;
+      interf.GetUIState = remixapi_GetUIState;
+      interf.SetUIState = remixapi_SetUIState;
+      interf.DrawScreenOverlay = remixapi_DrawScreenOverlay;
+      interf.CreateLightBatched = remixapi_CreateLightBatched;
+      interf.SetGameValue = remixapi_SetGameValue;
+      interf.RequestVramCompaction = remixapi_RequestVramCompaction;
+      interf.GetVramStats = remixapi_GetVramStats;
+      interf.RequestTextureVramFree = remixapi_RequestTextureVramFree;
+      interf.GetGameValue = remixapi_GetGameValue;
+      // Fork-added vtable slots (extern-C exported; delegated to fork hook)
+      dxvk::fork_hooks::remixApiVtableInit(interf);
     }
-    static_assert(sizeof(interf) == 176, "Add/remove function registration");
+    static_assert(sizeof(interf) == 328, "Add/remove function registration");
 
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;

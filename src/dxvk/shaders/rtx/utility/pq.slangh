@@ -1,0 +1,94 @@
+/*
+ * Fork-owned shared Perceptual Quantizer (PQ / SMPTE ST.2084) helpers.
+ *
+ * Originally inlined into temporal_aa.comp.slang (donut-attributed); extracted
+ * here so the tonemap GT7 operator can share the same PQ math. The vec3
+ * PQDecode / PQEncode functions keep their original signatures so the TAA
+ * pass continues to compile unchanged.
+ *
+ * Donut reference for the vec3 path:
+ *   https://github.com/NVIDIAGameWorks/donut/blob/main/shaders/passes/taa_cs.hlsl
+ *
+ * The scalar pq_eotfSt2084 / pq_inverseEotfSt2084 helpers follow the GT7
+ * Tone Mapping reference (Polyphony Digital, MIT 2025) and operate in
+ * GT7 frame-buffer units where 1.0 == 100 cd/m^2 (REFERENCE_LUMINANCE).
+ */
+
+#ifndef RTX_UTILITY_PQ_SLANGH
+#define RTX_UTILITY_PQ_SLANGH
+
+// SMPTE ST.2084 (PQ) constants.
+static const float pq_m1 = 0.1593017578125;     // (2610 / 4096) / 4
+static const float pq_m2 = 78.84375;            // (2523 / 4096) * 128
+static const float pq_c1 = 0.8359375;           //  3424 / 4096
+static const float pq_c2 = 18.8515625;          // (2413 / 4096) * 32
+static const float pq_c3 = 18.6875;             // (2392 / 4096) * 32
+static const float pq_maxLuminanceCdM2 = 10000.0;
+
+// GT7 luminance-scale convention: 1.0 in linear frame-buffer space corresponds
+// to REFERENCE_LUMINANCE cd/m^2 of physical luminance.
+static const float pq_gt7ReferenceLuminanceCdM2 = 100.0;
+
+// ---------------------------------------------------------------------------
+// vec3 PQ helpers (donut signatures — TAA call sites).
+// ---------------------------------------------------------------------------
+
+// PQ inverse-EOTF on a PQ-encoded signal in [0,1]; returns luminance scaled
+// by `pqC` (caller-provided). For absolute cd/m^2 pass pqC = 10000.
+float3 PQDecode(const float3 image, const float3 pqC)
+{
+  float3 Np = pow(max(image, 0.0), 1.0 / pq_m2);
+  float3 L = Np - pq_c1;
+  L = L / (pq_c2 - pq_c3 * Np);
+  L = pow(max(L, 0.0), 1.0 / pq_m1);
+
+  return L * pqC; // returns cd/m^2 when pqC == 10000.
+}
+
+// PQ EOTF on a luminance value (after dividing by invPqC); returns the
+// PQ-encoded signal saturated to [0,1].
+float3 PQEncode(float3 image, const float3 invPqC)
+{
+  float3 L = image * invPqC;
+  float3 Lm = pow(max(L, 0.0), pq_m1);
+  float3 N = (pq_c1 + pq_c2 * Lm) / (1.0 + pq_c3 * Lm);
+  image = pow(N, pq_m2);
+
+  return saturate(image);
+}
+
+// ---------------------------------------------------------------------------
+// Scalar PQ helpers in GT7 frame-buffer units (GT7 reference parity).
+// `exponentScaleFactor` scales m2 — defaults to 1.0 for plain PQ; the GT7
+// Jzazbz transform passes 1.7 here.
+// ---------------------------------------------------------------------------
+
+// PQ EOTF: normalized signal [0,1] -> frame-buffer luminance (1.0 == 100 cd/m^2).
+float pq_eotfSt2084(float n, float exponentScaleFactor = 1.0)
+{
+  n = clamp(n, 0.0, 1.0);
+
+  const float m2Scaled = pq_m2 * exponentScaleFactor;
+  float np = pow(n, 1.0 / m2Scaled);
+  float l = max(np - pq_c1, 0.0);
+  l = l / (pq_c2 - pq_c3 * np);
+  l = pow(l, 1.0 / pq_m1);
+
+  // Convert absolute luminance (cd/m^2) to frame-buffer scale.
+  return (l * pq_maxLuminanceCdM2) / pq_gt7ReferenceLuminanceCdM2;
+}
+
+// PQ inverse-EOTF: frame-buffer luminance (1.0 == 100 cd/m^2) -> normalized
+// signal [0, 1+].
+float pq_inverseEotfSt2084(float v, float exponentScaleFactor = 1.0)
+{
+  const float m2Scaled = pq_m2 * exponentScaleFactor;
+
+  float physical = v * pq_gt7ReferenceLuminanceCdM2;
+  float y = physical / pq_maxLuminanceCdM2;
+
+  float ym = pow(y, pq_m1);
+  return exp2(m2Scaled * (log2(pq_c1 + pq_c2 * ym) - log2(1.0 + pq_c3 * ym)));
+}
+
+#endif  // RTX_UTILITY_PQ_SLANGH

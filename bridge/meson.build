@@ -149,6 +149,11 @@ if (cpu_family == 'x86_64') or (cpu_family == 'aarch64')
 elif cpu_family == 'x86'
   add_global_arguments('/DREMIX_BRIDGE_CLIENT', language : 'cpp')
 
+  if bridge_compiler.get_id() == 'msvc'
+    # 32-bit bridge client truncates HWND/pointers to uint32_t by design.
+    add_global_arguments('/wd4311', '/wd4302', '/wd4312', '/wd4319', '/wd4244', '/wd4267', language: 'cpp')
+  endif
+
   if bridge_compiler.has_link_argument('-Wl,--add-stdcall-alias')
     add_global_link_arguments('-Wl,--add-stdcall-alias', language: 'cpp')
   endif

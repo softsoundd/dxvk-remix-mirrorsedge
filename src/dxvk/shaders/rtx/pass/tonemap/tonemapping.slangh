@@ -24,8 +24,6 @@
 #include "rtx/pass/tonemap/tonemapping.h"
 #include "rtx/utility/color.slangh"
 
-#include "ACES.hlsl"
-
 static const uint kHistogramFixedPointScale = 0x100;
 
 float getExposure(RWTexture1D<float> ExposureTex, const bool enableAutoExposure, const float exposureFactor)
@@ -38,34 +36,29 @@ float getExposure(RWTexture1D<float> ExposureTex, const bool enableAutoExposure,
   return exposure;
 }
 
-float normalizedEVToHistogramOffset(float normalizedEV)
+// Log-luminance histogram range used by the auto-exposure pipeline.
+// Values are log2 of linear luminance, so this covers ~0.000244 .. ~64.0
+// in linear units (~18 stops of dynamic range), which comfortably spans
+// typical HDR scene luminance.
+static const float kAutoExposureLogLumMin = -12.0f;
+static const float kAutoExposureLogLumMax =  6.0f;
+
+// Bucket layout: bin 0 is reserved for near-black pixels (excluded from
+// the average); bins 1..(EXPOSURE_HISTOGRAM_SIZE-1) span the log-luminance
+// range above with one bin per (range / (size - 1)) log2 stops.
+uint luminanceToHistogramBin(float luminance)
 {
-  // Remap exposure to bucket (1, size-1)
-  return (saturate(normalizedEV) * float(EXPOSURE_HISTOGRAM_SIZE - 2)) + 1;
+  const float logLum = log2(max(luminance, 1e-20f));
+  const float range = kAutoExposureLogLumMax - kAutoExposureLogLumMin;
+  const float t = saturate((logLum - kAutoExposureLogLumMin) / range);
+  // Map onto bins [1, EXPOSURE_HISTOGRAM_SIZE - 1].
+  return 1u + uint(t * float(EXPOSURE_HISTOGRAM_SIZE - 2) + 0.5f);
 }
 
-float histogramOffsetToNormalizedEV(float offset)
+float histogramBinToLuminance(uint bin)
 {
-  return saturate((offset - 1) / float(EXPOSURE_HISTOGRAM_SIZE - 2));
-}
-
-// Approximation of ACES
-// https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
-float3 ACESFilmApproximation(float3 x)
-{
-  float a = 2.51f;
-  float b = 0.03f;
-  float c = 2.43f;
-  float d = 0.59f;
-  float e = 0.14f;
-  return saturate((x*(a*x+b))/(x*(c*x+d)+e));
-}
-
-float3 ACESFilm(float3 color, bool useLegacyACES, bool suppressBlackLevelClamp = false)
-{
-  if (useLegacyACES)
-  {
-    return ACESFilmApproximation(color);
-  }
-  return ACESFitted(color, suppressBlackLevelClamp);
+  // Inverse of luminanceToHistogramBin for bins >= 1.
+  const float range = kAutoExposureLogLumMax - kAutoExposureLogLumMin;
+  const float t = (float(int(bin) - 1) + 0.5f) / float(EXPOSURE_HISTOGRAM_SIZE - 2);
+  return exp2(kAutoExposureLogLumMin + t * range);
 }

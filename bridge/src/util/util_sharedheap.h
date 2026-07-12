@@ -108,7 +108,7 @@ namespace bridge_util {
       };
       static inline Allocation createAllocation(const ChunkId firstChunk,
                                                 const size_t numChunks) {
-        return { firstChunk, firstChunk + numChunks - 1 };
+        return { firstChunk, static_cast<ChunkId>(firstChunk + numChunks - 1) };
       }
       Allocation findAllocation(const size_t numChunks);
       Allocation findFreeInMiddle(const size_t numChunks);

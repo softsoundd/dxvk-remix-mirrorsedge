@@ -28,6 +28,10 @@
 #include "rtx/utility/froxel.slangh"
 #include "rtx/utility/gbuffer_helpers.slangh"
 #include "rtx/utility/debug_view_helpers.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#ifdef ATMOSPHERE_AVAILABLE
+#include "rtx/pass/atmosphere/atmosphere_sky.slangh"
+#endif
 #include "rtx/concept/camera/camera.slangh"
 #include "rtx/concept/ray/ray.slangh"
 #include "rtx/concept/surface/surface.slangh"
@@ -37,7 +41,6 @@
 #include "rtx/concept/light/light.slangh"
 #include "rtx/algorithm/resolve.slangh"
 #include "rtx/algorithm/volume_lighting.slangh"
-#include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/pass/post_fx/post_fx_motion_blur_geometry_flags.slangh"
 #include "rtx/algorithm/nee_cache_light.slangh"
 #include "rtx/utility/gpu_printing.slangh"
@@ -718,12 +721,6 @@ void geometryResolverVertexOutputDebugView(
   case DEBUG_VIEW_TEXCOORD_GENERATION_MODE:
     storeInDebugView(pixelCoordinate, uint(surface.texcoordGenerationMode));
     break;
-  case DEBUG_VIEW_TRIANGLE_NORMAL:
-    storeInDebugView(pixelCoordinate, surfaceInteraction.debugTriangleNormal);
-    break;
-  case DEBUG_VIEW_INTERPOLATED_VERTEX_NORMAL:
-    storeInDebugView(pixelCoordinate, surfaceInteraction.debugInterpolatedVertexNormal);
-    break;
   case DEBUG_VIEW_GEOMETRY_NORMAL:
     storeInDebugView(pixelCoordinate, surfaceInteraction.geometryNormal);
     break;
@@ -1064,12 +1061,6 @@ void geometryResolverVertexOutputDebugView(
 
       // DEBUG_VIEW_TEXCOORD_GENERATION_MODE
       isValid &= isValidValue(surface.texcoordGenerationMode);
-
-      // DEBUG_VIEW_TRIANGLE_NORMAL
-      isValid &= isValidValue(surfaceInteraction.debugTriangleNormal);
-
-      // DEBUG_VIEW_INTERPOLATED_VERTEX_NORMAL
-      isValid &= isValidValue(surfaceInteraction.debugInterpolatedVertexNormal);
 
       // DEBUG_VIEW_GEOMETRY_NORMAL
       isValid &= isValidValue(surfaceInteraction.geometryNormal);
@@ -1901,7 +1892,10 @@ void geometryResolverVertex(
   // Output a miss
   if (!rayInteractionHasHit(rayInteraction))
   {
-    // Get sky radiance to blend with
+    // Fork: sky-radiance accumulation on miss. Three paths:
+    //   1. dome-light texture if dome light is active
+    //   2. Hillaire atmosphere (ATMOSPHERE_AVAILABLE-gated) if skyMode == 1
+    //   3. legacy skybox rasterization probe otherwise
     vec3 skyRadiance;
     if (cb.domeLightArgs.active)
     {
@@ -1910,15 +1904,23 @@ void geometryResolverVertex(
 #ifdef ATMOSPHERE_AVAILABLE
     else if (cb.skyMode == 1)
     {
-      // Physical atmosphere mode
-      skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
-        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      // Primary view ray — enable cloud temporal smoothing. The motion vector
+      // for sky misses comes from calcMotionVectorForRayMiss (already used
+      // below to write PrimaryScreenSpaceMotionVector), and historyResolution
+      // is the downscaled render extent (where this raygen writes).
+      const vec2 cloudMotion = calcMotionVectorForRayMiss(geometryResolverState.pixelCoordinate);
+      const uint2 cloudHistoryRes = cb.camera.resolution;
+      skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+                                     geometryResolverState.pixelCoordinate, cb.frameIdx,
+                                     cb.isZUp != 0,
+                                     /*enableCloudTemporalSmoothing=*/ true,
+                                     cloudMotion,
+                                     cloudHistoryRes,
+                                     /*isPrimaryRay=*/ true);
     }
 #endif
     else
     {
-      // Skybox rasterization mode
       skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
     }
 
@@ -2573,16 +2575,24 @@ void geometryPSRResolverVertex(
 #ifdef ATMOSPHERE_AVAILABLE
     else if (cb.skyMode == 1)
     {
-      // Physical atmosphere mode.
-      vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
-        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      // Physical atmosphere mode
+      vec3 skyRadiance;
+      if (cb.atmosphereArgs.useSkyViewLut != 0) {
+        vec3 dirYUp = cb.isZUp != 0
+          ? vec3(ray.direction.x, ray.direction.z, ray.direction.y)
+          : ray.direction;
+        skyRadiance = sampleSkyViewLutForRay(normalize(dirYUp), AtmosphereSkyViewLut, AtmosphereSkyViewSampler);
+      } else {
+        skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+                                        geometryPSRResolverState.pixelCoordinate, cb.frameIdx,
+                                        cb.isZUp != 0);
+      }
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }
 #endif
     else
     {
-      // Skybox rasterization mode.
+      // Skybox rasterization mode - output radiance from sky probe
        emissiveRadiance += cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0) * radianceAttenuation;
     }
   }
@@ -2622,6 +2632,50 @@ void geometryPSRResolverVertex(
 
     return;
   }
+
+  // NOTE: Deprecated feature - isOccluder property was removed from Surface struct
+  // Handle occluder surfaces in PSR path - they block geometry behind them but show the sky
+  // if (surface.isOccluder)
+  // {
+  //   // Get sky radiance
+  //   vec3 skyRadiance;
+  //   if (cb.domeLightArgs.active)
+  //   {
+  //     skyRadiance = cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, ray.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform);
+  //   }
+  // #ifdef ATMOSPHERE_AVAILABLE
+  //   else if (cb.skyMode == 1)
+  //   {
+  //     // Physical atmosphere mode
+  //     skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+  //                                    cb.isZUp != 0);
+  //   }
+  // #endif
+  //   else
+  //   {
+  //     // Skybox rasterization mode
+  //     skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
+  //   }
+  //   
+  //   // Apply sky radiance with accumulated attenuation
+  //   geometryPSRResolverState.radiance += skyRadiance * vec3(geometryPSRResolverState.attenuation);
+  //   
+  //   // NRC is only used for paths that are fully integrated
+  //   if (geometryPSRResolverState.selectedIntegrationSurface)
+  //   {
+  //     updateNrcOnGBufferMiss(geometryPSRResolverState.pixelCoordinate, cb.nrcArgs);
+  //   }
+  //   
+  //   // Output Miss
+  //   SharedRadianceRG[geometryPSRResolverState.pixelCoordinate] += geometryPSRResolverState.radiance.rg;
+  //   SharedRadianceB[geometryPSRResolverState.pixelCoordinate] += geometryPSRResolverState.radiance.b;
+  // 
+  //   geometryResolverOutputMiss(
+  //     geometryPSRResolverState.primarySurface, geometryPSRResolverState.selectedIntegrationSurface,
+  //     geometryPSRResolverState.pixelCoordinate);
+  // 
+  //   return;
+  // }
 
   // Now apply attenuation after dealing with the miss case (where attenuation is 0)
   geometryPSRResolverState.attenuation *= radianceAttenuation;

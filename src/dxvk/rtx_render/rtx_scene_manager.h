@@ -117,11 +117,25 @@ struct ExternalDrawState {
   XXH64_hash_t computeExternalDrawIdentityHash() const;
 };
 
+// Forward decls so SceneManager can friend the fork hook that needs access
+// to private m_drawCallMeta state. See docs/fork-touchpoints.md.
+class SceneManager;
+namespace fork_hooks {
+  void externalDrawObjectPicking(
+    DxvkDevice& device,
+    DrawCallState& drawCall,
+    XXH64_hash_t textureHash,
+    SceneManager& scene);
+}
+
 // Scene manager is a super manager, it's the interface between rendering and world state
 // along with managing the operation of other caches, scene manager also manages the cache
 // directly for "SceneObject"'s - which are "unique meshes/geometry", which map 1-to-1 with
 // BLAS entries in raytracing terminology.
 class SceneManager : public CommonDeviceObject, public ResourceCache {
+  friend void fork_hooks::externalDrawObjectPicking(
+    DxvkDevice&, DrawCallState&, XXH64_hash_t, SceneManager&);
+
 public:
   SceneManager(SceneManager const&) = delete;
   SceneManager& operator=(SceneManager const&) = delete;
@@ -135,7 +149,7 @@ public:
   void onDestroy();
 
   void submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData);
-  void submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> state);
+  void submitExternalDraw(const Rc<DxvkContext>& ctx, ExternalDrawState&& state);
   void setStartInMediumMaterial(const MaterialData& translucentMaterial);
   void clearStartInMediumMaterial();
 

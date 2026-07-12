@@ -732,10 +732,12 @@ void InstanceInfoGpuInstancing::_dtor() {
 // LightInfo //
 ///////////////
 
-static_assert(sizeof(void*) != 8 || sizeof remixapi_LightInfo == 40, "recheck Bridge member list here");
+static_assert(sizeof(void*) != 8 || sizeof remixapi_LightInfo == 48, "recheck Bridge member list here");
 #define LightInfoVars sType, \
                       hash, \
-                      radiance
+                      radiance, \
+                      isDynamic, \
+                      ignoreViewModel
 uint32_t LightInfo::_calcSize() const {
   return fold_helper::calcSize(LightInfoVars);
 }

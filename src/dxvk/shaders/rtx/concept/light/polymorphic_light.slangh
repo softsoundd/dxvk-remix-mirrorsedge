@@ -60,6 +60,9 @@ DecodedPolymorphicLight decodePolymorphicLight(MemoryPolymorphicLight memoryPoly
     (flagData & (1u << 0)) != 0u,
     data11, data12, data13);
 
+  decodedPolymorphicLight.ignoreViewModel = (flagData & (1u << 1)) != 0u;
+  decodedPolymorphicLight.atmosphereCloudShadowed = (flagData & (1u << 2)) != 0u; // fork — 2026-06-21
+
   decodedPolymorphicLight.radiance = logLuv32ToRadiance(data10);
 
   decodedPolymorphicLight.data0 = memoryPolymorphicLight.data0;

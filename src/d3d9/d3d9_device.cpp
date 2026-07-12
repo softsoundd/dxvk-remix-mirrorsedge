@@ -2615,7 +2615,7 @@ namespace dxvk {
         cPrimCount = PrimitiveCount,
         cStartVertex = StartVertex,
         cInstanceCount = GetInstanceCount(),
-        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2670,7 +2670,7 @@ namespace dxvk {
         cStartIndex = StartIndex,
         cBaseVertexIndex = BaseVertexIndex,
         cInstanceCount = GetInstanceCount(),
-        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2732,7 +2732,7 @@ namespace dxvk {
         cPrimCount = PrimitiveCount,
         cInstanceCount = GetInstanceCount(),
         cStride = VertexStreamZeroStride,
-        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2810,7 +2810,7 @@ namespace dxvk {
         cStride = VertexStreamZeroStride,
         cInstanceCount = GetInstanceCount(),
         cIndexType = DecodeIndexType(static_cast<D3D9Format>(IndexDataFormat)),
-        cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -4624,24 +4624,6 @@ namespace dxvk {
     const bool readOnly = Flags & D3DLOCK_READONLY;
     pResource->SetReadOnlyLocked(Subresource, readOnly);
 
-    // These hashes are configured as stable identities for RTX draw-call setup.
-    // Some games update them after setup, but Remix still needs the original
-    // hash to classify terrain and omit auxiliary textures like lightmaps.
-    if (MipLevel == 0 && !readOnly) {
-      Rc<DxvkImage> image = pResource->GetImage();
-      if (image != nullptr) {
-        const XXH64_hash_t imageHash = image->getHash();
-        const bool keepConfiguredHash =
-          lookupHash(RtxOptions::terrainTextures(), imageHash) ||
-          lookupHash(RtxOptions::lightmapTextures(), imageHash) ||
-          lookupHash(RtxOptions::ignoreTextures(), imageHash) ||
-          lookupHash(RtxOptions::ignoreBakedLightingTextures(), imageHash);
-        if (imageHash != kEmptyHash && !keepConfiguredHash) {
-          pResource->ClearHash();
-        }
-      }
-    }
-
     bool renderable = desc.Usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL);
 
     // If we recently wrote to the texture on the gpu,
@@ -5089,7 +5071,6 @@ namespace dxvk {
 
       // NV-DXVK start: Implement memoization for some expensive CPU operations
       pResource->remixMemoization.invalidateAll();
-      pResource->remixContentGeneration++;
       // NV-DXVK end
     }
     else {
@@ -5125,7 +5106,6 @@ namespace dxvk {
       // NV-DXVK start: Implement memoization for some expensive CPU operations
       if (!readOnly) {
         pResource->remixMemoization.invalidate(offset, size);
-        pResource->remixContentGeneration++;
       }
       // NV-DXVK end
     }

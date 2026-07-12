@@ -49,9 +49,22 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 	- Note: UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
  		- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`.
 
-### 3) Acknowledgements
+### 3) Remix Plus features (Numos atmosphere, SDK API, tonemap)
+
+This fork also integrates the [Remix Plus](https://github.com/RemixProjGroup/dxvk-remix) extended feature set:
+
+- **Numos sky system** — Hillaire atmospheric scattering, volumetric clouds, night sky, multi-moon, and weather presets (`rtx.skyMode = 1`). Replaces the earlier `PhysicalAtmosphere` name; the integer value is unchanged.
+- **ME sky-view LUT perf** — `rtx.atmosphere.useSkyViewLut` (default `True`) keeps the Mirror's Edge atmosphere performance optimization on top of Numos.
+- **Tonemap operators** — eight operators (ACES, AgX, GT7, Hable, etc.) with perceptual auto-exposure.
+- **Remix SDK API v0.1000.0** — batched mesh/light creation, `SetGameValue`, VRAM control, HW skinning, and related plugin integrations.
+- **Fork-touchpoint architecture** — Plus features live in `rtx_fork_*.cpp` modules; see [`docs/fork-touchpoints.md`](docs/fork-touchpoints.md) and [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for dual-upstream merge workflow (NVIDIA `dxvk-remix` + Remix Plus).
+
+For weather presets and sky API details, see [`docs/RemixSkyAPI.md`](docs/RemixSkyAPI.md) and [`docs/CloudSystem.md`](docs/CloudSystem.md).
+
+### 4) Acknowledgements
 - sambow23 for their physically based sky implementation.
 - xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
+- [Kim2091](https://github.com/Kim2091) and the Remix Plus community for the Numos atmosphere, SDK extensions, and fork-touchpoint architecture.
 
 ## Build instructions
 

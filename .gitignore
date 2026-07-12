@@ -43,3 +43,8 @@ metrics.txt
 nrc_session_log.txt
 python.dxvk-cache
 *.xml.user
+
+nv-private
+tests/rtx/dxvk_rt_testing/
+/src/dxvk/rtx_render/rtx_fast_noise_data.h
+/src/dxvk/rtx_render/rtx_fast_noise_data.cpp

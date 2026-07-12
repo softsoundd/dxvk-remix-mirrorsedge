@@ -1,0 +1,70 @@
+/*
+ * Lottes 2016 global tonemapping operator.
+ *
+ * Based on the implementation from glTF-Compressonator:
+ *   https://github.com/KhronosGroup/glTF-Compressonator/blob/master/Compressonator/Applications/_Plugins/C3DModel_viewers/glTF_DX12_EX/DX12Util/shaders/Tonemapping.hlsl
+ *
+ * Copyright (c) 2018 Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2004-2006 ATI Technologies Inc.
+ *
+ * Licensed under the MIT License (full text in the original source above).
+ */
+
+#ifndef RTX_PASS_TONEMAP_LOTTES_SLANGH
+#define RTX_PASS_TONEMAP_LOTTES_SLANGH
+
+// Build 'b' term for the general tonemapping operator.
+float lottesColToneB(float hdrMax, float contrast, float shoulder, float midIn, float midOut)
+{
+  return
+    -((-pow(midIn, contrast) + (midOut * (pow(hdrMax, contrast * shoulder) * pow(midIn, contrast) -
+      pow(hdrMax, contrast) * pow(midIn, contrast * shoulder) * midOut)) /
+      (pow(hdrMax, contrast * shoulder) * midOut - pow(midIn, contrast * shoulder) * midOut)) /
+      (pow(midIn, contrast * shoulder) * midOut));
+}
+
+// Build 'c' term for the general tonemapping operator.
+float lottesColToneC(float hdrMax, float contrast, float shoulder, float midIn, float midOut)
+{
+  return (pow(hdrMax, contrast * shoulder) * pow(midIn, contrast) -
+    pow(hdrMax, contrast) * pow(midIn, contrast * shoulder) * midOut) /
+    (pow(hdrMax, contrast * shoulder) * midOut - pow(midIn, contrast * shoulder) * midOut);
+}
+
+// General tonemapping operator, p := {contrast, shoulder, b, c}.
+float lottesColTone(float x, float4 p)
+{
+  float z = pow(x, p.x);
+  return z / (pow(z, p.y) * p.z + p.w);
+}
+
+float3 lottesToneMapping(float3 color, float hdrMax, float contrast, float shoulder, float midIn, float midOut)
+{
+  float b = lottesColToneB(hdrMax, contrast, shoulder, midIn, midOut);
+  float c = lottesColToneC(hdrMax, contrast, shoulder, midIn, midOut);
+
+  float peak = max(color.x, max(color.y, color.z));
+  // Avoid division by zero for black pixels.
+  if (peak <= 0.0)
+    return float3(0.0, 0.0, 0.0);
+
+  float3 ratio = color / peak;
+  peak = lottesColTone(peak, float4(contrast, shoulder, b, c));
+
+  // Channel crosstalk and saturation.
+  float crosstalk = 4.0;
+  float saturation = contrast;
+  float crossSaturation = contrast * 16.0;
+
+  float white = 1.0;
+
+  float saturationCrossSaturation = saturation / crossSaturation;
+  ratio = pow(abs(ratio), float3(saturationCrossSaturation, saturationCrossSaturation, saturationCrossSaturation));
+  ratio = lerp(ratio, float3(white, white, white), pow(peak, crosstalk));
+  ratio = pow(abs(ratio), float3(crossSaturation, crossSaturation, crossSaturation));
+
+  color = peak * ratio;
+  return color;
+}
+
+#endif // RTX_PASS_TONEMAP_LOTTES_SLANGH

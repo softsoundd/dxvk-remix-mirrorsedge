@@ -119,7 +119,7 @@ Sampler3D<float4> ValueNoiseSampler;
 layout(binding = BINDING_SAMPLER_READBACK_BUFFER) 
 RWStructuredBuffer<uint32_t> SamplerFeedbackBuffer;
 
-// Atmosphere LUTs.
+// Atmosphere LUTs - use high binding slots to avoid conflicts with pass-specific bindings
 layout(binding = BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)
 Texture2D AtmosphereTransmittanceLut;
 
@@ -128,3 +128,88 @@ Texture2D AtmosphereMultiscatteringLut;
 
 layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_LUT)
 Texture2D AtmosphereSkyViewLut;
+
+layout(binding = BINDING_ATMOSPHERE_CLOUD_NOISE_3D)
+Texture3D<float> AtmosphereCloudNoise3D;
+
+layout(binding = BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER)
+SamplerState AtmosphereCloudNoise3DSampler;
+
+layout(binding = BINDING_ATMOSPHERE_FAST_NOISE)
+Texture2DArray<float2> AtmosphereFastNoise;
+
+// Cloud history textures (fork). See atmosphere_bindings.slangh for full notes.
+layout(rgba16f, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_PREV)
+Texture2D<float4> AtmosphereCloudHistoryPrev;
+
+layout(rgba16f, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_CURR)
+RWTexture2D<float4> AtmosphereCloudHistoryCurr;
+
+// Cloud history frame-id ping-pong (fork). R16_UINT companion to the color
+// pair above, carrying the frame index at which each pixel was last written
+// by the sky-miss path. Used to reject stale history at pixels that were
+// foreground-occluded last frame. See atmosphere_bindings.slangh for the
+// full mechanism.
+layout(r16ui, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_PREV)
+Texture2D<uint> AtmosphereCloudHistoryFrameIdPrev;
+
+layout(r16ui, binding = BINDING_ATMOSPHERE_CLOUD_HISTORY_FRAME_ID_CURR)
+RWTexture2D<uint> AtmosphereCloudHistoryFrameIdCurr;
+
+// Cloud-occluded sky-ambient transmittance LUT (fork). 2D (azimuth, elevation),
+// R16F single-channel, baked per frame from camera position by
+// cloud_sky_transmittance_lut.comp.slang. Sampled via the linear/CLAMP sampler
+// produced alongside the bake (bound by fork_hooks::bindAtmosphereLuts).
+layout(binding = BINDING_ATMOSPHERE_CLOUD_SKY_TRANSMITTANCE_LUT)
+Texture2D<float> AtmosphereCloudSkyTransmittanceLut;
+
+// Cloud render RT (Nubis Cubed 2023, fork — 2026-05-12). Screen-space RGBA16F
+// at downscale resolution. rgb = premultiplied cloud radiance; a = view-ray
+// cloud transmittance. Produced once per frame by cloud_render.comp.slang via
+// RtxAtmosphere::dispatchCloudRender (called from computeLuts). Visualized
+// standalone via DEBUG_VIEW_CLOUD_RENDER_RT (876). Will feed the sky-miss
+// composite path (C5 of the 2026-05-12 workstream).
+layout(binding = BINDING_ATMOSPHERE_CLOUD_RENDER_RT)
+Texture2D<float4> AtmosphereCloudRender;
+
+// Cloud voxel grids (Nubis Cubed 2023, fork — 2026-05-12). 256x256x32 R16F
+// camera-centered tile-wrapped grids storing summed optical depth along the
+// sun direction (D_sun) and zenith (D_ambient). Round-robin baked every
+// 8 frames by cloud_sun_density_grid.comp.slang /
+// cloud_ambient_density_grid.comp.slang. Sampled via the linear/REPEAT cloud
+// noise sampler (BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER) — horizontal tile-wrap
+// matches the frac()-based UVW computation in cloudVoxelWorldToUVW. No
+// consumer in this commit; will feed the Nubis Cubed cloud-lighting rewrite.
+layout(binding = BINDING_ATMOSPHERE_CLOUD_D_SUN)
+Texture3D<float> AtmosphereCloudDSun;
+
+layout(binding = BINDING_ATMOSPHERE_CLOUD_D_AMBIENT)
+Texture3D<float> AtmosphereCloudDAmbient;
+
+// Linear sampler bound alongside the sky-view LUT (REPEAT-U / CLAMP-V).
+// Consumed by the sky-miss path in evalSkyRadiance to replace the live
+// atmosphere march with a bilinear tap of AtmosphereSkyViewLut. See
+// atmosphere_bindings.slangh for the same declaration used by compute
+// passes that include only the atmosphere binding header.
+layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER)
+SamplerState AtmosphereSkyViewSampler;
+
+// Secondary-ray cloud LUT (fork — 2026-06-10, perf). 256x128 RGBA16F dome:
+// rgb = premultiplied cloud radiance, a = view transmittance, keyed
+// (azimuth, elevation = (pi/2)*v^2) via cloudDomeDirToUv. Baked per frame by
+// cloud_secondary_lut.comp.slang with the same Nubis march the visible cloud
+// RT uses. Consumed by evalSkyRadiance's non-primary (indirect / PSR /
+// reflection) branch; sampled with AtmosphereSkyViewSampler
+// (REPEAT-U wraps the azimuth seam, CLAMP-V pins the horizon/zenith rows).
+layout(binding = BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT)
+Texture2D<float4> AtmosphereCloudSecondaryLut;
+
+// Cloud placement map (fork — 2026-06-11, column-shaping rework). 512x512
+// RGBA8 tiled at cloudNoiseTileKm, baked by
+// cloud_placement_map_baker.comp.slang (re-baked live when its inputs
+// change): R = cluster field, G = top-height jitter, B = base lift. Drives
+// the per-column cloud model inside the density samplers; consumed here by
+// those samplers and their shadow-march taps. Sampled with the
+// linear/REPEAT cloud noise sampler (BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER).
+layout(binding = BINDING_ATMOSPHERE_CLOUD_PLACEMENT_MAP)
+Texture2D<float4> AtmosphereCloudPlacementMap;

@@ -1,0 +1,211 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// ---------------------------------------------------------------------------
+// Source attribution
+// ---------------------------------------------------------------------------
+// This file is a Slang port of the public "GT7 Tone Mapping" reference
+// implementation published by Polyphony Digital Inc. as supplemental
+// material for SIGGRAPH 2025:
+//   https://blog.selfshadow.com/publications/s2025-shading-course/pdi/supplemental/gt7_tone_mapping.cpp
+//
+// The reference C++ ships under the MIT License; that notice is reproduced
+// below verbatim and applies to the GT7 algorithm in this file.
+//
+// ---------------------------------------------------------------------------
+// MIT License
+//
+// Copyright (c) 2025 Polyphony Digital Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+// CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+// TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+// SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// ---------------------------------------------------------------------------
+//
+// Port notes
+// ---------------------------------------------------------------------------
+// * Translated from C++ to Slang. All struct-and-method patterns from
+//   GTToneMappingCurveV2 / GT7ToneMapping are flattened into free functions
+//   driven by `static const` parameters since the Remix tonemap dispatcher
+//   does not need a stateful operator instance and the peak-luminance knob
+//   is fixed.
+// * SDR mode only. Peak luminance is hardcoded to 1.0 in frame-buffer
+//   units; sdrCorrectionFactor is therefore 1.0 (no post-scale). The full
+//   GT7 initializeAsSDR() path scales the curve to 250-nit paper white and
+//   then divides the output by 2.5 to bring it back to the sRGB 0..1
+//   range — collapsing those two steps yields peak == 1.0 directly.
+// * UCS is fixed to ICtCp (the GT7 default). The Jzazbz alternative is
+//   omitted; if needed it can be added later using pq_inverseEotfSt2084 /
+//   pq_eotfSt2084 with the JZAZBZ_EXPONENT_SCALE_FACTOR == 1.7 overload.
+// * Curve shoulder constants (kA / kB / kC) are precomputed below for
+//   peak = 1.0 with the GT7 reference defaults (alpha = 0.25,
+//   grayPoint = 0.538, linearSection = 0.444, toeStrength = 1.28). Same
+//   for the UCS target value (first ICtCp component of {1, 1, 1}).
+// * Input is assumed to be linear Rec.2020 frame-buffer RGB, matching the
+//   GT7 reference and the existing AgX operator convention in this
+//   codebase.
+// ---------------------------------------------------------------------------
+
+#ifndef RTX_PASS_TONEMAP_GT7_SLANGH
+#define RTX_PASS_TONEMAP_GT7_SLANGH
+
+#include "rtx/utility/pq.slangh"
+
+// GT7 curve parameters (SDR mode, peak = 1.0).
+static const float gt7_peakIntensity = 1.0;
+static const float gt7_midPoint      = 0.538;   // grayPoint
+static const float gt7_linearSection = 0.444;
+static const float gt7_toeStrength   = 1.280;
+
+// Pre-computed shoulder constants for the GT7 curve at peak = 1.0,
+// alpha = 0.25, linearSection = 0.444. Derivation (GT7 reference):
+//   k  = (linearSection - 1) / (alpha - 1)               = 0.7413333...
+//   kA = peak*linearSection + peak*k                     = 1.1853333...
+//   kB = -peak * k * exp(linearSection / k)              = -1.3494352...
+//   kC = -1 / (k * peak)                                 = -1.3489209...
+static const float gt7_curveKA =  1.18533333;
+static const float gt7_curveKB = -1.34943521;
+static const float gt7_curveKC = -1.34892086;
+
+// UCS chroma fade window and per-channel / UCS blend factor (GT7 defaults).
+static const float gt7_fadeStart  = 0.98;
+static const float gt7_fadeEnd    = 1.16;
+static const float gt7_blendRatio = 0.6;
+
+// First ICtCp component of rgbToICtCp({1, 1, 1}) — equals
+// pq_inverseEotfSt2084(1.0) since each L/M/S row of the Rec.2020 -> LMS
+// matrix sums to 4096/4096. Precomputed at double precision.
+static const float gt7_targetUcs = 0.50381;
+
+float gt7_smoothStep(float x, float edge0, float edge1)
+{
+  if (x < edge0) { return 0.0; }
+  if (x > edge1) { return 1.0; }
+  float t = (x - edge0) / (edge1 - edge0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+float gt7_chromaCurve(float x)
+{
+  return 1.0 - gt7_smoothStep(x, gt7_fadeStart, gt7_fadeEnd);
+}
+
+// Per-channel GT7 tone curve. Toe + linear blended by smoothstep below the
+// linear-section threshold; exponential shoulder past it.
+float gt7_evaluateCurve(float x)
+{
+  if (x < 0.0) { return 0.0; }
+
+  const float weightLinear = gt7_smoothStep(x, 0.0, gt7_midPoint);
+  const float weightToe    = 1.0 - weightLinear;
+
+  const float shoulder = gt7_curveKA + gt7_curveKB * exp(x * gt7_curveKC);
+
+  if (x < gt7_linearSection * gt7_peakIntensity)
+  {
+    const float toeMapped = gt7_midPoint * pow(x / gt7_midPoint, gt7_toeStrength);
+    return weightToe * toeMapped + weightLinear * x;
+  }
+  return shoulder;
+}
+
+// Rec.2020 linear RGB -> ICtCp (ITU-T T.302).
+float3 gt7_rgbToICtCp(float3 rgb)
+{
+  const float l = (rgb.r * 1688.0 + rgb.g * 2146.0 + rgb.b *  262.0) / 4096.0;
+  const float m = (rgb.r *  683.0 + rgb.g * 2951.0 + rgb.b *  462.0) / 4096.0;
+  const float s = (rgb.r *   99.0 + rgb.g *  309.0 + rgb.b * 3688.0) / 4096.0;
+
+  const float lPQ = pq_inverseEotfSt2084(l);
+  const float mPQ = pq_inverseEotfSt2084(m);
+  const float sPQ = pq_inverseEotfSt2084(s);
+
+  return float3(
+    (2048.0 * lPQ +  2048.0 * mPQ)                    / 4096.0,
+    (6610.0 * lPQ - 13613.0 * mPQ +  7003.0 * sPQ)    / 4096.0,
+    (17933.0 * lPQ - 17390.0 * mPQ -  543.0 * sPQ)    / 4096.0);
+}
+
+// ICtCp -> Rec.2020 linear RGB.
+float3 gt7_iCtCpToRgb(float3 ictCp)
+{
+  const float l = ictCp.x + 0.00860904 * ictCp.y + 0.11103   * ictCp.z;
+  const float m = ictCp.x - 0.00860904 * ictCp.y - 0.11103   * ictCp.z;
+  const float s = ictCp.x + 0.560031   * ictCp.y - 0.320627  * ictCp.z;
+
+  const float lLin = pq_eotfSt2084(l);
+  const float mLin = pq_eotfSt2084(m);
+  const float sLin = pq_eotfSt2084(s);
+
+  return float3(
+    max( 3.43661   * lLin - 2.50645   * mLin + 0.0698454 * sLin, 0.0),
+    max(-0.79133   * lLin + 1.9836    * mLin - 0.192271  * sLin, 0.0),
+    max(-0.0259499 * lLin - 0.0989137 * mLin + 1.12486   * sLin, 0.0));
+}
+
+// GT7 tone mapping entry point. Input: linear Rec.2020 RGB (frame-buffer
+// units); output: SDR-ready [0, 1] linear RGB suitable for the sRGB OETF.
+float3 gt7ToneMapping(float3 rgb)
+{
+  // Per-channel curve gives a "skewed" color with the right luminance
+  // distribution but distorted hue/saturation.
+  const float3 skewedRgb = float3(
+    gt7_evaluateCurve(rgb.r),
+    gt7_evaluateCurve(rgb.g),
+    gt7_evaluateCurve(rgb.b));
+
+  // UCS for the original color (chroma reference) and the skewed color
+  // (luminance reference). Chroma is faded out as the input luminance
+  // approaches and exceeds the target, then recombined with skewedRgb's
+  // luminance to produce the UCS-scaled color.
+  const float3 ucs       = gt7_rgbToICtCp(rgb);
+  const float3 skewedUcs = gt7_rgbToICtCp(skewedRgb);
+
+  const float chromaScale = gt7_chromaCurve(ucs.x / gt7_targetUcs);
+
+  const float3 scaledUcs = float3(
+    skewedUcs.x,           // luminance from the skewed (curve) result
+    ucs.y * chromaScale,   // faded chroma from the original
+    ucs.z * chromaScale);
+
+  const float3 scaledRgb = gt7_iCtCpToRgb(scaledUcs);
+
+  // Blend per-channel vs UCS-scaled output and clamp at the peak.
+  const float3 blended = (1.0 - gt7_blendRatio) * skewedRgb + gt7_blendRatio * scaledRgb;
+  return min(blended, gt7_peakIntensity);
+}
+
+#endif  // RTX_PASS_TONEMAP_GT7_SLANGH

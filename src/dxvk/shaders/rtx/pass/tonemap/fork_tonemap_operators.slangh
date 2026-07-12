@@ -1,0 +1,134 @@
+/*
+ * Fork-owned tonemap operator dispatcher.
+ *
+ * Upstream shader passes (currently tonemapping_apply_tonemapping.comp.slang)
+ * call applyTonemapOperator() from here instead of branching inline on per-
+ * operator booleans. Each operator's implementation lives in its own header
+ * (aces.slangh, agx.slangh, lottes.slangh, psycho17.slangh, hable.slangh) —
+ * this file is purely the dispatcher.
+ */
+
+#ifndef FORK_TONEMAP_OPERATORS_SLANGH
+#define FORK_TONEMAP_OPERATORS_SLANGH
+
+#include "rtx/pass/tonemap/tonemapping.h"
+#include "rtx/pass/tonemap/aces.slangh"
+#include "rtx/pass/tonemap/agx.slangh"
+#include "rtx/pass/tonemap/lottes.slangh"
+#include "rtx/pass/tonemap/psycho17.slangh"
+#include "rtx/pass/tonemap/hable.slangh"
+#include "rtx/pass/tonemap/gt7.slangh"
+#include "rtx/pass/tonemap/neutwo.slangh"
+
+// applyTonemapOperator — dispatches to the operator implementation selected
+// by `op`. Returns the operator-adjusted color. When op == None (or an
+// unrecognised value), returns `color` unchanged. The selection matches the
+// TonemapOperator enum in rtx_fork_tonemap.h and the tonemapOperator*
+// constants in tonemapping.h.
+//
+// `suppressBlackLevelClamp` forwards to the ACES Hill path. Operators
+// without an equivalent parameter ignore it.
+//
+// Per-operator parameters are passed explicitly (rather than read from a
+// constant buffer) so this function works for any caller that unpacks its
+// own cb fields into these positional parameters.
+float3 applyTonemapOperator(uint op, float3 color, bool suppressBlackLevelClamp,
+                            // Hable Filmic.
+                            float hableExposureBias,
+                            float hableA, float hableB, float hableC,
+                            float hableD, float hableE, float hableF,
+                            float hableW,
+                            // AgX Minimal.
+                            float agxSaturation, uint agxLook,
+                            // Psycho17 (renodx Psycho Test 17 / PsychoV17_Beta).
+                            float psycho17PeakValue, float psycho17Exposure,
+                            float psycho17Highlights, float psycho17Shadows,
+                            float psycho17Contrast, float psycho17PurityScale,
+                            float psycho17BleachingIntensity, float psycho17ClipPoint,
+                            float psycho17HueRestore, float psycho17AdaptationContrast,
+                            uint  psycho17WhiteCurveMode, float psycho17ConeResponseExponent,
+                            float psycho17GamutCompression, uint psycho17GamutCompressionMode,
+                            // Observer adaptive state in BT.709 (post-AE-exposure space).
+                            // When the perceptual auto-exposure is on this is supplied by
+                            // the caller (typically (0.18, 0.18, 0.18) once AE has settled);
+                            // when AE is off the caller passes the renodx default of
+                            // (0.18, 0.18, 0.18). Only psycho17 consumes it today.
+                            float3 adaptiveStateBT709)
+{
+  if (op == tonemapOperatorACESHill)
+  {
+    return acesHill(color, suppressBlackLevelClamp);
+  }
+  if (op == tonemapOperatorACESNarkowicz)
+  {
+    return acesNarkowicz(color);
+  }
+  if (op == tonemapOperatorHableFilmic)
+  {
+    return hableFilmicToneMapping(color, hableExposureBias,
+                                  hableA, hableB, hableC,
+                                  hableD, hableE, hableF, hableW);
+  }
+  if (op == tonemapOperatorAgX)
+  {
+    return agxMinimalToneMapping(color, agxSaturation, agxLook);
+  }
+  if (op == tonemapOperatorLottes)
+  {
+    // Lottes shares Hable's 8 param slots (mutually exclusive operators).
+    // Slot mapping is documented at the struct definition in tonemapping.h.
+    return lottesToneMapping(color,
+                             /*hdrMax=*/   hableExposureBias,
+                             /*contrast=*/ hableA,
+                             /*shoulder=*/ hableB,
+                             /*midIn=*/    hableC,
+                             /*midOut=*/   hableD);
+  }
+  if (op == tonemapOperatorPsycho17)
+  {
+    float3 psychoResult = renodx::tonemap::psycho::psychotm_test17(
+        color,
+        /*peak_value=*/ 1.0f,
+        psycho17Exposure,
+        psycho17Highlights,
+        psycho17Shadows,
+        psycho17Contrast,
+        psycho17PurityScale,
+        psycho17BleachingIntensity,
+        psycho17ClipPoint,
+        psycho17HueRestore,
+        psycho17AdaptationContrast,
+        (int)psycho17WhiteCurveMode,
+        psycho17ConeResponseExponent,
+        // current_adaptive_state_bt709 / current_background_state_bt709 are
+        // sourced from the perceptual auto-exposure observer when enabled
+        // (see tonemapping_apply_tonemapping.comp.slang); otherwise they
+        // fall back to the renodx reference's diffuse-gray adapted state.
+        // Both states share the same value because the perceptual AE only
+        // tracks the achromatic adaptation level; chromatic adaptation
+        // would require per-channel LMS accumulation in the AE pass.
+        adaptiveStateBT709,
+        adaptiveStateBT709,
+        psycho17GamutCompression,
+        (int)psycho17GamutCompressionMode,
+        /*adaptive_normalization=*/1.0f);
+
+    return psychoResult;
+  }
+  if (op == tonemapOperatorGT7)
+  {
+    // GT7 SDR mode at peak = 1.0 — no parameters threaded through the CB.
+    return gt7ToneMapping(color);
+  }
+  if (op == tonemapOperatorNeutwo)
+  {
+    // Renodx Neutwo per-channel saturation curve — parameterless,
+    // maps [0, +inf) to [0, 1) per RGB channel.
+    return neutwo_PerChannel(color);
+  }
+  // tonemapOperatorNone (0) or unrecognised — saturate-only identity so the
+  // downstream display path always receives a [0, 1] signal.
+  return saturate(color);
+}
+
+#endif // FORK_TONEMAP_OPERATORS_SLANGH

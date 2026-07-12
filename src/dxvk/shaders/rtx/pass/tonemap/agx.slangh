@@ -1,0 +1,127 @@
+/*
+ * AgX Minimal display rendering transform.
+ *
+ * AgX Minimal by Benjamin Wrensch (MIT License, 2024).
+ *   Source: https://iolite-engine.com/blog_posts/minimal_agx_implementation
+ * Values derived from Troy Sobotka's AgX: https://github.com/sobotka/AgX
+ * Credit: Troy Sobotka — AgX creator and matrix/spec author.
+ */
+
+#ifndef RTX_PASS_TONEMAP_AGX_SLANGH
+#define RTX_PASS_TONEMAP_AGX_SLANGH
+
+#include "neutwo.slangh"
+
+// AgX Base Transform (Rec.2020 primaries to AgX working space).
+static const float3x3 kAgxInputTransform =
+{
+    {0.842479062253094, 0.0784335999999992,  0.0792237451477643},
+    {0.0423282422610123, 0.878468636469772,  0.0791661274605434},
+    {0.0423756549057051, 0.0784336,          0.879142973793104}
+};
+
+// AgX Base Transform Output (AgX working space to Rec.2020 primaries).
+static const float3x3 kAgxOutputTransform =
+{
+    { 1.19687900512017, -0.0980208811401368, -0.0990297440797205},
+    {-0.0528968517574562, 1.15190312639708,   -0.0989611768448433},
+    {-0.0529716355144438, -0.0980434501171241, 1.15107367264116}
+};
+
+// Vectorised sigmoid approximation (mean error^2: 3.6705141e-06).
+float3 agxMinimalContrastApprox(float3 x)
+{
+  float3 x2 = x * x;
+  float3 x4 = x2 * x2;
+  return + 15.5f   * x4 * x2
+         - 40.14f  * x4 * x
+         + 31.96f  * x4
+         - 6.868f  * x2 * x
+         + 0.4298f * x2
+         + 0.1191f * x
+         - 0.00232f;
+}
+
+// ASC CDL look presets. look: 0 = None, 1 = Golden, 2 = Punchy.
+float3 agxMinimalLook(float3 val, uint look)
+{
+  float3 slope = float3(1.0f, 1.0f, 1.0f);
+  float3 power = float3(1.0f, 1.0f, 1.0f);
+  float  sat   = 1.0f;
+
+  if (look == 1u) {
+    // Golden
+    slope = float3(1.0f, 0.9f, 0.5f);
+    power = float3(0.8f, 0.8f, 0.8f);
+    sat   = 0.8f;
+  } else if (look == 2u) {
+    // Punchy
+    power = float3(1.35f, 1.35f, 1.35f);
+    sat   = 1.4f;
+  }
+
+  // ASC CDL: pow(val * slope + offset, power) — offset is 0 for all presets.
+  val = pow(saturate(val * slope), power);
+
+  float luma = dot(val, float3(0.2126f, 0.7152f, 0.0722f));
+  return luma + sat * (val - luma);
+}
+
+// Renodx Neutwo max-channel pre-scale is provided by neutwo.slangh
+// (neutwo_ComputeMaxChannelScale). See that file for the full attribution
+// and the math (Neutwo(x) = x * rsqrt(x*x + 1), scale = Neutwo(max) / max).
+
+// AgX Minimal display rendering transform.
+//   saturation — additional user saturation multiplier (1.0 = no change).
+//   look       — 0 = None, 1 = Golden, 2 = Punchy.
+float3 agxMinimalToneMapping(float3 color, float saturation, uint look)
+{
+  // Renodx Neutwo max-channel pre-scale: bring HDR-range input into the
+  // curve's well-behaved [0, 1] domain, run AgX as the "LUT", then
+  // divide the result back out to preserve relative dynamic range.
+  float scale = neutwo_ComputeMaxChannelScale(color);
+  color *= scale;
+
+  // Clamp negatives before the inset matrix to prevent cross-channel contamination.
+  color = max(color, float3(0.0f, 0.0f, 0.0f));
+
+  // Input transform (inset).
+  color = mul(kAgxInputTransform, color);
+
+  // Log2 encoding clamped to the AgX working range.
+  const float kMinEV = -12.47393f;
+  const float kMaxEV =  4.026069f;
+  color = clamp(log2(max(color, 1e-10f)), kMinEV, kMaxEV);
+  color = (color - kMinEV) / (kMaxEV - kMinEV);
+
+  // Sigmoid approximation.
+  color = agxMinimalContrastApprox(color);
+
+  // Look (includes per-look CDL saturation).
+  color = agxMinimalLook(color, look);
+
+  // Inverse input transform (outset).
+  color = mul(kAgxOutputTransform, color);
+
+  // No EOTF step here: the dxvk-remix pipeline applies linearToGamma
+  // (pow(1/2.2)) after tonemapping, so the tonemapper must output linear
+  // values. The outset matrix output is passed through directly.
+
+  // Additional user saturation control.
+  float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+  color = lerp(float3(luma, luma, luma), color, saturation);
+
+  // Clamp the AgX-mapped result to [0, 1] (the curve's well-defined output
+  // range, matching renodx's LUT-output assumption) before undoing the
+  // Neutwo pre-scale.
+  color = saturate(color);
+
+  // Undo the Neutwo pre-scale to restore the input's relative dynamic range.
+  color = color / max(scale, 1e-6f);
+
+  color = neutwo_MaxChannel(color);
+
+  return color;
+}
+
+#endif // RTX_PASS_TONEMAP_AGX_SLANGH

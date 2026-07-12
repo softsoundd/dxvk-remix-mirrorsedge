@@ -20,7 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-#include "rtx_game_capturer.h"
+#include "rtx_fork_hooks.h"
 
 #include "rtx_context.h"
 #include "rtx_types.h"
@@ -561,6 +561,10 @@ namespace dxvk {
     instance.lssData.firstTime = m_pCap->currentFrameNum;
 
     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Inst:" + hashToString(instanceId) + "] New");
+  }
+
+  void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const XXH64_hash_t runtimeMaterialHash, const LegacyMaterialData& materialData, const bool bEnableOpacity) {
+    fork_hooks::captureMaterialApiPath(*this, ctx, rtInstance, runtimeMaterialHash, materialData, bEnableOpacity);
   }
 
   void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData, const bool bEnableOpacity) {
@@ -1190,6 +1194,7 @@ namespace dxvk {
     }
     // Prep global transform
     exportPrep.globalXform = pxr::GfMatrix4d{1.0};
+    fork_hooks::captureCoordSystemSkip(exportPrep);
     const bool bInvX = (!exportPrep.camera.view.bInv) && (exportPrep.camera.proj.bInv || exportPrep.camera.isLHS());
     const bool bInvY = (!exportPrep.camera.view.bInv) && exportPrep.camera.proj.bInv;
     const pxr::GfVec3d scale{ bInvX ? -1.0 : 1.0, bInvY ? -1.0 : 1.0, 1.0 };

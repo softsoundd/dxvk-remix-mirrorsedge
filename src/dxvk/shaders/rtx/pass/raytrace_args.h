@@ -162,9 +162,9 @@ struct RaytraceArgs {
   DomeLightArgs domeLightArgs;
   NrcArgs nrcArgs;
   SssArgs sssArgs;
-  AtmosphereArgs atmosphereArgs;
   EyeArgs eyeArgs;
   ShadowTerminatorArgs shadowTerminatorArgs;
+  AtmosphereArgs atmosphereArgs;
 
   Camera renderTargetCamera;
 

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "rtx_asset_replacer.h"
+#include "rtx_fork_hooks.h"
 #include "rtx_scene_manager.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "dxvk_device.h"
@@ -2412,12 +2413,10 @@ namespace dxvk {
 
   static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);
 
-  void SceneManager::submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> pstate) {
+  void SceneManager::submitExternalDraw(const Rc<DxvkContext>& ctx, ExternalDrawState&& state) {
     ScopedCpuProfileZone();
 
     Rc<DxvkSampler> externalSampler = getOrCreateExternalSampler();
-
-    auto& state = *pstate;
 
     {
       state.drawCall.modifyMaterialData().samplers[0] = externalSampler;
@@ -2437,6 +2436,13 @@ namespace dxvk {
     }
 
     const auto& submeshes = m_pReplacer->accessExternalMesh(state.mesh);
+    if (submeshes.empty()) {
+      const XXH64_hash_t meshHash = reinterpret_cast<XXH64_hash_t>(state.mesh);
+      Logger::err(str::format("[RTX-Mesh] External mesh has no submeshes: 0x", std::hex, meshHash, std::dec));
+      return;
+    }
+
+    const XXH64_hash_t meshHash = reinterpret_cast<XXH64_hash_t>(state.mesh);
 
     const XXH64_hash_t identityHash = state.computeExternalDrawIdentityHash();
     const XXH64_hash_t spatialMapHash = spatialMapHashForExternalDrawMesh(state.mesh);
@@ -2448,21 +2454,39 @@ namespace dxvk {
     ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(externalKey);
     replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
 
+    if (std::vector<AssetReplacement>* pReplacements = fork_hooks::externalDrawMeshReplacement(*m_pReplacer, meshHash)) {
+      DrawCallState replacementDrawCall = state.drawCall;
+      replacementDrawCall.overrideGeometryData(nullptr);
+      replacementDrawCall.modifyGeometryData() = submeshes[0];
+      replacementDrawCall.modifyGeometryData().cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+      replacementDrawCall.modifyGeometryData().externalMaterial = nullptr;
+
+      MaterialData renderMaterialData = LegacyMaterialData().as<OpaqueMaterialData>();
+      drawReplacements(ctx, &replacementDrawCall, pReplacements, renderMaterialData, replacementInstance);
+      return;
+    }
+
     AxisAlignedBoundingBox geometryBBox;
 
     for (size_t i = 0; i < submeshes.size(); i++) {
       state.drawCall.overrideGeometryData(&submeshes[i]);
       state.drawCall.overrideCullMode(state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
 
+      XXH64_hash_t textureHash = 0;
+
       const MaterialData* material = m_pReplacer->accessExternalMaterial(submeshes[i].externalMaterial);
       if (material != nullptr) {
+        fork_hooks::externalDrawMaterialReplacement(*m_pReplacer, material);
         state.drawCall.modifyMaterialData().setHashOverride(material->getHash());
-      } 
+        fork_hooks::externalDrawTextureCategories(material, state.drawCall, textureHash);
+      }
 
       const RtxParticleSystemDesc* pParticles = nullptr;
       if (state.optionalParticleDesc.has_value()) {
         pParticles = &state.optionalParticleDesc.value();
       }
+
+      fork_hooks::externalDrawObjectPicking(*m_device, state.drawCall, textureHash, *this);
 
       RtInstance* existingInstance = (replacementInstance->prims.size() > i)
           ? replacementInstance->prims[i].getInstance() : nullptr;

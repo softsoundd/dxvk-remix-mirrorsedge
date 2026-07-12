@@ -105,8 +105,25 @@ struct MaterialData;
 struct DrawCallState;
 struct LegacyMaterialData;
 
+// Forward decls so GameCapturer can friend the fork hook that needs access
+// to private m_exporter and m_pCap state. See docs/fork-touchpoints.md.
+class GameCapturer;
+namespace fork_hooks {
+  void captureMaterialApiPath(
+    GameCapturer& capturer,
+    const Rc<DxvkContext> ctx,
+    const RtInstance& rtInstance,
+    XXH64_hash_t runtimeMaterialHash,
+    const LegacyMaterialData& materialData,
+    bool bEnableOpacity);
+}
+
 class GameCapturer : public RcObject
 {
+  friend void fork_hooks::captureMaterialApiPath(
+    GameCapturer&, const Rc<DxvkContext>, const RtInstance&,
+    XXH64_hash_t, const LegacyMaterialData&, bool);
+
 public:
   RTX_OPTION("rtx.capture", bool, correctBakedTransforms, false,
                 "Some games bake world transforms into mesh vertices. If individually captured\n"
@@ -232,6 +249,7 @@ private:
   void captureInstances(const Rc<DxvkContext> ctx);
   void newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance);
   void captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData, const bool bEnableOpacity);
+  void captureMaterial(const Rc<DxvkContext> ctx, const RtInstance& rtInstance, const XXH64_hash_t runtimeMaterialHash, const LegacyMaterialData& materialData, const bool bEnableOpacity);
   void captureMesh(const Rc<DxvkContext> ctx,
                    const XXH64_hash_t currentMeshHash,
                    const BlasEntry& blas,
