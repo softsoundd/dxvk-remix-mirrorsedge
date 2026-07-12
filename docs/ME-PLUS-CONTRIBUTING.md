@@ -19,7 +19,7 @@ This fork combines **Mirror's Edge / UE3 compatibility** (`mirrors-edge` lineage
 
 | Area | Location | Merge strategy |
 |------|----------|----------------|
-| UE3 / Mirror's Edge | `src/d3d9/d3d9_rtx.cpp`, `dxso/`, `config.cpp` | **Never overwrite from Plus** |
+| UE3 / Mirror's Edge | `src/d3d9/d3d9_rtx.cpp`, `src/d3d9/d3d9_device.cpp`, `dxso/`, `config.cpp` | **Never overwrite from Plus** |
 | Plus features | `src/dxvk/rtx_render/rtx_fork_*.cpp` | Copy/cherry-pick from `plus/main` |
 | Shared hooks | ~70 upstream files (see `docs/fork-touchpoints.md`) | Resolve at one-line `fork_hooks::` sites |
 | ME atmosphere perf | `useSkyViewLut` in `atmosphere_args.h`, integrators | Keep when merging Plus atmosphere |
