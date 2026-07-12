@@ -79,7 +79,7 @@ namespace fork_hooks {
     if (outTextureHash != 0 && outTextureHash != kEmptyHash) {
       auto applyCategory = [&](const fast_unordered_set& hashSet, InstanceCategories cat) {
         if (hashSet.find(outTextureHash) != hashSet.end()) {
-          drawCall.modifyCategoryFlags().set(cat);
+          drawCall.setCategory(cat, true);
         }
       };
 

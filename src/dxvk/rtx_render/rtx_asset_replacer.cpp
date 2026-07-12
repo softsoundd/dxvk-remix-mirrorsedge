@@ -190,11 +190,17 @@ void AssetReplacer::destroyExternalMaterial(remixapi_MaterialHandle handle) {
 
 void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector<RasterGeometry>&& submeshes) {
   if (m_extMeshes.count(handle) > 0) {
-    Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
+    //Logger::info("Ignoring repeated mesh registration (handle=" + tostr(handle) + ") ");
     return;
   }
 
-  m_extMeshes.emplace(handle, std::make_unique< std::vector<RasterGeometry>>(std::move(submeshes)));
+  // Tag each submesh with the external mesh handle so capture + runtime
+  // use the same identity for replacement-lookup parity.
+  for (auto& submesh : submeshes) {
+    submesh.externalMesh = handle;
+  }
+
+  m_extMeshes.emplace(handle, std::move(submeshes));
 }
 
 const std::vector<RasterGeometry>& AssetReplacer::accessExternalMesh(remixapi_MeshHandle handle) const {
@@ -203,7 +209,7 @@ const std::vector<RasterGeometry>& AssetReplacer::accessExternalMesh(remixapi_Me
     static const auto s_empty = std::vector<RasterGeometry> {};
     return s_empty;
   }
-  return *found->second;
+  return found->second;
 }
 
 void AssetReplacer::destroyExternalMesh(remixapi_MeshHandle handle) {

@@ -54,7 +54,7 @@ private:
     /* the version number */ 1,
     LIST_INPUTS, LIST_STATES, LIST_OUTPUTS
   )
-  void updateRange(const Rc<DxvkContext>& context, const size_t start, const size_t end) {
+  void Velocity::updateRange(const Rc<DxvkContext>& context, const size_t start, const size_t end) {
     float deltaTime = GlobalTime::get().deltaTime();
     for (size_t i = start; i < end; i++) {
       // Calculate velocity as the change from previous frame

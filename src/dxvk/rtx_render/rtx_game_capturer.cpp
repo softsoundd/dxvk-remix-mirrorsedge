@@ -468,7 +468,18 @@ namespace dxvk {
   void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance) {
     const BlasEntry* pBlas = rtInstance.getBlas();
     assert(pBlas != nullptr);
-    const XXH64_hash_t meshHash = pBlas->input.getHash(RtxOptions::geometryAssetHashRule());
+
+    // For external (API-submitted) meshes, use the original API handle as the hash so
+    // captures and runtime replacement lookups agree on mesh identity. Falling back to
+    // the geometry-data hash for API meshes produces a different hash at capture-time
+    // than at runtime, breaking replacement parity.
+    XXH64_hash_t meshHash = 0;
+    if (pBlas->input.getGeometryData().externalMesh != nullptr) {
+      meshHash = reinterpret_cast<XXH64_hash_t>(pBlas->input.getGeometryData().externalMesh);
+      Logger::info(str::format("[GameCapturer] Using external mesh hash: 0x", std::hex, meshHash, std::dec));
+    } else {
+      meshHash = pBlas->input.getHash(RtxOptions::geometryAssetHashRule());
+    }
     assert(meshHash != 0);
 
     // Instances kept alive without being re-drawn (e.g. anti-culling) can hold a material hash
@@ -487,7 +498,11 @@ namespace dxvk {
     }
     const LegacyMaterialData& material = *pMaterial;
 
-    const bool bIsNewMat = (matHash != 0x0) && (m_pCap->materials.count(matHash) == 0);
+    // For API materials, use the MaterialData hash (what runtime uses for replacement lookup).
+    // For D3D9 materials this equals matHash, but for API-submitted materials the two differ.
+    const XXH64_hash_t materialLookupHash = material.getHash();
+
+    const bool bIsNewMat = (materialLookupHash != 0x0) && (m_pCap->materials.count(materialLookupHash) == 0);
     if (bIsNewMat) {
       // Materials without a resident color texture or sampler (e.g. render-target-only or
       // evicted textures) can't be exported unless they carry a constant color instead;
@@ -495,10 +510,10 @@ namespace dxvk {
       const bool hasResidentColorTexture =
         material.getColorTexture().getImageView() != nullptr && material.getSampler().ptr() != nullptr;
       if (hasResidentColorTexture || material.hasUe3ConstantAlbedo) {
-        captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
+        captureMaterial(ctx, rtInstance, materialLookupHash, material, !rtInstance.surface.alphaState.isFullyOpaque);
       } else {
         Logger::warn(str::format(
-          "[GameCapturer][", m_pCap->idStr, "] Skipping material 0x", std::hex, matHash, std::dec,
+          "[GameCapturer][", m_pCap->idStr, "] Skipping material 0x", std::hex, materialLookupHash, std::dec,
           " - no resident color texture/sampler to export."));
       }
     }
@@ -511,7 +526,7 @@ namespace dxvk {
       const bool bIsNewPrimaryMesh = m_pCap->meshes.count(meshHash) == 0;
       if (bIsNewPrimaryMesh) {
         auto pNewMesh = std::make_shared<Mesh>();
-        pNewMesh->matHash = matHash;
+        pNewMesh->matHash = materialLookupHash;
         pNewMesh->capturedTextureTransform = rtInstance.surface.textureTransform;
         m_pCap->meshes[meshHash] = std::move(pNewMesh);
         bIsNewMesh = true;
@@ -530,7 +545,7 @@ namespace dxvk {
           } else if (pPrimaryMesh->uvVariantCount < perInstanceUvTransformMeshVariantsLimit()) {
             pPrimaryMesh->uvVariantCount++;
             auto pVariantMesh = std::make_shared<Mesh>();
-            pVariantMesh->matHash = matHash;
+            pVariantMesh->matHash = materialLookupHash;
             pVariantMesh->capturedTextureTransform = instanceTransform;
             // named after the primary mesh so the variant is attributable in the stage;
             // replacements should still target the primary (runtime-hash-named) mesh
@@ -556,7 +571,9 @@ namespace dxvk {
     const XXH64_hash_t instanceId = rtInstance.getId();
     Instance& instance = m_pCap->instances[instanceId];
     instance.meshHash = effectiveMeshHash;
-    instance.matHash = matHash;
+    // Store the lookup hash, not the BLAS hash, so capture output lines up with
+    // the runtime replacement lookup.
+    instance.matHash = materialLookupHash;
     instance.meshInstNum = instanceNum;
     instance.lssData.firstTime = m_pCap->currentFrameNum;
 

@@ -850,7 +850,7 @@ namespace dxvk {
     // take a screenshot of a present image (with UI and others)
     {
       const bool isRaytracingEnabled = RtxOptions::enableRaytracing();
-      const bool isCameraValid = getSceneManager().getCameraManager().isCameraValid(CameraType::Main);
+      const bool isCameraValid = getSceneManager().getCamera().isValid(m_device->getCurrentFrameId());
 
       if (!isRaytracingEnabled || !isCameraValid || s_capturePrePresentTestScreenshot) {
         const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);

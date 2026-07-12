@@ -26,7 +26,7 @@ Some additional test instructions are in `tests/rtx/dxvk_rt_testing/AGENTS.md` (
 
 ## C++ Coding Standards
 
-Full guide: `documentation/CONTRIBUTING-style-guide.md`
+Full guide: `docs/CONTRIBUTING-style-guide.md`
 
 ### Key Rules
 
@@ -36,7 +36,7 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Member variables: `m_` prefix (e.g. `m_value`)
   - Pointers: `p` prefix (e.g. `pInput`, `m_pPointer`)
   - Variables and functions: `camelCase`
-  - Functions: Prefer short verb + object names aligned with the subsystem; avoid encoding implementation steps in the identifier (see `documentation/CONTRIBUTING-style-guide.md`, Naming Conventions).
+  - Functions: Prefer short verb + object names aligned with the subsystem; avoid encoding implementation steps in the identifier (see `docs/CONTRIBUTING-style-guide.md`, Naming Conventions).
   - Constants: `k` prefix and camelCase, i.e. `kConstantName`
   - Macros and defines: `UPPER_CASE`
   - Classes and structs: `PascalCase`
@@ -130,4 +130,4 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 | `src/util/` | Shared utility code |
 | `bridge/` | 32-bit to 64-bit bridge |
 | `tests/rtx/unit/` | Unit tests |
-| `documentation/` | Project documentation |
+| `docs/` | Project documentation |

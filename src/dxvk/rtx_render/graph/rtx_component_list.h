@@ -54,6 +54,8 @@
 #include "components/equal_to.h"
 #include "components/floor.h"
 #include "components/fog_hash_checker.h"
+#include "components/game_value_read_bool.h"
+#include "components/game_value_read_number.h"
 #include "components/greater_than.h"
 #include "components/invert.h"
 #include "components/keyboard_input.h"

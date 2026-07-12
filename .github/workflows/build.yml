@@ -5,6 +5,12 @@ on:
     branches: [ main, 'release/**' ]
   pull_request:
     branches: [ main, 'release/**' ]
+  # Manual build trigger: publishing a GitHub Release (typically from
+  # modern-games-sdk-api) fires the workflow. Also enables
+  # workflow_dispatch so the Actions UI "Run workflow" button works.
+  release:
+    types: [published]
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -33,6 +39,13 @@ jobs:
 
     - name: Setup Meson
       run: pip install meson==1.1.0
+
+    - name: Install Pillow for FAST-noise embedder
+      run: pip install pillow
+
+    - name: Fetch pinned DLSS / NGX DLL bundle
+      shell: pwsh
+      run: .\scripts\update-dlss-dlls.ps1
 
     - name: Build
       shell: pwsh
@@ -107,7 +120,7 @@ jobs:
             - type: section
               text:
                 type: mrkdwn
-                text: "<!here> :rotating-light-red: *Build workflow failed* for `${{ github.repository }}`"
+                text: ":rotating-light-red: *Build workflow failed* for `${{ github.repository }}`"
             - type: section
               fields:
                 - type: mrkdwn

@@ -40,7 +40,6 @@
 #define DEBUG_VIEW_POSITION 11
 #define DEBUG_VIEW_TEXCOORDS 12
 #define DEBUG_VIEW_VIRTUAL_MOTION_VECTOR 13
-#define DEBUG_VIEW_TRIANGLE_NORMAL 14
 #define DEBUG_VIEW_GEOMETRY_NORMAL 15
 #define DEBUG_VIEW_SHADING_NORMAL 16
 #define DEBUG_VIEW_VIRTUAL_SHADING_NORMAL 17
@@ -51,7 +50,6 @@
 
 #define DEBUG_VIEW_MATERIAL_TYPE 22
 #define DEBUG_VIEW_ALBEDO 23
-#define DEBUG_VIEW_INTERPOLATED_VERTEX_NORMAL 24
 #define DEBUG_VIEW_ROUGHNESS 25
 #define DEBUG_VIEW_INDIRECT_FIRST_HIT_PERCEPTUAL_ROUGHNESS 26
 #define DEBUG_VIEW_ANISOTROPY 27
@@ -288,6 +286,42 @@
 #define DEBUG_VIEW_SPARSE_RENDERING_UNION_ACTIVE_THREADS 909
 #define DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_THREADS 910
 #define DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_THREADS 911
+
+// Fork: atmosphere / cloud diagnostics
+#define DEBUG_VIEW_CLOUD_SKY_TRANSMITTANCE_LUT 870
+#define DEBUG_VIEW_CLOUD_D_SUN              873
+#define DEBUG_VIEW_CLOUD_D_AMBIENT          874
+// Production-call-shape diagnostic for sampleCloudGroundShadow_OptionB.
+// Paints the helper's output at each G-buffer pixel using the EXACT
+// per-pixel call shape (worldPos, sunDir, args, isZUp) that the upcoming
+// NEE wiring will use. CRITICAL GATE: spatially compare against
+// DEBUG_VIEW_CLOUD_D_SUN (873). If they disagree on cumulus position,
+// isZUp handling is mismatched between debug and production paths.
+#define DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE 875
+// Nubis Cubed 2023 cloud render RT (fork — 2026-05-12, C4). Visualizes the
+// screen-space cloud RT produced by cloud_render.comp.slang. RGB = per-pixel
+// cloud radiance (premultiplied) accumulated through the Nubis Cubed lighting
+// equations. Alpha (view-ray transmittance) is ignored by this debug case.
+#define DEBUG_VIEW_CLOUD_RENDER_RT 876
+// Raw D_sun optical-depth diagnostic at the production NEE call shape
+// (fork — 2026-05-17). Sibling of 875: same per-pixel inputs (G-buffer
+// worldPos + atmosphereArgs.sunDirection + cb.isZUp), but stops at the
+// dSunTex.SampleLevel call — NO exp(), NO mix(cloudShadowStrength). Three
+// signals encoded in RGB so one screenshot discriminates all hypotheses:
+//   R = saturate(OD * 0.2)  — matches 873's vis scale (direct A/B vs bake)
+//   G = saturate(OD)        — raw magnitude (distinguishes amplified-tiny
+//                              from actually-visible-sized)
+//   B = uvw.x from cloudVoxelWorldToUVW — consumer's lookup position
+//                              (uniform B across screen = scene-scale bug)
+// Sentinels: magenta = surface above slab top; blue = sun below horizon
+// or otherwise unreachable. Black would be ambiguous, so we paint instead.
+#define DEBUG_VIEW_CLOUD_GROUND_SHADOW_RAW_OD 877
+// Enum 878 (DEBUG_VIEW_CLOUD_SHADOW_FACTOR_RAW) RETIRED 2026-06-19 with the
+// screen-space cloud-shadow system (it visualized the removed
+// PrimaryCloudShadowFactor texture). The cloud shadow now folds onto the sun
+// radiance in the NEE; use 875/877 (D_sun grid reads) for diagnostics. The
+// number is left burned (not reused) so saved configs referencing 878 fall
+// through to the default view rather than aliasing a new one.
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

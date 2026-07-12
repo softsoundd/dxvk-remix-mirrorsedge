@@ -1,0 +1,10 @@
+{
+  "release_tag": "dlss-bundle-v310.6.0",
+  "url": "https://github.com/RemixProjGroup/dxvk-remix-dlss-bundle/releases/download/dlss-bundle-v310.6.0/dlss-bundle-v310.6.0.zip",
+  "sha256": "AA5092FD4136CC981A5E7B7507224FAF17A07B9FD7325E26B056F9600B944131",
+  "dlls": [
+    "nvngx_dlss.dll",
+    "nvngx_dlssd.dll",
+    "nvngx_dlssg.dll"
+  ]
+}

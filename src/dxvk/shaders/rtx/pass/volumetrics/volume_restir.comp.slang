@@ -36,6 +36,14 @@
 // ensuring lights that are significantly boosted are sampled from more).
 #define ENABLE_VOLUMETRIC_RADIANCE_SCALE 1
 
+// Fork (2026-05-12, C6): expose the cloud voxel grid + cloud-noise samplers
+// declared in common_bindings.slangh so the atmosphere helpers
+// (sampleAtmosphereSunLightVolume -> sampleCloudGroundShadow_OptionB, plus
+// sampleDSun / sampleDAmbient / fastJitter) resolve to bound globals. Matches
+// the same #define used by the surface integrators in integrate_direct.slang
+// and integrate_indirect.slang.
+#define ATMOSPHERE_AVAILABLE
+
 #define INITIAL       0
 #define VISIBILITY    1
 #define TEMPORAL      2

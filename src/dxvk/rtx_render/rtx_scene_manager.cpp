@@ -684,6 +684,21 @@ namespace dxvk {
     const bool overrideMaterialHasParticles = overrideMaterialData != nullptr
         && overrideMaterialData->getParticleSystemDesc() != nullptr;
 
+    // Replacements with attached particle systems require processDrawCallState's particle-system wiring,
+    // which the preserve path doesn't replicate. Outer ParticleEmitter check only covers the input draw call
+    // (not replacement-attached emitters), so check here too.
+    auto anyReplacementHasParticleSystem = [pReplacements]() -> bool {
+      if (pReplacements == nullptr) {
+        return false;
+      }
+      for (const auto& rep : *pReplacements) {
+        if (rep.particleSystem.has_value()) {
+          return true;
+        }
+      }
+      return false;
+    };
+
     // The RI's prims must already be wired up for this exact replacements vector. drawReplacements
     // re-initializes prims when activeReplacements changes (e.g. async replacement load completes
     // after the RI was created without replacements, or hot-reload changes the replacement set).
@@ -720,7 +735,8 @@ namespace dxvk {
         !input.getCategoryFlags().test(InstanceCategories::ParticleEmitter) &&
         !RtxOptions::shouldConvertToLight(input.getMaterialData().getHash()) &&
         !blasAlreadyTouchedByOtherDraw() &&
-        !overrideMaterialHasParticles&&
+        !overrideMaterialHasParticles &&
+        !anyReplacementHasParticleSystem() &&
         activeReplacementsMatch &&
         legacyMaterialIdentityHashMatch &&
         !terrainCascadesJustChanged &&

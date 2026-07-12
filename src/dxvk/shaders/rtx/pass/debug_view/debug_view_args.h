@@ -34,6 +34,7 @@
 #include "rtx/pass/nrd_args.h"
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/nrc_args.h"
+#include "rtx/pass/atmosphere/atmosphere_args.h"
 #include "rtx/algorithm/accumulate.h"
 
 #define DEBUG_VIEW_THREAD_GROUP_SIZE_WIDTH 16
@@ -85,6 +86,13 @@ struct DebugViewArgs {
   NrcArgs nrcArgs;
   AccumulationArgs accumulationArgs;
 
+  // Fork: atmosphere CB mirror used by cloud-diagnostic debug views
+  // (DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE = 875) that need to call
+  // production atmosphere helpers with the production call shape. Copied
+  // verbatim from RaytraceArgs::atmosphereArgs at debug-view dispatch
+  // time. Mirrors the existing volumeArgs / nrcArgs nesting pattern.
+  AtmosphereArgs atmosphereArgs;
+
   uint debugViewIdx;
   int colorCodeRadius;
   float animationTimeSec;
@@ -129,7 +137,12 @@ struct DebugViewArgs {
   uint isRTXDIConfidenceValid;
   // Gamma flag
   uint enableGammaCorrectionFlag;
-  uint pad0;
+  // Fork: mirrors RaytraceArgs::isZUp so debug views that need to call
+  // production atmosphere helpers (e.g. the enum-875 production-call-
+  // shape diagnostic) can pass the same isZUp value the integrator would.
+  // 1 = Z-up world axis, 0 = Y-up. Sourced from RtxOptions::zUp() at
+  // dispatch time. Reuses the prior pad0 slot for byte-layout neutrality.
+  uint isZUp;
 
   uint overlayOnTopOfRenderOutput;
   float overlayOpacity;
