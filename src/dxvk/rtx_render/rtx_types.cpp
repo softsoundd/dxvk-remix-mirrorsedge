@@ -429,6 +429,7 @@ namespace dxvk {
       { InstanceCategories::Terrain, &RtxOptions::terrainTextures() },
       { InstanceCategories::Sky, &RtxOptions::skyBoxTextures() },
       { InstanceCategories::ParticleEmitter, &RtxOptions::particleEmitterTextures() },
+      { InstanceCategories::HairCards, &RtxOptions::hairCardTextures() },
     };
 
     // Position-weighted size fingerprint: any single-set tagging change (add/remove via
@@ -505,6 +506,7 @@ namespace dxvk {
     setCategory(InstanceCategories::Sky, matched(InstanceCategories::Sky));
 
     setCategory(InstanceCategories::ParticleEmitter, matched(InstanceCategories::ParticleEmitter));
+    setCategory(InstanceCategories::HairCards, matched(InstanceCategories::HairCards));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {

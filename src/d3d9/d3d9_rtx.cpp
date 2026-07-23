@@ -5652,10 +5652,25 @@ namespace dxvk {
     if (forceIaTexcoordForOutlier)
       capturedTexcoordOutputRegister = std::numeric_limits<uint32_t>::max();
 
+    if (useVertexCapturedTexcoords()
+        && BoundShaderHasAnyUsageIndex(vertexShader, DxsoUsage::Texcoord, false)
+        && capturedTexcoordOutputRegister == std::numeric_limits<uint32_t>::max()) {
+      capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
+    }
+
     // Shader path with vertex capture: prefer VS output TEXCOORD to preserve any VS-side UV math.
-    if (BoundShaderHasAnyUsageIndex(vertexShader, DxsoUsage::Texcoord, false) &&
-        capturedTexcoordOutputRegister != std::numeric_limits<uint32_t>::max()) {
-      // Known offset for vertex capture buffers
+    // By default we only capture VS output texcoords when the input vertex declaration didn't
+    // already provide them. Overriding valid input texcoords with the VS output is opt-in
+    // (useVertexCapturedTexcoords), since the data a VS writes to the :TEXCOORD attribute isn't
+    // always actual UVs and its memory layout can't be assumed for all games.
+    const bool captureVsTexcoords =
+      BoundShaderHasAnyUsageIndex(vertexShader, DxsoUsage::Texcoord, false)
+      && capturedTexcoordOutputRegister != std::numeric_limits<uint32_t>::max()
+      && (useVertexCapturedTexcoords()
+          || !geoData.texcoordBuffer.defined()
+          || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()));
+
+    if (captureVsTexcoords) {
       const uint32_t texcoordOffset = offsetof(CapturedVertex, texcoord0);
       geoData.texcoordBuffer = RasterBuffer(slice, texcoordOffset, stride, VK_FORMAT_R32G32_SFLOAT);
       assert(geoData.texcoordBuffer.offset() % 4 == 0);
