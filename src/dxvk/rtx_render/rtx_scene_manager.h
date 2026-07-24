@@ -335,7 +335,7 @@ private:
       const std::vector<AssetReplacement>* pReplacements,
       ReplacementInstance* replacementInstance);
 
-  void trackDrawCallMetaForObjectPicking(const DrawCallState& drawCallState, const RtInstance* instance);
+  void trackObjectPickingMeta(const DrawCallState& drawCallState, ObjectPickingValue objectPickingValue);
 
   // Refreshes BlasEntry::input and per-instance draw state on the preserve path (matches drawReplacements'
   // DrawCallState wiring).
