@@ -5658,15 +5658,18 @@ namespace dxvk {
       capturedTexcoordOutputRegister = FindUniqueVsTexcoordOutputRegister(vertexShader);
     }
 
-    // Shader path with vertex capture: prefer VS output TEXCOORD to preserve any VS-side UV math.
     // By default we only capture VS output texcoords when the input vertex declaration didn't
     // already provide them. Overriding valid input texcoords with the VS output is opt-in
     // (useVertexCapturedTexcoords), since the data a VS writes to the :TEXCOORD attribute isn't
     // always actual UVs and its memory layout can't be assumed for all games.
+    // CaptureInterpolant is exempt: that mode is only selected when UV analysis proved the
+    // sampled UV is VS-side math, so the bound IA set is just a backstop and must not
+    // suppress the capture.
     const bool captureVsTexcoords =
       BoundShaderHasAnyUsageIndex(vertexShader, DxsoUsage::Texcoord, false)
       && capturedTexcoordOutputRegister != std::numeric_limits<uint32_t>::max()
-      && (useVertexCapturedTexcoords()
+      && (m_uvResolutionMode == UvResolutionMode::CaptureInterpolant
+          || useVertexCapturedTexcoords()
           || !geoData.texcoordBuffer.defined()
           || !RtxGeometryUtils::isTexcoordFormatValid(geoData.texcoordBuffer.vertexFormat()));
 
