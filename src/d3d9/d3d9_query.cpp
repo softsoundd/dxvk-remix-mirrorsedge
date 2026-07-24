@@ -141,7 +141,31 @@ namespace dxvk {
       return D3D_OK;
     }
 
+    // NV-DXVK start: conservative occlusion queries - answer readbacks immediately.
+    // The outcome is predetermined (never occluded); waiting for the GPU measurement would only
+    // stall the game's render thread (spinning synchronous bridge round trips for 32-bit games),
+    // and the bracketed draws are ignored so the real query scope is empty anyway.
+    if (m_queryType == D3DQUERYTYPE_OCCLUSION &&
+        m_state != D3D9_VK_QUERY_BEGUN &&
+        m_parent->RTX().ConservativeOcclusionQueriesEnabled()) {
+      m_dataCache.Occlusion = m_parent->RTX().GetConservativeOcclusionQueryResult();
+      m_parent->RTX().TrackOcclusionQueryResult(m_dataCache.Occlusion, m_rtxOcclusionBracketId);
+      m_state = D3D9_VK_QUERY_CACHED;
+      if (likely(pData && dwSize)) {
+        memcpy(pData, &m_dataCache, dwSize);
+      }
+      return D3D_OK;
+    }
+    // NV-DXVK end
+
     HRESULT hr = this->GetQueryData(pData, dwSize);
+
+    // NV-DXVK start: occlusion query diagnostics - quantify readback latency (games spin on
+    // pending readbacks; each attempt is a synchronous bridge round trip for 32-bit games)
+    if (m_queryType == D3DQUERYTYPE_OCCLUSION && hr == S_FALSE) {
+      m_parent->RTX().TrackOcclusionQueryPendingRead();
+    }
+    // NV-DXVK end
 
     bool flush = dwGetDataFlags & D3DGETDATA_FLUSH;
 
@@ -221,6 +245,10 @@ namespace dxvk {
 
         case D3DQUERYTYPE_OCCLUSION:
           m_dataCache.Occlusion = DWORD(queryData[0].occlusion.samplesPassed);
+          // NV-DXVK start: occlusion query diagnostics - only reached when conservative
+          // occlusion queries are inactive (GetData otherwise answers with a synthesized result)
+          m_parent->RTX().TrackOcclusionQueryResult(m_dataCache.Occlusion, m_rtxOcclusionBracketId);
+          // NV-DXVK end
           break;
 
         case D3DQUERYTYPE_TIMESTAMP:

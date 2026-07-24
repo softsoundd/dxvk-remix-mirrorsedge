@@ -216,6 +216,21 @@ namespace dxvk {
                "extracts). Skipped draws are removed entirely while ray tracing, so probe target textures show "
                "their last resolved content - visually equivalent to running with 'show scenecapture' toggled "
                "off. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, conservativeOcclusionQueries, false,
+               "Answer hardware occlusion queries with conservative results suited to path tracing instead "
+               "of GPU-measured raster visibility: readbacks return immediately with full-backbuffer "
+               "coverage ('assume unoccluded'), and the bounding-box test draws inside query brackets are "
+               "ignored since nothing consumes a measurement. Raster-measured results misbehave under ray "
+               "tracing: the depth buffer they test against is never populated (scene draws are consumed "
+               "for RT instead of rasterized), and even a correct zero - an off-frustum, sub-pixel, edge-on "
+               "or camera-enclosing bounding box - only means invisible to a rasterizer, while that geometry "
+               "still drives reflections, GI and emissive lighting. Engines that hide meshes on 0-sample "
+               "results (e.g. UE3) otherwise flicker mesh visibility and drop geometry from reflections, and "
+               "their blocking readbacks stall the render thread on GPU completion (spinning synchronous "
+               "bridge round trips for 32-bit games). Net effect is equivalent to disabling the game's "
+               "occlusion culling, with no game-side console access, ini edits or patches required; "
+               "pixel-count consumers (e.g. UE3 lens flare fading) see fully-visible. Only active while ray "
+               "tracing is enabled. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
                "UE3 compat: for stable static LocalVertexFactory draws, reuse previously captured vertex shader output instead of preserving a new vertex-capture draw.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
@@ -301,6 +316,14 @@ namespace dxvk {
                "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
                "status flaps frame-to-frame manifests as geometry flickering in and out of the raytraced scene; this "
                "probe identifies which submission-side decision is responsible. Logs are capped per draw identity.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogOcclusionQueries, false,
+               "Occlusion query diagnostics: log bracketed test draws (fragment-test state, viewport, world "
+               "AABB, whether the view origin sits inside it; capped), 0-sample completions with their "
+               "recorded bracket contents (capped), and a periodic summary (bracket/draw/result counts, "
+               "empty brackets, zero-result causes, pending readbacks, min/max sample counts). Diagnoses "
+               "games whose hardware occlusion culling misbehaves under ray tracing - meshes hidden or "
+               "flickering, render thread stalling on readbacks - by showing what was queried and what the "
+               "game read back.");
     RTX_OPTION("rtx.d3d9", bool, deferredUiReplay, true,
                "Replay behavior for deferred UI overlay draws (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders): "
                "when enabled, each tagged draw is snapshotted (vertex/index data, shaders, constants, textures, blend "
@@ -348,6 +371,14 @@ namespace dxvk {
       */
     void BeginOcclusionQuery() {
       ++m_activeOcclusionQueries;
+      ++m_oqBracketCounter;
+      if (m_frameOptions.ue3LogOcclusionQueries) {
+        ++m_oqDiag.brackets;
+        m_oqDiag.drawsInCurrentBracket = 0;
+        auto& record = m_oqRecords[m_oqBracketCounter & (kOcclusionQueryRecordCount - 1)];
+        record = {};
+        record.bracketId = m_oqBracketCounter;
+      }
     }
 
     /**
@@ -356,6 +387,70 @@ namespace dxvk {
     void EndOcclusionQuery() {
       --m_activeOcclusionQueries;
       assert(m_activeOcclusionQueries >= 0);
+      if (m_frameOptions.ue3LogOcclusionQueries &&
+          m_activeOcclusionQueries == 0 &&
+          m_oqDiag.drawsInCurrentBracket == 0) {
+        // A measured empty bracket is guaranteed to report 0 samples passed.
+        ++m_oqDiag.emptyBrackets;
+      }
+    }
+
+    /**
+      * \brief: Diagnostics: count an occlusion query readback that found the result not yet
+      * available (see rtx.d3d9.ue3LogOcclusionQueries).
+      */
+    void TrackOcclusionQueryPendingRead() {
+      if (m_frameOptions.ue3LogOcclusionQueries) {
+        ++m_oqDiag.pendingReads;
+      }
+    }
+
+    /**
+      * \brief: Identifier of the most recently begun occlusion query bracket; stamped onto the
+      * query object so its eventual result can be correlated with the recorded bracket contents.
+      */
+    uint32_t GetCurrentOcclusionBracketId() const {
+      return m_oqBracketCounter;
+    }
+
+    /**
+      * \brief: Diagnostics: record an occlusion query result as it becomes available to the
+      * application (see rtx.d3d9.ue3LogOcclusionQueries).
+      */
+    void TrackOcclusionQueryResult(DWORD samplesPassed, uint32_t bracketId);
+
+    /**
+      * \brief: True when conservative occlusion query behaviour is active: occlusion query
+      * readbacks are answered immediately with the synthesized "unoccluded" result and the
+      * bracketed test draws are ignored. See rtx.d3d9.conservativeOcclusionQueries.
+      */
+    bool ConservativeOcclusionQueriesEnabled() const {
+      return m_frameOptions.enableRaytracing &&
+             (m_frameOptions.conservativeOcclusionQueries || m_frameOptions.ue3EngineMode);
+    }
+
+    /**
+      * \brief: True while draws are being issued inside an occlusion query bracket and
+      * conservative occlusion query behaviour applies to them.
+      */
+    bool ShouldApplyConservativeOcclusionQueryState() const {
+      return m_activeOcclusionQueries > 0 && ConservativeOcclusionQueriesEnabled();
+    }
+
+    /**
+      * \brief: The synthesized occlusion query result: full backbuffer coverage ("assume
+      * unoccluded"), which keeps pixel-count consumers (e.g. UE3's LastPixelsPercentage
+      * feeding lens flare fading) at fully-visible.
+      */
+    DWORD GetConservativeOcclusionQueryResult() const {
+      if (m_activePresentParams.has_value()) {
+        const DWORD area = DWORD(m_activePresentParams->BackBufferWidth) *
+                           DWORD(m_activePresentParams->BackBufferHeight);
+        if (area != 0) {
+          return area;
+        }
+      }
+      return 1u << 20;
     }
 
     /**
@@ -526,6 +621,46 @@ namespace dxvk {
     DWORD m_prevDrawCullMode = 0;
 
     int m_activeOcclusionQueries = 0;
+    uint32_t m_oqBracketCounter = 0;
+
+    // Diagnostics for rtx.d3d9.ue3LogOcclusionQueries: bracket/result statistics flushed
+    // periodically from EndFrame, plus capped one-off detail logs.
+    struct OcclusionQueryDiagnostics {
+      uint32_t brackets = 0;
+      uint32_t emptyBrackets = 0;
+      uint32_t bracketedDraws = 0;
+      uint32_t drawsInCurrentBracket = 0;
+      uint32_t results = 0;
+      uint32_t zeroResults = 0;
+      uint32_t zeroCameraInside = 0;
+      uint32_t zeroSmallViewport = 0;
+      uint32_t pendingReads = 0;
+      DWORD minResult = ~0u;
+      DWORD maxResult = 0;
+      uint32_t framesSinceSummary = 0;
+      uint32_t stateSnapshotLogsRemaining = 12;
+      uint32_t zeroResultLogsRemaining = 24;
+    };
+    OcclusionQueryDiagnostics m_oqDiag;
+
+    // Per-bracket record of what was drawn inside an occlusion query, so a query result that
+    // arrives frames later can be correlated with the geometry that produced it. Ring-indexed
+    // by bracket id; sized for several frames of query traffic.
+    struct OcclusionQueryBracketRecord {
+      uint32_t bracketId = 0;
+      uint16_t drawCount = 0;
+      uint16_t primCount = 0;
+      uint16_t viewportW = 0;
+      uint16_t viewportH = 0;
+      bool conservativeActive = false;
+      bool cameraInsideBox = false;
+      float cameraToBoxDistance = 0.0f;
+      Vector3 boxMin = Vector3(0.0f);
+      Vector3 boxMax = Vector3(0.0f);
+      Vector3 cameraPos = Vector3(0.0f);
+    };
+    static constexpr uint32_t kOcclusionQueryRecordCount = 4096; // power of two
+    std::array<OcclusionQueryBracketRecord, kOcclusionQueryRecordCount> m_oqRecords = {};
 
     Rc<DxvkBuffer> m_vsVertexCaptureData;
 
@@ -930,6 +1065,11 @@ namespace dxvk {
 
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
 
+    void recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
+                                           const DrawContext& drawContext);
+
+    void flushOcclusionQueryDiagnostics();
+
     void triggerInjectRTX();
 
     // rtx.deferredUiTextures support: self-contained snapshots of overlay draws captured
@@ -1095,6 +1235,7 @@ namespace dxvk {
       bool ue3SkipShadowDepthPasses = false;
       bool ue3SkipDepthTestDisabledTranslucency = false;
       bool ue3SkipSceneCapturePasses = false;
+      bool conservativeOcclusionQueries = false;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
       bool ue3StaticGeometryHashMemoization = false;
@@ -1109,6 +1250,7 @@ namespace dxvk {
       bool ue3LogAlbedoSelection = false;
       bool ue3LogCapturePrecision = false;
       bool ue3LogDrawStatusFlaps = false;
+      bool ue3LogOcclusionQueries = false;
       bool deferredUiReplay = false;
       bool deferredUiRefreshSceneColor = false;
       bool enableIndexBufferMemoization = false;

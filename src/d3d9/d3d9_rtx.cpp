@@ -4758,6 +4758,7 @@ namespace dxvk {
     o.ue3SkipShadowDepthPasses = ue3SkipShadowDepthPassesObject().get();
     o.ue3SkipDepthTestDisabledTranslucency = ue3SkipDepthTestDisabledTranslucencyObject().get();
     o.ue3SkipSceneCapturePasses = ue3SkipSceneCapturePassesObject().get();
+    o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
     o.ue3StaticGeometryHashMemoization = ue3StaticGeometryHashMemoizationObject().get();
@@ -4772,6 +4773,7 @@ namespace dxvk {
     o.ue3LogAlbedoSelection = ue3LogAlbedoSelectionObject().get();
     o.ue3LogCapturePrecision = ue3LogCapturePrecisionObject().get();
     o.ue3LogDrawStatusFlaps = ue3LogDrawStatusFlapsObject().get();
+    o.ue3LogOcclusionQueries = ue3LogOcclusionQueriesObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
     o.deferredUiRefreshSceneColor = deferredUiRefreshSceneColorObject().get();
     o.enableIndexBufferMemoization = enableIndexBufferMemoizationObject().get();
@@ -6718,6 +6720,21 @@ namespace dxvk {
       return { RtxGeometryStatus::Ignored, false };
     }
 
+    // Draws inside an occlusion query bracket are visibility-test geometry, never scene geometry
+    // to ray trace; checked first so no skip path below can starve an active query of its draws.
+    // With synthesized readbacks nothing consumes a measurement, so they are ignored entirely;
+    // otherwise they rasterize so the query can count their samples.
+    if (m_activeOcclusionQueries > 0) {
+      if (ConservativeOcclusionQueriesEnabled()) {
+        m_ue3LastDrawDecision = "occlusion query test draw (ignored, result synthesized)";
+        ONCE(Logger::info("[RTX-Compatibility-Info] Ignoring occlusion query test draw (conservative occlusion queries synthesize the result)."));
+        return { RtxGeometryStatus::Ignored, false };
+      }
+      m_ue3LastDrawDecision = "occlusion query test draw (rasterized)";
+      ONCE(Logger::info("[RTX-Compatibility-Info] Rasterizing occlusion query test draw without ray tracing."));
+      return { RtxGeometryStatus::Rasterized, false };
+    }
+
     // Raytraced Render Target Support
     // If the bound texture for this draw call is one that has been used as a render target then store its id
     if (m_frameOptions.raytracedRenderTargetEnable) {
@@ -6790,11 +6807,6 @@ namespace dxvk {
       m_ue3LastDrawDecision = "depth-test-disabled translucency skip";
       ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 depth-test-disabled translucent draw."));
       return { RtxGeometryStatus::Ignored, false };
-    }
-
-    if (m_activeOcclusionQueries > 0) {
-      ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to raytrace an occlusion query. Ignoring.")));
-      return { RtxGeometryStatus::Rasterized, false };
     }
 
     if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
@@ -8003,6 +8015,12 @@ namespace dxvk {
     // first use per draw (UI/deferred-UI tag checks, MIC texture-set hash, diffuse key).
     m_boundTextureSnapshotValid = false;
 
+    // Diagnostics: record every draw issued inside an occlusion query bracket, whichever path
+    // routes it below, so its query's eventual result can be correlated with the drawn geometry.
+    if (m_activeOcclusionQueries > 0 && m_frameOptions.ue3LogOcclusionQueries) {
+      recordOcclusionQueryBracketedDraw(vertexContext, drawContext);
+    }
+
     auto finishPrepare = [&](PrepareDrawFlags flags) {
       if (m_frameOptions.ue3LogDrawStatusFlaps && m_frameOptions.ue3EngineMode) {
         trackUe3DrawStatusFlap(drawContext, flags);
@@ -8029,6 +8047,13 @@ namespace dxvk {
         }
       }
       if (!isRaytracedRenderTarget) {
+        // Occlusion query test draws can land post-injection (games without a depth prepass
+        // issue queries after the base pass); same conservative handling as pre-injection.
+        if (ShouldApplyConservativeOcclusionQueryState()) {
+          m_ue3LastDrawDecision = "occlusion query test draw post RTX injection (ignored, result synthesized)";
+          return finishPrepare(PrepareDrawFlag::Ignore);
+        }
+
         m_ue3LastDrawDecision = "post RTX injection";
         return finishPrepare(m_frameOptions.skipDrawCallsPostRTXInjection
                ? PrepareDrawFlag::Ignore
@@ -10804,10 +10829,191 @@ namespace dxvk {
     }
   }
 
+  void D3D9Rtx::recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
+                                                  const DrawContext& drawContext) {
+    ++m_oqDiag.bracketedDraws;
+    ++m_oqDiag.drawsInCurrentBracket;
+
+    auto& record = m_oqRecords[m_oqBracketCounter & (kOcclusionQueryRecordCount - 1)];
+    if (record.bracketId != m_oqBracketCounter) {
+      // Bracket began before logging was enabled; initialise the slot late.
+      record = {};
+      record.bracketId = m_oqBracketCounter;
+    }
+
+    const auto& rs = d3d9State().renderStates;
+    ++record.drawCount;
+    record.primCount = uint16_t(std::min<UINT>(drawContext.PrimitiveCount, 0xFFFFu));
+    record.viewportW = uint16_t(std::min<DWORD>(d3d9State().viewport.Width, 0xFFFFu));
+    record.viewportH = uint16_t(std::min<DWORD>(d3d9State().viewport.Height, 0xFFFFu));
+    record.conservativeActive = ConservativeOcclusionQueriesEnabled();
+
+    // UE3 occlusion boxes are position-only world-space vertices in stream 0. Record their world
+    // AABB and whether the view origin (UE3 convention: register c4, set by the view setup and
+    // persisting across the query draws) sits inside it - a camera-enclosing box is fully
+    // back-face culled when measured and guaranteed to report 0 samples.
+    const VertexContext& vtx = vertexContext[0];
+    const uint8_t* vertexData = reinterpret_cast<const uint8_t*>(vtx.mappedSlice.mapPtr);
+    if (vertexData != nullptr && vtx.stride >= sizeof(float) * 3 && drawContext.NumVertices > 0) {
+      constexpr uint32_t kMaxAnalyzedVertices = 64;
+      const uint32_t vertexCount = std::min<uint32_t>(drawContext.NumVertices, kMaxAnalyzedVertices);
+
+      Vector3 boxMin(FLT_MAX, FLT_MAX, FLT_MAX);
+      Vector3 boxMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+      bool anyVertex = false;
+      for (uint32_t i = 0; i < vertexCount; i++) {
+        const size_t byteOffset = size_t(vtx.offset) + size_t(drawContext.MinVertexIndex + i) * vtx.stride;
+        if (byteOffset + sizeof(float) * 3 > vtx.mappedSlice.length) {
+          break;
+        }
+        const float* p = reinterpret_cast<const float*>(vertexData + byteOffset);
+        boxMin = Vector3(std::min(boxMin.x, p[0]), std::min(boxMin.y, p[1]), std::min(boxMin.z, p[2]));
+        boxMax = Vector3(std::max(boxMax.x, p[0]), std::max(boxMax.y, p[1]), std::max(boxMax.z, p[2]));
+        anyVertex = true;
+      }
+
+      if (anyVertex) {
+        if (record.drawCount == 1) {
+          record.boxMin = boxMin;
+          record.boxMax = boxMax;
+        } else {
+          record.boxMin = Vector3(std::min(record.boxMin.x, boxMin.x), std::min(record.boxMin.y, boxMin.y), std::min(record.boxMin.z, boxMin.z));
+          record.boxMax = Vector3(std::max(record.boxMax.x, boxMax.x), std::max(record.boxMax.y, boxMax.y), std::max(record.boxMax.z, boxMax.z));
+        }
+
+        const Vector3 cameraPos = d3d9State().vsConsts.fConsts[4].xyz();
+        record.cameraPos = cameraPos;
+        record.cameraInsideBox =
+          cameraPos.x >= record.boxMin.x && cameraPos.x <= record.boxMax.x &&
+          cameraPos.y >= record.boxMin.y && cameraPos.y <= record.boxMax.y &&
+          cameraPos.z >= record.boxMin.z && cameraPos.z <= record.boxMax.z;
+
+        const Vector3 closestPoint(
+          std::clamp(cameraPos.x, record.boxMin.x, record.boxMax.x),
+          std::clamp(cameraPos.y, record.boxMin.y, record.boxMax.y),
+          std::clamp(cameraPos.z, record.boxMin.z, record.boxMax.z));
+        record.cameraToBoxDistance = length(cameraPos - closestPoint);
+      }
+    }
+
+    if (m_oqDiag.stateSnapshotLogsRemaining == 0) {
+      return;
+    }
+    --m_oqDiag.stateSnapshotLogsRemaining;
+
+    Logger::info(str::format(
+      "[UE3-OQ] bracketed draw: prims=", drawContext.PrimitiveCount,
+      " indexed=", drawContext.Indexed ? 1 : 0,
+      " zEnable=", rs[D3DRS_ZENABLE],
+      " zFunc=", rs[D3DRS_ZFUNC],
+      " zWrite=", rs[D3DRS_ZWRITEENABLE],
+      " stencil=", rs[D3DRS_STENCILENABLE],
+      " alphaTest=", rs[D3DRS_ALPHATESTENABLE],
+      " alphaBlend=", rs[D3DRS_ALPHABLENDENABLE],
+      " colorWrite=0x", std::hex, rs[ColorWriteIndex(kRenderTargetIndex)], std::dec,
+      " clipPlanes=0x", std::hex, rs[D3DRS_CLIPPLANEENABLE], std::dec,
+      " scissor=", rs[D3DRS_SCISSORTESTENABLE],
+      " cull=", rs[D3DRS_CULLMODE],
+      " viewport=", d3d9State().viewport.X, ",", d3d9State().viewport.Y,
+      " ", d3d9State().viewport.Width, "x", d3d9State().viewport.Height,
+      " dsBound=", d3d9State().depthStencil != nullptr ? 1 : 0,
+      " programmableVS=", m_parent->UseProgrammableVS() ? 1 : 0,
+      " programmablePS=", m_parent->UseProgrammablePS() ? 1 : 0,
+      " cameraInside=", record.cameraInsideBox ? 1 : 0,
+      " camDistToBox=", record.cameraToBoxDistance,
+      " conservative=", record.conservativeActive ? 1 : 0));
+  }
+
+  void D3D9Rtx::TrackOcclusionQueryResult(DWORD samplesPassed, uint32_t bracketId) {
+    if (!m_frameOptions.ue3LogOcclusionQueries) {
+      return;
+    }
+
+    ++m_oqDiag.results;
+    m_oqDiag.minResult = std::min(m_oqDiag.minResult, samplesPassed);
+    m_oqDiag.maxResult = std::max(m_oqDiag.maxResult, samplesPassed);
+
+    if (samplesPassed != 0) {
+      return;
+    }
+    ++m_oqDiag.zeroResults;
+
+    const auto& record = m_oqRecords[bracketId & (kOcclusionQueryRecordCount - 1)];
+    const bool haveRecord = bracketId != 0 && record.bracketId == bracketId;
+
+    if (haveRecord) {
+      if (record.cameraInsideBox) {
+        ++m_oqDiag.zeroCameraInside;
+      }
+      if (m_activePresentParams.has_value() &&
+          record.viewportW < uint16_t(m_activePresentParams->BackBufferWidth / 2) &&
+          record.viewportH < uint16_t(m_activePresentParams->BackBufferHeight / 2)) {
+        ++m_oqDiag.zeroSmallViewport;
+      }
+    }
+
+    if (m_oqDiag.zeroResultLogsRemaining == 0) {
+      return;
+    }
+    --m_oqDiag.zeroResultLogsRemaining;
+
+    if (haveRecord) {
+      Logger::info(str::format(
+        "[UE3-OQ] 0 samples passed: bracket=", bracketId,
+        " draws=", record.drawCount,
+        " prims=", record.primCount,
+        " viewport=", record.viewportW, "x", record.viewportH,
+        " conservative=", record.conservativeActive ? 1 : 0,
+        " cameraInside=", record.cameraInsideBox ? 1 : 0,
+        " camDistToBox=", record.cameraToBoxDistance,
+        " boxMin=(", record.boxMin.x, ",", record.boxMin.y, ",", record.boxMin.z, ")",
+        " boxMax=(", record.boxMax.x, ",", record.boxMax.y, ",", record.boxMax.z, ")",
+        " camera=(", record.cameraPos.x, ",", record.cameraPos.y, ",", record.cameraPos.z, ")"));
+    } else {
+      Logger::info(str::format(
+        "[UE3-OQ] 0 samples passed: bracket=", bracketId,
+        " (no record: bracket predates logging or record evicted; ",
+        record.drawCount == 0 ? "possibly an empty bracket)" : "ring overwritten)"));
+    }
+  }
+
+  void D3D9Rtx::flushOcclusionQueryDiagnostics() {
+    auto& d = m_oqDiag;
+    if (++d.framesSinceSummary < 120) {
+      return;
+    }
+
+    if (d.brackets != 0 || d.results != 0) {
+      Logger::info(str::format(
+        "[UE3-OQ] summary over ", d.framesSinceSummary, " frames:",
+        " brackets=", d.brackets,
+        " emptyBrackets=", d.emptyBrackets,
+        " bracketedDraws=", d.bracketedDraws,
+        " results=", d.results,
+        " zeroResults=", d.zeroResults,
+        " zeroCameraInside=", d.zeroCameraInside,
+        " zeroSmallViewport=", d.zeroSmallViewport,
+        " pendingReads=", d.pendingReads,
+        " minResult=", d.results != 0 ? d.minResult : 0,
+        " maxResult=", d.maxResult));
+    }
+
+    // Reset aggregates but keep the remaining one-off log budgets.
+    const uint32_t stateLogs = d.stateSnapshotLogsRemaining;
+    const uint32_t zeroLogs = d.zeroResultLogsRemaining;
+    d = {};
+    d.stateSnapshotLogsRemaining = stateLogs;
+    d.zeroResultLogsRemaining = zeroLogs;
+  }
+
   void D3D9Rtx::EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx) {
     // Refresh the per-frame option snapshot: EndFrame's own consumers (deferred UI
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
+
+    if (m_frameOptions.ue3LogOcclusionQueries) {
+      flushOcclusionQueryDiagnostics();
+    }
 
     // Flush this frame's replacement-material-hash tracking as one CS command. Must be
     // emitted before the endFrame command below: the consumers (graph components) read
