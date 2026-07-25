@@ -68,7 +68,17 @@ namespace dxvk {
       m_stallFlag |= bit::popcnt(m_stallMask) >= 16;
     }
 
+    // NV-DXVK start: occlusion query diagnostics (rtx.d3d9.ue3LogOcclusionQueries)
+    void SetRtxOcclusionBracketId(uint32_t id) {
+      m_rtxOcclusionBracketId = id;
+    }
+    // NV-DXVK end
+
   private:
+
+    // NV-DXVK start: occlusion query diagnostics (rtx.d3d9.ue3LogOcclusionQueries)
+    uint32_t m_rtxOcclusionBracketId = 0;
+    // NV-DXVK end
 
     D3DQUERYTYPE      m_queryType;
 

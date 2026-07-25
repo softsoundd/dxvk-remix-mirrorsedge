@@ -6909,6 +6909,7 @@ namespace dxvk {
     // NV-DXVK start: Don't raytrace occlusion queries
     if (pQuery->GetType() == D3DQUERYTYPE_OCCLUSION) {
       m_rtx.BeginOcclusionQuery();
+      pQuery->SetRtxOcclusionBracketId(m_rtx.GetCurrentOcclusionBracketId());
     }
     // NV-DXVK end
 
