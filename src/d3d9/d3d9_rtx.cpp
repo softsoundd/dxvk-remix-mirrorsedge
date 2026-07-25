@@ -6814,6 +6814,14 @@ namespace dxvk {
       return { RtxGeometryStatus::Ignored, false };
     }
 
+    {
+      D3D9CommonTexture* rtTexture = GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture());
+      if (rtTexture != nullptr && rtTexture->GetImage() == nullptr) {
+        ONCE(Logger::info("[RTX-Compatibility-Info] Skipped drawcall, render target has no GPU image (possibly a depth-only pass)."));
+        return { RtxGeometryStatus::Ignored, false };
+      }
+    }
+
     constexpr DWORD rgbWriteMask = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE;
     if ((d3d9State().renderStates[ColorWriteIndex(kRenderTargetIndex)] & rgbWriteMask) != rgbWriteMask) {
       ONCE(Logger::info("[RTX-Compatibility-Info] Skipped drawcall, colour write disabled."));
