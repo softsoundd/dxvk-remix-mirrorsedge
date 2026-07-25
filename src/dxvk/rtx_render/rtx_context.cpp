@@ -202,9 +202,6 @@ namespace dxvk {
 
     GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames() * 0.001f);
     GlobalTime::get().setAdvanceTime(RtxOptions::advanceTime());
-
-    // Initialize atmosphere system.
-    m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
   }
 
   RtxContext::~RtxContext() {
@@ -1395,44 +1392,6 @@ namespace dxvk {
     constants.resolveStochasticAlphaBlendThreshold = m_common->metaComposite().stochasticAlphaBlendOpacityThreshold();
 
     constants.skyBrightness = RtxOptions::skyBrightness();
-    constants.skyMode = static_cast<uint32_t>(RtxOptions::skyMode());
-
-    // Detect sky mode changes and clear rasterized sky targets when switching to physical atmosphere.
-    SkyMode currentSkyMode = RtxOptions::skyMode();
-    if (currentSkyMode != m_lastSkyMode) {
-      if (currentSkyMode == SkyMode::PhysicalAtmosphere) {
-        auto skyProbe = getResourceManager().getSkyProbe(this, m_skyColorFormat);
-        auto skyMatte = getResourceManager().getSkyMatte(this, m_skyRtColorFormat);
-
-        VkClearValue clearValue = {};
-        clearValue.color.float32[0] = 0.0f;
-        clearValue.color.float32[1] = 0.0f;
-        clearValue.color.float32[2] = 0.0f;
-        clearValue.color.float32[3] = 0.0f;
-
-        if (skyProbe.view != nullptr) {
-          DxvkContext::clearRenderTarget(skyProbe.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-        }
-
-        if (skyMatte.view != nullptr) {
-          DxvkContext::clearRenderTarget(skyMatte.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-        }
-      }
-
-      m_lastSkyMode = currentSkyMode;
-    }
-
-    // Update atmosphere parameters and LUTs in physical atmosphere mode.
-    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
-      if (!m_atmosphere) {
-        m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
-      }
-
-      m_atmosphere->initialize(this);
-      m_atmosphere->computeLuts(this);
-      constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
-    }
-
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
@@ -1523,29 +1482,6 @@ namespace dxvk {
     bindResourceView(BINDING_VALUE_NOISE_SAMPLER, valueNoiseLut, nullptr);
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
-
-    // Atmosphere LUTs are declared in common bindings and must always be bound.
-    if (!m_atmosphere) {
-      m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
-    }
-
-    m_atmosphere->initialize(this);
-
-    auto transmittanceLut = m_atmosphere->getTransmittanceLut();
-    auto multiscatteringLut = m_atmosphere->getMultiscatteringLut();
-    auto skyViewLut = m_atmosphere->getSkyViewLut();
-
-    if (transmittanceLut.isValid()) {
-      bindResourceView(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT, transmittanceLut.view, nullptr);
-    }
-
-    if (multiscatteringLut.isValid()) {
-      bindResourceView(BINDING_ATMOSPHERE_MULTISCATTERING_LUT, multiscatteringLut.view, nullptr);
-    }
-
-    if (skyViewLut.isValid()) {
-      bindResourceView(BINDING_ATMOSPHERE_SKY_VIEW_LUT, skyViewLut.view, nullptr);
-    }
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)
@@ -2831,11 +2767,6 @@ namespace dxvk {
   }
 
   void RtxContext::rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState) {
-    // Skip rasterized sky rendering when physical atmosphere mode is active.
-    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
-      return;
-    }
-
     // Grab and apply replacement texture if any
     // NOTE: only the original color texture will be replaced with albedo-opacity texture
     MaterialData* replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());

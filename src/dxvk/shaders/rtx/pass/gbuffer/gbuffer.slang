@@ -30,7 +30,7 @@
 //!> axis psr psr GBUFFER_PSR
 //!> axis pipeline raygen.rgen RT_TRACE_RAY RAY_PIPELINE
 //!> axis pipeline raygen_ser.rgen RT_TRACE_RAY RAY_PIPELINE RT_SHADER_EXECUTION_REORDERING
-//!> axis pipeline rayquery_raygen.rgen RAY_PIPELINE ATMOSPHERE_AVAILABLE
+//!> axis pipeline rayquery_raygen.rgen RAY_PIPELINE
 //!> axis nrc -
 //!> axis nrc nrc ENABLE_NRC=1
 //!> axis wboit -
