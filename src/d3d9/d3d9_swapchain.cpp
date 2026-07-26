@@ -30,6 +30,7 @@
 #include "../util/util_once.h"
 #include "../util/util_string.h"
 #include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
+#include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
 
 // NV-DXVK start: DLFG integration
@@ -1084,6 +1085,13 @@ namespace dxvk {
       pPresentParams->MultiSampleQuality = 0;
     }
 
+    // NV-DXVK start: [NGX passthrough] no multisampled surface may exist, including the swapchain
+    if (RtxNgxPassthrough::forceGameMsaaOff()) {
+      pPresentParams->MultiSampleType    = D3DMULTISAMPLE_NONE;
+      pPresentParams->MultiSampleQuality = 0;
+    }
+    // NV-DXVK end
+
     if (pPresentParams->Windowed) {
       GetWindowClientSize(pPresentParams->hDeviceWindow,
         pPresentParams->BackBufferWidth  ? nullptr : &pPresentParams->BackBufferWidth,
@@ -1192,6 +1200,11 @@ namespace dxvk {
         {  int32_t(m_dstRect.left),                    int32_t(m_dstRect.top)                    },
         { uint32_t(m_dstRect.right - m_dstRect.left), uint32_t(m_dstRect.bottom - m_dstRect.top) } };
       
+
+      // NV-DXVK start: NGX passthrough debug overlay, recorded onto the context that presents this
+      // image a few lines below and ahead of both that blit and the UI
+      m_device->getCommon()->metaNgxPassthrough().blitDebugOverlayToPresent(m_context.ptr(), swapImage);
+      // NV-DXVK end
 
       m_blitter->presentImage(m_context.ptr(),
         m_imageViews.at(imageIndex), dstRect,

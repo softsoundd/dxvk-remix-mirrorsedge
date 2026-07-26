@@ -151,7 +151,15 @@ namespace dxvk {
 
     if (pDesc->Width == 0 || pDesc->Height == 0 || pDesc->Depth == 0)
       return D3DERR_INVALIDCALL;
-    
+
+    // NV-DXVK start: [NGX passthrough] downgrade rather than fail, for games that create
+    // multisampled surfaces without first querying CheckDeviceMultiSampleType
+    if (RtxNgxPassthrough::forceGameMsaaOff() && pDesc->MultiSample != D3DMULTISAMPLE_NONE) {
+      pDesc->MultiSample        = D3DMULTISAMPLE_NONE;
+      pDesc->MultisampleQuality = 0;
+    }
+    // NV-DXVK end
+
     if (FAILED(DecodeMultiSampleType(pDesc->MultiSample, pDesc->MultisampleQuality, nullptr)))
       return D3DERR_INVALIDCALL;
 

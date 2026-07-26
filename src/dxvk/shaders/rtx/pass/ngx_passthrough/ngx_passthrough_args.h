@@ -49,8 +49,27 @@ struct NgxPassthroughArgs {
   // Same for the foreground-phase draws sharing the texture (marked via the blue-channel
   // phase marker; consumed by camera-locked pixels only)
   uint foregroundVelocityValid;
-  uint pad0;
-  uint pad1;
+
+  // UE3's FinishRenderViewTarget composite is replaced by the Super Resolution upscale, so its
+  // transform is reapplied to the result instead: rgb = ColorScale, a = InverseGamma.
+  uint outputTransformEnabled;
+  // 1: take alpha from the game's original colour (the pre-post injection writes back over
+  // scene colour, whose alpha carries UE3's depth); 0: the target alpha is free.
+  uint preserveOriginalAlpha;
+
+  // Display extent. `resolution` above is the render extent, which Super Resolution makes
+  // smaller than the merged output.
+  vec2 outputResolution;
+  vec2 outputPad;
+
+  vec4 outputColorScaleAndGamma;
+  vec4 outputOverlayColor;
+
+  // The sub-pixel viewport offset this frame was rasterized with, in render pixels, y down -
+  // exactly what was added to the game's viewport. The depth buffer is displaced by it, so
+  // reconstructing a position from a pixel coordinate has to take it back out.
+  vec2 jitter;
+  vec2 jitterPad;
 };
 
 // Push constants for the object velocity raster pass: clip transforms composed from the

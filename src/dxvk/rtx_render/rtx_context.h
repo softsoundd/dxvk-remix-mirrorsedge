@@ -102,8 +102,11 @@ namespace dxvk {
                                     const Rc<DxvkImage>& colorMirrorImage,
                                     const Rc<DxvkImage>& upscaleSourceImage,
                                     const VkRect2D& sourceSubrect,
+                                    const VkOffset2D& colorSourceOffset,
+                                    const NgxOutputTransform& outputTransform,
                                     std::vector<NgxVelocityDraw>&& velocityDraws,
                                     const NgxVelocityCaptureStats& velocityStats,
+                                    const Vector3& sceneTransformOffset,
                                     float jitterX, float jitterY,
                                     bool cameraMatricesValid,
                                     const Matrix4& worldToView,
@@ -119,6 +122,7 @@ namespace dxvk {
     // clears the depth buffer ahead of its foreground DPG, which would otherwise destroy
     // the world depth needed for motion vector generation).
     void snapshotNgxPassthroughDepth(const Rc<DxvkImage>& sceneDepthImage);
+
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
@@ -288,6 +292,8 @@ namespace dxvk {
     Rc<DxvkImage> m_ngxPassthroughColorMirror;
     Rc<DxvkImage> m_ngxPassthroughUpscaleSource;
     VkRect2D m_ngxPassthroughSubrect = { { 0, 0 }, { 0, 0 } };
+    VkOffset2D m_ngxPassthroughColorSubrectOffset = { 0, 0 };
+    NgxOutputTransform m_ngxPassthroughOutputTransform;
     std::vector<NgxVelocityDraw> m_ngxPassthroughVelocityDraws;
     float m_ngxPassthroughJitter[2] = { 0.0f, 0.0f };
 

@@ -785,6 +785,13 @@ namespace dxvk {
       bool hasFogConstants = false;
       bool hasHazeConstants = false;
       bool hasUiCompositeConstants = false;
+      // Constant registers of UE3's GammaCorrectionPixelShader (kNgxNoRegister when absent).
+      // That shader is the engine's final composite, which the Super Resolution upscale
+      // replaces - so its transform has to be carried over rather than dropped.
+      static constexpr uint32_t kNgxNoRegister = UINT32_MAX;
+      uint32_t gammaInverseReg = kNgxNoRegister;
+      uint32_t gammaColorScaleReg = kNgxNoRegister;
+      uint32_t gammaOverlayColorReg = kNgxNoRegister;
     };
 
     fast_unordered_cache<Ue3ShaderFeatureInfo> m_ue3ShaderFeatureCache;
@@ -881,12 +888,10 @@ namespace dxvk {
     // transform state from previous sightings. The identity hash covers geometry and draw
     // parameters only, so every placement of the same mesh asset in the level aliases onto
     // one identity - each placement is tracked as an instance and draws are matched against
-    // the previous frame's instances (exact = static, near = the same object moved, far =
-    // a different placement). The raw register rows give a cheap exact-match test; the
-    // disambiguated objectToWorld feeds the previous-frame clip transform and the distance
-    // metric for the near-match.
+    // the previous frame's instances (same placement = static, near = the same object moved,
+    // far = a different placement). The disambiguated objectToWorld feeds the previous-frame
+    // clip transform, the same-placement test and the distance metric for the near-match.
     struct NgxVelocityObjectInstance {
-      Vector4 localToWorldRows[4];
       Matrix4 objectToWorld;
       // The packed ViewProjection at the sighting's draw (oriented): scene phases render
       // with their own projections (UE3's foreground DPG uses a first-person FOV), so
@@ -929,6 +934,9 @@ namespace dxvk {
       // confirmation (grids of instanced meshes produce repeating pop-in deltas under
       // steady camera movement, indistinguishable from consistent object motion)
       uint32_t lastNewRegistrationFrame = 0;
+      // Frame this identity last contributed to the global transform offset measurement: it
+      // gets one say per frame however many copies of it are on screen
+      uint32_t lastOffsetVoteFrame = UINT32_MAX;
     };
     fast_unordered_cache<NgxVelocityObjectState> m_ngxVelocityObjectCache;
     std::vector<NgxVelocityDraw> m_ngxVelocityDraws;
@@ -948,6 +956,48 @@ namespace dxvk {
     // count is cumulative and detects an unstable packing-convention tiebreaker)
     NgxVelocityCaptureStats m_ngxVelocityStats;
     uint32_t m_ngxCameraTransposeFlips = 0;
+
+    // Some UE3 titles upload LocalToWorld in a space carrying a per-frame global translation
+    // rather than true world space, recognizable in that every placement in a frame shares one
+    // fractional offset and it moves frame to frame with the camera. A static placement's
+    // matrix is then not identical across frames the way it is in Mirror's Edge. This is the
+    // offset the scene as a whole moved by, which a static placement's
+    // translation delta reproduces exactly. Zero for titles uploading true world space, which
+    // reduces the static test back to plain equality.
+    Vector3 m_ngxGlobalTransformOffset = Vector3(0.0f, 0.0f, 0.0f);
+    // Translation deltas of this frame's basis-preserving pairings, resolved to the offset
+    // above at frame end by picking the value the most sightings agree on
+    struct NgxTranslationDeltaVote {
+      Vector3 delta = Vector3(0.0f, 0.0f, 0.0f);
+      uint32_t votes = 0;
+    };
+    static constexpr uint32_t kNgxTranslationDeltaVoteSlots = 8;
+    std::array<NgxTranslationDeltaVote, kNgxTranslationDeltaVoteSlots> m_ngxTranslationDeltaVotes;
+    // Votes behind the offset currently in force, so a better supported candidate can take
+    // over mid-frame while a single dissenting sighting cannot
+    uint32_t m_ngxAdoptedOffsetVotes = 0;
+
+    // Counters accumulated over a window and logged, because the health of the capture is a
+    // ratio - sightings that paired against sightings that had to register anew - and the
+    // per-sighting miss lines are too heavily rate limited to show one. Only the per-frame
+    // counters that mean something summed live here; the rest of NgxVelocityCaptureStats is
+    // frame state (the frame's camera validity) or already cumulative (the transpose flips).
+    struct NgxVelocityWindowTotals {
+      uint32_t frames = 0;
+      uint32_t captured = 0;
+      uint32_t capturedSkinned = 0;
+      uint32_t capturedDynamic = 0;
+      uint32_t exactMatches = 0;
+      uint32_t newRegistrations = 0;
+      uint32_t pairedBeyondBounds = 0;
+      uint32_t skippedNoCamera = 0;
+      uint32_t skippedBudget = 0;
+      uint32_t skippedZDisabled = 0;
+      uint32_t skippedInstanceCap = 0;
+      uint32_t depthClears = 0;
+    };
+    static constexpr uint32_t kNgxVelocityWindowFrames = 600;
+    NgxVelocityWindowTotals m_ngxVelocityWindow;
 
     // Skinned / CPU-modified draws captured this frame (bound their upload buffers;
     // reset per frame)
@@ -1001,6 +1051,63 @@ namespace dxvk {
     // so every change forces a full sampler re-bind
     float m_ngxAppliedSamplerLodBias = 0.0f;
 
+    // The jitter state the currently bound Vulkan viewport carries. The per-draw jitter decision
+    // follows the bound targets, which can change without D3D9 dirtying the viewport, so the
+    // rebind has to be forced whenever this stops matching the current draw.
+    bool m_ngxViewportJitterApplied = false;
+    float m_ngxAppliedViewportJitter[2] = { 0.0f, 0.0f };
+
+    // Last logged jitter loop length, so the line is emitted only when it changes
+    uint32_t m_ngxLoggedJitterSequenceLength = 0;
+
+    // Which injection requirements the current frame met, for attributing a relocation to the
+    // late point, plus the running relocation count and its last reported value
+    bool m_ngxDiagSawPostQuad = false;
+    bool m_ngxDiagSceneColorReady = false;
+    uint32_t m_ngxPrePostMissCount = 0;
+    uint32_t m_ngxPrePostMissLastReportedCount = 0;
+
+    // Last frame whose scene draws donated the view rect. The per-frame validity flag needs a
+    // camera-reconstructed scene draw ahead of the post chain in the same frame, which a frame
+    // can miss for reasons unrelated to the view rect; the rect itself only changes when
+    // ScreenPercentage or the resolution does, so a recent one stays usable.
+    uint32_t m_ngxSceneViewportLastValidFrame = 0;
+
+    // Where this frame's scene depth clears, scene color reads, last depth-writing draw, injection
+    // and first backbuffer draw fell. The injection has to go at the first read past the end of the
+    // scene, which is only knowable once the frame is over, so the shape is recorded and the next
+    // frame's position derived from it. Also logged periodically, which is how a placement is
+    // verified in a title whose frame shape has not been seen before.
+    static constexpr uint32_t kNgxFrameShapeSlots = 12;
+    uint32_t m_ngxFrameClearDraws[kNgxFrameShapeSlots] = {};
+    uint32_t m_ngxFrameReadDraws[kNgxFrameShapeSlots] = {};
+    uint32_t m_ngxFrameClearCount = 0;
+    uint32_t m_ngxFrameReadCount = 0;
+    uint32_t m_ngxFrameLastGeometryDraw = 0;
+    uint32_t m_ngxFrameInjectionDraw = 0;
+    uint32_t m_ngxFrameFirstBackbufferDraw = 0;
+    uint32_t m_ngxFrameShapeLogsRemaining = 10;
+
+    // Reads seen so far this frame, and how many of them fell inside the scene last time. Counted
+    // from the frame's most recent scene depth clear where there is one, because that is the form
+    // that holds still: frames differ in how many reads land before the clear, so a whole-frame
+    // count inherits that variation and alternates, while the stretch from the clear to the end of
+    // the scene does not. The whole-frame pair covers frames with no detected clear.
+    uint32_t m_ngxPrePostCandidatesThisFrame = 0;
+    uint32_t m_ngxPrePostReadsInsideScene = 0;
+    uint32_t m_ngxPrevReadsInsideScene = UINT32_MAX;
+    uint32_t m_ngxReadsSinceLastClear = 0;
+    uint32_t m_ngxReadsAfterClearInsideScene = 1;
+    uint32_t m_ngxPrevReadsAfterClearInsideScene = UINT32_MAX;
+
+    // Set once the game has bound the backbuffer this frame, which marks the end of the scene and
+    // its post chain. Scene color reads after that belong to UI compositing and must not count
+    // towards the injection ordinal, or the upscaler ends up resolving the UI.
+    bool m_ngxBackbufferDrawSeenThisFrame = false;
+
+    void countNgxPostInjectionSceneColorConsumer(const DrawContext& drawContext);
+    void updateNgxPrePostInjectionAim();
+
     // Isolated renderer shadow (GSystemSettings untouched). Bridge path owns the parent handle.
     bool m_ngxScreenPercentageScanDone = false;
     bool m_ngxScreenPercentageDriven = false;
@@ -1022,12 +1129,28 @@ namespace dxvk {
       bool forceRestore = false;
     };
     std::vector<NgxGameSettingsCodePatch> m_ngxGameSettingsCodePatches;
-    // MSAA redirects install only during device setup (resource-creation latch).
-    bool m_ngxMsaaSetupDecisionCaptured = false;
-    bool m_ngxMsaaRedirectSetupAllowed = false;
-    bool m_ngxMsaaOverrideRequestedAtSetup = false;
-    bool m_ngxMsaaOverrideLatched = false;
-    bool m_ngxGameMsaaDriven = false;
+
+    // Shape alone never commits a candidate: the installed redirects are proven by driving a
+    // known percentage and watching the game's own scene viewport respond. A disproven
+    // candidate is rolled back, remembered, and the scan runs again for the next best match.
+    enum class NgxSettingsProbeState {
+      Idle,
+      Pending,
+      Confirmed,
+      Failed,
+    };
+    NgxSettingsProbeState m_ngxSettingsProbeState = NgxSettingsProbeState::Idle;
+    uint32_t m_ngxSettingsProbeStartFrame = 0;
+    float m_ngxSettingsProbeValue = 0.0f;
+    std::vector<uintptr_t> m_ngxRejectedSettingsCandidates;
+
+    // FSystemSettings::NeedsUpscale() reads both fields through `this`, so the engine can only
+    // keep performing its own upscale when those relative readers were redirected too;
+    // otherwise the runtime upscales the reduced subrect itself.
+    bool m_ngxEngineUpscaleAvailable = false;
+    bool m_ngxRuntimeOwnedUpscale = false;
+    uint32_t m_ngxMissingEngineUpscaleFrames = 0;
+
     // Scene-camera viewport gate; 0 = unknown.
     float m_ngxGameScreenPercentage = 0.0f;
     bool m_ngxPassthroughBootstrapped = false;
@@ -1446,7 +1569,12 @@ namespace dxvk {
     void applyNgxPassthroughScreenPercentage();
     void locateNgxPassthroughGameSettings();
     void restoreNgxGameSettingsRedirects();
-    void applyNgxPassthroughMsaaDisable();
+    bool writeNgxScreenPercentageShadow(float screenPercentage);
+    void mirrorNgxLiveScreenPercentage();
+    void updateNgxSettingsProbe();
+
+    // True while the runtime, rather than the engine, owns the final reduced-subrect upscale.
+    bool ngxRuntimeOwnsUpscale() const;
 
     // Scene targets identified from CTAB-verified camera draws with depth writes. Kept across
     // frames (UE3 render targets are stable between resolution changes) so the jitter can
@@ -1479,6 +1607,27 @@ namespace dxvk {
     bool m_ngxSceneViewportValid = false;
     Rc<DxvkImage> m_ngxUpscaleSourceImage;
     VkRect2D m_ngxSubrect = { { 0, 0 }, { 0, 0 } };
+    // Where the reduced colour sits inside the upscale source. Equal to m_ngxSubrect's offset
+    // for the engine-owned path (both live in scene color space), but the runtime-owned path
+    // reads from the backbuffer, where the engine centred the view rect instead.
+    VkOffset2D m_ngxColorSubrectOffset = { 0, 0 };
+
+    // Runtime-owned upscale: with NeedsUpscale() reporting no upscale, the engine's post chain
+    // composites its reduced view rect straight into the backbuffer and stops there.
+    D3DVIEWPORT9 m_ngxRuntimeUpscaleRect = {};
+    bool m_ngxRuntimeUpscaleRectValid = false;
+
+    // Super Resolution replaces UE3's FinishRenderViewTarget composite, so whatever that draw
+    // was doing to the colour has to be reproduced on the upscaled result. Read from the
+    // suppressed draw's own constants, so a title where the composite is a plain copy (its
+    // post chain already gamma corrected into LDR scene colour) yields the identity.
+    NgxOutputTransform m_ngxOutputTransform;
+    void captureNgxOutputTransform();
+
+    // Set when the engine's upscaling draw turned out to also be its post-process composite, so
+    // neither replacing it (the grade is lost) nor leaving it (it upscales itself, bilinearly)
+    // is correct. Such a title only supports full resolution DLAA.
+    bool m_ngxEngineCompositeUnsafe = false;
 
     // Pre-post-process injection: when the scene end trigger was the first post-process pass
     // sampling the scene color, DLSS reads and writes the image that pass consumes - the
@@ -1494,13 +1643,6 @@ namespace dxvk {
     std::array<Rc<DxvkImage>, 4> m_ngxSceneColorResolves;
     uint32_t m_ngxSceneColorResolveCount = 0;
 
-    // Whether the previous frame had a mid-scene depth clear (UE3 foreground DPG prepass).
-    // The clear separates all world-DPG rendering (including dynamic shadow projections,
-    // which sample the scene color resolve) from the foreground DPG and the post chain;
-    // when the previous frame had one, the pre-post-process trigger requires it this frame
-    // before firing so no world-DPG pass can ever be mistaken for the start of post.
-    bool m_ngxDepthClearSeenPrevFrame = false;
-
     // HUD-less capture for frame generation: when the injection ran pre-post-process, the
     // pre-UI backbuffer state is captured at the first UI-classified backbuffer draw after
     // the injection (or at frame end when no UI is drawn)
@@ -1513,10 +1655,15 @@ namespace dxvk {
     // and on demand (rtx.ngxPassthrough.dumpPostChainFrames); validates the pre-post
     // injection against the game's real compositing
     uint32_t m_ngxPostChainDumpFramesLeft = 0;
+
+    // Session budget for the automatic dump. The on-demand option disarms itself after one use;
+    // the automatic one is driven by scene target changes, which are not guaranteed to be rare.
+    uint32_t m_ngxAutoDumpArmsRemaining = 4;
     uint32_t m_ngxPostChainDumpLinesThisFrame = 0;
 
     void dumpNgxPostChainDraw(const DrawContext& drawContext);
     const char* classifyNgxImageForDump(const DxvkImage* image) const;
+    void reportNgxPrePostMiss();
 
     // Per-draw snapshot of the bound texture slots (common texture pointer, cached image
     // hash, render-target descriptor hash), lazily built and shared by the per-draw

@@ -209,10 +209,12 @@ namespace dxvk {
   RtxNgxPassthrough::~RtxNgxPassthrough() { }
 
   void RtxNgxPassthrough::onDestroy() {
-    if (m_dlssContext) {
-      m_dlssContext->releaseNGXFeature();
+    for (DlssFeature& feature : m_dlssFeatures) {
+      if (feature.context) {
+        feature.context->releaseNGXFeature();
+      }
+      feature.context = nullptr;
     }
-    m_dlssContext = nullptr;
   }
 
   void RtxNgxPassthrough::createResources(Rc<DxvkContext> ctx, const VkExtent2D& renderExtent, const VkExtent2D& displayExtent) {
@@ -230,6 +232,9 @@ namespace dxvk {
     m_colorInput = Resources::createImageResource(ctx, "NGX passthrough color input", renderExtent3D, VK_FORMAT_R16G16B16A16_SFLOAT);
     m_dlssOutput = Resources::createImageResource(ctx, "NGX passthrough DLSS output", displayExtent3D, VK_FORMAT_R16G16B16A16_SFLOAT);
     m_mergedOutput = Resources::createImageResource(ctx, "NGX passthrough merged output", displayExtent3D, VK_FORMAT_R16G16B16A16_SFLOAT);
+    // Render-sized: the inputs the debug view visualizes are render resolution
+    m_debugPresentImage = Resources::createImageResource(ctx, "NGX passthrough debug overlay", renderExtent3D, VK_FORMAT_R16G16B16A16_SFLOAT);
+    m_debugPresentValid = false;
 
     for (uint32_t i = 0; i < m_depthQueue.size(); i++) {
       m_depthQueue[i] = Resources::createImageResource(ctx, "NGX passthrough depth", renderExtent3D, VK_FORMAT_R32_SFLOAT);
@@ -249,7 +254,9 @@ namespace dxvk {
                                                       1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 0,
                                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
 
-    m_dlssNeedsInitialize = true;
+    for (DlssFeature& feature : m_dlssFeatures) {
+      feature.needsInitialize = true;
+    }
 
     Logger::info(str::format("[RTX NGX Passthrough] Created resources: render ", renderExtent.width, "x", renderExtent.height,
                              ", display ", displayExtent.width, "x", displayExtent.height));
@@ -553,7 +560,6 @@ namespace dxvk {
       viewport.maxDepth = maxDepth;
       ctx->setViewports(1, &viewport, &scissor);
     };
-
     ctx->bindShader(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_GEOMETRY_BIT, nullptr);
@@ -739,9 +745,9 @@ namespace dxvk {
 
     if (sceneDepthImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
       liveFailureReason = "multisampled depth unsupported";
-      ONCE(Logger::warn("[RTX NGX Passthrough] The game's depth buffer is multisampled which is not supported; "
-                        "leave rtx.ngxPassthrough.disableGameMsaa enabled or disable MSAA in the game "
-                        "('scale set MaxMultisamples 0' in the console), then restart."));
+      ONCE(Logger::warn("[RTX NGX Passthrough] The game's depth buffer is multisampled, which cannot be "
+                        "resolved for the NGX inputs. Leave rtx.ngxPassthrough.disableGameMsaa enabled so "
+                        "multisampling is refused at creation, then restart."));
     } else if (sceneDepthImage->info().layout != VK_IMAGE_LAYOUT_GENERAL) {
       // Game depth-stencil images are created with a GENERAL layout when the mode is enabled
       // at launch (see D3D9CommonTexture::CreateImage). Anything else means the image predates
@@ -807,15 +813,46 @@ namespace dxvk {
     // combined matrix well conditioned for large world coordinates.
     NgxPassthroughArgs args = {};
 
+    // Where the game expresses its transforms in a space that shifts every frame, the two
+    // cameras below describe different spaces, and walking from one to the other without
+    // accounting for the shift reprojects every pixel as though the scene had moved by it.
+    // A point standing still sits at p in this frame's space and p - offset in the previous
+    // one, so that step belongs between the two legs. The offset is zero for titles uploading
+    // true world space, leaving the chain exactly as it was.
+    Matrix4d previousSpaceFromCurrent = Matrix4d();
+    previousSpaceFromCurrent[3] = Vector4d(-double(m_sceneTransformOffset.x),
+                                           -double(m_sceneTransformOffset.y),
+                                           -double(m_sceneTransformOffset.z), 1.0);
+
     const Matrix4d reprojectToPrevClip =
       camera.getPreviousViewToProjection() *
       camera.getPreviousWorldToView() *
+      previousSpaceFromCurrent *
       camera.getViewToWorld() *
       camera.getProjectionToView();
+
+    // How far this matrix is from identity is how much camera motion the reprojection can
+    // express. Near zero while the view is moving means the previous camera is not actually a
+    // previous camera, and every static pixel gets a null motion vector no matter what the
+    // velocity raster does - a different fault to the raster missing objects, and one the two
+    // are easily confused for on screen.
+    {
+      double reprojectionFromIdentity = 0.0;
+      for (uint32_t col = 0; col < 4; col++) {
+        for (uint32_t row = 0; row < 4; row++) {
+          reprojectionFromIdentity +=
+            std::abs(reprojectToPrevClip[col][row] - (col == row ? 1.0 : 0.0));
+        }
+      }
+
+      m_statReprojectionFromIdentityMax = std::max(m_statReprojectionFromIdentityMax,
+                                                   float(reprojectionFromIdentity));
+    }
 
     args.reprojectToPrevClip = Matrix4(reprojectToPrevClip);
     args.resolution = vec2(float(m_renderExtent.width), float(m_renderExtent.height));
     args.subrectOffset = vec2(float(subrectOffset.x), float(subrectOffset.y));
+    args.jitter = vec2(jitter[0], jitter[1]);
     args.debugMode = uint(std::clamp(debugVisualization(), 0, int(DebugVisualization::ObjectVelocityCoverage)));
 
     const auto nearFarPlanes = camera.calculateNearFarPlanes();
@@ -824,6 +861,18 @@ namespace dxvk {
     args.motionBlurFirstPerson = motionBlurFirstPerson() ? 1u : 0u;
     args.objectVelocityValid = (velocityTargets & 1u) != 0 ? 1u : 0u;
     args.foregroundVelocityValid = (velocityTargets & 2u) != 0 ? 1u : 0u;
+
+    args.outputResolution = vec2(float(m_displayExtent.width), float(m_displayExtent.height));
+    args.outputTransformEnabled = m_outputTransform.enabled ? 1u : 0u;
+    args.preserveOriginalAlpha = m_preserveOriginalAlpha ? 1u : 0u;
+    args.outputColorScaleAndGamma = vec4(m_outputTransform.colorScale[0],
+                                         m_outputTransform.colorScale[1],
+                                         m_outputTransform.colorScale[2],
+                                         m_outputTransform.inverseGamma);
+    args.outputOverlayColor = vec4(m_outputTransform.overlayColor[0],
+                                   m_outputTransform.overlayColor[1],
+                                   m_outputTransform.overlayColor[2],
+                                   m_outputTransform.overlayColor[3]);
 
     ctx->updateBuffer(m_constantsBuffer, 0, sizeof(args), &args);
 
@@ -1062,13 +1111,46 @@ namespace dxvk {
     }
   }
 
-  uint32_t RtxNgxPassthrough::viewportJitterSequenceLength(DxvkDevice* device) {
+  // Upscale ratio above which the derived jitter phase count has to be shortened, and what to
+  // shorten it to. Measured in game: at 2x the derived 32 phases are clean, at 3x the derived 72
+  // are not, nor are 16 - only 8 is. Nothing between 2x and 3x has been tested because the
+  // standard presets skip from one to the other, hence the midpoint.
+  static constexpr float kNgxJitterSequenceClampRatio = 2.5f;
+  static constexpr uint32_t kNgxClampedJitterSequenceLength = 8;
+
+  uint32_t RtxNgxPassthrough::viewportJitterSequenceLength(DxvkDevice* device,
+                                                           uint32_t renderHeight,
+                                                           uint32_t displayHeight) {
 #ifndef _M_ARM64
     if (RtxOptions::isXeSSEnabled() && device != nullptr &&
         DxvkXeSS::XessOptions::useRecommendedJitterSequenceLength()) {
       return device->getCommon()->metaXeSS().calcRecommendedJitterSequenceLength();
     }
 #endif
+
+    // An explicit override wins, so the loop length can actually be bisected against an artefact.
+    if (jitterSequenceLength() > 0) {
+      return uint32_t(jitterSequenceLength());
+    }
+
+    // 8 * ratio^2 covers the upscaled sample grid - the rule RtCamera::updateResolution applies and
+    // what DLSS documents. That guidance assumes the jitter sits in the projection, where it reaches
+    // every scene sample; this mode offsets the viewport instead, and the upscaler still removes the
+    // offset from the whole frame, so whatever the offset missed is displaced rather than corrected.
+    // The displacement is proportional to the offset and scaled into display pixels by the ratio, so
+    // the sequence's deepest offsets become visible - as a shift with the period of the loop, once
+    // the loop is long enough that they no longer recur inside the accumulation window. Both
+    // conditions have to hold, which is why the derivation only needs shortening at high ratios.
+    if (renderHeight != 0 && displayHeight > renderHeight) {
+      const float ratio = float(displayHeight) / float(renderHeight);
+
+      if (ratio > kNgxJitterSequenceClampRatio) {
+        return kNgxClampedJitterSequenceLength;
+      }
+
+      return std::max(uint32_t(8.0f * ratio * ratio), 8u);
+    }
+
     return RtxOptions::cameraJitterSequenceLength();
   }
 
@@ -1249,6 +1331,42 @@ namespace dxvk {
     ctx->blitImage(m_colorInput.image, identityMap, colorSourceImage, identityMap, blitInfo, VK_FILTER_NEAREST);
   }
 
+  void RtxNgxPassthrough::blitDebugOverlayToPresent(DxvkContext* ctx, const Rc<DxvkImage>& targetImage) {
+    if (debugVisualization() == int(DebugVisualization::Off)) {
+      m_debugPresentValid = false;
+      return;
+    }
+
+    // Held rather than consumed. A frame that produces no depth/MV inputs - a rejected camera, a
+    // frame with no scene - captures no view, and clearing here would let the game's colour image
+    // through on those frames. That reads as the upscaler dropping out when nothing of the sort
+    // happened, so the last captured view stays up until a new one replaces it.
+    if (!m_debugPresentValid || ctx == nullptr || targetImage == nullptr ||
+        m_debugPresentImage.image == nullptr) {
+      return;
+    }
+
+    const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(m_debugPresentImage.image->info().format);
+    const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(targetImage->info().format);
+    const VkExtent3D& targetExtent = targetImage->info().extent;
+
+    VkImageBlit blitInfo = {};
+    blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.srcOffsets[0] = { 0, 0, 0 };
+    blitInfo.srcOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
+    blitInfo.dstOffsets[0] = { 0, 0, 0 };
+    blitInfo.dstOffsets[1] = { int32_t(targetExtent.width), int32_t(targetExtent.height), 1 };
+
+    const VkComponentMapping identityMap = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+
+    // Nearest keeps the visualized input pixels inspectable rather than smearing them
+    ctx->blitImage(targetImage, identityMap, m_debugPresentImage.image, identityMap, blitInfo, VK_FILTER_NEAREST);
+  }
+
   void RtxNgxPassthrough::copyColorInputToOutput(RtxContext* ctx) {
     const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(m_colorInput.image->info().format);
     const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(m_dlssOutput.image->info().format);
@@ -1328,7 +1446,9 @@ namespace dxvk {
       }
     }
 
-    if (preserveTargetAlpha) {
+    // The merge pass carries the game's alpha through and reapplies the suppressed composite's
+    // transform; when neither is needed the upscaled result goes straight to the target.
+    if (preserveTargetAlpha || m_outputTransform.enabled) {
       dispatchAlphaMerge(ctx, barriers);
       blitToTargetRect(ctx, m_mergedOutput.image, m_displayExtent, targetImage, targetOffset);
     } else {
@@ -1359,45 +1479,59 @@ namespace dxvk {
     // back over the same target, so it cannot be read in place)
     snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
 
-    if (!m_dlssContext) {
-      m_dlssContext = ngxContext.createDLSSContext();
-      m_dlssNeedsInitialize = true;
-    }
-
     // HDR content flag follows the color source: the pre-post-process injection point feeds
     // the game's linear scene color (float target), the late one display-encoded LDR output
     const bool contentHDR = isHDRColorFormat(colorSourceImage->info().format);
 
-    // Recreate the feature when the render preset option or the content type changes
-    if (m_dlssInitializedRenderPreset != dlssRenderPreset() || m_dlssInitializedHDR != contentHDR) {
-      m_dlssNeedsInitialize = true;
+    // The two injection points alternate freely - whether the pre-post trigger fires depends on
+    // the frame's own post chain and on the mid-scene depth clear, both of which follow scene
+    // content. They need different input sizes and different HDR flags, so one shared feature
+    // meant every switch paid a device idle, a feature rebuild and a full history reset: several
+    // frames of reconvergence, repeating for as long as the scene keeps flipping. Each injection
+    // point keeps its own feature and its own temporal history instead.
+    DlssFeature& feature = m_dlssFeatures[contentHDR ? 1 : 0];
+
+    if (!feature.context) {
+      feature.context = ngxContext.createDLSSContext();
+      feature.needsInitialize = true;
     }
 
-    if (m_dlssNeedsInitialize) {
-      m_dlssNeedsInitialize = false;
-      m_dlssInitializedRenderPreset = dlssRenderPreset();
-      m_dlssInitializedHDR = contentHDR;
+    if (feature.initializedRenderPreset != dlssRenderPreset() ||
+        feature.initializedInput[0] != m_renderExtent.width ||
+        feature.initializedInput[1] != m_renderExtent.height ||
+        feature.initializedOutput[0] != m_displayExtent.width ||
+        feature.initializedOutput[1] != m_displayExtent.height) {
+      feature.needsInitialize = true;
+    }
+
+    if (feature.needsInitialize) {
+      feature.needsInitialize = false;
+      feature.initializedRenderPreset = dlssRenderPreset();
+      feature.initializedInput[0] = m_renderExtent.width;
+      feature.initializedInput[1] = m_renderExtent.height;
+      feature.initializedOutput[0] = m_displayExtent.width;
+      feature.initializedOutput[1] = m_displayExtent.height;
 
       // The previous feature may still be in flight
       m_device->waitForIdle();
-      m_dlssContext->releaseNGXFeature();
+      feature.context->releaseNGXFeature();
 
       uint32_t inputSize[2] = { m_renderExtent.width, m_renderExtent.height };
       uint32_t outputSize[2] = { m_displayExtent.width, m_displayExtent.height };
 
       const float resolutionRatio = float(inputSize[0]) / float(std::max(outputSize[0], 1u));
       const NVSDK_NGX_PerfQuality_Value perfQuality = perfQualityFromResolutionRatio(resolutionRatio);
-      const NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset = renderPresetFromOption(m_dlssInitializedRenderPreset);
+      const NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset = renderPresetFromOption(feature.initializedRenderPreset);
 
       // Conventional (non-inverted) depth, NGX-internal auto exposure (Remix's auto exposure
       // pass never runs in this mode; for LDR content the exposure is ignored anyway).
-      m_dlssContext->initialize(ctx, inputSize, outputSize,
-                                contentHDR,
-                                /* depthInverted = */ false,
-                                /* autoExposure = */ true,
-                                /* sharpening = */ false,
-                                perfQuality,
-                                renderPreset);
+      feature.context->initialize(ctx, inputSize, outputSize,
+                                  contentHDR,
+                                  /* depthInverted = */ false,
+                                  /* autoExposure = */ true,
+                                  /* sharpening = */ false,
+                                  perfQuality,
+                                  renderPreset);
 
       m_dlssInitCount++;
 
@@ -1406,6 +1540,11 @@ namespace dxvk {
                                (perfQuality == NVSDK_NGX_PerfQuality_Value_DLAA ? " (DLAA)" : " (Super Resolution)"),
                                ", render preset ", renderPresetToString(renderPreset),
                                (contentHDR ? ", linear HDR input" : ", LDR input")));
+    }
+
+    if (m_dlssLastContentHDR != int(contentHDR)) {
+      m_dlssLastContentHDR = int(contentHDR);
+      m_statContentHdrFlips++;
     }
 
     // The DLSS indicator reads the exposure texture even with NGX auto exposure enabled, so
@@ -1469,7 +1608,7 @@ namespace dxvk {
 
     {
       ScopedGpuProfileZone(ctx, "DLSS (NGX Passthrough)");
-      success = m_dlssContext->evaluateDLSS(ctx, buffers, settings);
+      success = feature.context->evaluateDLSS(ctx, buffers, settings);
     }
 
     barriers.accessImage(
@@ -1619,6 +1758,8 @@ namespace dxvk {
                                    const Rc<DxvkImage>& sceneDepthImage,
                                    const Rc<DxvkImage>& upscaleSourceImage,
                                    const VkRect2D& sourceSubrect,
+                                   const VkOffset2D& colorSourceOffset,
+                                   const NgxOutputTransform& outputTransform,
                                    bool prePostProcess,
                                    const std::vector<NgxVelocityDraw>& velocityDraws,
                                    const float jitter[2],
@@ -1657,6 +1798,14 @@ namespace dxvk {
     const VkExtent2D renderExtent = superResolution ? sourceSubrect.extent : displayExtent;
     const VkOffset2D subrectOffset = (superResolution || prePostSubrectValid) ? sourceSubrect.offset : VkOffset2D { 0, 0 };
     const Rc<DxvkImage>& colorSourceImage = superResolution ? upscaleSourceImage : targetImage;
+    // Depth always reads at subrectOffset; colour may live elsewhere in its own image.
+    const VkOffset2D colorOffset = superResolution ? colorSourceOffset : subrectOffset;
+
+    // Latched before the constant buffer is filled in generateMotionVectorsAndDepth. The engine
+    // composite only exists on the Super Resolution path; the pre-post injection leaves the
+    // game's own chain to run afterwards, so nothing has been replaced there.
+    m_outputTransform = superResolution ? outputTransform : NgxOutputTransform();
+    m_preserveOriginalAlpha = prePostProcess;
 
     Rc<DxvkContext> dxvkCtx = ctx;
     createResources(dxvkCtx, renderExtent, displayExtent);
@@ -1701,45 +1850,28 @@ namespace dxvk {
 #endif
     const bool canRunUpscaler = canRunNis || canRunTaau || canRunDlss || canRunXess;
 
-    // Debug visualization only replaces the frame at the late injection point: the D3D9
-    // layer stops the pre-post trigger while a debug mode is active (the game's post chain
-    // would mangle the image, and the raw debug output has no valid alpha for the scene
-    // color). On the single transition frame where the two sides disagree (the option is
-    // read from different snapshots), the pre-post dispatch runs DLSS normally instead.
-    const bool debugVisualizationActive = debugVisualization() != int(DebugVisualization::Off) && !prePostProcess;
+    // The MV pass rendered an interpretable view of the synthesized inputs into the output image
+    // (motion vectors centered at neutral gray, log-scale depth). Held back for the present-time
+    // overlay rather than written to the target here - see blitDebugOverlayToPresent for why
+    // neither injection point can host it in place. Taken before the upscaler runs, which writes
+    // its own result over the same image.
+    if (haveDepthMvInputs && debugVisualization() != int(DebugVisualization::Off)) {
+      VkImageCopy copyRegion = {};
+      copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      copyRegion.extent = { m_renderExtent.width, m_renderExtent.height, 1 };
+
+      ctx->copyImage(m_debugPresentImage.image, copyRegion.dstSubresource, copyRegion.dstOffset,
+                     m_dlssOutput.image, copyRegion.srcSubresource, copyRegion.srcOffset,
+                     copyRegion.extent);
+
+      m_debugPresentValid = true;
+      m_statDebugVisCount++;
+    }
 
     bool wroteOutputToTarget = false;
 
-    if (haveDepthMvInputs && debugVisualizationActive) {
-      // The MV pass rendered an interpretable view of the synthesized inputs into the
-      // output image (motion vectors centered at neutral gray, log-scale depth); it
-      // replaces the frame and DLSS is skipped. The debug content is RENDER-resolution
-      // sized (the inputs it visualizes are), so it is stretched to the full target -
-      // under Super Resolution a 1:1 blit would park it in the top-left subrect.
-      // Nearest filtering keeps the input pixels inspectable.
-      {
-        const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(m_dlssOutput.image->info().format);
-        const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(targetImage->info().format);
-
-        VkImageBlit blitInfo = {};
-        blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
-        blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
-        blitInfo.srcOffsets[0] = { 0, 0, 0 };
-        blitInfo.srcOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
-        blitInfo.dstOffsets[0] = { 0, 0, 0 };
-        blitInfo.dstOffsets[1] = { int32_t(targetExtent.width), int32_t(targetExtent.height), 1 };
-
-        const VkComponentMapping identityMap = {
-          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
-        };
-
-        ctx->blitImage(targetImage, identityMap, m_dlssOutput.image, identityMap, blitInfo, VK_FILTER_NEAREST);
-      }
-      wroteOutputToTarget = true;
-      m_statusReason = "debug visualization active";
-      m_statDebugVisCount++;
-    } else if (!canRunUpscaler) {
+    if (!canRunUpscaler) {
       if (RtxOptions::upscalerType() == UpscalerType::None) {
         m_statusReason = "rtx.upscalerType is None";
       } else if (RtxOptions::isRayReconstructionEnabled()) {
@@ -1754,14 +1886,14 @@ namespace dxvk {
       }
       m_statUpscalerOffCount++;
 
-      if (evaluatePostFxOnly(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+      if (evaluatePostFxOnly(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                              writebackOffset, preserveTargetAlpha, resetHistory)) {
         wroteOutputToTarget = true;
         m_postFxActive = true;
         m_statusReason = "active (postfx only)";
       }
     } else if (canRunNis) {
-      upscalerActive = evaluateNis(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+      upscalerActive = evaluateNis(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                                    writebackOffset, preserveTargetAlpha, resetHistory);
       wroteOutputToTarget = upscalerActive;
       if (upscalerActive) {
@@ -1770,7 +1902,7 @@ namespace dxvk {
         m_statEvaluateFailedCount++;
       }
     } else if (canRunTaau) {
-      upscalerActive = evaluateTaau(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+      upscalerActive = evaluateTaau(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                                     writebackOffset, preserveTargetAlpha, jitter, resetHistory);
       wroteOutputToTarget = upscalerActive;
       if (upscalerActive) {
@@ -1780,7 +1912,7 @@ namespace dxvk {
       }
 #ifndef _M_ARM64
     } else if (canRunXess) {
-      upscalerActive = evaluateXess(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+      upscalerActive = evaluateXess(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                                     writebackOffset, preserveTargetAlpha, resetHistory);
       wroteOutputToTarget = upscalerActive;
       if (upscalerActive) {
@@ -1790,7 +1922,7 @@ namespace dxvk {
       }
 #endif
     } else if (canRunDlss) {
-      upscalerActive = evaluateDlss(ctx, barriers, colorSourceImage, subrectOffset, targetImage,
+      upscalerActive = evaluateDlss(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                                     writebackOffset, preserveTargetAlpha, jitter, resetHistory);
       wroteOutputToTarget = upscalerActive;
 
@@ -1845,7 +1977,9 @@ namespace dxvk {
                                  m_statEvaluateFailedCount, " with failed upscaler evaluation, ",
                                  m_statNoInputsCount, " without depth/MV inputs, ",
                                  m_statUpscalerOffCount, " with upscaler off/unavailable, ",
-                                 m_statCameraInvalidCount, " frames skipped for invalid camera; last status: ", m_statusReason));
+                                 m_statCameraInvalidCount, " frames skipped for invalid camera, ",
+                                 m_statContentHdrFlips, " HDR/LDR content changes, peak camera reprojection ",
+                                 m_statReprojectionFromIdentityMax, " from identity; last status: ", m_statusReason));
       }
       m_statDispatchCount = 0;
       m_statUpscalerActiveCount = 0;
@@ -1856,6 +1990,8 @@ namespace dxvk {
       m_statDebugVisCount = 0;
       m_statResetHistoryCount = 0;
       m_statPrePostCount = 0;
+      m_statContentHdrFlips = 0;
+      m_statReprojectionFromIdentityMax = 0.0f;
       m_statWindowStartFrameId = currentFrameId;
     }
 
@@ -1998,9 +2134,11 @@ namespace dxvk {
                                    m_lastCaptureStats.capturedForeground, " fg), ",
                                    m_lastCaptureStats.exactMatches, " static, ",
                                    m_lastCaptureStats.newRegistrations, " new, ",
+                                   m_lastCaptureStats.pairedBeyondBounds, " beyond-bounds, ",
                                    m_lastCaptureStats.skippedNoCamera, " no-camera, ",
                                    m_lastCaptureStats.skippedBudget, " budget, ",
-                                   m_lastCaptureStats.skippedZDisabled, " z-off | frame camera: ",
+                                   m_lastCaptureStats.skippedZDisabled, " z-off, ",
+                                   m_lastCaptureStats.skippedInstanceCap, " inst-cap | frame camera: ",
                                    m_lastCaptureStats.frameCameraValid ? "valid" : "missing",
                                    " | depth clears: ", m_lastCaptureStats.depthClears,
                                    " | transpose flips: ", m_lastCaptureStats.cameraTransposeFlips).c_str());

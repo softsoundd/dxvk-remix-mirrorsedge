@@ -102,8 +102,11 @@ void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
   OutLinearViewZ[pixelCoordinate] =
     (cb.nearPlane * cb.farPlane) / max(cb.farPlane - depth * (cb.farPlane - cb.nearPlane), 1e-6f);
 
-  // Unjittered NDC for the pixel center (y up), matching cameraPixelCoordinateToNDC
-  const float2 uv = (float2(pixelCoordinate) + 0.5f) / cb.resolution;
+  // Unjittered NDC for the pixel center (y up), matching cameraPixelCoordinateToNDC. The depth
+  // here was rasterized through a viewport displaced by cb.jitter, so the surface this pixel
+  // holds sits at the unjittered position (pixel center - jitter); pairing jittered depth with
+  // the unjittered matrices below would skew every motion vector by the frame's jitter.
+  const float2 uv = (float2(pixelCoordinate) + 0.5f - cb.jitter) / cb.resolution;
   const float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
 
   // Reproject through the previous frame camera. Far plane depth (sky) still reprojects

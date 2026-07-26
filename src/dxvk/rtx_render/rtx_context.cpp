@@ -2225,13 +2225,17 @@ namespace dxvk {
     m_common->metaNgxPassthrough().captureHudless(this, backbufferImage);
   }
 
+
   void RtxContext::setNgxPassthroughFrameData(const Rc<DxvkImage>& sceneDepthImage,
                                               const Rc<DxvkImage>& colorTargetImage,
                                               const Rc<DxvkImage>& colorMirrorImage,
                                               const Rc<DxvkImage>& upscaleSourceImage,
                                               const VkRect2D& sourceSubrect,
+                                              const VkOffset2D& colorSourceOffset,
+                                              const NgxOutputTransform& outputTransform,
                                               std::vector<NgxVelocityDraw>&& velocityDraws,
                                               const NgxVelocityCaptureStats& velocityStats,
+                                              const Vector3& sceneTransformOffset,
                                               float jitterX, float jitterY,
                                               bool cameraMatricesValid,
                                               const Matrix4& worldToView,
@@ -2246,11 +2250,14 @@ namespace dxvk {
     m_ngxPassthroughColorMirror = colorMirrorImage;
     m_ngxPassthroughUpscaleSource = upscaleSourceImage;
     m_ngxPassthroughSubrect = sourceSubrect;
+    m_ngxPassthroughColorSubrectOffset = colorSourceOffset;
+    m_ngxPassthroughOutputTransform = outputTransform;
     m_ngxPassthroughVelocityDraws = std::move(velocityDraws);
     m_ngxPassthroughJitter[0] = jitterX;
     m_ngxPassthroughJitter[1] = jitterY;
 
     m_common->metaNgxPassthrough().setVelocityCaptureStats(velocityStats);
+    m_common->metaNgxPassthrough().setSceneTransformOffset(sceneTransformOffset);
   }
 
   void RtxContext::dispatchNgxPassthrough(Rc<DxvkImage> targetImage) {
@@ -2275,6 +2282,8 @@ namespace dxvk {
                                             m_ngxPassthroughColorMirror,
                                             m_ngxPassthroughSceneDepth,
                                             m_ngxPassthroughUpscaleSource, m_ngxPassthroughSubrect,
+                                            m_ngxPassthroughColorSubrectOffset,
+                                            m_ngxPassthroughOutputTransform,
                                             prePostProcess,
                                             m_ngxPassthroughVelocityDraws,
                                             m_ngxPassthroughJitter, resetHistory);
@@ -2285,6 +2294,8 @@ namespace dxvk {
     m_ngxPassthroughColorMirror = nullptr;
     m_ngxPassthroughUpscaleSource = nullptr;
     m_ngxPassthroughSubrect = { { 0, 0 }, { 0, 0 } };
+    m_ngxPassthroughColorSubrectOffset = { 0, 0 };
+    m_ngxPassthroughOutputTransform = NgxOutputTransform();
     m_ngxPassthroughVelocityDraws.clear();
   }
 

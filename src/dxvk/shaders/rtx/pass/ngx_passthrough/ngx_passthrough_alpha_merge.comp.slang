@@ -47,11 +47,52 @@ RWTexture2D<float4> MergedOutput;
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
-  if (pixelCoordinate.x >= uint(cb.resolution.x) || pixelCoordinate.y >= uint(cb.resolution.y)) {
+  if (pixelCoordinate.x >= uint(cb.outputResolution.x) ||
+      pixelCoordinate.y >= uint(cb.outputResolution.y)) {
     return;
   }
 
-  MergedOutput[pixelCoordinate] = float4(
-    DlssColor[pixelCoordinate].rgb,
-    OriginalColor[pixelCoordinate].a);
+  float3 color = DlssColor[pixelCoordinate].rgb;
+
+  // The Super Resolution path replaces UE3's FinishRenderViewTarget composite, so that draw's
+  // own transform is reapplied here: it is the last thing between the post chain and the
+  // backbuffer, and skipping it leaves the frame un-gamma-corrected.
+  if (cb.outputTransformEnabled != 0) {
+    color = lerp(color * cb.outputColorScaleAndGamma.rgb,
+                 cb.outputOverlayColor.rgb,
+                 cb.outputOverlayColor.a);
+    color = pow(saturate(color), cb.outputColorScaleAndGamma.a);
+  }
+
+  // OriginalColor is render-resolution, so it is only 1:1 with the output on the pre-post
+  // injection path - which is exactly where the game's alpha needs carrying through.
+  float alpha;
+
+  if (cb.preserveOriginalAlpha != 0) {
+    // That alpha is scene depth, rasterized through the jittered viewport, while the colour it is
+    // being merged with has been resolved un-jittered. Buffer position q therefore holds the depth
+    // of un-jittered position q - jitter, so a straight load would pair each pixel's colour with
+    // depth from a slightly different place - one that moves every frame as the jitter does.
+    // Reconstructing at the pixel centre pins it, which matters because the game's post chain runs
+    // after this injection point and reads this depth for fog and depth of field.
+    const float2 maxCoordinate = cb.resolution - 1.0f;
+    const float2 samplePosition = clamp(float2(pixelCoordinate) + cb.jitter, float2(0.0f, 0.0f), maxCoordinate);
+
+    const int2 corner00 = int2(floor(samplePosition));
+    const int2 corner11 = int2(min(float2(corner00) + 1.0f, maxCoordinate));
+    const float2 weight = samplePosition - float2(corner00);
+
+    const float alpha00 = OriginalColor[uint2(corner00)].a;
+    const float alpha10 = OriginalColor[uint2(corner11.x, corner00.y)].a;
+    const float alpha01 = OriginalColor[uint2(corner00.x, corner11.y)].a;
+    const float alpha11 = OriginalColor[uint2(corner11)].a;
+
+    alpha = lerp(lerp(alpha00, alpha10, weight.x),
+                 lerp(alpha01, alpha11, weight.x),
+                 weight.y);
+  } else {
+    alpha = DlssColor[pixelCoordinate].a;
+  }
+
+  MergedOutput[pixelCoordinate] = float4(color, alpha);
 }

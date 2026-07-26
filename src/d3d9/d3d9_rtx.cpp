@@ -4379,7 +4379,20 @@ namespace dxvk {
 
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
         const bool isSampler = c.registerSet == kD3dxRegisterSetSampler;
-        markName(toLowerAscii(c.name), isSampler);
+        const std::string lowerName = toLowerAscii(c.name);
+        markName(lowerName, isSampler);
+
+        // Exact names, so UberPostProcessBlend's GammaColorScaleAndInverse/GammaOverlayColor
+        // (a different shader, whose output the composite still has to gamma correct) cannot
+        // be mistaken for the final composite's own constants.
+        if (!isSampler) {
+          if (lowerName == "inversegamma")
+            info.gammaInverseReg = c.registerIndex;
+          else if (lowerName == "colorscale")
+            info.gammaColorScaleReg = c.registerIndex;
+          else if (lowerName == "overlaycolor")
+            info.gammaOverlayColorReg = c.registerIndex;
+        }
       }
     } catch (...) {
     }
@@ -11023,6 +11036,7 @@ namespace dxvk {
         // game runs with a reduced ScreenPercentage this is smaller than the backbuffer
         m_ngxSceneViewport = d3d9State().viewport;
         m_ngxSceneViewportValid = true;
+        m_ngxSceneViewportLastValidFrame = m_ue3FrameCounter;
 
         if (sceneTargetsChanged) {
           ONCE(Logger::info(str::format("[RTX NGX Passthrough] Scene color/depth targets identified. color=0x",
@@ -11032,8 +11046,11 @@ namespace dxvk {
                                         m_ngxSceneColorImage->info().extent.height,
                                         " format=", int(m_ngxSceneColorImage->info().format))));
           // Automatic dump on target changes (level transitions): validates the pre-post
-          // injection point against the game's compositing without user action
-          if (m_frameOptions.ngxPrePostProcess) {
+          // injection point against the game's compositing without user action. Budgeted, because
+          // a title that alternates between two scene color surfaces changes target every frame
+          // and would re-arm this forever - Mirror's Edge does exactly that.
+          if (m_frameOptions.ngxPrePostProcess && m_ngxAutoDumpArmsRemaining > 0) {
+            m_ngxAutoDumpArmsRemaining--;
             m_ngxPostChainDumpFramesLeft = 2;
           }
           // Rebind the viewport so this draw already gets the sub-pixel jitter
@@ -11067,7 +11084,7 @@ namespace dxvk {
     // when their LocalToWorld moved believably since the previous frame; skinned draws
     // (UE3 GPU skin) additionally when their bone palette animated (see the emission
     // gates below). Sightings are matched against per-identity instance history.
-    constexpr size_t kMaxVelocityDrawsPerFrame = 256;
+    constexpr size_t kMaxVelocityDrawsPerFrame = 384;
 
     if (!m_frameOptions.ngxObjectVelocities) {
       return;
@@ -11084,6 +11101,28 @@ namespace dxvk {
     D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
     if (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr()) {
       return;
+    }
+
+    // A draw into the scene color through a viewport that cannot hold the scene is not the visible
+    // scene. Some titles run proxy passes over the same geometry into that target through a
+    // degenerate viewport, and those satisfy every other gate here. Capturing them costs twice
+    // over: the sighting claims the identity's history before the real draw arrives, so the real
+    // one finds nothing from the previous frame to pair with and loses its velocity, and whatever
+    // velocity the proxy does emit carries that pass's transforms into the raster and lands on
+    // unrelated pixels.
+    if (m_activePresentParams.has_value()) {
+      const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+      const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+      const D3DVIEWPORT9& vp = d3d9State().viewport;
+
+      // A quarter of the backbuffer in each axis: below the most aggressive ScreenPercentage the
+      // scene is ever driven to, and far above a proxy or probe pass.
+      if (uint64_t(vp.Width) * 4 < backBufferWidth || uint64_t(vp.Height) * 4 < backBufferHeight) {
+        ONCE(Logger::info(str::format(
+          "[RTX NGX Passthrough] Ignoring scene color draws through a ", vp.Width, "x", vp.Height,
+          " viewport for object velocity; the scene cannot be rendered through it.")));
+        return;
+      }
     }
 
     // Depth-tested draws only; depth WRITES are re-checked after classification (the
@@ -11311,7 +11350,6 @@ namespace dxvk {
     };
     const XXH64_hash_t identity = XXH3_64bits(identityData, sizeof(identityData));
 
-    const Vector4* localToWorldRows = &d3d9State().vsConsts.fConsts[l2wReg];
     const Vector4* boneRegisters = skinned ? &d3d9State().vsConsts.fConsts[ctabRegs.boneMatricesRegister] : nullptr;
     const uint32_t boneRegisterCount = skinned ? ctabRegs.boneMatricesRegisterCount : 0;
 
@@ -11384,6 +11422,18 @@ namespace dxvk {
       m_ngxVelocityStats.captured++;
     };
 
+    // Tolerances around the scene-wide transform offset, all in world units and all sized
+    // against the same thing: how exactly a translation that did not move can be expected to
+    // reproduce that offset. The cluster width is the floor, set by float precision on a
+    // difference of two level-scale positions. A bone's translation is compared at the same
+    // width, being the same kind of quantity. A placement is held to a wider bound because the
+    // offset it is judged against was itself only measured to within the cluster width, and
+    // because a residual has to stay far below the spacing between two copies of an asset to
+    // keep them apart.
+    constexpr float kOffsetClusterTolerance = 0.05f;
+    constexpr float kBoneTranslationTolerance = kOffsetClusterTolerance;
+    constexpr float kSamePlacementTolerance = 0.5f;
+
     // Position delta against a cached snapshot (CPU-modified meshes animate their
     // vertex data with a typically static LocalToWorld)
     const auto dynamicPositionsChangedFrom = [&](const std::vector<Vector3>& cachedPositions) {
@@ -11397,45 +11447,155 @@ namespace dxvk {
                          cachedPositions.size() * sizeof(Vector3)) != 0;
     };
 
-    // Bone palette delta against a cached palette (epsilon like the transform rows)
-    const auto bonesChangedFrom = [&](const std::vector<Vector4>& cachedBones) {
+    // Bone palette delta against a cached palette, net of a translation the whole palette is
+    // expected to have taken. The palette holds bone-to-world matrices, so where that space
+    // shifts every frame every bone's translation shifts with it, and a skinned mesh that never
+    // moved reports its entire palette as animated - which emits velocity unconditionally,
+    // ahead of every motion gate. Destructible and instanced scenery is commonly drawn through
+    // skinned vertex factories, so that reads as level geometry moving under its own power.
+    // Only the translation is affected, which the palette carries in .w, one axis per row of
+    // each bone's three; the rotation rows are compared as they are.
+    const auto bonesChangedFrom = [&](const std::vector<Vector4>& cachedBones,
+                                      const Vector3& expectedTranslationShift) {
       if (!skinned || cachedBones.size() != boneRegisterCount) {
         return false;
       }
       for (uint32_t reg = 0; reg < boneRegisterCount; reg++) {
         const Vector4 delta = boneRegisters[reg] - cachedBones[reg];
-        if (std::abs(delta.x) > 1e-5f || std::abs(delta.y) > 1e-5f ||
-            std::abs(delta.z) > 1e-5f || std::abs(delta.w) > 1e-5f) {
+        if (std::abs(delta.x) > 1e-5f || std::abs(delta.y) > 1e-5f || std::abs(delta.z) > 1e-5f) {
+          return true;
+        }
+
+        const uint32_t axis = reg % 3;
+        const float axisShift = axis == 0 ? expectedTranslationShift.x
+                              : axis == 1 ? expectedTranslationShift.y
+                                          : expectedTranslationShift.z;
+        // Looser than the rotation rows: a bone's translation is a world position, and the
+        // shift being subtracted was itself measured to within a fraction of a unit
+        if (std::abs(delta.w - axisShift) > kBoneTranslationTolerance) {
           return true;
         }
       }
       return false;
     };
 
-    // Exact register match: a static placement re-uploading the same matrix every frame,
-    // or a repeat draw of an instance already handled this frame (depth prepass + base
-    // pass, multi-pass lighting). Static placements get no velocity draw - the camera
-    // reprojection is exact for them. Skinned instances with a changed palette are
-    // animation in place: same placement, no swap ambiguity, always emitted.
-    for (NgxVelocityObjectInstance& instance : objectState.instances) {
-      bool rowsEqual = true;
-      for (uint32_t row = 0; row < 4 && rowsEqual; row++) {
-        const Vector4 delta = localToWorldRows[row] - instance.localToWorldRows[row];
-        rowsEqual = std::abs(delta.x) <= 1e-5f && std::abs(delta.y) <= 1e-5f &&
-                    std::abs(delta.z) <= 1e-5f && std::abs(delta.w) <= 1e-5f;
+    // The furthest anything is credited with travelling in one frame, applied both to an
+    // object pairing with its own past and to the scene's own coordinate space shifting.
+    // Generous: a frame hitch multiplies every per-frame delta, and a delta pushed past the
+    // bound costs two frames of velocity.
+    constexpr float kMaxFrameTranslation = 250.0f;  // world units per frame
+
+    const Matrix4 sightingObjectToWorld =
+      extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister, m_ngxFrameCameraUsedTranspose);
+
+    // Every placement that held still moved by the same global offset, so the offset is whatever
+    // the most sightings agree on. Movers disagree with each other as much as with the static
+    // scene, which is what keeps them out of the winning slot.
+    auto voteForGlobalTransformOffset = [&](const Vector3& delta) {
+      // One vote per identity per frame. Copies of a single instanced asset sit on a shared
+      // grid, so when the visible set shifts they pair with their neighbours and agree, in
+      // bulk, on a delta that is one grid step rather than the scene's: counted per sighting
+      // that bloc outvotes the real offset outright. Counted per identity it is worth one
+      // voice, and the offset is instead carried by how many unrelated assets report it.
+      if (objectState.lastOffsetVoteFrame == m_ue3FrameCounter) {
+        return;
       }
 
-      if (rowsEqual) {
+      // No camera crosses a level in a frame. A delta this large is a pairing across two
+      // placements, and adopting it would put the same error into every reprojected pixel.
+      if (lengthSqr(delta) > kMaxFrameTranslation * kMaxFrameTranslation) {
+        return;
+      }
+
+      objectState.lastOffsetVoteFrame = m_ue3FrameCounter;
+
+      NgxTranslationDeltaVote* slot = nullptr;
+      NgxTranslationDeltaVote* freeSlot = nullptr;
+      for (NgxTranslationDeltaVote& vote : m_ngxTranslationDeltaVotes) {
+        if (vote.votes == 0) {
+          freeSlot = freeSlot != nullptr ? freeSlot : &vote;
+          continue;
+        }
+        // Grouped loosely enough to survive float precision at level-scale coordinates, where
+        // a difference of two positions in the tens of thousands already carries thousandths
+        // of error: too tight and the far reaches of a level fragment one true offset across
+        // several slots, none of them carrying enough votes to be believed.
+        if (lengthSqr(vote.delta - delta) <= kOffsetClusterTolerance * kOffsetClusterTolerance) {
+          slot = &vote;
+          break;
+        }
+      }
+
+      if (slot != nullptr) {
+        slot->votes++;
+      } else if (freeSlot != nullptr) {
+        freeSlot->delta = delta;
+        freeSlot->votes = 1;
+        slot = freeSlot;
+      } else {
+        // Every slot is held by a candidate this one disagrees with; nothing to record it in
+        return;
+      }
+
+      // Follow the leader from its opening vote rather than waiting for a quorum: until the
+      // frame has adopted an offset of its own the placement test is judging against the
+      // previous frame's, which differs by however much the camera accelerated, and a static
+      // placement that fails that test emits a velocity it should not. An opening vote may
+      // come from a mover, so it only stands until two sightings agree on something else.
+      if (slot->votes > m_ngxAdoptedOffsetVotes) {
+        m_ngxGlobalTransformOffset = slot->delta;
+        m_ngxAdoptedOffsetVotes = slot->votes;
+      }
+    };
+
+    // Same placement: the basis is untouched and the translation moved by exactly what the rest
+    // of the scene moved by. A repeat draw within the frame has not moved at all; one carried
+    // over from the previous frame moved by the global offset, which is zero wherever
+    // LocalToWorld is true world space and the comparison is then plain equality.
+    auto isSamePlacement = [&](const NgxVelocityObjectInstance& instance) {
+      for (uint32_t col = 0; col < 3; col++) {
+        const Vector4 delta = sightingObjectToWorld[col] - instance.objectToWorld[col];
+        if (std::abs(delta.x) > 1e-4f || std::abs(delta.y) > 1e-4f || std::abs(delta.z) > 1e-4f) {
+          return false;
+        }
+      }
+
+      Vector3 expectedMove(0.0f, 0.0f, 0.0f);
+      if (instance.lastSeenFrame == m_ue3FrameCounter - 1) {
+        expectedMove = m_ngxGlobalTransformOffset;
+      } else if (instance.lastSeenFrame != m_ue3FrameCounter) {
+        // Older history spans an unknown number of global offsets, so it cannot be judged here;
+        // the near match below pairs it if the motion is believable
+        return false;
+      }
+
+      // A placement that held still reproduces the offset to float precision, so this only has
+      // to absorb rounding at level-scale coordinates - staying far below the slowest motion
+      // worth a velocity, and far below the spacing between two copies of an instanced asset
+      const Vector3 residual = (sightingObjectToWorld[3].xyz() - instance.objectToWorld[3].xyz()) - expectedMove;
+      return lengthSqr(residual) <= kSamePlacementTolerance * kSamePlacementTolerance;
+    };
+
+    // Static placement re-uploading the same matrix every frame, or a repeat draw of an instance
+    // already handled this frame (depth prepass + base pass, multi-pass lighting). Static
+    // placements get no velocity draw - the camera reprojection is exact for them. Skinned
+    // instances with a changed palette are animation in place: same placement, no swap
+    // ambiguity, always emitted.
+    for (NgxVelocityObjectInstance& instance : objectState.instances) {
+      if (isSamePlacement(instance)) {
         // Static placement, but the content may animate in place: skinned palettes or
         // CPU-modified positions changing under an unchanged LocalToWorld - no swap
         // ambiguity, always emitted
-        const bool contentAnimated = (skinned && bonesChangedFrom(instance.bones)) ||
+        // A repeat draw within the frame has taken no shift; one carried over from the previous
+        // frame has taken the scene's, exactly as isSamePlacement judged its transform
+        const Vector3 expectedBoneShift = instance.lastSeenFrame == m_ue3FrameCounter
+                                            ? Vector3(0.0f, 0.0f, 0.0f)
+                                            : m_ngxGlobalTransformOffset;
+        const bool contentAnimated = (skinned && bonesChangedFrom(instance.bones, expectedBoneShift)) ||
                                      (dynamicMesh && dynamicPositionsChangedFrom(instance.dynamicPositions));
 
         if (contentAnimated) {
-          const Matrix4 objectToWorld = extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
-                                                                m_ngxFrameCameraUsedTranspose);
-          appendVelocityDraw(objectToWorld, instance.worldToProjection, instance.objectToWorld,
+          appendVelocityDraw(sightingObjectToWorld, instance.worldToProjection, instance.objectToWorld,
                              instance.bones, instance.dynamicPositions);
           instance.lastEmitFrame = m_ue3FrameCounter;
           instance.lastEmitDrawIndex = uint32_t(m_ngxVelocityDraws.size() - 1);
@@ -11490,6 +11650,13 @@ namespace dxvk {
           }
         }
 
+        // The placement is the same one, but where LocalToWorld carries a global offset its
+        // matrix is not: it has to be carried forward, or the stored transform ages by a frame
+        // every frame and the offset the next sighting has to reproduce compounds out of reach
+        if (instance.lastSeenFrame != m_ue3FrameCounter) {
+          voteForGlobalTransformOffset(sightingObjectToWorld[3].xyz() - instance.objectToWorld[3].xyz());
+        }
+        instance.objectToWorld = sightingObjectToWorld;
         instance.lastSeenFrame = m_ue3FrameCounter;
         instance.worldToProjection = drawWorldToProjection;
 
@@ -11509,16 +11676,12 @@ namespace dxvk {
 
     // Disambiguated transform in the same convention the camera reconstruction uses;
     // composed exactly like the motion vector pass composes its reprojection chain
-    const Matrix4 objectToWorld = extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister,
-                                                          m_ngxFrameCameraUsedTranspose);
+    const Matrix4& objectToWorld = sightingObjectToWorld;
 
     // Near match against instances seen exactly one frame ago: the same object having
     // moved. Static placements are consumed by the exact match above, so the bounds only
     // arbitrate between simultaneously moving identical movers - the nearest-score pairs
     // each with its own history even when both fit the bounds (double door leaves).
-    // Generous bounds: a frame hitch multiplies every per-frame delta, and a delta pushed
-    // past the bounds costs two frames of velocity.
-    constexpr float kMaxFrameTranslation = 250.0f;  // world units per frame
     constexpr float kMaxFrameRotScaleL1 = 3.0f;     // L1 delta over the 3x3 rotation/scale
     const uint32_t previousFrame = m_ue3FrameCounter - 1;
 
@@ -11540,7 +11703,14 @@ namespace dxvk {
     // against the identity-stability assessment below
     uint32_t activeInstances = 0;
 
+    // Frames since the freshest sighting of this identity, for the pairing-miss diagnostics.
+    // With no last-frame candidate the question is whether the history is one frame too old -
+    // the capture skipping frames - or absent entirely, which is a different fault.
+    uint32_t freshestSightingAge = UINT32_MAX;
+
     for (NgxVelocityObjectInstance& instance : objectState.instances) {
+      freshestSightingAge = std::min(freshestSightingAge, m_ue3FrameCounter - instance.lastSeenFrame);
+
       if (instance.lastSeenFrame + 2 >= m_ue3FrameCounter) {
         activeInstances++;
       }
@@ -11550,12 +11720,28 @@ namespace dxvk {
       }
       lastFrameCandidates++;
 
-      const float translationDelta = length(objectToWorld[3].xyz() - instance.objectToWorld[3].xyz());
+      // Motion is what is left after the offset the scene as a whole moved by, so a placement
+      // that held still reads as motionless here however far the space its transform is
+      // expressed in travelled. Measured raw, every static placement that misses the
+      // same-placement test above - through an evicted slot, an ambiguity between copies, or
+      // simply never having been seen before - instead reads as moving by the camera's own
+      // travel. That is gentle enough to pass the onset gate below, and emitting once sets
+      // wasMoving, which keeps it emitting from then on.
+      const Vector3 rawTranslationDelta = objectToWorld[3].xyz() - instance.objectToWorld[3].xyz();
+      const float translationDelta = length(rawTranslationDelta - m_ngxGlobalTransformOffset);
 
       float rotScaleDelta = 0.0f;
       for (uint32_t col = 0; col < 3; col++) {
         const Vector4 delta = objectToWorld[col] - instance.objectToWorld[col];
         rotScaleDelta += std::abs(delta.x) + std::abs(delta.y) + std::abs(delta.z);
+      }
+
+      // The offset itself is measured raw, and from here rather than only from the matches
+      // above, so an estimate that has gone stale can still be re-measured: were it fed only
+      // by sightings the estimate itself admitted, a wrong estimate would reject every
+      // sighting and never be corrected
+      if (rotScaleDelta <= 1e-4f) {
+        voteForGlobalTransformOffset(rawTranslationDelta);
       }
 
       const float score = translationDelta / kMaxFrameTranslation + rotScaleDelta / kMaxFrameRotScaleL1;
@@ -11583,35 +11769,45 @@ namespace dxvk {
     // with exactly one unclaimed last-frame instance the pairing is unambiguous by
     // elimination, so faster-than-bounds motion (trains cover hundreds of units per
     // frame; frame hitches multiply every delta) may pair too.
+    bool pairedBeyondBounds = false;
     if (matchedInstance == nullptr && lastFrameCandidates == 1) {
       matchedInstance = nearestCandidate;
       matchedTranslationDelta = nearestTranslationDelta;
       matchedRotScaleDelta = nearestRotScaleDelta;
+      pairedBeyondBounds = matchedInstance != nullptr;
+      if (pairedBeyondBounds) {
+        m_ngxVelocityStats.pairedBeyondBounds++;
+      }
     }
 
     if (matchedInstance != nullptr) {
-      const Vector3 moveDelta = objectToWorld[3].xyz() - matchedInstance->objectToWorld[3].xyz();
+      // Net of the scene-wide offset, matching matchedTranslationDelta and the stored history
+      // this is compared against on the next sighting
+      const Vector3 moveDelta =
+        (objectToWorld[3].xyz() - matchedInstance->objectToWorld[3].xyz()) - m_ngxGlobalTransformOffset;
 
       // Emission gate: a pairing only produces velocity when the motion is believable.
       //  - Negligible deltas (one-time transform settles) are claimed silently: sub-pixel
       //    motion is served equally well by camera reprojection.
-      //  - Confirmed movers (wasMoving) emit unconditionally.
+      //  - Confirmed movers (wasMoving) emit on sight.
       //  - Unconfirmed instances emit immediately only for gentle motion, plausible for
       //    an object accelerating from rest. Larger first deltas - what a visibility swap
-      //    between two static placements of the same asset looks like - must repeat
-      //    consistently for one frame first: a real fast mover sustains its per-frame
-      //    delta, a swap does not repeat.
+      //    between two placements of the same asset looks like - must repeat consistently
+      //    for one frame first: a real fast mover sustains its per-frame delta, a swap
+      //    does not repeat.
+      //  - Pairings taken by elimination take that confirmation path unconditionally.
       constexpr float kNegligibleTranslation = 0.05f;
       constexpr float kNegligibleRotScale = 1e-3f;
       constexpr float kOnsetTranslationTrust = 8.0f;   // ~480 units/s at 60 fps
       constexpr float kOnsetRotScaleTrust = 0.35f;     // ~3 degrees/frame
 
-      // Animating content (skinned palettes / CPU-modified positions changing) is proof
-      // of identity: a static placement's vertex data never animates, so this pairing
-      // cannot be a visibility swap between two static copies - the anti-swap gates
-      // below do not apply and the sighting emits unconditionally (first person meshes
-      // pair through camera-attached transform deltas that routinely exceed the gates)
-      const bool contentAnimated = bonesChangedFrom(matchedInstance->bones) ||
+      // Animating content (skinned palettes / CPU-modified positions changing) rules out a
+      // swap between two static copies of an asset, whose vertex data never animates, so a
+      // pairing that stayed within the bounds skips the anti-swap gates below (first person
+      // meshes pair through camera-attached transform deltas that routinely exceed them).
+      // It cannot rule out a swap between two animated copies - see pairedBeyondBounds.
+      // Paired against a last-frame instance by construction, so the scene's shift applies
+      const bool contentAnimated = bonesChangedFrom(matchedInstance->bones, m_ngxGlobalTransformOffset) ||
                                    dynamicPositionsChangedFrom(matchedInstance->dynamicPositions);
 
       const bool negligibleMotion = !contentAnimated &&
@@ -11620,12 +11816,21 @@ namespace dxvk {
 
       bool emitVelocity = false;
 
-      if (contentAnimated) {
+      // A pairing taken by elimination sits beyond the per-frame bounds, so it is as much the
+      // shape of one placement leaving view as another arrives as it is of real motion, and
+      // nothing about the sighting itself tells them apart. Only the delta repeating does -
+      // a fast mover sustains it, a visibility swap does not - so these take the confirmation
+      // path below regardless of what else vouches for them. Animating content does not: two
+      // copies of one skeletal asset both animate, and pairing across them emits the distance
+      // between two different characters as a single frame of motion. Neither does wasMoving,
+      // which describes the instance's own past and not this sighting's claim to it.
+      if (contentAnimated && !pairedBeyondBounds) {
         emitVelocity = true;
       } else if (!negligibleMotion) {
-        if (matchedInstance->wasMoving) {
+        if (matchedInstance->wasMoving && !pairedBeyondBounds) {
           emitVelocity = true;
-        } else if (matchedTranslationDelta <= kOnsetTranslationTrust &&
+        } else if (!pairedBeyondBounds &&
+                   matchedTranslationDelta <= kOnsetTranslationTrust &&
                    matchedRotScaleDelta <= kOnsetRotScaleTrust) {
           emitVelocity = true;
         } else {
@@ -11661,12 +11866,9 @@ namespace dxvk {
         m_ngxVelocityStats.newRegistrations++;
       }
 
-      // Claim the instance: repeat draws this frame exact-match the updated rows, other
+      // Claim the instance: repeat draws this frame match the updated transform, other
       // instances cannot pair with it anymore. The movement history feeds the emission
       // gate above on the next sighting.
-      for (uint32_t row = 0; row < 4; row++) {
-        matchedInstance->localToWorldRows[row] = localToWorldRows[row];
-      }
       matchedInstance->objectToWorld = objectToWorld;
       matchedInstance->worldToProjection = drawWorldToProjection;
       matchedInstance->lastSeenFrame = m_ue3FrameCounter;
@@ -11719,6 +11921,8 @@ namespace dxvk {
             " identity=0x", std::hex, identity, std::dec,
             " instances=", objectState.instances.size(),
             " lastFrameCandidates=", lastFrameCandidates,
+            " freshestSightingAge=", (freshestSightingAge == UINT32_MAX
+                                        ? std::string("never") : std::to_string(freshestSightingAge)),
             " o2wPos=(", translation.x, ",", translation.y, ",", translation.z, ")",
             " camTranspose=", int(m_ngxFrameCameraUsedTranspose));
 
@@ -11740,14 +11944,32 @@ namespace dxvk {
     // No usable history: a new placement of this mesh (or a sighting after a visibility
     // gap, where a one-frame velocity cannot be derived). Register it without velocity;
     // replace the stalest slot when the identity is heavily instanced.
-    constexpr size_t kMaxInstancesPerIdentity = 64;
+    // Modular level geometry puts far more placements of one asset on screen than a small cap
+    // can hold: hundreds of copies of a wall or railing section, all sharing this identity and
+    // separated only by their transform.
+    constexpr size_t kMaxInstancesPerIdentity = 256;
 
     NgxVelocityObjectInstance* targetInstance = nullptr;
     if (objectState.instances.size() >= kMaxInstancesPerIdentity) {
       for (NgxVelocityObjectInstance& instance : objectState.instances) {
+        // Never recycle a slot the last two frames are still using. Over the cap, the stalest
+        // slot is one this frame just claimed, so recycling it blindly makes an identity spend
+        // the frame overwriting the history its remaining placements are about to pair against:
+        // none of them can then match their own placement, and those that pair at all pair with
+        // a neighbouring copy and emit the distance between two of them as motion. Leaving the
+        // surplus untracked instead costs nothing, since static geometry is served exactly by
+        // camera reprojection.
+        if (instance.lastSeenFrame + 1 >= m_ue3FrameCounter) {
+          continue;
+        }
         if (targetInstance == nullptr || instance.lastSeenFrame < targetInstance->lastSeenFrame) {
           targetInstance = &instance;
         }
+      }
+
+      if (targetInstance == nullptr) {
+        m_ngxVelocityStats.skippedInstanceCap++;
+        return;
       }
     } else {
       targetInstance = &objectState.instances.emplace_back();
@@ -11755,9 +11977,6 @@ namespace dxvk {
 
     // Fresh occupancy: recycled slots must not inherit the previous occupant's movement
     // history (a stale confirmed-mover latch would instant-emit for the next pairing)
-    for (uint32_t row = 0; row < 4; row++) {
-      targetInstance->localToWorldRows[row] = localToWorldRows[row];
-    }
     targetInstance->objectToWorld = objectToWorld;
     targetInstance->worldToProjection = drawWorldToProjection;
     targetInstance->lastSeenFrame = m_ue3FrameCounter;
@@ -11783,51 +12002,92 @@ namespace dxvk {
   }
 
   namespace {
-    // Anchor for FSystemSettings::ScaleViewportByScreenPercentage:
-    //   movss   xmm0, [&GSystemSettings.ScreenPercentage]   F3 0F 10 05 <abs32>
-    //   sub     esp, 8                                       83 EC 08
-    //   ucomiss xmm0, [&Const_100f]                          0F 2E 05 <abs32>
-    // Both absolute operands are validated before any reader is patched.
-    constexpr uint32_t kUe3ScreenPercentageSigLen = 14;
-    constexpr uint32_t kUe3ScreenPercentageSigScanLen = kUe3ScreenPercentageSigLen + sizeof(uint32_t);
+    // UE3 declares FSystemSettingsData's sub-structs in a fixed order (Engine/Inc/SystemSettings.h),
+    // so however the engine version sizes the earlier ones (FExposedTextureLODSettings grows with
+    // TEXTUREGROUP_MAX), the tail is always:
+    //   FLOAT ScreenPercentage; UBOOL bUpscaleScreenPercentage;
+    //   INT ResX; INT ResY; UBOOL bFullscreen; INT MaxMultiSamples;
+    // ResX/ResY/bFullscreen are known exactly from the D3D9 present parameters, which is what the
+    // whole layout is discovered from.
+    constexpr uint32_t kUe3UpscaleFromScreenPercentage = 0x04;
+    constexpr uint32_t kUe3ResXFromScreenPercentage = 0x08;
+    constexpr uint32_t kUe3ResYFromScreenPercentage = 0x0c;
+    constexpr uint32_t kUe3FullscreenFromScreenPercentage = 0x10;
+    constexpr uint32_t kUe3MaxMultisamplesFromScreenPercentage = 0x14;
+    constexpr uint32_t kUe3SettingsDataTailSize = 0x18;
 
-    bool matchUe3ScreenPercentageSig(const uint8_t* p) {
-      return p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x10 && p[3] == 0x05 &&
-             p[8] == 0x83 && p[9] == 0xEC && p[10] == 0x08 &&
-             p[11] == 0x0F && p[12] == 0x2E && p[13] == 0x05;
-    }
+    // A record opens with FSystemSettingsDataWorldDetail: INT DetailMode then twenty UBOOLs.
+    // Recognising that shape is how the offset of ScreenPercentage within the record - and so
+    // the address of GSystemSettings itself - is recovered without knowing the engine version.
+    constexpr int32_t kUe3DetailModeMax = 3;
+    constexpr uint32_t kUe3HeadBooleanRun = 12;
+    constexpr uint32_t kUe3MinSettingsDataSize = 0x40;
+    constexpr uint32_t kUe3MaxSettingsDataSize = 0x2000;
 
-    // Mirror's Edge FSystemSettings offsets.
-    constexpr uint32_t kUe3ScreenPercentageFromSystemSettings = 0x178;
-    constexpr uint32_t kUe3UpscaleScreenPercentageFromSystemSettings = 0x17c;
-    constexpr uintptr_t kUe3MaxMultisamplesFromScreenPercentage = 0x14;
-    constexpr uintptr_t kUe3RtMaxMultisamplesFromScreenPercentage = 0x2c;
+    // Relaxed pass: how far back from the resolution anchor ScreenPercentage may sit when a
+    // build does not use the stock tail adjacency.
+    constexpr uint32_t kUe3MaxRelaxedScreenPercentageBacktrack = 0x40;
 
-    // Reject an unexpected layout before redirecting MSAA readers.
+    // FSystemSettings embeds Defaults[FSL_LevelCount]; finding those repeats at a constant
+    // stride both confirms the hit and recovers sizeof(FSystemSettingsData).
+    constexpr uint32_t kUe3DefaultsSearchWindow = 0x8000;
+    constexpr uint32_t kUe3MinDefaultsRepeats = 2;
+
     constexpr int32_t kUe3MaxMultisamplesPlausibleLimit = 64;
+    constexpr float kUe3MaxPlausibleScreenPercentage = 400.0f;
+
+    // A wrong candidate must never be trusted on shape alone, so the redirect set is proven by
+    // driving this value and watching the game's own scene viewport respond. Above the 50%
+    // floor the camera gate falls back to while ScreenPercentage is still unknown.
+    constexpr float kNgxScreenPercentageProbeValue = 75.0f;
+    constexpr uint32_t kNgxScreenPercentageProbeFrames = 240;
+    constexpr int32_t kNgxScreenPercentageProbeTolerance = 16;
+
+    // How long an engine-owned upscale may stay missing before the runtime takes over.
+    constexpr uint32_t kNgxMissingEngineUpscaleFrameLimit = 30;
 
     // Bound retries for transient process/module read failures.
     constexpr uint32_t kNgxSettingsScanMaxAttempts = 30;
     constexpr uint64_t kNgxSettingsScanRetryIntervalMs = 1000;
 
+    // Cap accepted operand sites so a pathological match set can never be patched wholesale.
+    constexpr size_t kNgxMaxOperandSites = 64;
+    constexpr size_t kNgxMaxRawOperandSites = 256;
+
+    // Every renderer-facing use of ScreenPercentage in UE3 converts it to a scale factor:
+    // ScaleScreenCoords compares it against 100.0f before dividing by it, UnScaleScreenCoords
+    // multiplies by the reciprocal, NeedsUpscale compares against 100.0f. Reads that merely
+    // copy the field elsewhere - settings mirrors, script exposure - have no such constant
+    // beside them, and leaving those alone is what keeps the player's saved configuration out
+    // of this. The surrounding cluster then picks up same-function reads the compiler shared.
+    constexpr size_t kNgxPercentScaleConstantWindow = 24;
+    constexpr uintptr_t kNgxSettingsCodeClusterRadius = 0x800;
+
     // Renderer-only values; GSystemSettings remains authoritative for game configuration.
     struct NgxGameSettingsShadow {
       float screenPercentage;
       int32_t upscaleScreenPercentage;
-      int32_t maxMultisamples;
     };
-    static_assert(sizeof(NgxGameSettingsShadow) == 12);
+    static_assert(sizeof(NgxGameSettingsShadow) == 8);
 
     constexpr uintptr_t kNgxShadowScreenPercentageOffset =
       offsetof(NgxGameSettingsShadow, screenPercentage);
     constexpr uintptr_t kNgxShadowUpscaleScreenPercentageOffset =
       offsetof(NgxGameSettingsShadow, upscaleScreenPercentage);
-    constexpr uintptr_t kNgxShadowMaxMultisamplesOffset =
-      offsetof(NgxGameSettingsShadow, maxMultisamples);
 
     struct NgxOperandSite {
       uintptr_t address = 0;
       uint32_t original = 0;
+    };
+
+    // Which field a site reads, and how it addresses it. The relative pair is what
+    // FSystemSettings::NeedsUpscale() uses, so it decides whether the engine can still perform
+    // its own upscale.
+    enum class NgxOperandCategory : uint8_t {
+      AbsoluteScreenPercentage,
+      AbsoluteUpscale,
+      RelativeScreenPercentage,
+      RelativeUpscale,
     };
 
     struct NgxOperandRedirect {
@@ -11837,20 +12097,28 @@ namespace dxvk {
       DWORD originalProtection = 0;
       bool originalProtectionKnown = false;
       bool forceRestore = false;
+      NgxOperandCategory category = NgxOperandCategory::AbsoluteScreenPercentage;
     };
 
     struct NgxLocatedGameSettings {
       uintptr_t screenPercentageAddress = 0;
+      uintptr_t systemSettingsAddress = 0;
       float currentScreenPercentage = 100.0f;
       int32_t currentUpscaleScreenPercentage = 1;
       int32_t currentMaxMultisamples = 0;
-      int32_t currentRtMaxMultisamples = 0;
+      // Offset of ScreenPercentage within FSystemSettingsData; 0 when the relative readers
+      // could not be resolved, in which case only the absolute readers are redirected.
+      uint32_t screenPercentageStructOffset = 0;
+      uint32_t settingsDataStride = 0;
+      uint32_t defaultsRepeats = 0;
+      bool strictTailLayout = false;
+      bool iniConfirmed = false;
+      // Which stage rejected the module, so a failure is readable straight from the log.
+      const char* missReason = "no reason recorded";
       std::vector<NgxOperandSite> directScreenPercentageSites;
+      std::vector<NgxOperandSite> directUpscaleScreenPercentageSites;
       std::vector<NgxOperandSite> relativeScreenPercentageSites;
       std::vector<NgxOperandSite> relativeUpscaleScreenPercentageSites;
-      std::vector<NgxOperandSite> directRtMaxMultisamplesSites;
-      uint32_t over100CaveReaderCount = 0;
-      bool msaaReadersValid = false;
     };
 
     template <typename T>
@@ -12148,68 +12416,64 @@ namespace dxvk {
       std::array<DWORD, 256> m_threadIds = {};
     };
 
-    bool ngxApplyOperandRedirects(HANDLE process,
-                                  std::vector<NgxOperandRedirect>& redirects,
-                                  std::vector<NgxOperandRedirect>& outActive) {
+    struct NgxOperandApplyResult {
+      size_t applied = 0;
+      size_t skipped = 0;
+      size_t unrestorable = 0;
+      size_t appliedByCategory[4] = {};
+    };
+
+    // Per-site tolerance: a site that cannot be written, or that cannot regain its original page
+    // protection afterwards (WRITECOPY pages do not always come back), is rolled back and left
+    // stock instead of failing the whole set. Whether the sites that did land are sufficient is
+    // settled by the behavioural probe rather than guessed at here.
+    NgxOperandApplyResult ngxApplyOperandRedirects(
+        HANDLE process,
+        std::vector<NgxOperandRedirect>& redirects,
+        std::vector<NgxOperandRedirect>& outActive) {
+      NgxOperandApplyResult result;
       outActive.clear();
       // Caller must reserve before threads are suspended (no heap growth while suspended).
-      if (outActive.capacity() < redirects.size())
-        return false;
+      if (outActive.capacity() < redirects.size()) {
+        result.skipped = redirects.size();
+        return result;
+      }
 
       for (NgxOperandRedirect& redirect : redirects) {
         uint32_t current = 0;
-        if (!ngxReadProcessExact(process, redirect.address, current) ||
-            current != redirect.original)
-          return false;
         MEMORY_BASIC_INFORMATION memoryInfo = {};
-        if (::VirtualQueryEx(
+        if (!ngxReadProcessExact(process, redirect.address, current) ||
+            current != redirect.original ||
+            ::VirtualQueryEx(
               process, reinterpret_cast<LPCVOID>(redirect.address),
-              &memoryInfo, sizeof(memoryInfo)) != sizeof(memoryInfo))
-          return false;
+              &memoryInfo, sizeof(memoryInfo)) != sizeof(memoryInfo)) {
+          result.skipped++;
+          continue;
+        }
         redirect.originalProtection = memoryInfo.Protect;
         redirect.originalProtectionKnown = true;
-      }
 
-      size_t attemptedCount = 0;
-      bool applySucceeded = true;
-      for (size_t i = 0; i < redirects.size(); i++) {
-        NgxOperandRedirect& redirect = redirects[i];
-        attemptedCount = i + 1;
-        if (!ngxWriteCodeOperand(process, redirect)) {
-          applySucceeded = false;
-          break;
-        }
         uint32_t verified = 0;
-        if (!ngxReadProcessExact(process, redirect.address, verified) ||
-            verified != redirect.redirected) {
-          applySucceeded = false;
-          break;
-        }
-      }
-
-      if (applySucceeded) {
-        for (const NgxOperandRedirect& redirect : redirects)
+        if (ngxWriteCodeOperand(process, redirect) &&
+            ngxReadProcessExact(process, redirect.address, verified) &&
+            verified == redirect.redirected) {
+          result.applied++;
+          result.appliedByCategory[size_t(redirect.category)]++;
           outActive.push_back(redirect);
-        return true;
-      }
+          continue;
+        }
 
-      // A failed write may have landed before protection/cache restoration failed.
-      for (size_t i = attemptedCount; i > 0; i--) {
-        if (!ngxRestoreCodeOperand(process, redirects[i - 1]))
-          redirects[i - 1].forceRestore = true;
-      }
-
-      for (NgxOperandRedirect& redirect : redirects) {
-        uint32_t current = 0;
-        if (redirect.forceRestore ||
-            !ngxReadProcessExact(process, redirect.address, current) ||
-            current != redirect.original) {
+        // A failed write may still have landed before protection/cache restoration failed.
+        if (!ngxRestoreCodeOperand(process, redirect)) {
           redirect.forceRestore = true;
+          result.unrestorable++;
           outActive.push_back(redirect);
+        } else {
+          result.skipped++;
         }
       }
 
-      return false;
+      return result;
     }
 
     // Bridge host: parent PID is the game process.
@@ -12236,7 +12500,8 @@ namespace dxvk {
     }
 
     // SNAPMODULE32 so the 64-bit bridge host can see the 32-bit game module.
-    bool ngxGetMainModule(DWORD pid, uintptr_t& outBase, uint32_t& outSize) {
+    bool ngxGetMainModule(DWORD pid, uintptr_t& outBase, uint32_t& outSize,
+                          std::wstring& outPath) {
       HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
       if (snapshot == INVALID_HANDLE_VALUE)
         return false;
@@ -12247,6 +12512,7 @@ namespace dxvk {
       if (::Module32FirstW(snapshot, &module)) {
         outBase = reinterpret_cast<uintptr_t>(module.modBaseAddr);
         outSize = module.modBaseSize;
+        outPath = module.szExePath;
         ok = true;
       }
 
@@ -12260,16 +12526,502 @@ namespace dxvk {
       Incomplete,
     };
 
+    // ---------------------------------------------------------------------------------------
+    // Optional independent validator: the game's own [SystemSettings] ini section.
+    // UE3's property-name table is fixed across engine versions, so agreement between the ini
+    // and a candidate record is a known-plaintext confirmation of both base and layout. It only
+    // ever raises confidence - a user ini that lags the live values must not reject a candidate.
+    // ---------------------------------------------------------------------------------------
+    struct NgxIniSystemSettings {
+      bool found = false;
+      bool hasScreenPercentage = false;
+      bool hasUpscale = false;
+      bool hasResolution = false;
+      bool hasFullscreen = false;
+      bool hasMaxMultisamples = false;
+      float screenPercentage = 0.0f;
+      int32_t upscale = 0;
+      int32_t resX = 0;
+      int32_t resY = 0;
+      int32_t fullscreen = 0;
+      int32_t maxMultisamples = 0;
+    };
+
+    std::string ngxLowerAscii(const std::string& value) {
+      std::string out = value;
+      for (char& c : out)
+        c = char(std::tolower(uint8_t(c)));
+      return out;
+    }
+
+    std::string ngxTrimAscii(const std::string& value) {
+      size_t first = value.find_first_not_of(" \t\r\n");
+      if (first == std::string::npos)
+        return std::string();
+      size_t last = value.find_last_not_of(" \t\r\n");
+      return value.substr(first, last - first + 1);
+    }
+
+    bool ngxParseIniBool(const std::string& value, int32_t& out) {
+      const std::string lowered = ngxLowerAscii(value);
+      if (lowered == "true" || lowered == "1") {
+        out = 1;
+        return true;
+      }
+      if (lowered == "false" || lowered == "0") {
+        out = 0;
+        return true;
+      }
+      return false;
+    }
+
+    bool ngxReadFileText(const std::wstring& path, std::string& out) {
+      HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      if (file == INVALID_HANDLE_VALUE)
+        return false;
+
+      LARGE_INTEGER size = {};
+      constexpr LONGLONG kMaxIniBytes = 1 << 20;
+      if (!::GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > kMaxIniBytes) {
+        ::CloseHandle(file);
+        return false;
+      }
+
+      std::vector<uint8_t> raw(size_t(size.QuadPart));
+      DWORD bytesRead = 0;
+      const bool ok = ::ReadFile(file, raw.data(), DWORD(raw.size()), &bytesRead, nullptr) &&
+                      bytesRead == raw.size();
+      ::CloseHandle(file);
+      if (!ok)
+        return false;
+
+      // UE3 writes user configs as UTF-16LE; the shipped defaults are plain ASCII.
+      if (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
+        out.clear();
+        out.reserve(raw.size() / 2);
+        for (size_t i = 2; i + 1 < raw.size(); i += 2) {
+          const uint16_t unit = uint16_t(raw[i]) | uint16_t(uint16_t(raw[i + 1]) << 8);
+          out.push_back(unit < 0x80 ? char(unit) : '?');
+        }
+      } else {
+        out.assign(reinterpret_cast<const char*>(raw.data()), raw.size());
+      }
+
+      return true;
+    }
+
+    bool ngxParseIniSystemSettings(const std::string& text, NgxIniSystemSettings& out) {
+      std::istringstream stream(text);
+      std::string line;
+      bool inSection = false;
+      NgxIniSystemSettings parsed;
+
+      while (std::getline(stream, line)) {
+        const std::string trimmed = ngxTrimAscii(line);
+        if (trimmed.empty() || trimmed[0] == ';')
+          continue;
+
+        if (trimmed[0] == '[') {
+          if (inSection)
+            break;
+          inSection = ngxLowerAscii(trimmed) == "[systemsettings]";
+          continue;
+        }
+
+        if (!inSection)
+          continue;
+
+        const size_t separator = trimmed.find('=');
+        if (separator == std::string::npos)
+          continue;
+
+        const std::string key = ngxLowerAscii(ngxTrimAscii(trimmed.substr(0, separator)));
+        const std::string value = ngxTrimAscii(trimmed.substr(separator + 1));
+        if (value.empty())
+          continue;
+
+        try {
+          if (key == "screenpercentage") {
+            parsed.screenPercentage = std::stof(value);
+            parsed.hasScreenPercentage = std::isfinite(parsed.screenPercentage);
+          } else if (key == "upscalescreenpercentage") {
+            parsed.hasUpscale = ngxParseIniBool(value, parsed.upscale);
+          } else if (key == "fullscreen") {
+            parsed.hasFullscreen = ngxParseIniBool(value, parsed.fullscreen);
+          } else if (key == "resx") {
+            parsed.resX = std::stoi(value);
+          } else if (key == "resy") {
+            parsed.resY = std::stoi(value);
+          } else if (key == "maxmultisamples") {
+            parsed.maxMultisamples = std::stoi(value);
+            parsed.hasMaxMultisamples = true;
+          }
+        } catch (const std::exception&) {
+          // A malformed entry only costs us that one cross-check.
+        }
+      }
+
+      parsed.hasResolution = parsed.resX > 0 && parsed.resY > 0;
+      parsed.found = parsed.hasScreenPercentage || parsed.hasResolution ||
+                     parsed.hasMaxMultisamples;
+      if (!parsed.found)
+        return false;
+
+      out = parsed;
+      return true;
+    }
+
+    void ngxCollectEngineInis(const std::wstring& directory,
+                              std::vector<std::wstring>& out) {
+      constexpr size_t kMaxIniCandidates = 16;
+      if (out.size() >= kMaxIniCandidates)
+        return;
+
+      WIN32_FIND_DATAW find = {};
+      HANDLE search = ::FindFirstFileW((directory + L"\\Config\\*Engine.ini").c_str(), &find);
+      if (search == INVALID_HANDLE_VALUE)
+        return;
+
+      do {
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+          continue;
+        out.push_back(directory + L"\\Config\\" + find.cFileName);
+      } while (out.size() < kMaxIniCandidates && ::FindNextFileW(search, &find));
+
+      ::FindClose(search);
+    }
+
+    // UE3 keeps its configs at <root>\<X>Game\Config\<Y>Engine.ini, with the live user copy
+    // often under Documents. Only immediate subdirectories are enumerated, so this stays cheap.
+    void ngxCollectEngineIniRoots(const std::wstring& root, uint32_t remainingDepth,
+                                  std::vector<std::wstring>& out) {
+      constexpr size_t kMaxIniCandidates = 16;
+      ngxCollectEngineInis(root, out);
+      if (remainingDepth == 0 || out.size() >= kMaxIniCandidates)
+        return;
+
+      WIN32_FIND_DATAW find = {};
+      HANDLE search = ::FindFirstFileW((root + L"\\*").c_str(), &find);
+      if (search == INVALID_HANDLE_VALUE)
+        return;
+
+      constexpr uint32_t kMaxSubdirectories = 64;
+      uint32_t visited = 0;
+      do {
+        if (!(find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+          continue;
+        const std::wstring name = find.cFileName;
+        if (name == L"." || name == L"..")
+          continue;
+        ngxCollectEngineIniRoots(root + L"\\" + name, remainingDepth - 1, out);
+      } while (++visited < kMaxSubdirectories && out.size() < kMaxIniCandidates &&
+               ::FindNextFileW(search, &find));
+
+      ::FindClose(search);
+    }
+
+    NgxIniSystemSettings ngxReadIniSystemSettings(const std::wstring& exePath) {
+      NgxIniSystemSettings result;
+      if (exePath.empty())
+        return result;
+
+      std::vector<std::wstring> candidates;
+
+      // The install tree: the exe lives under <root>\Binaries[\Win32], so walk up a few levels.
+      std::wstring directory = exePath;
+      for (uint32_t level = 0; level < 4; level++) {
+        const size_t separator = directory.find_last_of(L"\\/");
+        if (separator == std::wstring::npos || separator == 0)
+          break;
+        directory = directory.substr(0, separator);
+        ngxCollectEngineIniRoots(directory, 1, candidates);
+      }
+
+      wchar_t userProfile[MAX_PATH] = {};
+      if (::GetEnvironmentVariableW(L"USERPROFILE", userProfile, MAX_PATH) != 0) {
+        ngxCollectEngineIniRoots(std::wstring(userProfile) + L"\\Documents\\My Games", 2,
+                                 candidates);
+      }
+
+      for (const std::wstring& candidate : candidates) {
+        std::string text;
+        NgxIniSystemSettings parsed;
+        if (ngxReadFileText(candidate, text) && ngxParseIniSystemSettings(text, parsed)) {
+          // Prefer the copy that carries a resolution: that is the one the game writes back to.
+          if (!result.found || (parsed.hasResolution && !result.hasResolution))
+            result = parsed;
+        }
+      }
+
+      return result;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Data-side recognition of an FSystemSettingsData record
+    // ---------------------------------------------------------------------------------------
+
+    bool ngxIsPlausibleScreenPercentage(float value) {
+      return std::isfinite(value) && value > 0.0f &&
+             value <= kUe3MaxPlausibleScreenPercentage;
+    }
+
+    // UE3 reads MaxMultisamples straight out of the ini as a plain INT and never constrains it,
+    // so real installs carry values the D3D9 sample counts do not (Mirror's Edge ships 10).
+    bool ngxIsPlausibleMaxMultisamples(int32_t value) {
+      return value >= 0 && value <= kUe3MaxMultisamplesPlausibleLimit;
+    }
+
+    bool ngxIsPlausibleResolution(int32_t x, int32_t y) {
+      return (x == 0 && y == 0) ||
+             (x >= 320 && x <= 16384 && y >= 240 && y <= 16384);
+    }
+
+    int32_t ngxReadInt32(const uint8_t* data) {
+      int32_t value = 0;
+      std::memcpy(&value, data, sizeof(value));
+      return value;
+    }
+
+    float ngxReadFloat(const uint8_t* data) {
+      float value = 0.0f;
+      std::memcpy(&value, data, sizeof(value));
+      return value;
+    }
+
+    // FSystemSettingsDataWorldDetail opens the record: INT DetailMode then a long run of UBOOLs.
+    bool ngxLooksLikeSettingsRecordHead(const uint8_t* data, size_t available) {
+      if (available < sizeof(int32_t) * (1 + kUe3HeadBooleanRun))
+        return false;
+
+      const int32_t detailMode = ngxReadInt32(data);
+      if (detailMode < 0 || detailMode > kUe3DetailModeMax)
+        return false;
+
+      for (uint32_t i = 1; i <= kUe3HeadBooleanRun; i++) {
+        const int32_t value = ngxReadInt32(data + i * sizeof(int32_t));
+        if (value != 0 && value != 1)
+          return false;
+      }
+
+      return true;
+    }
+
+    // The record tail, with the resolution left loose so the Defaults[] copies (populated from
+    // the compat ini rather than the live mode) match as well as the live record does.
+    bool ngxLooksLikeSettingsRecordTail(const uint8_t* tail, size_t available) {
+      if (available < kUe3SettingsDataTailSize)
+        return false;
+
+      const float screenPercentage = ngxReadFloat(tail);
+      const int32_t upscale = ngxReadInt32(tail + kUe3UpscaleFromScreenPercentage);
+      const int32_t resX = ngxReadInt32(tail + kUe3ResXFromScreenPercentage);
+      const int32_t resY = ngxReadInt32(tail + kUe3ResYFromScreenPercentage);
+      const int32_t fullscreen = ngxReadInt32(tail + kUe3FullscreenFromScreenPercentage);
+      const int32_t maxMultisamples = ngxReadInt32(tail + kUe3MaxMultisamplesFromScreenPercentage);
+
+      return ngxIsPlausibleScreenPercentage(screenPercentage) &&
+             (upscale == 0 || upscale == 1) &&
+             (fullscreen == 0 || fullscreen == 1) &&
+             ngxIsPlausibleMaxMultisamples(maxMultisamples) &&
+             ngxIsPlausibleResolution(resX, resY);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // x86 operand classification
+    //
+    // Sites are accepted on instruction form rather than on surrounding byte context: only the
+    // encodings that *read* one of these fields are patched, so the engine's own writes (and the
+    // config-facing consumers, which all reach the fields through `this`) keep the real values.
+    // ---------------------------------------------------------------------------------------
+
+    bool ngxIsAbsoluteModrm(uint8_t modrm) {
+      return (modrm & 0xC7) == 0x05;
+    }
+
+    bool ngxIsBaseDisp32Modrm(uint8_t modrm) {
+      return (modrm & 0xC0) == 0x80 && (modrm & 0x07) != 0x04;
+    }
+
+    uint8_t ngxModrmReg(uint8_t modrm) {
+      return uint8_t((modrm >> 3) & 0x07);
+    }
+
+    uint8_t ngxModrmRm(uint8_t modrm) {
+      return uint8_t(modrm & 0x07);
+    }
+
+    bool ngxIsAbsoluteFloatReadSite(const uint8_t* bytes, size_t operandOffset) {
+      if (operandOffset >= 4) {
+        const uint8_t modrm = bytes[operandOffset - 1];
+        // movss/addss/mulss/subss/divss xmm, m32. 0x11 (movss m32, xmm) is a store.
+        if (bytes[operandOffset - 4] == 0xF3 && bytes[operandOffset - 3] == 0x0F &&
+            ngxIsAbsoluteModrm(modrm)) {
+          const uint8_t op = bytes[operandOffset - 2];
+          if (op == 0x10 || op == 0x58 || op == 0x59 || op == 0x5C || op == 0x5E)
+            return true;
+        }
+      }
+
+      if (operandOffset >= 3) {
+        const uint8_t modrm = bytes[operandOffset - 1];
+        const uint8_t op = bytes[operandOffset - 2];
+        // ucomiss/comiss xmm, m32; a 0x66 prefix would make these the f64 variants.
+        if (bytes[operandOffset - 3] == 0x0F && (op == 0x2E || op == 0x2F) &&
+            ngxIsAbsoluteModrm(modrm) &&
+            (operandOffset < 4 || bytes[operandOffset - 4] != 0x66))
+          return true;
+      }
+
+      if (operandOffset >= 2) {
+        const uint8_t modrm = bytes[operandOffset - 1];
+        const uint8_t op = bytes[operandOffset - 2];
+        if (ngxIsAbsoluteModrm(modrm)) {
+          // x87 arithmetic/compare against m32; D9 /0 is fld, D9 /3 (fstp) is a store.
+          if (op == 0xD8)
+            return true;
+          if (op == 0xD9 && ngxModrmReg(modrm) == 0)
+            return true;
+        }
+      }
+
+      return false;
+    }
+
+    bool ngxIsAbsoluteIntReadSite(const uint8_t* bytes, size_t operandOffset) {
+      if (operandOffset >= 1 && bytes[operandOffset - 1] == 0xA1)
+        return true;  // mov eax, [disp32]
+
+      if (operandOffset >= 2) {
+        const uint8_t modrm = bytes[operandOffset - 1];
+        const uint8_t op = bytes[operandOffset - 2];
+        if (!ngxIsAbsoluteModrm(modrm))
+          return false;
+
+        // mov r32, m32 / cmp / test / xor / or, all reading the memory operand.
+        if (op == 0x8B || op == 0x3B || op == 0x39 || op == 0x85 || op == 0x33 || op == 0x0B)
+          return true;
+        // Group 1 immediate forms: only /7 (cmp) leaves the memory operand untouched.
+        if ((op == 0x83 || op == 0x81) && ngxModrmReg(modrm) == 7)
+          return true;
+        // test m32, imm32.
+        if (op == 0xF7 && ngxModrmReg(modrm) == 0)
+          return true;
+      }
+
+      return false;
+    }
+
+    // Distinguishes a renderer-facing read from a read that just copies the field somewhere.
+    bool ngxReadsPercentScaleConstantNearby(HANDLE proc, const uint8_t* bytes,
+                                            size_t operandOffset, size_t length) {
+      if (length < sizeof(uint32_t))
+        return false;
+
+      const size_t begin = operandOffset > kNgxPercentScaleConstantWindow
+        ? operandOffset - kNgxPercentScaleConstantWindow
+        : 0;
+      const size_t end = std::min(length - sizeof(uint32_t),
+                                  operandOffset + kNgxPercentScaleConstantWindow);
+
+      for (size_t offset = begin; offset < end; offset++) {
+        if (offset == operandOffset || !ngxIsAbsoluteFloatReadSite(bytes, offset))
+          continue;
+
+        uint32_t constantAddress = 0;
+        std::memcpy(&constantAddress, bytes + offset, sizeof(constantAddress));
+
+        float constantValue = 0.0f;
+        if (ngxReadProcessExact(proc, uintptr_t(constantAddress), constantValue) &&
+            (constantValue == 100.0f || constantValue == 0.01f))
+          return true;
+      }
+
+      return false;
+    }
+
+    struct NgxRelativeOperand {
+      size_t operandOffset = 0;
+      uint32_t displacement = 0;
+      uint8_t baseRegister = 0;
+      bool isFloat = false;
+      bool valid = false;
+    };
+
+    // Decodes only the [reg+disp32] read forms UE3 emits for these two fields; anything else
+    // simply does not match, which is what keeps the paired-window search precise.
+    NgxRelativeOperand ngxDecodeRelativeRead(const uint8_t* bytes, size_t offset,
+                                             size_t available) {
+      NgxRelativeOperand out;
+
+      const auto emit = [&](size_t operandOffset, bool isFloat, uint8_t modrm) {
+        if (operandOffset + sizeof(uint32_t) > available)
+          return;
+        std::memcpy(&out.displacement, bytes + operandOffset, sizeof(out.displacement));
+        out.operandOffset = operandOffset;
+        out.baseRegister = ngxModrmRm(modrm);
+        out.isFloat = isFloat;
+        out.valid = true;
+      };
+
+      if (offset + 3 <= available && bytes[offset] == 0x0F &&
+          (bytes[offset + 1] == 0x2E || bytes[offset + 1] == 0x2F) &&
+          ngxIsBaseDisp32Modrm(bytes[offset + 2]) &&
+          (offset == 0 || bytes[offset - 1] != 0x66)) {
+        emit(offset + 3, true, bytes[offset + 2]);
+      } else if (offset + 4 <= available && bytes[offset] == 0xF3 &&
+                 bytes[offset + 1] == 0x0F && bytes[offset + 2] == 0x10 &&
+                 ngxIsBaseDisp32Modrm(bytes[offset + 3])) {
+        emit(offset + 4, true, bytes[offset + 3]);
+      } else if (offset + 2 <= available &&
+                 (bytes[offset] == 0x8B || bytes[offset] == 0x3B ||
+                  bytes[offset] == 0x39 || bytes[offset] == 0x85) &&
+                 ngxIsBaseDisp32Modrm(bytes[offset + 1])) {
+        emit(offset + 2, false, bytes[offset + 1]);
+      } else if (offset + 2 <= available && bytes[offset] == 0x83 &&
+                 ngxIsBaseDisp32Modrm(bytes[offset + 1]) &&
+                 ngxModrmReg(bytes[offset + 1]) == 7) {
+        emit(offset + 2, false, bytes[offset + 1]);
+      }
+
+      return out;
+    }
+
+    struct NgxGameSettingsScanInputs {
+      uint32_t backBufferWidth = 0;
+      uint32_t backBufferHeight = 0;
+      bool windowed = false;
+      // Escape hatch: when set, discovery is skipped in favour of this module-relative address
+      // (still subject to the shape checks and the behavioural probe).
+      uint32_t forcedScreenPercentageRva = 0;
+      NgxIniSystemSettings ini;
+    };
+
+    // The filesystem search is worth doing once per process, not once per scan retry.
+    const NgxIniSystemSettings& ngxCachedIniSystemSettings(const std::wstring& exePath) {
+      static const NgxIniSystemSettings cached = ngxReadIniSystemSettings(exePath);
+      return cached;
+    }
+
     // Finds and validates the renderer-facing settings operands in a 32-bit game module.
+    // Candidates the behavioural probe has already disproven are skipped, so a failed probe can
+    // simply rescan for the next best match.
     NgxLocateResult ngxLocateGameSettings(HANDLE proc, uintptr_t base, uint32_t moduleSize,
+                                          const NgxGameSettingsScanInputs& inputs,
+                                          const std::vector<uintptr_t>& rejectedCandidates,
                                           NgxLocatedGameSettings& outSettings) {
       outSettings = {};
+
+      if (inputs.backBufferWidth == 0 || inputs.backBufferHeight == 0)
+        return NgxLocateResult::Incomplete;
 
       uint8_t headers[0x1000];
       SIZE_T bytesRead = 0;
       if (!::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(base), headers, sizeof(headers), &bytesRead) ||
           bytesRead < sizeof(IMAGE_DOS_HEADER))
         return NgxLocateResult::Incomplete;
+
+      outSettings.missReason = "not a 32-bit PE module";
 
       const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headers);
       if (dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -12284,6 +13036,8 @@ namespace dxvk {
           nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
         return NgxLocateResult::Miss;
 
+      outSettings.missReason = "malformed PE section table";
+
       // IMAGE_NT_HEADERS32 = DWORD Signature; IMAGE_FILE_HEADER; IMAGE_OPTIONAL_HEADER32.
       // The section table follows the optional header (whose size is declared, so this is
       // robust to layout differences).
@@ -12293,11 +13047,12 @@ namespace dxvk {
       if (sectionCount == 0 || sectionCount > 96)
         return NgxLocateResult::Miss;
 
-      struct ExecutableSectionCopy {
+      struct SectionRange {
         uintptr_t address = 0;
-        std::vector<uint8_t> bytes;
+        uint32_t size = 0;
+        bool executable = false;
       };
-      std::vector<ExecutableSectionCopy> executableSections;
+      std::vector<SectionRange> sectionRanges;
 
       for (uint32_t i = 0; i < sectionCount; i++) {
         const uint32_t entryOffset = sectionTableOffset + i * uint32_t(sizeof(IMAGE_SECTION_HEADER));
@@ -12305,315 +13060,456 @@ namespace dxvk {
           return NgxLocateResult::Incomplete;
 
         const auto* section = reinterpret_cast<const IMAGE_SECTION_HEADER*>(headers + entryOffset);
-        if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
+        const DWORD characteristics = section->Characteristics;
+        const bool executable = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        // GSystemSettings has a constructor, so it lands in an initialised or zero-filled
+        // writable data section; both are committed and readable at this point.
+        const bool writableData = !executable &&
+                                  (characteristics & IMAGE_SCN_MEM_WRITE) != 0 &&
+                                  (characteristics & IMAGE_SCN_MEM_READ) != 0;
+        if (!executable && !writableData)
           continue;
 
         uint32_t size = section->Misc.VirtualSize != 0 ? section->Misc.VirtualSize : section->SizeOfRawData;
-        if (size < kUe3ScreenPercentageSigScanLen)
-          continue;
         if (moduleSize != 0) {
           if (section->VirtualAddress >= moduleSize)
             return NgxLocateResult::Incomplete;
           size = std::min(size,
                           moduleSize - uint32_t(section->VirtualAddress));
         }
-        if (size < kUe3ScreenPercentageSigScanLen)
+        if (size < kUe3SettingsDataTailSize)
           continue;
 
-        ExecutableSectionCopy copy;
-        copy.address = base + section->VirtualAddress;
-        copy.bytes.resize(size);
-        SIZE_T sectionRead = 0;
-        const bool readSucceeded =
-          ::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(copy.address),
-                              copy.bytes.data(), size, &sectionRead) != FALSE;
-        if (!readSucceeded || sectionRead < size)
-          return NgxLocateResult::Incomplete;
-        executableSections.push_back(std::move(copy));
+        sectionRanges.push_back({ base + section->VirtualAddress, size, executable });
       }
 
-      uintptr_t scaleViewportInstruction = 0;
-      uint32_t screenPercentageAddress = 0;
-      uint32_t validatedConst100Address = 0;
+      struct SectionCopy {
+        uintptr_t address = 0;
+        std::vector<uint8_t> bytes;
+      };
 
-      // The anchor supplies the real field and comparison-constant addresses.
-      for (const ExecutableSectionCopy& section : executableSections) {
-        const size_t scanLen = section.bytes.size();
-        for (size_t off = 0; off + kUe3ScreenPercentageSigScanLen <= scanLen; off++) {
-          const uint8_t* p = section.bytes.data() + off;
-          if (!matchUe3ScreenPercentageSig(p))
+      const auto readSections = [&](bool executable, std::vector<SectionCopy>& out) {
+        for (const SectionRange& range : sectionRanges) {
+          if (range.executable != executable)
             continue;
 
-          uint32_t candidateScreenPercentageAddress = 0;
-          uint32_t const100Address = 0;
-          std::memcpy(&candidateScreenPercentageAddress, p + 4,
-                      sizeof(candidateScreenPercentageAddress));
-          std::memcpy(&const100Address, p + kUe3ScreenPercentageSigLen,
-                      sizeof(const100Address));
-
-          const uintptr_t moduleEnd = base + moduleSize;
-          if (moduleSize != 0 &&
-              (uintptr_t(candidateScreenPercentageAddress) < base ||
-               uintptr_t(candidateScreenPercentageAddress) + kUe3RtMaxMultisamplesFromScreenPercentage +
-                 sizeof(int32_t) > moduleEnd ||
-               uintptr_t(const100Address) < base ||
-               uintptr_t(const100Address) + sizeof(float) > moduleEnd))
-            continue;
-
-          float const100 = 0.0f;
-          float currentScreenPercentage = 0.0f;
-          if (!ngxReadProcessExact(proc, uintptr_t(const100Address), const100) ||
-              const100 != 100.0f ||
-              !ngxReadProcessExact(proc, uintptr_t(candidateScreenPercentageAddress),
-                                   currentScreenPercentage) ||
-              !std::isfinite(currentScreenPercentage) ||
-              currentScreenPercentage <= 0.0f || currentScreenPercentage > 400.0f)
-            continue;
-
-          if (scaleViewportInstruction != 0)
-            return NgxLocateResult::Miss;
-
-          scaleViewportInstruction = section.address + off;
-          screenPercentageAddress = candidateScreenPercentageAddress;
-          validatedConst100Address = const100Address;
-          outSettings.currentScreenPercentage = currentScreenPercentage;
+          SectionCopy copy;
+          copy.address = range.address;
+          copy.bytes.resize(range.size);
+          SIZE_T sectionRead = 0;
+          if (!::ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(range.address),
+                                   copy.bytes.data(), range.size, &sectionRead) ||
+              sectionRead < range.size)
+            return false;
+          out.push_back(std::move(copy));
         }
-      }
+        return !out.empty();
+      };
 
-      if (scaleViewportInstruction == 0)
-        return NgxLocateResult::Miss;
-
-      outSettings.screenPercentageAddress = uintptr_t(screenPercentageAddress);
-
-      const uintptr_t upscaleAddress =
-        outSettings.screenPercentageAddress + sizeof(float);
-      const uintptr_t gameMaxMultisamplesAddress =
-        outSettings.screenPercentageAddress + kUe3MaxMultisamplesFromScreenPercentage;
-      const uintptr_t rtMaxMultisamplesAddress =
-        outSettings.screenPercentageAddress + kUe3RtMaxMultisamplesFromScreenPercentage;
-
-      if (!ngxReadProcessExact(proc, upscaleAddress,
-                               outSettings.currentUpscaleScreenPercentage) ||
-          (outSettings.currentUpscaleScreenPercentage != 0 &&
-           outSettings.currentUpscaleScreenPercentage != 1) ||
-          !ngxReadProcessExact(proc, gameMaxMultisamplesAddress,
-                               outSettings.currentMaxMultisamples) ||
-          !ngxReadProcessExact(proc, rtMaxMultisamplesAddress,
-                               outSettings.currentRtMaxMultisamples))
+      // The code sections are two orders of magnitude larger than the data ones, so they are
+      // only read once the data side has something worth looking for. Scans repeat until the
+      // engine has populated GSystemSettings, and paying for the code copy every retry would
+      // be a visible hitch each second.
+      std::vector<SectionCopy> dataSections;
+      if (!readSections(false, dataSections))
         return NgxLocateResult::Incomplete;
 
-      const auto appendUnique = [](std::vector<NgxOperandSite>& sites,
-                                   uintptr_t address, uint32_t original) {
-        for (const NgxOperandSite& site : sites) {
-          if (site.address == address)
+      // ---- Resolution-anchored candidate search -------------------------------------------
+      struct Candidate {
+        const SectionCopy* section = nullptr;
+        size_t offset = 0;              // ScreenPercentage, within the section
+        bool strictTail = false;
+        bool fullscreenAgrees = false;
+        int32_t score = 0;
+        float screenPercentage = 100.0f;
+        int32_t upscale = 1;
+        int32_t maxMultisamples = 0;
+        uint32_t defaultsStride = 0;
+        uint32_t defaultsRepeats = 0;
+      };
+      // Relaxed hits are only consulted when nothing matched the stock tail layout, so an
+      // unusual build cannot bury the obvious answer under near-misses.
+      std::vector<Candidate> candidates;
+      std::vector<Candidate> relaxedCandidates;
+      constexpr size_t kMaxCandidates = 64;
+
+      const int32_t expectedResX = int32_t(inputs.backBufferWidth);
+      const int32_t expectedResY = int32_t(inputs.backBufferHeight);
+      const int32_t expectedFullscreen = inputs.windowed ? 0 : 1;
+
+      const auto isRejected = [&](uintptr_t address) {
+        return std::find(rejectedCandidates.begin(), rejectedCandidates.end(), address) !=
+               rejectedCandidates.end();
+      };
+
+      for (const SectionCopy& section : dataSections) {
+        const uint8_t* bytes = section.bytes.data();
+        const size_t length = section.bytes.size();
+
+        if (inputs.forcedScreenPercentageRva != 0) {
+          const uintptr_t forcedAddress = base + inputs.forcedScreenPercentageRva;
+          if (forcedAddress < section.address ||
+              forcedAddress + kUe3UpscaleFromScreenPercentage + sizeof(int32_t) >
+                section.address + length)
+            continue;
+
+          const size_t offset = size_t(forcedAddress - section.address);
+          // A pinned address the probe already disproved is not worth retrying.
+          if (isRejected(forcedAddress))
+            continue;
+
+          Candidate candidate;
+          candidate.section = &section;
+          candidate.offset = offset;
+          candidate.strictTail = ngxLooksLikeSettingsRecordTail(bytes + offset, length - offset);
+          candidate.screenPercentage = ngxReadFloat(bytes + offset);
+          candidate.upscale = ngxReadInt32(bytes + offset + kUe3UpscaleFromScreenPercentage);
+          if (candidate.strictTail) {
+            candidate.maxMultisamples =
+              ngxReadInt32(bytes + offset + kUe3MaxMultisamplesFromScreenPercentage);
+          }
+          candidates.push_back(candidate);
+          continue;
+        }
+
+        for (size_t resOffset = 0; resOffset + 2 * sizeof(int32_t) <= length;
+             resOffset += sizeof(int32_t)) {
+          if (ngxReadInt32(bytes + resOffset) != expectedResX ||
+              ngxReadInt32(bytes + resOffset + sizeof(int32_t)) != expectedResY)
+            continue;
+
+          // Strict stock layout first: ScreenPercentage sits two dwords ahead of ResX, with
+          // bFullscreen and MaxMultiSamples behind ResY.
+          if (resOffset >= kUe3ResXFromScreenPercentage) {
+            const size_t offset = resOffset - kUe3ResXFromScreenPercentage;
+            if (ngxLooksLikeSettingsRecordTail(bytes + offset, length - offset) &&
+                !isRejected(section.address + offset)) {
+              Candidate candidate;
+              candidate.section = &section;
+              candidate.offset = offset;
+              candidate.strictTail = true;
+              candidate.screenPercentage = ngxReadFloat(bytes + offset);
+              candidate.upscale = ngxReadInt32(bytes + offset + kUe3UpscaleFromScreenPercentage);
+              candidate.maxMultisamples =
+                ngxReadInt32(bytes + offset + kUe3MaxMultisamplesFromScreenPercentage);
+              // Borderless windowed makes the engine's own idea of fullscreen disagree with
+              // D3D9's, so agreement raises confidence rather than gating the candidate.
+              candidate.fullscreenAgrees =
+                ngxReadInt32(bytes + offset + kUe3FullscreenFromScreenPercentage) ==
+                expectedFullscreen;
+              if (candidates.size() < kMaxCandidates)
+                candidates.push_back(candidate);
+              continue;
+            }
+          }
+
+          // Relaxed pass for builds that do not use the stock tail adjacency: only the
+          // ScreenPercentage/bUpscaleScreenPercentage pair itself is required, and the probe
+          // carries the burden of proof.
+          for (uint32_t back = kUe3ResXFromScreenPercentage + sizeof(int32_t);
+               back <= kUe3ResXFromScreenPercentage + kUe3MaxRelaxedScreenPercentageBacktrack &&
+               relaxedCandidates.size() < kMaxCandidates;
+               back += sizeof(int32_t)) {
+            if (resOffset < back)
+              break;
+            const size_t offset = resOffset - back;
+            const int32_t upscale = ngxReadInt32(bytes + offset + kUe3UpscaleFromScreenPercentage);
+            if (!ngxIsPlausibleScreenPercentage(ngxReadFloat(bytes + offset)) ||
+                (upscale != 0 && upscale != 1) ||
+                isRejected(section.address + offset))
+              continue;
+
+            Candidate candidate;
+            candidate.section = &section;
+            candidate.offset = offset;
+            candidate.screenPercentage = ngxReadFloat(bytes + offset);
+            candidate.upscale = upscale;
+            relaxedCandidates.push_back(candidate);
+          }
+        }
+      }
+
+      if (candidates.empty())
+        candidates = std::move(relaxedCandidates);
+
+      if (candidates.empty()) {
+        outSettings.missReason =
+          "no FSystemSettings record in writable data matched the live resolution";
+        return NgxLocateResult::Miss;
+      }
+
+      std::vector<SectionCopy> executableSections;
+      if (!readSections(true, executableSections))
+        return NgxLocateResult::Incomplete;
+
+      // ---- Scoring: structural repeats and the optional ini cross-check --------------------
+      for (Candidate& candidate : candidates) {
+        const uint8_t* bytes = candidate.section->bytes.data();
+        const size_t length = candidate.section->bytes.size();
+
+        candidate.score = (candidate.strictTail ? 100 : 0) +
+                          (candidate.fullscreenAgrees ? 20 : 0);
+
+        // FSystemSettings embeds Defaults[FSL_LevelCount] behind the live record, so the tail
+        // shape repeats at a constant stride equal to sizeof(FSystemSettingsData).
+        uint32_t bestStride = 0;
+        uint32_t bestRepeats = 0;
+        if (candidate.strictTail) {
+          // Bounded: the pairwise stride search below is quadratic in the number of hits.
+          constexpr size_t kMaxTailHits = 64;
+          std::vector<size_t> tailHits;
+          const size_t searchEnd =
+            std::min(length, candidate.offset + kUe3DefaultsSearchWindow);
+          for (size_t offset = candidate.offset + sizeof(int32_t);
+               offset + kUe3SettingsDataTailSize <= searchEnd && tailHits.size() < kMaxTailHits;
+               offset += sizeof(int32_t)) {
+            if (ngxLooksLikeSettingsRecordTail(bytes + offset, length - offset))
+              tailHits.push_back(offset);
+          }
+
+          for (size_t i = 0; i < tailHits.size(); i++) {
+            for (size_t j = i + 1; j < tailHits.size(); j++) {
+              const size_t stride = tailHits[j] - tailHits[i];
+              if (stride < kUe3MinSettingsDataSize || stride > kUe3MaxSettingsDataSize)
+                continue;
+
+              uint32_t repeats = 1;
+              for (size_t next = tailHits[j] + stride;
+                   next + kUe3SettingsDataTailSize <= searchEnd; next += stride) {
+                if (!ngxLooksLikeSettingsRecordTail(bytes + next, length - next))
+                  break;
+                repeats++;
+              }
+
+              if (repeats > bestRepeats) {
+                bestRepeats = repeats;
+                bestStride = uint32_t(stride);
+              }
+            }
+          }
+        }
+
+        if (bestRepeats >= kUe3MinDefaultsRepeats) {
+          candidate.defaultsStride = bestStride;
+          candidate.defaultsRepeats = bestRepeats;
+          candidate.score += 20 * int32_t(std::min<uint32_t>(bestRepeats, 5u));
+        }
+
+        const NgxIniSystemSettings& ini = inputs.ini;
+        if (ini.found) {
+          if (ini.hasScreenPercentage &&
+              std::fabs(ini.screenPercentage - candidate.screenPercentage) < 0.01f)
+            candidate.score += 50;
+          if (ini.hasUpscale && ini.upscale == candidate.upscale)
+            candidate.score += 15;
+          if (candidate.strictTail && ini.hasMaxMultisamples &&
+              ini.maxMultisamples == candidate.maxMultisamples)
+            candidate.score += 25;
+        }
+      }
+
+      std::stable_sort(candidates.begin(), candidates.end(),
+                       [](const Candidate& a, const Candidate& b) {
+                         return a.score > b.score;
+                       });
+
+      const Candidate& chosen = candidates.front();
+      const uint8_t* dataBytes = chosen.section->bytes.data();
+      const size_t dataLength = chosen.section->bytes.size();
+      const uintptr_t screenPercentageAddress = chosen.section->address + chosen.offset;
+
+      outSettings.screenPercentageAddress = screenPercentageAddress;
+      outSettings.currentScreenPercentage = chosen.screenPercentage;
+      outSettings.currentUpscaleScreenPercentage = chosen.upscale;
+      outSettings.currentMaxMultisamples = chosen.maxMultisamples;
+      outSettings.settingsDataStride = chosen.defaultsStride;
+      outSettings.defaultsRepeats = chosen.defaultsRepeats;
+      outSettings.strictTailLayout = chosen.strictTail;
+      outSettings.iniConfirmed =
+        inputs.ini.found && inputs.ini.hasScreenPercentage &&
+        std::fabs(inputs.ini.screenPercentage - chosen.screenPercentage) < 0.01f;
+
+      // ---- Code scan ----------------------------------------------------------------------
+      const uint32_t screenPercentageOperand = uint32_t(screenPercentageAddress);
+      const uint32_t upscaleOperand =
+        uint32_t(screenPercentageAddress + kUe3UpscaleFromScreenPercentage);
+
+      struct AbsoluteSite {
+        uintptr_t address = 0;
+        uint32_t original = 0;
+        bool upscale = false;
+      };
+      std::vector<AbsoluteSite> absoluteSites;
+      std::vector<uintptr_t> seedAddresses;
+
+      struct RelativeWindow {
+        uint32_t structOffset = 0;
+        NgxOperandSite floatSite;
+        NgxOperandSite intSite;
+      };
+      std::vector<RelativeWindow> relativeWindows;
+      constexpr size_t kRelativePairWindow = 48;
+
+      // Two float reads in one function can pair with the same integer read, so sites are
+      // deduplicated by address rather than trusting one entry per match.
+      const auto appendUniqueSite = [](std::vector<NgxOperandSite>& sites,
+                                       const NgxOperandSite& site) {
+        for (const NgxOperandSite& existing : sites) {
+          if (existing.address == site.address)
             return;
         }
-        sites.push_back({ address, original });
+        sites.push_back(site);
       };
 
-      const auto bytesAt = [&](uintptr_t address, size_t length)
-          -> const uint8_t* {
-        for (const ExecutableSectionCopy& section : executableSections) {
-          if (address >= section.address &&
-              address - section.address <= section.bytes.size() &&
-              length <= section.bytes.size() - size_t(address - section.address))
-            return section.bytes.data() + (address - section.address);
-        }
-        return nullptr;
-      };
-
-      // Full instruction context at fixed offsets establishes the secondary boundaries;
-      // branch bytes are intentionally ignored.
-      if (scaleViewportInstruction < 0x390)
-        return NgxLocateResult::Miss;
-      const uintptr_t needsUpscaleInstruction =
-        scaleViewportInstruction - 0x390;
-      const uintptr_t computeUpscaleInstruction =
-        scaleViewportInstruction + 0x100;
-      const uint8_t* needsUpscale =
-        bytesAt(needsUpscaleInstruction, 27);
-      const uint8_t* computeUpscale =
-        bytesAt(computeUpscaleInstruction, 56);
-      if (needsUpscale == nullptr || computeUpscale == nullptr)
-        return NgxLocateResult::Miss;
-
-      uint32_t needsUpscaleDisplacement = 0;
-      uint32_t needsScreenPercentageDisplacement = 0;
-      uint32_t needsConst100Address = 0;
-      std::memcpy(&needsUpscaleDisplacement, needsUpscale + 2,
-                  sizeof(needsUpscaleDisplacement));
-      std::memcpy(&needsConst100Address, needsUpscale + 13,
-                  sizeof(needsConst100Address));
-      std::memcpy(&needsScreenPercentageDisplacement, needsUpscale + 20,
-                  sizeof(needsScreenPercentageDisplacement));
-      const bool needsUpscaleValid =
-        needsUpscale[0] == 0x83 && needsUpscale[1] == 0xB9 &&
-        needsUpscale[6] == 0x00 &&
-        needsUpscaleDisplacement ==
-          kUe3UpscaleScreenPercentageFromSystemSettings &&
-        needsUpscale[9] == 0xF3 && needsUpscale[10] == 0x0F &&
-        needsUpscale[11] == 0x10 && needsUpscale[12] == 0x05 &&
-        needsConst100Address == validatedConst100Address &&
-        needsUpscale[17] == 0x0F && needsUpscale[18] == 0x2F &&
-        needsUpscale[19] == 0x81 &&
-        needsScreenPercentageDisplacement ==
-          kUe3ScreenPercentageFromSystemSettings;
-
-      uint32_t computeUpscaleDisplacement = 0;
-      uint32_t computeScreenPercentageDisplacement = 0;
-      uint32_t computeConst100Address = 0;
-      uint32_t computeDirectScreenPercentageAddress = 0;
-      std::memcpy(&computeUpscaleDisplacement, computeUpscale + 3,
-                  sizeof(computeUpscaleDisplacement));
-      std::memcpy(&computeConst100Address, computeUpscale + 18,
-                  sizeof(computeConst100Address));
-      std::memcpy(&computeScreenPercentageDisplacement,
-                  computeUpscale + 25,
-                  sizeof(computeScreenPercentageDisplacement));
-      std::memcpy(&computeDirectScreenPercentageAddress,
-                  computeUpscale + 0x34,
-                  sizeof(computeDirectScreenPercentageAddress));
-      const bool computeUpscaleValid =
-        computeUpscale[0] == 0x51 &&
-        computeUpscale[1] == 0x83 && computeUpscale[2] == 0xB9 &&
-        computeUpscale[7] == 0x00 &&
-        computeUpscaleDisplacement ==
-          kUe3UpscaleScreenPercentageFromSystemSettings &&
-        computeUpscale[14] == 0xF3 && computeUpscale[15] == 0x0F &&
-        computeUpscale[16] == 0x10 && computeUpscale[17] == 0x05 &&
-        computeConst100Address == validatedConst100Address &&
-        computeUpscale[22] == 0x0F && computeUpscale[23] == 0x2F &&
-        computeUpscale[24] == 0x81 &&
-        computeScreenPercentageDisplacement ==
-          kUe3ScreenPercentageFromSystemSettings &&
-        computeUpscale[0x30] == 0xF3 &&
-        computeUpscale[0x31] == 0x0F &&
-        computeUpscale[0x32] == 0x10 &&
-        computeUpscale[0x33] == 0x05 &&
-        computeDirectScreenPercentageAddress == screenPercentageAddress;
-      if (!needsUpscaleValid || !computeUpscaleValid)
-        return NgxLocateResult::Miss;
-
-      appendUnique(outSettings.directScreenPercentageSites,
-                   scaleViewportInstruction + 4, screenPercentageAddress);
-      appendUnique(outSettings.directScreenPercentageSites,
-                   computeUpscaleInstruction + 0x34,
-                   screenPercentageAddress);
-      appendUnique(outSettings.relativeUpscaleScreenPercentageSites,
-                   needsUpscaleInstruction + 2,
-                   needsUpscaleDisplacement);
-      appendUnique(outSettings.relativeScreenPercentageSites,
-                   needsUpscaleInstruction + 20,
-                   needsScreenPercentageDisplacement);
-      appendUnique(outSettings.relativeUpscaleScreenPercentageSites,
-                   computeUpscaleInstruction + 3,
-                   computeUpscaleDisplacement);
-      appendUnique(outSettings.relativeScreenPercentageSites,
-                   computeUpscaleInstruction + 25,
-                   computeScreenPercentageDisplacement);
-
-      // Optional >100%-only cave readers remain stock: NGX never drives above 100, and their
-      // WRITECOPY pages cannot reliably regain their original protection after modification.
-      for (const ExecutableSectionCopy& section : executableSections) {
+      for (const SectionCopy& section : executableSections) {
         const uint8_t* bytes = section.bytes.data();
-        const size_t scanLen = section.bytes.size();
-        for (size_t off = 0; off + 23 <= scanLen; off++) {
-          if (bytes[off + 0] != 0xF3 || bytes[off + 1] != 0x0F ||
-              bytes[off + 2] != 0x10 || bytes[off + 3] != 0x05)
-            continue;
+        const size_t length = section.bytes.size();
 
+        for (size_t offset = 0; offset + sizeof(uint32_t) <= length; offset++) {
           uint32_t operand = 0;
-          std::memcpy(&operand, bytes + off + 4, sizeof(operand));
-          const uintptr_t operandAddress = section.address + off + 4;
-          if (operand != screenPercentageAddress ||
-              operandAddress == scaleViewportInstruction + 4 ||
-              operandAddress == computeUpscaleInstruction + 0x34)
-            continue;
+          std::memcpy(&operand, bytes + offset, sizeof(operand));
 
-          if (bytes[off + 8] != 0xF3 || bytes[off + 9] != 0x0F ||
-              bytes[off + 10] != 0x59 || bytes[off + 11] != 0x05 ||
-              bytes[off + 16] != 0x0F || bytes[off + 17] != 0x2F ||
-              bytes[off + 18] != 0x05)
-            return NgxLocateResult::Miss;
-
-          uint32_t const001Address = 0;
-          uint32_t const1Address = 0;
-          std::memcpy(&const001Address, bytes + off + 12,
-                      sizeof(const001Address));
-          std::memcpy(&const1Address, bytes + off + 19,
-                      sizeof(const1Address));
-          float const001 = 0.0f;
-          float const1 = 0.0f;
-          if (!ngxReadProcessExact(proc, uintptr_t(const001Address),
-                                   const001) ||
-              !ngxReadProcessExact(proc, uintptr_t(const1Address), const1) ||
-              const001 != 0.01f || const1 != 1.0f)
-            return NgxLocateResult::Miss;
-
-          outSettings.over100CaveReaderCount++;
+          if (operand == screenPercentageOperand &&
+              ngxIsAbsoluteFloatReadSite(bytes, offset)) {
+            if (ngxReadsPercentScaleConstantNearby(proc, bytes, offset, length))
+              seedAddresses.push_back(section.address + offset);
+            if (absoluteSites.size() < kNgxMaxRawOperandSites)
+              absoluteSites.push_back({ section.address + offset, operand, false });
+          } else if (operand == upscaleOperand && ngxIsAbsoluteIntReadSite(bytes, offset)) {
+            if (absoluteSites.size() < kNgxMaxRawOperandSites)
+              absoluteSites.push_back({ section.address + offset, operand, true });
+          }
         }
       }
 
-      if (outSettings.directScreenPercentageSites.size() != 2 ||
-          (outSettings.over100CaveReaderCount != 0 &&
-           outSettings.over100CaveReaderCount != 2) ||
-          (outSettings.over100CaveReaderCount == 2 &&
-           outSettings.currentScreenPercentage > 100.0f))
+      // Without a scale-factor conversion there is no renderer-facing reader to redirect, and
+      // patching the copies alone would corrupt whatever they feed.
+      if (seedAddresses.empty()) {
+        outSettings.missReason =
+          "the record was found but no code converts ScreenPercentage into a scale factor";
         return NgxLocateResult::Miss;
+      }
 
-      // Match only the two resource-creation readers; the settings-sync reader stays real.
-      const uint32_t rtMaxMultisamples32 = uint32_t(rtMaxMultisamplesAddress);
-      constexpr uint8_t kMsaaReaderContextA[] = {
-        0x33, 0xFF, 0x3B, 0xC2,
-        0xC7, 0x44, 0x24, 0x28, 0x03, 0x00, 0x00, 0x00,
-        0x8B, 0xF2, 0x0F, 0x86,
-      };
-      constexpr uint8_t kMsaaReaderContextB[] = {
-        0x8B, 0x44, 0x24, 0x48,
-        0x33, 0xF6, 0x33, 0xFF, 0x83, 0xF9, 0x01,
+      const auto nearSeed = [&](uintptr_t address) {
+        for (const uintptr_t seed : seedAddresses) {
+          const uintptr_t distance = address > seed ? address - seed : seed - address;
+          if (distance <= kNgxSettingsCodeClusterRadius)
+            return true;
+        }
+        return false;
       };
 
-      for (const ExecutableSectionCopy& section : executableSections) {
+      for (const AbsoluteSite& site : absoluteSites) {
+        if (!nearSeed(site.address))
+          continue;
+        appendUniqueSite(site.upscale ? outSettings.directUpscaleScreenPercentageSites
+                                      : outSettings.directScreenPercentageSites,
+                         { site.address, site.original });
+      }
+
+      // Without ScaleScreenCoords' absolute reader nothing can shrink the view.
+      if (outSettings.directScreenPercentageSites.empty() ||
+          outSettings.directScreenPercentageSites.size() > kNgxMaxOperandSites ||
+          outSettings.directUpscaleScreenPercentageSites.size() > kNgxMaxOperandSites) {
+        outSettings.missReason = "no usable absolute ScreenPercentage readers";
+        return NgxLocateResult::Miss;
+      }
+
+      // FSystemSettings::NeedsUpscale() reads both fields through `this`, and
+      // UnScaleScreenCoords provably inlines it right beside an absolute ScreenPercentage read.
+      // So the engine's own displacement is simply the one that appears next to a seed - which
+      // is what identifies GSystemSettings without having to recognise the *head* of the
+      // record. The head is the part that genuinely varies: the FSystemSettingsData sub-struct
+      // split (DetailMode followed by a run of UBOOLs) only exists in later UE3 versions, and
+      // Mirror's Edge predates it.
+      for (const SectionCopy& section : executableSections) {
         const uint8_t* bytes = section.bytes.data();
-        const size_t scanLen = section.bytes.size();
-        for (size_t off = 0; off + sizeof(uint32_t) <= scanLen; off++) {
-          uint32_t operand = 0;
-          std::memcpy(&operand, bytes + off, sizeof(operand));
-          if (operand != rtMaxMultisamples32)
+        const size_t length = section.bytes.size();
+
+        for (const uintptr_t seed : seedAddresses) {
+          if (seed < section.address || seed - section.address >= length)
             continue;
 
-          const bool readerA =
-            off >= 1 && bytes[off - 1] == 0xA1 &&
-            off + sizeof(uint32_t) + sizeof(kMsaaReaderContextA) <= scanLen &&
-            std::memcmp(bytes + off + sizeof(uint32_t),
-                        kMsaaReaderContextA,
-                        sizeof(kMsaaReaderContextA)) == 0;
-          const bool readerB =
-            off >= 2 && bytes[off - 2] == 0x8B &&
-            bytes[off - 1] == 0x0D &&
-            off + sizeof(uint32_t) + sizeof(kMsaaReaderContextB) <= scanLen &&
-            std::memcmp(bytes + off + sizeof(uint32_t),
-                        kMsaaReaderContextB,
-                        sizeof(kMsaaReaderContextB)) == 0;
-          if (!readerA && !readerB)
-            continue;
+          const size_t seedOffset = size_t(seed - section.address);
+          const size_t begin = seedOffset > kNgxSettingsCodeClusterRadius
+            ? seedOffset - kNgxSettingsCodeClusterRadius
+            : 0;
+          const size_t end = std::min(length, seedOffset + kNgxSettingsCodeClusterRadius);
 
-          appendUnique(outSettings.directRtMaxMultisamplesSites,
-                       section.address + off, operand);
+          for (size_t offset = begin;
+               offset < end && relativeWindows.size() < kNgxMaxOperandSites; offset++) {
+            const NgxRelativeOperand decoded = ngxDecodeRelativeRead(bytes, offset, length);
+            if (!decoded.valid || !decoded.isFloat ||
+                decoded.displacement < kUe3MinSettingsDataSize ||
+                decoded.displacement > kUe3MaxSettingsDataSize ||
+                decoded.displacement > chosen.offset)
+              continue;
+
+            const uintptr_t floatSiteAddress = section.address + decoded.operandOffset;
+            bool alreadyKnown = false;
+            for (const RelativeWindow& window : relativeWindows)
+              alreadyKnown |= window.floatSite.address == floatSiteAddress;
+            if (alreadyKnown)
+              continue;
+
+            const size_t pairBegin = offset > kRelativePairWindow ? offset - kRelativePairWindow : 0;
+            const size_t pairEnd = std::min(length, offset + kRelativePairWindow);
+            for (size_t pairOffset = pairBegin; pairOffset < pairEnd; pairOffset++) {
+              const NgxRelativeOperand paired = ngxDecodeRelativeRead(bytes, pairOffset, length);
+              if (!paired.valid || paired.isFloat ||
+                  paired.baseRegister != decoded.baseRegister ||
+                  paired.displacement != decoded.displacement + kUe3UpscaleFromScreenPercentage)
+                continue;
+
+              relativeWindows.push_back({
+                decoded.displacement,
+                { floatSiteAddress, decoded.displacement },
+                { section.address + paired.operandOffset, paired.displacement },
+              });
+              break;
+            }
+          }
         }
       }
 
-      const bool msaaValuesPlausible =
-        outSettings.currentMaxMultisamples >= 0 &&
-        outSettings.currentMaxMultisamples <= kUe3MaxMultisamplesPlausibleLimit &&
-        outSettings.currentRtMaxMultisamples >= 0 &&
-        outSettings.currentRtMaxMultisamples <= kUe3MaxMultisamplesPlausibleLimit;
+      // The displacement backed by the most windows wins; the Defaults[] stride and the record
+      // head (when this engine version has one) are independent derivations that break ties.
+      const uint32_t strideDerivedOffset =
+        chosen.defaultsStride > kUe3SettingsDataTailSize
+          ? chosen.defaultsStride - kUe3SettingsDataTailSize
+          : 0;
+      uint32_t bestStructOffset = 0;
+      size_t bestWindowCount = 0;
+      int32_t bestTieBreak = -1;
+      for (const RelativeWindow& candidateWindow : relativeWindows) {
+        const uint32_t structOffset = candidateWindow.structOffset;
+        size_t count = 0;
+        for (const RelativeWindow& window : relativeWindows)
+          count += window.structOffset == structOffset ? 1 : 0;
 
-      outSettings.msaaReadersValid =
-        msaaValuesPlausible &&
-        outSettings.directRtMaxMultisamplesSites.size() == 2;
-      if (!outSettings.msaaReadersValid)
-        outSettings.directRtMaxMultisamplesSites.clear();
+        const size_t headOffset = chosen.offset - structOffset;
+        const int32_t tieBreak =
+          (structOffset == strideDerivedOffset ? 2 : 0) +
+          (ngxLooksLikeSettingsRecordHead(dataBytes + headOffset, dataLength - headOffset) ? 1 : 0);
+
+        if (count > bestWindowCount ||
+            (count == bestWindowCount && tieBreak > bestTieBreak)) {
+          bestWindowCount = count;
+          bestTieBreak = tieBreak;
+          bestStructOffset = structOffset;
+        }
+      }
+
+      if (bestWindowCount != 0 && bestStructOffset <= chosen.offset) {
+        outSettings.screenPercentageStructOffset = bestStructOffset;
+        outSettings.systemSettingsAddress = screenPercentageAddress - bestStructOffset;
+        for (const RelativeWindow& window : relativeWindows) {
+          if (window.structOffset != bestStructOffset)
+            continue;
+          appendUniqueSite(outSettings.relativeScreenPercentageSites, window.floatSite);
+          appendUniqueSite(outSettings.relativeUpscaleScreenPercentageSites, window.intSite);
+        }
+      }
 
       return NgxLocateResult::Found;
     }
@@ -12643,17 +13539,136 @@ namespace dxvk {
     m_ngxPassthroughBootstrapped = true;
   }
 
+  bool D3D9Rtx::ngxRuntimeOwnsUpscale() const {
+    return m_ngxGameSettingsRedirectsValid && m_ngxRuntimeOwnedUpscale;
+  }
+
+  void D3D9Rtx::mirrorNgxLiveScreenPercentage() {
+    float liveScreenPercentage = 0.0f;
+    int32_t liveUpscale = 0;
+    bool rollbackVerified = true;
+    const bool mirrored =
+      ngxReadProcessExact(m_ngxGameProcess, m_ngxScreenPercentageRemoteAddr,
+                          liveScreenPercentage) &&
+      ngxReadProcessExact(m_ngxGameProcess,
+                          m_ngxScreenPercentageRemoteAddr + sizeof(float),
+                          liveUpscale) &&
+      ngxUpdateScreenPercentageShadow(
+        m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
+        liveScreenPercentage, liveUpscale, &rollbackVerified);
+
+    if (!mirrored) {
+      ONCE(Logger::warn("[RTX NGX Passthrough] Could not mirror the game's live "
+                        "ScreenPercentage/UpscaleScreenPercentage into the renderer shadow; "
+                        "retaining the last effective values."));
+      if (!rollbackVerified) {
+        ONCE(Logger::err("[RTX NGX Passthrough] ScreenPercentage shadow rollback could "
+                         "not be verified after the failed update."));
+      }
+    } else {
+      if (m_ngxScreenPercentageDriven) {
+        Logger::info(str::format(
+          "[RTX NGX Passthrough] ScreenPercentage override released; renderer follows the "
+          "game's live value ", liveScreenPercentage, " (UpscaleScreenPercentage ",
+          liveUpscale, ")."));
+      }
+      m_ngxScreenPercentageDriven = false;
+      m_ngxScreenPercentageLastLogged = 0.0f;
+    }
+
+    m_ngxGameScreenPercentage =
+      (mirrored && m_frameOptions.ngxPassthroughMode &&
+       std::isfinite(liveScreenPercentage) && liveScreenPercentage > 0.0f)
+        ? liveScreenPercentage
+        : 0.0f;
+  }
+
+  bool D3D9Rtx::writeNgxScreenPercentageShadow(float screenPercentage) {
+    // Engine-owned upscale needs NeedsUpscale() to agree with the reduced view. When the
+    // relative readers are unavailable the flag is pinned off instead, so any inlined copy of
+    // NeedsUpscale() agrees with the out-of-line one - which still reads the game's own,
+    // untouched values and therefore reports no upscale.
+    const int32_t upscale = m_ngxRuntimeOwnedUpscale ? 0 : 1;
+
+    bool rollbackVerified = true;
+    if (ngxUpdateScreenPercentageShadow(
+          m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
+          screenPercentage, upscale, &rollbackVerified))
+      return true;
+
+    ONCE(Logger::warn("[RTX NGX Passthrough] Could not transactionally update the "
+                      "renderer-isolated ScreenPercentage shadow; it will be retried."));
+    if (!rollbackVerified) {
+      ONCE(Logger::err("[RTX NGX Passthrough] ScreenPercentage shadow rollback could "
+                       "not be verified after the failed update."));
+    }
+    return false;
+  }
+
+  void D3D9Rtx::updateNgxSettingsProbe() {
+    if (m_ngxSettingsProbeState != NgxSettingsProbeState::Pending)
+      return;
+
+    const uint32_t backBufferWidth =
+      m_activePresentParams.has_value() ? m_activePresentParams->BackBufferWidth : 0;
+    const uint32_t backBufferHeight =
+      m_activePresentParams.has_value() ? m_activePresentParams->BackBufferHeight : 0;
+
+    if (backBufferWidth != 0 && backBufferHeight != 0 && m_ngxSceneViewportValid) {
+      const int32_t expectedWidth =
+        int32_t(float(backBufferWidth) * m_ngxSettingsProbeValue / 100.0f);
+      const int32_t expectedHeight =
+        int32_t(float(backBufferHeight) * m_ngxSettingsProbeValue / 100.0f);
+      const int32_t widthError = int32_t(m_ngxSceneViewport.Width) - expectedWidth;
+      const int32_t heightError = int32_t(m_ngxSceneViewport.Height) - expectedHeight;
+
+      if (widthError >= -kNgxScreenPercentageProbeTolerance &&
+          widthError <= kNgxScreenPercentageProbeTolerance &&
+          heightError >= -kNgxScreenPercentageProbeTolerance &&
+          heightError <= kNgxScreenPercentageProbeTolerance) {
+        m_ngxSettingsProbeState = NgxSettingsProbeState::Confirmed;
+        Logger::info(str::format(
+          "[RTX NGX Passthrough] Game settings redirects confirmed: driving ",
+          m_ngxSettingsProbeValue, "% produced a ", m_ngxSceneViewport.Width, "x",
+          m_ngxSceneViewport.Height, " scene viewport. Upscale owner: ",
+          (m_ngxRuntimeOwnedUpscale ? "runtime." : "engine.")));
+        return;
+      }
+    }
+
+    if (m_ue3FrameCounter - m_ngxSettingsProbeStartFrame < kNgxScreenPercentageProbeFrames)
+      return;
+
+    Logger::warn(str::format(
+      "[RTX NGX Passthrough] The candidate ScreenPercentage at 0x", std::hex,
+      m_ngxScreenPercentageRemoteAddr, std::dec, " did not move the game's scene viewport within ",
+      kNgxScreenPercentageProbeFrames, " frames; rejecting it."));
+
+    m_ngxSettingsProbeState = NgxSettingsProbeState::Failed;
+    m_ngxRejectedSettingsCandidates.push_back(m_ngxScreenPercentageRemoteAddr);
+    restoreNgxGameSettingsRedirects();
+
+    // Only a clean rollback leaves the process in a state where another candidate can be tried.
+    constexpr size_t kMaxRejectedCandidates = 4;
+    if (m_ngxGameSettingsShadowRemoteAddr == 0 &&
+        m_ngxRejectedSettingsCandidates.size() < kMaxRejectedCandidates) {
+      if (m_ngxGameProcessOwned && m_ngxGameProcess != nullptr)
+        ::CloseHandle(m_ngxGameProcess);
+      m_ngxGameProcess = nullptr;
+      m_ngxGameProcessOwned = false;
+      m_ngxGameProcessId = 0;
+      m_ngxScreenPercentageRemoteAddr = 0;
+      m_ngxGameScreenPercentage = 0.0f;
+      m_ngxScreenPercentageScanDone = false;
+      m_ngxSettingsProbeState = NgxSettingsProbeState::Idle;
+    } else {
+      m_ngxScreenPercentageScanDone = true;
+    }
+  }
+
   void D3D9Rtx::applyNgxPassthroughScreenPercentage() {
     const bool driving = m_frameOptions.ngxPassthroughMode &&
                          RtxNgxPassthrough::driveGameScreenPercentage();
-
-    // Rendering without ResetSwapChain has missed the safe MSAA setup window.
-    if (!m_ngxMsaaSetupDecisionCaptured &&
-        m_frameOptions.ngxPassthroughMode) {
-      m_ngxMsaaSetupDecisionCaptured = true;
-      m_ngxMsaaOverrideRequestedAtSetup =
-        RtxNgxPassthrough::disableGameMsaa();
-    }
 
     // The camera gate needs ScreenPercentage even when automatic driving is disabled.
     if (m_ngxScreenPercentageRemoteAddr == 0 && !m_ngxScreenPercentageScanDone &&
@@ -12673,104 +13688,13 @@ namespace dxvk {
     }
 
     // A retained partial transaction is mirrored but never driven.
-    if (!m_ngxGameSettingsRedirectsValid) {
-      float liveScreenPercentage = 0.0f;
-      int32_t liveUpscale = 0;
-      int32_t liveRtMaxMultisamples = 0;
-      const bool screenValuesRead =
-        ngxReadProcessExact(m_ngxGameProcess,
-                            m_ngxScreenPercentageRemoteAddr,
-                            liveScreenPercentage) &&
-        ngxReadProcessExact(m_ngxGameProcess,
-                            m_ngxScreenPercentageRemoteAddr + sizeof(float),
-                            liveUpscale);
-      bool screenRollbackVerified = true;
-      const bool screenShadowUpdated =
-        screenValuesRead &&
-        ngxUpdateScreenPercentageShadow(
-          m_ngxGameProcess,
-          m_ngxGameSettingsShadowRemoteAddr,
-          liveScreenPercentage, liveUpscale,
-          &screenRollbackVerified);
-      const bool maxMultisamplesRead =
-        ngxReadProcessExact(
-          m_ngxGameProcess,
-          m_ngxScreenPercentageRemoteAddr +
-            kUe3RtMaxMultisamplesFromScreenPercentage,
-          liveRtMaxMultisamples);
-      const bool maxMultisamplesShadowUpdated =
-        maxMultisamplesRead &&
-        ngxWriteProcessExactRetry(
-          m_ngxGameProcess,
-          m_ngxGameSettingsShadowRemoteAddr +
-            kNgxShadowMaxMultisamplesOffset,
-          liveRtMaxMultisamples);
+    if (!m_ngxGameSettingsRedirectsValid || !driving) {
+      // A probe interrupted by driving being switched off would otherwise run out its frame
+      // budget while nothing is being driven, and reject a candidate it never tested.
+      if (m_ngxSettingsProbeState == NgxSettingsProbeState::Pending)
+        m_ngxSettingsProbeState = NgxSettingsProbeState::Idle;
 
-      if (!screenShadowUpdated || !screenRollbackVerified ||
-          !maxMultisamplesShadowUpdated) {
-        ONCE(Logger::err(
-          "[RTX NGX Passthrough] A partially installed settings redirect could not be "
-          "fully mirrored from the game's live values; automatic driving remains disabled."));
-      }
-      if (screenShadowUpdated &&
-          m_frameOptions.ngxPassthroughMode &&
-          std::isfinite(liveScreenPercentage) &&
-          liveScreenPercentage > 0.0f)
-        m_ngxGameScreenPercentage = liveScreenPercentage;
-      if (!m_frameOptions.ngxPassthroughMode)
-        m_ngxGameScreenPercentage = 0.0f;
-      return;
-    }
-
-    applyNgxPassthroughMsaaDisable();
-
-    if (!driving) {
-      float liveScreenPercentage = 0.0f;
-      int32_t liveUpscale = 0;
-      const bool liveValuesRead =
-        ngxReadProcessExact(m_ngxGameProcess, m_ngxScreenPercentageRemoteAddr,
-                            liveScreenPercentage) &&
-        ngxReadProcessExact(m_ngxGameProcess,
-                            m_ngxScreenPercentageRemoteAddr + sizeof(float),
-                            liveUpscale);
-
-      if (liveValuesRead) {
-        bool rollbackVerified = true;
-        const bool shadowUpdated =
-          ngxUpdateScreenPercentageShadow(
-            m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
-            liveScreenPercentage, liveUpscale,
-            &rollbackVerified);
-        if (!shadowUpdated) {
-          ONCE(Logger::warn("[RTX NGX Passthrough] Could not commit the renderer-isolated "
-                            "ScreenPercentage shadow update; it will be retried next frame."));
-          if (!rollbackVerified) {
-            ONCE(Logger::err("[RTX NGX Passthrough] ScreenPercentage shadow rollback "
-                             "could not be verified after the failed update."));
-          }
-        } else {
-          if (m_frameOptions.ngxPassthroughMode &&
-              std::isfinite(liveScreenPercentage) &&
-              liveScreenPercentage > 0.0f)
-            m_ngxGameScreenPercentage = liveScreenPercentage;
-
-          if (m_ngxScreenPercentageDriven) {
-            Logger::info(str::format(
-              "[RTX NGX Passthrough] ScreenPercentage override released; renderer follows the "
-              "game's live value ", liveScreenPercentage, " (UpscaleScreenPercentage ",
-              liveUpscale, ")."));
-          }
-          m_ngxScreenPercentageDriven = false;
-          m_ngxScreenPercentageLastLogged = 0.0f;
-        }
-      } else {
-        ONCE(Logger::warn("[RTX NGX Passthrough] Could not read the game's live "
-                          "ScreenPercentage/UpscaleScreenPercentage; retaining the last "
-                          "effective shadow values."));
-      }
-
-      if (!m_frameOptions.ngxPassthroughMode)
-        m_ngxGameScreenPercentage = 0.0f;
+      mirrorNgxLiveScreenPercentage();
       return;
     }
 
@@ -12783,28 +13707,60 @@ namespace dxvk {
 
     bootstrapNgxPassthroughUpscaler(displayWidth, displayHeight);
 
-    const float screenPercentage = m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough()
+    float screenPercentage = m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough()
       .screenPercentageForDisplay(displayWidth, displayHeight);
+
+    // A title whose composite cannot be separated from its upscale is served by the runtime-owned
+    // path, where the engine's pass runs untouched into the reduced rect. Without that path a
+    // reduced resolution either loses the game's grade or leaves a bordered image, so the only
+    // correct answer left is full resolution.
+    if (m_ngxEngineCompositeUnsafe && !ngxRuntimeOwnsUpscale()) {
+      screenPercentage = 100.0f;
+    }
+
     if (!std::isfinite(screenPercentage) || screenPercentage <= 0.0f) {
       ONCE(Logger::warn("[RTX NGX Passthrough] Upscaler returned an invalid "
                         "ScreenPercentage; retaining the previous effective value."));
       return;
     }
 
-    // Reduced rendering requires the game's upscale gate; at 100 (DLAA) it is a no-op.
-    const int32_t upscaleOn = 1;
-    bool rollbackVerified = true;
-    if (!ngxUpdateScreenPercentageShadow(
-          m_ngxGameProcess, m_ngxGameSettingsShadowRemoteAddr,
-          screenPercentage, upscaleOn, &rollbackVerified)) {
-      ONCE(Logger::warn("[RTX NGX Passthrough] Could not transactionally update the "
-                        "renderer-isolated ScreenPercentage shadow; it will be retried."));
-      if (!rollbackVerified) {
-        ONCE(Logger::err("[RTX NGX Passthrough] ScreenPercentage shadow rollback could "
-                         "not be verified after the failed update."));
+    // Nothing is trusted until the game's own scene viewport has been seen responding to a value
+    // we drove, so the probe has to drive something the game must visibly react to. There is
+    // nothing to prove while the request matches what the game is already using - and probing
+    // then would cost a visible resolution blip for no gain, so keep mirroring until the
+    // selected preset actually asks for something different.
+    if (m_ngxSettingsProbeState == NgxSettingsProbeState::Idle) {
+      if (m_ngxGameScreenPercentage > 0.0f &&
+          std::fabs(screenPercentage - m_ngxGameScreenPercentage) < 0.5f) {
+        mirrorNgxLiveScreenPercentage();
+        return;
       }
-      return;
+
+      m_ngxSettingsProbeState = NgxSettingsProbeState::Pending;
+      m_ngxSettingsProbeStartFrame = m_ue3FrameCounter;
+      // Probing at the target itself avoids a blip whenever the selected preset is reduced.
+      m_ngxSettingsProbeValue = screenPercentage < 90.0f
+        ? screenPercentage
+        : kNgxScreenPercentageProbeValue;
+      Logger::info(str::format(
+        "[RTX NGX Passthrough] Verifying the game-settings redirects by driving ",
+        m_ngxSettingsProbeValue, "%."));
     }
+
+    if (m_ngxSettingsProbeState == NgxSettingsProbeState::Pending) {
+      updateNgxSettingsProbe();
+      if (m_ngxSettingsProbeState == NgxSettingsProbeState::Pending) {
+        if (writeNgxScreenPercentageShadow(m_ngxSettingsProbeValue))
+          m_ngxGameScreenPercentage = m_ngxSettingsProbeValue;
+        return;
+      }
+    }
+
+    if (m_ngxSettingsProbeState != NgxSettingsProbeState::Confirmed)
+      return;
+
+    if (!writeNgxScreenPercentageShadow(screenPercentage))
+      return;
 
     m_ngxScreenPercentageDriven = true;
     m_ngxGameScreenPercentage = screenPercentage;
@@ -12817,43 +13773,21 @@ namespace dxvk {
     }
   }
 
-  void D3D9Rtx::applyNgxPassthroughMsaaDisable() {
-    if (!m_ngxMsaaOverrideLatched)
-      return;
-
-    const uintptr_t shadowAddress =
-      m_ngxGameSettingsShadowRemoteAddr + kNgxShadowMaxMultisamplesOffset;
-    const int32_t msaaDisabled = 0;
-    if (!ngxWriteProcessExactRetry(
-          m_ngxGameProcess, shadowAddress, msaaDisabled)) {
-      ONCE(Logger::warn("[RTX NGX Passthrough] Could not update the renderer-isolated "
-                        "MaxMultisamples shadow; automatic MSAA disabling is unavailable."));
-      return;
-    }
-
-    if (!m_ngxGameMsaaDriven) {
-      m_ngxGameMsaaDriven = true;
-      int32_t gameMaxMultisamples = 0;
-      const bool gameValueRead = ngxReadProcessExact(
-        m_ngxGameProcess,
-        m_ngxScreenPercentageRemoteAddr +
-          kUe3MaxMultisamplesFromScreenPercentage,
-        gameMaxMultisamples);
-      if (!gameValueRead) {
-        Logger::info(
-          "[RTX NGX Passthrough] Effective MaxMultisamples pinned to 0.");
-      } else if (gameMaxMultisamples > 1) {
-        Logger::info(str::format(
-          "[RTX NGX Passthrough] Renderer MSAA disabled for this device: effective "
-          "MaxMultisamples 0 (game setting remains ", gameMaxMultisamples, ")."));
-      } else {
-        Logger::info("[RTX NGX Passthrough] Effective MaxMultisamples pinned to 0 for this "
-                     "device (the game's own MSAA setting was already off).");
-      }
-    }
-  }
-
   void D3D9Rtx::locateNgxPassthroughGameSettings() {
+    // The live resolution is the anchor the whole layout is discovered from, so there is
+    // nothing to look for until the device's present parameters are known.
+    if (!m_activePresentParams.has_value())
+      return;
+
+    NgxGameSettingsScanInputs scanInputs;
+    scanInputs.backBufferWidth = m_activePresentParams->BackBufferWidth;
+    scanInputs.backBufferHeight = m_activePresentParams->BackBufferHeight;
+    scanInputs.windowed = m_activePresentParams->Windowed != FALSE;
+    scanInputs.forcedScreenPercentageRva =
+      uint32_t(std::max(0, RtxNgxPassthrough::systemSettingsScreenPercentageRva()));
+    if (scanInputs.backBufferWidth == 0 || scanInputs.backBufferHeight == 0)
+      return;
+
     // Current process + bridge parent; Incomplete results retry within the budget.
     struct Candidate { HANDLE handle; DWORD pid; bool ownsHandle; };
     std::vector<Candidate> candidates;
@@ -12877,18 +13811,28 @@ namespace dxvk {
     for (const Candidate& candidate : candidates) {
       uintptr_t moduleBase = 0;
       uint32_t moduleSize = 0;
-      if (!ngxGetMainModule(candidate.pid, moduleBase, moduleSize)) {
+      std::wstring modulePath;
+      if (!ngxGetMainModule(candidate.pid, moduleBase, moduleSize, modulePath)) {
         anyIncomplete = true;
         continue;
       }
 
+      scanInputs.ini = ngxCachedIniSystemSettings(modulePath);
+
       NgxLocatedGameSettings located;
       const NgxLocateResult result =
-        ngxLocateGameSettings(candidate.handle, moduleBase, moduleSize, located);
+        ngxLocateGameSettings(candidate.handle, moduleBase, moduleSize, scanInputs,
+                              m_ngxRejectedSettingsCandidates, located);
       if (result == NgxLocateResult::Incomplete)
         anyIncomplete = true;
-      if (result != NgxLocateResult::Found)
+      if (result != NgxLocateResult::Found) {
+        if (result == NgxLocateResult::Miss && candidate.ownsHandle) {
+          ONCE(Logger::info(str::format(
+            "[RTX NGX Passthrough] Game-settings scan of the parent game process found nothing: ",
+            located.missReason, ". Retrying while the engine finishes starting up.")));
+        }
         continue;
+      }
 
       void* shadowMemory =
         ::VirtualAllocEx(candidate.handle, nullptr, sizeof(NgxGameSettingsShadow),
@@ -12905,17 +13849,7 @@ namespace dxvk {
       NgxGameSettingsShadow shadow = {
         located.currentScreenPercentage,
         located.currentUpscaleScreenPercentage,
-        located.currentRtMaxMultisamples,
       };
-      const bool msaaOverrideRequested =
-        m_ngxMsaaOverrideRequestedAtSetup;
-      const bool msaaOverrideAvailable =
-        msaaOverrideRequested &&
-        m_ngxMsaaRedirectSetupAllowed &&
-        located.msaaReadersValid;
-      // MSAA must be primed before the blocked resource-creation call resumes.
-      if (msaaOverrideAvailable)
-        shadow.maxMultisamples = 0;
 
       if (!ngxWriteProcessExact(candidate.handle, shadowAddress, shadow)) {
         ::VirtualFreeEx(candidate.handle, shadowMemory, 0, MEM_RELEASE);
@@ -12923,55 +13857,71 @@ namespace dxvk {
         continue;
       }
 
-      const uintptr_t systemSettingsAddress =
-        located.screenPercentageAddress -
-          kUe3ScreenPercentageFromSystemSettings;
       const uint32_t shadowScreenPercentage =
         uint32_t(shadowAddress + kNgxShadowScreenPercentageOffset);
       const uint32_t shadowUpscaleScreenPercentage =
         uint32_t(shadowAddress + kNgxShadowUpscaleScreenPercentageOffset);
-      const uint32_t shadowMaxMultisamples =
-        uint32_t(shadowAddress + kNgxShadowMaxMultisamplesOffset);
+      // Relative sites keep their [reg+disp32] form; only the displacement moves, so they still
+      // depend on the base register holding GSystemSettings.
       const uint32_t relativeShadowScreenPercentage =
         uint32_t((shadowAddress + kNgxShadowScreenPercentageOffset) -
-                 systemSettingsAddress);
+                 located.systemSettingsAddress);
       const uint32_t relativeShadowUpscaleScreenPercentage =
         uint32_t((shadowAddress + kNgxShadowUpscaleScreenPercentageOffset) -
-                 systemSettingsAddress);
+                 located.systemSettingsAddress);
 
       std::vector<NgxOperandRedirect> redirects;
       redirects.reserve(
         located.directScreenPercentageSites.size() +
+        located.directUpscaleScreenPercentageSites.size() +
         located.relativeScreenPercentageSites.size() +
-        located.relativeUpscaleScreenPercentageSites.size() +
-        located.directRtMaxMultisamplesSites.size());
+        located.relativeUpscaleScreenPercentageSites.size());
 
       for (const NgxOperandSite& site : located.directScreenPercentageSites)
-        redirects.push_back({ site.address, site.original,
-                              shadowScreenPercentage });
-      for (const NgxOperandSite& site : located.relativeScreenPercentageSites)
-        redirects.push_back({ site.address, site.original,
-                              relativeShadowScreenPercentage });
-      for (const NgxOperandSite& site :
-           located.relativeUpscaleScreenPercentageSites)
-        redirects.push_back({ site.address, site.original,
-                              relativeShadowUpscaleScreenPercentage });
-      if (msaaOverrideAvailable) {
-        for (const NgxOperandSite& site :
-             located.directRtMaxMultisamplesSites)
-          redirects.push_back({ site.address, site.original,
-                                shadowMaxMultisamples });
+        redirects.push_back({ site.address, site.original, shadowScreenPercentage,
+                              0, false, false,
+                              NgxOperandCategory::AbsoluteScreenPercentage });
+      for (const NgxOperandSite& site : located.directUpscaleScreenPercentageSites)
+        redirects.push_back({ site.address, site.original, shadowUpscaleScreenPercentage,
+                              0, false, false,
+                              NgxOperandCategory::AbsoluteUpscale });
+      if (located.systemSettingsAddress != 0) {
+        for (const NgxOperandSite& site : located.relativeScreenPercentageSites)
+          redirects.push_back({ site.address, site.original, relativeShadowScreenPercentage,
+                                0, false, false,
+                                NgxOperandCategory::RelativeScreenPercentage });
+        for (const NgxOperandSite& site : located.relativeUpscaleScreenPercentageSites)
+          redirects.push_back({ site.address, site.original, relativeShadowUpscaleScreenPercentage,
+                                0, false, false,
+                                NgxOperandCategory::RelativeUpscale });
       }
 
       std::vector<NgxOperandRedirect> activeRedirects;
       activeRedirects.reserve(redirects.size());
-      bool redirectsApplied = false;
+      NgxOperandApplyResult applyResult;
       {
         NgxScopedThreadSuspension suspended(candidate.pid);
-        if (suspended.complete()) {
-          redirectsApplied =
-            ngxApplyOperandRedirects(candidate.handle, redirects, activeRedirects);
+        if (suspended.complete())
+          applyResult = ngxApplyOperandRedirects(candidate.handle, redirects, activeRedirects);
+        else
+          applyResult.skipped = redirects.size();
+      }
+
+      // Without ScaleScreenCoords' reader nothing can shrink the view, so a set that lost it is
+      // worthless; roll the rest back rather than let the probe spend frames disproving it.
+      const bool redirectsApplied =
+        applyResult.appliedByCategory[size_t(NgxOperandCategory::AbsoluteScreenPercentage)] != 0;
+      if (!redirectsApplied) {
+        for (NgxOperandRedirect& redirect : activeRedirects) {
+          if (!redirect.forceRestore && !ngxRestoreCodeOperand(candidate.handle, redirect))
+            redirect.forceRestore = true;
         }
+        activeRedirects.erase(
+          std::remove_if(activeRedirects.begin(), activeRedirects.end(),
+                         [](const NgxOperandRedirect& redirect) {
+                           return !redirect.forceRestore;
+                         }),
+          activeRedirects.end());
       }
 
       if (!redirectsApplied) {
@@ -13022,7 +13972,7 @@ namespace dxvk {
         m_ngxScreenPercentageScanDone = true;
         Logger::err("[RTX NGX Passthrough] Game-settings operand redirection failed and "
                     "could not be fully rolled back. Effective values remain mirrored from "
-                    "the game, but automatic ScreenPercentage/MSAA driving is disabled.");
+                    "the game, but automatic ScreenPercentage driving is disabled.");
         break;
       }
 
@@ -13034,46 +13984,52 @@ namespace dxvk {
       m_ngxGameSettingsShadowRemoteAddr = shadowAddress;
       m_ngxGameSettingsRedirectsValid = true;
       m_ngxGameScreenPercentage = located.currentScreenPercentage;
-      m_ngxMsaaOverrideLatched = msaaOverrideAvailable;
       m_ngxGameSettingsCodePatches.reserve(activeRedirects.size());
       for (const NgxOperandRedirect& redirect : activeRedirects) {
         m_ngxGameSettingsCodePatches.push_back({
           redirect.address, redirect.original, redirect.redirected,
           redirect.originalProtection,
-          redirect.originalProtectionKnown, false
+          redirect.originalProtectionKnown, redirect.forceRestore
         });
       }
       m_ngxScreenPercentageScanDone = true;
+
+      // FSystemSettings::NeedsUpscale() reads both fields through `this`, so the engine only
+      // keeps its own upscale when that relative pair was redirected as well.
+      m_ngxEngineUpscaleAvailable =
+        applyResult.appliedByCategory[size_t(NgxOperandCategory::RelativeScreenPercentage)] != 0 &&
+        applyResult.appliedByCategory[size_t(NgxOperandCategory::RelativeUpscale)] != 0;
+
+      const int upscaleOwner = RtxNgxPassthrough::screenPercentageUpscaleOwner();
+      m_ngxRuntimeOwnedUpscale = upscaleOwner == 2 || !m_ngxEngineUpscaleAvailable;
+      if (upscaleOwner == 1 && !m_ngxEngineUpscaleAvailable) {
+        Logger::warn(
+          "[RTX NGX Passthrough] screenPercentageUpscaleOwner requests the engine, but its "
+          "NeedsUpscale() readers could not be redirected; the runtime will upscale instead.");
+      }
+
+      m_ngxSettingsProbeState = NgxSettingsProbeState::Idle;
 
       Logger::info(str::format(
         "[RTX NGX Passthrough] Game settings redirects installed in ",
         (candidate.ownsHandle
           ? "the parent game process (RTX Remix bridge)"
           : "the current process"),
-        ": ScreenPercentage=0x", std::hex,
-        located.screenPercentageAddress, ", shadow=0x",
-        shadowAddress, std::dec, ", live=",
-        located.currentScreenPercentage, "/",
+        ": ScreenPercentage=0x", std::hex, located.screenPercentageAddress,
+        ", GSystemSettings=0x", located.systemSettingsAddress,
+        ", shadow=0x", shadowAddress, std::dec,
+        ", live=", located.currentScreenPercentage, "/",
         located.currentUpscaleScreenPercentage, "."));
-
-      if (msaaOverrideAvailable) {
-        Logger::info(str::format(
-          "[RTX NGX Passthrough] Renderer MSAA override installed (game/render-thread ",
-          located.currentMaxMultisamples, "/",
-          located.currentRtMaxMultisamples, ")."));
-      } else if (msaaOverrideRequested &&
-                 !m_ngxMsaaRedirectSetupAllowed) {
-        Logger::warn(
-          "[RTX NGX Passthrough] Game-settings scanning completed after the D3D device "
-          "setup window; MSAA readers were deliberately left stock because existing "
-          "resources cannot be changed safely. Recreate the device or restart the game "
-          "with rtx.ngxPassthrough.disableGameMsaa enabled.");
-      } else if (msaaOverrideRequested) {
-        Logger::warn(
-          "[RTX NGX Passthrough] Renderer MaxMultisamples readers failed validation; "
-          "the game's MSAA will not be disabled automatically. Use the in-game "
-          "'scale set MaxMultisamples 0' console command instead.");
-      }
+      Logger::info(str::format(
+        "[RTX NGX Passthrough] Layout: ",
+        (located.strictTailLayout ? "stock tail" : "relaxed tail"),
+        ", ScreenPercentage offset 0x", std::hex, located.screenPercentageStructOffset,
+        std::dec, ", FSystemSettingsData stride ", located.settingsDataStride,
+        " (", located.defaultsRepeats, " Defaults repeats), ini cross-check ",
+        (located.iniConfirmed ? "agrees" : "unavailable"),
+        ". Operands: ", applyResult.applied, " patched, ", applyResult.skipped,
+        " left stock, ", applyResult.unrestorable, " unrestorable. Upscale owner: ",
+        (m_ngxRuntimeOwnedUpscale ? "runtime." : "engine.")));
       break;
     }
 
@@ -13082,25 +14038,22 @@ namespace dxvk {
         ::CloseHandle(candidate.handle);
     }
 
+    // Unlike a code-signature scan, this one reads engine state: GSystemSettings is only
+    // populated once FSystemSettings::Initialize has run and the resolution has been applied,
+    // so an early miss says nothing about whether the record exists. Keep retrying on the
+    // shared budget instead of giving up on the first look.
     if (m_ngxScreenPercentageRemoteAddr == 0 &&
-        m_ngxGameSettingsShadowRemoteAddr == 0) {
-      if (!anyIncomplete) {
-        m_ngxScreenPercentageScanDone = true;
-        Logger::warn(
-          "[RTX NGX Passthrough] The required game-settings reader signatures are not "
-          "present in this executable; the DLSS mode selector will not drive render "
-          "resolution and game MSAA will not be disabled automatically. Use the in-game "
-          "'scale set ScreenPercentage <value>' and 'scale set MaxMultisamples 0' console "
-          "commands instead.");
-      } else if (++m_ngxScreenPercentageScanAttempts >= kNgxSettingsScanMaxAttempts) {
-        m_ngxScreenPercentageScanDone = true;
-        Logger::warn(str::format(
-          "[RTX NGX Passthrough] Could not install the game-settings reader redirects after ",
-          kNgxSettingsScanMaxAttempts,
-          " attempts (game process/module not readable or patchable); giving up. The DLSS "
-          "mode selector will not drive render resolution. Use the in-game "
-          "'scale set ScreenPercentage <value>' console command instead."));
-      }
+        m_ngxGameSettingsShadowRemoteAddr == 0 &&
+        ++m_ngxScreenPercentageScanAttempts >= kNgxSettingsScanMaxAttempts) {
+      m_ngxScreenPercentageScanDone = true;
+      Logger::warn(str::format(
+        "[RTX NGX Passthrough] No usable FSystemSettings record was found in the game's main "
+        "module after ", kNgxSettingsScanMaxAttempts,
+        (anyIncomplete ? " attempts (the process or module was not fully readable); "
+                       : " attempts; "),
+        "the DLSS mode selector will not drive render resolution. Set "
+        "rtx.ngxPassthrough.systemSettingsScreenPercentageRva to pin the address, or use the "
+        "in-game 'scale set ScreenPercentage <value>' console command."));
     }
   }
 
@@ -13111,16 +14064,6 @@ namespace dxvk {
 
     // Mirror live values first so any unrestorable redirect stays coherent.
     bool screenShadowMirrored = false;
-    const uint32_t realRtMaxMultisamples =
-      uint32_t(m_ngxScreenPercentageRemoteAddr +
-               kUe3RtMaxMultisamplesFromScreenPercentage);
-    bool maxMultisamplesShadowReferenced = false;
-    for (const NgxGameSettingsCodePatch& patch :
-         m_ngxGameSettingsCodePatches) {
-      maxMultisamplesShadowReferenced |=
-        patch.originalOperand == realRtMaxMultisamples;
-    }
-    bool msaaShadowMirrored = !maxMultisamplesShadowReferenced;
     if (m_ngxScreenPercentageRemoteAddr != 0) {
       float liveScreenPercentage = 0.0f;
       int32_t liveUpscale = 0;
@@ -13137,19 +14080,6 @@ namespace dxvk {
             liveScreenPercentage, liveUpscale,
             &rollbackVerified) &&
           rollbackVerified;
-      }
-
-      int32_t liveRtMaxMultisamples = 0;
-      if (ngxReadProcessExact(
-            m_ngxGameProcess,
-            m_ngxScreenPercentageRemoteAddr +
-              kUe3RtMaxMultisamplesFromScreenPercentage,
-            liveRtMaxMultisamples)) {
-        msaaShadowMirrored = ngxWriteProcessExactRetry(
-          m_ngxGameProcess,
-          m_ngxGameSettingsShadowRemoteAddr +
-            kNgxShadowMaxMultisamplesOffset,
-          liveRtMaxMultisamples);
       }
     }
 
@@ -13216,7 +14146,7 @@ namespace dxvk {
       Logger::warn(
         "[RTX NGX Passthrough] Could not quiesce the game threads to restore settings "
         "reader operands; retaining the renderer shadow allocation.");
-      if (!screenShadowMirrored || !msaaShadowMirrored) {
+      if (!screenShadowMirrored) {
         Logger::err(
           "[RTX NGX Passthrough] The retained renderer shadow could not be fully returned "
           "to the game's live values before teardown.");
@@ -13243,7 +14173,7 @@ namespace dxvk {
       Logger::warn(
         "[RTX NGX Passthrough] One or more settings reader operands could not be restored; "
         "retaining the renderer shadow allocation so no game code points to freed memory.");
-      if (!screenShadowMirrored || !msaaShadowMirrored) {
+      if (!screenShadowMirrored) {
         Logger::err(
           "[RTX NGX Passthrough] The retained renderer shadow could not be fully returned "
           "to the game's live values.");
@@ -13251,9 +14181,83 @@ namespace dxvk {
     }
 
     m_ngxScreenPercentageDriven = false;
-    m_ngxGameMsaaDriven = false;
-    m_ngxMsaaOverrideLatched = false;
     m_ngxGameSettingsRedirectsValid = false;
+    m_ngxEngineUpscaleAvailable = false;
+    m_ngxRuntimeOwnedUpscale = false;
+    m_ngxMissingEngineUpscaleFrames = 0;
+  }
+
+  // Reads the constants of the draw about to be suppressed. UE3's GammaCorrectionPixelShader is
+  // `pow(saturate(lerp(scene * ColorScale, OverlayColor.rgb, OverlayColor.a)), InverseGamma)`;
+  // when the post chain already gamma corrected into LDR scene colour the engine sets
+  // InverseGamma to 1 and this reduces to a copy, which is why Mirror's Edge never needed it.
+  void D3D9Rtx::captureNgxOutputTransform() {
+    m_ngxOutputTransform = NgxOutputTransform();
+
+    if (!m_parent->UseProgrammablePS() || d3d9State().pixelShader.ptr() == nullptr)
+      return;
+
+    const D3D9CommonShader* pixelShaderCommon = d3d9State().pixelShader->GetCommonShader();
+    const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(pixelShaderCommon);
+
+    if (psInfo.gammaInverseReg == Ue3ShaderFeatureInfo::kNgxNoRegister) {
+      // Not UE3's GammaCorrectionPixelShader. Report what the suppressed draw actually is:
+      // if it carries the Uber post-process constants then the engine composited its whole
+      // post chain here, and replacing that draw costs far more than a gamma curve.
+      ONCE(Logger::warn(str::format(
+        "[RTX NGX Passthrough] The suppressed composite is not UE3's GammaCorrectionPixelShader "
+        "(ps=0x", std::hex, pixelShaderCommon->GetBytecodeHash(), std::dec,
+        ", gammaConstants=", psInfo.hasGammaConstants ? 1 : 0,
+        ", toneMapConstants=", psInfo.hasToneMapConstants ? 1 : 0,
+        ", exposureOrToneSampler=", psInfo.hasExposureOrToneSampler ? 1 : 0,
+        ", sceneColorSampler=", psInfo.hasSceneColorSampler ? 1 : 0,
+        ", colorScaleReg=", psInfo.gammaColorScaleReg != Ue3ShaderFeatureInfo::kNgxNoRegister ? 1 : 0,
+        ", overlayColorReg=", psInfo.gammaOverlayColorReg != Ue3ShaderFeatureInfo::kNgxNoRegister ? 1 : 0,
+        "); its colour transform cannot be carried over to the upscaled result.")));
+      return;
+    }
+
+    const auto& constants = d3d9State().psConsts.fConsts;
+    const auto readRegister = [&](uint32_t reg) -> const Vector4* {
+      return reg < std::size(constants) ? &constants[reg] : nullptr;
+    };
+
+    const Vector4* inverseGamma = readRegister(psInfo.gammaInverseReg);
+    if (inverseGamma == nullptr || !std::isfinite(inverseGamma->x) ||
+        inverseGamma->x <= 0.0f || inverseGamma->x > 4.0f)
+      return;
+
+    m_ngxOutputTransform.inverseGamma = inverseGamma->x;
+
+    if (const Vector4* colorScale = readRegister(psInfo.gammaColorScaleReg)) {
+      m_ngxOutputTransform.colorScale[0] = colorScale->x;
+      m_ngxOutputTransform.colorScale[1] = colorScale->y;
+      m_ngxOutputTransform.colorScale[2] = colorScale->z;
+    }
+
+    if (const Vector4* overlayColor = readRegister(psInfo.gammaOverlayColorReg)) {
+      m_ngxOutputTransform.overlayColor[0] = overlayColor->x;
+      m_ngxOutputTransform.overlayColor[1] = overlayColor->y;
+      m_ngxOutputTransform.overlayColor[2] = overlayColor->z;
+      m_ngxOutputTransform.overlayColor[3] = overlayColor->w;
+    }
+
+    const bool isIdentity =
+      m_ngxOutputTransform.inverseGamma == 1.0f &&
+      m_ngxOutputTransform.colorScale[0] == 1.0f &&
+      m_ngxOutputTransform.colorScale[1] == 1.0f &&
+      m_ngxOutputTransform.colorScale[2] == 1.0f &&
+      m_ngxOutputTransform.overlayColor[3] == 0.0f;
+    m_ngxOutputTransform.enabled = !isIdentity;
+
+    ONCE(Logger::info(str::format(
+      "[RTX NGX Passthrough] Suppressed composite transform: InverseGamma ",
+      m_ngxOutputTransform.inverseGamma, ", ColorScale (",
+      m_ngxOutputTransform.colorScale[0], ", ", m_ngxOutputTransform.colorScale[1], ", ",
+      m_ngxOutputTransform.colorScale[2], "), OverlayColor alpha ",
+      m_ngxOutputTransform.overlayColor[3], " -> ",
+      (m_ngxOutputTransform.enabled ? "reapplied to the upscaled result."
+                                    : "identity, nothing to reapply."))));
   }
 
   void D3D9Rtx::emitNgxPassthroughFrameData() {
@@ -13263,12 +14267,24 @@ namespace dxvk {
 
     Rc<DxvkImage> sceneDepth = m_ngxSceneDepthImage;
 
+    // Runtime-owned upscale: the engine composited its reduced view rect into the backbuffer and
+    // performed no upscale of its own, so DLSS reads that subrect and writes the full frame. The
+    // depth subrect stays where the scene rasterized (scene color space), which is why the two
+    // offsets are tracked separately.
+    if (m_ngxUpscaleSourceImage == nullptr && m_ngxRuntimeUpscaleRectValid &&
+        m_ngxColorTargetImage == nullptr && m_ngxFrameBackbufferImage != nullptr &&
+        m_ngxSceneViewportValid) {
+      m_ngxUpscaleSourceImage = m_ngxFrameBackbufferImage;
+      m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
+      m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
+      m_ngxColorSubrectOffset = { int32_t(m_ngxRuntimeUpscaleRect.X),
+                                  int32_t(m_ngxRuntimeUpscaleRect.Y) };
+    }
+
     // A scene rendered into a reduced subrect (both dimensions - a single reduced dimension
-    // is letterboxing, which full-rect DLAA handles fine) without the Super Resolution
-    // interception (the engine's upscale stretch went undetected, e.g. UE3 with
-    // UpscaleScreenPercentage=false) means the depth subrect does not correspond to the
-    // full-resolution color the injection sees; skip the DLSS inputs rather than feeding
-    // mismatched data.
+    // is letterboxing, which full-rect DLAA handles fine) without any Super Resolution
+    // interception means the depth subrect does not correspond to the full-resolution color
+    // the injection sees; skip the DLSS inputs rather than feeding mismatched data.
     if (m_ngxUpscaleSourceImage == nullptr && m_ngxSceneViewportValid && m_activePresentParams.has_value()) {
       const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
       const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
@@ -13276,30 +14292,84 @@ namespace dxvk {
       if (backBufferWidth != 0 && backBufferHeight != 0 &&
           uint64_t(m_ngxSceneViewport.Width) * 100 <= uint64_t(backBufferWidth) * 97 &&
           uint64_t(m_ngxSceneViewport.Height) * 100 <= uint64_t(backBufferHeight) * 97) {
-        ONCE(Logger::warn("[RTX NGX Passthrough] Scene rendered into a reduced subrect without Super Resolution interception; DLSS is skipped. "
-                          "Set the game's UpscaleScreenPercentage=true for DLSS Super Resolution, or ScreenPercentage to 100 for DLAA."));
+        ONCE(Logger::warn("[RTX NGX Passthrough] Scene rendered into a reduced subrect without Super Resolution interception; DLSS is skipped."));
         sceneDepth = nullptr;
+
+        // Neither the engine's upscale stretch nor its subrect composite was found. If the
+        // engine was supposed to be doing the upscale, hand ownership to the runtime rather
+        // than keep presenting a reduced image; the next frame renders through that path.
+        if (!m_ngxRuntimeOwnedUpscale && m_ngxGameSettingsRedirectsValid &&
+            RtxNgxPassthrough::screenPercentageUpscaleOwner() != 1 &&
+            ++m_ngxMissingEngineUpscaleFrames >= kNgxMissingEngineUpscaleFrameLimit) {
+          m_ngxRuntimeOwnedUpscale = true;
+          m_ngxMissingEngineUpscaleFrames = 0;
+          Logger::warn("[RTX NGX Passthrough] The engine's own upscale never appeared; taking "
+                       "ownership of the Super Resolution upscale in the runtime instead.");
+        }
       }
+    } else {
+      m_ngxMissingEngineUpscaleFrames = 0;
     }
 
     m_ngxVelocityStats.frameCameraValid = m_ngxFrameCameraValid;
     m_ngxVelocityStats.depthClears = m_ngxDepthClearsThisFrame;
     m_ngxVelocityStats.cameraTransposeFlips = m_ngxCameraTransposeFlips;
 
+    // Accumulated across the window and logged as a rate. The per-sighting pairing-miss lines are
+    // rate limited to a burst every couple of seconds, which shows what a miss looks like but not
+    // how often one happens - and whether the capture is healthy is entirely a question of the
+    // ratio between sightings that paired and sightings that had to register anew.
+    m_ngxVelocityWindow.captured += m_ngxVelocityStats.captured;
+    m_ngxVelocityWindow.capturedSkinned += m_ngxVelocityStats.capturedSkinned;
+    m_ngxVelocityWindow.capturedDynamic += m_ngxVelocityStats.capturedDynamic;
+    m_ngxVelocityWindow.exactMatches += m_ngxVelocityStats.exactMatches;
+    m_ngxVelocityWindow.newRegistrations += m_ngxVelocityStats.newRegistrations;
+    m_ngxVelocityWindow.pairedBeyondBounds += m_ngxVelocityStats.pairedBeyondBounds;
+    m_ngxVelocityWindow.skippedNoCamera += m_ngxVelocityStats.skippedNoCamera;
+    m_ngxVelocityWindow.skippedBudget += m_ngxVelocityStats.skippedBudget;
+    m_ngxVelocityWindow.skippedZDisabled += m_ngxVelocityStats.skippedZDisabled;
+    m_ngxVelocityWindow.skippedInstanceCap += m_ngxVelocityStats.skippedInstanceCap;
+    m_ngxVelocityWindow.depthClears += m_ngxVelocityStats.depthClears;
+
+    if (++m_ngxVelocityWindow.frames >= kNgxVelocityWindowFrames) {
+      Logger::info(str::format(
+        "[RTX NGX Passthrough][velocity] over ", m_ngxVelocityWindow.frames, " frames: ",
+        m_ngxVelocityWindow.captured, " captured (", m_ngxVelocityWindow.capturedSkinned, " skinned, ",
+        m_ngxVelocityWindow.capturedDynamic, " CPU-modified), ",
+        m_ngxVelocityWindow.exactMatches, " paired to their own history, ",
+        m_ngxVelocityWindow.newRegistrations, " registered anew, ",
+        m_ngxVelocityWindow.pairedBeyondBounds, " paired beyond the motion bounds, skipped: ",
+        m_ngxVelocityWindow.skippedNoCamera, " no camera / ",
+        m_ngxVelocityWindow.skippedBudget, " over budget / ",
+        m_ngxVelocityWindow.skippedZDisabled, " depth test off / ",
+        m_ngxVelocityWindow.skippedInstanceCap, " over the instance cap; tracking ",
+        m_ngxVelocityObjectCache.size(), " identities; ", m_ngxVelocityWindow.depthClears,
+        " mid-scene depth clears; scene-wide transform offset (",
+        m_ngxGlobalTransformOffset.x, ",", m_ngxGlobalTransformOffset.y, ",",
+        m_ngxGlobalTransformOffset.z, ")."));
+
+      m_ngxVelocityWindow = NgxVelocityWindowTotals();
+    }
+
     m_parent->EmitCs([cSceneDepth = sceneDepth,
                       cColorTarget = m_ngxColorTargetImage,
                       cColorMirror = m_ngxColorMirrorImage,
                       cUpscaleSource = m_ngxUpscaleSourceImage,
                       cSubrect = m_ngxSubrect,
+                      cColorSubrectOffset = m_ngxColorSubrectOffset,
+                      cOutputTransform = m_ngxOutputTransform,
                       cVelocityDraws = std::move(m_ngxVelocityDraws),
                       cVelocityStats = m_ngxVelocityStats,
+                      cSceneTransformOffset = m_ngxGlobalTransformOffset,
                       cJitterX = m_ngxFrameJitter[0],
                       cJitterY = m_ngxFrameJitter[1],
                       cCameraMatricesValid = m_ngxFrameCameraMatricesValid,
                       cWorldToView = m_ngxFrameWorldToView,
                       cViewToProjection = m_ngxFrameViewToProjection](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->setNgxPassthroughFrameData(cSceneDepth, cColorTarget, cColorMirror, cUpscaleSource, cSubrect,
-                                                                std::move(cVelocityDraws), cVelocityStats, cJitterX, cJitterY,
+                                                                cColorSubrectOffset, cOutputTransform,
+                                                                std::move(cVelocityDraws), cVelocityStats, cSceneTransformOffset,
+                                                                cJitterX, cJitterY,
                                                                 cCameraMatricesValid, cWorldToView, cViewToProjection);
     });
 
@@ -13325,6 +14395,47 @@ namespace dxvk {
   // Line cap shared by the per-draw and StretchRect dump paths (heavy frames would
   // otherwise flood the log)
   static constexpr uint32_t kNgxPostChainDumpMaxLinesPerFrame = 160;
+
+  // Frames a donated scene view rect stays usable for the injection decision
+  static constexpr uint32_t kNgxSceneViewportStaleFrameLimit = 8;
+
+  // Frames between the bounded frame-shape log lines
+  static constexpr uint32_t kNgxFrameShapeLogInterval = 900;
+
+  // A frame reaching the late injection point while the pre-post one is enabled has relocated
+  // the injection, which costs the upscaler its history. Attribute it to the requirement that
+  // failed; rate limited because what matters is which reason dominates, not each instance.
+  void D3D9Rtx::reportNgxPrePostMiss() {
+    if (!m_frameOptions.ngxPrePostProcess)
+      return;
+
+    // A frame that never identified a scene color has no scene to inject into - a menu, a loading
+    // screen, the frames either side of a level transition. Nothing relocated there and no history
+    // is lost, so counting it here would misattribute a normal transition as a fault.
+    if (m_ngxSceneColorImage == nullptr) {
+      return;
+    }
+
+    m_ngxPrePostMissCount++;
+
+    if (m_ngxPrePostMissCount != 1 &&
+        m_ngxPrePostMissCount - m_ngxPrePostMissLastReportedCount < 60)
+      return;
+
+    m_ngxPrePostMissLastReportedCount = m_ngxPrePostMissCount;
+
+    const char* reason =
+      !m_ngxDiagSceneColorReady ? "no scene color/view rect was established" :
+      !m_ngxDiagSawPostQuad     ? "no pass matched the post-process quad shape" :
+      m_ngxPrePostCandidatesThisFrame == 0
+                                ? "a qualifying pass ran but sampled neither the scene color nor a resolve of it" :
+                                  "the frame's scene color reads ran out before the one the injection was aimed at";
+
+    Logger::info(str::format("[RTX NGX Passthrough] Injection relocated to the late point on ",
+                             m_ngxPrePostMissCount, " frames so far; most recently because ", reason,
+                             ". DLSS keeps a separate history per injection point, so relocating "
+                             "costs the moving content its accumulation."));
+  }
 
   void D3D9Rtx::dumpNgxPostChainDraw(const DrawContext& drawContext) {
     if (m_ngxPostChainDumpLinesThisFrame >= kNgxPostChainDumpMaxLinesPerFrame)
@@ -13442,6 +14553,14 @@ namespace dxvk {
     // foreground DPG following the last clear stays live in the depth buffer through the
     // injection point).
     m_ngxDepthClearsThisFrame++;
+
+    if (m_ngxFrameClearCount < kNgxFrameShapeSlots) {
+      m_ngxFrameClearDraws[m_ngxFrameClearCount++] = m_drawCallID;
+    }
+
+    // The injection counts reads from the clear, so a later clear restarts the count
+    m_ngxReadsSinceLastClear = 0;
+
     if (m_ngxDepthClearsThisFrame > 1)
       return;
 
@@ -13654,6 +14773,149 @@ namespace dxvk {
     });
   }
 
+  // Positions the next frame's injection from the shape this one turned out to have, and logs that
+  // shape a bounded number of times so a placement can be checked in a title whose frame shape has
+  // not been seen before. Called once per frame, before the shape is cleared.
+  void D3D9Rtx::updateNgxPrePostInjectionAim() {
+    if (m_ngxFrameShapeLogsRemaining > 0 && m_ngxFrameReadCount > 0 &&
+        (m_ue3FrameCounter % kNgxFrameShapeLogInterval) == 0) {
+      m_ngxFrameShapeLogsRemaining--;
+
+      std::string clears;
+      for (uint32_t i = 0; i < m_ngxFrameClearCount; i++) {
+        clears += (i != 0 ? ", " : "") + std::to_string(m_ngxFrameClearDraws[i]);
+      }
+
+      std::string reads;
+      for (uint32_t i = 0; i < m_ngxFrameReadCount; i++) {
+        reads += (i != 0 ? ", " : "") + std::to_string(m_ngxFrameReadDraws[i]);
+      }
+
+      // A correct placement has injectedAtDraw equal to the first read past lastDepthWritingDraw
+      Logger::info(str::format(
+        "[RTX NGX Passthrough][frame shape] frame=", m_ue3FrameCounter,
+        " sceneDepthClearsAtDraw={", clears, "}",
+        " lastDepthWritingDraw=", m_ngxFrameLastGeometryDraw,
+        " sceneColorReadsAtDraw={", reads, "}",
+        " injectedAtDraw=", m_ngxFrameInjectionDraw,
+        " firstBackbufferDraw=", m_ngxFrameFirstBackbufferDraw));
+    }
+
+    if (m_ngxFrameLastGeometryDraw != 0 && m_ngxFrameReadCount != 0) {
+      uint32_t readsInsideScene = 0;
+      while (readsInsideScene < m_ngxFrameReadCount &&
+             m_ngxFrameReadDraws[readsInsideScene] < m_ngxFrameLastGeometryDraw) {
+        readsInsideScene++;
+      }
+
+      // Both counts are adopted only when two frames running agree. A title may alternate between
+      // frames whose scene holds two scene color reads and frames whose scene holds three, and
+      // correcting after every frame that proves the aim wrong is wrong on both: aim at the later
+      // read and the shorter frame never reaches it, aim at the earlier one and the longer frame
+      // injects inside its scene. Requiring agreement declines to chase the alternation.
+      if (readsInsideScene == m_ngxPrevReadsInsideScene &&
+          readsInsideScene != m_ngxPrePostReadsInsideScene) {
+        m_ngxPrePostReadsInsideScene = readsInsideScene;
+      }
+      m_ngxPrevReadsInsideScene = readsInsideScene;
+
+      if (m_ngxFrameClearCount > 0) {
+        const uint32_t lastClearDraw = m_ngxFrameClearDraws[m_ngxFrameClearCount - 1];
+        uint32_t readsAfterClearInsideScene = 0;
+
+        for (uint32_t i = 0; i < m_ngxFrameReadCount; i++) {
+          if (m_ngxFrameReadDraws[i] > lastClearDraw &&
+              m_ngxFrameReadDraws[i] < m_ngxFrameLastGeometryDraw) {
+            readsAfterClearInsideScene++;
+          }
+        }
+
+        if (readsAfterClearInsideScene == m_ngxPrevReadsAfterClearInsideScene &&
+            readsAfterClearInsideScene != m_ngxReadsAfterClearInsideScene) {
+          Logger::info(str::format(
+            "[RTX NGX Passthrough] Pre-post-process injection aimed at scene color read ",
+            readsAfterClearInsideScene + 1, " after the scene depth clear: ",
+            readsAfterClearInsideScene, " of them fall inside the scene."));
+
+          m_ngxReadsAfterClearInsideScene = readsAfterClearInsideScene;
+        }
+        m_ngxPrevReadsAfterClearInsideScene = readsAfterClearInsideScene;
+      }
+    }
+
+    m_ngxReadsSinceLastClear = 0;
+    m_ngxFrameClearCount = 0;
+    m_ngxFrameReadCount = 0;
+    m_ngxFrameLastGeometryDraw = 0;
+    m_ngxFrameInjectionDraw = 0;
+    m_ngxFrameFirstBackbufferDraw = 0;
+    m_ngxPrePostCandidatesThisFrame = 0;
+  }
+
+  void D3D9Rtx::countNgxPostInjectionSceneColorConsumer(const DrawContext& drawContext) {
+    // The injection ordinal is only useful if the count it comes from covers the whole frame, and
+    // the passes that decide whether this frame's injection was the last one are precisely the ones
+    // that come after it. Same shape test as the pre-injection path, deliberately: a mismatch
+    // between the two would bias the count and walk the injection point away from the end.
+    if (!m_frameOptions.ngxPrePostProcess || m_ngxSceneColorImage == nullptr ||
+        m_ngxBackbufferDrawSeenThisFrame ||
+        !m_activePresentParams.has_value() || d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
+      return;
+    }
+
+    const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+    const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+
+    // These have to match the pre-injection test exactly. Any difference makes the frame's read
+    // total depend on where the injection landed, and since that total aims the next frame, the
+    // aim then feeds back into itself and never settles.
+    const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+                                   d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
+
+    if (drawContext.PrimitiveCount > 4 ||
+        !depthTestDisabled ||
+        d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE ||
+        d3d9State().renderStates[D3DRS_STENCILENABLE] != FALSE ||
+        d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE ||
+        d3d9State().viewport.Width + 1 < backBufferWidth ||
+        d3d9State().viewport.Height + 1 < backBufferHeight) {
+      return;
+    }
+
+    D3D9CommonTexture* renderTargetTexture = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (renderTargetTexture != nullptr &&
+        (renderTargetTexture->GetImage().ptr() == m_ngxSceneColorImage.ptr() ||
+         (m_ngxFrameBackbufferImage != nullptr &&
+          renderTargetTexture->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr()))) {
+      return;
+    }
+
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      if (texture == nullptr || texture->GetImage() == nullptr) {
+        continue;
+      }
+
+      const DxvkImage* sampledImage = texture->GetImage().ptr();
+      bool consumesSceneColor = sampledImage == m_ngxSceneColorImage.ptr();
+
+      for (uint32_t r = 0; !consumesSceneColor && r < m_ngxSceneColorResolveCount; r++) {
+        consumesSceneColor = m_ngxSceneColorResolves[r].ptr() == sampledImage;
+      }
+
+      if (consumesSceneColor) {
+        m_ngxPrePostCandidatesThisFrame++;
+
+        if (m_ngxFrameReadCount < kNgxFrameShapeSlots) {
+          m_ngxFrameReadDraws[m_ngxFrameReadCount++] = m_drawCallID;
+        }
+        break;
+      }
+    }
+  }
+
   PrepareDrawFlags D3D9Rtx::prepareDrawForNgxPassthrough(const DrawContext& drawContext) {
     ScopedCpuProfileZone();
 
@@ -13677,9 +14939,53 @@ namespace dxvk {
       }
     }
 
+    // The same hazard applies to the viewport jitter. Whether a draw is jittered depends on its
+    // render target and depth-stencil (see GetNgxPassthroughViewportJitter), but the Vulkan
+    // viewport is only rebuilt when D3D9 marks the viewport dirty, which binding a different
+    // target need not do - so a draw can inherit the previous draw's jitter state and land on a
+    // different sub-pixel grid to the rest of the frame. Force the rebind whenever it flips.
+    {
+      float jitterX = 0.0f;
+      float jitterY = 0.0f;
+      const bool jitterThisDraw = GetNgxPassthroughViewportJitter(&jitterX, &jitterY);
+
+      if (jitterThisDraw != m_ngxViewportJitterApplied ||
+          (jitterThisDraw && (jitterX != m_ngxAppliedViewportJitter[0] ||
+                              jitterY != m_ngxAppliedViewportJitter[1]))) {
+        m_ngxViewportJitterApplied = jitterThisDraw;
+        m_ngxAppliedViewportJitter[0] = jitterX;
+        m_ngxAppliedViewportJitter[1] = jitterY;
+        m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+      }
+    }
+
+    // Where the scene ends. Deliberately independent of camera reconstruction: the last depth
+    // priority group is where the first person mesh and held weapon are, they are skinned, and
+    // skinned draws are exactly the ones whose constants the camera extraction rejects - reading
+    // this from that path would make the frame look as if its last group never drew anything.
+    if (drawContext.PrimitiveCount > 4 &&
+        d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE &&
+        d3d9State().depthStencil != nullptr) {
+      m_ngxFrameLastGeometryDraw = m_drawCallID;
+    }
+
+    // Once the game has bound the backbuffer it is finished with the scene and its post chain, and
+    // what follows is the UI being composited. Tracked across the whole frame, including past the
+    // injection, because the shape that positions the next frame spans the whole frame.
+    if (!m_ngxBackbufferDrawSeenThisFrame && m_ngxFrameBackbufferImage != nullptr &&
+        d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      D3D9CommonTexture* drawTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+
+      if (drawTarget != nullptr && drawTarget->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr()) {
+        m_ngxBackbufferDrawSeenThisFrame = true;
+        m_ngxFrameFirstBackbufferDraw = m_drawCallID;
+      }
+    }
+
     // Every draw executes as plain rasterization in this mode. The remaining per-draw work:
     // UE3 camera extraction, scene target identification, and the thin injection trigger.
     if (m_rtxInjectTriggered) {
+      countNgxPostInjectionSceneColorConsumer(drawContext);
       maybeCaptureNgxHudless(drawContext);
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
@@ -13704,7 +15010,29 @@ namespace dxvk {
       const bool temporalUpscalerUsable = RtxNgxPassthrough::needsViewportJitter(m_parent->GetDXVKDevice().ptr());
 
       if (m_frameOptions.ngxPassthroughJitter && temporalUpscalerUsable) {
-        const uint32_t jitterSequenceLength = RtxNgxPassthrough::viewportJitterSequenceLength(m_parent->GetDXVKDevice().ptr());
+        // The render height the game is about to draw at, so the phase count matches the
+        // upscale ratio DLSS will see this frame.
+        uint32_t renderHeight = 0;
+        uint32_t displayHeight = 0;
+        if (m_activePresentParams.has_value()) {
+          displayHeight = m_activePresentParams->BackBufferHeight;
+          if (m_ngxGameScreenPercentage > 0.0f && m_ngxGameScreenPercentage <= 100.0f) {
+            renderHeight = uint32_t(float(displayHeight) * m_ngxGameScreenPercentage / 100.0f);
+          } else {
+            renderHeight = displayHeight;
+          }
+        }
+
+        const uint32_t jitterSequenceLength = RtxNgxPassthrough::viewportJitterSequenceLength(
+          m_parent->GetDXVKDevice().ptr(), renderHeight, displayHeight);
+
+        // An artefact with the period of this loop is the signature of a phase that recurs too
+        // rarely to accumulate, so the length has to be readable rather than re-derived by hand
+        if (jitterSequenceLength != m_ngxLoggedJitterSequenceLength) {
+          m_ngxLoggedJitterSequenceLength = jitterSequenceLength;
+          Logger::info(str::format("[RTX NGX Passthrough] Viewport jitter loop: ", jitterSequenceLength,
+                                   " phases at ", renderHeight, "p render / ", displayHeight, "p display."));
+        }
         const Vector2 jitter = calculateHaltonJitter(m_parent->GetDXVKDevice()->getCurrentFrameId(),
                                                      jitterSequenceLength);
         m_ngxFrameJitter[0] = jitter.x;
@@ -13872,24 +15200,37 @@ namespace dxvk {
         d3d9State().viewport.Width + 1 >= backBufferWidth &&
         d3d9State().viewport.Height + 1 >= backBufferHeight;
 
-      // Structural mid-scene guard: in frames that have a foreground DPG depth clear (all
-      // normal gameplay frames), every world DPG pass - lighting, dynamic shadow
-      // projections, translucency - precedes that clear, and the post chain follows it.
-      // Requiring the clear before the trigger makes a world-DPG pass firing the injection
-      // impossible regardless of its render state. Frames without the clear (menus,
-      // sequences without a foreground DPG) are detected via the previous frame and skip
-      // the requirement.
-      const bool sceneCompletionGateOpen = !m_ngxDepthClearSeenPrevFrame || m_ngxDepthSnapshotTakenThisFrame;
+      // The view rect comes from the frame's scene draws, and a frame whose geometry all failed
+      // camera reconstruction donates none. Losing the injection over a rectangle that had not
+      // changed sends the frame to the late point, so a recently donated rect stays usable.
+      const bool sceneViewportUsable =
+        m_ngxSceneViewportValid ||
+        (m_ngxSceneViewportLastValidFrame != 0 &&
+         m_ue3FrameCounter - m_ngxSceneViewportLastValidFrame <= kNgxSceneViewportStaleFrameLimit);
 
-      if (m_frameOptions.ngxPrePostProcess &&
-          m_frameOptions.ngxDebugVisualization == 0 &&
-          likelyPostProcessQuad &&
-          sceneCompletionGateOpen &&
-          m_ngxSceneColorImage != nullptr && m_ngxSceneViewportValid &&
-          backBufferWidth != 0 && backBufferHeight != 0 &&
-          uint64_t(m_ngxSceneViewport.Width) * 100 >= uint64_t(backBufferWidth) * 97 &&
-          uint64_t(m_ngxSceneViewport.Height) * 100 >= uint64_t(backBufferHeight) * 97 &&
-          (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr())) {
+      // Which requirements the frame met, so one that ends up at the late point can say why
+      m_ngxDiagSawPostQuad |= likelyPostProcessQuad;
+      m_ngxDiagSceneColorReady |= (m_ngxSceneColorImage != nullptr && sceneViewportUsable);
+
+      // A pass with the backbuffer bound is the final composite or the UI being drawn over it, and
+      // the pre-post point is mid-chain by definition. Letting those count walks the injection past
+      // the end of the post chain onto a pass with UI in it, which the upscaler then resolves and
+      // softens; that territory belongs to the late injection point.
+      const bool targetsBackbuffer =
+        renderTargetTexture != nullptr && m_ngxFrameBackbufferImage != nullptr &&
+        renderTargetTexture->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr();
+
+      const bool candidateShape =
+        m_frameOptions.ngxPrePostProcess &&
+        likelyPostProcessQuad &&
+        !targetsBackbuffer && !m_ngxBackbufferDrawSeenThisFrame &&
+        m_ngxSceneColorImage != nullptr && sceneViewportUsable &&
+        backBufferWidth != 0 && backBufferHeight != 0 &&
+        uint64_t(m_ngxSceneViewport.Width) * 100 >= uint64_t(backBufferWidth) * 97 &&
+        uint64_t(m_ngxSceneViewport.Height) * 100 >= uint64_t(backBufferHeight) * 97 &&
+        (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr());
+
+      if (candidateShape) {
         const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
 
         for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
@@ -13916,6 +15257,37 @@ namespace dxvk {
             continue;
           }
 
+          m_ngxPrePostCandidatesThisFrame++;
+          m_ngxReadsSinceLastClear++;
+
+          if (m_ngxFrameReadCount < kNgxFrameShapeSlots) {
+            m_ngxFrameReadDraws[m_ngxFrameReadCount++] = m_drawCallID;
+          }
+
+          // Inject at the first read of the scene color that follows the frame's last depth-writing
+          // draw. Anything the game draws after the injection is composited onto the upscaler's
+          // finished output, un-jittered and never anti-aliased; UE3 runs post-process effects
+          // inside its DPG loop, so the earlier reads are interleaved with the scene rather than
+          // after it, and injecting at one of those leaves the last DPG - first person mesh and
+          // held weapon included - on the wrong side of it.
+          //
+          // Where the scene ends is only knowable once the frame is over, so it is predicted from
+          // the previous frame's shape. Counted from the most recent scene depth clear, which is
+          // the only form of the count that holds still: frames differ in how many reads land
+          // before the clear, so a whole-frame count inherits that variation and alternates, while
+          // the stretch between the clear and the end of the scene does not. Frames with no
+          // detected clear use the whole-frame count instead - menu frames, whose scene ends before
+          // any read, need it anyway.
+          const bool haveClearThisFrame = m_ngxFrameClearCount > 0;
+
+          const bool atInjectionPoint = haveClearThisFrame
+            ? m_ngxReadsSinceLastClear >= m_ngxReadsAfterClearInsideScene + 1
+            : m_ngxPrePostCandidatesThisFrame >= m_ngxPrePostReadsInsideScene + 1;
+
+          if (!atInjectionPoint) {
+            break;
+          }
+
           m_ngxColorTargetImage = matchedTarget;
           // When the consumed image is a resolve copy, mirror the DLSS output into the
           // scene color surface as well: later post passes may re-resolve from it (UE3
@@ -13923,8 +15295,10 @@ namespace dxvk {
           m_ngxColorMirrorImage = (matchedTarget.ptr() != m_ngxSceneColorImage.ptr()) ? m_ngxSceneColorImage : nullptr;
           m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
           m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
+          m_ngxColorSubrectOffset = m_ngxSubrect.offset;
 
           triggerInjection = true;
+          m_ngxFrameInjectionDraw = m_drawCallID;
 
           ONCE(Logger::info(str::format("[RTX NGX Passthrough] Pre-post-process injection engaged: DLSS runs on the ",
                                         (m_ngxColorMirrorImage != nullptr ? "resolved scene color" : "scene color"),
@@ -13957,7 +15331,66 @@ namespace dxvk {
           uint64_t(m_ngxSceneViewport.Width) * 100 <= uint64_t(backBufferWidth) * 97 &&
           uint64_t(m_ngxSceneViewport.Height) * 100 <= uint64_t(backBufferHeight) * 97;
 
-        if (sceneIsSubrect) {
+        // The composite has to execute before DLSS can read what it wrote, so the draw that
+        // produced it must never be the one that triggers the injection.
+        bool recordedRuntimeComposite = false;
+
+        if (sceneIsSubrect && ngxRuntimeOwnsUpscale()) {
+          // The engine believes it renders natively, so there is no upscale stretch to replace:
+          // its post chain composites the reduced view rect straight into the backbuffer (at the
+          // centred position ScaleScreenCoords produced) and stops. Note where that landed; the
+          // upscale happens once the scene is finished, in emitNgxPassthroughFrameData.
+          //
+          // The composite's own viewport is not a usable signature for finding it. UE3 may leave
+          // the viewport at full size and size the quad instead, so requiring the viewport to
+          // match the scene rect misses the draw entirely in those titles, and the reduced image
+          // is then presented unstretched with borders around it. Either shape is accepted.
+          const D3DVIEWPORT9& vp = d3d9State().viewport;
+          const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+                                         d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
+          const bool compositeViewportIsSceneSized =
+            vp.Width == m_ngxSceneViewport.Width && vp.Height == m_ngxSceneViewport.Height;
+          const bool viewportIsSceneOrFull =
+            compositeViewportIsSceneSized ||
+            (vp.Width + 1 >= backBufferWidth && vp.Height + 1 >= backBufferHeight);
+
+          const bool likelySubrectComposite =
+            drawContext.PrimitiveCount <= 4 &&
+            depthTestDisabled &&
+            d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE &&
+            viewportIsSceneOrFull &&
+            (m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask) != 0;
+
+          if (likelySubrectComposite) {
+            // Where the scene landed in the backbuffer, which is not where it landed in scene
+            // color. A composite that sets a reduced viewport states its position directly; one
+            // that leaves the viewport full size does not, and the scene viewport's own offset
+            // cannot stand in for it - that is a scene color space position, and a title may
+            // render at its origin while compositing centred. UE3's ScaleScreenCoords centres
+            // the reduced rect in the target, so the remaining case is half the difference.
+            m_ngxRuntimeUpscaleRect = m_ngxSceneViewport;
+
+            if (compositeViewportIsSceneSized) {
+              m_ngxRuntimeUpscaleRect.X = vp.X;
+              m_ngxRuntimeUpscaleRect.Y = vp.Y;
+            } else {
+              m_ngxRuntimeUpscaleRect.X = backBufferWidth > m_ngxSceneViewport.Width
+                ? (backBufferWidth - m_ngxSceneViewport.Width) / 2 : 0;
+              m_ngxRuntimeUpscaleRect.Y = backBufferHeight > m_ngxSceneViewport.Height
+                ? (backBufferHeight - m_ngxSceneViewport.Height) / 2 : 0;
+            }
+
+            m_ngxRuntimeUpscaleRectValid = true;
+            recordedRuntimeComposite = true;
+
+            ONCE(Logger::info(str::format(
+              "[RTX NGX Passthrough] Runtime-owned Super Resolution: the engine composited its ",
+              m_ngxRuntimeUpscaleRect.Width, "x", m_ngxRuntimeUpscaleRect.Height, " view rect at (",
+              m_ngxRuntimeUpscaleRect.X, ", ", m_ngxRuntimeUpscaleRect.Y,
+              ") in the backbuffer, ", (compositeViewportIsSceneSized ? "stated by its viewport" : "centred by ScaleScreenCoords"),
+              "; DLSS will upscale it to ", backBufferWidth, "x", backBufferHeight, ".")));
+          }
+        } else if (sceneIsSubrect) {
           const D3DVIEWPORT9& vp = d3d9State().viewport;
           const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
                                          d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
@@ -13971,7 +15404,42 @@ namespace dxvk {
             depthTestDisabled && !zWriteEnabled &&
             vp.Width + 1 >= backBufferWidth && vp.Height + 1 >= backBufferHeight;
 
-          if (likelyUpscaleStretch) {
+          // Only a plain composite may be stood in for. Some UE3 licensee builds fold the whole
+          // post chain into the upscaling draw - depth of field, bloom, the material grade and
+          // atmospheric fog on the way out; replacing that discards all of it, so the runtime
+          // takes ownership of the upscale instead and lets the engine's own pass composite
+          // into the reduced rect untouched.
+          bool compositeSafeToReplace = true;
+          if (likelyUpscaleStretch && m_parent->UseProgrammablePS() &&
+              d3d9State().pixelShader.ptr() != nullptr) {
+            const Ue3ShaderFeatureInfo psInfo =
+              getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+            compositeSafeToReplace =
+              psInfo.gammaInverseReg != Ue3ShaderFeatureInfo::kNgxNoRegister ||
+              (!psInfo.hasToneMapConstants && !psInfo.hasExposureOrToneSampler);
+
+            if (!compositeSafeToReplace && !m_ngxEngineCompositeUnsafe) {
+              m_ngxEngineCompositeUnsafe = true;
+
+              // Hand the upscale to the runtime rather than give up on Super Resolution: the
+              // engine's pass then composites its reduced view rect into the backbuffer with its
+              // whole chain intact, and the runtime upscales that rect. Only when the settings
+              // redirects are unavailable - so the runtime cannot own the upscale either - does
+              // this leave full resolution as the only correct option.
+              m_ngxRuntimeOwnedUpscale = m_ngxGameSettingsRedirectsValid;
+
+              Logger::info(str::format(
+                "[RTX NGX Passthrough] The engine's upscaling draw also runs its post-process chain "
+                "(DOF, bloom, colour grading), so it cannot be replaced without discarding all of it. ",
+                m_ngxRuntimeOwnedUpscale
+                  ? "The runtime will upscale the reduced rect the engine composites instead, leaving "
+                    "that pass untouched."
+                  : "Without the settings redirects the runtime cannot upscale either, so this title "
+                    "is limited to full resolution DLAA."));
+            }
+          }
+
+          if (likelyUpscaleStretch && compositeSafeToReplace) {
             // The stretch source: the largest render-target texture the pixel shader samples
             // that covers the scene subrect
             Rc<DxvkImage> sourceImage;
@@ -14000,6 +15468,8 @@ namespace dxvk {
               m_ngxUpscaleSourceImage = sourceImage;
               m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
               m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
+              m_ngxColorSubrectOffset = m_ngxSubrect.offset;
+              captureNgxOutputTransform();
 
               triggerInjection = true;
               suppressDraw = true;
@@ -14012,12 +15482,14 @@ namespace dxvk {
           }
         }
 
-        if (!triggerInjection) {
+        if (!triggerInjection && !recordedRuntimeComposite) {
           m_currentUe3PassType = classifyUe3Pass(drawContext);
 
           if (m_currentUe3PassType == Ue3PassType::UiComposite) {
+            reportNgxPrePostMiss();
             triggerInjection = true;
           } else if (isRenderingUI()) {
+            reportNgxPrePostMiss();
             triggerInjection = true;
           } else if (m_frameOptions.preTransformedVerticesIsUI &&
                      d3d9State().vertexDecl != nullptr &&
@@ -14054,6 +15526,9 @@ namespace dxvk {
       m_rtxInjectTriggered = true;
 
       // The UI must not inherit the scene's sub-pixel jitter
+      m_ngxViewportJitterApplied = false;
+      m_ngxAppliedViewportJitter[0] = 0.0f;
+      m_ngxAppliedViewportJitter[1] = 0.0f;
       m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
     }
 
@@ -14195,24 +15670,12 @@ namespace dxvk {
     // Cache the present parameters
     m_activePresentParams = presentationParameters;
 
-    const bool initialMsaaSetupWindow =
-      !m_ngxMsaaSetupDecisionCaptured;
-    if (initialMsaaSetupWindow) {
-      m_ngxMsaaSetupDecisionCaptured = true;
-      m_ngxMsaaOverrideRequestedAtSetup =
-        RtxNgxPassthrough::ngxPassthroughMode() &&
-        RtxNgxPassthrough::disableGameMsaa();
-    }
-
     // Prime settings before the first scene pass.
     if (RtxNgxPassthrough::ngxPassthroughMode()) {
       if (!m_frameOptions.valid) {
         refreshFrameOptionCache();
       }
-      // Late scan retries may not change a resource-creation setting.
-      m_ngxMsaaRedirectSetupAllowed = initialMsaaSetupWindow;
       applyNgxPassthroughScreenPercentage();
-      m_ngxMsaaRedirectSetupAllowed = false;
     }
 
     // Inform the backend about potential presenter update
@@ -14567,12 +16030,21 @@ namespace dxvk {
     ++m_ue3FrameCounter;
 
     // NGX passthrough per-frame state
-    m_ngxDepthClearSeenPrevFrame = m_ngxDepthSnapshotTakenThisFrame;
     m_ngxSpsbPatchActive = false;
     m_ngxFrameJitterValid = false;
+    // The new frame's jitter differs, so the bound viewport no longer matches anything
+    m_ngxViewportJitterApplied = false;
+    m_ngxAppliedViewportJitter[0] = 0.0f;
+    m_ngxAppliedViewportJitter[1] = 0.0f;
     m_ngxFrameDataEmitted = false;
     m_ngxDepthSnapshotTakenThisFrame = false;
     m_ngxDepthClearsThisFrame = 0;
+    m_ngxDiagSawPostQuad = false;
+    m_ngxDiagSceneColorReady = false;
+    m_ngxBackbufferDrawSeenThisFrame = false;
+
+    updateNgxPrePostInjectionAim();
+
     m_ngxHudlessCapturedThisFrame = false;
 
     // Object velocity per-frame state: rotate the accepted camera, drop uncaptured
@@ -14586,25 +16058,62 @@ namespace dxvk {
     m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
     m_ngxFrameCameraValid = false;
     m_ngxFrameCameraMatricesValid = false;
+    // Settle on the best supported offset of the frame, which may be better supported than
+    // whichever candidate led at the moment it was adopted. A frame that produced no evidence
+    // at all leaves the standing offset alone rather than dropping it: zeroing it would put a
+    // step the size of the camera's travel through the next frame's reprojection, and a frame
+    // with nothing to measure from is equally a frame with nothing to misjudge.
+    {
+      const NgxTranslationDeltaVote* winner = nullptr;
+      for (const NgxTranslationDeltaVote& vote : m_ngxTranslationDeltaVotes) {
+        if (vote.votes > 0 && (winner == nullptr || vote.votes > winner->votes)) {
+          winner = &vote;
+        }
+      }
+      if (winner != nullptr) {
+        m_ngxGlobalTransformOffset = winner->delta;
+      }
+      m_ngxTranslationDeltaVotes.fill(NgxTranslationDeltaVote());
+      m_ngxAdoptedOffsetVotes = 0;
+    }
+
     m_ngxVelocityStats = NgxVelocityCaptureStats();
     m_ngxVelocitySkinnedDraws = 0;
     m_ngxVelocityDynamicDraws = 0;
     m_ngxVelocityDraws.clear();
-    // Periodically drop instances not sighted for a while (left behind by level streaming
-    // and visibility changes), then empty identities; emergency-clear pathological growth
-    if ((m_ue3FrameCounter & 0xFF) == 0) {
-      m_ngxVelocityObjectCache.erase_if([frame = m_ue3FrameCounter](auto it) {
+    // Instances left behind by level streaming and visibility changes accumulate, so the cache
+    // drops the ones not sighted for a while: as routine upkeep, and as soon as it grows past
+    // the ceiling. The ceiling bounds memory, not correctness - discarding the cache wholesale
+    // takes every object's previous transform with it, so a level dense enough to sit above the
+    // ceiling loses its history on every frame and the scene renders with no object velocities
+    // at all. Pruning by age instead only ever drops what could not have paired anyway, and
+    // tightens the age until the cache fits.
+    constexpr size_t kVelocityCacheCeiling = 32768;
+    constexpr uint32_t kVelocityCacheRoutinePruneAge = 1024;
+
+    auto pruneVelocityInstancesOlderThan = [this](const uint32_t maxAge) {
+      m_ngxVelocityObjectCache.erase_if([frame = m_ue3FrameCounter, maxAge](auto it) {
         auto& instances = it->second.instances;
         instances.erase(std::remove_if(instances.begin(), instances.end(),
-                                       [frame](const NgxVelocityObjectInstance& instance) {
-                                         return instance.lastSeenFrame + 1024 < frame;
+                                       [frame, maxAge](const NgxVelocityObjectInstance& instance) {
+                                         return instance.lastSeenFrame + maxAge < frame;
                                        }),
                         instances.end());
         return instances.empty();
       });
-    }
-    if (m_ngxVelocityObjectCache.size() > 8192) {
-      m_ngxVelocityObjectCache.clear();
+    };
+
+    if ((m_ue3FrameCounter & 0xFF) == 0 || m_ngxVelocityObjectCache.size() > kVelocityCacheCeiling) {
+      uint32_t maxAge = kVelocityCacheRoutinePruneAge;
+      pruneVelocityInstancesOlderThan(maxAge);
+
+      // Pairing only ever reaches one frame back, so tightening the age surrenders nothing that
+      // was going to be used. At the floor the cache holds only what the last couple of frames
+      // sighted, which the per-frame draw count bounds on its own.
+      while (m_ngxVelocityObjectCache.size() > kVelocityCacheCeiling && maxAge > 2) {
+        maxAge /= 4;
+        pruneVelocityInstancesOlderThan(maxAge);
+      }
     }
     m_ngxLastCameraConstantsHash = 0;
     m_ngxSceneViewportValid = false;
@@ -14612,6 +16121,9 @@ namespace dxvk {
     m_ngxColorTargetImage = nullptr;
     m_ngxColorMirrorImage = nullptr;
     m_ngxSubrect = { { 0, 0 }, { 0, 0 } };
+    m_ngxColorSubrectOffset = { 0, 0 };
+    m_ngxRuntimeUpscaleRectValid = false;
+    m_ngxOutputTransform = NgxOutputTransform();
     for (uint32_t i = 0; i < m_ngxSceneColorResolveCount; i++) {
       m_ngxSceneColorResolves[i] = nullptr;
     }

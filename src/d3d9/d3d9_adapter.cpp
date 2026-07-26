@@ -8,6 +8,9 @@
 #include "../util/util_bit.h"
 #include "../util/util_luid.h"
 #include "../util/util_ratio.h"
+// NV-DXVK start: [NGX passthrough] refuse MSAA at the capability level
+#include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
+// NV-DXVK end
 
 #include <cfloat>
 
@@ -176,6 +179,16 @@ namespace dxvk {
         DWORD*              pQualityLevels) {
     if (pQualityLevels != nullptr)
       *pQualityLevels = 1;
+
+    // NV-DXVK start: [NGX passthrough] engines build their MSAA option list from this query, so
+    // reporting no support here keeps them from ever requesting a multisampled surface
+    if (RtxNgxPassthrough::forceGameMsaaOff() && MultiSampleType != D3DMULTISAMPLE_NONE) {
+      if (pQualityLevels != nullptr)
+        *pQualityLevels = 0;
+
+      return D3DERR_NOTAVAILABLE;
+    }
+    // NV-DXVK end
 
     auto dst = ConvertFormatUnfixed(SurfaceFormat);
     if (dst.FormatColor == VK_FORMAT_UNDEFINED)

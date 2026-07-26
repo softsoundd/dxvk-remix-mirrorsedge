@@ -43,7 +43,11 @@ namespace dxvk {
   // to this count so the raster's palette layout is uniform); the per-frame draw cap
   // bounds the bone upload buffer.
   constexpr uint32_t kNgxVelocityBonePaletteRegisters = 225;
-  constexpr uint32_t kNgxVelocityMaxSkinnedDraws = 64;
+  // A crowd puts far more skinned draws on screen than there are characters, since each one
+  // renders as several sections (body, head, attachments). A cap of 64 was overrun by roughly
+  // half as much again with a handful of characters in view, and a skinned draw that misses the
+  // cap is a character that loses its velocity for the frame.
+  constexpr uint32_t kNgxVelocityMaxSkinnedDraws = 192;
 
   // CPU-modified mesh limits (UE3 CPU-skins morph/cloth-augmented skeletal meshes into
   // dedicated dynamic buffers, e.g. the first person arms): per-frame draw cap and
@@ -107,6 +111,16 @@ namespace dxvk {
     std::vector<Vector3> previousPositions;
   };
 
+  // The colour transform of the engine composite that Super Resolution replaces, captured from
+  // that draw's own constants (UE3 GammaCorrectionPixelShader). Identity when the engine's
+  // composite was already a plain copy.
+  struct NgxOutputTransform {
+    float colorScale[3] = { 1.0f, 1.0f, 1.0f };
+    float overlayColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float inverseGamma = 1.0f;
+    bool enabled = false;
+  };
+
   // Per-frame diagnostics of the D3D9-side dynamic draw capture, shown in the developer
   // menu. Healthy steady state: captured tracks the number of moving objects on screen
   // (capturedSkinned of them skeletal, capturedForeground of them in the foreground DPG
@@ -122,6 +136,17 @@ namespace dxvk {
     uint32_t capturedForeground = 0;
     uint32_t exactMatches = 0;
     uint32_t newRegistrations = 0;
+    // Sightings paired only by elimination, beyond the per-frame motion bounds: a fast mover
+    // sustaining its delta, or one placement of an asset arriving as another leaves. Held to
+    // the repeat-confirmation path, so a steady nonzero count with content that visibly moves
+    // means real movers are being made to wait a frame; spikes as the camera turns are swaps
+    // being refused.
+    uint32_t pairedBeyondBounds = 0;
+    // Sightings left untracked because every instance slot for their identity was already in
+    // use by a placement seen this frame or last. Nonzero means an asset has more copies on
+    // screen than kMaxInstancesPerIdentity holds: harmless for the static geometry that is
+    // usually instanced that heavily, but a mover among them would go without velocity.
+    uint32_t skippedInstanceCap = 0;
     uint32_t skippedNoCamera = 0;
     uint32_t skippedBudget = 0;
     // Scene draws with the CPU-modified-mesh buffer shape (dedicated dynamic VB, static
@@ -196,6 +221,10 @@ namespace dxvk {
     // over the stretch's source texture plus the scene subrect; DLSS then performs the
     // upscale to the target resolution instead (true Super Resolution). When
     // upscaleSourceImage is null the mode operates as DLAA at the target resolution.
+    // colorSourceOffset is where that reduced colour sits inside upscaleSourceImage. It matches
+    // sourceSubrect's offset whenever both live in scene color space, but when the runtime owns
+    // the upscale the source is the backbuffer, where the engine centred the view rect while the
+    // depth subrect stayed where the scene rasterized.
     // mirrorTargetImage (optional, pre-post-process only): a second image that receives the
     // DLSS output as well - the scene color render surface when the post chain consumes a
     // resolved copy, so any later surface->texture re-resolves propagate the result.
@@ -207,6 +236,8 @@ namespace dxvk {
                   const Rc<DxvkImage>& sceneDepthImage,
                   const Rc<DxvkImage>& upscaleSourceImage,
                   const VkRect2D& sourceSubrect,
+                  const VkOffset2D& colorSourceOffset,
+                  const NgxOutputTransform& outputTransform,
                   bool prePostProcess,
                   const std::vector<NgxVelocityDraw>& velocityDraws,
                   const float jitter[2],
@@ -219,7 +250,33 @@ namespace dxvk {
 
     // Whether the selected passthrough upscaler needs sub-pixel viewport jitter (temporal upscalers only).
     static bool needsViewportJitter(DxvkDevice* device);
-    static uint32_t viewportJitterSequenceLength(DxvkDevice* device);
+    // renderHeight/displayHeight scale the phase count with the upscale ratio, as DLSS requires
+    // and as RtCamera already does on the path traced path. Pass 0 when they are not known yet.
+    static uint32_t viewportJitterSequenceLength(DxvkDevice* device,
+                                                 uint32_t renderHeight = 0,
+                                                 uint32_t displayHeight = 0);
+
+    // Multisampled depth cannot be resolved for the NGX inputs, so the D3D9 layer refuses MSAA
+    // outright (capability queries and resource creation) rather than negotiating it with the
+    // game's own settings.
+    static bool forceGameMsaaOff() {
+      return ngxPassthroughMode() && disableGameMsaa();
+    }
+
+    /**
+      * \brief: Draws the frame's held-back debug view over the presented image.
+      *
+      * Neither injection point can host the view in place: at the pre-post point the game's post
+      * chain still has to run over that image and would mangle it, and at the late point the game
+      * keeps drawing to the backbuffer afterwards and overwrites it. Overlaying at present also
+      * leaves the frame rendering exactly as it normally does, upscaler included, so the view
+      * shows the configuration being diagnosed rather than one altered to make room for it.
+      *
+      * Called from the swapchain on its own context - going through the device's command stream
+      * puts the blit after the present flush, where it never reaches the presented image - and
+      * ahead of the present blit, so the Remix UI stays on top and usable.
+      */
+    void blitDebugOverlayToPresent(DxvkContext* ctx, const Rc<DxvkImage>& targetImage);
 
     // Like screenPercentageForUpscaler(), but uses cached XeSS optimal input size when available
     // so the game's ScreenPercentage tracks the SDK rather than hardcoded fallback factors.
@@ -236,6 +293,14 @@ namespace dxvk {
     // Per-frame capture diagnostics from the D3D9 layer, stored for the developer menu
     void setVelocityCaptureStats(const NgxVelocityCaptureStats& stats) {
       m_lastCaptureStats = stats;
+    }
+
+    // How far the space the game's transforms are expressed in moved since the previous frame,
+    // measured by the D3D9 capture. Titles uploading true world space report zero; where it is
+    // nonzero the two frames' cameras describe different spaces, and the reprojection has to
+    // cross between them (see generateMotionVectorsAndDepth).
+    void setSceneTransformOffset(const Vector3& offset) {
+      m_sceneTransformOffset = offset;
     }
 
     // Single status line (upscaler state + resolutions), shared between the developer panel and
@@ -321,9 +386,29 @@ namespace dxvk {
                "standard scaling factors. In-memory only (saved game settings unchanged); when disabled, follows live\n"
                "game values. Requires rtx.ngxPassthroughMode and locatable game readers.");
     RTX_OPTION("rtx.ngxPassthrough", bool, disableGameMsaa, true,
-               "Forces effective renderer MSAA off in-memory (saved setting unchanged). Latched at D3D device setup;\n"
-               "changing it needs device recreation or restart. Required because multisampled depth cannot be resolved\n"
-               "for NGX inputs. Requires rtx.ngxPassthroughMode and locatable game readers.");
+               "Reports multisampling as unsupported to the game and creates every surface single-sampled, so no\n"
+               "multisampled resource can exist. Required because multisampled depth cannot be resolved for NGX inputs.\n"
+               "The game's saved MSAA setting is not modified; it simply has nothing to select. Requires\n"
+               "rtx.ngxPassthroughMode.");
+    RTX_OPTION("rtx.ngxPassthrough", int, jitterSequenceLength, 0,
+               "Number of frames in the sub-pixel jitter loop. 0 derives it from the upscale ratio as\n"
+               "8 * (display/render)^2, the value DLSS documents, and uses it unchanged up to a 2.5x ratio -\n"
+               "so Quality, Balanced and Performance are unaffected. Beyond that it is clamped to 8 frames,\n"
+               "which is a deliberate divergence: the documented rule assumes jitter in the projection, where\n"
+               "it reaches every sample, while this mode offsets the viewport and whatever the offset misses\n"
+               "is displaced when the upscaler removes it. A long loop makes the deepest offsets rare enough\n"
+               "to escape accumulation and show as a shift with the loop's period, scaled into display pixels\n"
+               "by the ratio, which is why only the most aggressive preset needs it. Set a value to override.");
+    RTX_OPTION("rtx.ngxPassthrough", int, screenPercentageUpscaleOwner, 0,
+               "Who turns the reduced render resolution back into a full resolution frame.\n"
+               "0: Auto - let the engine do it when its own NeedsUpscale() readers could be redirected\n"
+               "(the verified path), otherwise fall back to the runtime. 1: Engine. 2: Runtime, which\n"
+               "upscales the reduced subrect the engine composited into the backbuffer and leaves the\n"
+               "engine believing it renders natively.");
+    RTX_OPTION("rtx.ngxPassthrough", int, systemSettingsScreenPercentageRva, 0,
+               "Escape hatch for titles where GSystemSettings cannot be located automatically: the RVA of\n"
+               "FSystemSettings::ScreenPercentage within the game's main module. 0 leaves discovery\n"
+               "automatic. The value is still proven by the behavioural probe before it is used.");
     RTX_OPTION("rtx.ngxPassthrough", int, dlssRenderPreset, 10,
                "DLSS render preset (model selection) hint for the NGX feature. 0: Default (snippet/driver decides, typically an\n"
                "older CNN model), 1-6: presets A-F (CNN models), 10: preset J (transformer model - noticeably better detail\n"
@@ -446,12 +531,25 @@ namespace dxvk {
     // Combines m_dlssOutput RGB with m_colorInput alpha into m_mergedOutput
     void dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers);
 
-    std::unique_ptr<NGXDLSSContext> m_dlssContext;
-    bool m_dlssNeedsInitialize = true;
+    // One feature per injection point (indexed by HDR content), so switching between them costs
+    // nothing and neither loses its temporal history. Sharing one meant every switch rebuilt the
+    // feature and reset the history, which the scene-dependent injection point does constantly.
+    struct DlssFeature {
+      std::unique_ptr<NGXDLSSContext> context;
+      bool needsInitialize = true;
+      int initializedRenderPreset = -1;
+      uint32_t initializedInput[2] = { 0, 0 };
+      uint32_t initializedOutput[2] = { 0, 0 };
+    };
+    DlssFeature m_dlssFeatures[2];
+    int m_dlssLastContentHDR = -1;
+
     bool m_upscalerActive = false;
     bool m_postFxActive = false;
-    int m_dlssInitializedRenderPreset = -1;
-    bool m_dlssInitializedHDR = false;
+
+    // Per-dispatch write-back configuration, consumed by the merge pass.
+    NgxOutputTransform m_outputTransform;
+    bool m_preserveOriginalAlpha = false;
 
     // Status/diagnostics for the developer menu (written on the CS thread, read for display)
     const char* m_statusReason = "not dispatched yet";
@@ -470,6 +568,14 @@ namespace dxvk {
     uint32_t m_statDebugVisCount = 0;
     uint32_t m_statResetHistoryCount = 0;
     uint32_t m_statPrePostCount = 0;
+    // How often the colour source changed between HDR and LDR within the window. Not the same as
+    // the injection point moving, which is what m_statPrePostCount against m_statDispatchCount
+    // shows: both injection points can feed HDR content, so this can read zero while the point is
+    // relocating on a third of frames.
+    uint32_t m_statContentHdrFlips = 0;
+    // Largest deviation of the camera reprojection matrix from identity in the window. Zero while
+    // the view moves means camera reprojection is producing no motion at all.
+    float m_statReprojectionFromIdentityMax = 0.0f;
     uint32_t m_statWindowStartFrameId = 0;
 
     VkExtent2D m_renderExtent = { 0, 0 };
@@ -479,6 +585,8 @@ namespace dxvk {
     Resources::Resource m_dlssOutput;                 // DLSS output, blitted back onto the game target
     Resources::Resource m_mergedOutput;               // DLSS RGB + the game's original alpha (pre-post
                                                       // injection: UE3 D3D9 stores scene depth in alpha)
+    Resources::Resource m_debugPresentImage;          // debug view held back for the present-time overlay
+    bool m_debugPresentValid = false;                 // holds across frames that capture no new view
     Resources::ResourceQueue m_depthQueue;            // R32F depth, one slot per DLFG frame in flight
     Resources::ResourceQueue m_motionVectorQueue;     // RG16F pixel-space motion vectors
 
@@ -513,6 +621,7 @@ namespace dxvk {
     // Diagnostics: dynamic draws rasterized last frame + D3D9-side capture stats (imgui)
     uint32_t m_lastVelocityDrawCount = 0;
     NgxVelocityCaptureStats m_lastCaptureStats;
+    Vector3 m_sceneTransformOffset = Vector3(0.0f, 0.0f, 0.0f);
 
     Rc<DxvkBuffer> m_constantsBuffer;
     Rc<DxvkBuffer> m_velocityRasterConstants;
