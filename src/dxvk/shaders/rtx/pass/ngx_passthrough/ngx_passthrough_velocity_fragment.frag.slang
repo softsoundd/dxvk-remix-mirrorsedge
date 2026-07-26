@@ -63,7 +63,7 @@ float4 main(float4 svPosition : SV_Position,
   // seeping their motion through walls). The raster replays the game's packed clip
   // transform verbatim, so the residual error is float rounding - 0.1% of view distance
   // absorbs it with a wide margin while keeping occlusion strict.
-  const float depthTolerance = max(1e-3f * (1.0f - sceneDepth), 1e-6f);
+  const float depthTolerance = max(1e-3f * (1.0f - sceneDepth), 1e-6f) * cb.depthToleranceScale;
 
   if (cb.debugSkipDepthTest == 0 && abs(svPosition.z - sceneDepth) > depthTolerance) {
     discard;

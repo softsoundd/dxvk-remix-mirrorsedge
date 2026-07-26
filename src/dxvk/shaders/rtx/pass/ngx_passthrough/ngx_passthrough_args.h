@@ -95,7 +95,9 @@ struct NgxVelocityRasterArgs {
   // channel so the motion vector pass can tell foreground-owned pixels from world-owned
   // ones (both phases share one target; re-uploaded between the passes)
   uint foregroundPass;
+  // Diagnostic (rtx.ngxPassthrough.objectVelocityDepthTolerance): widens the depth match so an
+  // object whose velocity is being discarded can be bisected for how far off its depth actually is
+  float depthToleranceScale;
   uint pad0;
   uint pad1;
-  uint pad2;
 };

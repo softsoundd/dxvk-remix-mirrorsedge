@@ -453,6 +453,7 @@ namespace dxvk {
 
     NgxVelocityRasterArgs rasterArgs = {};
     rasterArgs.subrectOffset = vec2(float(subrectOffset.x), float(subrectOffset.y));
+    rasterArgs.depthToleranceScale = std::max(objectVelocityDepthTolerance(), 1.0f);
     rasterArgs.bonePaletteRegisterCount = kNgxVelocityBonePaletteRegisters;
     // The freeze diagnostic also exposes the raw rasterized footprint (no depth test):
     // coverage hugging the mesh silhouettes with zero motion proves the replay; coverage
@@ -2210,6 +2211,10 @@ namespace dxvk {
 
     if (ImGui::Button("Dump Post-Chain Draw Flow To Log (4 Frames)")) {
       dumpPostChainFramesObject().setDeferred(4);
+    }
+
+    if (ImGui::Button("Dump Velocity Capture To Log (2 Frames)")) {
+      dumpVelocityCaptureFramesObject().setDeferred(2);
     }
   }
 }

@@ -52,7 +52,8 @@ namespace dxvk {
   // CPU-modified mesh limits (UE3 CPU-skins morph/cloth-augmented skeletal meshes into
   // dedicated dynamic buffers, e.g. the first person arms): per-frame draw cap and
   // per-draw vertex cap bound the previous-position upload buffer.
-  constexpr uint32_t kNgxVelocityMaxDynamicDraws = 8;
+  // A character's cloth is several draws on its own, and a scene holds more than one character.
+  constexpr uint32_t kNgxVelocityMaxDynamicDraws = 16;
   constexpr uint32_t kNgxVelocityMaxDynamicVertices = 32768;
 
   // One dynamic object draw captured by the D3D9 layer for the object velocity pass: the
@@ -135,7 +136,19 @@ namespace dxvk {
     uint32_t capturedDynamic = 0;
     uint32_t capturedForeground = 0;
     uint32_t exactMatches = 0;
+    // Sightings that found nothing to pair with, so produced no velocity: a one-frame dropout each.
+    // Broken down by why - no sighting of that placement last frame at all, or one that was there
+    // but too far in translation or in rotation to be believed the same object having moved.
     uint32_t newRegistrations = 0;
+    // Of those, the skinned ones. The total is dominated by instanced level geometry, where a
+    // placement's nearest sibling is far enough away to refuse and emitting nothing is the right
+    // answer anyway; a skinned miss is a character or an attachment losing a frame of velocity.
+    uint32_t newRegistrationsSkinned = 0;
+    uint32_t missNoLastFrameSighting = 0;
+    uint32_t missBeyondTranslation = 0;
+    uint32_t missBeyondRotation = 0;
+    // Sightings that paired but whose motion the emission gate would not vouch for
+    uint32_t claimedWithoutVelocity = 0;
     // Sightings paired only by elimination, beyond the per-frame motion bounds: a fast mover
     // sustaining its delta, or one placement of an asset arriving as another leaves. Held to
     // the repeat-confirmation path, so a steady nonzero count with content that visibly moves
@@ -147,6 +160,13 @@ namespace dxvk {
     // screen than kMaxInstancesPerIdentity holds: harmless for the static geometry that is
     // usually instanced that heavily, but a mover among them would go without velocity.
     uint32_t skippedInstanceCap = 0;
+    // Scene draws on dynamic buffers that did not match the CPU-modified-mesh shape, so nothing was
+    // captured for them - ring-pool geometry, whose allocations move every frame. A mesh that
+    // carries its motion in its vertex positions and lands here goes without velocity entirely.
+    uint32_t skippedDynamicBuffer = 0;
+    // Skinned draws whose bone palette does not fit kNgxVelocityBonePaletteRegisters. Nonzero means
+    // a rig richer than the cap allows, and every mesh using it goes without velocity.
+    uint32_t skippedBonePalette = 0;
     uint32_t skippedNoCamera = 0;
     uint32_t skippedBudget = 0;
     // Scene draws with the CPU-modified-mesh buffer shape (dedicated dynamic VB, static
@@ -421,6 +441,13 @@ namespace dxvk {
                "run the upscaler, bringing the reduced render up to display resolution with a plain filtered stretch\n"
                "instead - the same reduced input, with and without the reconstruction. Setting rtx.upscalerType to None\n"
                "instead returns the game to rendering at full resolution.")
+    RTX_OPTION("rtx.ngxPassthrough", float, objectVelocityDepthTolerance, 1.0f,
+               "Diagnostic multiplier on the object velocity raster's depth match, which is 0.1% of view distance at\n"
+               "1.0. An object that is captured and rasterized in the right place but never appears in the Object\n"
+               "Velocity Coverage view is being discarded by that match; raising this until it appears measures how\n"
+               "far its depth actually is from the game's, which distinguishes float rounding from a wrong transform.\n"
+               "Values below 1 are ignored. Leave at 1 outside diagnosis: a loose match lets an occluded object's\n"
+               "motion seep through whatever is in front of it.")
     RTX_OPTION("rtx.ngxPassthrough", int, debugVisualization, 0,
                "Debug visualization for the synthesized DLSS inputs. 0: Off, 1: Motion Vectors, 2: Depth,\n"
                "3: Object Velocity Coverage (the raw velocity raster output: green = world-phase coverage, red =\n"
@@ -429,6 +456,13 @@ namespace dxvk {
                "magnitude: 0 = per-object velocity override (dynamic object coverage), 0.25 = foreground object velocity\n"
                "(first person meshes with true skinned motion), 0.5 = world camera reprojection, 1 = camera-locked\n"
                "foreground without object velocity.");
+    RTX_OPTION("rtx.ngxPassthrough", int, dumpVelocityCaptureFrames, 0,
+               "Diagnostic: when set to a value N > 0, every scene draw the object velocity capture examines over the\n"
+               "next N frames is written to the log with the state its gates decide on - primitive count, bone palette\n"
+               "size, buffer usage, depth write and compare, and the viewport against the scene's - then the value\n"
+               "resets to 0 automatically. The developer menu has a button for this. Arm it while the object under\n"
+               "investigation is on screen: an object whose velocity never reaches the screen is told from one whose\n"
+               "does by which gate its draw fails.")
     RTX_OPTION("rtx.ngxPassthrough", int, dumpPostChainFrames, 0,
                "Diagnostic: when set to a value N > 0, the non-scene draw flow (post-process passes, composites, UI, resolve\n"
                "copies, render state) of the next N frames is written to the log, then the value resets to 0 automatically.\n"

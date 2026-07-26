@@ -977,6 +977,18 @@ namespace dxvk {
     // over mid-frame while a single dissenting sighting cannot
     uint32_t m_ngxAdoptedOffsetVotes = 0;
 
+    // On-demand velocity capture dump (rtx.ngxPassthrough.dumpVelocityCaptureFrames), armed while
+    // the object under investigation is on screen, since a log that fires by itself samples startup
+    // instead. Budgeted per draw kind rather than per frame: world geometry is hundreds of draws
+    // and comes first, so a single budget is spent before a character is ever reached.
+    static constexpr uint32_t kNgxVelocityDumpMaxSkinnedPerFrame = 40;
+    static constexpr uint32_t kNgxVelocityDumpMaxDynamicPerFrame = 20;
+    static constexpr uint32_t kNgxVelocityDumpMaxRigidPerFrame = 12;
+    uint32_t m_ngxVelocityDumpFramesLeft = 0;
+    uint32_t m_ngxVelocityDumpSkinnedThisFrame = 0;
+    uint32_t m_ngxVelocityDumpDynamicThisFrame = 0;
+    uint32_t m_ngxVelocityDumpRigidThisFrame = 0;
+
     // Counters accumulated over a window and logged, because the health of the capture is a
     // ratio - sightings that paired against sightings that had to register anew - and the
     // per-sighting miss lines are too heavily rate limited to show one. Only the per-frame
@@ -987,14 +999,26 @@ namespace dxvk {
       uint32_t captured = 0;
       uint32_t capturedSkinned = 0;
       uint32_t capturedDynamic = 0;
+      uint32_t capturedForeground = 0;
       uint32_t exactMatches = 0;
       uint32_t newRegistrations = 0;
+      uint32_t newRegistrationsSkinned = 0;
+      uint32_t missNoLastFrameSighting = 0;
+      uint32_t missBeyondTranslation = 0;
+      uint32_t missBeyondRotation = 0;
+      uint32_t claimedWithoutVelocity = 0;
       uint32_t pairedBeyondBounds = 0;
       uint32_t skippedNoCamera = 0;
       uint32_t skippedBudget = 0;
       uint32_t skippedZDisabled = 0;
       uint32_t skippedInstanceCap = 0;
+      uint32_t skippedDynamicBuffer = 0;
+      uint32_t skippedBonePalette = 0;
       uint32_t depthClears = 0;
+      // Frames whose depth was cleared more than once mid-scene. Only two depth sources exist -
+      // the snapshot taken at the first clear and the live buffer after the last - so a draw
+      // between two clears is in neither, and the raster discards its velocity entirely.
+      uint32_t framesWithOrphanedDepthPhase = 0;
     };
     static constexpr uint32_t kNgxVelocityWindowFrames = 600;
     NgxVelocityWindowTotals m_ngxVelocityWindow;

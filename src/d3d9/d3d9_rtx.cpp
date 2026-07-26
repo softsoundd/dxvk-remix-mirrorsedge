@@ -4818,6 +4818,14 @@ namespace dxvk {
       RtxNgxPassthrough::dumpPostChainFramesObject().setDeferred(0);
       Logger::info(str::format("[RTX NGX Passthrough][dump] On-demand dump armed for ", m_ngxPostChainDumpFramesLeft, " frames."));
     }
+
+    if (o.ngxPassthroughMode && RtxNgxPassthrough::dumpVelocityCaptureFrames() > 0 &&
+        m_ngxVelocityDumpFramesLeft == 0) {
+      m_ngxVelocityDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpVelocityCaptureFrames());
+      RtxNgxPassthrough::dumpVelocityCaptureFramesObject().setDeferred(0);
+      Logger::info(str::format("[RTX NGX Passthrough][velocity dump] Armed for ",
+                               m_ngxVelocityDumpFramesLeft, " frames."));
+    }
     o.enableIndexBufferMemoization = enableIndexBufferMemoizationObject().get();
 
     o.enableRaytracing = RtxOptions::enableRaytracingObject().get();
@@ -11193,7 +11201,20 @@ namespace dxvk {
 
     const bool vbDynamic = (vertexBufferCommon->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
     const bool ibDynamic = (indexBufferCommon->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
-    const bool dynamicMeshShape = vbDynamic && !ibDynamic && !ctabRegs.hasBoneMatrices &&
+    // UE3 gives a CPU-modified mesh a dedicated dynamic vertex buffer, and a dedicated dynamic
+    // index buffer as well wherever cloth tearing is enabled, since torn triangles need new
+    // indices. Requiring a static index buffer therefore rejects exactly the meshes whose motion
+    // this path exists to carry. A dedicated buffer is told from a shared ring pool by the draw
+    // covering a large part of it: a ring-pool draw takes a small slice of a big buffer, and it is
+    // the shifting allocations within one that make that geometry untrackable to begin with.
+    const uint32_t indexStride =
+      static_cast<D3D9Format>(indexBufferCommon->Desc()->Format) == D3D9Format::INDEX32 ? 4u : 2u;
+    const uint64_t drawIndexBytes = uint64_t(drawContext.PrimitiveCount) * 3u * indexStride;
+    const bool indexBufferDedicated =
+      !ibDynamic || drawIndexBytes * 4 >= uint64_t(indexBufferCommon->Desc()->Size);
+
+    const bool dynamicMeshShape = vbDynamic && indexBufferDedicated &&
+                                  !ctabRegs.hasBoneMatrices &&
                                   d3d9State().vertexBuffers[0].offset == 0;
 
     if (!ctabRegs.hasLocalToWorld) {
@@ -11220,6 +11241,17 @@ namespace dxvk {
       if (ctabRegs.boneMatricesRegisterCount == 0 ||
           ctabRegs.boneMatricesRegisterCount > kNgxVelocityBonePaletteRegisters ||
           ctabRegs.boneMatricesRegister + ctabRegs.boneMatricesRegisterCount > caps::MaxFloatConstantsSoftware) {
+        // The palette cap follows stock UE3's 75 bones per chunk, but a licensee that needed a
+        // richer rig may have raised it, and a mesh past the cap is dropped here while simpler
+        // ones around it are captured - one character without velocity, everything else with.
+        m_ngxVelocityStats.skippedBonePalette++;
+
+        ONCE(Logger::info(str::format(
+          "[RTX NGX Passthrough] Velocity capture rejecting a skinned draw over the bone palette "
+          "cap: ", ctabRegs.boneMatricesRegisterCount, " registers (",
+          ctabRegs.boneMatricesRegisterCount / 3, " bones) at register ",
+          ctabRegs.boneMatricesRegister, ", cap ", kNgxVelocityBonePaletteRegisters, " (",
+          kNgxVelocityBonePaletteRegisters / 3, " bones).")));
         return;
       }
       if (m_ngxVelocitySkinnedDraws >= kNgxVelocityMaxSkinnedDraws) {
@@ -11246,6 +11278,41 @@ namespace dxvk {
     drawWorldToProjection[3] = d3d9State().vsConsts.fConsts[ctabRegs.viewProjRegister + 3];
     if (m_ngxFrameCameraUsedTranspose) {
       drawWorldToProjection = transpose(drawWorldToProjection);
+    }
+
+    // On-demand per-draw record of everything the gates below decide on, so a draw whose velocity
+    // never reaches the screen can be told from one whose does. Armed by the user while the object
+    // in question is on screen, because a one-shot log fires during startup instead and describes
+    // menu frames.
+    const bool dumpThisDraw = [&] {
+      if (likely(m_ngxVelocityDumpFramesLeft == 0)) {
+        return false;
+      }
+      if (skinned) {
+        return m_ngxVelocityDumpSkinnedThisFrame++ < kNgxVelocityDumpMaxSkinnedPerFrame;
+      }
+      if (vbDynamic || ibDynamic) {
+        return m_ngxVelocityDumpDynamicThisFrame++ < kNgxVelocityDumpMaxDynamicPerFrame;
+      }
+      return m_ngxVelocityDumpRigidThisFrame++ < kNgxVelocityDumpMaxRigidPerFrame;
+    }();
+
+    if (unlikely(dumpThisDraw)) {
+      const D3DVIEWPORT9& vp = d3d9State().viewport;
+      Logger::info(str::format(
+        "[RTX NGX Passthrough][velocity dump] draw=", m_drawCallID,
+        " prims=", drawContext.PrimitiveCount,
+        " skinned=", skinned ? 1 : 0,
+        " boneRegs=", skinned ? ctabRegs.boneMatricesRegisterCount : 0,
+        " vbDynamic=", vbDynamic ? 1 : 0, " ibDynamic=", ibDynamic ? 1 : 0,
+        " vbBytes=", vertexBufferCommon->Desc()->Size,
+        " streamOffset=", d3d9State().vertexBuffers[0].offset,
+        " zwrite=", d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE ? 1 : 0,
+        " zfunc=", int(d3d9State().renderStates[D3DRS_ZFUNC]),
+        " vp=", vp.X, ",", vp.Y, " ", vp.Width, "x", vp.Height,
+        " z=", vp.MinZ, "..", vp.MaxZ,
+        " sceneVp=", m_ngxSceneViewport.X, ",", m_ngxSceneViewport.Y, " ",
+        m_ngxSceneViewport.Width, "x", m_ngxSceneViewport.Height));
     }
 
     // Vertex layout on stream 0: position always; skinned draws additionally need the
@@ -11292,12 +11359,24 @@ namespace dxvk {
     // morph/cloth-augmented skeletal meshes into DEDICATED dynamic buffers, e.g. the
     // first person arms) carry their motion in the vertex positions and are captured
     // with a position snapshot below; they are recognizable by a bone-less shader, a
-    // whole-buffer stream (offset 0) and a static index buffer. Everything else on
-    // dynamic buffers is ring-pool geometry (particles, trails, canvas) whose
+    // whole-buffer stream (offset 0) and a buffer the draw largely fills. Everything
+    // else on dynamic buffers is ring-pool geometry (particles, trails, canvas) whose
     // allocation offsets shift every frame - untrackable, and skipped.
     const bool dynamicMesh = dynamicMeshShape && !skinned;
 
     if ((vbDynamic || ibDynamic) && !dynamicMesh) {
+      // Ring-pool geometry: a dynamic buffer shared between draws whose allocations move every
+      // frame, so nothing here can be matched against a previous sighting. Counted because a mesh
+      // that carries its motion in its vertex positions is silently left without velocity if it
+      // ever lands in this shape rather than being recognised above.
+      m_ngxVelocityStats.skippedDynamicBuffer++;
+
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] Velocity capture rejecting a dynamic-buffer draw: vb dynamic=",
+        vbDynamic ? 1 : 0, ", ib dynamic=", ibDynamic ? 1 : 0, ", bone palette=", skinned ? 1 : 0,
+        ", stream offset=", d3d9State().vertexBuffers[0].offset,
+        ", vb bytes=", vertexBufferCommon->Desc()->Size,
+        ". Motion carried in vertex positions is invisible to the capture in this shape.")));
       return;
     }
 
@@ -11863,7 +11942,7 @@ namespace dxvk {
         matchedInstance->lastEmitPrevWorldToProjection = matchedInstance->worldToProjection;
       } else {
         // Claimed without velocity (negligible motion or deferred onset confirmation)
-        m_ngxVelocityStats.newRegistrations++;
+        m_ngxVelocityStats.claimedWithoutVelocity++;
       }
 
       // Claim the instance: repeat draws this frame match the updated transform, other
@@ -11999,6 +12078,20 @@ namespace dxvk {
 
     objectState.lastNewRegistrationFrame = m_ue3FrameCounter;
     m_ngxVelocityStats.newRegistrations++;
+    if (skinned) {
+      m_ngxVelocityStats.newRegistrationsSkinned++;
+    }
+
+    // Why the sighting had nothing to pair with. A one-frame velocity dropout is exactly this
+    // outcome, so the population behind it has to be readable as a breakdown - the per-sighting
+    // miss lines are rate limited to a burst every couple of seconds and cannot characterise it.
+    if (lastFrameCandidates == 0) {
+      m_ngxVelocityStats.missNoLastFrameSighting++;
+    } else if (nearestTranslationDelta > kMaxFrameTranslation) {
+      m_ngxVelocityStats.missBeyondTranslation++;
+    } else {
+      m_ngxVelocityStats.missBeyondRotation++;
+    }
   }
 
   namespace {
@@ -14322,29 +14415,49 @@ namespace dxvk {
     m_ngxVelocityWindow.captured += m_ngxVelocityStats.captured;
     m_ngxVelocityWindow.capturedSkinned += m_ngxVelocityStats.capturedSkinned;
     m_ngxVelocityWindow.capturedDynamic += m_ngxVelocityStats.capturedDynamic;
+    m_ngxVelocityWindow.capturedForeground += m_ngxVelocityStats.capturedForeground;
     m_ngxVelocityWindow.exactMatches += m_ngxVelocityStats.exactMatches;
     m_ngxVelocityWindow.newRegistrations += m_ngxVelocityStats.newRegistrations;
+    m_ngxVelocityWindow.newRegistrationsSkinned += m_ngxVelocityStats.newRegistrationsSkinned;
+    m_ngxVelocityWindow.missNoLastFrameSighting += m_ngxVelocityStats.missNoLastFrameSighting;
+    m_ngxVelocityWindow.missBeyondTranslation += m_ngxVelocityStats.missBeyondTranslation;
+    m_ngxVelocityWindow.missBeyondRotation += m_ngxVelocityStats.missBeyondRotation;
+    m_ngxVelocityWindow.claimedWithoutVelocity += m_ngxVelocityStats.claimedWithoutVelocity;
     m_ngxVelocityWindow.pairedBeyondBounds += m_ngxVelocityStats.pairedBeyondBounds;
     m_ngxVelocityWindow.skippedNoCamera += m_ngxVelocityStats.skippedNoCamera;
     m_ngxVelocityWindow.skippedBudget += m_ngxVelocityStats.skippedBudget;
     m_ngxVelocityWindow.skippedZDisabled += m_ngxVelocityStats.skippedZDisabled;
     m_ngxVelocityWindow.skippedInstanceCap += m_ngxVelocityStats.skippedInstanceCap;
+    m_ngxVelocityWindow.skippedDynamicBuffer += m_ngxVelocityStats.skippedDynamicBuffer;
+    m_ngxVelocityWindow.skippedBonePalette += m_ngxVelocityStats.skippedBonePalette;
     m_ngxVelocityWindow.depthClears += m_ngxVelocityStats.depthClears;
+    if (m_ngxVelocityStats.depthClears > 1) {
+      m_ngxVelocityWindow.framesWithOrphanedDepthPhase++;
+    }
 
     if (++m_ngxVelocityWindow.frames >= kNgxVelocityWindowFrames) {
       Logger::info(str::format(
         "[RTX NGX Passthrough][velocity] over ", m_ngxVelocityWindow.frames, " frames: ",
         m_ngxVelocityWindow.captured, " captured (", m_ngxVelocityWindow.capturedSkinned, " skinned, ",
-        m_ngxVelocityWindow.capturedDynamic, " CPU-modified), ",
+        m_ngxVelocityWindow.capturedDynamic, " CPU-modified, ",
+        m_ngxVelocityWindow.capturedForeground, " foreground-phase), ",
         m_ngxVelocityWindow.exactMatches, " paired to their own history, ",
-        m_ngxVelocityWindow.newRegistrations, " registered anew, ",
+        m_ngxVelocityWindow.newRegistrations, " registered anew (",
+        m_ngxVelocityWindow.newRegistrationsSkinned, " of them skinned; ",
+        m_ngxVelocityWindow.missNoLastFrameSighting, " unseen last frame / ",
+        m_ngxVelocityWindow.missBeyondTranslation, " beyond translation / ",
+        m_ngxVelocityWindow.missBeyondRotation, " beyond rotation), ",
+        m_ngxVelocityWindow.claimedWithoutVelocity, " claimed without velocity, ",
         m_ngxVelocityWindow.pairedBeyondBounds, " paired beyond the motion bounds, skipped: ",
         m_ngxVelocityWindow.skippedNoCamera, " no camera / ",
         m_ngxVelocityWindow.skippedBudget, " over budget / ",
         m_ngxVelocityWindow.skippedZDisabled, " depth test off / ",
-        m_ngxVelocityWindow.skippedInstanceCap, " over the instance cap; tracking ",
+        m_ngxVelocityWindow.skippedInstanceCap, " over the instance cap / ",
+        m_ngxVelocityWindow.skippedDynamicBuffer, " on unrecognised dynamic buffers / ",
+        m_ngxVelocityWindow.skippedBonePalette, " over the bone palette cap; tracking ",
         m_ngxVelocityObjectCache.size(), " identities; ", m_ngxVelocityWindow.depthClears,
-        " mid-scene depth clears; scene-wide transform offset (",
+        " mid-scene depth clears over ", m_ngxVelocityWindow.framesWithOrphanedDepthPhase,
+        " frames cleared more than once; scene-wide transform offset (",
         m_ngxGlobalTransformOffset.x, ",", m_ngxGlobalTransformOffset.y, ",",
         m_ngxGlobalTransformOffset.z, ")."));
 
@@ -16128,6 +16241,12 @@ namespace dxvk {
       m_ngxSceneColorResolves[i] = nullptr;
     }
     m_ngxSceneColorResolveCount = 0;
+    m_ngxVelocityDumpSkinnedThisFrame = 0;
+    m_ngxVelocityDumpDynamicThisFrame = 0;
+    m_ngxVelocityDumpRigidThisFrame = 0;
+    if (m_ngxVelocityDumpFramesLeft > 0) {
+      m_ngxVelocityDumpFramesLeft--;
+    }
     if (m_ngxPostChainDumpFramesLeft > 0) {
       m_ngxPostChainDumpFramesLeft--;
       Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));
