@@ -2258,6 +2258,7 @@ namespace dxvk {
 
     m_common->metaNgxPassthrough().setVelocityCaptureStats(velocityStats);
     m_common->metaNgxPassthrough().setSceneTransformOffset(sceneTransformOffset);
+    m_common->metaNgxPassthrough().setSceneCameraFresh(cameraMatricesValid);
   }
 
   void RtxContext::dispatchNgxPassthrough(Rc<DxvkImage> targetImage) {

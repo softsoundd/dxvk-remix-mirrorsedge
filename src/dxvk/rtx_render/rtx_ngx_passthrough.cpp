@@ -825,12 +825,15 @@ namespace dxvk {
                                            -double(m_sceneTransformOffset.y),
                                            -double(m_sceneTransformOffset.z), 1.0);
 
-    const Matrix4d reprojectToPrevClip =
-      camera.getPreviousViewToProjection() *
-      camera.getPreviousWorldToView() *
-      previousSpaceFromCurrent *
-      camera.getViewToWorld() *
-      camera.getProjectionToView();
+    // Without a camera of its own, the matrices below still describe the last scene and would
+    // reproject a movie or loading screen by motion that predates it; nothing here moved.
+    const Matrix4d reprojectToPrevClip = m_sceneCameraFresh
+      ? camera.getPreviousViewToProjection() *
+        camera.getPreviousWorldToView() *
+        previousSpaceFromCurrent *
+        camera.getViewToWorld() *
+        camera.getProjectionToView()
+      : Matrix4d();
 
     // How far this matrix is from identity is how much camera motion the reprojection can
     // express. Near zero while the view is moving means the previous camera is not actually a
@@ -1867,6 +1870,11 @@ namespace dxvk {
     // The sub-pixel jitter was applied on the D3D9 side (viewport offset); the camera must
     // report exactly the value the frame was rasterized with so DLSS and DLFG agree with it
     camera.setExternalJitter(jitter);
+
+    // Crossing into or out of that state swaps the content wholesale, with no motion to reconcile
+    // the two. Only the crossing resets, so the movie still accumulates across its own frames.
+    resetHistory |= m_sceneCameraFresh != m_previousSceneCameraFresh;
+    m_previousSceneCameraFresh = m_sceneCameraFresh;
 
     const bool haveDepthMvInputs = generateMotionVectorsAndDepth(ctx, dxvkCtxState, barriers, sceneDepthImage, subrectOffset, camera,
                                                                  objectVelocities() ? velocityDraws : std::vector<NgxVelocityDraw>(),

@@ -323,6 +323,12 @@ namespace dxvk {
       m_sceneTransformOffset = offset;
     }
 
+    // Whether a scene draw donated the camera this frame. False where the game presents no scene -
+    // a fullscreen movie, a loading screen - and the camera then holds the matrices it last had.
+    void setSceneCameraFresh(bool fresh) {
+      m_sceneCameraFresh = fresh;
+    }
+
     // Single status line (upscaler state + resolutions), shared between the developer panel and
     // the user menu (the stock DLSS object's state is meaningless while this mode is active)
     void showImguiStatusLine(bool includeInjectionPoint = true);
@@ -667,6 +673,8 @@ namespace dxvk {
     uint32_t m_lastVelocityDrawCount = 0;
     NgxVelocityCaptureStats m_lastCaptureStats;
     Vector3 m_sceneTransformOffset = Vector3(0.0f, 0.0f, 0.0f);
+    bool m_sceneCameraFresh = false;
+    bool m_previousSceneCameraFresh = false;
 
     Rc<DxvkBuffer> m_constantsBuffer;
     Rc<DxvkBuffer> m_velocityRasterConstants;
