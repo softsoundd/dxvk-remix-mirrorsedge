@@ -307,11 +307,6 @@ namespace dxvk {
     // the user menu (the stock DLSS object's state is meaningless while this mode is active)
     void showImguiStatusLine(bool includeInjectionPoint = true);
 
-    // True when the selected upscaler evaluated successfully last frame (for UI/status display)
-    bool isUpscalerActive() const {
-      return m_upscalerActive;
-    }
-
     // Copies the game's depth buffer into a runtime-owned snapshot. Called (via RtxContext)
     // right before the game's first mid-scene depth clear: UE3 clears the depth buffer
     // ahead of its foreground DPG (with occlusion culling enabled, an extra clear precedes
@@ -421,6 +416,11 @@ namespace dxvk {
                "exactly where the replayed geometry lands with current-frame data alone: neutral coverage hugging the\n"
                "object silhouettes means the replay (transforms, skinning) is correct; any artifact seen without the\n"
                "freeze then comes from the depth-based visibility or the previous-frame history pairing.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, bypassUpscaler, false,
+               "Diagnostic: keeps driving the game's render resolution from the selected upscaler's preset but does not\n"
+               "run the upscaler, bringing the reduced render up to display resolution with a plain filtered stretch\n"
+               "instead - the same reduced input, with and without the reconstruction. Setting rtx.upscalerType to None\n"
+               "instead returns the game to rendering at full resolution.")
     RTX_OPTION("rtx.ngxPassthrough", int, debugVisualization, 0,
                "Debug visualization for the synthesized DLSS inputs. 0: Off, 1: Motion Vectors, 2: Depth,\n"
                "3: Object Velocity Coverage (the raw velocity raster output: green = world-phase coverage, red =\n"
@@ -474,6 +474,16 @@ namespace dxvk {
                       bool preserveTargetAlpha,
                       const float jitter[2],
                       bool resetHistory);
+
+    // Plain filtered stretch in the upscaler's place, for rtx.ngxPassthrough.bypassUpscaler
+    bool evaluateUpscalerBypass(RtxContext* ctx,
+                                DxvkBarrierSet& barriers,
+                                const Rc<DxvkImage>& colorSourceImage,
+                                const VkOffset2D& colorSourceOffset,
+                                const Rc<DxvkImage>& targetImage,
+                                const VkOffset2D& targetOffset,
+                                bool preserveTargetAlpha,
+                                bool resetHistory);
 
     bool evaluateNis(RtxContext* ctx,
                      DxvkBarrierSet& barriers,
@@ -544,6 +554,7 @@ namespace dxvk {
     DlssFeature m_dlssFeatures[2];
     int m_dlssLastContentHDR = -1;
 
+    // Whether the selected upscaler evaluated successfully last frame, for the status line
     bool m_upscalerActive = false;
     bool m_postFxActive = false;
 

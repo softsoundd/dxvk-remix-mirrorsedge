@@ -1100,6 +1100,12 @@ namespace dxvk {
   }
 
   bool RtxNgxPassthrough::needsViewportJitter(DxvkDevice* device) {
+    // A plain stretch has no history to accumulate phases into, so jitter would only wobble the
+    // image and leave the game's alpha a sub-pixel away from the colour the merge pairs it with
+    if (bypassUpscaler()) {
+      return false;
+    }
+
     switch (RtxOptions::upscalerType()) {
     case UpscalerType::DLSS:
       return device != nullptr && device->getCommon()->metaNGXContext().supportsDLSS();
@@ -1215,9 +1221,12 @@ namespace dxvk {
     // Blit an image 1:1 into a rect of another image (used for the DLSS output and debug
     // visualization write-back, which target a subrect of the game's scene color at the
     // pre-post-process injection point)
-    void blitToTargetRect(DxvkContext* ctx,
-                          const Rc<DxvkImage>& sourceImage, const VkExtent2D& sourceExtent,
-                          const Rc<DxvkImage>& targetImage, const VkOffset2D& targetOffset) {
+    // A source rect at the origin into an arbitrary destination rect. Equal extents with a
+    // nearest filter deliver a result unaltered; differing extents stretch.
+    void blitImageRect(DxvkContext* ctx,
+                       const Rc<DxvkImage>& sourceImage, const VkExtent2D& sourceExtent,
+                       const Rc<DxvkImage>& targetImage, const VkOffset2D& targetOffset,
+                       const VkExtent2D& targetExtent, VkFilter filter) {
       const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(sourceImage->info().format);
       const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(targetImage->info().format);
 
@@ -1227,15 +1236,22 @@ namespace dxvk {
       blitInfo.srcOffsets[0] = { 0, 0, 0 };
       blitInfo.srcOffsets[1] = { int32_t(sourceExtent.width), int32_t(sourceExtent.height), 1 };
       blitInfo.dstOffsets[0] = { targetOffset.x, targetOffset.y, 0 };
-      blitInfo.dstOffsets[1] = { targetOffset.x + int32_t(sourceExtent.width),
-                                 targetOffset.y + int32_t(sourceExtent.height), 1 };
+      blitInfo.dstOffsets[1] = { targetOffset.x + int32_t(targetExtent.width),
+                                 targetOffset.y + int32_t(targetExtent.height), 1 };
 
       const VkComponentMapping identityMap = {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
       };
 
-      ctx->blitImage(targetImage, identityMap, sourceImage, identityMap, blitInfo, VK_FILTER_NEAREST);
+      ctx->blitImage(targetImage, identityMap, sourceImage, identityMap, blitInfo, filter);
+    }
+
+    void blitToTargetRect(DxvkContext* ctx,
+                          const Rc<DxvkImage>& sourceImage, const VkExtent2D& sourceExtent,
+                          const Rc<DxvkImage>& targetImage, const VkOffset2D& targetOffset) {
+      blitImageRect(ctx, sourceImage, sourceExtent, targetImage, targetOffset, sourceExtent,
+                    VK_FILTER_NEAREST);
     }
   }
 
@@ -1661,6 +1677,31 @@ namespace dxvk {
     return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
   }
 
+  bool RtxNgxPassthrough::evaluateUpscalerBypass(RtxContext* ctx,
+                                                 DxvkBarrierSet& barriers,
+                                                 const Rc<DxvkImage>& colorSourceImage,
+                                                 const VkOffset2D& colorSourceOffset,
+                                                 const Rc<DxvkImage>& targetImage,
+                                                 const VkOffset2D& targetOffset,
+                                                 bool preserveTargetAlpha,
+                                                 bool resetHistory) {
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
+
+    // Stands in for the upscaler at the point it would have written, taking the same input and
+    // leaving the same output for everything downstream, so the presented frame differs from the
+    // upscaled one by the reconstruction alone.
+    {
+      ScopedGpuProfileZone(ctx, "Upscaler Bypass (NGX Passthrough)");
+      blitImageRect(ctx, m_colorInput.image, m_renderExtent, m_dlssOutput.image, { 0, 0 },
+                    m_displayExtent, VK_FILTER_LINEAR);
+    }
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_colorInput.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_dlssOutput.image);
+
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
+  }
+
   bool RtxNgxPassthrough::evaluateTaau(RtxContext* ctx,
                                        DxvkBarrierSet& barriers,
                                        const Rc<DxvkImage>& colorSourceImage,
@@ -1871,7 +1912,19 @@ namespace dxvk {
 
     bool wroteOutputToTarget = false;
 
-    if (!canRunUpscaler) {
+    // The render resolution is still driven from the selected upscaler's preset; only the
+    // reconstruction is withheld, so the frame shows what that same input looks like without it.
+    // Reported as an inactive upscaler, which is what it is.
+    if (canRunUpscaler && bypassUpscaler()) {
+      wroteOutputToTarget = evaluateUpscalerBypass(ctx, barriers, colorSourceImage, colorOffset, targetImage,
+                                                   writebackOffset, preserveTargetAlpha, resetHistory);
+      if (wroteOutputToTarget) {
+        m_statusReason = "upscaler bypassed (plain stretch)";
+      } else {
+        m_statusReason = "upscaler bypass could not write its output";
+        m_statEvaluateFailedCount++;
+      }
+    } else if (!canRunUpscaler) {
       if (RtxOptions::upscalerType() == UpscalerType::None) {
         m_statusReason = "rtx.upscalerType is None";
       } else if (RtxOptions::isRayReconstructionEnabled()) {
@@ -2097,6 +2150,7 @@ namespace dxvk {
   void RtxNgxPassthrough::showImguiSettings() {
     RemixGui::Checkbox("Sub-Pixel Camera Jitter", &enableJitterObject());
     RemixGui::Checkbox("Pre-Post-Process Injection (DLSS before the game's post chain)", &prePostProcessObject());
+    RemixGui::Checkbox("Bypass Upscaler (keep the reduced render, plain stretch)", &bypassUpscalerObject());
 
     {
       static const int kPresetOptionValues[] = { 0, 1, 2, 3, 4, 5, 6, 10 };
