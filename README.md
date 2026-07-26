@@ -12,7 +12,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ## NGX passthrough branch (`mirrors-edge-ngx`)
 
-This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's Post FX runs on top of it. Render resolution and MSAA control are derived from stock Unreal Engine 3 behaviour rather than from Mirror's Edge's binary, so they should hold across UE3 titles; the rest of the mode may work elsewhere too, but support is not guaranteed.
+This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's Post FX runs on top of it. Like the rest of this fork, NGX passthrough mode may work in other UE3 titles, but support is not guaranteed.
 
 ### NGX mode setup
 
