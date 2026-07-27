@@ -449,6 +449,14 @@ namespace dxvk {
       ImGui::BeginDisabled(!postFx.enable());
 
       RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
+      if (postFx.enableMotionBlur()) {
+        ImGui::Indent(static_cast<float>(subItemIndent));
+        RemixGui::Combo("Motion Blur Quality", &postFx.motionBlurModeObject(), "Legacy\0Cinematic\0");
+        if (postFx.motionBlurMode() == MotionBlurMode::Cinematic) {
+          RemixGui::DragFloat("Shutter Angle", &postFx.motionBlurShutterAngleObject(), 1.0f, 0.0f, 360.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
+        }
+        ImGui::Unindent(static_cast<float>(subItemIndent));
+      }
       RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
       RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
 

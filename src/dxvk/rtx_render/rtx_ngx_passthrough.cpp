@@ -41,6 +41,7 @@
 #include "rtx_initializer.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/ngx_passthrough/ngx_passthrough_args.h"
+#include "rtx/pass/post_fx/post_fx.h"
 
 #include <rtx_shaders/ngx_passthrough_mv.h>
 #include <rtx_shaders/ngx_passthrough_alpha_merge.h>
@@ -246,6 +247,24 @@ namespace dxvk {
     m_surfaceFlags = Resources::createImageResource(ctx, "NGX passthrough surface flags", renderExtent3D, VK_FORMAT_R8_UINT);
     m_surfaceFlagsScratch1 = Resources::AliasedResource(ctx, renderExtent3D, VK_FORMAT_R8_UINT, "NGX passthrough surface flags scratch 1");
     m_surfaceFlagsScratch2 = Resources::AliasedResource(ctx, renderExtent3D, VK_FORMAT_R8_UINT, "NGX passthrough surface flags scratch 2");
+
+    // Cinematic motion blur intermediates. These live at display resolution because the
+    // filter runs on the upscaled colour; the tile textures are sized for the smallest
+    // supported tile so changing the blur radius at runtime never reallocates.
+    {
+      const VkExtent3D tileExtent = {
+        (displayExtent.width + POST_FX_MB_TILE_SIZE_MIN - 1) / POST_FX_MB_TILE_SIZE_MIN,
+        (displayExtent.height + POST_FX_MB_TILE_SIZE_MIN - 1) / POST_FX_MB_TILE_SIZE_MIN,
+        1
+      };
+      const VkExtent3D tileColumnExtent = { tileExtent.width, displayExtent.height, 1 };
+
+      m_motionBlurCineVelocityDepth = Resources::createImageResource(ctx, "NGX passthrough motion blur velocity depth", displayExtent3D, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_motionBlurCineCurvature = Resources::createImageResource(ctx, "NGX passthrough motion blur curvature", displayExtent3D, VK_FORMAT_R16G16_SFLOAT);
+      m_motionBlurCineTileMaxX = Resources::createImageResource(ctx, "NGX passthrough motion blur tile max x", tileColumnExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_motionBlurCineTileMax = Resources::createImageResource(ctx, "NGX passthrough motion blur tile max", tileExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_motionBlurCineNeighborMax = Resources::createImageResource(ctx, "NGX passthrough motion blur neighbor max", tileExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+    }
 
     // Per-object velocity raster target (color attachment for the raster, sampled by the
     // motion vector pass; no storage usage needed): RG = NDC delta, B = phase ownership
@@ -862,6 +881,15 @@ namespace dxvk {
     const auto nearFarPlanes = camera.calculateNearFarPlanes();
     args.nearPlane = nearFarPlanes.first;
     args.farPlane = nearFarPlanes.second;
+
+    // Curved sample paths for the cinematic motion blur are fitted from the camera's own
+    // pose history, so they are built here where the space offset is already known, and held
+    // for the post effect stage further down the frame.
+    m_motionBlurNearPlane = args.nearPlane;
+    m_motionBlurFarPlane = args.farPlane;
+    m_motionBlurCurves = m_sceneCameraFresh
+      ? buildMotionBlurCurveMatrices(camera, previousSpaceFromCurrent)
+      : DxvkPostFx::MotionBlurCurveMatrices();
     args.motionBlurFirstPerson = motionBlurFirstPerson() ? 1u : 0u;
     args.objectVelocityValid = (velocityTargets & 1u) != 0 ? 1u : 0u;
     args.foregroundVelocityValid = (velocityTargets & 2u) != 0 ? 1u : 0u;
@@ -1457,6 +1485,16 @@ namespace dxvk {
         motionBlurInputs.surfaceFlagsScratch1 = &m_surfaceFlagsScratch1;
         motionBlurInputs.surfaceFlagsScratch2 = &m_surfaceFlagsScratch2;
         motionBlurInputs.linearViewZ = &m_linearViewZ;
+        motionBlurInputs.cineVelocityDepth = &m_motionBlurCineVelocityDepth;
+        motionBlurInputs.cineCurvature = &m_motionBlurCineCurvature;
+        motionBlurInputs.cineTileMaxX = &m_motionBlurCineTileMaxX;
+        motionBlurInputs.cineTileMax = &m_motionBlurCineTileMax;
+        motionBlurInputs.cineNeighborMax = &m_motionBlurCineNeighborMax;
+        motionBlurInputs.previousScreenSpaceMotionVector =
+          m_motionVectorQueue.hasDistinctPrevious() ? &m_motionVectorQueue.getPrevious() : nullptr;
+        motionBlurInputs.curves = m_motionBlurCurves;
+        motionBlurInputs.nearPlane = m_motionBlurNearPlane;
+        motionBlurInputs.farPlane = m_motionBlurFarPlane;
 
         postFx.dispatchMotionBlur(ctx, nearestSampler, linearSampler, renderResolution, frameIdx,
                                   motionBlurInputs, resetHistory);

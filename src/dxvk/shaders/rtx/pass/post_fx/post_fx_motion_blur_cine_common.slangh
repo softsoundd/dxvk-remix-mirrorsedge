@@ -1,0 +1,203 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Shared definitions for the cinematic motion blur passes.
+//
+// A Fast and Stable Feature-Aware Motion Blur Filter
+// Guertin, McGuire & Nowrouzezahrai, HPG 2014 / Computer Graphics Forum 33(2)
+// https://casual-effects.com/research/Guertin2014MotionBlur/Guertin2014MotionBlur-small.pdf
+//
+// Curved sample paths follow the idea in High Performance Non-linear Motion Blur
+// (Guertin & Nowrouzezahrai, EGSR 2015) but derive the curve analytically from the camera
+// rather than from a forward motion vector buffer, and evaluate it in the gather domain.
+
+#include "rtx/utility/math.slangh"
+#include "rtx/utility/shader_types.slangh"
+
+// Velocities below this are treated as motionless. Also the minimum magnitude used when
+// normalizing or reciprocating a velocity, matching the paper's 0.5 pixel clamp.
+#define POST_FX_MB_MIN_SPEED 0.5f
+
+// The setup pass collapses everything the gather needs about a pixel into two textures so
+// the inner loop costs two fetches per tap instead of four:
+//   velocityDepth : xy = blur half-extent in display pixels, z = linear view Z, w = validity
+//   curvature     : xy = parabolic path curvature in display pixels
+
+struct MotionBlurSample
+{
+  float2 velocity;   // half-extent of the blur, display pixels, already shutter scaled
+  float  linearZ;    // linear view space Z, larger is farther
+  float  validity;   // 1 when the pixel may participate in motion blur, 0 otherwise
+};
+
+float4 motionBlurPackVelocityDepth(const float2 velocity, const float linearZ, const float validity)
+{
+  return float4(velocity, linearZ, validity);
+}
+
+MotionBlurSample motionBlurUnpackVelocityDepth(const float4 packed)
+{
+  MotionBlurSample result;
+  result.velocity = packed.xy;
+  result.linearZ = packed.z;
+  result.validity = packed.w;
+  return result;
+}
+
+// The setup pass fits a quadratic through the surface point's screen position half a frame
+// back, now, and half a frame forward. Rewriting that in the symmetric parameter t = 2s - 1,
+// so t = 0 is the current position, collapses the Bezier to
+//
+//   B(t) = c + v * t - k * t^2
+//
+// which is exact, and degenerates to the straight line c + v*t when the curvature k is zero.
+// Deriving it: with B0 = p(-0.5), B2 = p(+0.5), mid = (B0 + B2)/2, the control point that
+// satisfies B(1/2) = c is B1 = 2c - mid; substituting into the quadratic Bezier basis and
+// rewriting in t gives v = (B2 - B0)/2 and k = mid - c.
+
+float2 motionBlurEvaluatePath(const float2 center, const float2 velocity, const float2 curvature, const float t)
+{
+  return center + velocity * t - curvature * (t * t);
+}
+
+// Approximate half arc length of the path over t in [0,1] with a two segment polyline. The
+// cone and cylinder falloffs are defined against distance travelled, so on a curved path
+// chord length would understate how far a sample actually is along the trail.
+float motionBlurPathHalfLength(const float2 velocity, const float2 curvature)
+{
+  const float2 quarter = velocity * 0.5f - curvature * 0.25f;
+  const float2 full = velocity - curvature;
+  return length(quarter) + length(full - quarter);
+}
+
+// Paper section 5. Relative rather than absolute depth interval, so the comparison behaves
+// the same for objects at 10 and 20 units as for 1000 and 2000, and needs no scene tuning.
+//
+// Returns 1 when za is nearer than or equal to zb. Both arguments are linear view Z where
+// larger means farther, which is the opposite of the convention the paper's pseudocode is
+// written against, so callers pass the sample depth first for the foreground term.
+float motionBlurZCompare(const float za, const float zb)
+{
+  const float minZ = max(min(za, zb), 1e-4f);
+  return saturate(1.0f - (za - zb) / minZ);
+}
+
+// McGuire's falloffs, unchanged.
+float motionBlurCone(const float distanceAlongPath, const float speed)
+{
+  return saturate(1.0f - distanceAlongPath / max(speed, POST_FX_MB_MIN_SPEED));
+}
+
+float motionBlurCylinder(const float distanceAlongPath, const float speed)
+{
+  const float clampedSpeed = max(speed, POST_FX_MB_MIN_SPEED);
+  return 1.0f - smoothstep(0.95f * clampedSpeed, 1.05f * clampedSpeed, distanceAlongPath);
+}
+
+// Paper section 4.1. The three phenomenological terms, each additionally modulated by how
+// closely the relevant velocity aligns with the direction being sampled. abs() is used for
+// the same reason the paper applies it in Eq. 2: a trail is symmetric along its line, so an
+// anti-parallel velocity contributes just as much as a parallel one and the signs must not
+// cancel.
+float motionBlurSampleWeight(
+  const float distanceAlongPath,
+  const float centerSpeed,
+  const float sampleSpeed,
+  const float foreground,     // sample is in front of the centre
+  const float background,     // sample is behind the centre
+  const float centerAlignment,
+  const float sampleAlignment)
+{
+  float weight = 0.0f;
+
+  // A distant object blurring over the shading pixel.
+  weight += foreground * motionBlurCone(distanceAlongPath, sampleSpeed) * sampleAlignment;
+  // The shading pixel's own blur revealing what is behind it.
+  weight += background * motionBlurCone(distanceAlongPath, centerSpeed) * centerAlignment;
+  // Both simultaneously blurry.
+  weight += motionBlurCylinder(distanceAlongPath, min(sampleSpeed, centerSpeed))
+          * max(centerAlignment, sampleAlignment) * 2.0f;
+
+  return weight;
+}
+
+// Interleaved gradient noise (Jimenez, Next Generation Post Processing in Call of Duty:
+// Advanced Warfare, SIGGRAPH 2014), returning [0, 1]. Spatially decorrelated like a random
+// pattern but temporally stable like a dither, so residual sampling noise does not crawl
+// between frames.
+//
+// Duplicated from noise.slangh rather than included: that header also defines blue noise
+// sampling against a BlueNoise texture binding these passes have no reason to carry.
+float motionBlurInterleavedGradientNoise(float2 position, const uint frameIdx)
+{
+  position += float2(frameIdx * 1664525u + 1013904223u, frameIdx * 214013u + 2531011u) * 1e-7f;
+
+  const float3 magic = float3(0.06711056f, 0.00583715f, 52.9829189f);
+  return frac(magic.z * frac(dot(position, magic.xy)));
+}
+
+float2 motionBlurPerpendicular(const float2 v)
+{
+  return float2(-v.y, v.x);
+}
+
+// A near motionless velocity carries no meaningful direction, so substitute one the caller
+// picked rather than returning the noise left over from dividing by almost zero.
+float2 motionBlurSafeNormalize(const float2 v, const float2 fallback)
+{
+  const float lengthSquared = dot(v, v);
+  if (lengthSquared < 1e-8f)
+  {
+    return fallback;
+  }
+  return v * rsqrt(lengthSquared);
+}
+
+// The curvature stored by the setup pass describes the arc this pixel's own surface point
+// sweeps, and is only meaningful over a trail of that pixel's own length. The gather also
+// walks along the tile's dominant velocity, which frequently belongs to a different and much
+// faster object, and there is no per direction curvature field to consult.
+//
+// Extrapolating up to that longer trail is guesswork, and getting it wrong displaces samples
+// sideways onto unrelated geometry - which reads as warping along exactly the silhouettes
+// where fast objects meet slower ones. So the scale never exceeds one: curvature is applied
+// at full strength to a walk no longer than the pixel's own trail, and faded out as the walk
+// grows past it. The remaining bend is capped well inside the trail length so the path stays
+// close to a straight line even when the estimate is poor.
+float2 motionBlurCurvatureForDirection(
+  const float2 curvature,
+  const float  directionLength,
+  const float  centerSpeed)
+{
+  const float ratio = saturate(max(centerSpeed, POST_FX_MB_MIN_SPEED) / max(directionLength, 1e-4f));
+  float2 scaled = curvature * ratio;
+
+  const float maxBend = directionLength * 0.1f;
+  const float bend = length(scaled);
+  if (bend > maxBend && bend > 1e-6f)
+  {
+    scaled *= maxBend / bend;
+  }
+
+  return scaled;
+}

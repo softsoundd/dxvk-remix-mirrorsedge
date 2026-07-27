@@ -27,6 +27,7 @@
 #include "rtx_resources.h"
 #include "rtx_common_object.h"
 #include "rtx_options.h"
+#include "rtx_postFx.h"
 #include "../util/util_matrix.h"
 
 namespace dxvk {
@@ -640,6 +641,20 @@ namespace dxvk {
     bool m_debugPresentValid = false;                 // holds across frames that capture no new view
     Resources::ResourceQueue m_depthQueue;            // R32F depth, one slot per DLFG frame in flight
     Resources::ResourceQueue m_motionVectorQueue;     // RG16F pixel-space motion vectors
+
+    // Cinematic motion blur intermediates, at display resolution because the filter runs on
+    // the upscaled colour (see DxvkPostFx::MotionBlurInputs).
+    Resources::Resource m_motionBlurCineVelocityDepth;
+    Resources::Resource m_motionBlurCineCurvature;
+    Resources::Resource m_motionBlurCineTileMaxX;
+    Resources::Resource m_motionBlurCineTileMax;
+    Resources::Resource m_motionBlurCineNeighborMax;
+
+    // Captured alongside the reprojection matrix, where the camera and the frame's space
+    // offset are already in hand, and consumed later when post effects run.
+    DxvkPostFx::MotionBlurCurveMatrices m_motionBlurCurves;
+    float m_motionBlurNearPlane = 0.0f;
+    float m_motionBlurFarPlane = 0.0f;
 
     // HUD-less copies of the pre-UI backbuffer for frame generation (see dlfgHudlessInput).
     // Created lazily to match the backbuffer format/extent; the current slot's view is

@@ -27,6 +27,7 @@
 #include <rtxdi/RtxdiParameters.h>
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
+#include "rtx/pass/post_fx/post_fx.h"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 #include "rtx/algorithm/nee_cache_data.h"
 #include "rtx/utility/procedural_noise.h"
@@ -1257,6 +1258,22 @@ namespace dxvk {
 
     // Post Effect intermediate textures
     m_raytracingOutput.m_postFxIntermediateTexture = createImageResource(ctx, "postfx intermediate texture", m_targetExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+
+    // Cinematic motion blur intermediates
+    {
+      const VkExtent3D tileExtent = {
+        (m_targetExtent.width + POST_FX_MB_TILE_SIZE_MIN - 1) / POST_FX_MB_TILE_SIZE_MIN,
+        (m_targetExtent.height + POST_FX_MB_TILE_SIZE_MIN - 1) / POST_FX_MB_TILE_SIZE_MIN,
+        1
+      };
+      const VkExtent3D tileColumnExtent = { tileExtent.width, m_targetExtent.height, 1 };
+
+      m_raytracingOutput.m_motionBlurCineVelocityDepth = createImageResource(ctx, "motion blur velocity depth", m_targetExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_raytracingOutput.m_motionBlurCineCurvature = createImageResource(ctx, "motion blur curvature", m_targetExtent, VK_FORMAT_R16G16_SFLOAT);
+      m_raytracingOutput.m_motionBlurCineTileMaxX = createImageResource(ctx, "motion blur tile max x", tileColumnExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_raytracingOutput.m_motionBlurCineTileMax = createImageResource(ctx, "motion blur tile max", tileExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_raytracingOutput.m_motionBlurCineNeighborMax = createImageResource(ctx, "motion blur neighbor max", tileExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+    }
 
     // Let other systems know of the resize
     executeResizeEventList(m_onTargetResize, ctx, m_targetExtent);

@@ -336,6 +336,9 @@ void geometryResolverOutputSurface<
     motionBlurSurfaceFlags.isViewModel = isViewModel;
     motionBlurSurfaceFlags.isStatic = surface.isStatic;
     motionBlurSurfaceFlags.isEmissive = isRadianceOutput;
+    // Carries rtx.motionBlurMaskOutTextures through to the filter. Previously left unset,
+    // so the flag the blur passes read was whatever the register happened to hold.
+    motionBlurSurfaceFlags.isMaskOut = surface.isMotionBlurMaskOut;
     motionBlurSurfaceFlagsWriteToGBuffer(motionBlurSurfaceFlags, ivec2(pixelCoordinate), PrimarySurfaceFlags);
   }
   else

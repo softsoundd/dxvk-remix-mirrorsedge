@@ -221,12 +221,29 @@ namespace dxvk
         return (*this)[idx];
       }
 
+      Resource& getPrevious() {
+        return (*this)[(idx + int(size()) - 1) % int(size())];
+      }
+
+      const Resource& getPrevious() const {
+        return (*this)[(idx + int(size()) - 1) % int(size())];
+      }
+
+      // The queues are only advanced when frame generation is available, so without it every
+      // slot holds the current frame and getPrevious() aliases get(). Callers that need real
+      // history rather than just a valid resource have to check.
+      bool hasDistinctPrevious() const {
+        return advanced;
+      }
+
       void next() {
         idx = (idx + 1) % size();
+        advanced = true;
       }
 
     private:
       int idx = 0;
+      bool advanced = false;
     };
 
     struct RaytracingOutput {
@@ -258,6 +275,15 @@ namespace dxvk
       AliasedResource m_primaryVirtualMotionVector;
       ResourceQueue m_primaryScreenSpaceMotionVectorQueue;
       Resource m_primaryScreenSpaceMotionVector;
+
+      // Cinematic motion blur intermediates. The two tile textures are sized for the
+      // smallest supported tile so that changing the blur radius never reallocates; larger
+      // tiles simply dispatch into a sub-rect.
+      Resource m_motionBlurCineVelocityDepth;
+      Resource m_motionBlurCineCurvature;
+      Resource m_motionBlurCineTileMaxX;
+      Resource m_motionBlurCineTileMax;
+      Resource m_motionBlurCineNeighborMax;
       Resource m_primaryVirtualWorldShadingNormalPerceptualRoughness;
       AliasedResource m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising;
       Resource m_primaryHitDistance;
