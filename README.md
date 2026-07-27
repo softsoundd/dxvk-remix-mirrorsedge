@@ -36,6 +36,7 @@ Notes and limitations:
 - Options under `rtx.ngxPassthrough.*`; Rendering -> General shows DLSS stats and depth/MV visualisers.
 - Default DLSS model is the transformer preset (`rtx.ngxPassthrough.dlssRenderPreset = 10`, preset J), which keeps more detail than NGX's default CNN presets; the developer menu can switch presets live.
 - Ghosting issues with particles and textures on transparent planes (chain link fences). Will investigate solutions for this in the future.
+- Separate existing issue with Mirror's Edge where sub-native render resolutions offsets the position of some effects like sun haze and first person self-shadowing. This is not Remix's doing.
 
 ## Build instructions
 
