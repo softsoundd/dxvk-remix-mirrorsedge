@@ -4,8 +4,7 @@ subdir('unit')
 if target_machine.cpu() != 'armv8'
 
 dxvkrt_test_root = meson.global_source_root().replace('\\', '/') + '/tests/rtx/dxvk_rt_testing/'
-# softsoundd note - some checkouts may contain the `dxvk_rt_testing` runtime assets directory without the
-# corresponding meson build scripts, only include the subdir when a `meson.build` is present
+# Some checkouts contain dxvk_rt_testing assets without meson.build (no private test harness).
 if fs.is_file('dxvk_rt_testing/meson.build')
   subdir('dxvk_rt_testing')
 endif
