@@ -364,6 +364,7 @@ namespace dxvk {
     // Path tracing is incompatible with NGX passthrough; keep rtx.enableRaytracing off.
     static void enforceRaytracingDisabledForPassthrough();
     static void ngxPassthroughModeOnChange(DxvkDevice* device);
+    static void dlssRenderPresetOnChange(DxvkDevice* device);
 
     RTX_OPTION_ARGS("rtx", bool, ngxPassthroughMode, false,
                "Master toggle for the NGX passthrough mode: the game's original rasterized rendering is presented (no path tracing,\n"
@@ -431,11 +432,12 @@ namespace dxvk {
                "Escape hatch for titles where GSystemSettings cannot be located automatically: the RVA of\n"
                "FSystemSettings::ScreenPercentage within the game's main module. 0 leaves discovery\n"
                "automatic. The value is still proven by the behavioural probe before it is used.");
-    RTX_OPTION("rtx.ngxPassthrough", int, dlssRenderPreset, 10,
-               "DLSS render preset (model selection) hint for the NGX feature. 0: Default (snippet/driver decides, typically an\n"
-               "older CNN model), 1-6: presets A-F (CNN models), 10: preset J (transformer model - noticeably better detail\n"
-               "preservation and temporal stability, slightly higher GPU cost). Values outside the known range fall back to\n"
-               "Default. Changing this recreates the DLSS feature.");
+    RTX_OPTION_ARGS("rtx.ngxPassthrough", int, dlssRenderPreset, 11,
+               "DLSS render preset (model selection) hint for the NGX feature. 0: Default (snippet/driver decides), 1-6:\n"
+               "presets A-F (legacy CNN models), 10: preset J (transformer v1), 11: preset K (transformer, recommended),\n"
+               "12: preset L (DLSS 4.5 transformer, ultra performance), 13: preset M (DLSS 4.5 transformer, performance).\n"
+               "Reserved values 7-9 and 14-15 revert to default per the NGX SDK. Changing this recreates the DLSS feature.",
+               args.onChangeCallback = &RtxNgxPassthrough::dlssRenderPresetOnChange);
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocityDebugFreeze, false,
                "Diagnostic for the object velocity pass: composes every captured draw's previous-frame side from the\n"
                "current frame's transforms and bone palettes (forcing the rasterized velocity to zero) and disables the\n"
@@ -579,6 +581,8 @@ namespace dxvk {
 
     void copyColorInputToOutput(RtxContext* ctx);
 
+    void invalidateDlssFeatures();
+
     // Combines m_dlssOutput RGB with m_colorInput alpha into m_mergedOutput
     void dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers);
 
@@ -607,6 +611,7 @@ namespace dxvk {
     const char* m_statusReason = "not dispatched yet";
     uint32_t m_lastDispatchFrameId = 0;
     uint32_t m_dlssInitCount = 0;
+    int m_activeRenderPreset = -1;
     float m_lastJitter[2] = { 0.0f, 0.0f };
     bool m_lastDispatchPrePost = false;
 

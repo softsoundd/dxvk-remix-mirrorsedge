@@ -68,6 +68,18 @@ namespace dxvk {
     }
   }
 
+  void RtxNgxPassthrough::dlssRenderPresetOnChange(DxvkDevice* device) {
+    if (device != nullptr) {
+      device->getCommon()->metaNgxPassthrough().invalidateDlssFeatures();
+    }
+  }
+
+  void RtxNgxPassthrough::invalidateDlssFeatures() {
+    for (DlssFeature& feature : m_dlssFeatures) {
+      feature.needsInitialize = true;
+    }
+  }
+
   namespace {
     class NgxPassthroughMvShader : public ManagedShader {
       SHADER_SOURCE(NgxPassthroughMvShader, VK_SHADER_STAGE_COMPUTE_BIT, ngx_passthrough_mv)
@@ -1219,21 +1231,43 @@ namespace dxvk {
       case 5: return NVSDK_NGX_DLSS_Hint_Render_Preset_E;
       case 6: return NVSDK_NGX_DLSS_Hint_Render_Preset_F;
       case 10: return NVSDK_NGX_DLSS_Hint_Render_Preset_J;
+      case 7:
+      case 8:
+      case 9:
+      case 11:
+      case 12:
+      case 13:
+      case 14:
+      case 15:
+        // K/L/M and reserved slots are not named in the bundled NGX 1.5 header.
+        return static_cast<NVSDK_NGX_DLSS_Hint_Render_Preset>(optionValue);
       default: return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
       }
     }
 
-    const char* renderPresetToString(NVSDK_NGX_DLSS_Hint_Render_Preset preset) {
-      switch (preset) {
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_A: return "A";
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_B: return "B";
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_C: return "C";
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_D: return "D";
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_E: return "E";
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_F: return "F";
-      case NVSDK_NGX_DLSS_Hint_Render_Preset_J: return "J (transformer)";
+    const char* renderPresetOptionToString(int optionValue) {
+      switch (optionValue) {
+      case 1: return "A (CNN, legacy)";
+      case 2: return "B (CNN, legacy)";
+      case 3: return "C (CNN, legacy)";
+      case 4: return "D (CNN, legacy)";
+      case 5: return "E (CNN, legacy)";
+      case 6: return "F (CNN, legacy)";
+      case 7: return "G (reserved)";
+      case 8: return "H (reserved)";
+      case 9: return "I (reserved)";
+      case 10: return "J (transformer v1)";
+      case 11: return "K (transformer, recommended)";
+      case 12: return "L (transformer 4.5, ultra perf)";
+      case 13: return "M (transformer 4.5, perf)";
+      case 14: return "N (reserved)";
+      case 15: return "O (reserved)";
       default: return "Default";
       }
+    }
+
+    const char* renderPresetToString(NVSDK_NGX_DLSS_Hint_Render_Preset preset) {
+      return renderPresetOptionToString(static_cast<int>(preset));
     }
 
     // At the pre-post-process injection point the color source is the game's scene color,
@@ -1592,6 +1626,7 @@ namespace dxvk {
                                   renderPreset);
 
       m_dlssInitCount++;
+      m_activeRenderPreset = feature.initializedRenderPreset;
 
       Logger::info(str::format("[RTX NGX Passthrough] DLSS initialized: ", inputSize[0], "x", inputSize[1],
                                " -> ", outputSize[0], "x", outputSize[1],
@@ -2200,8 +2235,19 @@ namespace dxvk {
     RemixGui::Checkbox("Bypass Upscaler (keep the reduced render, plain stretch)", &bypassUpscalerObject());
 
     {
-      static const int kPresetOptionValues[] = { 0, 1, 2, 3, 4, 5, 6, 10 };
-      static const char* kPresetLabels = "Default\0Preset A (CNN)\0Preset B (CNN)\0Preset C (CNN)\0Preset D (CNN)\0Preset E (CNN)\0Preset F (CNN)\0Preset J (Transformer)\0";
+      static const int kPresetOptionValues[] = { 0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13 };
+      static const char* kPresetLabels =
+        "Default\0"
+        "Preset A (CNN, legacy)\0"
+        "Preset B (CNN, legacy)\0"
+        "Preset C (CNN, legacy)\0"
+        "Preset D (CNN, legacy)\0"
+        "Preset E (CNN, legacy)\0"
+        "Preset F (CNN, legacy)\0"
+        "Preset J (Transformer v1)\0"
+        "Preset K (Transformer, recommended)\0"
+        "Preset L (Transformer 4.5, Ultra Perf)\0"
+        "Preset M (Transformer 4.5, Perf)\0";
 
       int comboIndex = 0;
       for (int i = 0; i < int(std::size(kPresetOptionValues)); i++) {
@@ -2211,7 +2257,12 @@ namespace dxvk {
         }
       }
 
-      if (ImGui::Combo("DLSS Model Preset", &comboIndex, kPresetLabels)) {
+      if (IMGUI_ADD_TOOLTIP(ImGui::Combo("DLSS Model Preset", &comboIndex, kPresetLabels),
+          "Selects the DLSS Super Resolution model passed to NGX as a render-preset hint. "
+          "K is the recommended general-purpose transformer preset. "
+          "L and M are DLSS 4.5 transformer models tuned for ultra performance and performance modes; "
+          "they are FP8-accelerated and can cost significantly more on RTX 20/30 GPUs without native FP8 support. "
+          "Changing the preset recreates the DLSS feature on the next frame.")) {
         dlssRenderPresetObject().setDeferred(kPresetOptionValues[comboIndex]);
       }
     }
@@ -2222,8 +2273,12 @@ namespace dxvk {
     // DLSS feature re-initializations (should stay at 1 outside resolution changes), and the
     // sub-pixel jitter the last frame was rasterized with (0,0 means jitter is not engaging)
     const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    if (m_activeRenderPreset >= 0) {
+      ImGui::TextWrapped(str::format("Active model preset: ",
+                                     renderPresetOptionToString(m_activeRenderPreset)).c_str());
+    }
     ImGui::TextWrapped(str::format("Last dispatch: frame ", m_lastDispatchFrameId, " (current ", currentFrameId,
-                                   "), DLSS initializations: ", m_dlssInitCount).c_str());
+                                   "), total DLSS initializations: ", m_dlssInitCount).c_str());
     ImGui::TextWrapped(str::format("Jitter: ", m_lastJitter[0], ", ", m_lastJitter[1],
                                    " | Dynamic object draws: ", m_lastVelocityDrawCount).c_str());
 
