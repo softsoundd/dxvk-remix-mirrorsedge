@@ -505,8 +505,8 @@ namespace dxvk {
     setCategory(InstanceCategories::Terrain, matched(InstanceCategories::Terrain));
     setCategory(InstanceCategories::Sky, matched(InstanceCategories::Sky));
 
-    setCategory(InstanceCategories::ParticleEmitter, matched(InstanceCategories::ParticleEmitter));
-    setCategory(InstanceCategories::HairCards, matched(InstanceCategories::HairCards));
+    setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
+    setCategory(InstanceCategories::HairCards, lookupHash(RtxOptions::hairCardTextures(), textureHash));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {

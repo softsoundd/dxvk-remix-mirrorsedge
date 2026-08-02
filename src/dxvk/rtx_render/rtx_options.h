@@ -138,6 +138,7 @@ namespace dxvk {
     None = 0,
     Basic,
     Advanced,
+    FirstUseGuide,
     Count
   };
 
@@ -174,13 +175,6 @@ namespace dxvk {
   };
 
   class RtxOptions {
-    friend class ImGUI;
-    friend class ImGuiSplash;
-    friend class ImGuiCapture;
-    friend class NeuralRadianceCache;
-    friend class RtxContext;
-    friend class RtxInitializer;
-    friend class RtxComposite;
 
     RTX_OPTION("rtx", fast_unordered_set, lightmapTextures, {},
                   "Textures used for lightmapping (baked static lighting on surfaces) in older games.\n"
@@ -565,7 +559,7 @@ namespace dxvk {
 
     RTX_OPTION("rtx", bool, useNewGuiInputMethod, true, "Disables the previous method for getting mouse/keyboard input and enables a new method which should be more reliable.  If successful the old method will be deprecated.  This setting can't be changed at runtime, so it must be set in a .conf file.");
 
-    RTX_OPTION_ARGS("rtx", UIType, showUI, UIType::None, "0 = Don't Show, 1 = Show Simple, 2 = Show Advanced.",
+    RTX_OPTION_ARGS("rtx", UIType, showUI, UIType::None, "0 = Don't Show, 1 = Show Simple, 2 = Show Advanced, 3 = First Use Guide.",
                     args.environment = "RTX_GUI_DISPLAY_UI",
                     args.flags = RtxOptionFlags::NoSave | RtxOptionFlags::NoReset);
     RTX_OPTION_ARGS("rtx", bool, defaultToAdvancedUI, false, "Whether to default to the Advanced UI when opening the developer menu.", 
@@ -1062,6 +1056,12 @@ namespace dxvk {
                     "The hotkey combination that triggers a deliberate crash when the crash hotkey feature is armed.\n"
                     "Default is Ctrl+Shift+Alt+K. Only takes effect when rtx.enableCrashHotkey is True.\n"
                     "This setting is not saved to config files but can be set manually in rtx.conf.");
+    // GPU crash hotkey - same "armed" state as crashHotkey. When armed, this key triggers a GPU crash (dialog + Sentry).
+    inline static const VirtualKeys kDefaultGpuCrashHotkey{ VirtualKey{VK_CONTROL}, VirtualKey{VK_SHIFT}, VirtualKey{VK_MENU}, VirtualKey{'G'} };
+    RTX_OPTION_FLAG("rtx", VirtualKeys, gpuCrashHotkey, kDefaultGpuCrashHotkey, RtxOptionFlags::NoSave,
+                    "The hotkey that triggers a GPU crash when the crash hotkey feature is armed.\n"
+                    "Default is Ctrl+Shift+Alt+G.");
+
     RTX_OPTION_ARGS("rtx", bool, enablePreservePath, true,
                 "When true, Remix attempts to identify draw calls whose state has not changed since last frame and re-use the previous\n"
                 "frame's translation, rather than retranslating the draw call into raytrace-ready scene data.\n"
@@ -1087,6 +1087,11 @@ namespace dxvk {
                "A time in milliseconds that the DXVK presentation thread should sleep for. Requires present throttling to be enabled to take effect.\n"
                "Note that the application may sleep for longer than the specified time as is expected with sleep functions in general.");
     RTX_OPTION_ENV("rtx", bool, validateCPUIndexData, false, "DXVK_VALIDATE_CPU_INDEX_DATA", "");
+    RTX_OPTION_ARGS("rtx", bool, recomputeTextureHashOnWrite, false,
+                "When true, Remix computes the hash of a texture when the game writes to the resource. Some games manage their own pool of\n"
+                "textures and shuffle data around those resources resulting in incorrect textures being displayed. Recomputing the hash\n"
+                "when the game writes to the resource can resolve this issue, however this can have unintended side effects when replacing\n"
+                "animated game textures.");
     RTX_OPTION("rtx", uint, dumpAllInstancesOnFrame, UINT32_MAX, "If set, and running in a REMIX_DEVELOPMENT build, this will dump all active instances to the log on the specified frame.");
     // Note: Use use areValidationLayersEnabled helper function rather than accessing this option directly as additional logic must be done to determine if validation layers should be used or not.
     RTX_OPTION_FLAG_ENV("rtx", bool, enableValidationLayers, false, RtxOptionFlags::NoSave, "DXVK_ENABLE_VALIDATION_LAYERS",

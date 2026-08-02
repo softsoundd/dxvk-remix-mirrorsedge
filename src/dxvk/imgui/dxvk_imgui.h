@@ -43,6 +43,7 @@ struct ImPlotContext;
 
 namespace dxvk {
   class ImGuiAbout;
+  class ImGuiFirstUseGuide;
   class ImGuiSplash;
   class ImGuiCapture;
   class DxvkDevice;
@@ -137,6 +138,7 @@ namespace dxvk {
     DxvkBlendMode         m_blendMode;
     VkDescriptorPool      m_imguiPool;
     Rc<ImGuiAbout>        m_about;
+    Rc<ImGuiFirstUseGuide> m_firstUseGuide;
     Rc<ImGuiSplash>       m_splash;
     Rc<ImGuiCapture>      m_capture;
     Rc<class GameOverlay>  m_overlayWin;
@@ -220,6 +222,10 @@ namespace dxvk {
       const int subItemWidth,
       const int subItemIndent);
     void showUserRenderingSettings(
+      const Rc<DxvkContext>& ctx,
+      const int subItemWidth,
+      const int subItemIndent);
+    void showUserContentSettings(
       const Rc<DxvkContext>& ctx,
       const int subItemWidth,
       const int subItemIndent);

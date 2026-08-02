@@ -21,6 +21,7 @@
 */
 
 #include "dxvk_imgui.h"
+#include "dxvk_imgui_first_use_guide.h"
 #include "imgui.h"
 #include "rtx_render/rtx_imgui.h"
 #include "dxvk_device.h"
@@ -153,6 +154,20 @@ namespace dxvk {
         if (ImGui::BeginTabItem("Graphics", nullptr, tab_item_flags)) {
           beginTabChild("##tab_child_graphics");
           showUserRenderingSettings(ctx, subItemWidth, subItemIndent);
+          endTabChild();
+          ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Content", nullptr, tab_item_flags)) {
+          beginTabChild("##tab_child_content");
+          showUserContentSettings(ctx, subItemWidth, subItemIndent);
+          endTabChild();
+          ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Permissions", nullptr, tab_item_flags)) {
+          beginTabChild("##tab_child_permissions");
+          ImGuiFirstUseGuide::showPermissionsUI();
           endTabChild();
           ImGui::EndTabItem();
         }
@@ -474,6 +489,41 @@ namespace dxvk {
     {
       showVsyncOptions(true);
     }
+
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+  }
+
+  void ImGUI::showUserContentSettings(
+    const Rc<DxvkContext>& ctx,
+    const int subItemWidth,
+    const int subItemIndent) {
+    auto common = ctx->getCommonObjects();
+
+    ImGui::TextWrapped("Content-specific settings. Allows control of what types of assets Remix should replace (if any).");
+
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+
+    ImGui::BeginDisabled(!common->getSceneManager().areAllReplacementsLoaded());
+
+    RemixGui::Checkbox("Enable All Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
+
+    {
+      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
+      ImGui::Indent(static_cast<float>(subItemIndent));
+
+      ImGui::BeginDisabled(!RtxOptions::enableReplacementAssets());
+
+      RemixGui::Checkbox("Enable Enhanced Materials", &RtxOptions::enableReplacementMaterialsObject());
+      RemixGui::Checkbox("Enable Enhanced Meshes", &RtxOptions::enableReplacementMeshesObject());
+      RemixGui::Checkbox("Enable Enhanced Lights", &RtxOptions::enableReplacementLightsObject());
+
+      ImGui::EndDisabled();
+
+      ImGui::Unindent(static_cast<float>(subItemIndent));
+      ImGui::PopItemWidth();
+    }
+
+    ImGui::EndDisabled();
 
     ImGui::Dummy(ImVec2(0.0f, 5.0f));
   }
