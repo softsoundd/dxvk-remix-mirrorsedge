@@ -35,7 +35,7 @@ struct NgxPassthroughArgs {
   vec2 resolution;         // output resolution in pixels
   vec2 subrectOffset;      // top-left corner of the source subrect in the game depth buffer, in pixels
 
-  uint debugMode;          // 0: off, 1: motion vector visualization, 2: depth visualization
+  uint debugMode;          // 0: off, 1: motion vectors, 2: depth, 3: object velocity coverage, 4: scene color (injection input)
   // Near/far planes for hardware depth -> linear view-space Z (Remix motion blur input)
   float nearPlane;
   float farPlane;

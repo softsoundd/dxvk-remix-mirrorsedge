@@ -14519,7 +14519,7 @@ namespace dxvk {
   // the injection, which costs the upscaler its history. Attribute it to the requirement that
   // failed; rate limited because what matters is which reason dominates, not each instance.
   void D3D9Rtx::reportNgxPrePostMiss() {
-    if (!m_frameOptions.ngxPrePostProcess)
+    if (!ngxPrePostInjectionAllowed())
       return;
 
     // A frame that never identified a scene color has no scene to inject into - a menu, a loading
@@ -14965,12 +14965,109 @@ namespace dxvk {
     m_ngxPrePostCandidatesThisFrame = 0;
   }
 
+  bool D3D9Rtx::ngxPrePostInjectionAllowed() const {
+    if (!m_frameOptions.ngxPrePostProcess)
+      return false;
+
+    const int debugVis = m_frameOptions.ngxDebugVisualization;
+    return debugVis == 0 ||
+           debugVis == int(dxvk::RtxNgxPassthrough::DebugVisualization::SceneColor);
+  }
+
+  Rc<DxvkImage> D3D9Rtx::matchNgxSceneColorSample(const DxvkImage* sampledImage) const {
+    if (sampledImage == nullptr || m_ngxSceneColorImage == nullptr)
+      return nullptr;
+
+    if (sampledImage == m_ngxSceneColorImage.ptr())
+      return m_ngxSceneColorImage;
+
+    for (uint32_t r = 0; r < m_ngxSceneColorResolveCount; r++) {
+      if (m_ngxSceneColorResolves[r].ptr() == sampledImage)
+        return m_ngxSceneColorResolves[r];
+    }
+
+    return nullptr;
+  }
+
+  void D3D9Rtx::recordNgxPrePostSceneColorRead() {
+    m_ngxPrePostCandidatesThisFrame++;
+    m_ngxReadsSinceLastClear++;
+
+    if (m_ngxFrameReadCount < kNgxFrameShapeSlots)
+      m_ngxFrameReadDraws[m_ngxFrameReadCount++] = m_drawCallID;
+  }
+
+  void D3D9Rtx::engageNgxPrePostInjection(const Rc<DxvkImage>& matchedTarget) {
+    m_ngxColorTargetImage = matchedTarget;
+    // When the consumed image is a resolve copy, mirror the DLSS output into the scene color
+    // surface as well: later post passes may re-resolve from it (UE3 scene color resolves are
+    // surface -> texture copies)
+    m_ngxColorMirrorImage = (matchedTarget.ptr() != m_ngxSceneColorImage.ptr()) ? m_ngxSceneColorImage : nullptr;
+    m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
+    m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
+    m_ngxColorSubrectOffset = m_ngxSubrect.offset;
+    m_ngxFrameInjectionDraw = m_drawCallID;
+  }
+
+  Rc<DxvkImage> D3D9Rtx::findNgxPrePostSceneColorFromSamplers(bool applyOrdinalGate, bool recordRead) {
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      if (texture == nullptr || texture->GetImage() == nullptr)
+        continue;
+
+      const Rc<DxvkImage> matchedTarget = matchNgxSceneColorSample(texture->GetImage().ptr());
+      if (matchedTarget == nullptr)
+        continue;
+
+      if (recordRead)
+        recordNgxPrePostSceneColorRead();
+
+      if (applyOrdinalGate) {
+        const bool haveClearThisFrame = m_ngxFrameClearCount > 0;
+
+        const bool atInjectionPoint = haveClearThisFrame
+          ? m_ngxReadsSinceLastClear >= m_ngxReadsAfterClearInsideScene + 1
+          : m_ngxPrePostCandidatesThisFrame >= m_ngxPrePostReadsInsideScene + 1;
+
+        if (!atInjectionPoint)
+          break;
+      }
+
+      return matchedTarget;
+    }
+
+    return nullptr;
+  }
+
+  bool D3D9Rtx::ngxSceneViewportIsFullSize(const D3DVIEWPORT9& sceneViewport,
+                                           uint32_t backBufferWidth, uint32_t backBufferHeight) {
+    return backBufferWidth != 0 && backBufferHeight != 0 &&
+           uint64_t(sceneViewport.Width) * 100 >= uint64_t(backBufferWidth) * 97 &&
+           uint64_t(sceneViewport.Height) * 100 >= uint64_t(backBufferHeight) * 97;
+  }
+
+  bool D3D9Rtx::ngxSceneViewportIsSubrect(const D3DVIEWPORT9& sceneViewport,
+                                          uint32_t backBufferWidth, uint32_t backBufferHeight) {
+    return backBufferWidth != 0 && backBufferHeight != 0 &&
+           uint64_t(sceneViewport.Width) * 100 <= uint64_t(backBufferWidth) * 97 &&
+           uint64_t(sceneViewport.Height) * 100 <= uint64_t(backBufferHeight) * 97;
+  }
+
+  bool D3D9Rtx::ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo) {
+    return psInfo.gammaInverseReg != Ue3ShaderFeatureInfo::kNgxNoRegister &&
+           psInfo.hasSceneColorSampler &&
+           !psInfo.hasToneMapConstants &&
+           !psInfo.hasExposureOrToneSampler;
+  }
+
   void D3D9Rtx::countNgxPostInjectionSceneColorConsumer(const DrawContext& drawContext) {
     // The injection ordinal is only useful if the count it comes from covers the whole frame, and
     // the passes that decide whether this frame's injection was the last one are precisely the ones
     // that come after it. Same shape test as the pre-injection path, deliberately: a mismatch
     // between the two would bias the count and walk the injection point away from the end.
-    if (!m_frameOptions.ngxPrePostProcess || m_ngxSceneColorImage == nullptr ||
+    if (!ngxPrePostInjectionAllowed() || m_ngxSceneColorImage == nullptr ||
         m_ngxBackbufferDrawSeenThisFrame ||
         !m_activePresentParams.has_value() || d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
       return;
@@ -15012,13 +15109,7 @@ namespace dxvk {
       }
 
       const DxvkImage* sampledImage = texture->GetImage().ptr();
-      bool consumesSceneColor = sampledImage == m_ngxSceneColorImage.ptr();
-
-      for (uint32_t r = 0; !consumesSceneColor && r < m_ngxSceneColorResolveCount; r++) {
-        consumesSceneColor = m_ngxSceneColorResolves[r].ptr() == sampledImage;
-      }
-
-      if (consumesSceneColor) {
+      if (matchNgxSceneColorSample(sampledImage) != nullptr) {
         m_ngxPrePostCandidatesThisFrame++;
 
         if (m_ngxFrameReadCount < kNgxFrameShapeSlots) {
@@ -15299,10 +15390,7 @@ namespace dxvk {
       // those would run DLSS before the scene is complete.
       //
       // Only engages for a full-size scene (a ScreenPercentage subrect is handled by the
-      // stretch-replacement path below) and while the debug visualization is off (the
-      // debug image would be mangled by the game's post chain; the late injection point
-      // writes it to the final output instead). If this trigger never fires (post
-      // disabled, no scene color identified), the backbuffer trigger below is the fallback.
+      // stretch-replacement path below).
       const bool likelyPostProcessQuad =
         drawContext.PrimitiveCount <= 4 &&
         (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
@@ -15333,90 +15421,27 @@ namespace dxvk {
         renderTargetTexture != nullptr && m_ngxFrameBackbufferImage != nullptr &&
         renderTargetTexture->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr();
 
+      const bool sceneIsFullRes =
+        m_ngxSceneColorImage != nullptr && sceneViewportUsable &&
+        ngxSceneViewportIsFullSize(m_ngxSceneViewport, backBufferWidth, backBufferHeight);
+
       const bool candidateShape =
-        m_frameOptions.ngxPrePostProcess &&
+        ngxPrePostInjectionAllowed() &&
         likelyPostProcessQuad &&
         !targetsBackbuffer && !m_ngxBackbufferDrawSeenThisFrame &&
-        m_ngxSceneColorImage != nullptr && sceneViewportUsable &&
-        backBufferWidth != 0 && backBufferHeight != 0 &&
-        uint64_t(m_ngxSceneViewport.Width) * 100 >= uint64_t(backBufferWidth) * 97 &&
-        uint64_t(m_ngxSceneViewport.Height) * 100 >= uint64_t(backBufferHeight) * 97 &&
+        sceneIsFullRes &&
         (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr());
 
       if (candidateShape) {
-        const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+        const Rc<DxvkImage> matchedTarget = findNgxPrePostSceneColorFromSamplers(true, true);
 
-        for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
-          D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-          if (texture == nullptr || texture->GetImage() == nullptr) {
-            continue;
-          }
-
-          const DxvkImage* sampledImage = texture->GetImage().ptr();
-
-          Rc<DxvkImage> matchedTarget;
-          if (sampledImage == m_ngxSceneColorImage.ptr()) {
-            matchedTarget = m_ngxSceneColorImage;
-          } else {
-            for (uint32_t r = 0; r < m_ngxSceneColorResolveCount; r++) {
-              if (m_ngxSceneColorResolves[r].ptr() == sampledImage) {
-                matchedTarget = m_ngxSceneColorResolves[r];
-                break;
-              }
-            }
-          }
-
-          if (matchedTarget == nullptr) {
-            continue;
-          }
-
-          m_ngxPrePostCandidatesThisFrame++;
-          m_ngxReadsSinceLastClear++;
-
-          if (m_ngxFrameReadCount < kNgxFrameShapeSlots) {
-            m_ngxFrameReadDraws[m_ngxFrameReadCount++] = m_drawCallID;
-          }
-
-          // Inject at the first read of the scene color that follows the frame's last depth-writing
-          // draw. Anything the game draws after the injection is composited onto the upscaler's
-          // finished output, un-jittered and never anti-aliased; UE3 runs post-process effects
-          // inside its DPG loop, so the earlier reads are interleaved with the scene rather than
-          // after it, and injecting at one of those leaves the last DPG - first person mesh and
-          // held weapon included - on the wrong side of it.
-          //
-          // Where the scene ends is only knowable once the frame is over, so it is predicted from
-          // the previous frame's shape. Counted from the most recent scene depth clear, which is
-          // the only form of the count that holds still: frames differ in how many reads land
-          // before the clear, so a whole-frame count inherits that variation and alternates, while
-          // the stretch between the clear and the end of the scene does not. Frames with no
-          // detected clear use the whole-frame count instead - menu frames, whose scene ends before
-          // any read, need it anyway.
-          const bool haveClearThisFrame = m_ngxFrameClearCount > 0;
-
-          const bool atInjectionPoint = haveClearThisFrame
-            ? m_ngxReadsSinceLastClear >= m_ngxReadsAfterClearInsideScene + 1
-            : m_ngxPrePostCandidatesThisFrame >= m_ngxPrePostReadsInsideScene + 1;
-
-          if (!atInjectionPoint) {
-            break;
-          }
-
-          m_ngxColorTargetImage = matchedTarget;
-          // When the consumed image is a resolve copy, mirror the DLSS output into the
-          // scene color surface as well: later post passes may re-resolve from it (UE3
-          // scene color resolves are surface -> texture copies)
-          m_ngxColorMirrorImage = (matchedTarget.ptr() != m_ngxSceneColorImage.ptr()) ? m_ngxSceneColorImage : nullptr;
-          m_ngxSubrect.offset = { int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y) };
-          m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
-          m_ngxColorSubrectOffset = m_ngxSubrect.offset;
-
+        if (matchedTarget != nullptr) {
+          engageNgxPrePostInjection(matchedTarget);
           triggerInjection = true;
-          m_ngxFrameInjectionDraw = m_drawCallID;
 
           ONCE(Logger::info(str::format("[RTX NGX Passthrough] Pre-post-process injection engaged: DLSS runs on the ",
                                         (m_ngxColorMirrorImage != nullptr ? "resolved scene color" : "scene color"),
                                         " before the game's post-process chain.")));
-          break;
         }
       }
 
@@ -15440,9 +15465,7 @@ namespace dxvk {
         // (a reduced height alone would match letterboxed cinematics)
         const bool sceneIsSubrect =
           m_ngxSceneViewportValid &&
-          backBufferWidth != 0 && backBufferHeight != 0 &&
-          uint64_t(m_ngxSceneViewport.Width) * 100 <= uint64_t(backBufferWidth) * 97 &&
-          uint64_t(m_ngxSceneViewport.Height) * 100 <= uint64_t(backBufferHeight) * 97;
+          ngxSceneViewportIsSubrect(m_ngxSceneViewport, backBufferWidth, backBufferHeight);
 
         // The composite has to execute before DLSS can read what it wrote, so the draw that
         // produced it must never be the one that triggers the injection.
@@ -15591,6 +15614,29 @@ namespace dxvk {
                 "[RTX NGX Passthrough] ScreenPercentage upscale detected and replaced with DLSS Super Resolution (",
                 m_ngxSceneViewport.Width, "x", m_ngxSceneViewport.Height, " -> ",
                 backBufferWidth, "x", backBufferHeight, ").")));
+            }
+          }
+        }
+
+        if (!triggerInjection && !recordedRuntimeComposite && sceneIsFullRes &&
+            ngxPrePostInjectionAllowed() &&
+            likelyPostProcessQuad && targetsBackbuffer &&
+            m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+          const Ue3ShaderFeatureInfo psInfo =
+            getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+
+          if (ngxShaderIsFinishRenderViewTargetGamma(psInfo)) {
+            const Rc<DxvkImage> matchedTarget = findNgxPrePostSceneColorFromSamplers(false, true);
+
+            if (matchedTarget != nullptr) {
+              engageNgxPrePostInjection(matchedTarget);
+              triggerInjection = true;
+
+              ONCE(Logger::info(str::format(
+                "[RTX NGX Passthrough] Post-process disabled: pre-post-process injection engaged at ",
+                "FinishRenderViewTarget (DLSS runs on the ",
+                (m_ngxColorMirrorImage != nullptr ? "resolved scene color" : "scene color"),
+                " before gamma composite to the backbuffer).")));
             }
           }
         }

@@ -1689,6 +1689,17 @@ namespace dxvk {
     const char* classifyNgxImageForDump(const DxvkImage* image) const;
     void reportNgxPrePostMiss();
 
+    bool ngxPrePostInjectionAllowed() const;
+    Rc<DxvkImage> matchNgxSceneColorSample(const DxvkImage* sampledImage) const;
+    void recordNgxPrePostSceneColorRead();
+    void engageNgxPrePostInjection(const Rc<DxvkImage>& matchedTarget);
+    Rc<DxvkImage> findNgxPrePostSceneColorFromSamplers(bool applyOrdinalGate, bool recordRead);
+    static bool ngxSceneViewportIsFullSize(const D3DVIEWPORT9& sceneViewport,
+                                           uint32_t backBufferWidth, uint32_t backBufferHeight);
+    static bool ngxSceneViewportIsSubrect(const D3DVIEWPORT9& sceneViewport,
+                                          uint32_t backBufferWidth, uint32_t backBufferHeight);
+    static bool ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo);
+
     // Per-draw snapshot of the bound texture slots (common texture pointer, cached image
     // hash, render-target descriptor hash), lazily built and shared by the per-draw
     // consumers that would otherwise each re-walk the texture stages: UI/deferred-UI tag

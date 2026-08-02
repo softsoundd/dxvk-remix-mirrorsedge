@@ -45,6 +45,7 @@
 
 #include <rtx_shaders/ngx_passthrough_mv.h>
 #include <rtx_shaders/ngx_passthrough_alpha_merge.h>
+#include <rtx_shaders/ngx_passthrough_scene_color_debug.h>
 #include <rtx_shaders/ngx_passthrough_velocity_vertex.h>
 #include <rtx_shaders/ngx_passthrough_velocity_skinned_vertex.h>
 #include <rtx_shaders/ngx_passthrough_velocity_dynamic_vertex.h>
@@ -112,6 +113,18 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(NgxPassthroughAlphaMergeShader);
 
+    class NgxPassthroughSceneColorDebugShader : public ManagedShader {
+      SHADER_SOURCE(NgxPassthroughSceneColorDebugShader, VK_SHADER_STAGE_COMPUTE_BIT, ngx_passthrough_scene_color_debug)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        RW_TEXTURE2D(2)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(NgxPassthroughSceneColorDebugShader);
+
     // Interface slots are location bitmasks: the vertex stage consumes the position
     // attribute (location 0) and feeds two clip-space varyings (locations 0 and 1 -> mask
     // 0b11); the fragment stage consumes both and writes one render target (location 0)
@@ -173,6 +186,7 @@ namespace dxvk {
   void RtxNgxPassthrough::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
     NgxPassthroughMvShader::getShader();
     NgxPassthroughAlphaMergeShader::getShader();
+    NgxPassthroughSceneColorDebugShader::getShader();
   }
 
   RtxNgxPassthrough::RtxNgxPassthrough(DxvkDevice* device)
@@ -888,7 +902,7 @@ namespace dxvk {
     args.resolution = vec2(float(m_renderExtent.width), float(m_renderExtent.height));
     args.subrectOffset = vec2(float(subrectOffset.x), float(subrectOffset.y));
     args.jitter = vec2(jitter[0], jitter[1]);
-    args.debugMode = uint(std::clamp(debugVisualization(), 0, int(DebugVisualization::ObjectVelocityCoverage)));
+    args.debugMode = uint(std::clamp(debugVisualization(), 0, int(DebugVisualization::SceneColor)));
 
     const auto nearFarPlanes = camera.calculateNearFarPlanes();
     args.nearPlane = nearFarPlanes.first;
@@ -1319,6 +1333,46 @@ namespace dxvk {
       blitImageRect(ctx, sourceImage, sourceExtent, targetImage, targetOffset, sourceExtent,
                     VK_FILTER_NEAREST);
     }
+  }
+
+  void RtxNgxPassthrough::dispatchSceneColorDebug(RtxContext* ctx, DxvkBarrierSet& barriers) {
+    ScopedGpuProfileZone(ctx, "NGX Passthrough Scene Color Debug");
+
+    barriers.accessImage(
+      m_colorInput.image,
+      m_colorInput.view->imageSubresources(),
+      m_colorInput.image->info().layout,
+      m_colorInput.image->info().stages,
+      m_colorInput.image->info().access,
+      m_colorInput.image->info().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT);
+
+    barriers.accessImage(
+      m_debugPresentImage.image,
+      m_debugPresentImage.view->imageSubresources(),
+      m_debugPresentImage.image->info().layout,
+      m_debugPresentImage.image->info().stages,
+      m_debugPresentImage.image->info().access,
+      m_debugPresentImage.image->info().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT);
+
+    barriers.recordCommands(ctx->getCommandList());
+
+    ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+    ctx->bindResourceView(1, m_colorInput.view, nullptr);
+    ctx->bindResourceView(2, m_debugPresentImage.view, nullptr);
+
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NgxPassthroughSceneColorDebugShader::getShader());
+
+    ctx->dispatch(
+      (m_renderExtent.width + 15) / 16,
+      (m_renderExtent.height + 15) / 16,
+      1);
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_colorInput.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_debugPresentImage.image);
   }
 
   void RtxNgxPassthrough::dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers) {
@@ -1978,7 +2032,17 @@ namespace dxvk {
     // overlay rather than written to the target here - see blitDebugOverlayToPresent for why
     // neither injection point can host it in place. Taken before the upscaler runs, which writes
     // its own result over the same image.
-    if (haveDepthMvInputs && debugVisualization() != int(DebugVisualization::Off)) {
+    const int debugVis = debugVisualization();
+
+    // Scene colour is sampled at the injection point (the upscaler's colour input) and
+    // display-mapped for SDR inspection. Unlike the depth/MV views this does not depend
+    // on synthesized inputs being available.
+    if (debugVis == int(DebugVisualization::SceneColor)) {
+      snapshotColorInput(ctx, colorSourceImage, colorOffset);
+      dispatchSceneColorDebug(ctx, barriers);
+      m_debugPresentValid = true;
+      m_statDebugVisCount++;
+    } else if (haveDepthMvInputs && debugVis != int(DebugVisualization::Off)) {
       VkImageCopy copyRegion = {};
       copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
       copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -2306,7 +2370,7 @@ namespace dxvk {
 
     int debugVisualizationValue = debugVisualization();
     if (ImGui::Combo("Debug Visualization", &debugVisualizationValue,
-                     "Off\0Motion Vectors\0Depth\0Object Velocity Coverage\0")) {
+                     "Off\0Motion Vectors\0Depth\0Object Velocity Coverage\0Scene Color (Injection Input)\0")) {
       debugVisualizationObject().setDeferred(debugVisualizationValue);
     }
 

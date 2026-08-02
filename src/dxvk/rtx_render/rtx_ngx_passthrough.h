@@ -359,6 +359,7 @@ namespace dxvk {
       MotionVectors = 1,
       Depth = 2,
       ObjectVelocityCoverage = 3,
+      SceneColor = 4,
     };
 
     // Path tracing is incompatible with NGX passthrough; keep rtx.enableRaytracing off.
@@ -460,7 +461,10 @@ namespace dxvk {
     RTX_OPTION("rtx.ngxPassthrough", int, debugVisualization, 0,
                "Debug visualization for the synthesized DLSS inputs. 0: Off, 1: Motion Vectors, 2: Depth,\n"
                "3: Object Velocity Coverage (the raw velocity raster output: green = world-phase coverage, red =\n"
-               "foreground-phase coverage, dark = no rasterized velocity).\n"
+               "foreground-phase coverage, dark = no rasterized velocity), 4: Scene Color (the linear colour\n"
+               "sampled at the upscaler injection point, display-mapped for SDR inspection; at the pre-post-process\n"
+               "injection this is the game's HDR scene colour before bloom/tonemap, at the late injection point it is\n"
+               "the post-processed output instead).\n"
                "In the motion vector mode the blue channel encodes each pixel's motion source, independent of motion\n"
                "magnitude: 0 = per-object velocity override (dynamic object coverage), 0.25 = foreground object velocity\n"
                "(first person meshes with true skinned motion), 0.5 = world camera reprojection, 1 = camera-locked\n"
@@ -585,6 +589,7 @@ namespace dxvk {
 
     // Combines m_dlssOutput RGB with m_colorInput alpha into m_mergedOutput
     void dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers);
+    void dispatchSceneColorDebug(RtxContext* ctx, DxvkBarrierSet& barriers);
 
     // One feature per injection point (indexed by HDR content), so switching between them costs
     // nothing and neither loses its temporal history. Sharing one meant every switch rebuilt the
