@@ -173,6 +173,10 @@ namespace dxvk {
                                               const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
     ScopedCpuProfileZone();
 
+    if (m_pGeometryWorkers == nullptr) {
+      return Future<GeometryHashes>();
+    }
+
     const uint32_t indexCount = geoData.indexCount;
     const uint32_t vertexCount = geoData.vertexCount;
 
@@ -273,7 +277,7 @@ namespace dxvk {
                                                                         const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
     ScopedCpuProfileZone();
 
-    if (!m_frameOptions.needsMeshBoundingBox) {
+    if (m_pGeometryWorkers == nullptr || !m_frameOptions.needsMeshBoundingBox) {
       return Future<AxisAlignedBoundingBox>();
     }
 

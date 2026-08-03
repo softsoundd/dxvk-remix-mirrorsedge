@@ -47,6 +47,7 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_lights_data.h"
 #include "rtx_light_utils.h"
+#include "rtx_ngx_passthrough.h"
 
 #include "../util/util_global_time.h"
 #include "../util/util_struct_hash.h"
@@ -503,6 +504,14 @@ namespace dxvk {
 
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame) {
     ScopedCpuProfileZone();
+
+    // NGX: no RT scene - keep camera onFrameEnd for DLSS/MV history only.
+    if (!raytracedThisFrame && RtxNgxPassthrough::ngxPassthroughMode()) {
+      m_cameraManager.onFrameEnd();
+      m_previousFrameSceneAvailable = false;
+      RtxOptionManager::clearDrawcallTranslationInvalid();
+      return;
+    }
 
     // Commit this frame's texture registrations for preserve next frame. Must run before
     // manageTextureVram(), which may clear the cache and bump the generation so the

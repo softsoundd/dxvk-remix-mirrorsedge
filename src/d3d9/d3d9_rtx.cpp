@@ -4699,7 +4699,11 @@ namespace dxvk {
     : m_rtStagingData(d3d9Device->GetDXVKDevice(), "RtxStagingDataAlloc: D3D9", (VkMemoryPropertyFlagBits) (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     , m_parent(d3d9Device)
     , m_enableDrawCallConversion(enableDrawCallConversion)
-    , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
+    // Skip LowLatency geometry workers under NGX - they never get jobs but still spin.
+    // Launch-time only (same as depth layout): ngxPassthroughMode must be set at init.
+    , m_pGeometryWorkers((enableDrawCallConversion && !RtxNgxPassthrough::ngxPassthroughMode())
+                           ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing")
+                           : nullptr) {
   }
 
   D3D9Rtx::~D3D9Rtx() {
@@ -8536,6 +8540,10 @@ namespace dxvk {
     ScopedCpuProfileZone();
 
     static const auto kEmptySkinningFuture = Future<SkinningData>();
+
+    if (m_pGeometryWorkers == nullptr) {
+      return kEmptySkinningFuture;
+    }
 
     if (m_parent->UseProgrammableVS()) {
       return kEmptySkinningFuture;
@@ -16121,7 +16129,7 @@ namespace dxvk {
 
     // persist newly discovered texture material-spread so the next session scores
     // deterministically from its first frame instead of re-converging
-    if (m_ue3TextureSpreadDirty &&
+    if (!m_frameOptions.ngxPassthroughMode && m_ue3TextureSpreadDirty &&
         currentReflexFrameId >= m_ue3TextureSpreadLastSaveFrame + kUe3TextureSpreadSaveIntervalFrames) {
       m_ue3TextureSpreadLastSaveFrame = uint32_t(currentReflexFrameId);
       saveUe3TextureSpreadCache();
@@ -16177,8 +16185,11 @@ namespace dxvk {
     }
     m_deferredUiFrameVertexBytes = 0;
 
-    pruneUe3StaticVertexCaptureCache();
-    pruneUe3GeometryMemoCache();
+    // Capture caches stay empty under NGX (no internalPrepareDraw).
+    if (!m_frameOptions.ngxPassthroughMode) {
+      pruneUe3StaticVertexCaptureCache();
+      pruneUe3GeometryMemoCache();
+    }
 
     DrawCallState::refreshCategoryLookupTable();
 
