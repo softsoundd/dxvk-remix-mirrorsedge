@@ -29,7 +29,9 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 > [!NOTE]
 > UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, roughly 9 state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
 
-2. Disable the game's lightmaps - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks). Disabling lightmaps is recommended for both compatibility and, more importantly, when authoring assets, as scene exports with lightmaps active produce different material hashes that cannot survive in non-lightmapped states. If you wish to keep lightmaps enabled for before/after comparisons, that is supported and will not throw off hashes (provided authoring had been in a non-lightmapped mode).
+2. Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`) - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
+> [!IMPORTANT]
+> Disabling lightmaps is strongly recommended, both for compatibility and especially when authoring assets. When lightmaps are enabled, Remix scene exports generate different material hashes that are not compatible with non-lightmapped states. As a result, assets authored with lightmaps enabled may not match correctly once lightmaps are disabled. If you want to keep lightmaps enabled for before/after comparisons, that is fully supported. As long as assets were originally authored with lightmaps disabled, enabling lightmaps later for comparison will not affect material hash matching.
 
 3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```
