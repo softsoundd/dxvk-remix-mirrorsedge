@@ -67,14 +67,13 @@ show fog
 > The above commands ensures maximum compatibility with Remix. That being said, a lot of consideration has gone into this fork into ensuring that games with less flexibility around commands can still play somewhat nice with these graphics systems active, though game-side modding is recommended to disable them.
 
 4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments, so the above commands will not work out of the box. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Once patched, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
-5. *(Optional)* UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
+
+5. Mirror's Edge hides the third-person player model in the default first-person camera state, which means Remix cannot cast shadows or reflect the character as you'd expect in a raytraced scenario. A modded TdGame.u game file is provided which always shows the third-person model regardless of camera state - this can be downloaded from the releases section, and goes into `<path-to-game\TdGame\CookedPC>`. Make sure you have the runtime's `rtx.conf` file which has the necessary player/viewmodel hashes pre-tagged so this renders properly.
+
+6. *(Optional)* UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
 	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
 
-### 3) Acknowledgements
-- sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
-- xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
-
-### 4) Extra fork notes/debugging
+### 3) Extra fork notes/debugging
 
 #### Material identity and replacement anchor stability
 
@@ -95,6 +94,10 @@ When an authored enhancement does not appear (or appears intermittently), enable
 - `[RTX-MeshAnchorDrift]`: a mesh replacement key moved, attributed to its geometry part (unstable vertex data, e.g. CPU-morphed skinned meshes) vs its material part (mesh keys are `geometryHash XOR materialHash`).
 
 `rtx.replacementDebugHashes` tracks specific hashes in detail (matched against texture, material, textureSet+shader, geometry, and mesh-key hashes) without the full-scene log volume. Toggling enhanced assets on/off in the UI intentionally shows up as synchronised matched/`NO MATCH` flaps with unchanged hashes.
+
+### 4) Acknowledgements
+- sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
+- xoxor4d for their research into UE3 → Remix support and other tidbits of info that helped guide the initial work around this.
 
 ## Build instructions
 

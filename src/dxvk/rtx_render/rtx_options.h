@@ -233,6 +233,16 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, playerModelBodyTextures, {},
                   "Textures on draw calls that identify the player model body/root position.\n"
                   "Remix uses the tagged body instance as the anchor for filtering nearby player-model parts and for creating or positioning virtual player-model instances through portals.");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for third-person player model draw calls.\n"
+                  "Use when Mesh3p shares materials with the first-person mesh.");
+    RTX_OPTION("rtx", fast_unordered_set, viewModelTextures, {},
+                  "Textures / material hashes for first-person view-model draw calls (e.g. Mesh1p arms, FP weapon).\n"
+                  "Forces CameraType::ViewModel when rtx.viewModel.enable is true.\n"
+                  "Prefer rtx.viewModelGeometries when the same material is also used on the third-person body.");
+    RTX_OPTION("rtx", fast_unordered_set, viewModelGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for first-person view-model draw calls.\n"
+                  "Preferred when Mesh1p shares materials with Mesh3p.");
     RTX_OPTION("rtx", fast_unordered_set, lightConverter, {},
                   "Textures on draw calls that should spawn Remix effect lights.\n"
                   "An effect light is a dynamic sphere light placed at the tagged draw call's geometry centroid; radius, intensity, color, and plasma-ball animation are controlled in the Runtime UI's Lighting > Effect Light section.");
@@ -456,7 +466,12 @@ namespace dxvk {
     struct PlayerModel {
       friend class ImGUI;
       RTX_OPTION("rtx.playerModel", bool, enableVirtualInstances, true, "");
-      RTX_OPTION("rtx.playerModel", bool, enableInPrimarySpace, false, "");
+      RTX_OPTION("rtx.playerModel", bool, enableInPrimarySpace, false,
+                 "Show third-person player-model instances on primary camera rays.\n"
+                 "Also hides the view model while enabled; prefer autoEnableInPrimarySpaceWhenNoViewModel for cutscenes.");
+      RTX_OPTION("rtx.playerModel", bool, autoEnableInPrimarySpaceWhenNoViewModel, false,
+                 "Show player-model instances on primary rays in frames with no ViewModel camera\n"
+                 "(cutscenes / flyovers that do not draw Mesh1p). Does not override enableInPrimarySpace.");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
       RTX_OPTION("rtx.playerModel", float, backwardOffset, 0.f, "");
       RTX_OPTION("rtx.playerModel", float, horizontalDetectionDistance, 34.f, "");
@@ -464,6 +479,14 @@ namespace dxvk {
       RTX_OPTION("rtx.playerModel", float, eyeHeight, 64.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleRadius, 24.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleHeight, 68.f, "");
+
+      // enableInPrimarySpace wins; otherwise auto-enable when Mesh1p/ViewModel was not drawn.
+      static bool resolveEnableInPrimarySpace(bool viewModelCameraValidThisFrame) {
+        if (enableInPrimarySpace()) {
+          return true;
+        }
+        return autoEnableInPrimarySpaceWhenNoViewModel() && !viewModelCameraValidThisFrame;
+      }
     } playerModel;
 
     struct Displacement {

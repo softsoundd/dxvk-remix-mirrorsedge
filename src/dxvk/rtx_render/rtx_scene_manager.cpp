@@ -1768,6 +1768,10 @@ namespace dxvk {
     if (h != kEmptyHash) {
       meta.legacyTextureHash2 = h;
     }
+    meta.geometryHash = drawCallState.getGeometryData().getHashForRule(HashRule(rules::TopologicalHash));
+    if (meta.geometryHash == kEmptyHash) {
+      meta.geometryHash = drawCallState.getGeometryData().getHashForRule(RtxOptions::geometryAssetHashRule());
+    }
 
     std::lock_guard lock { m_drawCallMeta.mutex };
     auto [iter, isNew] = m_drawCallMeta.infos[m_drawCallMeta.ticker].emplace(objectPickingValue, meta);
@@ -2142,6 +2146,35 @@ namespace dxvk {
     const int ticksToCheck[] = {
       m_drawCallMeta.ticker, // current tick
       (m_drawCallMeta.ticker + m_drawCallMeta.MaxTicks - 1) % m_drawCallMeta.MaxTicks, // prev tick
+    };
+    for (int tick : ticksToCheck) {
+      if (m_drawCallMeta.ready[tick]) {
+        if (auto h = tryFindIn(m_drawCallMeta.infos[tick], objectPickingValue)) {
+          return h;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<XXH64_hash_t> SceneManager::findGeometryHashByObjectPickingValue(uint32_t objectPickingValue) {
+    std::lock_guard lock { m_drawCallMeta.mutex };
+
+    auto tryFindIn = [](const std::unordered_map<ObjectPickingValue, DrawCallMetaInfo>& table, ObjectPickingValue toFind)
+      -> std::optional<XXH64_hash_t> {
+      auto found = table.find(toFind);
+      if (found != table.end()) {
+        const DrawCallMetaInfo& meta = found->second;
+        if (meta.geometryHash != kEmptyHash) {
+          return meta.geometryHash;
+        }
+      }
+      return std::nullopt;
+    };
+
+    const int ticksToCheck[] = {
+      m_drawCallMeta.ticker,
+      (m_drawCallMeta.ticker + m_drawCallMeta.MaxTicks - 1) % m_drawCallMeta.MaxTicks,
     };
     for (int tick : ticksToCheck) {
       if (m_drawCallMeta.ready[tick]) {

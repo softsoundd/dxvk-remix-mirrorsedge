@@ -1530,8 +1530,9 @@ namespace dxvk {
       return;
     }
 
-    // If the first person player model is enabled, hide the view model.
-    if (RtxOptions::PlayerModel::enableInPrimarySpace()) {
+    // Hide the view model when the third-person player model is shown on primary rays.
+    if (RtxOptions::PlayerModel::resolveEnableInPrimarySpace(
+          cameraManager.isCameraValid(CameraType::ViewModel))) {
       for (auto* candidateInstance : m_viewModelCandidates) {
         candidateInstance->m_vkInstance.mask = 0;
       }

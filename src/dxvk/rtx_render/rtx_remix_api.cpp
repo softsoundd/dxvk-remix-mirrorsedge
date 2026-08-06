@@ -671,8 +671,9 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS)                { result.set(InstanceCategories::HairCards); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL)                { result.set(InstanceCategories::ViewModel); }
       
-      static_assert((int)InstanceCategories::Count == 26, "Instance categories changed, please update Remix SDK");
+      static_assert((int)InstanceCategories::Count == 27, "Instance categories changed, please update Remix SDK");
       return result;
     }
 
@@ -1286,7 +1287,7 @@ namespace {
       dxvk::Vector2i{ pixelRegion->left, pixelRegion->top },
       dxvk::Vector2i{ pixelRegion->right, pixelRegion->bottom },
       // invoke user's callback on result
-      [callback, callbackUserData](std::vector<dxvk::ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t>) {
+      [callback, callbackUserData](std::vector<dxvk::ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t>, std::optional<XXH64_hash_t>) {
         callback(objectPickingValues.data(), uint32_t(objectPickingValues.size()), callbackUserData);
       }
     );

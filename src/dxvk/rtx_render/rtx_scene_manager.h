@@ -226,6 +226,7 @@ public:
   [[nodiscard]] SamplerIndex trackSampler(Rc<DxvkSampler> sampler);
 
   std::optional<XXH64_hash_t> findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue);
+  std::optional<XXH64_hash_t> findGeometryHashByObjectPickingValue(uint32_t objectPickingValue);
   std::vector<ObjectPickingValue> gatherObjectPickingValuesByTextureHash(XXH64_hash_t texHash);
 
   // Replacement material hash tracking
@@ -399,6 +400,8 @@ private:
   struct DrawCallMetaInfo {
     XXH64_hash_t legacyTextureHash { kEmptyHash };
     XXH64_hash_t legacyTextureHash2 { kEmptyHash };
+    // Topology-stable geometry hash used for geometry category tagging in the UI.
+    XXH64_hash_t geometryHash { kEmptyHash };
   };
   struct DrawCallMeta {
     constexpr static inline uint8_t MaxTicks = 2;

@@ -1196,7 +1196,9 @@ namespace dxvk {
 
     constants.directLightBoilingThreshold = m_common->metaDemodulate().directLightBoilingThreshold();
     constants.translucentDecalAlbedoFactor = RtxOptions::translucentDecalAlbedoFactor();
-    constants.enablePlayerModelInPrimarySpace = RtxOptions::PlayerModel::enableInPrimarySpace();
+    constants.enablePlayerModelInPrimarySpace =
+      RtxOptions::PlayerModel::resolveEnableInPrimarySpace(
+        getSceneManager().getCameraManager().isCameraValid(CameraType::ViewModel));
     constants.enablePlayerModelPrimaryShadows = RtxOptions::PlayerModel::enablePrimaryShadows();
     constants.enablePreviousTLAS = RtxOptions::enablePreviousTLAS() && m_common->getSceneManager().isPreviousFrameSceneAvailable();
 
@@ -2214,7 +2216,7 @@ namespace dxvk {
             const uint32_t* readback = mapAs<const uint32_t*>(cReadbackDst);
             if (!readback || cReadbackDst->info().size < onePixelInBytes) {
               assert(0);
-              cCallback(std::vector<ObjectPickingValue>{}, std::nullopt);
+              cCallback(std::vector<ObjectPickingValue>{}, std::nullopt, std::nullopt);
               return;
             }
 
@@ -2237,12 +2239,15 @@ namespace dxvk {
             auto legacyHashForPrimaryValue = g_allowMappingLegacyHashToObjectPickingValue ?
               m_common->getSceneManager().findLegacyTextureHashByObjectPickingValue(primaryValue) :
               std::optional<XXH64_hash_t>{};
+            auto geometryHashForPrimaryValue = g_allowMappingLegacyHashToObjectPickingValue ?
+              m_common->getSceneManager().findGeometryHashByObjectPickingValue(primaryValue) :
+              std::optional<XXH64_hash_t>{};
 
-            cCallback(std::move(values), legacyHashForPrimaryValue);
+            cCallback(std::move(values), legacyHashForPrimaryValue, geometryHashForPrimaryValue);
           }
         ));
       } else {
-        request->callback(std::vector<ObjectPickingValue>{}, std::nullopt);
+        request->callback(std::vector<ObjectPickingValue>{}, std::nullopt, std::nullopt);
       }
     }
 

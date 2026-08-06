@@ -430,6 +430,7 @@ namespace dxvk {
       { InstanceCategories::Sky, &RtxOptions::skyBoxTextures() },
       { InstanceCategories::ParticleEmitter, &RtxOptions::particleEmitterTextures() },
       { InstanceCategories::HairCards, &RtxOptions::hairCardTextures() },
+      { InstanceCategories::ViewModel, &RtxOptions::viewModelTextures() },
     };
 
     // Position-weighted size fingerprint: any single-set tagging change (add/remove via
@@ -507,11 +508,25 @@ namespace dxvk {
 
     setCategory(InstanceCategories::ParticleEmitter, matched(InstanceCategories::ParticleEmitter));
     setCategory(InstanceCategories::HairCards, matched(InstanceCategories::HairCards));
+    setCategory(InstanceCategories::ViewModel, matched(InstanceCategories::ViewModel));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {
     const XXH64_hash_t assetReplacementHash = getHash(RtxOptions::geometryAssetHashRule());
     setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxGeometries(), assetReplacementHash));
+
+    // Topology-stable (indices + descriptor) so CPU-skinned meshes keep a stable tag across poses.
+    const XXH64_hash_t topologyHash =
+      getGeometryData().getHashForRule(HashRule(rules::TopologicalHash));
+
+    // Geometry tags OR with texture categories. Player-model geometry clears ViewModel so a
+    // shared material in viewModelTextures cannot pull Mesh3p onto the view-model camera.
+    if (lookupHash(RtxOptions::playerModelGeometries(), topologyHash)) {
+      setCategory(InstanceCategories::ThirdPersonPlayerModel, true);
+      removeCategory(InstanceCategories::ViewModel);
+    } else if (lookupHash(RtxOptions::viewModelGeometries(), topologyHash)) {
+      setCategory(InstanceCategories::ViewModel, true);
+    }
   }
 
   static std::optional<Vector3> makeCameraPosition(const Matrix4& worldToView,

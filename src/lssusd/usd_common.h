@@ -45,6 +45,7 @@ namespace dxvk {
     { InstanceCategories::ParticleEmitter,         "remix_category:particle_emitter",         "Particle Emitter",          "rtx.particleEmitterTextures" },
     { InstanceCategories::SmoothNormals,           "remix_category:smooth_normals",           "Smooth Normals",            "rtx.smoothNormalsTextures" },
     { InstanceCategories::HairCards,               "remix_category:hair_cards",               "Hair Cards",                "rtx.hairCardTextures" },
+    { InstanceCategories::ViewModel,               "remix_category:view_model",               "View Model",                "rtx.viewModelTextures" },
   };
 
   // Table must have one entry per enum value.
