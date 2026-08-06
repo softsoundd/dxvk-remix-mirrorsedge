@@ -1332,6 +1332,23 @@ namespace dxvk {
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");
 
+    RTX_OPTION("rtx", bool, logReplacementResolution, false,
+               "Replacement anchor diagnostics: log how every draw resolves against authored replacement "
+               "anchors (material replacements through the tiered material identity lookup, mesh/light "
+               "replacements through the geometry-asset-hash XOR material-hash key), and warn whenever the "
+               "same material family or mesh resolves differently than it did earlier in the session - the "
+               "signature of hash drift breaking authored anchors. Also enables the UE3 material-identity "
+               "drift attribution in the D3D9 layer, which names the identity tier (texture set, constants, "
+               "render-target-backed sampler) responsible for a changed material hash. Verbose; intended for "
+               "debugging sessions only.");
+    RTX_OPTION("rtx", fast_unordered_set, replacementDebugHashes, {},
+               "Replacement anchor diagnostics: hashes to track in detail even when "
+               "rtx.logReplacementResolution is disabled. A draw is tracked when any of its identity hashes "
+               "match an entry: the primary color texture hash, the full material hash, the "
+               "textureSet+shader tier hash, the geometry asset hash, the combined mesh replacement key, or "
+               "any material sampler's image hash. Tracked draws produce the same resolution and drift logs "
+               "as rtx.logReplacementResolution without the full-scene log volume.");
+
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 
     RTX_OPTION("rtx", bool, useBuffersDirectly, true, "When enabled Remix will use the incoming vertex buffers directly where possible instead of copying data. Note: setting the d3d9.allowDiscard to False will disable this option.");

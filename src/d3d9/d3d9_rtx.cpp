@@ -2195,12 +2195,114 @@ namespace dxvk {
     static fast_unordered_cache<Ue3MicConstantChurnEntry> s_ue3MicConstantChurnPerGroup;
     static fast_unordered_set s_ue3MicAutoExcludedGroups;
 
+    // Cross-session persistence for the auto-exclusion set; rationale in the
+    // rtx.d3d9.ue3MicPersistAutoExcludedConstantGroups option documentation.
+    constexpr char kUe3MicAutoExcludedGroupsCachePath[] = "rtx-remix/ue3MicAutoExcludedGroups.cache";
+    constexpr uint64_t kUe3MicAutoExcludedGroupsCacheMagic = 0x315843494D334555ull; // "UE3MICX1"
+    constexpr uint32_t kUe3MicAutoExcludedGroupsCacheMaxEntries = 1u << 16;
+
+    static bool s_ue3MicAutoExcludedGroupsLoaded = false;
+
+    static void loadUe3MicAutoExcludedGroupsCache() {
+      s_ue3MicAutoExcludedGroupsLoaded = true;
+
+      std::ifstream file(kUe3MicAutoExcludedGroupsCachePath, std::ios::binary);
+      if (!file.is_open())
+        return;
+
+      uint64_t magic = 0;
+      uint32_t entryCount = 0;
+      file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+      file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
+      if (!file || magic != kUe3MicAutoExcludedGroupsCacheMagic || entryCount > kUe3MicAutoExcludedGroupsCacheMaxEntries)
+        return;
+
+      for (uint32_t i = 0; i < entryCount; i++) {
+        XXH64_hash_t groupKey = 0;
+        file.read(reinterpret_cast<char*>(&groupKey), sizeof(groupKey));
+        if (!file)
+          return;
+        s_ue3MicAutoExcludedGroups.insert(groupKey);
+      }
+
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-MIC] Loaded constants auto-exclusion cache: ", entryCount, " material groups"));
+    }
+
+    static void saveUe3MicAutoExcludedGroupsCache() {
+      // Merge any not-yet-loaded persisted entries first so a save never drops them.
+      if (!s_ue3MicAutoExcludedGroupsLoaded)
+        loadUe3MicAutoExcludedGroupsCache();
+
+      std::ofstream file(kUe3MicAutoExcludedGroupsCachePath, std::ios::binary | std::ios::trunc);
+      if (!file.is_open())
+        return;
+
+      const uint32_t entryCount =
+        uint32_t(std::min<size_t>(s_ue3MicAutoExcludedGroups.size(), kUe3MicAutoExcludedGroupsCacheMaxEntries));
+      file.write(reinterpret_cast<const char*>(&kUe3MicAutoExcludedGroupsCacheMagic), sizeof(kUe3MicAutoExcludedGroupsCacheMagic));
+      file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+      uint32_t written = 0;
+      for (const XXH64_hash_t groupKey : s_ue3MicAutoExcludedGroups) {
+        if (written >= entryCount)
+          break;
+        file.write(reinterpret_cast<const char*>(&groupKey), sizeof(groupKey));
+        written++;
+      }
+    }
+
+    // ===== Replacement identity drift diagnostics =====
+    // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
+    //
+    // Remembers, per material family, the identity tiers behind the last minted material
+    // hash so a mint with a different hash can be attributed to the tier that moved
+    // (texture set, constants, or exclusion state). A family is keyed by (shader identity
+    // seed, primary color texture hash) - both stable across sessions, unlike any of the
+    // minted hashes themselves.
+    constexpr uint32_t kMicDriftMaxTrackedSamplers = 16;  // caps::MaxTexturesPS
+    constexpr uint32_t kMicDriftMaxTrackedConstants = 16;
+    // Per-family log caps: without them an A/B-oscillating constants hash (which the churn
+    // ring buffer intentionally does not auto-exclude) would emit a drift warning per draw.
+    constexpr uint32_t kMicDriftMaxLogsPerFamily = 16;
+    constexpr uint32_t kMicDriftMaxLogsPerTrackedFamily = 64;
+
+    struct Ue3MicIdentitySample {
+      XXH64_hash_t materialHash = kEmptyHash;
+      XXH64_hash_t textureSetHash = kEmptyHash;
+      XXH64_hash_t constantsHash = kEmptyHash;
+      bool constantsExcluded = false;
+      bool valid = false;
+      uint32_t driftLogsEmitted = 0;
+
+      struct SamplerRecord {
+        uint8_t reg = 0xFF;
+        bool isRenderTarget = false;
+        XXH64_hash_t imageHash = kEmptyHash;
+        XXH64_hash_t descriptorHash = kEmptyHash;
+      };
+      std::array<SamplerRecord, kMicDriftMaxTrackedSamplers> samplers = {};
+      uint32_t samplerCount = 0;
+
+      struct ConstantRecord {
+        uint16_t reg = 0xFFFF;
+        Vector4 value;
+      };
+      std::array<ConstantRecord, kMicDriftMaxTrackedConstants> constants = {};
+      uint32_t constantCount = 0;
+    };
+
+    static fast_unordered_cache<Ue3MicIdentitySample> s_ue3MicIdentityByFamily;
+    static fast_unordered_set s_ue3MicRtPoisonWarnedFamilies;
+
     static XXH64_hash_t makeUe3MicChurnGroupKey(const XXH64_hash_t shaderIdentitySeed,
                                                 const XXH64_hash_t textureSetHash) {
       return XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentitySeed);
     }
 
-    static bool isUe3MicGroupAutoExcluded(const XXH64_hash_t churnGroupKey) {
+    static bool isUe3MicGroupAutoExcluded(const XXH64_hash_t churnGroupKey, const bool persistAcrossSessions) {
+      if (persistAcrossSessions && !s_ue3MicAutoExcludedGroupsLoaded)
+        loadUe3MicAutoExcludedGroupsCache();
       return s_ue3MicAutoExcludedGroups.find(churnGroupKey) != s_ue3MicAutoExcludedGroups.end();
     }
 
@@ -2209,7 +2311,8 @@ namespace dxvk {
                                          const XXH64_hash_t psHash,
                                          const XXH64_hash_t shaderIdentitySeed,
                                          const XXH64_hash_t textureSetHash,
-                                         const XXH64_hash_t constantsHash) {
+                                         const XXH64_hash_t constantsHash,
+                                         const bool persistAcrossSessions) {
       Ue3MicConstantChurnEntry& entry = s_ue3MicConstantChurnPerGroup[churnGroupKey];
 
       for (const XXH64_hash_t seenHash : entry.recentHashes) {
@@ -2227,6 +2330,9 @@ namespace dxvk {
 
       if (entry.distinctCount >= kUe3MicChurnWarnThreshold &&
           s_ue3MicAutoExcludedGroups.insert(churnGroupKey).second) {
+        if (persistAcrossSessions) {
+          saveUe3MicAutoExcludedGroupsCache();
+        }
         Logger::warn(str::format(
           "[RTX-Compatibility][UE3-MIC] Material group (seed=0x", std::hex, shaderIdentitySeed,
           ", ps=0x", psHash,
@@ -2234,8 +2340,12 @@ namespace dxvk {
           ") minted ", kUe3MicChurnWarnThreshold,
           "+ distinct constant hashes - its constant registers are frame-varying "
           "(Time/panner/fade/sub-UV expressions). Excluding this group's constants from "
-          "material identity for this session; add the shader hash or seed to "
-          "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to exclude it permanently."));
+          "material identity",
+          persistAcrossSessions
+            ? " and persisting the exclusion to rtx-remix/ue3MicAutoExcludedGroups.cache (applies "
+              "from the start of future sessions; delete the file to reset)."
+            : " for this session; add the shader hash or seed to "
+              "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to exclude it permanently."));
         return true;
       }
 
@@ -4753,6 +4863,8 @@ namespace dxvk {
     o.ue3MaterialInstanceConstantHash = ue3MaterialInstanceConstantHashObject().get();
     o.ue3LightmapPermutationInvariantHash = ue3LightmapPermutationInvariantHashObject().get();
     o.ue3LightmapPermutationBridgeLookup = ue3LightmapPermutationBridgeLookupObject().get();
+    o.ue3MicExcludeRenderTargetsFromIdentity = ue3MicExcludeRenderTargetsFromIdentityObject().get();
+    o.ue3MicPersistAutoExcludedConstantGroups = ue3MicPersistAutoExcludedConstantGroupsObject().get();
     o.ue3LogMaterialInstanceHash = ue3LogMaterialInstanceHashObject().get();
     o.ue3SkipDepthPrepass = ue3SkipDepthPrepassObject().get();
     o.ue3SkipShadowDepthPasses = ue3SkipShadowDepthPassesObject().get();
@@ -4793,6 +4905,7 @@ namespace dxvk {
     o.enableMultiStageTextureFactorBlending = RtxOptions::enableMultiStageTextureFactorBlendingObject().get();
     o.ignoreAllVertexColorBakedLighting = RtxOptions::ignoreAllVertexColorBakedLightingObject().get();
     o.vertexColorIsBakedLighting = RtxOptions::vertexColorIsBakedLightingObject().get();
+    o.logReplacementResolution = RtxOptions::logReplacementResolutionObject().get();
     o.drawCallRange = RtxOptions::drawCallRangeObject().get();
 
     o.uiTextures = &RtxOptions::uiTexturesObject().get();
@@ -4806,6 +4919,8 @@ namespace dxvk {
     o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
     o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
     o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
+    o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
+    o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
 
     o.valid = true;
   }
@@ -7198,6 +7313,20 @@ namespace dxvk {
       entry.imageHash = entry.hasImage ? image->getHash() : kEmptyHash;
       entry.isRenderTarget = texture->IsRenderTarget();
       entry.rtDescriptorHash = (entry.isRenderTarget && entry.hasImage) ? image->getDescriptorHash() : 0;
+      // Non-RT images carry no descriptor hash on the DxvkImage; compute one only when
+      // the identity exclusion option or the replacement diagnostics actually consume it.
+      const bool wantDescriptorHashes =
+        (m_frameOptions.ue3MicIdentityExcludedTextureDescHashes != nullptr &&
+         !m_frameOptions.ue3MicIdentityExcludedTextureDescHashes->empty()) ||
+        m_frameOptions.logReplacementResolution ||
+        m_frameOptions.ue3LogMaterialInstanceHash;
+      if (entry.rtDescriptorHash != 0) {
+        entry.descriptorHash = entry.rtDescriptorHash;
+      } else if (wantDescriptorHashes && entry.hasImage && texture->Desc() != nullptr) {
+        entry.descriptorHash = texture->Desc()->CalculateHash();
+      } else {
+        entry.descriptorHash = 0;
+      }
 
       m_boundTextureSnapshot.mask |= (1u << idx);
     }
@@ -9896,6 +10025,10 @@ namespace dxvk {
             std::array<Ue3PresentMaterialSampler, kUe3BridgeMaxSamplers> presentSamplers;
             uint32_t presentSamplerCount = 0;
             bool presentSamplersOverflowed = false;
+            // Replacement identity drift diagnostics: record the (register, image hash, RT flag)
+            // tuples that feed textureSetHash so tier drift can be attributed per sampler.
+            Ue3MicIdentitySample::SamplerRecord micDiagSamplers[kMicDriftMaxTrackedSamplers];
+            uint32_t micDiagSamplerCount = 0;
             XXH64_hash_t textureSetHash = kEmptyHash;
             if (identityInfo.materialSamplerMask != 0) {
               XXH3_state_t* const state = getThreadLocalXxh3State();
@@ -9912,14 +10045,53 @@ namespace dxvk {
                   const XXH64_hash_t imageHash = entry.imageHash;
                   if (imageHash == kEmptyHash)
                     return kEmptyHash; // hashless (e.g. render target bound as a material texture)
+                  if (m_frameOptions.ue3MicExcludeRenderTargetsFromIdentity && entry.isRenderTarget) {
+                    // RT image hashes change on every recreation (respawn/checkpoint/level
+                    // load) and would re-mint the identity each time; treat as hashless.
+                    if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
+                      static fast_unordered_set s_loggedRtIdentityExclusions;
+                      const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
+                      if (s_loggedRtIdentityExclusions.insert(exclusionLogKey).second) {
+                        Logger::info(str::format(
+                          "[RTX-Compatibility][UE3-MIC] Excluded render-target image 0x", std::hex, imageHash,
+                          " (RT descriptor hash 0x", entry.rtDescriptorHash,
+                          ") at material sampler s", std::dec, samplerRegister,
+                          " of pixel shader 0x", std::hex, psHash, std::dec,
+                          " from material identity (rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity)."));
+                      }
+                    }
+                    return kEmptyHash;
+                  }
+                  if (!m_frameOptions.ue3MicIdentityExcludedTextureDescHashes->empty() &&
+                      lookupHash(*m_frameOptions.ue3MicIdentityExcludedTextureDescHashes, entry.descriptorHash)) {
+                    // User-tagged session-unstable texture (engine-composited contents give it a
+                    // new image hash every session): keep it out of the identity so anchors hold.
+                    if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
+                      static fast_unordered_set s_loggedDescIdentityExclusions;
+                      const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
+                      if (s_loggedDescIdentityExclusions.insert(exclusionLogKey).second) {
+                        Logger::info(str::format(
+                          "[RTX-Compatibility][UE3-MIC] Excluded texture image 0x", std::hex, imageHash,
+                          " (descriptor hash 0x", entry.descriptorHash,
+                          ") at material sampler s", std::dec, samplerRegister,
+                          " of pixel shader 0x", std::hex, psHash, std::dec,
+                          " from material identity (rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes)."));
+                      }
+                    }
+                    return kEmptyHash;
+                  }
                   XXH3_64bits_update(state, samplerKey, samplerKeySize);
                   XXH3_64bits_update(state, &imageHash, sizeof(imageHash));
                   anyTextureHashed = true;
+                  if (micDiagSamplerCount < kMicDriftMaxTrackedSamplers) {
+                    micDiagSamplers[micDiagSamplerCount++] = Ue3MicIdentitySample::SamplerRecord {
+                      uint8_t(samplerRegister), entry.isRenderTarget, imageHash, entry.descriptorHash };
+                  }
                   if (logMicHash) {
                     micTextureListLog += str::format(
                       micTextureListLog.empty() ? "s" : ",s", samplerRegister,
                       samplerLogName != nullptr ? str::format("(", samplerLogName, ")") : std::string(),
-                      ":0x", std::hex, imageHash, std::dec);
+                      ":0x", std::hex, imageHash, "(desc:0x", entry.descriptorHash, ")", std::dec);
                   }
                   return imageHash;
                 };
@@ -9962,7 +10134,7 @@ namespace dxvk {
             bool constantsExcluded =
               lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, psHash) ||
               (useInvariantShaderIdentity && lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, shaderIdentitySeed)) ||
-              (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey));
+              (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey, m_frameOptions.ue3MicPersistAutoExcludedConstantGroups));
             // Invariant-identity shaders hash constants by uniform name and leading register:
             // lightmap policy permutations shift uniform registers and trim per-permutation
             // unreferenced elements, so the raw register-range stream is not comparable
@@ -9977,11 +10149,178 @@ namespace dxvk {
             // frame-varying constant registers would mint a new material identity every
             // draw; detect that here and drop constants-based identity for the group
             if (!constantsExcluded && psConstsHash != kEmptyHash && autoExcludeEnabled &&
-                trackUe3MicConstantChurn(micChurnGroupKey, psHash, shaderIdentitySeed, textureSetHash, psConstsHash)) {
+                trackUe3MicConstantChurn(micChurnGroupKey, psHash, shaderIdentitySeed, textureSetHash, psConstsHash,
+                                         m_frameOptions.ue3MicPersistAutoExcludedConstantGroups)) {
+              // The exclusion changes this group's material identity mid-session; log both
+              // sides so anchor mismatches around the flip are attributable.
+              const XXH64_hash_t primaryTexHashForFlipLog = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+              const XXH64_hash_t effectiveTextureSet = (textureSetHash != kEmptyHash) ? textureSetHash : primaryTexHashForFlipLog;
+              const XXH64_hash_t identityWithoutConstants = XXH3_64bits_withSeed(&effectiveTextureSet, sizeof(effectiveTextureSet), shaderIdentitySeed);
+              const XXH64_hash_t identityWithConstants = XXH3_64bits_withSeed(&psConstsHash, sizeof(psConstsHash), identityWithoutConstants);
+              Logger::warn(str::format(
+                "[RTX-MicDrift] Constants auto-exclusion changed material identity mid-session for group seed=0x",
+                std::hex, shaderIdentitySeed, " textureSet=0x", textureSetHash, " tex=0x", primaryTexHashForFlipLog,
+                ": last constants-bearing materialHash 0x", identityWithConstants,
+                " -> constants-free materialHash 0x", identityWithoutConstants, std::dec,
+                ". Replacements anchored on one side of this flip stop matching on the other."));
               constantsExcluded = true;
               psConstsHash = kEmptyHash;
             }
             m_activeDrawCallState.materialData.setPixelShaderConstantsHashForMaterialInstance(psConstsHash);
+
+            // Replacement identity drift diagnostics: attribute a changed material hash
+            // to the tier that moved and flag RT-poisoned identities.
+            const bool replacementDiagActive =
+              m_frameOptions.logReplacementResolution ||
+              (m_frameOptions.replacementDebugHashes != nullptr && !m_frameOptions.replacementDebugHashes->empty());
+            if (replacementDiagActive) {
+              m_activeDrawCallState.materialData.updateCachedHash();
+              const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+              const XXH64_hash_t textureSetShaderHash = m_activeDrawCallState.materialData.getTextureSetAndShaderHash();
+              const XXH64_hash_t primaryTexHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+
+              bool tracked = false;
+              if (m_frameOptions.replacementDebugHashes != nullptr && !m_frameOptions.replacementDebugHashes->empty()) {
+                const fast_unordered_set& dbg = *m_frameOptions.replacementDebugHashes;
+                tracked = lookupHash(dbg, primaryTexHash) || lookupHash(dbg, materialHash) || lookupHash(dbg, textureSetShaderHash);
+                for (uint32_t i = 0; !tracked && i < micDiagSamplerCount; i++) {
+                  tracked = lookupHash(dbg, micDiagSamplers[i].imageHash);
+                }
+              }
+
+              if (m_frameOptions.logReplacementResolution || tracked) {
+                const XXH64_hash_t familyKey = XXH3_64bits_withSeed(&primaryTexHash, sizeof(primaryTexHash), shaderIdentitySeed);
+
+                // Snapshot the constant registers feeding the identity so drift can name the
+                // register(s) whose values moved.
+                Ue3MicIdentitySample::ConstantRecord curConstants[kMicDriftMaxTrackedConstants];
+                uint32_t curConstantCount = 0;
+                if (!constantsExcluded && psConstsHash != kEmptyHash) {
+                  if (useInvariantShaderIdentity) {
+                    for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
+                      if (curConstantCount >= kMicDriftMaxTrackedConstants)
+                        break;
+                      if (uniformRegister >= caps::MaxFloatConstantsPS)
+                        continue;
+                      curConstants[curConstantCount++] = Ue3MicIdentitySample::ConstantRecord {
+                        uint16_t(uniformRegister), d3d9State().psConsts.fConsts[uniformRegister] };
+                    }
+                  } else {
+                    for (const auto& [rangeStart, rangeCount] : identityInfo.constRanges) {
+                      for (uint32_t r = rangeStart; r < rangeStart + rangeCount; r++) {
+                        if (curConstantCount >= kMicDriftMaxTrackedConstants || r >= caps::MaxFloatConstantsPS)
+                          break;
+                        curConstants[curConstantCount++] = Ue3MicIdentitySample::ConstantRecord {
+                          uint16_t(r), d3d9State().psConsts.fConsts[r] };
+                      }
+                      if (curConstantCount >= kMicDriftMaxTrackedConstants)
+                        break;
+                    }
+                  }
+                }
+
+                Ue3MicIdentitySample& prev = s_ue3MicIdentityByFamily[familyKey];
+                if (prev.valid && prev.materialHash != materialHash &&
+                    prev.driftLogsEmitted < (tracked ? kMicDriftMaxLogsPerTrackedFamily : kMicDriftMaxLogsPerFamily)) {
+                  ++prev.driftLogsEmitted;
+                  std::string detail;
+                  if (prev.textureSetHash != textureSetHash) {
+                    detail += str::format("\n  textureSet 0x", std::hex, prev.textureSetHash, " -> 0x", textureSetHash, std::dec, ":");
+                    for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                      const Ue3MicIdentitySample::SamplerRecord& cur = micDiagSamplers[i];
+                      const Ue3MicIdentitySample::SamplerRecord* old = nullptr;
+                      for (uint32_t j = 0; j < prev.samplerCount; j++) {
+                        if (prev.samplers[j].reg == cur.reg) {
+                          old = &prev.samplers[j];
+                          break;
+                        }
+                      }
+                      if (old == nullptr) {
+                        detail += str::format(" s", uint32_t(cur.reg), " added=0x", std::hex, cur.imageHash,
+                                              "(desc:0x", cur.descriptorHash, ")", std::dec, cur.isRenderTarget ? "(RT)" : "");
+                      } else if (old->imageHash != cur.imageHash) {
+                        detail += str::format(" s", uint32_t(cur.reg), " 0x", std::hex, old->imageHash, "->0x", cur.imageHash,
+                                              "(desc:0x", cur.descriptorHash, ")", std::dec, cur.isRenderTarget ? "(RT)" : "");
+                      }
+                    }
+                    for (uint32_t j = 0; j < prev.samplerCount; j++) {
+                      bool stillPresent = false;
+                      for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                        if (micDiagSamplers[i].reg == prev.samplers[j].reg) {
+                          stillPresent = true;
+                          break;
+                        }
+                      }
+                      if (!stillPresent) {
+                        detail += str::format(" s", uint32_t(prev.samplers[j].reg), " removed=0x", std::hex, prev.samplers[j].imageHash, std::dec,
+                                              prev.samplers[j].isRenderTarget ? "(RT)" : "");
+                      }
+                    }
+                  }
+                  if (prev.constantsExcluded != constantsExcluded) {
+                    detail += str::format("\n  constantsExcluded ", prev.constantsExcluded ? 1 : 0, " -> ", constantsExcluded ? 1 : 0);
+                  }
+                  if (prev.constantsHash != psConstsHash) {
+                    detail += str::format("\n  consts 0x", std::hex, prev.constantsHash, " -> 0x", psConstsHash, std::dec, ":");
+                    for (uint32_t i = 0; i < curConstantCount; i++) {
+                      const Ue3MicIdentitySample::ConstantRecord& cur = curConstants[i];
+                      for (uint32_t j = 0; j < prev.constantCount; j++) {
+                        const Ue3MicIdentitySample::ConstantRecord& old = prev.constants[j];
+                        if (old.reg == cur.reg) {
+                          if (old.value.x != cur.value.x || old.value.y != cur.value.y ||
+                              old.value.z != cur.value.z || old.value.w != cur.value.w) {
+                            detail += str::format(" c", uint32_t(cur.reg),
+                                                  " (", old.value.x, ",", old.value.y, ",", old.value.z, ",", old.value.w,
+                                                  ")->(", cur.value.x, ",", cur.value.y, ",", cur.value.z, ",", cur.value.w, ")");
+                          }
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  Logger::warn(str::format(
+                    "[RTX-MicDrift] Material identity changed for family tex=0x", std::hex, primaryTexHash,
+                    " seed=0x", shaderIdentitySeed,
+                    ": materialHash 0x", prev.materialHash, " -> 0x", materialHash,
+                    " (textureSet+shader tier 0x", textureSetShaderHash, ")", std::dec,
+                    detail.empty() ? "\n  (no attributable tier diff captured)" : detail.c_str(),
+                    "\n  Replacements anchored on the previous hash no longer match this draw."));
+                }
+
+                prev.valid = true;
+                prev.materialHash = materialHash;
+                prev.textureSetHash = textureSetHash;
+                prev.constantsHash = psConstsHash;
+                prev.constantsExcluded = constantsExcluded;
+                prev.samplerCount = micDiagSamplerCount;
+                for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                  prev.samplers[i] = micDiagSamplers[i];
+                }
+                prev.constantCount = curConstantCount;
+                for (uint32_t i = 0; i < curConstantCount; i++) {
+                  prev.constants[i] = curConstants[i];
+                }
+
+                // RT-poisoning sweep: a render-target-backed image hash inside the identity
+                // makes it unstable across RT recreation (respawn / level load).
+                for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                  if (micDiagSamplers[i].isRenderTarget) {
+                    if (s_ue3MicRtPoisonWarnedFamilies.insert(familyKey).second) {
+                      Logger::warn(str::format(
+                        "[RTX-MicRtPoisoning] Material identity for family tex=0x", std::hex, primaryTexHash,
+                        " seed=0x", shaderIdentitySeed,
+                        " includes render-target image hash 0x", micDiagSamplers[i].imageHash,
+                        " at material sampler s", std::dec, uint32_t(micDiagSamplers[i].reg),
+                        std::hex, " (stable RT descriptor hash 0x", micDiagSamplers[i].descriptorHash,
+                        "): materialHash 0x", materialHash, std::dec,
+                        " will change whenever the game recreates this render target (respawn/level load),"
+                        " breaking replacements anchored on it."));
+                    }
+                    break;
+                  }
+                }
+              }
+            }
 
             // Lightmap-permutation bridge: publish the identity hashes this draw would produce
             // under lightmap permutations that reference fewer material symbols (see

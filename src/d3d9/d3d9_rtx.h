@@ -186,6 +186,42 @@ namespace dxvk {
                "ranges and hash, and the final hash), plus a churn warning naming any shader that mints an "
                "abnormal number of distinct hashes (a sign its constants are frame-varying and it belongs in "
                "rtx.d3d9.ue3MicConstantIdentityExcludedShaders).");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicExcludeRenderTargetsFromIdentity, true,
+               "UE3 MaterialInstanceConstant support: exclude render-target-backed textures from the material "
+               "texture-set identity hash. Render targets bound as material samplers (scene captures, "
+               "reflection buffers - e.g. the capture Mirror's Edge routes into the first-person body "
+               "materials) receive a new image hash every time the game recreates them (respawn, checkpoint "
+               "reload, level load). Folding that hash into material identity re-mints the material hash on "
+               "every recreation, silently breaking texture tags and asset replacements anchored on the "
+               "identity: they only match again when the render target happens to reproduce its capture-time "
+               "hash. Excluding render targets (treating them like hashless textures, which were always "
+               "skipped) keeps material identity stable across recreations. Note: identities that previously "
+               "included a render-target hash change once when this option turns on - re-anchor affected "
+               "replacements (rtx.logReplacementResolution logs the new hashes).");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicIdentityExcludedTextureDescHashes, {},
+               "UE3 MaterialInstanceConstant support: descriptor hashes of textures to exclude from the "
+               "material texture-set identity hash. Some engine-composited textures are re-uploaded with "
+               "different contents every session, so their content-based image hash is session-unique and "
+               "any material identity that includes them changes across sessions - replacements anchored on "
+               "such identities silently stop matching (they were authored against one session's hash). A "
+               "texture's *descriptor* hash is stable across recreations: find it in the "
+               "rtx.d3d9.ue3LogMaterialInstanceHash breakdown (textures=[sN:0x<image>(desc:0x<descriptor>)]) "
+               "or in [RTX-MicDrift] sampler diffs, add it here, then re-anchor the affected material once - "
+               "its identity is stable from then on. Note descriptor hashes derive from texture properties "
+               "(dimensions/format/usage), so identically-shaped textures share one and the exclusion "
+               "applies to all of them - usually desirable for the engine-composited textures this option "
+               "targets. UE3-streamed textures recreate at a different size per resident mip level and so "
+               "carry one descriptor hash per size; the composited/dynamic textures this option is meant "
+               "for are fixed-size.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicPersistAutoExcludedConstantGroups, true,
+               "UE3 MaterialInstanceConstant support: persist the constants-churn auto-exclusion set "
+               "(see rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants) across sessions in "
+               "rtx-remix/ue3MicAutoExcludedGroups.cache. Without persistence a churning material group is "
+               "only excluded after it re-mints enough distinct hashes within the session, so its material "
+               "identity flips mid-session at an unpredictable point - replacements anchored on either side "
+               "of the flip only match part of the time. With persistence the exclusion applies from the "
+               "first frame of every later session, making such identities deterministic. Delete the cache "
+               "file to reset learned exclusions.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, vsTexcoordCaptureOutlierTextures, {},
                "Texture hashes for which VS-captured texcoords should be overridden with IA (input assembler) texcoords. "
                "Useful as a compatibility fallback when certain textures appear stretched due to incorrect VS texcoord capture.");
@@ -1187,7 +1223,12 @@ namespace dxvk {
     struct BoundTextureSnapshotEntry {
       D3D9CommonTexture* texture = nullptr;
       XXH64_hash_t imageHash = kEmptyHash;
+      // Descriptor hash of render targets only; deferred-UI tag matching relies on this
+      // being zero for non-RT textures (a descriptor-hash match implies "is an RT").
       XXH64_hash_t rtDescriptorHash = 0;
+      // Descriptor hash of every image (stable across recreation, unlike imageHash for
+      // GPU-written or session-composited textures).
+      XXH64_hash_t descriptorHash = 0;
       bool hasImage = false;
       bool hasSampleView = false;
       bool isRenderTarget = false;
@@ -1230,6 +1271,8 @@ namespace dxvk {
       bool ue3MaterialInstanceConstantHash = false;
       bool ue3LightmapPermutationInvariantHash = false;
       bool ue3LightmapPermutationBridgeLookup = false;
+      bool ue3MicExcludeRenderTargetsFromIdentity = true;
+      bool ue3MicPersistAutoExcludedConstantGroups = true;
       bool ue3LogMaterialInstanceHash = false;
       bool ue3SkipDepthPrepass = false;
       bool ue3SkipShadowDepthPasses = false;
@@ -1273,6 +1316,7 @@ namespace dxvk {
       bool enableMultiStageTextureFactorBlending = false;
       bool ignoreAllVertexColorBakedLighting = false;
       bool vertexColorIsBakedLighting = false;
+      bool logReplacementResolution = false;
       Vector2i drawCallRange = Vector2i(0, 0);
 
       // Set-typed options, cached as pointers: each option's resolved hash set is
@@ -1291,6 +1335,8 @@ namespace dxvk {
       const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
       const fast_unordered_set* vsTexcoordCaptureOutlierTextures = nullptr;
       const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
+      const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
+      const fast_unordered_set* replacementDebugHashes = nullptr;
     };
     FrameOptionCache m_frameOptions;
     void refreshFrameOptionCache();

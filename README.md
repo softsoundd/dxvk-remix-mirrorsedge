@@ -74,6 +74,28 @@ show fog
 - sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
 - xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
 
+### 4) Extra fork notes/debugging
+
+#### Material identity and replacement anchor stability
+
+With `rtx.d3d9.ue3EngineMode`, a material's identity hash (the `mat_*` anchor that captures, texture tags, and asset replacements key off) is a chain: pixel shader identity → material texture set (image hash of every CTAB `Texture2D_*`/`TextureCube_*` sampler) → material constants (`UniformVector_*`/`UniformScalar_*`). Every tier is a pure function of the draw, so the same material instance always gets the same hash when the inputs themselves are stable. UE3 games expose three unstable input classes, so the runtime deals with each:
+
+- Render targets bound as material samplers (scene captures, reflection buffers). An RT's image hash embeds a creation counter and changes every respawn, checkpoint, or level load. RTs are excluded from identity by default (`rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity`). Anchors that still key off RT-bearing identities need re-anchoring once.
+- Frame-varying constants (time/panner/fade/sub-UV expressions). Churn auto-exclusion drops such a group's constants from identity once it has minted enough distinct hashes. That exclusion is written to `rtx-remix/ue3MicAutoExcludedGroups.cache` (`rtx.d3d9.ue3MicPersistAutoExcludedConstantGroups`), so the group's identity is deterministic from the first frame of every later session instead of flipping mid-session at an unpredictable point. You can delete the cache file in the `rtx-remix` folder to reset this.
+- Session-composited textures (engine-generated textures reuploaded with different contents every session). Their content hash is session-unique, so any identity containing them cannot be anchored from a capture. Tag the texture's descriptor hash (stable across recreations; shown as `desc:0x...` in the `rtx.d3d9.ue3LogMaterialInstanceHash` breakdown and `[RTX-MicDrift]` sampler diffs) in `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes`, then re-anchor the material once. Alternatively, anchor the override at the raw texture hash (`mat_<textureHash>`): replacement lookup runs tiers material → lightmap-permutation bridge → textureSet+shader → texture, so a texture-tier anchor catches every material variant that selects that image as its albedo, while more specific anchors still win where present.
+
+#### Replacement anchor diagnostics
+
+When an authored enhancement does not appear (or appears intermittently), enable `rtx.logReplacementResolution = True` for one session and reproduce briefly. The log names the failing material and the drifting identity tier directly:
+
+- `[RTX-ReplacementResolve]`: how each material/mesh resolved against the mod's anchors (which lookup tier matched, or `NO MATCH`), plus a per-mod anchor dump at load.
+- `[RTX-ReplacementFlap]`: a material family that previously matched stopped matching (or vice versa) mid-session, with old/new hashes for every tier.
+- `[RTX-MicDrift]`: a material family minted a new identity, attributed to the tier that moved: per-sampler image hash diffs (with `desc:0x...` and RT flags) or changed constant registers with old/new values.
+- `[RTX-MicRtPoisoning]`: a material identity still embeds a render-target image hash (only possible with RT exclusion disabled).
+- `[RTX-MeshAnchorDrift]`: a mesh replacement key moved, attributed to its geometry part (unstable vertex data, e.g. CPU-morphed skinned meshes) vs its material part (mesh keys are `geometryHash XOR materialHash`).
+
+`rtx.replacementDebugHashes` tracks specific hashes in detail (matched against texture, material, textureSet+shader, geometry, and mesh-key hashes) without the full-scene log volume. Toggling enhanced assets on/off in the UI intentionally shows up as synchronised matched/`NO MATCH` flaps with unchanged hashes.
+
 ## Build instructions
 
 ### Requirements:

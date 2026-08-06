@@ -601,6 +601,184 @@ namespace dxvk {
 
   std::unordered_set<XXH64_hash_t> uniqueHashes;
 
+  // ===== Replacement resolution diagnostics =====
+  // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
+  //
+  // Detects authored anchors silently un-matching mid-session: the last resolution outcome
+  // is remembered per material family (color texture hash + material shader seed, both
+  // stable across sessions) and per mesh, and any change - matched<->miss, or a different
+  // identity hash while the family stayed the same - is logged with the hashes needed to
+  // attribute the drift to a specific identity tier.
+  namespace replacement_diag {
+    // Per-family log caps: without them an identity oscillating between two hashes would
+    // emit a flap warning on every draw. Tracked families get a higher budget.
+    constexpr uint32_t kMaxLogsPerFamily = 16;
+    constexpr uint32_t kMaxLogsPerTrackedFamily = 64;
+
+    struct MaterialResolutionRecord {
+      XXH64_hash_t materialHash = kEmptyHash;
+      XXH64_hash_t textureSetShaderHash = kEmptyHash;
+      bool found = false;
+      bool valid = false;
+      uint32_t logsEmitted = 0;
+    };
+
+    struct MeshResolutionRecord {
+      XXH64_hash_t materialHash = kEmptyHash;
+      XXH64_hash_t meshKey = kEmptyHash;
+      bool found = false;
+      bool valid = false;
+      uint32_t logsEmitted = 0;
+    };
+
+    struct MeshGeometryRecord {
+      XXH64_hash_t geometryHash = kEmptyHash;
+      XXH64_hash_t positionsHash = kEmptyHash;
+      bool valid = false;
+      uint32_t logsEmitted = 0;
+    };
+
+    static fast_unordered_cache<MaterialResolutionRecord> s_materialResolutionByFamily;
+    static fast_unordered_cache<MeshResolutionRecord> s_meshResolutionByGeometry;
+    static fast_unordered_cache<MeshGeometryRecord> s_meshGeometryByTopology;
+
+    static bool isTracked(std::initializer_list<XXH64_hash_t> hashes) {
+      const fast_unordered_set& dbg = RtxOptions::replacementDebugHashes();
+      if (dbg.empty()) {
+        return false;
+      }
+      for (const XXH64_hash_t h : hashes) {
+        if (h != kEmptyHash && lookupHash(dbg, h)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    static void logMaterialResolution(const XXH64_hash_t materialHash,
+                                      const XXH64_hash_t textureSetShaderHash,
+                                      const XXH64_hash_t textureHash,
+                                      const XXH64_hash_t materialShaderSeed,
+                                      const bool found,
+                                      const char* matchedTier) {
+      const bool logAll = RtxOptions::logReplacementResolution();
+      if (!logAll && RtxOptions::replacementDebugHashes().empty()) {
+        return;
+      }
+      const bool tracked = isTracked({ materialHash, textureSetShaderHash, textureHash });
+      if (!logAll && !tracked) {
+        return;
+      }
+      // Family = (texture, MIC shader seed): distinct materials legitimately sharing a
+      // texture (e.g. a plain and a two-texture-blend variant of the same surface) must
+      // not alias into one family, or their alternation reads as false identity drift.
+      XXH64_hash_t familyKey = textureHash != kEmptyHash ? textureHash
+                             : textureSetShaderHash != kEmptyHash ? textureSetShaderHash
+                             : materialHash;
+      if (materialShaderSeed != kEmptyHash) {
+        familyKey = XXH3_64bits_withSeed(&familyKey, sizeof(familyKey), materialShaderSeed);
+      }
+      MaterialResolutionRecord& rec = s_materialResolutionByFamily[familyKey];
+      const bool changed = !rec.valid || rec.found != found || rec.materialHash != materialHash;
+      if (changed && rec.logsEmitted < (tracked ? kMaxLogsPerTrackedFamily : kMaxLogsPerFamily)) {
+        ++rec.logsEmitted;
+        const std::string state = found ? str::format("matched tier '", matchedTier, "'") : std::string("NO MATCH");
+        if (!rec.valid) {
+          Logger::info(str::format(
+            "[RTX-ReplacementResolve] material tex=0x", std::hex, textureHash,
+            " materialHash=0x", materialHash,
+            " textureSetShader=0x", textureSetShaderHash, std::dec,
+            " -> ", state));
+        } else {
+          Logger::warn(str::format(
+            "[RTX-ReplacementFlap] material tex=0x", std::hex, textureHash,
+            ": materialHash 0x", rec.materialHash, " -> 0x", materialHash,
+            ", textureSetShader 0x", rec.textureSetShaderHash, " -> 0x", textureSetShaderHash, std::dec,
+            ", resolution ", rec.found ? "matched" : "NO MATCH", " -> ", state,
+            (rec.found && !found)
+              ? " - an authored replacement stopped matching this material (identity drift)."
+              : "."));
+        }
+      }
+      rec.materialHash = materialHash;
+      rec.textureSetShaderHash = textureSetShaderHash;
+      rec.found = found;
+      rec.valid = true;
+    }
+
+    static void logMeshResolution(const DrawCallState& input,
+                                  const XXH64_hash_t meshReplacementKey,
+                                  const bool found) {
+      const bool logAll = RtxOptions::logReplacementResolution();
+      if (!logAll && RtxOptions::replacementDebugHashes().empty()) {
+        return;
+      }
+      const RasterGeometry& geometry = input.getGeometryData();
+      const XXH64_hash_t geometryHash = geometry.getHashForRule(RtxOptions::geometryAssetHashRule());
+      const XXH64_hash_t materialHash = input.getMaterialData().getHash();
+      const XXH64_hash_t textureHash = input.getMaterialData().getColorTexture().getImageHash();
+      const bool tracked = isTracked({ geometryHash, meshReplacementKey, materialHash, textureHash,
+                                       input.getMaterialData().getTextureSetAndShaderHash() });
+      if (!logAll && !tracked) {
+        return;
+      }
+
+      // Same geometry, different material part -> the mesh key moved because material
+      // identity drifted (mesh key = geometry hash XOR material hash).
+      MeshResolutionRecord& rec = s_meshResolutionByGeometry[geometryHash];
+      const bool changed = !rec.valid || rec.found != found || rec.meshKey != meshReplacementKey;
+      if (changed && rec.logsEmitted < (tracked ? kMaxLogsPerTrackedFamily : kMaxLogsPerFamily)) {
+        ++rec.logsEmitted;
+        if (!rec.valid) {
+          // Only log first sightings that resolve (or are tracked): most draws have no
+          // mesh anchor and would flood the log otherwise.
+          if (found || tracked) {
+            Logger::info(str::format(
+              "[RTX-ReplacementResolve] mesh key=0x", std::hex, meshReplacementKey,
+              " (geometry 0x", geometryHash, " XOR material 0x", materialHash,
+              ", tex=0x", textureHash, ")", std::dec,
+              " -> ", found ? "replacement found" : "no replacement"));
+          }
+        } else {
+          Logger::warn(str::format(
+            "[RTX-MeshAnchorDrift] geometry 0x", std::hex, geometryHash,
+            " (tex=0x", textureHash, "): material part changed 0x", rec.materialHash, " -> 0x", materialHash,
+            ", mesh key 0x", rec.meshKey, " -> 0x", meshReplacementKey, std::dec,
+            ", resolution ", rec.found ? "found" : "none", " -> ", found ? "found" : "none",
+            (rec.found && !found)
+              ? " - an authored mesh/light anchor stopped matching (material identity drift)."
+              : "."));
+        }
+      }
+      rec.materialHash = materialHash;
+      rec.meshKey = meshReplacementKey;
+      rec.found = found;
+      rec.valid = true;
+
+      // Same material and index/descriptor topology, different positions hash -> the
+      // geometry part itself is unstable (dynamic/CPU-morphed vertex data on skinned
+      // meshes), which makes mesh anchors on this mesh unmatchable across sessions.
+      const XXH64_hash_t indicesHash = geometry.hashes[HashComponents::Indices];
+      const XXH64_hash_t descriptorHash = geometry.hashes[HashComponents::GeometryDescriptor];
+      const XXH64_hash_t positionsHash = geometry.hashes[HashComponents::VertexPosition];
+      XXH64_hash_t topologyKey = XXH3_64bits_withSeed(&indicesHash, sizeof(indicesHash), materialHash);
+      topologyKey = XXH3_64bits_withSeed(&descriptorHash, sizeof(descriptorHash), topologyKey);
+      MeshGeometryRecord& geoRec = s_meshGeometryByTopology[topologyKey];
+      if (geoRec.valid && geoRec.geometryHash != geometryHash &&
+          geoRec.logsEmitted < (tracked ? kMaxLogsPerTrackedFamily : kMaxLogsPerFamily)) {
+        ++geoRec.logsEmitted;
+        Logger::warn(str::format(
+          "[RTX-MeshAnchorDrift] geometry positions drift for tex=0x", std::hex, textureHash,
+          " (material 0x", materialHash, ", indices 0x", indicesHash, " stable):",
+          " positions 0x", geoRec.positionsHash, " -> 0x", positionsHash,
+          ", geometry asset hash 0x", geoRec.geometryHash, " -> 0x", geometryHash, std::dec,
+          " - vertex data is not stable, so mesh anchors on this mesh change per pose/session."));
+      }
+      geoRec.geometryHash = geometryHash;
+      geoRec.positionsHash = positionsHash;
+      geoRec.valid = true;
+    }
+  }
 
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
@@ -668,6 +846,8 @@ namespace dxvk {
         }
       }
     }
+
+    replacement_diag::logMeshResolution(input, activeReplacementHash, pReplacements != nullptr);
 
     ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(
         input, m_rayPortalManager, overrideMaterialData);
@@ -865,6 +1045,10 @@ namespace dxvk {
       pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureHash);
       matchedTier = "texture";
     }
+
+    replacement_diag::logMaterialResolution(materialHash, textureSetShaderHash, textureHash,
+                                            inputMaterial.m_pixelShaderHashForMaterialInstance,
+                                            pReplacementMaterial != nullptr, matchedTier);
 
     if (pReplacementMaterial != nullptr) {
       if (Logger::logLevel() <= LogLevel::Debug && materialHash != textureHash) {
