@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include "../dxvk/imgui/dxvk_imgui.h"
 
@@ -649,6 +650,56 @@ namespace dxvk {
     }
   }
 
+  // UE3 streaming-stable texture identity: UE3's texture streamer creates a new D3D9 texture
+  // object per mip-count change, so a top-mip hash differs per streamed variant of one logical
+  // texture and everything keyed on texture hashes (replacements, categories, tags, material
+  // identity) stops matching while a lower-mip variant is bound. The small-mip tail (mips at or
+  // below 64px) is present in every variant - GMinTextureResidentMipCount=7 keeps at least the
+  // last 7 mips resident - and the engine copies it byte-identically between variants, so a hash
+  // of the tail plus format and reduced aspect ratio (collision guards for unrelated textures
+  // with equal tails) identifies the texture regardless of streaming state or LOD settings.
+  // Like SetupForRtxFrom, `source` supplies the CPU mip buffers while this texture's desc is
+  // used. Returns kEmptyHash when ineligible (unmipped, render target, tail buffers missing).
+  XXH64_hash_t D3D9CommonTexture::ComputeUe3StreamingStableHash(const D3D9CommonTexture* source) const {
+    if (m_desc.MipLevels <= 1 || IsRenderTarget())
+      return kEmptyHash;
+
+    constexpr uint32_t kTailMaxDimension = 64;
+    XXH64_hash_t tailHash = kEmptyHash;
+    uint32_t tailMipCount = 0;
+    // chain from the smallest mip upward so the value is independent of how many
+    // larger mips this particular variant has
+    for (int32_t mip = int32_t(m_desc.MipLevels) - 1; mip >= 0; mip--) {
+      const uint32_t mipWidth = std::max(1u, m_desc.Width >> mip);
+      const uint32_t mipHeight = std::max(1u, m_desc.Height >> mip);
+      if (std::max(mipWidth, mipHeight) > kTailMaxDimension)
+        break;
+
+      const auto& mipBuffer = source->m_buffers[mip];
+      if (mipBuffer.ptr() == nullptr)
+        return kEmptyHash;
+
+      tailHash = XXH3_64bits_withSeed(mipBuffer->mapPtr(0), mipBuffer->info().size, tailHash);
+      tailMipCount++;
+    }
+
+    if (tailMipCount == 0)
+      return kEmptyHash;
+
+    struct TailIdentitySeed {
+      uint32_t format;
+      uint32_t aspectW;
+      uint32_t aspectH;
+    };
+    const uint32_t aspectGcd = std::max(1u, std::gcd(m_desc.Width, m_desc.Height));
+    const TailIdentitySeed seed = {
+      uint32_t(m_desc.Format),
+      m_desc.Width / aspectGcd,
+      m_desc.Height / aspectGcd,
+    };
+    return XXH3_64bits_withSeed(&seed, sizeof(seed), tailHash);
+  }
+
   void D3D9CommonTexture::SetupForRtxFrom(const D3D9CommonTexture* source) {
     ScopedCpuProfileZone();
 
@@ -675,13 +726,20 @@ namespace dxvk {
       if (nullptr == buffer.ptr())
         return;
 
-      const bool useObsoleteHashMethod = NeedsUpload(subresource) &&
-        RtxOptions::useObsoleteHashOnTextureUpload();
+      if (D3D9Rtx::ue3StreamingStableTextureHashing() && D3D9Rtx::ue3EngineMode()) {
+        imageHash = ComputeUe3StreamingStableHash(source);
+      }
 
-      if (unlikely(useObsoleteHashMethod)) {
-        imageHash = XXH64(buffer->mapPtr(0), buffer->info().size, 0);
-      } else {
-        imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+      // standard top-mip content hash (also the fallback for tail-ineligible textures)
+      if (imageHash == kEmptyHash) {
+        const bool useObsoleteHashMethod = NeedsUpload(subresource) &&
+          RtxOptions::useObsoleteHashOnTextureUpload();
+
+        if (unlikely(useObsoleteHashMethod)) {
+          imageHash = XXH64(buffer->mapPtr(0), buffer->info().size, 0);
+        } else {
+          imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+        }
       }
     } else {
       // resolve cubemap albedo materials

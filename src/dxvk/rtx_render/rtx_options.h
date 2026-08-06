@@ -139,6 +139,7 @@ namespace dxvk {
     None = 0,
     Basic,
     Advanced,
+    FirstUseGuide,
     Count
   };
 
@@ -180,13 +181,6 @@ namespace dxvk {
   };
 
   class RtxOptions {
-    friend class ImGUI;
-    friend class ImGuiSplash;
-    friend class ImGuiCapture;
-    friend class NeuralRadianceCache;
-    friend class RtxContext;
-    friend class RtxInitializer;
-    friend class RtxComposite;
 
     RTX_OPTION("rtx", fast_unordered_set, lightmapTextures, {},
                   "Textures used for lightmapping (baked static lighting on surfaces) in older games.\n"
@@ -216,6 +210,13 @@ namespace dxvk {
                   "Textures on draw calls that should be treated as screenspace UI elements.\n"
                   "All exclusively UI-related textures should be classified this way and doing so allows the UI to be rasterized on top of the ray traced scene like usual.\n"
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
+    RTX_OPTION("rtx", fast_unordered_set, deferredUiTextures, {},
+                  "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
+                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
+                  "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
+                  "For render-target textures the stable descriptor hash matches in addition to the (recreation-dependent) image hash, and rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
+                  "Tagging is not absolute: depth-writing draws, world geometry (anything beyond trivial depth-test-off overlay quads), and engine post-process shaders are refused deferral and classified normally, so shared textures cannot pull scene geometry out of the ray-traced world.\n"
+                  "See rtx.d3d9.deferredUiReplay and rtx.d3d9.deferredUiRefreshSceneColor for the replay behavior.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
                   "Textures on draw calls that should be treated as worldspace UI elements.\n"
                   "Unlike typical UI textures this option is useful for improved rendering of UI elements which appear as part of the scene (moving around in 3D space rather than as a screenspace element).");
@@ -227,13 +228,37 @@ namespace dxvk {
                   "Textures on draw calls that should be hidden from rendering, but not totally ignored.\n"
                   "This is similar to rtx.ignoreTextures but instead of completely ignoring such draw calls they are only hidden from rendering, allowing for the hidden objects to still appear in captures.\n"
                   "As such, this is mostly only a development tool to hide objects during development until they are properly replaced, otherwise the objects should be ignored with rtx.ignoreTextures instead for better performance.");
-    RTX_OPTION("rtx", fast_unordered_set, playerModelTextures, {}, "");
-    RTX_OPTION("rtx", fast_unordered_set, playerModelBodyTextures, {}, "");
-    RTX_OPTION("rtx", fast_unordered_set, lightConverter, {}, "");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelTextures, {},
+                  "Textures on draw calls that are part of the third-person player model, such as body, head, or held equipment.\n"
+                  "Tagged instances use the player-model ray mask so their primary-ray visibility, shadows, reflections, and portal-space virtual copies can be controlled independently from regular world geometry.");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelBodyTextures, {},
+                  "Textures on draw calls that identify the player model body/root position.\n"
+                  "Remix uses the tagged body instance as the anchor for filtering nearby player-model parts and for creating or positioning virtual player-model instances through portals.");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for third-person player model draw calls.\n"
+                  "Use when Mesh3p shares materials with the first-person mesh.");
+    RTX_OPTION("rtx", fast_unordered_set, viewModelTextures, {},
+                  "Textures / material hashes for first-person view-model draw calls (e.g. Mesh1p arms, FP weapon).\n"
+                  "Forces CameraType::ViewModel when rtx.viewModel.enable is true.\n"
+                  "Prefer rtx.viewModelGeometries when the same material is also used on the third-person body.");
+    RTX_OPTION("rtx", fast_unordered_set, viewModelGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for first-person view-model draw calls.\n"
+                  "Preferred when Mesh1p shares materials with Mesh3p.");
+    RTX_OPTION("rtx", fast_unordered_set, lightConverter, {},
+                  "Textures on draw calls that should spawn Remix effect lights.\n"
+                  "An effect light is a dynamic sphere light placed at the tagged draw call's geometry centroid; radius, intensity, color, and plasma-ball animation are controlled in the Runtime UI's Lighting > Effect Light section.");
     RTX_OPTION("rtx", fast_unordered_set, particleTextures, {},
                   "Textures on draw calls that should be treated as particles.\n"
                   "When objects are marked as particles more approximate rendering methods are leveraged allowing for more effecient and typically better looking particle rendering.\n"
                   "Generally any billboard-like blended particle objects in the original application should be classified this way.");
+    RTX_OPTION_ARGS("rtx", fast_unordered_set, hairCardTextures, {},
+                  "Textures on draw calls that should be treated as alpha-tested hair cards.\n"
+                  "Tagged materials preserve fine texture detail, render as cutouts instead of alpha blends, and disable backface culling.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION("rtx", float, hairCardMipBias, -32.0f,
+               "The mip level bias applied to textures on materials tagged as hair cards. Large negative values preserve thin strand detail at a distance.");
+    RTX_OPTION("rtx", float, hairCardRoughnessScale, 1.0f,
+               "An additional roughness multiplier applied only to materials tagged as hair cards.");
     RTX_OPTION("rtx", fast_unordered_set, beamTextures, {},
                   "Textures on draw calls that are already particles or emissively blended and have beam-like geometry.\n"
                   "Typically objects marked as particles or objects using emissive blending will be rendered with a special method which allows re-orientation of the billboard geometry assumed to make up the draw call in indirect rays (reflections for example).\n"
@@ -434,7 +459,12 @@ namespace dxvk {
     struct PlayerModel {
       friend class ImGUI;
       RTX_OPTION("rtx.playerModel", bool, enableVirtualInstances, true, "");
-      RTX_OPTION("rtx.playerModel", bool, enableInPrimarySpace, false, "");
+      RTX_OPTION("rtx.playerModel", bool, enableInPrimarySpace, false,
+                 "Show third-person player-model instances on primary camera rays.\n"
+                 "Also hides the view model while enabled; prefer autoEnableInPrimarySpaceWhenNoViewModel for cutscenes.");
+      RTX_OPTION("rtx.playerModel", bool, autoEnableInPrimarySpaceWhenNoViewModel, false,
+                 "Show player-model instances on primary rays in frames with no ViewModel camera\n"
+                 "(cutscenes / flyovers that do not draw Mesh1p). Does not override enableInPrimarySpace.");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
       RTX_OPTION("rtx.playerModel", float, backwardOffset, 0.f, "");
       RTX_OPTION("rtx.playerModel", float, horizontalDetectionDistance, 34.f, "");
@@ -442,6 +472,14 @@ namespace dxvk {
       RTX_OPTION("rtx.playerModel", float, eyeHeight, 64.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleRadius, 24.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleHeight, 68.f, "");
+
+      // enableInPrimarySpace wins; otherwise auto-enable when Mesh1p/ViewModel was not drawn.
+      static bool resolveEnableInPrimarySpace(bool viewModelCameraValidThisFrame) {
+        if (enableInPrimarySpace()) {
+          return true;
+        }
+        return autoEnableInPrimarySpaceWhenNoViewModel() && !viewModelCameraValidThisFrame;
+      }
     } playerModel;
 
     struct Displacement {
@@ -538,7 +576,7 @@ namespace dxvk {
     
     RTX_OPTION("rtx", bool, useNewGuiInputMethod, true, "Disables the previous method for getting mouse/keyboard input and enables a new method which should be more reliable.  If successful the old method will be deprecated.  This setting can't be changed at runtime, so it must be set in a .conf file.");
 
-    RTX_OPTION_ARGS("rtx", UIType, showUI, UIType::None, "0 = Don't Show, 1 = Show Simple, 2 = Show Advanced.",
+    RTX_OPTION_ARGS("rtx", UIType, showUI, UIType::None, "0 = Don't Show, 1 = Show Simple, 2 = Show Advanced, 3 = First Use Guide.",
                     args.environment = "RTX_GUI_DISPLAY_UI",
                     args.flags = RtxOptionFlags::NoSave | RtxOptionFlags::NoReset);
     RTX_OPTION_ARGS("rtx", bool, defaultToAdvancedUI, false, "Whether to default to the Advanced UI when opening the developer menu.", 
@@ -1019,6 +1057,12 @@ namespace dxvk {
                     "The hotkey combination that triggers a deliberate crash when the crash hotkey feature is armed.\n"
                     "Default is Ctrl+Shift+Alt+K. Only takes effect when rtx.enableCrashHotkey is True.\n"
                     "This setting is not saved to config files but can be set manually in rtx.conf.");
+    // GPU crash hotkey - same "armed" state as crashHotkey. When armed, this key triggers a GPU crash (dialog + Sentry).
+    inline static const VirtualKeys kDefaultGpuCrashHotkey{ VirtualKey{VK_CONTROL}, VirtualKey{VK_SHIFT}, VirtualKey{VK_MENU}, VirtualKey{'G'} };
+    RTX_OPTION_FLAG("rtx", VirtualKeys, gpuCrashHotkey, kDefaultGpuCrashHotkey, RtxOptionFlags::NoSave,
+                    "The hotkey that triggers a GPU crash when the crash hotkey feature is armed.\n"
+                    "Default is Ctrl+Shift+Alt+G.");
+
     RTX_OPTION_ARGS("rtx", bool, enablePreservePath, true,
                 "When true, Remix attempts to identify draw calls whose state has not changed since last frame and re-use the previous\n"
                 "frame's translation, rather than retranslating the draw call into raytrace-ready scene data.\n"
@@ -1038,6 +1082,11 @@ namespace dxvk {
                "A time in milliseconds that the DXVK presentation thread should sleep for. Requires present throttling to be enabled to take effect.\n"
                "Note that the application may sleep for longer than the specified time as is expected with sleep functions in general.");
     RTX_OPTION_ENV("rtx", bool, validateCPUIndexData, false, "DXVK_VALIDATE_CPU_INDEX_DATA", "");
+    RTX_OPTION_ARGS("rtx", bool, recomputeTextureHashOnWrite, false,
+                "When true, Remix computes the hash of a texture when the game writes to the resource. Some games manage their own pool of\n"
+                "textures and shuffle data around those resources resulting in incorrect textures being displayed. Recomputing the hash\n"
+                "when the game writes to the resource can resolve this issue, however this can have unintended side effects when replacing\n"
+                "animated game textures.");
     RTX_OPTION("rtx", uint, dumpAllInstancesOnFrame, UINT32_MAX, "If set, and running in a REMIX_DEVELOPMENT build, this will dump all active instances to the log on the specified frame.");
     // Note: Use use areValidationLayersEnabled helper function rather than accessing this option directly as additional logic must be done to determine if validation layers should be used or not.
     RTX_OPTION_FLAG_ENV("rtx", bool, enableValidationLayers, false, RtxOptionFlags::NoSave, "DXVK_ENABLE_VALIDATION_LAYERS",
@@ -2140,6 +2189,23 @@ namespace dxvk {
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");
+
+    RTX_OPTION("rtx", bool, logReplacementResolution, false,
+               "Replacement anchor diagnostics: log how every draw resolves against authored replacement "
+               "anchors (material replacements through the tiered material identity lookup, mesh/light "
+               "replacements through the geometry-asset-hash XOR material-hash key), and warn whenever the "
+               "same material family or mesh resolves differently than it did earlier in the session - the "
+               "signature of hash drift breaking authored anchors. Also enables the UE3 material-identity "
+               "drift attribution in the D3D9 layer, which names the identity tier (texture set, constants, "
+               "render-target-backed sampler) responsible for a changed material hash. Verbose; intended for "
+               "debugging sessions only.");
+    RTX_OPTION("rtx", fast_unordered_set, replacementDebugHashes, {},
+               "Replacement anchor diagnostics: hashes to track in detail even when "
+               "rtx.logReplacementResolution is disabled. A draw is tracked when any of its identity hashes "
+               "match an entry: the primary color texture hash, the full material hash, the "
+               "textureSet+shader tier hash, the geometry asset hash, the combined mesh replacement key, or "
+               "any material sampler's image hash. Tracked draws produce the same resolution and drift logs "
+               "as rtx.logReplacementResolution without the full-scene log volume.");
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 

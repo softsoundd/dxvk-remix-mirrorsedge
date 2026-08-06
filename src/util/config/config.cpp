@@ -133,6 +133,12 @@ namespace dxvk {
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },
       { "rtx.fallbackLightMode",                                     "0" },
       { "rtx.numGeometryProcessingThreads",                          "4" },
+      // Mesh1p as ViewModel; Mesh3p as player model (hidden in FP primary, visible in cutscenes).
+      { "rtx.viewModel.enable",                                      "True" },
+      { "rtx.viewModel.enableVirtualInstances",                      "False" },
+      { "rtx.playerModel.enableInPrimarySpace",                      "False" },
+      { "rtx.playerModel.autoEnableInPrimarySpaceWhenNoViewModel",   "True" },
+      { "rtx.playerModel.enablePrimaryShadows",                      "True" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

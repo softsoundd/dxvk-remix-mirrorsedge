@@ -135,7 +135,7 @@ namespace dxvk {
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
 
     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
-    void commitExternalGeometryToRT(ExternalDrawState&& state);
+    void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
 
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
@@ -169,6 +169,9 @@ namespace dxvk {
     bool useRayReconstruction() const;
 
 #ifdef REMIX_DEVELOPMENT
+    /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */
+    bool handleCrashHotkeys();
+
     // Note: Cache image views for all resources that used by current frame, so we can do query for resource aliasing at the end of frame.
     //       This is automatically called when binding resources for passes, RtxContext::bindCommonRayTracingResources
     //       When we are not using the binding function in the passes such as DLSSRR, we need to manually cache the image views. Please reference the cache logic in DxvkRayReconstruction::dispatch

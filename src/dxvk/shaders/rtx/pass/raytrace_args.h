@@ -243,6 +243,7 @@ struct RaytraceArgs {
 
   // NOTE: Variables need to be in groups of 4x32 bits above this comment.
 
+  uint invalidateHistoryForAnimatedWater;
   uint uniformRandomNumber;
   uint16_t opaqueDiffuseLobeSamplingProbabilityZeroThreshold;
   uint16_t minOpaqueDiffuseLobeSamplingProbability;
@@ -400,6 +401,8 @@ struct RaytraceArgs {
   uint sssTransmissionSingleScatteringSampleCount;
   uint enableTransmissionDiffusionProfileCorrection;
   float totalMipBias;
+  float hairCardMipBias;
+  float hairCardRoughnessScale;
 
   uint forceFirstHitInGBufferPass;
 

@@ -43,6 +43,7 @@ struct ImPlotContext;
 
 namespace dxvk {
   class ImGuiAbout;
+  class ImGuiFirstUseGuide;
   class ImGuiSplash;
   class ImGuiCapture;
   class DxvkDevice;
@@ -88,16 +89,10 @@ namespace dxvk {
      * \brief Render ImGUI
      * 
      * Renders the ImGUI to the given context.
-     * \param [in] hwnd Window currently being drawn into
      * \param [in] ctx Device context
      * \param [in] surfaceSize Image size, in pixels
-     * \param [in] vsync swapchain vsync enabled
      */
-    void render(
-            const HWND hwnd,
-            const Rc<DxvkContext>&  ctx,
-            VkExtent2D         surfaceSize,
-            bool               vsync);
+    void render(const Rc<DxvkContext>&  ctx,  VkExtent2D surfaceSize);
     
     static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
     static void ReleaseTexture(const XXH64_hash_t hash);
@@ -144,6 +139,7 @@ namespace dxvk {
     DxvkBlendMode         m_blendMode;
     VkDescriptorPool      m_imguiPool;
     Rc<ImGuiAbout>        m_about;
+    Rc<ImGuiFirstUseGuide> m_firstUseGuide;
     Rc<ImGuiSplash>       m_splash;
     Rc<ImGuiCapture>      m_capture;
     Rc<class GameOverlay>  m_overlayWin;
@@ -282,7 +278,9 @@ namespace dxvk {
                     args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION_ARGS("rtx.gui", float, reflexStatRangePaddingRatio, 0.05f, "A value specifying the amount of padding applied to the Reflex stat graph ranges as a ratio to the calculated range.",
                     args.minValue = 0.0f);
-
+    RTX_OPTION("rtx.gui", bool, enableExternalPresenter, false, "Enables GUI rendering for external presenters.");
+    RTX_OPTION("rtx.gui", Vector4, subRect, Vector4(0.f, 0.f, 0.f, 0.f), "Used for toolkit.");
+    
     public: static void onThemeChange(DxvkDevice* device);
     public: static void onBackgroundAlphaChange(DxvkDevice* device);
     RTX_OPTION_ARGS("rtx.gui", bool, compactGui, false, "A setting to toggle between compact and spacious GUI modes.",

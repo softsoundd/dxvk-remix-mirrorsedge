@@ -61,6 +61,7 @@
 #include "../util/log/metrics.h"
 #include "../util/util_defer.h"
 #include "../util/util_global_time.h"
+#include "../util/util_sentry.h"
 
 #include "rtx_imgui.h"
 #include "dxvk_scoped_annotation.h"
@@ -452,6 +453,38 @@ namespace dxvk {
 
     getSceneManager().onFrameEnd(this, rayTracedThisFrame);
   }
+  
+#ifdef REMIX_DEVELOPMENT
+  bool RtxContext::handleCrashHotkeys() {
+    // Crash Hotkey Feature: When armed via the Development tab checkbox, pressing the crash hotkey
+    // triggers a deliberate null pointer dereference crash. This is useful for testing crash handling,
+    // crash dumps, and crash reporting systems.
+    static bool crashHotkeyStartupLogged = false;
+    if (!crashHotkeyStartupLogged && RtxOptions::enableCrashHotkey()) {
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
+      Logger::warn(str::format("Crash hotkeys ARMED at startup - ", crashHotkeyStr, " = CPU crash, ", gpuCrashHotkeyStr, " = GPU crash"));
+      crashHotkeyStartupLogged = true;
+    }
+
+    if (RtxOptions::enableCrashHotkey() && ImGUI::checkHotkeyState(RtxOptions::crashHotkey(), false)) {
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      Logger::err(str::format("Deliberate crash triggered via crash hotkey (", crashHotkeyStr, ")"));
+      // Trigger a null pointer dereference to cause a crash
+      volatile int* nullPtr = nullptr;
+      *nullPtr = 0xDEAD;
+    }
+
+    if (RtxOptions::enableCrashHotkey() && ImGUI::checkHotkeyState(RtxOptions::gpuCrashHotkey(), false)) {
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
+      Logger::warn(str::format("GPU crash triggered via hotkey (", gpuCrashHotkeyStr, ")"));
+      commitGraphicsState<true, false>();
+      getCommonObjects()->metaGpuCrash().dispatch(this);
+      return true;
+    }
+    return false;
+  }
+#endif
 
   // Hooked into D3D9 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
@@ -468,24 +501,8 @@ namespace dxvk {
     }
 
 #ifdef REMIX_DEVELOPMENT
-    // Crash Hotkey Feature: When armed via the Development tab checkbox, pressing the crash hotkey
-    // triggers a deliberate null pointer dereference crash. This is useful for testing crash handling,
-    // crash dumps, and crash reporting systems.
-    {
-      static bool crashHotkeyStartupLogged = false;
-      if (!crashHotkeyStartupLogged && RtxOptions::enableCrashHotkey()) {
-        const auto crashHotkeyStr = buildKeyBindDescriptorString(RtxOptions::crashHotkey());
-        Logger::warn(str::format("Crash hotkey is ARMED at startup (via config/environment) - press ", crashHotkeyStr, " to trigger crash"));
-        crashHotkeyStartupLogged = true;
-      }
-      
-      if (RtxOptions::enableCrashHotkey() && ImGUI::checkHotkeyState(RtxOptions::crashHotkey(), false)) {
-        const auto crashHotkeyStr = buildKeyBindDescriptorString(RtxOptions::crashHotkey());
-        Logger::err(str::format("Deliberate crash triggered via crash hotkey (", crashHotkeyStr, ")"));
-        // Trigger a null pointer dereference to cause a crash
-        volatile int* nullPtr = nullptr;
-        *nullPtr = 0xDEAD;
-      }
+    if (handleCrashHotkeys()) {
+      return;
     }
 #endif
 
@@ -846,6 +863,13 @@ namespace dxvk {
 
   // Called right before D3D9 present
   void RtxContext::onPresent(Rc<DxvkImage> targetImage) {
+    {
+      static bool s_firstFrameDone = false;
+      if (!s_firstFrameDone) {
+        s_firstFrameDone = true;
+        sentry::onFirstFrame();
+      }
+    }
     // If injectRTX couldn't screenshot a final image or a pre-present screenshot is requested,
     // take a screenshot of a present image (with UI and others)
     {
@@ -1003,7 +1027,7 @@ namespace dxvk {
     }
   }
 
-  void RtxContext::commitExternalGeometryToRT(ExternalDrawState&& state) {
+  void RtxContext::commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state) {
     getSceneManager().submitExternalDraw(this, std::move(state));
   }
 
@@ -1177,7 +1201,9 @@ namespace dxvk {
 
     constants.directLightBoilingThreshold = m_common->metaDemodulate().directLightBoilingThreshold();
     constants.translucentDecalAlbedoFactor = RtxOptions::translucentDecalAlbedoFactor();
-    constants.enablePlayerModelInPrimarySpace = RtxOptions::PlayerModel::enableInPrimarySpace();
+    constants.enablePlayerModelInPrimarySpace =
+      RtxOptions::PlayerModel::resolveEnableInPrimarySpace(
+        getSceneManager().getCameraManager().isCameraValid(CameraType::ViewModel));
     constants.enablePlayerModelPrimaryShadows = RtxOptions::PlayerModel::enablePrimaryShadows();
     constants.enablePreviousTLAS = RtxOptions::enablePreviousTLAS() && m_common->getSceneManager().isPreviousFrameSceneAvailable();
 
@@ -1198,6 +1224,8 @@ namespace dxvk {
     constants.pomMaxIterations = RtxOptions::Displacement::maxIterations();
 
     constants.totalMipBias = getSceneManager().getTotalMipBias(); 
+    constants.hairCardMipBias = RtxOptions::hairCardMipBias();
+    constants.hairCardRoughnessScale = RtxOptions::hairCardRoughnessScale();
 
     constants.upscaleFactor = float2 {
       rtOutput.m_compositeOutputExtent.width / static_cast<float>(rtOutput.m_finalOutputExtent.width),
@@ -1378,6 +1406,7 @@ namespace dxvk {
     // DLSS-RR
     constants.enableDLSSRR = useRR;
     constants.setLogValueForDisocclusionMaskForDLSSRR = DxvkRayReconstruction::enableDisocclusionMaskBlur();
+    constants.invalidateHistoryForAnimatedWater = DxvkRayReconstruction::invalidateHistoryForAnimatedWater();
 
     NrdArgs primaryDirectNrdArgs;
     NrdArgs primaryIndirectNrdArgs;
@@ -2135,7 +2164,7 @@ namespace dxvk {
             const uint32_t* readback = mapAs<const uint32_t*>(cReadbackDst);
             if (!readback || cReadbackDst->info().size < onePixelInBytes) {
               assert(0);
-              cCallback(std::vector<ObjectPickingValue>{}, std::nullopt);
+              cCallback(std::vector<ObjectPickingValue>{}, std::nullopt, std::nullopt);
               return;
             }
 
@@ -2158,12 +2187,15 @@ namespace dxvk {
             auto legacyHashForPrimaryValue = g_allowMappingLegacyHashToObjectPickingValue ?
               m_common->getSceneManager().findLegacyTextureHashByObjectPickingValue(primaryValue) :
               std::optional<XXH64_hash_t>{};
+            auto geometryHashForPrimaryValue = g_allowMappingLegacyHashToObjectPickingValue ?
+              m_common->getSceneManager().findGeometryHashByObjectPickingValue(primaryValue) :
+              std::optional<XXH64_hash_t>{};
 
-            cCallback(std::move(values), legacyHashForPrimaryValue);
+            cCallback(std::move(values), legacyHashForPrimaryValue, geometryHashForPrimaryValue);
           }
         ));
       } else {
-        request->callback(std::vector<ObjectPickingValue>{}, std::nullopt);
+        request->callback(std::vector<ObjectPickingValue>{}, std::nullopt, std::nullopt);
       }
     }
 

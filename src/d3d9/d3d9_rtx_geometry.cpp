@@ -127,6 +127,48 @@ namespace dxvk {
     }
   }
 
+  XXH64_hash_t D3D9Rtx::computeLiveGeometryVertexShaderHashComponent() {
+    XXH64_hash_t vertexShaderHash = kEmptyHash;
+
+    if (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture) {
+      if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
+        vertexShaderHash = m_activeStableVsHash;
+
+        if (m_activeStableVsHashUsedExclusions) {
+          // refresh geometry as the camera travels by folding a coarse camera anchor into the hash
+          // doing this to avoid the distortion that grows with distance from the location where RT was enabled
+          // todo: revisit this, it still doesn't solve scene capture distortion
+          Ue3CameraHashCell cameraCell;
+          if (computeUe3CameraHashCell(cameraCell)) {
+            logUe3CameraHashCellIfChanged(cameraCell, "geometry hash");
+            vertexShaderHash = XXH3_64bits_withSeed(
+              &cameraCell,
+              sizeof(cameraCell),
+              vertexShaderHash);
+          }
+          if (m_frameOptions.ue3LogCapturePrecision && Logger::logLevel() <= LogLevel::Debug) {
+            ONCE(Logger::debug(str::format(
+              "[RTX-Compatibility][UE3-Capture] VS camera constants excluded from geometry hash, cameraCellEnabled=",
+              shouldUseUe3CameraHashCell())));
+          }
+        }
+
+        if (m_forceIaTexcoordForOutlier) {
+          // compat cache key - outlier draws force IA texcoords in vertex capture
+          // include this mode bit in the VS hash so cache entries built with VS TEXCOORD output
+          // are not reused when outlier fallback wants IA TEXCOORDs and vice versa
+          constexpr uint64_t kOutlierIaTexcoordHashMode = 0x4A5D9C5E6F10B2D3ull;
+          vertexShaderHash = XXH3_64bits_withSeed(
+            &kOutlierIaTexcoordHashMode,
+            sizeof(kOutlierIaTexcoordHashMode),
+            vertexShaderHash);
+        }
+      }
+    }
+
+    return vertexShaderHash;
+  }
+
   Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue,
                                               const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
     ScopedCpuProfileZone();
@@ -162,43 +204,9 @@ namespace dxvk {
     // Assume the GPU changed the data via shaders, include the constant buffer data in hash.
     // The bytecode + constant hashing (with UE3 camera-register exclusions) is computed once
     // per draw in internalPrepareDraw (m_activeStableVsHash) and shared with the static
-    // vertex-capture cache key; only the geometry-hash-specific folds happen here.
-    XXH64_hash_t vertexShaderHash = kEmptyHash;
-    if (m_parent->UseProgrammableVS() && useVertexCapture()) {
-      if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
-        vertexShaderHash = m_activeStableVsHash;
-
-        if (m_activeStableVsHashUsedExclusions) {
-          // refresh geometry as the camera travels by folding a coarse camera anchor into the hash
-          // doing this to avoid the distortion that grows with distance from the location where RT was enabled
-          // todo: revisit this, it still doesn't solve scene capture distortion
-          Ue3CameraHashCell cameraCell;
-          if (computeUe3CameraHashCell(cameraCell)) {
-            logUe3CameraHashCellIfChanged(cameraCell, "geometry hash");
-            vertexShaderHash = XXH3_64bits_withSeed(
-              &cameraCell,
-              sizeof(cameraCell),
-              vertexShaderHash);
-          }
-          if (ue3LogCapturePrecision() && Logger::logLevel() <= LogLevel::Debug) {
-            ONCE(Logger::debug(str::format(
-              "[RTX-Compatibility][UE3-Capture] VS camera constants excluded from geometry hash, cameraCellEnabled=",
-              shouldUseUe3CameraHashCell())));
-          }
-        }
-
-        if (m_forceIaTexcoordForOutlier) {
-          // compat cache key - outlier draws force IA texcoords in vertex capture
-          // include this mode bit in the VS hash so cache entries built with VS TEXCOORD output
-          // are not reused when outlier fallback wants IA TEXCOORDs and vice versa
-          constexpr uint64_t kOutlierIaTexcoordHashMode = 0x4A5D9C5E6F10B2D3ull;
-          vertexShaderHash = XXH3_64bits_withSeed(
-            &kOutlierIaTexcoordHashMode,
-            sizeof(kOutlierIaTexcoordHashMode),
-            vertexShaderHash);
-        }
-      }
-    }
+    // vertex-capture cache key; only the geometry-hash-specific folds happen here. Shared
+    // with the geometry memo hit path so served hashes recombine to identical values.
+    const XXH64_hash_t vertexShaderHash = computeLiveGeometryVertexShaderHashComponent();
 
     // Calculate this based on the RasterGeometry input data
     XXH64_hash_t geometryDescriptorHash = kEmptyHash;
@@ -247,8 +255,13 @@ namespace dxvk {
 
       // Publish into the static-geometry memo entry so later frames can reuse the
       // result without recomputing (entry storage is heap-pinned via shared_ptr).
+      // The VertexShader component is per-draw (stable VS-constant hash, camera cell)
+      // and is recombined live by the memo consumer, so it is not stored.
       if (publishTo != nullptr) {
-        publishTo->hashes = hashes;
+        for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {
+          publishTo->componentHashes[i] = hashes[HashComponents(i)];
+        }
+        publishTo->componentHashes[uint32_t(HashComponents::VertexShader)] = kEmptyHash;
         publishTo->hashesReady.store(true, std::memory_order_release);
       }
 
@@ -260,7 +273,7 @@ namespace dxvk {
                                                                         const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
     ScopedCpuProfileZone();
 
-    if (!RtxOptions::needsMeshBoundingBox()) {
+    if (!m_frameOptions.needsMeshBoundingBox) {
       return Future<AxisAlignedBoundingBox>();
     }
 

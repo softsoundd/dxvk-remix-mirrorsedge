@@ -31,6 +31,41 @@
 
 namespace dxvk {
 
+void AssetReplacements::logAnchorSummary(const std::string& modName) const {
+  std::lock_guard<sync::Spinlock> lock(m_spinlock);
+  // Note: mesh/light anchors are registered asynchronously after their upload command
+  // list completes on the GPU (addReplacementsSync), so counts logged at processUSD end
+  // only cover what has landed so far - typically just the synchronously stored materials.
+  Logger::info(str::format(
+    "[RTX-ReplacementResolve] Mod '", modName, "' anchors registered so far: ",
+    m_meshReplacers.size(), " mesh, ",
+    m_lightReplacers.size(), " light, ",
+    m_materials.size(), " material (mesh/light anchors may still register asynchronously after GPU sync)."));
+
+  if (!RtxOptions::logReplacementResolution()) {
+    return;
+  }
+
+  const auto dump = [](const char* label, const auto& map) {
+    std::string line;
+    uint32_t hashesInLine = 0;
+    for (const auto& entry : map) {
+      line += str::format(" 0x", std::hex, entry.first, std::dec);
+      if (++hashesInLine == 16) {
+        Logger::info(str::format("[RTX-ReplacementResolve] ", label, " anchors:", line));
+        line.clear();
+        hashesInLine = 0;
+      }
+    }
+    if (!line.empty()) {
+      Logger::info(str::format("[RTX-ReplacementResolve] ", label, " anchors:", line));
+    }
+  };
+  dump("mesh", m_meshReplacers);
+  dump("light", m_lightReplacers);
+  dump("material", m_materials);
+}
+
 std::vector<AssetReplacement>* AssetReplacer::getReplacementsForMesh(XXH64_hash_t hash) {
   if (!RtxOptions::getEnableReplacementMeshes())
     return nullptr;

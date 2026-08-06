@@ -22,6 +22,7 @@
 #pragma once
 
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <vector>
 #include <set>
@@ -149,7 +150,7 @@ public:
   void onDestroy();
 
   void submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData);
-  void submitExternalDraw(const Rc<DxvkContext>& ctx, ExternalDrawState&& state);
+  void submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> state);
   void setStartInMediumMaterial(const MaterialData& translucentMaterial);
   void clearStartInMediumMaterial();
 
@@ -240,6 +241,7 @@ public:
   [[nodiscard]] SamplerIndex trackSampler(Rc<DxvkSampler> sampler);
 
   std::optional<XXH64_hash_t> findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue);
+  std::optional<XXH64_hash_t> findGeometryHashByObjectPickingValue(uint32_t objectPickingValue);
   std::vector<ObjectPickingValue> gatherObjectPickingValuesByTextureHash(XXH64_hash_t texHash);
 
   // Replacement material hash tracking
@@ -264,8 +266,8 @@ public:
   void requestVramCompaction();
   void manageTextureVram();
 
-  bool isThinOpaqueMaterialExist() const { return m_thinOpaqueMaterialExist; }
-  bool isSssMaterialExist() const { return m_sssMaterialExist; }
+  bool isThinOpaqueMaterialExist() const { return m_thinOpaqueCount > 0; }
+  bool isSssMaterialExist() const { return m_sssCount > 0; }
 
   bool isAntiCullingSupported() const { return m_isAntiCullingSupported; }
 
@@ -293,12 +295,11 @@ private:
                                                  const DrawCallState& drawCallState,
                                                  uint32_t* out_indexInCache = nullptr);
 
-  // Update per-frame scene-wide aggregates derived from a finalized opaque surface
-  // material (POM count, SSS / thin-opaque existence). These are reset each frame
-  // in onFrameEnd; both the dynamic path (createSurfaceMaterial) and the
-  // preserve path (preserveInstance) must call this so the classification of
-  // SSS-vs-thin-opaque lives in exactly one place.
-  void accumulateOpaqueMaterialAggregates(const RtOpaqueSurfaceMaterial& opaqueMat);
+  // Retain / release all resources associated with the surface material at the given cache index:
+  // texture ref counts (via RtxTextureManager) and scene-wide feature counts (POM, SSS, thin-opaque).
+  // Called when an instance's bound material changes or the instance is destroyed.
+  void retainSurfaceMaterial(uint32_t matIdx);
+  void releaseSurfaceMaterial(uint32_t matIdx);
 
   RtTranslucentSurfaceMaterial createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
                                                                 uint32_t samplerIndex,
@@ -348,6 +349,8 @@ private:
       const DrawCallState& input,
       const std::vector<AssetReplacement>* pReplacements,
       ReplacementInstance* replacementInstance);
+
+  void trackObjectPickingMeta(const DrawCallState& drawCallState, ObjectPickingValue objectPickingValue);
 
   // Refreshes BlasEntry::input and per-instance draw state on the preserve path (matches drawReplacements'
   // DrawCallState wiring).
@@ -412,6 +415,8 @@ private:
   struct DrawCallMetaInfo {
     XXH64_hash_t legacyTextureHash { kEmptyHash };
     XXH64_hash_t legacyTextureHash2 { kEmptyHash };
+    // Topology-stable geometry hash used for geometry category tagging in the UI.
+    XXH64_hash_t geometryHash { kEmptyHash };
   };
   struct DrawCallMeta {
     constexpr static inline uint8_t MaxTicks = 2;
@@ -427,8 +432,8 @@ private:
   std::atomic_bool m_forceFreeTextureMemory = false;
   std::atomic_bool m_forceFreeUnusedDxvkAllocatorChunks = false;
 
-  bool m_thinOpaqueMaterialExist = false;
-  bool m_sssMaterialExist = false;
+  uint32_t m_thinOpaqueCount = 0;
+  uint32_t m_sssCount = 0;
 
   bool m_isAntiCullingSupported = true;
 

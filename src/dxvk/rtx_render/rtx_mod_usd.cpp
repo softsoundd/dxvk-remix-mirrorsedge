@@ -1268,6 +1268,8 @@ void UsdMod::Impl::processUSD(const Rc<DxvkContext>& context) {
     VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
     VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
 
+  m_owner.m_replacements->logAnchorSummary(m_owner.m_name);
+
   m_owner.setState(ProgressState::Loaded);
 }
 
@@ -1703,3 +1705,9 @@ const ModTypeInfo& UsdMod::getTypeInfo() {
 }
 
 } // namespace dxvk
+
+// Export function for unit testing - writes the RemixCategories schema.usda
+// generated from the InstanceCategories enum (see usd_common.h).
+bool writeRemixCategoriesSchemaUsda(const char* outputFilePath) {
+  return dxvk::writeRemixCategoriesSchemaUsda(outputFilePath);
+}

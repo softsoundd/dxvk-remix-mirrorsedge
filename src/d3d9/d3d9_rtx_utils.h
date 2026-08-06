@@ -40,7 +40,7 @@ namespace dxvk {
     * \param [in] alphaSwizzle: is the current render target alpha capable
     * \param [out] materialData: material data structure to update
     */
-  void setLegacyMaterialState(D3D9DeviceEx* pDevice, const bool alphaSwizzle, LegacyMaterialData& materialData);
+  void setLegacyMaterialState(D3D9DeviceEx* pDevice, const bool alphaSwizzle, const bool vertexColorIsBakedLighting, LegacyMaterialData& materialData);
 
   /**
     * \brief: This function creates a legacy state object by taking the Direct3D 9 state information

@@ -58,6 +58,7 @@
 #include <vector>
 #include <atomic>
 #include <array>
+#include <vector>
 
 using namespace Commands;
 using namespace bridge_util;
@@ -121,6 +122,23 @@ typedef IDirect3D9* (WINAPI* D3DC9)(UINT);
 typedef HRESULT(WINAPI* D3DC9Ex)(UINT, IDirect3D9Ex**);
 HMODULE ghModule;
 LPDIRECT3D9 gpD3D;
+
+static void shutdownSentryIfLoaded() {
+  if (ghModule == nullptr) {
+    return;
+  }
+  typedef void (__stdcall * RtxSentryShutdownFn)();
+  const auto fn = reinterpret_cast<RtxSentryShutdownFn>(GetProcAddress(ghModule, "RtxSentryShutdown"));
+  if (fn != nullptr) {
+    fn();
+  }
+}
+
+struct SentryShutdownOnExit {
+  ~SentryShutdownOnExit() {
+    shutdownSentryIfLoaded();
+  }
+};
 
 bool gOverwriteConditionAlreadyActive = false;
 
@@ -3332,7 +3350,8 @@ bool InitializeD3D() {
   } else {
     // Since vanilla dxvk is diabled attempt loading regular d3d9.dll which
     // could be either the system d3d9 one or our own Remix dxvk flavor of it.
-    ghModule = LoadLibrary("d3d9.dll");
+    ghModule = LoadLibraryExA("d3d9.dll", nullptr,
+                              LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
   }
   // Now check if loading the dll actually succeeded or not, and try to
   // create the D3D instance used for the lifetime of this process.
@@ -3485,9 +3504,51 @@ static inline bool initFileSys() {
 
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ PWSTR pCmdLine, _In_ int nCmdShow) {
   gTimeStart = std::chrono::high_resolution_clock::now();
-  
+
+  int argCount = 0;
+  LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount);
+
+  // Sentry upload-only mode: x86 bridge client launches us to flush pending crash reports.
+  // Load d3d9.dll the same way as the regular path (exe dir is first in DLL search order); call RtxSentryRunUploadHelper.
+  if (argCount >= 2 && wcscmp(argList[0], L"--sentry-upload-only") == 0) {
+    const int logsUtf8Len = WideCharToMultiByte(CP_UTF8, 0, argList[1], -1, nullptr, 0, nullptr, nullptr);
+    if (logsUtf8Len > 0) {
+      std::vector<char> logsDirUtf8(static_cast<size_t>(logsUtf8Len));
+      WideCharToMultiByte(CP_UTF8, 0, argList[1], -1, logsDirUtf8.data(), logsUtf8Len, nullptr, nullptr);
+      std::string dbPath = std::string(logsDirUtf8.data()) + "/.sentry-native";
+      if (initFileSys()) {
+        Logger::init();
+      }
+
+      // Crash type is passed as optional third arg ("GPU" or "CPU"); recorded in crash-upload.log.
+      const char* crashType = (argCount >= 3 && argList[2][0] != L'\0')
+          ? (wcscmp(argList[2], L"GPU") == 0 ? "GPU" : "CPU")
+          : "unknown";
+
+      Logger::info(format_string("Sentry upload helper starting (crash type: %s)", crashType));
+      HMODULE d3d9 = LoadLibraryExA("d3d9.dll", nullptr,
+                                   LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+      if (d3d9 != nullptr) {
+        typedef void (__stdcall * RtxSentryRunUploadHelperFn)(const char*, const char*);
+        auto fn = reinterpret_cast<RtxSentryRunUploadHelperFn>(GetProcAddress(d3d9, "RtxSentryRunUploadHelper"));
+        if (fn != nullptr) {
+          fn(dbPath.c_str(), crashType);
+          Logger::info("Sentry upload helper finished");
+        } else {
+          Logger::err("Sentry upload helper export RtxSentryRunUploadHelper was not found");
+        }
+        FreeLibrary(d3d9);
+      } else {
+        Logger::err("Sentry upload helper failed to load d3d9.dll");
+      }
+    }
+    LocalFree(argList);
+    return 0;
+  }
+
   if (!initFileSys()) {
     Logger::err("Failed to initialize rtx filesystem!");
+    LocalFree(argList);
     return 1;
   }
 
@@ -3507,17 +3568,17 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
   Logger::warn("Running in x86 mode! Are you sure this is what you want? RTX will not work this way, please run the 64-bit server instead!");
 #endif
 
-  int argCount;
-  LPWSTR* argList = CommandLineToArgvW(pCmdLine, &argCount);
   BRIDGE_ASSERT_LOG((argCount >= 2), "Command line argument count received to launch server is not as expected");
   if (gUniqueIdentifier.setGuid(&argList[0])) {
     Logger::info("Launched server with GUID " + gUniqueIdentifier.toString());
   } else {
     Logger::err("Server was invoked with invalid GUID! Unable to establish bridge, exiting...");
+    LocalFree(argList);
     return 1;
   }
   if (wcscmp(argList[1], BRIDGE_VERSION_W) != 0) {
-    Logger::err(format_string("Client (%s) and server (%s) version numbers do not match. Mixed version runtime execution is currently not supported! Exiting...", argList[1], BRIDGE_VERSION));
+    Logger::err(format_string("Client (%ls) and server (%s) version numbers do not match. Mixed version runtime execution is currently not supported! Exiting...", argList[1], BRIDGE_VERSION));
+    LocalFree(argList);
     return 1;
   }
   LocalFree(argList);
@@ -3563,6 +3624,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
   if (!InitializeD3D()) {
     return 1;
   }
+  const SentryShutdownOnExit sentryShutdownOnExit;
 
   // (3) Send ACK to Client. Connection has been established
   Logger::info("Sync request received, sending ACK response...");
@@ -3610,7 +3672,6 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     // especially with other dependencies loaded by dxvk and threads that may deadlock due
     // to being unable to acquire certain locks during unloading.
     //FreeLibrary(ghModule);
-    ghModule = nullptr;
   }
 
   // Clean up client exit callback handler

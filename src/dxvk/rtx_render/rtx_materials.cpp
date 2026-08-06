@@ -36,6 +36,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   struct LegacyMaterialIdentityHashData {
     XXH64_hash_t colorTextureHash0;
     XXH64_hash_t colorTextureHash1;
+    XXH64_hash_t colorTextureDescriptorHash0;
+    XXH64_hash_t colorTextureDescriptorHash1;
     XXH64_hash_t samplerHash0;
     XXH64_hash_t samplerHash1;
     uint32_t alphaTestCompareOp;
@@ -60,9 +62,44 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
     uint8_t padding[7];
   };
 
+  // NV-DXVK fork: UE3 streaming-stable image hashes are identical across every streamed
+  // mip variant of a logical texture by design (see rtx.d3d9.ue3StreamingStableTextureHashing),
+  // so the image hash alone cannot tell the preserve path that the game swapped the bound
+  // texture object for a different-resolution variant - a preserved instance would keep
+  // sampling the stale low-mip image view in the bindless table indefinitely. A signature of
+  // the image properties (extent, mip count, format) differs across streamed variants while
+  // remaining stable across identical recreations, forcing exactly one dynamic-path rebind
+  // when the variant changes. (Note: DxvkImage::getDescriptorHash is only populated for
+  // render targets, so it cannot serve this purpose for regular textures.)
+  auto textureVariantHash = [](const TextureRef& tex) -> XXH64_hash_t {
+    if (const DxvkImageView* view = tex.getImageView()) {
+      const DxvkImageCreateInfo& info = view->image()->info();
+      struct VariantKey {
+        uint32_t width;
+        uint32_t height;
+        uint32_t depth;
+        uint32_t mipLevels;
+        uint32_t numLayers;
+        int32_t format;
+      };
+      const VariantKey key = {
+        info.extent.width,
+        info.extent.height,
+        info.extent.depth,
+        info.mipLevels,
+        info.numLayers,
+        int32_t(info.format),
+      };
+      return XXH3_64bits(&key, sizeof(key));
+    }
+    return kEmptyHash;
+  };
+
   LegacyMaterialIdentityHashData data{};
   data.colorTextureHash0 = colorTextures[0].getImageHash();
   data.colorTextureHash1 = colorTextures[1].getImageHash();
+  data.colorTextureDescriptorHash0 = textureVariantHash(colorTextures[0]);
+  data.colorTextureDescriptorHash1 = textureVariantHash(colorTextures[1]);
   data.samplerHash0 = samplers[0].ptr() != nullptr ? samplers[0]->info().calculateHash() : kEmptyHash;
   data.samplerHash1 = samplers[1].ptr() != nullptr ? samplers[1]->info().calculateHash() : kEmptyHash;
   data.alphaTestCompareOp = static_cast<uint32_t>(alphaTestCompareOp);
@@ -88,6 +125,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   return hashStructByMemory<LegacyMaterialIdentityHashData,
       &LegacyMaterialIdentityHashData::colorTextureHash0,
       &LegacyMaterialIdentityHashData::colorTextureHash1,
+      &LegacyMaterialIdentityHashData::colorTextureDescriptorHash0,
+      &LegacyMaterialIdentityHashData::colorTextureDescriptorHash1,
       &LegacyMaterialIdentityHashData::samplerHash0,
       &LegacyMaterialIdentityHashData::samplerHash1,
       &LegacyMaterialIdentityHashData::alphaTestCompareOp,

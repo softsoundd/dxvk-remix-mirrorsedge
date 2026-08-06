@@ -146,7 +146,7 @@ namespace dxvk {
     }
   }
 
-  void setLegacyMaterialState(D3D9DeviceEx* pDevice, const bool alphaSwizzle, LegacyMaterialData& materialData) {
+  void setLegacyMaterialState(D3D9DeviceEx* pDevice, const bool alphaSwizzle, const bool vertexColorIsBakedLighting, LegacyMaterialData& materialData) {
     assert(pDevice != nullptr);
     const Direct3DState9& d3d9State = *pDevice->GetRawState();
 
@@ -220,7 +220,9 @@ namespace dxvk {
     materialData.d3dMaterial = d3d9State.material;
 
     // Allow the users to configure vertex color as baked lighting for legacy draw calls.
-    materialData.isVertexColorBakedLighting = RtxOptions::vertexColorIsBakedLighting();
+    // Value supplied by the caller's per-frame option snapshot (a locked per-draw
+    // RtxOption read here would defeat D3D9Rtx::FrameOptionCache).
+    materialData.isVertexColorBakedLighting = vertexColorIsBakedLighting;
   }
 
 

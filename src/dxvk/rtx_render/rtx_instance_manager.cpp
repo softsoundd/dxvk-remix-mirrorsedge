@@ -102,6 +102,10 @@ namespace dxvk {
     if (!RtxOptions::enableCulling())
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 
+    if (drawCall.testCategoryFlags(InstanceCategories::HairCards)) {
+      flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    }
+
     // This check can be overridden by replacement assets.
     if (drawCall.getMaterialData().blendMode.enableBlending && !surface.alphaState.isDecal && !drawCall.getGeometryData().forceCullBit)
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
@@ -695,18 +699,32 @@ namespace dxvk {
     // Handle Alpha Test State
 
     // Note: Even if the Alpha Test enable flag is set, we consider it disabled if the actual test type is set to always.
-    const bool forceAlphaTest = drawCall.getCategoryFlags().test(InstanceCategories::AlphaBlendToCutout);
-    const bool alphaTestEnabled = forceAlphaTest || (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp != AlphaTestType::kAlways;
+    const bool forceCutoutAlphaTest = drawCall.testCategoryFlags(InstanceCategories::AlphaBlendToCutout);
+    const bool forceHairCardAlphaTest = drawCall.testCategoryFlags(InstanceCategories::HairCards);
+    const bool forceAlphaTest = forceCutoutAlphaTest || forceHairCardAlphaTest;
+    const bool legacyAlphaTestEnabled = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp != AlphaTestType::kAlways;
+    const bool materialAlphaTestEnabled = opaqueMaterialData.getAlphaTestType() != AlphaTestType::kAlways;
 
     // Note: Use the Opaque Material Data's alpha test state information directly if requested,
     // otherwise derive the alpha test state from the drawcall (via its legacy material data).
-    if (forceAlphaTest) {
+    if (forceCutoutAlphaTest) {
       out.alphaTestType = AlphaTestType::kGreater;
       out.alphaTestReferenceValue = static_cast<uint8_t>(RtxOptions::forceCutoutAlpha() * 255.0);
+    } else if (forceHairCardAlphaTest) {
+      if (!useLegacyAlphaState && materialAlphaTestEnabled) {
+        out.alphaTestType = opaqueMaterialData.getAlphaTestType();
+        out.alphaTestReferenceValue = opaqueMaterialData.getAlphaTestReferenceValue();
+      } else if (legacyAlphaTestEnabled) {
+        out.alphaTestType = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp;
+        out.alphaTestReferenceValue = drawCall.getMaterialData().alphaTestReferenceValue;
+      } else {
+        out.alphaTestType = AlphaTestType::kGreater;
+        out.alphaTestReferenceValue = static_cast<uint8_t>(RtxOptions::forceCutoutAlpha() * 255.0);
+      }
     } else if (!useLegacyAlphaState) {
       out.alphaTestType = opaqueMaterialData.getAlphaTestType();
       out.alphaTestReferenceValue = opaqueMaterialData.getAlphaTestReferenceValue();
-    } else if (alphaTestEnabled) {
+    } else if (legacyAlphaTestEnabled) {
       out.alphaTestType = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp;
       out.alphaTestReferenceValue = drawCall.getMaterialData().alphaTestReferenceValue;
     }
@@ -1369,14 +1387,14 @@ namespace dxvk {
       bool hasPreviousPositions,
       bool isFirstUpdateThisFrame,
       bool fireEvents) {
-    // Camera registration. Idempotent (RtInstance::m_seenCameraTypes is cumulative and never
-    // cleared), so calling it from updateInstance and again here is harmless. We need it on
-    // the preserve path because that path bypasses updateInstance entirely.
-    instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
+    // Camera registration. This is per-instance, so this detects the first time an instance
+    // is drawn with a given camera each frame.
+    const bool isNewCameraTypeThisFrame =
+        instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
 
     // Re-register view-model candidates every frame; m_viewModelCandidates is cleared in
     // onFrameEnd, and createViewModelInstances() iterates the list later in the frame.
-    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isFirstUpdateThisFrame) {
+    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isNewCameraTypeThisFrame) {
       registerViewModelCandidate(instance);
     }
 
@@ -1512,8 +1530,9 @@ namespace dxvk {
       return;
     }
 
-    // If the first person player model is enabled, hide the view model.
-    if (RtxOptions::PlayerModel::enableInPrimarySpace()) {
+    // Hide the view model when the third-person player model is shown on primary rays.
+    if (RtxOptions::PlayerModel::resolveEnableInPrimarySpace(
+          cameraManager.isCameraValid(CameraType::ViewModel))) {
       for (auto* candidateInstance : m_viewModelCandidates) {
         candidateInstance->m_vkInstance.mask = 0;
       }
@@ -1558,11 +1577,11 @@ namespace dxvk {
     std::unordered_set<RtInstance*> activeViewModelReferences;
     for (auto* candidateInstance : m_viewModelCandidates) {
 
-      // Valid view model instances must be associated only with the view model camera
-      // Check: exactly one bit set (power-of-two check via raw bitmask)
-      const auto seenMask = candidateInstance->m_seenCameraTypes.raw();
-      if (seenMask == 0 || (seenMask & (seenMask - 1)) != 0)
+      // A valid view-model reference must have been drawn with the view-model camera this
+      // frame.
+      if (!candidateInstance->isCameraRegistered(CameraType::ViewModel)) {
         continue;
+      }
 
       // Hide the reference instance since we'll create a separate instance for the view model 
       candidateInstance->m_vkInstance.mask = 0;

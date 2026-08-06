@@ -479,6 +479,10 @@ namespace dxvk {
 
   private:
 
+    // NV-DXVK start: UE3 streaming-stable texture hashing
+    XXH64_hash_t ComputeUe3StreamingStableHash(const D3D9CommonTexture* source) const;
+    // NV-DXVK end
+
     D3D9DeviceEx*                 m_device;
     D3D9_COMMON_TEXTURE_DESC      m_desc;
     D3DRESOURCETYPE               m_type;

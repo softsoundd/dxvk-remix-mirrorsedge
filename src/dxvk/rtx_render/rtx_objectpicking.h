@@ -49,7 +49,8 @@ namespace dxvk {
 
     using Callback = std::function<
       void(std::vector<ObjectPickingValue>&& /* objectPickingValues */,
-           std::optional<XXH64_hash_t>       /* legacyTextureHash -- corresponding to objectPickingValues[0] */)
+           std::optional<XXH64_hash_t>       /* legacyTextureHash -- corresponding to objectPickingValues[0] */,
+           std::optional<XXH64_hash_t>       /* geometryHash -- corresponding to objectPickingValues[0] */)
     >;
 
     struct Request {

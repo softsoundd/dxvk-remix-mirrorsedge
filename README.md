@@ -14,40 +14,64 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ### 1) Mirror's Edge (UE3/D3D9) compatibility improvements
 
-- Improved pixel shader sampler semantic classification to better distinguish material textures from engine auxiliary buffers (shadow/post-process/UI/scene textures) to reduce wrong diffuse/albedo picks.
-- Expanded texcoord inference for legacy D3D9 opcodes (`TexBem`, `TexReg2*`, `TexM3x*`, `TexDp3Tex` etc.)
-- Added extra material semantic hints (normal/specular/roughness/opacity/mask map categories) to improve slot-0 material scoring + texture selection.
-- Strengthened UE3 vertex shader CTAB parsing, additional vertex factory hint extraction (decal/lightmap/wind/view to local patterns).
-- Updated packed UV heuristics for UE3 vertex factory styles (terrain, decal etc.) to reduce false penalties + improve UV promotion behavior.
+All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` toggle which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
 
-### 2) Mirror's Edge game profile/launch args and patches
+- Camera and object transforms are read from UE3's reserved shader constants (CTAB parsing).
+- Depth prepass, shadow depth, SceneCapture, and depth-test-disabled translucency passes are skipped so only real base-pass geometry gets ray traced.
+- Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level: tags, categories and asset replacements survive texture streaming, settings changes, and restarts.
+- Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
+- Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
+- Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
 
-- Added a new Remix Mirror's Edge profile in `src/util/config/config.cpp`
-- Game setup/requirements:
-	- The game's lightmaps need to be disabled. This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
-	- The game needs to be configured to use unlit rendering, no occlusion-based culling etc. Fortunately UE3 is quite flexible with commands which allows us to do this. The simplest way to set this up is to:
-		1. Make a text file titled "remix" (no extension) and paste the following:
-		```
-		scale set TdBicubicFiltering false
-		scale set MaxMultisamples 0
-		scale set DynamicLights false
-		scale set DynamicShadows false
-		scale set AmbientOcclusion false
-		scale set DepthOfField false
-		scale set Bloom false
-		scale set LightEnvironmentShadows false
-		scale set FogVolumes false
-		scale set TdSunHaze false
-		scale set TdMotionBlur false
-		toggleocclusion
-		viewmode unlit
-		show scenecapture
-		```
-		2. Place the text file in `<path-to-game>\Binaries`
-  		3. By default `MirrorsEdge.exe` whitelists only a select few launch arguments. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher.
-	 	4. Add "-exec=remix" (without double quotes) into your game libray's launch arguments/other shortcuts, or within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the 'Launch Game w/ Args' button.
-	- Note: UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible (a dedicated patch script will come later). Note this has been tested only with the GOG version so far.
- 		- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`.
+### 2) Mirror's Edge/UE3 setup:
+
+1. Enable the bridge's redundant state filtering. Create (or edit) `.trex\bridge.conf` and add `eliminateRedundantSetterCalls = True`.
+> [!NOTE]
+> UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, roughly 9 state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
+
+2. Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`) - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
+> [!IMPORTANT]
+> Disabling lightmaps is strongly recommended, both for compatibility and especially when authoring assets. When lightmaps are enabled, Remix scene exports generate different material hashes that are not compatible with non-lightmapped states. As a result, assets authored with lightmaps enabled may not match correctly once lightmaps are disabled. If you want to keep lightmaps enabled for before/after comparisons, that is fully supported. As long as assets were originally authored with lightmaps disabled, enabling lightmaps later for comparison will not affect material hash matching.
+
+3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
+```
+scale set TdBicubicFiltering false
+scale set TdTonemapping false
+scale set MaxMultisamples 0
+scale set MaxAnisotropy 0
+scale set DynamicLights false
+scale set DynamicShadows false
+scale set AmbientOcclusion false
+scale set Distortion false
+scale set DropParticleDistortion true
+scale set MotionBlur false
+scale set DepthOfField false
+scale set Bloom false
+scale set LightEnvironmentShadows false
+scale set LensFlares false
+scale set FogVolumes false
+scale set TdSunHaze false
+scale set TdMotionBlur false
+scale set Trilinear false
+scale set UpscaleScreenPercentage false
+scale set ScreenPercentage 100
+scale set OnlyStreamInTextures true
+toggleocclusion
+ToggleDynamicContrast
+viewmode unlit
+show scenecapture
+show dynamicshadows
+show fog
+```
+> [!NOTE]
+> The above commands ensures maximum compatibility with Remix. That being said, a lot of consideration has gone into this fork into ensuring that games with less flexibility around commands can still play somewhat nice with these graphics systems active, though game-side modding is recommended to disable them.
+
+4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments, so the above commands will not work out of the box. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Once patched, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
+
+5. Mirror's Edge hides the third-person player model in the default first-person camera state, which means Remix cannot cast shadows or reflect the character as you'd expect in a raytraced scenario. A modded TdGame.u game file is provided which always shows the third-person model regardless of camera state - this can be downloaded from the releases section, and goes into `<path-to-game\TdGame\CookedPC>`. Make sure you have the runtime's `rtx.conf` file which has the necessary player/viewmodel hashes pre-tagged so this renders properly.
+
+6. *(Optional)* UE3 employs frustum culling in native C++ land. This requires patching the executable to treat primitives as always visible. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
+	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
 
 ### 3) Remix Plus features (Numos atmosphere, SDK API, tonemap)
 
@@ -61,9 +85,31 @@ This fork also integrates the [Remix Plus](https://github.com/RemixProjGroup/dxv
 
 For weather presets and sky API details, see [`docs/RemixSkyAPI.md`](docs/RemixSkyAPI.md) and [`docs/CloudSystem.md`](docs/CloudSystem.md).
 
-### 4) Acknowledgements
-- sambow23 for their physically based sky implementation.
-- xoxor4d for their research into UE3->Remix support and other tidbits of info that helped guide the initial work around this.
+### 4) Extra fork notes/debugging
+
+#### Material identity and replacement anchor stability
+
+With `rtx.d3d9.ue3EngineMode`, a material's identity hash (the `mat_*` anchor that captures, texture tags, and asset replacements key off) is a chain: pixel shader identity → material texture set (image hash of every CTAB `Texture2D_*`/`TextureCube_*` sampler) → material constants (`UniformVector_*`/`UniformScalar_*`). Every tier is a pure function of the draw, so the same material instance always gets the same hash when the inputs themselves are stable. UE3 games expose three unstable input classes, so the runtime deals with each:
+
+- Render targets bound as material samplers (scene captures, reflection buffers). An RT's image hash embeds a creation counter and changes every respawn, checkpoint, or level load. RTs are excluded from identity by default (`rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity`). Anchors that still key off RT-bearing identities need re-anchoring once.
+- Frame-varying constants (time/panner/fade/sub-UV expressions). Churn auto-exclusion drops such a group's constants from identity once it has minted enough distinct hashes. That exclusion is written to `rtx-remix/ue3MicAutoExcludedGroups.cache` (`rtx.d3d9.ue3MicPersistAutoExcludedConstantGroups`), so the group's identity is deterministic from the first frame of every later session instead of flipping mid-session at an unpredictable point. You can delete the cache file in the `rtx-remix` folder to reset this.
+- Session-composited textures (engine-generated textures reuploaded with different contents every session). Their content hash is session-unique, so any identity containing them cannot be anchored from a capture. Tag the texture's descriptor hash (stable across recreations; shown as `desc:0x...` in the `rtx.d3d9.ue3LogMaterialInstanceHash` breakdown and `[RTX-MicDrift]` sampler diffs) in `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes`, then re-anchor the material once. Alternatively, anchor the override at the raw texture hash (`mat_<textureHash>`): replacement lookup runs tiers material → lightmap-permutation bridge → textureSet+shader → texture, so a texture-tier anchor catches every material variant that selects that image as its albedo, while more specific anchors still win where present.
+
+#### Replacement anchor diagnostics
+
+When an authored enhancement does not appear (or appears intermittently), enable `rtx.logReplacementResolution = True` for one session and reproduce briefly. The log names the failing material and the drifting identity tier directly:
+
+- `[RTX-ReplacementResolve]`: how each material/mesh resolved against the mod's anchors (which lookup tier matched, or `NO MATCH`), plus a per-mod anchor dump at load.
+- `[RTX-ReplacementFlap]`: a material family that previously matched stopped matching (or vice versa) mid-session, with old/new hashes for every tier.
+- `[RTX-MicDrift]`: a material family minted a new identity, attributed to the tier that moved: per-sampler image hash diffs (with `desc:0x...` and RT flags) or changed constant registers with old/new values.
+- `[RTX-MicRtPoisoning]`: a material identity still embeds a render-target image hash (only possible with RT exclusion disabled).
+- `[RTX-MeshAnchorDrift]`: a mesh replacement key moved, attributed to its geometry part (unstable vertex data, e.g. CPU-morphed skinned meshes) vs its material part (mesh keys are `geometryHash XOR materialHash`).
+
+`rtx.replacementDebugHashes` tracks specific hashes in detail (matched against texture, material, textureSet+shader, geometry, and mesh-key hashes) without the full-scene log volume. Toggling enhanced assets on/off in the UI intentionally shows up as synchronised matched/`NO MATCH` flaps with unchanged hashes.
+
+### 5) Acknowledgements
+- sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
+- xoxor4d for their research into UE3 → Remix support and other tidbits of info that helped guide the initial work around this.
 - [Kim2091](https://github.com/Kim2091) and the Remix Plus community for the Numos atmosphere, SDK extensions, and fork-touchpoint architecture.
 
 ## Build instructions

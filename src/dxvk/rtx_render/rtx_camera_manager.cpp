@@ -115,6 +115,12 @@ namespace dxvk {
       cameraType = CameraType::RenderToTexture;
     } else if (input.testCategoryFlags(InstanceCategories::Sky)) {
       cameraType = CameraType::Sky;
+    } else if (input.testCategoryFlags(InstanceCategories::ViewModel)
+               && !input.testCategoryFlags(InstanceCategories::ThirdPersonPlayerModel)
+               && RtxOptions::ViewModel::enable()) {
+      // Categories are finalized before processCameraData. Player-model wins over ViewModel
+      // when both are set (e.g. shared material tagged viewModelTextures + playerModelGeometries).
+      cameraType = CameraType::ViewModel;
     } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
       cameraType = CameraType::ViewModel;
     }

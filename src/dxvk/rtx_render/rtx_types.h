@@ -649,6 +649,8 @@ enum class InstanceCategories : uint32_t {
   IgnoreTransparencyLayer,
   ParticleEmitter,
   SmoothNormals,
+  HairCards,
+  ViewModel,
 
   Count,
 };
@@ -764,6 +766,12 @@ struct DrawCallState {
   // Main camera: engine utility passes (e.g. shadow depth) upload light-space matrices through
   // those registers that can reconstruct as a plausible camera.
   bool allowMainCameraUpdate = true;
+
+  // Material identity hashes this draw would have produced under lightmap policy permutations
+  // that reference fewer material symbols; tried against the replacement database when the
+  // draw's own identity tiers miss (see rtx.d3d9.ue3LightmapPermutationBridgeLookup). Shared
+  // immutable list, memoized per material identity; null when inapplicable.
+  std::shared_ptr<const std::vector<XXH64_hash_t>> ue3LightmapPermutationAlternateHashes;
 
   // UE3 pass classification for diagnostics (points to a static string)
   const char* ue3PassDescription = "Unknown";
@@ -936,6 +944,10 @@ struct PooledBlas : public RcObject {
   // Keep a copy of the build info so we can validate BLAS update compatibility
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
   std::vector<uint32_t> primitiveCounts {};
+
+  // Hash of the index topology that was last built into this BLAS.
+  // Vulkan updates may change vertex positions, but not index values.
+  XXH64_hash_t topologyHash = kEmptyHash;
 
   // Content hash of the geometry data that was last built into this BLAS.
   // When the merged BLAS content (geometry addresses + primitive counts) is

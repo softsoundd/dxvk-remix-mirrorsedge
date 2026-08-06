@@ -26,6 +26,8 @@
 #include <sstream>
 #include <iomanip>
 #include <optional>
+#include <vector>
+#include <algorithm>
 #include <nvapi.h>
 #include <NVIDIASansMd.ttf.h>
 #include <NVIDIASansBd.ttf.h>
@@ -63,6 +65,7 @@
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
+#include "dxvk_imgui_first_use_guide.h"
 #include "dxvk_imgui_splash.h"
 #include "dxvk_imgui_capture.h"
 #include "rtx_render/rtx_option_layer_gui.h"
@@ -176,6 +179,7 @@ namespace dxvk {
 
   std::vector<RtxTextureOption> rtxTextureOptions = {
     {"uitextures", "UI Texture", &RtxOptions::uiTexturesObject()},
+    {"deferreduitextures", "Deferred UI Texture (overlay)", &RtxOptions::deferredUiTexturesObject()},
     {"worldspaceuitextures", "World Space UI Texture", &RtxOptions::worldSpaceUiTexturesObject()},
     {"worldspaceuibackgroundtextures", "World Space UI Background Texture", &RtxOptions::worldSpaceUiBackgroundTexturesObject()},
     {"skytextures", "Sky Texture", &RtxOptions::skyBoxTexturesObject()},
@@ -184,6 +188,7 @@ namespace dxvk {
     {"lightmaptextures","Lightmap Textures (optional)", &RtxOptions::lightmapTexturesObject()},
     {"ignorelights", "Ignore Lights (optional)", &RtxOptions::ignoreLightsObject()},
     {"particletextures", "Particle Texture (optional)", &RtxOptions::particleTexturesObject()},
+    {"haircardtextures", "Hair Cards Texture (optional)", &RtxOptions::hairCardTexturesObject()},
     {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
     {"ignoretransparencytextures", "Ignore Transparency Layer Texture (optional)", &RtxOptions::ignoreTransparencyLayerTexturesObject()},
     {"lightconvertertextures", "Add Light to Textures (optional)", &RtxOptions::lightConverterObject()},
@@ -194,6 +199,7 @@ namespace dxvk {
     {"motionBlurMaskOutTextures", "Motion Blur Mask-Out Textures (optional)", &RtxOptions::motionBlurMaskOutTexturesObject()},
     {"playermodeltextures", "Player Model Texture (optional)", &RtxOptions::playerModelTexturesObject()},
     {"playermodelbodytextures", "Player Model Body Texture (optional)", &RtxOptions::playerModelBodyTexturesObject()},
+    {"viewmodeltextures", "View Model Texture (optional)", &RtxOptions::viewModelTexturesObject()},
     {"opacitymicromapignoretextures", "Opacity Micromap Ignore Texture (optional)", &RtxOptions::opacityMicromapIgnoreTexturesObject()},
     {"ignorebakedlightingtextures","Ignore Baked Lighting Textures (optional)", &RtxOptions::ignoreBakedLightingTexturesObject()},
     {"ignorealphaontextures","Ignore Alpha Channel of Textures (optional)", &RtxOptions::ignoreAlphaOnTexturesObject()},
@@ -202,6 +208,13 @@ namespace dxvk {
     {"smoothnormalstextures","Smooth Normals (optional)", &RtxOptions::smoothNormalsTexturesObject()},
     {"preferredalbedotextures","Prefer As Albedo (optional)", &RtxOptions::preferredAlbedoTexturesObject()},
     {"neveralbedotextures","Never Albedo (optional)", &RtxOptions::neverAlbedoTexturesObject()}
+  };
+
+  // Geometry-hash categories (no thumbnails) — prefer when Mesh1p/Mesh3p share materials.
+  // Sky stays out: skyBoxGeometries still matches the asset-hash rule, not topology.
+  std::vector<RtxTextureOption> rtxGeometryOptions = {
+    {"viewmodelgeometries", "View Model Geometry (optional)", &RtxOptions::viewModelGeometriesObject()},
+    {"playermodelgeometries", "Player Model Geometry (optional)", &RtxOptions::playerModelGeometriesObject()},
   };
 
   RemixGui::ComboWithKey<RenderPassGBufferRaytraceMode> renderPassGBufferRaytraceModeCombo {
@@ -536,6 +549,7 @@ namespace dxvk {
   : m_device (device)
   , m_gameHwnd   (nullptr)
   , m_about  (new ImGuiAbout)
+  , m_firstUseGuide (new ImGuiFirstUseGuide)
   , m_splash  (new ImGuiSplash)
   , m_graphGUI  (new RtxGraphGUI) {
     // Set up constant state
@@ -792,6 +806,8 @@ namespace dxvk {
           RemixGui::SliderFloat("Metallic Bias", &OpaqueMaterialOptions::metallicBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
           RemixGui::SliderFloat("Roughness Scale", &OpaqueMaterialOptions::roughnessScaleObject(), 0.0f, 1.f, "%.3f", sliderFlags);
           RemixGui::SliderFloat("Roughness Bias", &OpaqueMaterialOptions::roughnessBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Hair Cards Mip Bias", &RtxOptions::hairCardMipBiasObject(), 0.25f, -32.0f, 16.0f, "%.2f", sliderFlags);
+          RemixGui::DragFloat("Hair Cards Roughness Scale", &RtxOptions::hairCardRoughnessScaleObject(), 0.01f, 0.0f, 4.0f, "%.3f", sliderFlags);
           RemixGui::SliderFloat("Normal Strength##1", &OpaqueMaterialOptions::normalIntensityObject(), -10.0f, 10.f, "%.3f", sliderFlags);
 
           RemixGui::Checkbox("Enable dual-layer animated water normal for Opaque", &OpaqueMaterialOptions::layeredWaterNormalEnableObject());
@@ -882,11 +898,6 @@ namespace dxvk {
   }
 
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
-    ImGui_ImplDxvk::NewFrame();
-    ImGui_ImplWin32_NewFrame();
-
-    ImGui::NewFrame();
-
     processHotkeys();
     updateQuickActions(ctx);
 
@@ -898,6 +909,17 @@ namespace dxvk {
 
     showDebugVisualizations(ctx);
 
+    // On first frame, check if the first-use guide should be shown (overrides loaded showUI).
+    {
+      static bool s_firstUseChecked = false;
+      if (!s_firstUseChecked) {
+        s_firstUseChecked = true;
+        if (ImGuiFirstUseGuide::shouldShow()) {
+          switchMenu(UIType::FirstUseGuide);
+        }
+      }
+    }
+
     const auto showUI = RtxOptions::showUI();
     if (showUI == UIType::Advanced) {
       showMainMenu(ctx);
@@ -906,6 +928,10 @@ namespace dxvk {
       //ImGui::ShowDemoWindow();
     } else if (showUI == UIType::Basic) {
       showUserMenu(ctx);
+    } else if (showUI == UIType::FirstUseGuide) {
+      if (m_firstUseGuide->show(m_boldFont)) {
+        switchMenu(UIType::None);
+      }
     }
     
     // Render any blocked edit popup warnings
@@ -934,10 +960,11 @@ namespace dxvk {
     showHudMessages(ctx);
 
 #ifdef REMIX_DEVELOPMENT
-    // Show visual indicator when crash hotkey is armed
+    // Show visual indicator when crash hotkeys are armed (one option arms both CPU and GPU crash hotkeys)
     if (RtxOptions::enableCrashHotkey()) {
-      const auto crashHotkeyStr = buildKeyBindDescriptorString(RtxOptions::crashHotkey());
-      const auto warningText = str::format("!! CRASH HOTKEY ARMED (", crashHotkeyStr, ") !!");
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
+      const auto warningText = str::format("!! CRASH HOTKEYS ARMED (", crashHotkeyStr, " = CPU crash, ", gpuCrashHotkeyStr, " = GPU crash) !!");
       const ImVec2 textSize = ImGui::CalcTextSize(warningText.c_str());
       const ImGuiViewport* viewport = ImGui::GetMainViewport();
       const ImVec2 textPos(viewport->Size.x - textSize.x - 10.0f, 10.0f);
@@ -1514,7 +1541,7 @@ namespace dxvk {
 
     ImGui::Separator();
 
-    { // Crash Hotkey Feature - allows triggering a deliberate crash for testing crash handling
+    { // Crash Hotkey Feature - arms both CPU crash (deliberate crash) and GPU crash (dialog + Sentry) hotkeys
       const bool isArmed = RtxOptions::enableCrashHotkey();
       
       // Use warning color when armed to make it visually distinct
@@ -1522,32 +1549,32 @@ namespace dxvk {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
       }
       
-      // ImGui::Checkbox returns true when the checkbox state changes
       const bool changed = RemixGui::Checkbox("Arm Crash Hotkey", &RtxOptions::enableCrashHotkeyObject());
       
       if (isArmed) {
         ImGui::PopStyleColor();
       }
       
-      const auto crashHotkeyStr = buildKeyBindDescriptorString(RtxOptions::crashHotkey());
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
       RemixGui::SetTooltipToLastWidgetOnHover(
-        str::format("When armed, pressing ", crashHotkeyStr, " will trigger a deliberate crash.\n"
-        "Useful for testing crash handling, crash dumps, and crash reporting.\n"
+        str::format("When armed: ", crashHotkeyStr, " = deliberate CPU crash; ", gpuCrashHotkeyStr, " = deliberate GPU crash.\n"
         "A red warning indicator will appear on screen while armed.").c_str());
       
       // Log state changes for crash dump analysis
       if (changed) {
         const bool nowArmed = RtxOptions::enableCrashHotkey();
         if (nowArmed) {
-          Logger::warn(str::format("Crash hotkey ARMED - press ", crashHotkeyStr, " to trigger crash"));
+          Logger::warn(str::format("Crash hotkeys ARMED - ", crashHotkeyStr, " = CPU crash, ", gpuCrashHotkeyStr, " = GPU crash"));
         } else {
-          Logger::warn("Crash hotkey disarmed");
+          Logger::warn("Crash hotkeys disarmed");
         }
       }
     }
+    
+    RemixGui::Separator();
 #endif
 
-    RemixGui::Separator();
 
     showVsyncOptions(false);
 
@@ -2006,6 +2033,33 @@ namespace dxvk {
       return str.str();
     }
 
+    std::string buildTextureCategoryTooltip(const RtxTextureOption& category,
+                                            std::optional<XXH64_hash_t> texHash = std::nullopt) {
+      if (!category.textureSetOption) {
+        assert(false && "Texture category is missing an RTX option.");
+        return category.displayName;
+      }
+
+      std::string tooltipText;
+      const char* description = category.textureSetOption->getDescription();
+      if (description && description[0] != '\0') {
+        tooltipText = description;
+        tooltipText += "\n\n";
+      }
+
+      tooltipText += category.textureSetOption->getFullName();
+
+      if (texHash.has_value()) {
+        std::string layerValues = RemixGui::FormatOptionLayerValues(category.textureSetOption, texHash, false);
+        if (!layerValues.empty()) {
+          tooltipText += "\n\nPer-layer status for this hash:\n";
+          tooltipText += layerValues;
+        }
+      }
+
+      return tooltipText;
+    }
+
     float computeTexturePopupLabelColumnWidth(uint32_t textureFeatureFlags) {
       float maxWidth = 0.0f;
       for (const auto& rtxOption : rtxTextureOptions) {
@@ -2098,8 +2152,25 @@ namespace dxvk {
             return category.textureSetOption;
           }
         }
+        for (RtxTextureOption& category : rtxGeometryOptions) {
+          if (strcmp(category.uniqueId, uniqueId) == 0) {
+            return category.textureSetOption;
+          }
+        }
       }
       return nullptr;
+    }
+
+    bool isGeometryCategoryId(const char* uniqueId) {
+      if (!uniqueId) {
+        return false;
+      }
+      for (const RtxTextureOption& category : rtxGeometryOptions) {
+        if (strcmp(category.uniqueId, uniqueId) == 0) {
+          return true;
+        }
+      }
+      return false;
     }
 
     namespace texture_popup {
@@ -2113,6 +2184,7 @@ namespace dxvk {
       // need to keep a reference to a texture that was passed to 'open()',
       // as 'open()' is called only once, but popup needs to reference that texture throughout open-close
       std::atomic<XXH64_hash_t> g_holdingTexture {};
+      std::atomic<XXH64_hash_t> g_holdingGeometry {};
       bool g_openWhenAvailable {};
 
       void openImguiPopupOrToggle() {
@@ -2124,18 +2196,27 @@ namespace dxvk {
         g_wasLeftClick = false;
 
         if (toggleWithoutPopup) {
-          if (auto textureSet = findTextureSetByUniqueId(lastOpenCategoryId.c_str())) {
-            toggleTextureSelection(g_holdingTexture.load(),
-                                   lastOpenCategoryId.c_str(),
-                                   textureSet);
+          const bool geometryCategory = isGeometryCategoryId(lastOpenCategoryId.c_str());
+          const XXH64_hash_t hashToToggle = geometryCategory
+            ? g_holdingGeometry.load()
+            : g_holdingTexture.load();
+          // Geometry categories only toggle from world picks (holding a geometry hash).
+          // Texture-thumbnail clicks leave geometry empty — fall through to the popup.
+          if (!geometryCategory || hashToToggle != kEmptyHash) {
+            if (auto textureSet = findTextureSetByUniqueId(lastOpenCategoryId.c_str())) {
+              toggleTextureSelection(hashToToggle,
+                                     lastOpenCategoryId.c_str(),
+                                     textureSet);
+              return;
+            }
           }
-        } else {
-          ImGui::OpenPopup(POPUP_NAME);
         }
+        ImGui::OpenPopup(POPUP_NAME);
       }
 
-      void open(std::optional<XXH64_hash_t> texHash) {
+      void open(std::optional<XXH64_hash_t> texHash, std::optional<XXH64_hash_t> geoHash = std::nullopt) {
         g_holdingTexture.exchange(texHash.value_or(kEmptyHash));
+        g_holdingGeometry.exchange(geoHash.value_or(kEmptyHash));
         g_openWhenAvailable = false;
         // no need to wait, open immediately
         openImguiPopupOrToggle();
@@ -2143,6 +2224,7 @@ namespace dxvk {
 
       void openAsync() {
         g_holdingTexture.exchange(kEmptyHash);
+        g_holdingGeometry.exchange(kEmptyHash);
         g_openWhenAvailable = true;
       }
 
@@ -2153,9 +2235,9 @@ namespace dxvk {
       // Returns a texture hash that it holds, if the popup is opened.
       // Must be called every frame.
       std::optional<XXH64_hash_t> produce(SceneManager& sceneMgr) {
-        // delayed open, if waiting async to set g_holdingTexture
+        // delayed open, if waiting async to set g_holdingTexture / g_holdingGeometry
         if (g_openWhenAvailable) {
-          if (g_holdingTexture.load() != kEmptyHash) {
+          if (g_holdingTexture.load() != kEmptyHash || g_holdingGeometry.load() != kEmptyHash) {
             openImguiPopupOrToggle();
             g_openWhenAvailable = false;
           }
@@ -2163,13 +2245,20 @@ namespace dxvk {
 
         const XXH64_hash_t texHashForSizing = g_holdingTexture.load();
         float texturePopupLabelColumnW = 0.0f;
-        if (texHashForSizing != kEmptyHash) {
+        {
           uint32_t textureFeatureFlagsForSizing = 0;
-          const auto pairForSizing = g_imguiTextureMap.find(texHashForSizing);
-          if (pairForSizing != g_imguiTextureMap.end()) {
-            textureFeatureFlagsForSizing = pairForSizing->second.textureFeatureFlags;
+          if (texHashForSizing != kEmptyHash) {
+            const auto pairForSizing = g_imguiTextureMap.find(texHashForSizing);
+            if (pairForSizing != g_imguiTextureMap.end()) {
+              textureFeatureFlagsForSizing = pairForSizing->second.textureFeatureFlags;
+            }
           }
           texturePopupLabelColumnW = computeTexturePopupLabelColumnWidth(textureFeatureFlagsForSizing);
+          for (const auto& geoOption : rtxGeometryOptions) {
+            const std::string labelForWidth = std::string(geoOption.displayName) + " [!]";
+            texturePopupLabelColumnW = ImMax(texturePopupLabelColumnW,
+                                             ImGui::CalcTextSize(labelForWidth.c_str()).x + ImGui::GetStyle().FramePadding.x * 2.0f);
+          }
           if (ImGui::IsPopupOpen(POPUP_NAME, ImGuiPopupFlags_None)) {
             const ImGuiStyle& sizingStyle = ImGui::GetStyle();
             const float minPopupW =
@@ -2180,64 +2269,109 @@ namespace dxvk {
 
         if (ImGui::BeginPopup(POPUP_NAME)) {
           const XXH64_hash_t texHash = g_holdingTexture.load();
-          if (texHash != kEmptyHash) {
-            ImGui::Text("Texture Info:\n%s", makeTextureInfo(texHash, isMaterialReplacement(sceneMgr, texHash), false).c_str());
-            if (ImGui::Button("Copy Texture hash##texture_popup")) {
-              ImGui::SetClipboardText(hashToString(texHash).c_str());
+          const XXH64_hash_t geoHash = g_holdingGeometry.load();
+          if (texHash != kEmptyHash || geoHash != kEmptyHash) {
+            if (texHash != kEmptyHash) {
+              ImGui::Text("Texture Info:\n%s", makeTextureInfo(texHash, isMaterialReplacement(sceneMgr, texHash), false).c_str());
+              if (ImGui::Button("Copy Texture hash##texture_popup")) {
+                ImGui::SetClipboardText(hashToString(texHash).c_str());
+              }
             }
+            if (geoHash != kEmptyHash) {
+              if (texHash != kEmptyHash) {
+                ImGui::Separator();
+              }
+              ImGui::Text("Geometry Hash:\n%s", hashToString(geoHash).c_str());
+              if (ImGui::Button("Copy Geometry hash##texture_popup")) {
+                ImGui::SetClipboardText(hashToString(geoHash).c_str());
+              }
+            }
+
             uint32_t textureFeatureFlags = 0;
-            const auto& pair = g_imguiTextureMap.find(texHash);
-            if (pair != g_imguiTextureMap.end()) {
-              textureFeatureFlags = pair->second.textureFeatureFlags;
+            if (texHash != kEmptyHash) {
+              const auto& pair = g_imguiTextureMap.find(texHash);
+              if (pair != g_imguiTextureMap.end()) {
+                textureFeatureFlags = pair->second.textureFeatureFlags;
+              }
             }
             RemixGui::PushLabelColumnFixedWidth(texturePopupLabelColumnW);
-            for (auto& rtxOption : rtxTextureOptions) {
-              rtxOption.bufferToggle = rtxOption.textureSetOption->containsHash(texHash);
-              if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
-                // option requires a feature, but the texture doesn't have that feature.
-                continue;
-              }
-              
-              // Quick check for blocking layer (need this for display name)
-              bool hasBlockingLayer = false;
-              const RtxOptionLayer* targetLayer = rtxOption.textureSetOption->getTargetLayer();
-              if (targetLayer) {
-                hasBlockingLayer = rtxOption.textureSetOption->getBlockingLayer(targetLayer, texHash) != nullptr;
-              }
-              
-              // Build display name with warning indicator if hash is blocked by higher priority layer
-              std::string displayName = rtxOption.displayName;
-              if (hasBlockingLayer) {
-                displayName = std::string(rtxOption.displayName) + " [!]";
-              }
 
-              if (RemixGui::Checkbox(displayName.c_str(), &rtxOption.bufferToggle)) {
-                toggleTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption);
-              }
-              
-              // Only build the expensive tooltip when this item is actually hovered
-              if (ImGui::IsItemHovered()) {
-                std::ostringstream tooltipStream;
-                tooltipStream << rtxOption.textureSetOption->getDescription() << "\n";
-                
-                std::string layerValues = RemixGui::FormatOptionLayerValues(rtxOption.textureSetOption, texHash, false);
-                if (!layerValues.empty()) {
-                  tooltipStream << "\nPer-layer status for this hash:\n" << layerValues;
+            if (texHash != kEmptyHash) {
+              ImGui::Separator();
+              ImGui::TextUnformatted("Texture Categories");
+              for (auto& rtxOption : rtxTextureOptions) {
+                rtxOption.bufferToggle = rtxOption.textureSetOption->containsHash(texHash);
+                if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
+                  continue;
                 }
-                
-                ImGui::SetTooltip("%s", tooltipStream.str().c_str());
+
+                bool hasBlockingLayer = false;
+                const RtxOptionLayer* targetLayer = rtxOption.textureSetOption->getTargetLayer();
+                if (targetLayer) {
+                  hasBlockingLayer = rtxOption.textureSetOption->getBlockingLayer(targetLayer, texHash) != nullptr;
+                }
+
+                std::string displayName = rtxOption.displayName;
+                if (hasBlockingLayer) {
+                  displayName = std::string(rtxOption.displayName) + " [!]";
+                }
+
+                const bool toggleChanged = RemixGui::Checkbox(displayName.c_str(), &rtxOption.bufferToggle);
+                const bool showTooltip = ImGui::IsItemHovered();
+
+                if (toggleChanged) {
+                  toggleTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption);
+                }
+
+                if (showTooltip) {
+                  std::string tooltipText = buildTextureCategoryTooltip(rtxOption, texHash);
+                  RemixGui::SetTooltipUnformatted(tooltipText.c_str());
+                }
               }
             }
+
+            if (geoHash != kEmptyHash) {
+              ImGui::Separator();
+              ImGui::TextUnformatted("Geometry Categories");
+              for (auto& geoOption : rtxGeometryOptions) {
+                geoOption.bufferToggle = geoOption.textureSetOption->containsHash(geoHash);
+
+                bool hasBlockingLayer = false;
+                const RtxOptionLayer* targetLayer = geoOption.textureSetOption->getTargetLayer();
+                if (targetLayer) {
+                  hasBlockingLayer = geoOption.textureSetOption->getBlockingLayer(targetLayer, geoHash) != nullptr;
+                }
+
+                std::string displayName = geoOption.displayName;
+                if (hasBlockingLayer) {
+                  displayName = std::string(geoOption.displayName) + " [!]";
+                }
+
+                const bool toggleChanged = RemixGui::Checkbox(displayName.c_str(), &geoOption.bufferToggle);
+                const bool showTooltip = ImGui::IsItemHovered();
+
+                if (toggleChanged) {
+                  toggleTextureSelection(geoHash, geoOption.uniqueId, geoOption.textureSetOption);
+                }
+
+                if (showTooltip) {
+                  std::string tooltipText = buildTextureCategoryTooltip(geoOption, geoHash);
+                  RemixGui::SetTooltipUnformatted(tooltipText.c_str());
+                }
+              }
+            }
+
             RemixGui::PopLabelColumnFixedWidth();
 
             ImGui::EndPopup();
-            return texHash;
+            return texHash != kEmptyHash ? std::optional<XXH64_hash_t>{ texHash } : std::nullopt;
           }
           ImGui::EndPopup();
           return {};
         } else {
-          // popup is closed, forget texture
+          // popup is closed, forget hashes
           g_holdingTexture.exchange(kEmptyHash);
+          g_holdingGeometry.exchange(kEmptyHash);
           return {};
         }
       }
@@ -2469,10 +2603,10 @@ namespace dxvk {
           tovec2i(ImGui::GetMousePos()) + Vector2i { 1, 1 },
 
           // and callback on result:
-          [](std::vector<ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t> legacyTextureHash) {
-            // assert(legacyTextureHash);
-            // found asynchronously the legacy texture hash, place it into texture_popup; so we would highlight it
+          [](std::vector<ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t> legacyTextureHash,
+             std::optional<XXH64_hash_t> geometryHash) {
             texture_popup::g_holdingTexture.exchange(legacyTextureHash.value_or(kEmptyHash));
+            texture_popup::g_holdingGeometry.exchange(geometryHash.value_or(kEmptyHash));
             // move UI menu focus
             g_jumpto.exchange(legacyTextureHash.value_or(kEmptyHash));
           });
@@ -2680,6 +2814,14 @@ namespace dxvk {
               break;
             }
           }
+          if (!hasTexturesInUserConf) {
+            for (const auto& rtxOption : rtxGeometryOptions) {
+              if (rtxOption.textureSetOption && rtxOption.textureSetOption->hasValueInLayer(userLayer)) {
+                hasTexturesInUserConf = true;
+                break;
+              }
+            }
+          }
         }
         
         if (hasTexturesInUserConf) {
@@ -2693,6 +2835,11 @@ namespace dxvk {
             RtxOptionLayer* rtxConfLayer = RtxOptionLayer::getRtxConfLayer();
             if (rtxConfLayer) {
               for (auto& rtxOption : rtxTextureOptions) {
+                if (rtxOption.textureSetOption) {
+                  rtxOption.textureSetOption->moveLayerValue(userLayer, rtxConfLayer);
+                }
+              }
+              for (auto& rtxOption : rtxGeometryOptions) {
                 if (rtxOption.textureSetOption) {
                   rtxOption.textureSetOption->moveLayerValue(userLayer, rtxConfLayer);
                 }
@@ -2760,6 +2907,58 @@ namespace dxvk {
           showLegacyGui(category.uniqueId, category.displayName, RemixGui::BuildRtxOptionTooltip(category.textureSetOption).c_str());
         }
 
+        ImGui::Separator();
+        ImGui::TextUnformatted("Geometry Categories");
+        ImGui::TextWrapped("Click an object to tag, or activate a category below and left-click to toggle.");
+
+        for (const RtxTextureOption& category : rtxGeometryOptions) {
+          std::string categoryTooltip = buildTextureCategoryTooltip(category);
+          const bool isForToggle = (texture_popup::lastOpenCategoryId == category.uniqueId);
+          if (isForToggle) {
+            ImGui::PushStyleColor(ImGuiCol_Header, ImVec4 { 0.996078f, 0.329412f, 0.f, 1.f });
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4 { 0.996078f, 0.329412f, 0.f, 1.f });
+          }
+
+          const auto& hashes = category.textureSetOption->get();
+          const bool empty = hashes.empty();
+          if (empty && legacyTextureGuiShowAssignedOnly()) {
+            ImGui::BeginDisabled(true);
+            const auto label = std::string(category.displayName) + " [Empty]";
+            RemixGui::CollapsingHeader(label.c_str(), collapsingHeaderClosedFlags);
+            ImGui::EndDisabled();
+          } else if (IMGUI_ADD_TOOLTIP(RemixGui::CollapsingHeader(category.displayName, collapsingHeaderClosedFlags), categoryTooltip.c_str())) {
+            if (ImGui::IsItemToggledOpen() || texture_popup::lastOpenCategoryId.empty()) {
+              texture_popup::lastOpenCategoryId = category.uniqueId;
+            }
+            texture_popup::lastOpenCategoryActive = true;
+
+            if (hashes.empty()) {
+              ImGui::TextDisabled("No geometry hashes assigned. Click an object to tag.");
+            } else {
+              // Snapshot keys so remove during iteration is safe.
+              std::vector<XXH64_hash_t> assigned(hashes.begin(), hashes.end());
+              std::sort(assigned.begin(), assigned.end());
+              for (XXH64_hash_t geoHash : assigned) {
+                ImGui::PushID(static_cast<int>(geoHash ^ (geoHash >> 32)));
+                ImGui::TextUnformatted(hashToString(geoHash).c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Copy")) {
+                  ImGui::SetClipboardText(hashToString(geoHash).c_str());
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) {
+                  toggleTextureSelection(geoHash, category.uniqueId, category.textureSetOption);
+                }
+                ImGui::PopID();
+              }
+            }
+          }
+
+          if (isForToggle) {
+            ImGui::PopStyleColor(2);
+          }
+        }
+
         // Check if last saved category was closed this frame
         if (!texture_popup::lastOpenCategoryActive) {
           texture_popup::lastOpenCategoryId.clear();
@@ -2795,6 +2994,7 @@ namespace dxvk {
         RemixGui::Checkbox("Allow Cubemaps", &D3D9Rtx::allowCubemapsObject());
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
         RemixGui::Checkbox("Skip Sky Fog Values", &RtxOptions::fogIgnoreSkyObject());
+        RemixGui::Checkbox("Recompute Texture Hash On Write", &RtxOptions::recomputeTextureHashOnWriteObject());
         ImGui::Unindent();
       }
 
@@ -2811,6 +3011,7 @@ namespace dxvk {
         ImGui::Indent();
         RemixGui::Checkbox("Capture Vertices from Shader", &D3D9Rtx::useVertexCaptureObject());
         RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
+        RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
         RemixGui::Separator();
         RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
         ImGui::Unindent();
@@ -4117,6 +4318,12 @@ namespace dxvk {
       ImGui::Indent();
       RemixGui::Checkbox("Primary Shadows", &RtxOptions::PlayerModel::enablePrimaryShadowsObject());
       RemixGui::Checkbox("Show in Primary Space", &RtxOptions::PlayerModel::enableInPrimarySpaceObject());
+      RemixGui::Checkbox("Auto Show in Primary Space (No View Model)",
+                        &RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModelObject());
+      if (ImGui::IsItemHovered()) {
+        RemixGui::SetTooltipUnformatted(
+          "Shows player-model geometry on primary rays when no ViewModel camera was submitted this frame.");
+      }
       RemixGui::Checkbox("Create Virtual Instances", &RtxOptions::PlayerModel::enableVirtualInstancesObject());
       if (RemixGui::CollapsingHeader("Calibration", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -4224,18 +4431,19 @@ namespace dxvk {
     ImGui::PopItemWidth();
   }
 
-  void ImGUI::render(
-    const HWND gameHwnd,
-    const Rc<DxvkContext>& ctx,
-    VkExtent2D         surfaceSize,
-    bool               vsync) {
+  void ImGUI::render(const Rc<DxvkContext>& ctx, VkExtent2D surfaceSize) {
     ScopedGpuProfileZone(ctx, "ImGUI Render");
+
+    const HWND gameHwnd = ctx->getCommonObjects()->getLastKnownWindowHandle();
+    
+    // We need a window to render the GUI and for input to work correctly
+    if (gameHwnd == 0) {
+      return;
+    }
 
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->update(gameHwnd);
     }
-
-    m_lastRenderVsyncStatus = vsync;
 
     ImGui::SetCurrentContext(m_context);
     ImPlot::SetCurrentContext(m_plotContext);
@@ -4260,11 +4468,17 @@ namespace dxvk {
       m_init = true;
     }
 
+    ImGui_ImplDxvk::NewFrame();
+    ImGui_ImplWin32_NewFrame(); 
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
+
+    ImGui::NewFrame();
+
     update(ctx);
 
     ImGui_ImplDxvk::RenderDrawData(ImGui::GetDrawData(), ctx.ptr(), surfaceSize.width, surfaceSize.height);
-
-    ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, 0, 0);
   }
 
   void ImGUI::createFontsTexture(const Rc<DxvkContext>& ctx) {
