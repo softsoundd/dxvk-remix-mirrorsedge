@@ -75,13 +75,7 @@ show fog
 
 ### 3) Remix Plus features (Numos atmosphere, SDK API, tonemap)
 
-This fork also integrates the [Remix Plus](https://github.com/RemixProjGroup/dxvk-remix) extended feature set:
-
-- **Numos sky system** — Hillaire atmospheric scattering, volumetric clouds, night sky, multi-moon, and weather presets (`rtx.skyMode = 1`). Replaces the earlier `PhysicalAtmosphere` name; the integer value is unchanged.
-- **ME sky-view LUT perf** — `rtx.atmosphere.useSkyViewLut` (default `True`) keeps the Mirror's Edge atmosphere performance optimization on top of Numos.
-- **Tonemap operators** — eight operators (ACES, AgX, GT7, Hable, etc.) with perceptual auto-exposure.
-- **Remix SDK API v0.1000.0** — batched mesh/light creation, `SetGameValue`, VRAM control, HW skinning, and related plugin integrations.
-- **Fork-touchpoint architecture** — Plus features live in `rtx_fork_*.cpp` modules; see [`docs/fork-touchpoints.md`](docs/fork-touchpoints.md) and [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for dual-upstream merge workflow (NVIDIA `dxvk-remix` + Remix Plus).
+This fork also integrates the [Remix Plus](https://github.com/RemixProjGroup/dxvk-remix) extended feature set. Plus features live in `rtx_fork_*.cpp` modules; see [`docs/fork-touchpoints.md`](docs/fork-touchpoints.md) and [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for dual-upstream merge workflow (NVIDIA `dxvk-remix` + Remix Plus).
 
 For weather presets and sky API details, see [`docs/RemixSkyAPI.md`](docs/RemixSkyAPI.md) and [`docs/CloudSystem.md`](docs/CloudSystem.md).
 
@@ -110,7 +104,7 @@ When an authored enhancement does not appear (or appears intermittently), enable
 ### 5) Acknowledgements
 - sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
 - xoxor4d for their research into UE3 → Remix support and other tidbits of info that helped guide the initial work around this.
-- [Kim2091](https://github.com/Kim2091) and the Remix Plus community for the Numos atmosphere, SDK extensions, and fork-touchpoint architecture.
+- [Kim2091](https://github.com/Kim2091) and the Remix Plus community.
 
 ## Build instructions
 
