@@ -225,6 +225,30 @@ namespace dxvk {
       return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
     }
 
+    // True if the VkFormat is an sRGB-encoded color format, meaning the sampler hardware performs the
+    // sRGB->linear conversion automatically on read. Used to skip the shader's software gamma correction
+    // for such textures (see OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB). Mirrors the set of
+    // formats produced by toSRGB(), plus the BC1 RGBA and BC2 sRGB blocks.
+    static inline bool isSRGB(const VkFormat format) {
+      switch (format) {
+      case VK_FORMAT_R8_SRGB:
+      case VK_FORMAT_R8G8_SRGB:
+      case VK_FORMAT_R8G8B8_SRGB:
+      case VK_FORMAT_B8G8R8_SRGB:
+      case VK_FORMAT_R8G8B8A8_SRGB:
+      case VK_FORMAT_B8G8R8A8_SRGB:
+      case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+      case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+      case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+      case VK_FORMAT_BC2_SRGB_BLOCK:
+      case VK_FORMAT_BC3_SRGB_BLOCK:
+      case VK_FORMAT_BC7_SRGB_BLOCK:
+        return true;
+      default:
+        return false;
+      }
+    }
+
     static inline bool isLDR(const VkFormat format) {
       return (isBC(format) && format != VK_FORMAT_BC6H_UFLOAT_BLOCK &&
              format != VK_FORMAT_BC6H_SFLOAT_BLOCK) || format < VK_FORMAT_A2R10G10B10_UNORM_PACK32;

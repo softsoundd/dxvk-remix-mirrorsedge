@@ -500,6 +500,13 @@ namespace dxvk {
 
     compositeArgs.domeLightArgs = domeLightArgs;
     compositeArgs.skyBrightness = RtxOptions::skyBrightness();
+    // Cloud-shadow composite application removed 2026-06-19 (fork). The
+    // screen-space PrimaryCloudShadowFactor texture and the pow(factor,
+    // cloudShadowFactorStrength) multiply on post-denoise primary direct radiance
+    // were deleted when the cloud shadow moved onto the sun term in the NEE
+    // (atmosphere_common.slangh). The contrast knob is now populated into
+    // atmosphereArgs (rtx_atmosphere.cpp). composite_args.h::pad1/pad2 are the
+    // retired cloudShadowFactorStrength / cloudShadowIndirectStrength CB slots.
 
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
 

@@ -59,6 +59,9 @@ namespace dxvk {
   // Forward declarations of fork_hooks functions that require friend access to
   // RtxContext private members, so the friend declarations inside the class body
   // can name them. See rtx_fork_hooks.h for the full hook catalogue.
+  // Note: Resources::RaytracingOutput is fully defined via #include "rtx_resources.h"
+  // above; RtxContext is forward-declared here so the fork_hooks signatures compile
+  // before the class definition is encountered.
   class RtxContext;
   namespace fork_weather {
     class WeatherBlender;
@@ -69,15 +72,36 @@ namespace dxvk {
     void bindAtmosphereLuts(RtxContext&);
     void dispatchScreenOverlay(RtxContext&, Resources::RaytracingOutput&);
     void updateWeatherBlender(RtxContext& ctx, float deltaTimeSeconds);
+    bool isFsrUpscalerActive(RtxContext&);
+    void dispatchFsrUpscale(RtxContext&, const Resources::RaytracingOutput&);
+    void dispatchRcasSharpening(RtxContext&, const Resources::RaytracingOutput&);
+    void dispatchFsrFrameGeneration(RtxContext&, const Rc<DxvkImage>& hudLessBackBuffer);
+    void setFsrDownscaleExtent(RtxContext&, const VkExtent3D& upscaleExtent, VkExtent3D& downscaleExtent);
+    // Returns the per-frame cloud-occluded sky-ambient transmittance LUT, or an
+    // invalid Resource if the atmosphere has not been initialized yet. Used by
+    // the debug view to bind the LUT into its pass-local descriptor set.
     Resources::Resource getCloudSkyTransmittanceLut(RtxContext& ctx);
+    // Returns the Nubis Cubed sun-direction / zenith cloud optical-depth voxel
+    // grids. Lazy-initialized on demand; returns an invalid Resource if the
+    // atmosphere has not been initialized yet. Used by the cloud voxel-grid
+    // debug views to bind the 3D textures into their pass-local descriptor sets.
     Resources::Resource getCloudDSun(RtxContext& ctx);
     Resources::Resource getCloudDAmbient(RtxContext& ctx);
+    // Returns the published cloud NVDF SDF (fork — Nubis3 conversion Phase A):
+    // the tile-periodic signed distance field of the cloud body, raw km,
+    // negative inside. Lazy-initialized on demand like the voxel grids. Used
+    // by the NVDF SDF slice debug view (enum 879).
+    Resources::Resource getCloudNvdfSdf(RtxContext& ctx);
+    // Returns the per-frame Nubis Cubed cloud render RT (fork — 2026-05-12,
+    // C4). Lazy-initialized on demand; the resource becomes valid once
+    // ensureCloudRenderRT has run during updateAtmosphereConstants. Used by
+    // the cloud-render-RT debug view (enum 876).
     Resources::Resource getCloudRenderRT(RtxContext& ctx);
   } // namespace fork_hooks
 
-  /** 
+  /**
    * \brief RTX context
-   * 
+   *
    * Tracks pipeline state and records command lists.
    * This is where the actual rendering commands are
    * recorded.
@@ -137,6 +161,10 @@ namespace dxvk {
     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
     void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
 
+    // Queue a pixel buffer to be alpha-composited over the final tone-mapped image in the next frame.
+    // Used by remixapi_DrawScreenOverlay. Ownership of stagingBuffer transfers here.
+    void setScreenOverlayData(Rc<DxvkBuffer> stagingBuffer, uint32_t width, uint32_t height, VkFormat format, float opacity);
+
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
     virtual void flushCommandList() override;
@@ -147,8 +175,6 @@ namespace dxvk {
     static void triggerScreenshot() { s_triggerScreenshot = true; }
     static void triggerUsdCapture() { s_triggerUsdCapture = true; }
 
-    // Used by remixapi_DrawScreenOverlay. Ownership of stagingBuffer transfers here.
-    void setScreenOverlayData(Rc<DxvkBuffer> stagingBuffer, uint32_t width, uint32_t height, VkFormat format, float opacity);
 
     void bindCommonRayTracingResources(const Resources::RaytracingOutput& rtOutput);
 
@@ -197,6 +223,7 @@ namespace dxvk {
       NIS,
       TAAU,
       XeSS,
+      FSR,
       DLSS_RR,
     };
 
@@ -272,7 +299,7 @@ namespace dxvk {
     bool shouldUseNIS() const;
     bool shouldUseTAA() const;
     bool shouldUseXeSS() const;
-    bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS(); }
+    bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS() || RtxOptions::isFSREnabled(); }
 
     inline static bool s_triggerScreenshot = false;
     inline static bool s_triggerUsdCapture = false;
@@ -340,6 +367,10 @@ namespace dxvk {
     RtxFramePassStage m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
 
+    // Grant fork_hooks functions access to private members they require.
+    // Each friend corresponds to a hook that was lifted out of this class's
+    // method bodies during the 2026-04-18 fork touchpoint-pattern refactor.
+    // See docs/fork-touchpoints.md and rtx_fork_hooks.h for the catalogue.
     friend void fork_hooks::initAtmosphere(RtxContext&);
     friend void fork_hooks::updateAtmosphereConstants(RtxContext&, RaytraceArgs&);
     friend void fork_hooks::bindAtmosphereLuts(RtxContext&);
@@ -348,6 +379,12 @@ namespace dxvk {
     friend Resources::Resource fork_hooks::getCloudSkyTransmittanceLut(RtxContext& ctx);
     friend Resources::Resource fork_hooks::getCloudDSun(RtxContext& ctx);
     friend Resources::Resource fork_hooks::getCloudDAmbient(RtxContext& ctx);
+    friend Resources::Resource fork_hooks::getCloudNvdfSdf(RtxContext& ctx);
     friend Resources::Resource fork_hooks::getCloudRenderRT(RtxContext& ctx);
+    friend bool fork_hooks::isFsrUpscalerActive(RtxContext&);
+    friend void fork_hooks::dispatchFsrUpscale(RtxContext&, const Resources::RaytracingOutput&);
+    friend void fork_hooks::dispatchRcasSharpening(RtxContext&, const Resources::RaytracingOutput&);
+    friend void fork_hooks::dispatchFsrFrameGeneration(RtxContext&, const Rc<DxvkImage>&);
+    friend void fork_hooks::setFsrDownscaleExtent(RtxContext&, const VkExtent3D&, VkExtent3D&);
   };
 } // namespace dxvk

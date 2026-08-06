@@ -4215,8 +4215,14 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_module.setDebugName(useCustom, "custom_vertex_transform_enabled");
       m_module.decorateSpecId(useCustom, getSpecId(D3D9SpecConstantId::CustomVertexTransformEnabled));
 
-      // Explicit select (result vec4, scalar bool condition)
-      const uint32_t chosenPos = m_module.opSelect(vec4TypeId, useCustom, projPosId, oldPos);
+      // OpSelect with scalar bool condition + vector Result Type is only legal
+      // in SPIR-V 1.4+. Broadcast to bvec4 to stay valid in older modules.
+      const uint32_t bool_t = m_module.defBoolType();
+      const uint32_t bvec4_t = m_module.defVectorType(bool_t, 4);
+      const std::array<uint32_t, 4> useCustomComps = { useCustom, useCustom, useCustom, useCustom };
+      const uint32_t useCustomVec = m_module.opCompositeConstruct(bvec4_t, useCustomComps.size(), useCustomComps.data());
+
+      const uint32_t chosenPos = m_module.opSelect(vec4TypeId, useCustomVec, projPosId, oldPos);
       m_module.opStore(m_vs.oPos.id, chosenPos);
     }
 
@@ -4239,8 +4245,14 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_module.setDebugName(jitterOn, "clip_space_jitter_enabled");
       m_module.decorateSpecId(jitterOn, getSpecId(D3D9SpecConstantId::ClipSpaceJitterEnabled));
 
-      // Explicit select
-      const uint32_t finalPos = m_module.opSelect(vec4TypeId, jitterOn, jittered, pos0);
+      // Broadcast scalar condition to bvec4 (see custom-transform select above
+      // for the SPIR-V version rationale).
+      const uint32_t bool_t = m_module.defBoolType();
+      const uint32_t bvec4_t = m_module.defVectorType(bool_t, 4);
+      const std::array<uint32_t, 4> jitterOnComps = { jitterOn, jitterOn, jitterOn, jitterOn };
+      const uint32_t jitterOnVec = m_module.opCompositeConstruct(bvec4_t, jitterOnComps.size(), jitterOnComps.data());
+
+      const uint32_t finalPos = m_module.opSelect(vec4TypeId, jitterOnVec, jittered, pos0);
       m_module.opStore(m_vs.oPos.id, finalPos);
     }
   }

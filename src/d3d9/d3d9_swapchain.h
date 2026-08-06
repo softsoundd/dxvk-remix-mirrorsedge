@@ -39,6 +39,7 @@
 namespace dxvk {
 
   class D3D9Surface;
+  class DxvkFSRFGPresenter;
 
   using D3D9SwapChainExBase = D3D9DeviceChild<IDirect3DSwapChain9Ex>;
   class D3D9SwapChainEx : public D3D9SwapChainExBase {
@@ -148,6 +149,12 @@ namespace dxvk {
 
     // NV-DXVK begin: DLFG integration
     Rc <DxvkDLFGPresenter>    m_dlfgPresenter;
+    // NV-DXVK end
+
+    // NV-DXVK begin: FSR FG integration
+    Rc <DxvkFSRFGPresenter>   m_fsrfgPresenter;
+    // Null-tolerant sibling of GetPresenter; see d3d9_swapchain.cpp.
+    vk::Presenter* GetActivePresenterOrNull() const;
     // NV-DXVK end
 
     Rc<hud::Hud>              m_hud;

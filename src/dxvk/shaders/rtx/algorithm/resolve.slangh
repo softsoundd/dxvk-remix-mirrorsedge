@@ -140,7 +140,11 @@ bool evaluateOpaqueApproximations(
   PortalSpace2BitsType portalSpace,
   // Note: Radiance attenuation split into incoming/outgoing rather than having the function accumulate into it
   // to accomodate some processes optimize around the fact that opaque approximations only result in monochromatic attenuation.
-  vec3 incomingRadianceAttenuation, inout float outgoingRadianceAttenuation, inout vec3 emissiveRadiance)
+  vec3 incomingRadianceAttenuation, inout float outgoingRadianceAttenuation, inout vec3 emissiveRadiance,
+  // Fork (2026-07-26): true when the surface's material carries
+  // OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE (weather precipitation) - the
+  // opacity lighting approximation then adds a sky-ambient term. See below.
+  bool skyLitParticle = false)
 {
   const Camera camera = cb.camera;
   const VolumeArgs volumeArgs = cb.volumeArgs;
@@ -170,6 +174,43 @@ bool evaluateOpaqueApproximations(
     // for some contribution from behind) distribution so more directionality is respected rather than this simple multiply by 4 hack (which is not super physically correct).
     // Finally, albedo has opacity baked into it already so it does not need to be multiplied in here.
     emissiveRadiance += opaqueSurfaceMaterialInteraction.albedo * accumulatedOutgoingRadiance * incomingRadianceAttenuation;
+
+#ifdef RESOLVE_SKY_LIT_PARTICLES
+    // Fork (2026-07-26): skylight for sky-lit particle materials (weather
+    // precipitation). The froxel radiance cache sampled above is filled purely
+    // by NEE over the analytic light pool - its integrator has NO sky term, so
+    // in open air under an overcast (sun-killed) sky it is nearly black and
+    // particles shaded only by it render as dark silhouettes against a bright
+    // sky, which was the reported rain bug. Real drops transmit the sky around
+    // them; this adds that term from the atmosphere's own sky-view LUT via
+    // sampleSkyAmbientForVolume (includes the cloud-transmittance LUT, so
+    // storm decks genuinely dim it; warm at sunset; zero at night below the
+    // horizon). Two taps: the view direction (forward transmission - the sky
+    // behind the drop, lifted slightly above the horizon so looking down does
+    // not zero it) and the zenith (ambient), averaged. Gated to materials that
+    // explicitly opt in: precipitation qualifies because its spawn-time
+    // shelter probe guarantees every living drop saw open sky - the same
+    // guarantee cannot be made for generic game particles (indoor smoke must
+    // not glow sky-blue), hence the material flag rather than isParticle.
+    // Numos-only: the LUTs exist only in that sky mode.
+    if (skyLitParticle && cb.skyMode == 1 && cb.particleSkyAmbientScale > 0.0f)
+    {
+      vec3 viewDir = normalize(surfaceInteraction.position - cameraGetWorldPosition(camera));
+      vec3 viewDirYUp = cb.isZUp != 0 ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir;
+      viewDirYUp.y = max(viewDirYUp.y, 0.05f);
+      viewDirYUp = normalize(viewDirYUp);
+
+      const vec3 skyForward = sampleSkyAmbientForVolume(viewDirYUp, cb.atmosphereArgs,
+        AtmosphereSkyViewLut, AtmosphereCloudSkyTransmittanceLut, AtmosphereSkyViewSampler);
+      const vec3 skyZenith = sampleSkyAmbientForVolume(vec3(0.0f, 1.0f, 0.0f), cb.atmosphereArgs,
+        AtmosphereSkyViewLut, AtmosphereCloudSkyTransmittanceLut, AtmosphereSkyViewSampler);
+      const vec3 skyAmbient = (skyForward + skyZenith) * 0.5f;
+
+      // Same albedo convention as the froxel term above (opacity pre-baked).
+      emissiveRadiance += opaqueSurfaceMaterialInteraction.albedo * skyAmbient
+        * cb.particleSkyAmbientScale * incomingRadianceAttenuation;
+    }
+#endif
   }
 #else
   const bool opacityLightingApprox = false;
@@ -493,7 +534,8 @@ void resolveVertex<T: IBasePayloadState>(
         resolveMode,
         surface, surfaceInteraction, opaqueSurfaceMaterialInteraction,
         resolveVertexState.portalSpace,
-        radianceAttenuation, opaqueApproximationOutgoingAttenuation, emissiveRadiance);
+        radianceAttenuation, opaqueApproximationOutgoingAttenuation, emissiveRadiance,
+        (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE) != 0);
 
       radianceAttenuation *= opaqueApproximationOutgoingAttenuation;
 
@@ -1015,7 +1057,8 @@ void resolveVertexUnorderedParticles<
       evaluateOpaqueApproximations(
         resolveMode | resolveModeForceOpacityLightingApprox,
         surface, surfaceInteraction, opaqueSurfaceMaterialInteraction, portalSpace,
-        vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
+        vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance,
+        (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE) != 0);
       handledInteraction = true;
     }
     else if (polymorphicType == surfaceMaterialTypeTranslucent)
@@ -1444,7 +1487,8 @@ void resolveVertexUnordered<
         evaluateOpaqueApproximations(
           resolveMode | resolveModeForceOpacityLightingApprox,
           surface, surfaceInteraction, opaqueSurfaceMaterialInteraction, portalSpace,
-          vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
+          vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance,
+          (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE) != 0);
         handledInteraction = true;
       }
     }

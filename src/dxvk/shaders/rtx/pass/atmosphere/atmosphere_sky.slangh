@@ -30,7 +30,7 @@
 //
 // Cloud and atmosphere helpers used by both the sky path and the ground
 // shadow term (intersectSphere, cloudPlanetRadius, computeCloudHeightFraction,
-// sampleCloudDensityTextured, intersectCloudLayer, evalCloudGroundShadow,
+// intersectCloudLayer, evalCloudGroundShadow,
 // getTransmittanceToSun, evalAtmosphereRadiance, hash31, fbmNoise2D, etc.)
 // stay in atmosphere_common.slangh and are pulled in via the include below.
 
@@ -959,13 +959,19 @@ vec3 evalSkyRadiance(
   // frames.
   //
   // Storage convention: AtmosphereCloudHistory stores
-  //   (rgb = cloudLayer.rgb * cloudLayer.a, a = cloudLayer.a)
-  // — premultiplied radiance. This means an off-screen / disocclusion fallback
-  // (zero history) blends to "no clouds" cleanly, and the final composite is
-  // `radiance + smoothed.rgb - radiance * smoothed.a` which equals
-  // `mix(radiance, smoothed.rgb / max(smoothed.a, eps), smoothed.a)` for
-  // smoothed.a > 0 and `radiance` otherwise. We use the additive form to
-  // skip the divide.
+  //   (rgb = cloudLayer.rgb, a = cloudLayer.a)
+  // — cloudLayer.rgb is ALREADY premultiplied radiance (both cloud sources
+  // store vec4(premultiplied_rgb, transmittance) — see the source comment
+  // above). An off-screen / disocclusion fallback (zero history) blends to
+  // "no clouds" cleanly, and the final composite is the premultiplied over:
+  // `radiance * (1 - smoothed.a) + smoothed.rgb`.
+  //
+  // BUG FIX (fork — 2026-07-16, found in the GT7 cross-audit): this block
+  // and the no-smoothing composite below used to multiply cloudLayer.rgb by
+  // cloudLayer.a AGAIN — a second premultiply. Opaque cores (a ~ 1) hid it,
+  // but thin cloud reads scaled QUADRATICALLY with alpha: wisps, silhouette
+  // skirts and light edges rendered darker than intended everywhere, at
+  // every time of day, in both density models.
   //
   // Age-channel disocclusion (fork — 2026-05-13). The color slot above is
   // ONLY written from the sky-miss branch — when a pixel is occluded by
@@ -984,7 +990,7 @@ vec3 evalSkyRadiance(
   // sentinel for a single one-frame rejection (~18 min cadence at 60fps).
   vec4 smoothedCloud = cloudLayer;  // default: no smoothing
   if (enableCloudTemporalSmoothing && all(historyResolution > uint2(0u, 0u))) {
-    vec4 currentPremul = vec4(cloudLayer.rgb * cloudLayer.a, cloudLayer.a);
+    vec4 currentPremul = vec4(cloudLayer.rgb, cloudLayer.a);  // rgb already premultiplied
 
     // Reproject: previous-frame pixel = current pixel + motion-vector (in pixels).
     // calcMotionVectorForRayMiss returns NDC-delta * resolution, so adding it
@@ -1016,13 +1022,26 @@ vec3 evalSkyRadiance(
       bool historyValid = ageValid
                        && ((history.a > 0.001f) || (currentPremul.a < 0.001f));
       if (historyValid) {
-        // Fixed history weight. Higher = smoother but slower to respond to
-        // genuine sky changes (sun motion, weather preset changes); lower =
-        // less smoothing benefit. 0.92 was picked to settle to within 1% of
+        // History weight (fork — 2026-07-16, crispness pass: now the
+        // args.cloudHistoryWeight knob; was hardcoded 0.92). Higher =
+        // smoother but slower to respond to genuine sky changes (sun motion,
+        // weather preset changes) and softer/smearier clouds; lower = less
+        // smoothing benefit but crisper detail. 0.92 settles to within 1% of
         // a stable signal in ~30 frames at 60Hz (~0.5s) while still strongly
         // suppressing the per-frame jitter variance DLSS sees.
-        const float kHistoryWeight = 0.92f;
-        vec4 blended = lerp(currentPremul, history, kHistoryWeight);
+        //
+        // Lightning ghost suppression (fork — 2026-07-14). A 100-300 ms flash
+        // embedded into this ~1 s EMA outlives itself 3-10x, and on camera
+        // move the reprojected history drags a bright "old frame" imprint of
+        // the lit deck across the sky (sharp-edged where reprojection leaves
+        // the old viewport). While a flash is live — plus a ~0.25 s trailing
+        // window (CPU-side lightningHistoryFade) — collapse the history
+        // weight so the flash tracks near-live and never embeds. The jitter
+        // noise the EMA normally hides is masked by the flash itself; weight
+        // returns to the knob value as the fade expires. Inert at fade 0.
+        float historyWeight = saturate(args.cloudHistoryWeight)
+                            * (1.0f - 0.8f * saturate(args.lightningHistoryFade));
+        vec4 blended = lerp(currentPremul, history, historyWeight);
         smoothedCloud = vec4(blended.rgb, blended.a);
       } else {
         smoothedCloud = currentPremul;
@@ -1042,8 +1061,10 @@ vec3 evalSkyRadiance(
     // is `radiance * (1 - alpha) + premul.rgb`.
     radiance = radiance * (1.0f - smoothedCloud.a) + smoothedCloud.rgb;
   } else {
-    // No temporal smoothing — original composite path.
-    radiance = mix(radiance, cloudLayer.rgb, cloudLayer.a);
+    // No temporal smoothing — premultiplied over (cloudLayer.rgb is already
+    // premultiplied; the old mix() here was the same double-multiply bug as
+    // the smoothing path above).
+    radiance = radiance * (1.0f - cloudLayer.a) + cloudLayer.rgb;
   }
 
   // Star composite (fork). Stars were held out of `radiance` above so they

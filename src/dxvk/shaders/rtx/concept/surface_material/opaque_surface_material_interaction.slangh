@@ -747,16 +747,24 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opacity = 1.f;
   }
   
-  // avoid double gamma conversion for legacy color textures that are already sampled through sRGB views
-  if (!surface.colorTextureIsSrgb)
+  // Note: Gamma correct albedo input (be it from a constant or a texture). Textures using a UNORM format do not have their
+  // sRGB->linear conversion done by the sampler, so we do it here in software. When the albedo comes from a texture that uses
+  // an sRGB VkFormat however, the sampler hardware already linearized it on read, so applying gammaToLinear again would double
+  // linearize it (darkening the result); OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB (set on the CPU) marks that case.
+  // The albedo constant is always gamma-encoded, so this only skips when the texture was actually the source.
+  const bool albedoAlreadyLinear = albedoOpacityLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB);
+  if (!albedoAlreadyLinear)
   {
-  albedo = gammaToLinear(albedo);
+    albedo = gammaToLinear(albedo);
   }
-  
-  // Note: Gamma correct emissive color input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
-  // automatically do this conversion.
-  // Todo: Disable this for when a sRGB texture is the source of the emissive color.
-  emissiveColor = gammaToLinear(emissiveColor);
+
+  // Note: Same handling as albedo above - skip the software gamma correction when the emissive color came from an sRGB-format
+  // texture that the sampler already linearized (OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_IS_SRGB).
+  const bool emissiveAlreadyLinear = emissiveColorLoaded && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_IS_SRGB);
+  if (!emissiveAlreadyLinear)
+  {
+    emissiveColor = gammaToLinear(emissiveColor);
+  }
   
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);

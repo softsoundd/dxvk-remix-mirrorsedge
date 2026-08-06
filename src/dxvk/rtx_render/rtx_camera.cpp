@@ -31,6 +31,7 @@
 #include "rtx_matrix_helpers.h"
 #include "rtx_imgui.h"
 #include "rtx_xess.h"
+#include "rtx_fork_hooks.h"
 
 /*
 *             Free/Debug Camera
@@ -805,9 +806,10 @@ namespace dxvk
   }
   
   Vector2 RtCamera::calcPixelJitter(uint32_t jitterFrameIdx) const {
-    // Only apply jittering when DLSS/XeSS/TAA is enabled, or if forced by settings
+    // Only apply jittering when DLSS/XeSS/FSR/TAA is enabled, or if forced by settings
     if (!RtxOptions::isDLSSOrRayReconstructionEnabled() &&
         !RtxOptions::isXeSSEnabled() &&
+        !RtxOptions::isFSREnabled() &&
         !RtxOptions::isTAAEnabled() &&
         !RtxOptions::forceCameraJitter()) {
       return Vector2{ 0, 0 };
@@ -831,6 +833,12 @@ namespace dxvk
       jitterSequenceLength = xessLength;
     }
     
+    // NV-DXVK start: FSR needs its own jitter sequence length (returns 0 unless FSR is active)
+    if (const uint32_t fsrLength = fork_hooks::fsrJitterSequenceLength(m_finalResolution[0], m_renderResolution[0])) {
+      jitterSequenceLength = fsrLength;
+    }
+    // NV-DXVK end
+
     return calculateHaltonJitter(jitterFrameIdx, jitterSequenceLength);
 #else
     return m_halton.next();

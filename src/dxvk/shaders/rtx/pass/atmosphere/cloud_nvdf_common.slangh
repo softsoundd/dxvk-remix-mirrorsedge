@@ -1,0 +1,107 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+/*
+ * Cloud NVDF shared helpers (fork — Nubis3 conversion Phase A).
+ *
+ * Seed encoding, wrap-aware voxel metrics, and voxel <-> domain mapping for
+ * the cloud-body SDF bake chain (occupancy -> JFA -> resolve). Included ONLY
+ * by the cloud_nvdf_* compute passes and (from Phase B on) the cloud-only
+ * march headers — never by anything the path tracer compiles, so iterating
+ * here does not trigger the 3-minute path-tracer recompile.
+ *
+ * See cloud_nvdf.h for the texture axis convention (u = world X, v =
+ * VERTICAL, w = world Z) and dimensions.
+ */
+
+#pragma once
+
+#include "rtx/pass/atmosphere/cloud_nvdf.h"
+
+// ---------------------------------------------------------------------------
+// Seed encoding for the JFA ping-pong buffers (R32_UINT).
+//
+// A seed is the voxel coordinate of a cloud-body BOUNDARY voxel (an occupied
+// voxel with at least one empty 6-neighbor). Packed x | y<<8 | z<<16; the
+// coordinate ranges (x,z < 256, y < 64) keep the packed value <= 0x00FF3FFF,
+// so 0xFFFFFFFF is unambiguously "no seed known yet".
+// ---------------------------------------------------------------------------
+static const uint kCloudNvdfSeedInvalid = 0xFFFFFFFFu;
+
+uint cloudNvdfPackSeed(uint3 vox) {
+  return vox.x | (vox.y << 8u) | (vox.z << 16u);
+}
+
+uint3 cloudNvdfUnpackSeed(uint seed) {
+  return uint3(seed & 0xFFu, (seed >> 8u) & 0xFFu, (seed >> 16u) & 0xFFu);
+}
+
+// ---------------------------------------------------------------------------
+// Wrap-aware distance between two voxel CENTERS, in km.
+//
+// The horizontal axes live on a torus (the field tiles at cloudNoiseTileKm),
+// so the per-axis voxel delta wraps: min(|d|, N - |d|). The vertical axis is
+// a plain clamped slab. Deltas are converted to km with the per-axis voxel
+// size BEFORE the norm — the voxels are only square at the 12 km / 3 km
+// defaults, and the JFA "closest seed" comparison must use the physical
+// metric or anisotropic tiles would prefer seeds along the cheaper axis.
+//
+// tileKm / thicknessKm are passed explicitly (not read from a CB) so the
+// helper stays usable from any pass without binding assumptions.
+// ---------------------------------------------------------------------------
+float cloudNvdfVoxelDistanceKm(uint3 a, uint3 b, float tileKm, float thicknessKm) {
+  const float kSizeXZ = float(CLOUD_NVDF_SIZE_XZ);
+  float voxXZKm = max(tileKm, 1e-3f) / kSizeXZ;
+  float voxYKm  = max(thicknessKm, 0.05f) / float(CLOUD_NVDF_SIZE_Y);
+
+  float dx = abs(float(a.x) - float(b.x));
+  dx = min(dx, kSizeXZ - dx);
+  float dz = abs(float(a.z) - float(b.z));
+  dz = min(dz, kSizeXZ - dz);
+  float dy = abs(float(a.y) - float(b.y));
+
+  vec3 dKm = vec3(dx * voxXZKm, dy * voxYKm, dz * voxXZKm);
+  return length(dKm);
+}
+
+// Wrap a (possibly negative) horizontal voxel coordinate onto [0, SIZE_XZ).
+int cloudNvdfWrapXZ(int c) {
+  int n = int(CLOUD_NVDF_SIZE_XZ);
+  return ((c % n) + n) % n;
+}
+
+// ---------------------------------------------------------------------------
+// Voxel -> bake-domain mapping.
+//
+// XZ: voxel centers map to the tile-space UV the placement map / noise
+//     volume use (frac(worldKm / cloudNoiseTileKm)); the NVDF is baked RAW
+//     tile-periodic — hex de-tiling and wind translation are applied by the
+//     SAMPLER (Phase B), mirroring how the placement map itself is treated.
+// Y:  voxel centers map to the slab height fraction [0,1].
+// ---------------------------------------------------------------------------
+vec2 cloudNvdfVoxelToTileUV(uint3 vox) {
+  return (vec2(vox.xz) + 0.5f) / float(CLOUD_NVDF_SIZE_XZ);
+}
+
+float cloudNvdfVoxelToHeightFraction(uint3 vox) {
+  return (float(vox.y) + 0.5f) / float(CLOUD_NVDF_SIZE_Y);
+}

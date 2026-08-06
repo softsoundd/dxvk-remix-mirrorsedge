@@ -70,7 +70,8 @@ namespace dxvk {
     DLSS,
     NIS,
     TAAU,
-    XeSS
+    XeSS,
+    FSR
   };
 
   enum class GraphicsPreset : int {
@@ -134,6 +135,24 @@ namespace dxvk {
   // were removed in the tonemap refactor (2026-05-13 / 2026-05-15). The
   // apply pass dispatches the selected operator directly via
   // RtxForkGlobalTonemap::tonemapOperator.
+
+  // Frame Generation technology selection. Selecting a backend here *is* the
+  // enable action — there is no separate per-backend enable checkbox in the UI.
+  enum class FrameGenerationType : int {
+    None = 0,    // Frame generation disabled
+    DLSS,        // NVIDIA DLSS Frame Generation (DLSS 3.0/4.0)
+    FSR          // AMD FSR 3 Frame Generation
+  };
+
+  namespace fork_hooks {
+    // Drives DxvkDLFG::enable / DxvkFSRFrameGen::enable from
+    // rtx.frameGenerationType. Wired as that option's onChange handler so the
+    // invariant holds for config files, DXVK_FRAMEGEN_TYPE and the API — not
+    // just while the settings menu happens to be open.
+    // Declared here rather than pulled in from rtx_fork_hooks.h to avoid a
+    // circular include. Implementation in rtx_fork_upscaler_ui.cpp.
+    void applyFrameGenerationType(DxvkDevice* device);
+  } // namespace fork_hooks
 
   enum class UIType : int {
     None = 0,
@@ -557,6 +576,10 @@ namespace dxvk {
                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
                     args.environment = "DXVK_UPSCALER_TYPE",
+                    args.flags = RtxOptionFlags::UserSetting | RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION_ARGS("rtx", FrameGenerationType, frameGenerationType, FrameGenerationType::None, "Frame Generation technology to use, and the control that enables it. None = disabled, DLSS = NVIDIA DLSS Frame Generation, FSR = AMD FSR 3 Frame Generation. Setting this drives rtx.dlfg.enable / rtx.fsrfg.enable; you do not set those directly.",
+                    args.environment = "DXVK_FRAMEGEN_TYPE",
+                    args.onChangeCallback = &fork_hooks::applyFrameGenerationType,
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", bool, enableRayReconstruction, true, "Enables DLSS ray reconstruction, an AI-based denoiser designed for real time ray tracing.",
                     args.environment = "DXVK_RAY_RECONSTRUCTION",
@@ -1022,17 +1045,26 @@ namespace dxvk {
 
     RTX_OPTION_ENV("rtx", bool, useWhiteMaterialMode, false, "RTX_USE_WHITE_MATERIAL_MODE", "Override all objects' materials by white material");
     RTX_OPTION("rtx", bool, useHighlightLegacyMode, false, "");
-    RTX_OPTION("rtx", float, nativeMipBias, 0.0f,
+    RTX_OPTION("rtx", bool, linearizeSrgbTextures, true,
+               "When true, opaque albedo/emissive textures that use an sRGB VkFormat are detected and the path tracer's software gamma\n"
+               "correction (gammaToLinear/pow(2.2)) is skipped for them, since the sampler hardware already linearized the value on read.\n"
+               "This avoids a double linearization (sampler sRGB curve + shader pow(2.2)) that darkens such textures. Constants and\n"
+               "non-sRGB (UNORM) textures are unaffected and still receive the software gamma correction. Set to false to restore the\n"
+               "legacy behavior where the software conversion is always applied regardless of texture format.");
+    RTX_OPTION_ARGS("rtx", float, nativeMipBias, 0.0f,
                "Specifies a mipmapping level bias to add to all material texture filtering. Stacks with the upscaling mip bias.\n"
                "Mipmaps are determined based on how far away a texture is, using this can bias the desired level in a lower quality direction (positive bias), or a higher quality direction with potentially more aliasing (negative bias).\n"
-               "Note that mipmaps are also important for good spatial caching of textures, so too far negative of a mip bias may start to significantly affect performance, therefore changing this value is not recommended");
-    RTX_OPTION("rtx", float, upscalingMipBias, 0.0f,
+               "Note that mipmaps are also important for good spatial caching of textures, so too far negative of a mip bias may start to significantly affect performance, therefore changing this value is not recommended",
+               args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION_ARGS("rtx", float, upscalingMipBias, 0.0f,
                "Specifies a mipmapping level bias to add to all material texture filtering when upscaling (such as DLSS) is used.\n"
                "Mipmaps are determined based on how far away a texture is, using this can bias the desired level in a lower quality direction (positive bias), or a higher quality direction with potentially more aliasing (negative bias).\n"
-               "Note that mipmaps are also important for good spatial caching of textures, so too far negative of a mip bias may start to significantly affect performance, therefore changing this value is not recommended");
-    RTX_OPTION("rtx", bool, useAnisotropicFiltering, true,
+               "Note that mipmaps are also important for good spatial caching of textures, so too far negative of a mip bias may start to significantly affect performance, therefore changing this value is not recommended",
+               args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION_ARGS("rtx", bool, useAnisotropicFiltering, true,
                "A flag to indicate if anisotropic filtering should be used on material textures, otherwise typical trilinear filtering will be used.\n"
-               "This should generally be enabled as anisotropic filtering allows for less blurring on textures at grazing angles than typical trilinear filtering with only usually minor performance impact (depending on the max anisotropy samples).");
+               "This should generally be enabled as anisotropic filtering allows for less blurring on textures at grazing angles than typical trilinear filtering with only usually minor performance impact (depending on the max anisotropy samples).",
+               args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION("rtx", float, maxAnisotropySamples, 8.0f,
                "The maximum number of samples to use when anisotropic filtering is enabled.\n"
                "The actual max anisotropy used will be the minimum between this value and the hardware's maximum. Higher values increase quality but will likely reduce performance.");
@@ -1297,7 +1329,9 @@ namespace dxvk {
                "Sun elevation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f,
                "Sun rotation in degrees. Game-drivable per-frame; persists when saved unless overridden by a runtime push.");
-    RTX_OPTION("rtx.atmosphere", float, altitude, 100.0f, "Height from sea level in meters.");
+    // rtx.atmosphere.altitude retired 2026-07-17 (panel audit): it fed
+    // AtmosphereArgs::viewAltitude, which nothing ever read. That args field is
+    // now padRetired10, so there is nothing left to drive.
     RTX_OPTION("rtx.atmosphere", float, airDensity, 1.0f, "Density of air molecules multiplier (1.0 = clear sky).");
     RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.1f, "Density of aerosols/dust multiplier (1.0 = typical).");
     RTX_OPTION("rtx.atmosphere", float, ozoneDensity, 1.0f, "Density of ozone layer multiplier (1.0 = typical).");
@@ -1552,7 +1586,7 @@ namespace dxvk {
 
     // Cloud parameters (procedural FBM cloud layer)
     RTX_OPTION("rtx.atmosphere", bool, cloudEnabled, true, "Enable procedural cloud rendering.");
-    RTX_OPTION("rtx.atmosphere", float, cloudDensity, 1.8f, "Cloud opacity/density multiplier.");
+    RTX_OPTION("rtx.atmosphere", float, cloudDensity, 4.0f, "Cloud opacity/density multiplier.");
     RTX_OPTION("rtx.atmosphere", float, cloudAltitude, 1.3f, "Cloud layer altitude in kilometers.");
     RTX_OPTION("rtx.atmosphere", Vector3, cloudColor, Vector3(0.89f, 0.92f, 1.0f), "Base cloud color (albedo).");
     RTX_OPTION("rtx.atmosphere", float, cloudWindSpeed, 0.02f, "Cloud drift speed in km/s. Clouds scroll with this velocity.");
@@ -1572,7 +1606,7 @@ namespace dxvk {
                "(Y) axis [0..1]. Higher = more in-place morphing (clouds form/dissolve); lower = "
                "more lateral sliding. The remainder is split into a fixed diagonal X/Z drift for "
                "decorrelation.");
-    RTX_OPTION("rtx.atmosphere", float, cloudShadowStrength, 0.5f,
+    RTX_OPTION("rtx.atmosphere", float, cloudShadowStrength, 1.0f,
                "How strongly overcast clouds dim ground and atmosphere lighting [0..1]. "
                "1.0 = full physical voxel-grid shadow contribution from cloudVoxelShadowsEnable; "
                "0 = shadows fully muted (voxel grid still runs but its output is mixed away).");
@@ -1639,25 +1673,26 @@ namespace dxvk {
     // remain accessible via user.conf for power tuning.
     RTX_OPTION("rtx.atmosphere", float, cloudMsScale, 1.0f,
                "Multi-scatter strength multiplier on the Nubis Cubed sigma_ms term [0..2]. "
-               "1.0 = paper baseline; higher brightens cumulus bottoms, lower flattens.");
+               "1.0 = paper baseline. sigma_ms is an EXTINCTION on the body lobe "
+               "(exp(-sigma_ms * D_sun)), so higher = darker shadowed bulk / more "
+               "shading contrast, lower = brighter, flatter body fill. (Doc fixed "
+               "2026-07-14; the old text had the direction inverted.)");
 
     // Cloud spatial variation (Nubis-style — spec 2026-05-06)
-    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 0.5f,
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeMean, 1.0f,
                "Mean cloud type across the sky [0,1]: 0=stratus, 0.5=stratocumulus, 1=cumulus.");
-    RTX_OPTION("rtx.atmosphere", float, cloudTypeSpread, 0.2f,
+    RTX_OPTION("rtx.atmosphere", float, cloudTypeSpread, 0.54f,
                "Spatial variation amplitude for cloud type [0,1]. 0=uniform, 1=full range across the sky.");
     RTX_OPTION("rtx.atmosphere", float, cloudTypeNoiseScale, 0.0034f,
                "Region size frequency for type noise. Numerically smaller = larger spatial features. "
                "Capped at 0.0034 in the UI because faster variation puts visible 2D-noise cell "
                "structure at sub-cumulus scales (regular grid of cumulus blobs).");
-    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.64f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageMean, 0.29f,
                "Mean cloud coverage across the sky [0,1]: 0=clear, 1=overcast.");
-    RTX_OPTION("rtx.atmosphere", float, cloudCoverageSpread, 0.16f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageSpread, 0.0f,
                "Spatial variation amplitude for coverage [0,1]. 0=uniform, 1=full range.");
-    RTX_OPTION("rtx.atmosphere", float, cloudCoverageNoiseScale, 0.0033f,
+    RTX_OPTION("rtx.atmosphere", float, cloudCoverageNoiseScale, 0.00257732f,
                "Region size frequency for coverage noise. Independent from type noise scale.");
-    RTX_OPTION("rtx.atmosphere", float, cloudAnvilBias, 0.3f,
-               "Cumulus top inflation strength [0,1]. 0=flat tops, 1=fully spread mushroom-cap anvils.");
     RTX_OPTION("rtx.atmosphere", float, cloudNoiseTileKm, 12.0f,
                "World-space tile period (km) for the prebaked 3D cloud noise texture. "
                "Smaller = more visible repetition; larger = lower-frequency cloud detail. "
@@ -1715,6 +1750,120 @@ namespace dxvk {
                "Coverage-remap feather band at cloud-cluster edges "
                "[0.05..1]. Narrow = crisp solid-cored clouds; wide = soft "
                "wispy transitions. Applies live.");
+    // Nubis3 conversion (fork — Phase A). The cloud body (placement map +
+    // column model) is voxelized and distance-transformed into a real SDF
+    // (the NVDF) — the foundation for Nubis3's profile-from-SDF density
+    // model and sphere-traced marching in later phases.
+    RTX_OPTION("rtx.atmosphere", float, nvdfNominalCoverage, 0.65f,
+               "Coverage the cloud-body SDF (NVDF) bakes at [0 or 0.25..1]. "
+               "0 = auto: track the live weather coverage quantized to 0.25 "
+               "steps (recommended — keeps the sample-time coverage "
+               "level-set offset small; re-bakes amortized only when the "
+               "drift crosses a step). Nonzero pins the bake nominal for "
+               "debugging or look-tuning.");
+    RTX_OPTION("rtx.atmosphere", float, nvdfProfileDepthKm, 0.6f,
+               "Nubis3: depth into the cloud body (km) over which the "
+               "dimensional profile ramps 0 -> 1 [0.1..3]. Small = dense "
+               "hard-shelled clouds; large = soft translucent-edged bodies. "
+               "Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nvdfCoverageOffsetKm, 0.2f,
+               "Nubis3: km of iso-surface (level-set) shift per unit of "
+               "coverage delta from the baked nominal [0..4]. Higher = "
+               "coverage changes grow/shrink clouds more aggressively "
+               "(bodies merge sooner at high coverage). Applies live with "
+               "zero rebakes.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3ErosionStrength, 0.42f,
+               "Nubis3: scale on the wispy/billowy noise composite that "
+               "erodes the dimensional profile [0..2]. 0 = smooth un-eroded "
+               "bodies (pure SDF blobs); 1 = paper-faithful erosion; higher "
+               "= ragged heavily-carved clouds. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3SharpenStrength, 1.0f,
+               "Nubis3: blend toward the paper's pow() density sharpen "
+               "[0..1], which lifts low densities to bring out definition "
+               "in wisps and edges. 0 = off (raw erosion output). Applies "
+               "live.");
+    RTX_OPTION("rtx.atmosphere", float, nvdfBodyErosionStrength, 1.5f,
+               "Nubis3: strength of the 3D noise carve applied to the cloud "
+               "BODIES in the NVDF occupancy bake [0..1.5]. The carve shifts "
+               "the placement waterline per voxel, baking concavity "
+               "(overhangs, notches, lumps) into the otherwise-convex column "
+               "bodies — the anti-blobby body lever. 0 = smooth convex "
+               "bodies. Changing it re-bakes the SDF (amortized, ~6 frames).");
+    RTX_OPTION("rtx.atmosphere", float, nubis3HFDetailStrength, 0.62f,
+               "Nubis3: near-camera high-frequency detail mix (Nubis Cubed "
+               "p.125 'inHFDetails') [0..3]. Blends twice-folded "
+               "high-frequency noise into the erosion composite close to the "
+               "camera for fly-through crispness. 1 = the paper's 10% max "
+               "mix at the nearest range; 0 = off. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3ShapeVarietyKm, 1.11f,
+               "Nubis3: mid-frequency SHAPE displacement amplitude in km "
+               "[0..1.5] (the GT7 mid-band role). Pushes/pulls the body "
+               "iso-surface by up to half this at ~2.4 km wavelengths — "
+               "lobes, notches and full splits that turn round singular "
+               "blobs into varied cloud clusters. Whole-body reshaping, "
+               "not edge detail; coverage-neutral on average. 0 = off. "
+               "Applies live, no rebake.");
+    // Default 0 = OFF (fork — 2026-07-30). Tested and rejected as a perf fix: at
+    // 0.02 it recovered no measurable time, because the cost is not concentrated
+    // in low-visibility samples (the march already exits at viewTransmittance
+    // < 0.01, so the actionable band is narrow); at 0.07 it did buy time but
+    // visibly degraded the look. Kept as an optional quality/perf trade — it is
+    // still a better trade than setting Sun Shadow (Near) to 0 outright — but it
+    // must not be on by default.
+    RTX_OPTION("rtx.atmosphere", float, cloudLightingLodThreshold, 0.0f,
+               "Nubis3: contribution-weighted lighting LOD [0..0.25]. A march "
+               "sample's contribution weight is view transmittance x aerial "
+               "haze x its own opacity — exactly the factor its color is "
+               "multiplied by in the composite. Samples below this threshold "
+               "skip the expensive near-field live sun refinement (two full "
+               "density-sampler calls, ~9 of ~16 texture taps per dense "
+               "sample) and the moon shadow march, falling back to the D_sun "
+               "grid and unshadowed moonlight — the same fallbacks the "
+               "existing thin-sample density gates already use, so this only "
+               "coarsens lighting that was designed to degrade that way and "
+               "never removes cloud material. Targets deep-in-cloud and "
+               "distance-dimmed samples, which pay full price while "
+               "contributing almost nothing to the pixel. Raise until edges "
+               "or crevice contrast visibly soften, then back off. "
+               "0 = disabled (every sample fully refined). Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3FineDetailStrength, 0.0f,
+               "Nubis3: fine-frequency detail band [0..2] (GT7-style third "
+               "noise band). A third tap of the detail volume at 2.11x "
+               "(content ~220..41 m) feeds the micro-AO relief shading and "
+               "the edge wisp cut for clouds within ~9 km — fine cauliflower "
+               "granulation on lit faces and scalloped wisp edges, the grain "
+               "the sqrt-adaptive march can resolve but the base texture "
+               "tops out above. 0 = off. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3EdgeErosion, 2.28f,
+               "Nubis3: edge wisp cut [0..3]. Extra erosion shaped by the "
+               "wispy noise channel, concentrated at the silhouette and "
+               "fading by mid-shell — cuts trailing wisp shapes out of cloud "
+               "edges while billowy cores keep rounded cauliflower edges. "
+               "0 = uniform erosion only. Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3InteriorTexture, 0.0f,
+               "Nubis3: interior density texture strength [0..1]. Modulates "
+               "the density INSIDE the body by the raw detail noise (the "
+               "stand-in for Nubis3's authored per-voxel Density Scale NVDF "
+               "and iw3xo's multiplicative self-gate), so lit cloud faces "
+               "show billow-scale light variation instead of saturating to "
+               "a flat white mass. 0 = flat interiors (old behavior). "
+               "Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, nvdfStepScale, 0.95f,
+               "Nubis3 Phase C: safety factor on the SDF empty-space skip in "
+               "the cloud march [0..0.95]. In empty air the march jumps "
+               "ahead by (min SDF tap) x this factor instead of stepping "
+               "uniformly — a large perf win at the horizon. 0 disables "
+               "(uniform legacy stepping). Lower it if silhouettes show "
+               "onion-shell banding.");
+    RTX_OPTION("rtx.atmosphere", float, nubis3AdaptiveStepKm, 0.025f,
+               "Nubis3: sqrt-adaptive march step FLOOR in km [0..0.2] (Nubis "
+               "Cubed p.172/174 hybrid stepping). When nonzero, the view "
+               "march steps max(SDF x SDF Step Scale, cloudViewStepKm x "
+               "sqrt(dist / 12 km)) clamped no smaller than this — fine "
+               "steps near the camera resolve the sub-100 m detail the "
+               "fixed lattice could never sample, growing with distance as "
+               "the pixel footprint grows. 0 = the legacy fixed-length "
+               "lattice march. Applies live.");
     // Adaptive march sampling (fork — 2026-06-12). A fixed step COUNT
     // across a slab span that varies ~4 km (zenith) to 50+ km (horizon
     // through the curved shell) undersamples horizon rays — ~1.6 km steps
@@ -1739,7 +1888,7 @@ namespace dxvk {
                "default spacing out to ~6 km of cloud span; lower costs "
                "less but lets some banding back in at the far horizon. "
                "32 = legacy cost ceiling. Applies live.");
-    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 0.12f,
+    RTX_OPTION("rtx.atmosphere", float, cloudUndersideLightSigma, 0.2f,
                "Extinction of the light filtering down through each cloud, "
                "per km of overlying water [0..0.5]. Drives the analytic "
                "per-column underside light field: brightness varies "
@@ -1755,7 +1904,7 @@ namespace dxvk {
     // the prebaked noise volume grows billows OUTWARD from the density field
     // where it is weak (silhouettes), leaving saturated cores untouched.
     // Nubis detail remap, bias mirrored across the field mean for growth.
-    RTX_OPTION("rtx.atmosphere", float, cloudDetailStrength, 0.6f,
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailStrength, 0.0f,
                "Edge detail strength [0..1]. Grows high-frequency "
                "cauliflower billows OUTWARD from cloud EDGES while leaving dense "
                "cores solid. 0 = off (smooth legacy silhouettes). Note: the "
@@ -1767,6 +1916,69 @@ namespace dxvk {
                "filigree; lower = chunkier edge billows. Non-integer values "
                "keep the combined base+detail repeat period long. Default 4.3, "
                "viable range 2-12. Applies live (no re-bake).");
+
+    // Cloud detail-shading pass (fork — 2026-07-14). Four knobs that make the
+    // edge-detail field visible INSIDE the silhouette, not just on it:
+    // micro-AO reuses the detail tap as billow-scale relief shading, powder
+    // darkens low-density sun-facing wisps (Schneider 2015), and the height
+    // character / base shear give bases a ragged wind-sheared read while tops
+    // stay billowy. All apply live, all view-path only (the cheap shadow
+    // sampler and the validated self-shadow bakes are untouched); each knob
+    // at 0 is bit-identical legacy.
+    RTX_OPTION("rtx.atmosphere", float, cloudMicroAoStrength, 0.6f,
+               "Billow-scale shading from the edge-detail field [0..1]: grown "
+               "cauliflower knuckles brighten, carved crevices darken, so the "
+               "edge detail reads inside the cloud body instead of only at "
+               "the silhouette. Applies to ambient + multi-scatter body "
+               "light; silver linings are exempt. 0 = off (legacy smooth "
+               "shading).");
+    RTX_OPTION("rtx.atmosphere", float, cloudPowderStrength, 0.5f,
+               "Powder darkening [0..1] (Schneider): thin sun-facing wisps "
+               "and crevice walls go dark against the bright dense body when "
+               "the sun is behind the viewer - the classic crisp-cumulus cue. "
+               "Fades off looking toward the sun so silver linings survive. "
+               "0 = off.");
+    RTX_OPTION("rtx.atmosphere", float, cloudDetailBaseShearKm, 0.2f,
+               "Horizontal shear of the edge-detail field at each cloud's "
+               "base (km), fading to zero at its top - streaks base-level "
+               "wisps sideways like wind-sheared scud while tops stay round. "
+               "0 = no shear.");
+
+    // Lightning (fork — 2026-07-14). A CPU strike scheduler drives a
+    // flickering flash envelope; the cloud view march adds an emissive glow
+    // around the strike (tier 1) and a transient sphere light flashes the
+    // scene through the standard light path, froxel volumetrics included
+    // (tier 2). Off by default — storms are opt-in (weather-preset field
+    // candidate later).
+    RTX_OPTION("rtx.atmosphere", bool, lightningEnable, true,
+               "Lightning master switch. With this on, lightning is driven "
+               "entirely by lightningStrikesPerMinute (default 0 = no "
+               "strikes) - the weather presets raise the rate for storm "
+               "archetypes. Turn this off to mute lightning everywhere, "
+               "including storm presets and the Test Strike button.");
+    RTX_OPTION("rtx.atmosphere", float, lightningStrikesPerMinute, 0.0f,
+               "Mean lightning strike rate per minute [0..60]. Inter-strike "
+               "gaps are randomized (Poisson-like) so strikes cluster and "
+               "lull naturally. 0 = no automatic strikes (Test Strike still "
+               "works). Driven by the weather-preset system when a preset is "
+               "active (thunderstorm 12/min, rainstorm 4/min).");
+    RTX_OPTION("rtx.atmosphere", float, lightningFlashIntensity, 50.0f,
+               "Radiance scale of the in-cloud flash glow. Higher = the deck "
+               "lights up brighter and the glow reaches further through the "
+               "cloud. Tune against your sky brightness; the flash competes "
+               "with direct sunlight, so night storms need far less.");
+    RTX_OPTION("rtx.atmosphere", float, lightningSceneLightIntensity, 2000.0f,
+               "Radiance of the transient sphere light that flashes the "
+               "SCENE at the strike position (independent of the in-cloud "
+               "glow's intensity). 0 = cloud-only lightning (no ground "
+               "flash).");
+    RTX_OPTION("rtx.atmosphere", float, lightningRangeKm, 15.0f,
+               "Maximum strike distance from the camera in km [1.5..30]. "
+               "Strikes distribute uniformly by area between 1 km and this "
+               "range.");
+    RTX_OPTION("rtx.atmosphere", Vector3, lightningColor, Vector3(0.72f, 0.78f, 1.0f),
+               "Lightning flash color (linear RGB), shared by the in-cloud "
+               "glow and the scene flash. Default is a cool blue-white.");
 
     // Cloud-edge / halo tuning (fork — 2026-06-13). Two live knobs for the soft
     // fringe around cloud silhouettes: cloudEdgeSoftness sets how wide the
@@ -1819,7 +2031,7 @@ namespace dxvk {
                "with the sun overhead and fades out toward the horizon, where "
                "the low sun rakes under the deck and lights the bases (sunset "
                "glow). 0 = off (uniformly lit undersides).");
-    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientFill, 0.5f,
+    RTX_OPTION("rtx.atmosphere", float, cloudSkyAmbientFill, 0.52f,
                "How strongly cloud undersides pick up the open sky around them "
                "[0..1]. Adds a sky-dome fill - the overhead sky color, "
                "bypassing the bottom-darkening since that skylight reaches the "
@@ -1828,6 +2040,16 @@ namespace dxvk {
                "the actual sky color; naturally fades at sunset (the overhead "
                "sky is dim then). Higher = brighter, more sky-colored bases; "
                "0 = off (legacy, undersides ignore the open sky). Applies live.");
+    RTX_OPTION("rtx.atmosphere", float, cloudAmbientShadowStrength, 1.0f,
+               "Dramatic shading [0..1]: how much the sky-ambient fill is "
+               "attenuated by sun-shadow depth inside the cloud. The ambient "
+               "term otherwise refloods sun-shadowed bulk with bright daytime "
+               "sky light, flattening the cloud; with this, shaded cores fall "
+               "toward dark grey while sunlit faces and silver linings keep "
+               "their full ambient - the high-contrast puffy-cumulus read. "
+               "The sky-dome underside fill (Sky Ambient Fill) is exempt so "
+               "midday bases keep their open-sky floor. 0 = off (legacy flat "
+               "ambient). Applies live.");
     RTX_OPTION("rtx.atmosphere", float, cloudSkyBleedStrength, 0.15f,
                "How strongly the clouds tint the surrounding sky [0..1+]. The "
                "sky picks up cloud-colored inscatter sampled from the (smooth) "
@@ -1936,11 +2158,17 @@ namespace dxvk {
     // by ~1/scale^2 with little visible difference. The temporal smoothing
     // path runs AFTER the upsample, at full downscale resolution, so its
     // stabilization is unaffected.
-    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 0.5f,
+    RTX_OPTION("rtx.atmosphere", float, cloudRenderResolutionScale, 1.0f,
                "Resolution scale of the cloud render target relative to the "
                "internal (DLSS-input) resolution [0.25..1]. 0.5 = quarter the "
                "pixels (~4x cheaper cloud march); 1.0 = native (legacy, "
                "bit-exact). Applies on the next frame; live-tunable.");
+    RTX_OPTION("rtx.atmosphere", float, cloudHistoryWeight, 0.85f,
+               "EMA history weight of the cloud temporal smoother [0..0.98]. "
+               "Higher = smoother/softer clouds that respond slowly; lower = "
+               "crisper, faster-responding clouds with more visible per-frame "
+               "jitter. 0 disables the temporal blend entirely (raw jittered "
+               "march). 0.92 = the previous hardcoded value. Applies live.");
 
     // Secondary-ray cloud LUT (fork — 2026-06-10, perf). Every indirect /
     // PSR / reflection ray that reaches sky-miss would otherwise run a full
@@ -2135,7 +2363,7 @@ namespace dxvk {
     // by default) on top of the existing cumulus layer. cloud_render marches
     // the lower slab first and composites layer 2 onto residual transmittance.
     // Default off so today's look is preserved bit-for-bit.
-    RTX_OPTION("rtx.atmosphere", bool, cloudLayer2Enable, true,
+    RTX_OPTION("rtx.atmosphere", bool, cloudLayer2Enable, false,
                "When true, cloud_render.comp.slang marches a second 'echo' "
                "cloud deck above the primary slab — the same cloud-slab density "
                "model at a higher, gapped altitude, marched cheaply (low step "
@@ -2402,6 +2630,7 @@ namespace dxvk {
     static bool isNISEnabled() { return upscalerType() == UpscalerType::NIS; }
     static bool isTAAEnabled() { return upscalerType() == UpscalerType::TAAU; }
     static bool isXeSSEnabled() { return upscalerType() == UpscalerType::XeSS; }
+    static bool isFSREnabled() { return upscalerType() == UpscalerType::FSR; }
     
     static float getUniqueObjectDistanceSqr() { return uniqueObjectDistance() * uniqueObjectDistance(); }
     static uint32_t getNumFramesToPutLightsToSleep() { return numFramesToKeepLights() /2; }

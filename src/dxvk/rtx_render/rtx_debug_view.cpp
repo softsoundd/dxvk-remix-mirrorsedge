@@ -196,6 +196,17 @@ namespace dxvk {
                                 "  R patterned, matches 873  -> consumer works; exp+mix is killing it\n"
                                 "  R patterned but unrelated -> world-anchoring / slab-bottom bug\n"
                                 "  R dark, G even darker     -> magnitude underflow (bake OD tiny)"},
+        {DEBUG_VIEW_CLOUD_NVDF_SDF, "Atmosphere: Cloud NVDF SDF Slice (Nubis3)",
+                                "Fork diagnostic (Nubis3 conversion Phase A). Horizontal slice of the\n"
+                                "cloud-body signed distance field at height fraction 0.25, one full\n"
+                                "noise-tile period. Screen X = world X, screen Y = world Z.\n"
+                                "  Green band = the zero-crossing iso-line (cloud body outline)\n"
+                                "  Warm ramp  = inside (bright = deep core, saturates ~1.5 km)\n"
+                                "  Cool ramp  = outside (dark = far clear sky, saturates ~4 km)\n"
+                                "Validation gates: bodies read as smooth blobby cells matching the\n"
+                                "placement-map clusters; the green outline is clean (no speckle =\n"
+                                "JFA converged); the pattern is seamless across the tile wrap; and\n"
+                                "dragging Cloud Cell Size re-bakes it live (amortized, ~6 frames)."},
         {DEBUG_VIEW_CASCADE_LEVEL, "Terrain: Cascade Level"},
 
         {DEBUG_VIEW_VIRTUAL_HIT_DISTANCE, "Virtual Hit Distance"},
@@ -660,6 +671,7 @@ namespace dxvk {
         TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_D_SUN_INPUT)
         TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_D_AMBIENT_INPUT)
         TEXTURE2D(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT)
+        TEXTURE3D(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT)
 
         RW_TEXTURE2D(DEBUG_VIEW_BINDING_ACCUMULATED_DEBUG_VIEW_INPUT_OUTPUT)
 
@@ -1457,6 +1469,19 @@ namespace dxvk {
         ctx->bindResourceView(
           DEBUG_VIEW_BINDING_CLOUD_D_AMBIENT_INPUT,
           cloudDAmbient.view,
+          nullptr);
+      }
+    }
+    // Fork: cloud NVDF body SDF (Nubis3 conversion Phase A). Same lazy-init
+    // contract as the voxel grids above; the atmosphere init path runs the
+    // full synchronous NVDF bake, so a valid resource is always a complete
+    // field (the accessor returns the published FRONT buffer).
+    {
+      Resources::Resource cloudNvdfSdf = fork_hooks::getCloudNvdfSdf(*ctx);
+      if (cloudNvdfSdf.isValid()) {
+        ctx->bindResourceView(
+          DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT,
+          cloudNvdfSdf.view,
           nullptr);
       }
     }

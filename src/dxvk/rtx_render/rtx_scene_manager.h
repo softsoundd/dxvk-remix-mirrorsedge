@@ -134,6 +134,9 @@ namespace fork_hooks {
 // directly for "SceneObject"'s - which are "unique meshes/geometry", which map 1-to-1 with
 // BLAS entries in raytracing terminology.
 class SceneManager : public CommonDeviceObject, public ResourceCache {
+  // Fork touchpoint: the external-draw object-picking hook needs access to
+  // private m_drawCallMeta. Tracked as an inline tweak in
+  // docs/fork-touchpoints.md.
   friend void fork_hooks::externalDrawObjectPicking(
     DxvkDevice&, DrawCallState&, XXH64_hash_t, SceneManager&);
 

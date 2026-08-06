@@ -106,6 +106,13 @@ namespace dxvk {
 
   void AssetExporter::exportImage(Rc<DxvkContext> ctx, const std::string& filename, Rc<DxvkImage> image, bool thumbnail/* = false*/) {
     ScopedCpuProfileZone();
+
+    // Validate image before attempting export
+    if (image == nullptr) {
+      Logger::err(str::format("RTX: Cannot export null image to \"", filename, "\""));
+      return;
+    }
+
     // NOTE: Should use a mutex here...
     {
       std::lock_guard lock(m_readbackSignalMutex);
@@ -332,6 +339,15 @@ namespace dxvk {
         const void* pSrc = nullptr;
         VkDeviceSize srcRowPitch = 0;
         VkDeviceSize srcSlicePitch = 0;
+
+        // Validate memory mapping succeeded
+        if (!pSrc) {
+          Logger::err(str::format("RTX: Failed to map image memory for texture export \"", filename, "\" at mip level ", level));
+          delete[] pBlitTemps;
+          delete[] pBlitDests;
+          m_numExportsInFlight--;
+          return;
+        }
 
         const VkExtent3D levelExtent = gliExtentToVk(exportTex.extent(level));
         const VkExtent3D elementCount = util::computeBlockCount(levelExtent, formatInfo->blockSize);

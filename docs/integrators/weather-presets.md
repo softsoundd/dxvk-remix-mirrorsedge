@@ -10,9 +10,10 @@ that coordinates with the dxvk-remix weather preset system.
 The weather preset system is a renderer-side lerp pipeline that blends between
 12 named atmospheric archetypes (clear, partlyCloudy, overcast, hazy, foggy,
 drizzle, rainstorm, thunderstorm, snow, blizzard, sandstorm, smoggy). Each
-archetype defines 42 RTX_OPTION values covering clouds (13), atmosphere (3),
-sky/moon mood (3), and volumetric fog (23 — transmittance/scattering, fog
-gains, the full heterogeneous-fog noise field, fog reach, and fog remap).
+archetype defines 63 RTX_OPTION values covering clouds (17), atmosphere (5),
+sky/moon mood (4), volumetric fog (27 — transmittance/scattering, fog gains,
+the full heterogeneous-fog noise field, fog reach, and fog remap), and
+precipitation (10 — rain / snow / blowing sand particles).
 
 The entire per-field set is generated from a single source of truth — the
 `WEATHER_PRESET_FIELD_LIST` X-macro in
@@ -34,9 +35,10 @@ midpoint) and its widget.
 **Plugin's responsibility:**
 - Chooses when to trigger a weather transition and what duration to use.
 - Writes the two trigger keys to GameStateStore via `remixapi_SetGameValue`.
-- Owns all particle effects (rain, snow, dust, etc.). The renderer has no
-  built-in particle authoring; the plugin must spawn, blend, and despawn
-  particles in sync with the weather transition it initiated.
+- Owns particle effects the runtime does not: sound layers, splash and
+  accumulation VFX, and any bespoke channels. Precipitation itself (rain, snow,
+  blowing sand) is built in since 2026-07-25 and blends with the preset — see
+  section 5.
 
 The system is dormant by default. If the plugin never writes `__weather.target`,
 the blender does not run and all existing `rtx.atmosphere.*` and
@@ -190,12 +192,116 @@ void onExitDangerZone() {
 
 ## 5. Particle Coordination
 
-The renderer handles atmospheric rendering (clouds, fog, volumetric scattering,
-sky color). Particles -- rain drops, snowflakes, dust motes, smoke -- are
-**entirely the plugin's responsibility**. The renderer does not spawn or
-manage any particles as part of the preset transition.
+> **Updated 2026-07-25: precipitation is now built in.** The runtime ships a
+> weather-driven precipitation particle system (rain, snow, blowing sand). It is
+> part of the preset like any other parameter, so a plugin that only wants
+> falling weather needs to do *nothing* beyond setting `__weather.target` --
+> the drops blend in and out with the rest of the transition. The rest of this
+> section still applies to everything the runtime does NOT own: sound layers,
+> splash and accumulation VFX, and any bespoke particle channels.
 
-### Recommended pattern
+### Built-in precipitation
+
+Ten per-preset fields (`precipitationIntensity`, `precipitationFallSpeed`,
+`precipitationWindResponse`, `precipitationTurbulence`, `precipitationDrag`,
+`precipitationStreak`, `precipitationDropWidth`, `precipitationDropLength`,
+`precipitationOpacity`, `precipitationColor`) blend exactly like the cloud and
+fog fields and drive the live `rtx.weather.precipitation.*` options. Presets
+ship authored: dry for clear/partlyCloudy/overcast/hazy/smoggy, drifting mist
+for foggy, escalating rain for drizzle/rainstorm/thunderstorm, tumbling flakes
+for snow/blizzard, and tinted near-horizontal grit for sandstorm. Per-preset
+defaults are tabulated in `weather-presets-reference.md`.
+
+The emitter is anchored to the main camera POSITION -- never its orientation --
+and slants with the atmosphere's cloud wind, so precipitation follows the player
+automatically and matches the direction the sky is moving. Nothing about
+spawning depends on where the player is looking; tying the spawn volume to the
+view direction makes turning drag freshly spawned particles along with it.
+
+Keep `precipitationWindResponse` small. The slant it produces is fixed in world
+space (as it should be), which means it re-projects on screen as the camera
+turns -- a slant big enough to notice reads to players as "the rain changes
+direction when I look around". A few degrees is plenty for anything that is not
+deliberately a blizzard.
+
+Settings that are *not* per-preset live under `rtx.weather.precipitation` and
+are exposed in the dev menu under Weather Presets -> "Precipitation (global)" --
+these are performance and integration choices rather than weather look:
+
+| Option | Default | What it is for |
+|---|---|---|
+| `enable` | `True` | Master switch. Set `False` if the game drives its own precipitation. |
+| `maxParticles` | `24000` | Particle budget and the main performance dial; buffers are allocated for this count. |
+| `spawnRadiusMeters` / `spawnHeightMeters` | `20` / `14` | Size and altitude of the spawn plane above the camera. |
+| `fallMarginMeters` | `8` | How far below the camera drops survive before being recycled. |
+| `occludeUnderCover` | `True` | Ray-trace one occlusion query per spawned particle against the scene, ending its life where it would hit geometry. View-independent — this is what makes roofs, bridges and interiors work. |
+| `enableCollision` | `False` | Additional per-step *screen-space* collision (bounce/kill against visible surfaces only). Largely redundant now that `occludeUnderCover` exists; costs a depth test per particle per frame. |
+| `descUpdateIntervalMs` | `750` | How often the particle descriptor may change. Lower reacts to blends faster and costs more transient VRAM. Internally floored at one sixth of the particle lifetime so slow-falling looks (snow lives ~20 s) cannot pile up transient systems during a blend. |
+| `roughness` / `metallic` | `0.35` / `0` | Drop material surface response. Edits apply on the descriptor cadence and crossfade in over one particle lifetime (a material change forks the particle-system identity the same way a descriptor change does). |
+
+Only turn `enable` off if your game already has precipitation you want to keep;
+leaving both on will double it up.
+
+### Interiors and cover
+
+Precipitation is stopped by real geometry. When a particle spawns, the runtime
+ray traces the scene acceleration structure twice: an upward shelter probe
+first (if opaque cover hangs anywhere overhead -- even far above the spawn
+plane -- the drop is killed at birth, because it would have been stopped up
+there), then a trace along the direction the particle is about to travel,
+ending its life where it would land. Rain therefore stops under roofs,
+bridges, awnings and overhangs without the game telling the runtime anything
+about them.
+
+The upward probe matters more than it looks: the spawn plane hangs only
+`spawnHeightMeters` above the camera, and any cover ABOVE that plane is behind
+a downward ray's origin and invisible to it. This is especially acute when
+`rtx.sceneScale` under-states the game's real unit scale (authored meters
+shrink relative to the world, lowering the plane beneath most roofs) -- but it
+is true at any scale: a bridge 30 m up should shelter the street even though
+the plane hangs at 14 m.
+
+This is view-independent, which is the whole point: the older
+`collideWithWorld` path reprojects into the previous frame G-buffer and so can
+only see what is on screen -- useless for the roof above the player head, which
+almost never is. Cost is at most two rays per SPAWNED particle (hundreds per
+frame at default settings, not thousands), because a straight-line ray covers a
+ballistic particle whole path in a single query.
+
+Controlled by `rtx.weather.precipitation.occludeUnderCover` (default on).
+Read-only diagnostics (per-frame ray/kill/hit counters, TLAS availability, and
+the spawn-plane height in world units) live directly under that toggle in the
+dev menu.
+
+Limits worth knowing:
+- The rays are straight lines along the spawn velocity, so they are exact for
+  straight-falling rain and an approximation for heavily tumbling snow.
+- Only opaque geometry blocks. Glass, alpha-blended AND alpha-tested surfaces
+  (foliage cards, chain fences, gratings) do not stop precipitation.
+- It uses the previous frame acceleration structure (particle simulation runs
+  before this frame TLAS is built) and is skipped entirely on the first frames
+  of a scene, before any TLAS exists.
+
+That covers physical cover. It does NOT cover the case where a game considers
+somewhere "indoors" that has no geometry above it, or where you simply want no
+weather in an interior cell regardless. For that, the wrapper still decides: it
+already owns `__weather.target`, so target a dry preset on entering an interior,
+or set `rtx.weather.precipitation.intensity = 0` directly. Precipitation ramps
+down over one particle lifetime, which reads as walking out of the rain rather
+than a hard cut.
+
+### Fast movement
+
+Because only the camera's *position* anchors the spawn volume, sustained fast
+horizontal movement (vehicles, flight) thins the leading edge of the volume
+slightly: already-falling drops are world-anchored and get left behind, and only
+the per-frame spawn smear refills the disc overhead. At on-foot speeds the
+effect is negligible; at tens of m/s expect visibly lighter rain in the
+direction of travel. This is the deliberate trade against view-coupled spawning
+(which made turning drag the whole rain volume around the player) -- do not
+"fix" it by biasing the volume along the view direction.
+
+### Recommended pattern (plugin-owned particle channels)
 
 1. Maintain a particle archetype map keyed by preset name in your plugin:
 
@@ -242,21 +348,20 @@ void updateParticles(float deltaTime) {
    This ensures particle density and atmospheric appearance reach their target
    states simultaneously.
 
-### Why particles are not just spawn rate
+### Why the rest is still plugin-owned
 
-Particle systems involve far more than a single density scalar:
-- Particle velocity, spread, and lifetime all shift between weather states
-  (light drizzle has slow, wide drops; blizzard has fast horizontal streaks).
+Weather is more than falling drops, and the remaining channels do not follow the
+atmospheric blend curve:
 - Sound layers (rain on surfaces, thunder rumble, wind howl) blend on separate
   curves.
 - Splash / accumulation VFX (puddles, snow buildup) have their own accumulation
-  timelines that do not simply follow the atmospheric blend curve.
-- GPU particle budget varies widely across archetypes -- the plugin must manage
-  pool sizing and LOD independently.
+  timelines that lag the atmospheric blend by design -- the ground stays wet
+  long after the rain stops.
+- Game-specific effects (leaves in wind, ash, embers, spore drifts) are content,
+  not weather, and the plugin owns their budget and LOD.
 
-Because of this complexity, the design leaves all particle authoring to the
-plugin. The renderer provides the blend progress signal; the plugin decides what
-to do with it.
+For those, the renderer provides the blend progress signal and the plugin
+decides what to do with it.
 
 ---
 

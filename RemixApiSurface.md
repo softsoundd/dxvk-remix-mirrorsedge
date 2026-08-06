@@ -170,6 +170,8 @@ toRtCategories(), so the bit values are free to match upstream and must.)
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER` | `1 << 22` |  |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER` | `1 << 23` |  |
 | `REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS` | `1 << 24` |  |
+| `REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS` | `1 << 25` |  |
+| `REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL` | `1 << 26` |  |
 
 ### `remixapi_dxvk_CopyRenderingOutputType`
 
@@ -179,6 +181,7 @@ toRtCategories(), so the bit values are free to match upstream and must.)
 | `REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH` | `1` |  |
 | `REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS` | `2` |  |
 | `REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING` | `3` |  |
+| `REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI` | `4` |  |
 
 ### `remixapi_Format`
 
@@ -251,6 +254,7 @@ Texture upload API
 | `remixapi_Bool` | `disableSrgbConversionForOutput` |  |
 | `remixapi_Bool` | `forceNoVkSwapchain` | If true, 'dxvk_GetExternalSwapchain' can be used to retrieve a raw VkImage, so the application can present it, for example by using OpenGL interop: converting VkImage to OpenGL, and presenting it via OpenGL. Default: false. Use VkSwapchainKHR to present frame into HWND. |
 | `remixapi_Bool` | `editorModeEnabled` |  |
+| `remixapi_Bool` | `combineGuiInFinalColor` | With this disabled, the user must fetch the GUI buffer using the, remixapi_dxvk_CopyRenderingOutputType, api with the, remixapi_dxvk_CopyRenderingOutputType, field set to: 'REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI' Otherwise the GUI will be drawn in the final color buffer. |
 
 ### `remixapi_MaterialInfoOpaqueEXT`
 

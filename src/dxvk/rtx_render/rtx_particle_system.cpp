@@ -55,6 +55,9 @@ namespace dxvk {
         SAMPLER2D(PARTICLE_SYSTEM_BINDING_ANIMATION_DATA_INPUT)
 
         RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT)
+        // Fork (2026-07-25): spawn-occlusion diagnostics counters (see
+        // particle_system_spawn.comp.slang for the counter layout).
+        RW_STRUCTURED_BUFFER(PARTICLE_SYSTEM_BINDING_SPAWN_TRACE_STATS_OUTPUT)
         END_PARAMETER()
     };
 
@@ -176,6 +179,14 @@ namespace dxvk {
 
   RtxParticleSystemManager::RtxParticleSystemManager(DxvkDevice* device)
     : CommonDeviceObject(device) { }
+
+  // Fork (2026-07-25): spawn-occlusion diagnostics statics (see the header for
+  // why these exist).
+  std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceRays { 0 };
+  std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceShelterKills { 0 };
+  std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceLandingHits { 0 };
+  std::atomic<uint32_t> RtxParticleSystemManager::s_spawnTraceRelocations { 0 };
+  std::atomic<bool> RtxParticleSystemManager::s_spawnTraceTlasValid { false };
 
   void RtxParticleSystemManager::showImguiSettings() {
     if (RemixGui::CollapsingHeader("Particle System")) {
@@ -356,6 +367,17 @@ namespace dxvk {
     constants.resolveTransparencyThreshold = RtxOptions::resolveTransparencyThreshold();
     constants.minParticleSize = 2.f; // NOTE: In pixels
     constants.sceneScale = RtxOptions::sceneScale();
+
+    // Fork (2026-07-25): tell the spawn kernel whether the acceleration
+    // structure it can trace against actually exists. Particle simulation runs
+    // from SceneManager::prepareSceneData, BEFORE AccelManager::prepareSceneData
+    // builds/swaps this frame's TLAS, so getTLAS(Opaque).accelStructure is still
+    // last frame's fully-built structure here — exactly what the spawn-time
+    // occlusion trace wants, and one frame of staleness is irrelevant for
+    // "is there a roof over this raindrop". It is null for the first frames of
+    // a scene though, so gate on it.
+    constants.sceneTlasValid =
+      ctx->getResourceManager().getTLAS(Tlas::Opaque).accelStructure.ptr() != nullptr ? 1u : 0u;
   }
 
   // Please re-profile performance if any of these structures change in size.  As a minimum performance requirement, always preserve a 16 byte alignment.
@@ -590,12 +612,71 @@ namespace dxvk {
 
     allocStaticBuffers(ctx);
 
+    // Fork (2026-07-25): with nothing simulating there are no spawn dispatches,
+    // so zero the published occlusion diagnostics instead of letting the dev
+    // panel show numbers from whenever particles last ran.
+    if (m_particleSystems.empty()) {
+      s_spawnTraceRays.store(0, std::memory_order_relaxed);
+      s_spawnTraceShelterKills.store(0, std::memory_order_relaxed);
+      s_spawnTraceLandingHits.store(0, std::memory_order_relaxed);
+      s_spawnTraceRelocations.store(0, std::memory_order_relaxed);
+    }
+
     // If we have particles to simulate...
     if (m_particleSystems.size()) {
       writeSpawnContextsToGpu(ctx);
 
       ParticleSystemConstants constants;
       setupConstants(ctx, constants);
+
+      // Fork (2026-07-25): bind the scene TLAS so the spawn kernel can trace
+      // real occlusion rays (GpuParticleSystemDesc::traceSpawnOcclusion). The
+      // binding is already declared for these passes via
+      // COMMON_RAYTRACING_BINDINGS; it simply was never populated, because
+      // bindCommonRayTracingResources runs later in the frame with the
+      // raytracing dispatches. See setupConstants for why this is last frame's
+      // structure and why sceneTlasValid gates its use.
+      const bool tlasBound = ctx->getResourceManager().getTLAS(Tlas::Opaque).accelStructure.ptr() != nullptr;
+      if (tlasBound) {
+        ctx->bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE,
+                                       ctx->getResourceManager().getTLAS(Tlas::Opaque).accelStructure);
+      }
+      s_spawnTraceTlasValid.store(tlasBound, std::memory_order_relaxed);
+
+      // Fork (2026-07-25): spawn-occlusion diagnostics ring (see the header).
+      // Mirrors ConservativeCounter's clear -> shader-atomics -> copy pattern
+      // and its 10-frames-in-flight retirement assumption.
+      const uint32_t statsFrameIdx = ctx->getDevice()->getCurrentFrameId();
+      constexpr VkDeviceSize kStatsSizeBytes = kSpawnTraceStatsCount * sizeof(uint32_t);
+      if (m_spawnTraceStatsGpu == nullptr) {
+        DxvkBufferCreateInfo info;
+        info.size = kStatsSizeBytes;
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        m_spawnTraceStatsGpu = device()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "RTX Particles - SpawnTraceStats Buffer");
+
+        info.size = kStatsSizeBytes * kSpawnTraceStatsFramesInFlight;
+        info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        m_spawnTraceStatsHost = device()->createBuffer(info, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, DxvkMemoryStats::Category::RTXBuffer, "RTX Particles - SpawnTraceStats HOST Buffer");
+        memset(m_spawnTraceStatsHost->mapPtr(0), 0, info.size);
+      }
+
+      // Publish the oldest ring slot - with 10 slots and one write per frame it
+      // retired many frames ago, so no fence is needed (same contract
+      // ConservativeCounter relies on for its own readback).
+      {
+        const uint32_t oldestSlot = (statsFrameIdx + 1) % kSpawnTraceStatsFramesInFlight;
+        const uint32_t* stats = reinterpret_cast<const uint32_t*>(m_spawnTraceStatsHost->mapPtr(oldestSlot * kStatsSizeBytes));
+        s_spawnTraceRays.store(stats[0], std::memory_order_relaxed);
+        s_spawnTraceShelterKills.store(stats[1], std::memory_order_relaxed);
+        s_spawnTraceLandingHits.store(stats[2], std::memory_order_relaxed);
+        s_spawnTraceRelocations.store(stats[3], std::memory_order_relaxed);
+      }
+
+      ctx->clearBuffer(m_spawnTraceStatsGpu, 0, kStatsSizeBytes, 0);
+      ctx->bindResourceBuffer(PARTICLE_SYSTEM_BINDING_SPAWN_TRACE_STATS_OUTPUT, DxvkBufferSlice(m_spawnTraceStatsGpu));
 
       ctx->bindResourceView(BINDING_VALUE_NOISE_SAMPLER, ctx->getResourceManager().getValueNoiseLut(ctx), nullptr);
       Rc<DxvkSampler> valueNoiseSampler = ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
@@ -707,6 +788,12 @@ namespace dxvk {
           conservativeCount->postSimulation(ctx, ctx->getDevice()->getCurrentFrameId());
         }
       }
+
+      // Fork (2026-07-25): stash this frame's spawn-occlusion counters into the
+      // readback ring after every system's spawn dispatch has run.
+      ctx->copyBuffer(m_spawnTraceStatsHost,
+                      (statsFrameIdx % kSpawnTraceStatsFramesInFlight) * kStatsSizeBytes,
+                      m_spawnTraceStatsGpu, 0, kStatsSizeBytes);
     }
 
     prepareForNextFrame();

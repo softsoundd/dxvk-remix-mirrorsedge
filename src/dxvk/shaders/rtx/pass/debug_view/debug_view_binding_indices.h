@@ -62,6 +62,12 @@
 // by DEBUG_VIEW_CLOUD_RENDER_RT (enum 876).
 #define DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT                                            42
 
+// Fork: cloud NVDF body SDF (Nubis3 conversion Phase A; R16F 3D, signed km,
+// texture y = VERTICAL — see cloud_nvdf.h). Sampled by
+// DEBUG_VIEW_CLOUD_NVDF_SDF (enum 879). Extends the contiguous fork-owned
+// cloud-debug block to 39-43.
+#define DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT                                             43
+
 // Slot 38 was DEBUG_VIEW_BINDING_PRIMARY_CLOUD_SHADOW_FACTOR_INPUT (fork
 // screen-space cloud-shadow texture, debug view 878). Removed 2026-06-19 with
 // the screen-space cloud-shadow system; number left reserved (no descriptor

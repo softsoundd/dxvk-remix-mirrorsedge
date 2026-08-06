@@ -41,6 +41,10 @@
 #include <remix/remix_c.h>
 // NV-DXVK end
 
+// NV-DXVK start: FSR 3.1 runtime probe
+#include "rtx_render/rtx_fork_hooks.h"
+// NV-DXVK end
+
 namespace dxvk {
 
   const char* GpuVendorToString(DxvkGpuVendor vendor) {
@@ -176,6 +180,32 @@ namespace dxvk {
       queues.present = presentQueue;
     }
     // NV_DXVK end
+
+    // NV-DXVK start: FSR FG integration
+    // Frame interpolation needs its own image-acquire queue and a present queue
+    // that is not the graphics queue. Only claimed when the FidelityFX runtime
+    // is present, so installs without it get upstream's queue set untouched.
+    if (fork_hooks::fsrRuntimeAvailable()) {
+      // Prefer a family with transfer support for the acquire queue.
+      uint32_t imageAcquireQueue = findQueueFamily(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+                                                   VK_QUEUE_TRANSFER_BIT);
+      if (imageAcquireQueue == VK_QUEUE_FAMILY_IGNORED) {
+        // Fall back to compute+transfer if no dedicated transfer queue
+        imageAcquireQueue = findQueueFamily(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+                                            VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT);
+      }
+
+      if (imageAcquireQueue != VK_QUEUE_FAMILY_IGNORED) {
+        queues.imageAcquire = imageAcquireQueue;
+      }
+
+      // Prefer a dedicated FSR present queue when available.
+      // Surface support gets validated later during swapchain creation where a surface is available.
+      if (presentQueue != VK_QUEUE_FAMILY_IGNORED && presentQueue != graphicsQueue) {
+        queues.fsrPresent = presentQueue;
+      }
+    }
+    // NV-DXVK end
 
     return queues;
   }
@@ -453,6 +483,12 @@ namespace dxvk {
       devDlfgExtensions.size(),
       devDlfgExtensions.data(),
       extensionsEnabled);
+    // NV-DXVK end
+
+    // NV-DXVK start: FSR 3.1 — required by the FidelityFX SDK's internal
+    // allocator. Only requested when the FidelityFX runtime is actually present.
+    if (fork_hooks::fsrRuntimeAvailable() && m_deviceExtensions.supports(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME))
+      extensionsEnabled.add(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
     // NV-DXVK end
 
     // Enable additional extensions if necessary
@@ -759,6 +795,16 @@ namespace dxvk {
     if (queueFamilies.present != VK_QUEUE_FAMILY_IGNORED) {
       handleQueueFamily(queueFamilies.present, queueInfos.present);
     }
+
+    // NV-DXVK start: FSR FG integration
+    if (queueFamilies.imageAcquire != VK_QUEUE_FAMILY_IGNORED) {
+      handleQueueFamily(queueFamilies.imageAcquire, queueInfos.imageAcquire);
+    }
+    
+    if (queueFamilies.fsrPresent != VK_QUEUE_FAMILY_IGNORED) {
+      handleQueueFamily(queueFamilies.fsrPresent, queueInfos.fsrPresent);
+    }
+    // NV-DXVK end
 
     // Create the requested queues
 

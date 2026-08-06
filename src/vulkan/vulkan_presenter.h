@@ -136,6 +136,22 @@ namespace dxvk::vk {
       // NV-DXVK end
     ~Presenter();
 
+    // NV-DXVK start: FSR FG support - surface handover across presenter switches
+    /**
+     * \brief Releases ownership of the surface
+     * 
+     * Returns the surface handle and sets internal handle to
+     * VK_NULL_HANDLE so the destructor won't destroy it.
+     * Caller is responsible for the surface lifetime.
+     * \returns The VkSurfaceKHR handle (caller takes ownership)
+     */
+    VkSurfaceKHR releaseSurface() {
+      VkSurfaceKHR surface = m_surface;
+      m_surface = VK_NULL_HANDLE;
+      return surface;
+    }
+    // NV-DXVK end
+
     /**
      * \brief Actual presenter info
      * \returns Swap chain properties
@@ -290,6 +306,23 @@ namespace dxvk::vk {
 
   protected:
   // NV-DXVK end
+
+    // NV-DXVK start: FSR FG support - Protected constructor for derived classes
+    /**
+     * \brief Protected constructor for derived classes
+     * 
+     * Creates a presenter using an existing surface, allowing
+     * derived classes to take ownership of another presenter's
+     * surface without recreating it. This avoids VK_ERROR_NATIVE_WINDOW_IN_USE_KHR
+     * when switching presenter types at runtime.
+     */
+    Presenter(
+            HWND            window,
+      const Rc<InstanceFn>& vki,
+      const Rc<DeviceFn>&   vkd,
+            PresenterDevice device,
+            VkSurfaceKHR    existingSurface);
+    // NV-DXVK end
 
     Rc<InstanceFn>    m_vki;
     Rc<DeviceFn>      m_vkd;

@@ -120,6 +120,9 @@ namespace fork_hooks {
 
 class GameCapturer : public RcObject
 {
+  // Fork touchpoint: the capture material API-path hook needs access to
+  // private m_exporter and m_pCap. Tracked as an inline tweak in
+  // docs/fork-touchpoints.md.
   friend void fork_hooks::captureMaterialApiPath(
     GameCapturer&, const Rc<DxvkContext>, const RtInstance&,
     XXH64_hash_t, const LegacyMaterialData&, bool);

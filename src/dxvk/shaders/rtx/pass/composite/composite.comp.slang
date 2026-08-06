@@ -579,16 +579,16 @@ void applySkyContribution(
     return;
   }
 
-  vec3 skyContribution;
-  if (cb.domeLightArgs.active)
+  if (!cb.domeLightArgs.active)
   {
-    skyContribution = cb.domeLightArgs.radiance * sampleDomeLightTexture(SkyLight, primaryRayDirections.worldDirection, cb.domeLightArgs.worldToLightTransform) * volumeAttenuation;
+    // Sky radiance (rasterized SkyProbe cubemap for skyMode==0, Hillaire
+    // atmosphere for skyMode==1) is already accumulated into SharedRadiance
+    // by the primary-miss handler in geometry_resolver.slangh. Adding SkyMatte
+    // here as well double-counts the sky (NV-DXVK fork bug since sync 1448e4e77).
+    return;
   }
-  else
-  {
-    vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
-    skyContribution = cb.skyBrightness * SkyLight.SampleLevel(screenUV, 0) * volumeAttenuation;
-  }
+
+  vec3 skyContribution = cb.domeLightArgs.radiance * sampleDomeLightTexture(SkyLight, primaryRayDirections.worldDirection, cb.domeLightArgs.worldToLightTransform) * volumeAttenuation;
 
   if (cb.sparseRenderingArgs.mode != SparseRenderingMode::Off &&
       cb.sparseRenderingArgs.enableSparsePrimaryRayMissComposition)

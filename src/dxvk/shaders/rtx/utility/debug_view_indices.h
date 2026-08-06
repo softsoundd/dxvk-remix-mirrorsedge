@@ -322,6 +322,14 @@
 // radiance in the NEE; use 875/877 (D_sun grid reads) for diagnostics. The
 // number is left burned (not reused) so saved configs referencing 878 fall
 // through to the default view rather than aliasing a new one.
+// Cloud NVDF SDF slice (fork — Nubis3 conversion Phase A). Horizontal slice
+// of the 256x64x256 body signed-distance field at a fixed height fraction:
+// warm gradient inside (negative km), cool gradient outside (positive km),
+// green band at the zero crossing. Primary validation surface for the JFA
+// bake — cloud bodies should read as smooth blobby cells, the green
+// iso-line should trace their outlines, and panning the tile must show no
+// seam at the wrap boundary.
+#define DEBUG_VIEW_CLOUD_NVDF_SDF 879
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

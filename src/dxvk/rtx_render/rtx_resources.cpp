@@ -38,6 +38,7 @@
 #include "rtx_texture_manager.h"
 #include "rtx_debug_view.h"
 #include "rtx_xess.h"
+#include "rtx_fork_hooks.h"
 #include "../util/util_global_time.h"
 
 namespace dxvk {
@@ -708,6 +709,10 @@ namespace dxvk {
       }
     }
     
+    // NV-DXVK start: FSR mip bias (returns 0 unless FSR is the active upscaler)
+    totalMipBias += fork_hooks::fsrUpscalingMipBias(m_device);
+    // NV-DXVK end
+
     return getSampler(filter, mipFilter, addressModeU, addressModeV, addressModeW, borderColor, totalMipBias, useAnisotropy);
   }
 

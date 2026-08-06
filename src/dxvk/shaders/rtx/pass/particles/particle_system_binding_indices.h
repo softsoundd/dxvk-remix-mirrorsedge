@@ -36,15 +36,31 @@ struct GpuParticle {
 
   f16vec4 uvMinMax;
   half rotation;
-  half timeToLive;
   half pad0;
-  half pad1;
+  // Fork-touchpoint inline tweak (2026-07-25): timeToLive was a half sharing a
+  // 32-bit word with `rotation` (plus two half pads). fp16 spacing at 16..32 is
+  // 1/64 s, so the evolve shader's `timeToLive -= deltaTimeSecs` ROUNDS BACK TO
+  // THE SAME VALUE whenever deltaTime < 1/128 s: at >128 fps any particle with
+  // >=16 s of life left never ages, never dies, never decrements the
+  // conservative counter — the system pins at maxNumParticles immortal
+  // particles and (since spawning is capacity-gated) stops emitting entirely
+  // once they have all fallen out of view. Long lifetimes are exactly what the
+  // weather precipitation system uses for slow-falling snow (~20 s to cover the
+  // spawn volume at 1.1 m/s), and USD-authored systems can hit this too.
+  // Promoted to a full float by absorbing the two pad halves; struct stays 48
+  // bytes (static_assert in rtx_particle_system.cpp) and the field is 4-byte
+  // aligned at offset 44.
+  float timeToLive;
 
-  const static uint16_t kDeadTimeToLiveSentinel = 0x7C00;
+  // Float +inf bit pattern. Doubles as the whole-buffer clear word: every
+  // 32-bit word of a cleared particle reads as inf/NaN garbage, which is fine
+  // because the only field consulted while dead is timeToLive (the word at
+  // offset 44, which reads exactly +inf = dead).
+  const static uint kDeadTimeToLiveSentinel = 0x7F800000;
 
 #ifdef __cplusplus
   // This ensures that `timeToLive` is initialized with the correct value.
-  static const uint kBufferClearValue = (kDeadTimeToLiveSentinel << 16) | kDeadTimeToLiveSentinel;
+  static const uint kBufferClearValue = kDeadTimeToLiveSentinel;
 #else
   [mutating]
   void reset(GpuParticleSystem system, float3 worldPosition, float3 worldVelocity, f16vec4 _uvMinMax, vec4 color, float seed) {
@@ -59,11 +75,14 @@ struct GpuParticle {
 
   [mutating]
   void setDead() {
-    timeToLive = reinterpret<half>(kDeadTimeToLiveSentinel);
+    timeToLive = asfloat(kDeadTimeToLiveSentinel);
   }
 
   bool isDead() {
-    return timeToLive == reinterpret<half>(kDeadTimeToLiveSentinel);
+    // +inf compares equal to +inf; live particles are always finite (initial
+    // life is finite and subtraction keeps it finite), so the sentinel is
+    // unambiguous.
+    return timeToLive == asfloat(kDeadTimeToLiveSentinel);
   }
 
   bool isSleeping() {
@@ -119,6 +138,10 @@ struct ParticleVertex {
 #define PARTICLE_SYSTEM_BINDING_PARTICLES_BUFFER_INPUT_OUTPUT  60
 #define PARTICLE_SYSTEM_BINDING_VERTEX_BUFFER_OUTPUT           61
 #define PARTICLE_SYSTEM_BINDING_COUNTER_OUTPUT                 62
+// Fork (2026-07-25): spawn-occlusion diagnostics counters written by the spawn
+// kernel (rays traced / shelter kills / landing hits), read back for the
+// Precipitation dev panel. See RtxParticleSystemManager::simulate.
+#define PARTICLE_SYSTEM_BINDING_SPAWN_TRACE_STATS_OUTPUT       63
 
 #define PARTICLE_SYSTEM_MIN_BINDING                           PARTICLE_SYSTEM_BINDING_CONSTANTS
 

@@ -487,6 +487,115 @@ namespace dxvk {
     // Implementation in rtx_fork_weather.cpp.
     void showWeatherUI();
 
+    // --- FSR 3.1 upscaling, RCAS sharpening and frame generation -------------
+    //
+    // The FidelityFX runtime is delay-loaded (see the /DELAYLOAD link arg in
+    // src/dxvk/meson.build), so every one of these hooks is safe to call on a
+    // machine with no amd_fidelityfx_vk.dll: they degrade to no-ops / "not
+    // supported" rather than raising a delay-load exception.
+
+    // True when amd_fidelityfx_vk.dll could be loaded in this process. Probed
+    // once and latched. Every FFX entry point in the fork sits behind this.
+    // Implementation in rtx_fork_fsr.cpp.
+    bool fsrRuntimeAvailable();
+
+    // True when FSR is the selected upscaler *and* its pass is active this
+    // frame. Called from RtxContext::getCurrentUpscaler.
+    // Requires friend access to RtxContext::m_common.
+    // Implementation in rtx_fork_fsr.cpp.
+    bool isFsrUpscalerActive(RtxContext& ctx);
+
+    // Fills downscaleExtent with the render resolution FSR wants for the given
+    // display resolution. Called from RtxContext::setDownscaleExtent.
+    // Requires friend access to RtxContext::m_common.
+    // Implementation in rtx_fork_fsr.cpp.
+    void setFsrDownscaleExtent(RtxContext& ctx, const VkExtent3D& upscaleExtent, VkExtent3D& downscaleExtent);
+
+    // Runs the FSR upscale pass. Called from RtxContext::dispatchUpscale in
+    // place of the per-upscaler dispatch bodies.
+    // Requires friend access to RtxContext private members.
+    // Implementation in rtx_fork_fsr.cpp.
+    void dispatchFsrUpscale(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
+
+    // Runs the standalone RCAS sharpening pass after the main upscale. No-ops
+    // unless sharpening is non-zero and the active upscaler is one that does
+    // not sharpen internally (DLSS / DLSS-RR / XeSS / TAA-U).
+    // Requires friend access to RtxContext::m_currentUpscaler.
+    // Implementation in rtx_fork_rcas.cpp.
+    void dispatchRcasSharpening(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
+
+    // Configures and prepares FSR frame generation for the current frame.
+    // No-ops unless FSR frame generation is the selected, enabled and supported
+    // backend. Called from the same site as RtxContext::dispatchDLFG.
+    // Requires friend access to RtxContext private members.
+    // Implementation in rtx_fork_fsr_framegen.cpp.
+    void dispatchFsrFrameGeneration(RtxContext& ctx, const Rc<DxvkImage>& hudLessBackBuffer);
+
+    // Texture mip-bias contribution when FSR is the active upscaler; returns 0
+    // when it is not. Called from Resources::getSampler and
+    // SceneManager::getTotalMipBias / getCalculatedUpscalingMipBias.
+    // No private-member access.
+    // Implementation in rtx_fork_fsr.cpp.
+    float fsrUpscalingMipBias(DxvkDevice* device);
+
+    // Camera jitter sequence length FSR expects, matching
+    // ffxFsr3UpscalerGetJitterPhaseCount. Returns 0 when FSR is not the active
+    // upscaler, in which case the caller keeps its own sequence length.
+    // No private-member access.
+    // Implementation in rtx_fork_fsr.cpp.
+    uint32_t fsrJitterSequenceLength(uint32_t finalWidth, uint32_t renderWidth);
+
+    // True when FSR frame generation is selected, enabled and supported on this
+    // device. The DXVK-side mirror of DxvkContext::isDLFGEnabled; consumed by
+    // D3D9SwapChainEx to decide which presenter to create.
+    // No private-member access.
+    // Implementation in rtx_fork_fsr_framegen.cpp.
+    bool isFsrFrameGenEnabled(DxvkDevice* device);
+
+    // True when either frame-generation backend is currently enabled. Used by
+    // the dev menu's V-Sync guard, which must disable the V-Sync widgets for
+    // FSR FG as well as DLSS-G.
+    // Implementation in rtx_fork_upscaler_ui.cpp.
+    bool anyFrameGenerationEnabled();
+
+    // True when this device supports at least one frame-generation backend.
+    // Gates whether the menus show a "Frame Generation Settings" section.
+    // Implementation in rtx_fork_upscaler_ui.cpp.
+    bool anyFrameGenerationSupported(const Rc<DxvkContext>& ctx, bool isDlfgSupported);
+
+    // Draws the whole frame-generation panel: the Off / DLSS / FSR technology
+    // combo (which is itself the enable control - see
+    // fork_hooks::applyFrameGenerationType), a status line, and whatever extra
+    // controls the selected backend has. Replaces the call to the upstream
+    // ImGUI::showDLFGOptions, which is left untouched but unused because its
+    // body is built around a per-backend enable checkbox this UI does not have.
+    // Implementation in rtx_fork_upscaler_ui.cpp.
+    void showFrameGenerationOptions(const Rc<DxvkContext>& ctx, bool isDlfgSupported);
+
+    // Draws the FSR upscaler sub-panel: preset combo plus render-resolution
+    // readout. Called from the upscaler-settings switch in both menus.
+    // Implementation in rtx_fork_upscaler_ui.cpp.
+    void showFsrUpscalerSettings(const Rc<DxvkContext>& ctx);
+
+    // Draws the shared post-upscale RCAS sharpness slider. Shown for any active
+    // upscaler; the option itself lives at rtx.sharpening.sharpness.
+    // Implementation in rtx_fork_upscaler_ui.cpp.
+    void showSharedSharpnessSlider();
+    // Submits the weather precipitation emitter (rain / snow / blowing sand) for
+    // this frame. Called from RtxContext::injectRTX immediately BEFORE
+    // SceneManager::prepareSceneData, which is where the particle simulation
+    // runs — submitting after it would lose this frame's spawn contexts.
+    // Dormant unless rtx.weather.precipitation.intensity is non-zero, which the
+    // weather blender drives from the per-preset precipitation fields.
+    // No private-member access. Implementation in rtx_fork_precipitation.cpp.
+    void submitPrecipitation(class RtxContext& ctx);
+
+    // Renders the global (non-per-preset) precipitation controls — budget, spawn
+    // volume, collision. The per-preset look values are generated into the
+    // weather preset editor automatically by WEATHER_PRESET_FIELD_LIST.
+    // No private-member access. Implementation in rtx_fork_precipitation.cpp.
+    void showPrecipitationUI();
+
   } // namespace fork_hooks
 
 } // namespace dxvk

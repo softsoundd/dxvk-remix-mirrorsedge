@@ -85,8 +85,11 @@ GENERIC_ILLUMINANCE_EV100(float)
 GENERIC_ILLUMINANCE_EV100(vec3)
 
 // https://en.wikipedia.org/wiki/SRGB#Transformation
-// Note: Technically following conversions are not 100% accurate, we simply approximate the
-// sRGB transfer function with x^gamma rather than the full formula.
+// Note: linearToGamma below approximates the sRGB transfer function with x^(1/gamma) (used only for output
+// encoding). gammaToLinear uses the EXACT sRGB (IEC 61966-2-1) piecewise curve -- the same conversion the
+// GPU sampler performs when decoding an sRGB-format texture -- so color inputs decoded in software (e.g.
+// albedo submitted to the runtime as UNORM) linearize identically to the hardware/"game" sRGB decode
+// rather than the coarser x^2.2 approximation.
 static const float kSRGBGamma = 2.2f;
 
 // Converts color in linear space to color in gamma space with a sRGB gamma
@@ -100,11 +103,14 @@ GENERIC_LINEAR_TO_GAMMA(f16vec4)
 GENERIC_LINEAR_TO_GAMMA(f16vec3)
 GENERIC_LINEAR_TO_GAMMA(vec3)
 
-// Converts color in gamma space to color in linear space with a sRGB gamma
-#define GENERIC_GAMMA_TO_LINEAR(colorType)       \
-colorType gammaToLinear(colorType gammaColor)    \
-{                                                \
-  return pow(gammaColor, colorType(kSRGBGamma)); \
+// Converts color in gamma space to color in linear space using the exact sRGB electro-optical transfer
+// function (piecewise: linear segment below 0.04045, else ((c + 0.055) / 1.055)^2.4).
+#define GENERIC_GAMMA_TO_LINEAR(colorType)                                                                \
+colorType gammaToLinear(colorType gammaColor)                                                             \
+{                                                                                                         \
+  const colorType linearLo = gammaColor / colorType(12.92f);                                              \
+  const colorType linearHi = pow((gammaColor + colorType(0.055f)) / colorType(1.055f), colorType(2.4f));  \
+  return lerp(linearLo, linearHi, step(colorType(0.04045f), gammaColor));                                 \
 }
 
 GENERIC_GAMMA_TO_LINEAR(f16vec4)

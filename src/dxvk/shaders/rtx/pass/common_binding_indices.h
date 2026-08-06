@@ -53,7 +53,7 @@
 #define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     200
 #define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   201
 #define BINDING_ATMOSPHERE_SKY_VIEW_LUT          202
-#define BINDING_ATMOSPHERE_CLOUD_NOISE_3D        203
+// 203: retired (legacy 256^3 cloud noise volume, removed 2026-07-16 — do not reuse without a collision audit)
 #define BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER   204
 #define BINDING_ATMOSPHERE_FAST_NOISE            205
 // Cloud history textures (fork): screen-space ping-pong for temporal smoothing
@@ -125,19 +125,15 @@
 // sky-view sampler (REPEAT-U handles the azimuth seam).
 #define BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT 215
 
-// Cloud placement map (fork — 2026-06-11, column-shaping rework). 512x512
-// RGBA8 tiled at cloudNoiseTileKm: R = cluster field (where clouds are, at
-// cloud scale), G = per-cloud top-height jitter, B = base lift. Baked by
-// cloud_placement_map_baker.comp.slang (live re-bake on input change).
-// Drives the per-column cloud model in the density samplers (and their
-// shadow-march taps). Sampled with the linear/REPEAT cloud noise sampler.
-#define BINDING_ATMOSPHERE_CLOUD_PLACEMENT_MAP 216
+// 216: retired (legacy view-pass placement-map slot, removed 2026-07-16 — the
+// placement map itself lives on as an NVDF-occupancy bake input, bound at the
+// bake passes' own slots; do not reuse without a collision audit)
 
 // Fork atmosphere/cloud bindings occupy a contiguous range ABOVE COMMON_MAX_BINDING
 // (which only covers the base common bindings). Expose the range so passes that
 // also bind their own resources (e.g. sparse rendering) can assert no overlap.
 #define BINDING_ATMOSPHERE_MIN                   BINDING_ATMOSPHERE_TRANSMITTANCE_LUT
-#define BINDING_ATMOSPHERE_MAX                   BINDING_ATMOSPHERE_CLOUD_PLACEMENT_MAP
+#define BINDING_ATMOSPHERE_MAX                   BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT
 
 #define COMMON_MAX_BINDING                       BINDING_SAMPLER_READBACK_BUFFER
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
@@ -185,7 +181,6 @@
   TEXTURE2D(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)                   \
   TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
   TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)                        \
-  TEXTURE3D(BINDING_ATMOSPHERE_CLOUD_NOISE_3D)                      \
   SAMPLER(BINDING_ATMOSPHERE_CLOUD_NOISE_SAMPLER)                   \
   TEXTURE2DARRAY(BINDING_ATMOSPHERE_FAST_NOISE)                     \
   TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_HISTORY_PREV)                  \
@@ -197,7 +192,6 @@
   TEXTURE3D(BINDING_ATMOSPHERE_CLOUD_D_SUN)                         \
   TEXTURE3D(BINDING_ATMOSPHERE_CLOUD_D_AMBIENT)                     \
   SAMPLER(BINDING_ATMOSPHERE_SKY_VIEW_SAMPLER)                      \
-  TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT)                 \
-  TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_PLACEMENT_MAP)
+  TEXTURE2D(BINDING_ATMOSPHERE_CLOUD_SECONDARY_LUT)
 
 #endif

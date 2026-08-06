@@ -32,6 +32,7 @@
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
+#include "rtx_render/rtx_fork_hooks.h"
 #include "rtx_render/rtx_postFx.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
 #include "rtx_render/rtx_restir_gi_rayquery.h"
@@ -185,6 +186,7 @@ namespace dxvk {
       const ImVec2 childSize = ImVec2(ImGui::GetContentRegionAvail().x + windowPaddingX, m_userWindowHeight * 0.63f);
       const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
       const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
+
 
       ImGui::PopStyleVar();
 
@@ -458,11 +460,17 @@ namespace dxvk {
 
           break;
         }
+        case UpscalerType::FSR: {
+          fork_hooks::showFsrUpscalerSettings(ctx);
+          break;
+        }
         case UpscalerType::None: {
           // No custom UI here.
           break;
         }
       }
+
+      fork_hooks::showSharedSharpnessSlider();
 
       ImGui::Unindent(static_cast<float>(subItemIndent));
       ImGui::PopItemWidth();
@@ -471,10 +479,12 @@ namespace dxvk {
     }
 
     // Latency Reduction Settings
-    if (dlfgSupported) {
+    if (fork_hooks::anyFrameGenerationSupported(ctx, dlfgSupported)) {
       ImGui::Dummy(ImVec2(0.0f, 3.0f));
       ImGui::TextSeparator("Frame Generation Settings");
-      showDLFGOptions(ctx);
+      // NV-DXVK start: fork frame-generation panel (DLSS-G / FSR-FG selector)
+      fork_hooks::showFrameGenerationOptions(ctx, dlfgSupported);
+      // NV-DXVK end
     }
 
     if (reflexInitialized) {

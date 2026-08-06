@@ -46,7 +46,6 @@
 // accumulation to hide refresh shimmer behind.
 
 #define ATMOSPHERE_AVAILABLE
-#define ATMOSPHERE_CLOUD_HEIGHT_LUT_AVAILABLE
 
 #include "rtx/utility/shader_types.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h"
@@ -57,9 +56,6 @@
 // the include per the established binding-then-include layout.
 layout(binding = 0)
 ConstantBuffer<AtmosphereArgs> atmosphereArgs;
-
-layout(binding = 1)
-Texture3D<float> AtmosphereCloudNoise3D;
 
 layout(binding = 2)
 SamplerState AtmosphereCloudNoise3DSampler;
@@ -85,19 +81,14 @@ Texture2D<float> AtmosphereCloudSkyTransmittanceLut;
 layout(binding = 9)
 SamplerState AtmosphereSkyViewSampler;
 
-// RGBA8 since column-shaping rev 3 (B = cumulative envelope integral for
-// the analytic downwelling light field; see cloud_height_lut_baker).
-layout(binding = 10)
-Texture2D<float4> AtmosphereCloudHeightLut;
+// Nubis3 NVDF/SDF model inputs (fork — Nubis3 conversion Phase B). Same
+// resources + slots as cloud_render.comp.slang so the dome LUT march sees
+// the identical Nubis3 field when the model toggle is on.
+layout(binding = 13)
+Texture3D<float> AtmosphereCloudNvdfSdf;
 
-layout(binding = 11)
-SamplerState AtmosphereCloudHeightLutSampler;
-
-// Cloud placement map (fork — 2026-06-11, column-shaping rework). Same
-// resource + slot as cloud_render.comp.slang so the dome LUT march sees
-// the identical per-column cloud field the visible pass renders.
-layout(binding = 12)
-Texture2D<float4> AtmosphereCloudPlacementMap;
+layout(binding = 14)
+Texture3D<float4> AtmosphereCloudDetailNoise3D;
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/pass/atmosphere/cloud_march_common.slangh"
@@ -138,7 +129,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
   vec3 accumColor = vec3(0.0f);
   float viewTransmittance = 1.0f;
-  marchCloudLayers(viewDirYUp, jitter,
+  // The LUT bake's jitter is already frame-constant, so the adaptive march's
+  // near (animated) and far (static) hashes are the same value here.
+  marchCloudLayers(viewDirYUp, jitter, jitter,
                    /*tMinClamp=*/0.0f,
                    /*tMaxClamp=*/0.0f,
                    args.cloudViewSamples, ctx, args,

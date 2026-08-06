@@ -24,7 +24,7 @@
  * Cloud placement map bake (fork — 2026-06-11, column-shaping rework).
  *
  * Fills the 512x512 RGBA8 cloud placement map that drives the per-column
- * cloud model in sampleCloudDensityTextured / sampleCloudDensityForShadow:
+ * cloud model consumed by the NVDF occupancy bake (formerly also the legacy view/shadow samplers):
  *
  *   R — cluster field F [0,1]: Worley-cell cloud clusters modulated by a
  *       value-noise FBM. Cell centers are cloud cores (F high); cell
@@ -67,7 +67,7 @@ RWTexture2D<float4> cloudPlacementMapOutput;
 static const float kPlacementMapSize = 512.0f;
 
 // Design mean of the R-channel cluster field. The runtime hex-blend
-// (sampleCloudPlacement in atmosphere_common.slangh) anchors its
+// (formerly sampleCloudPlacement in atmosphere_common.slangh) anchors its
 // variance-preserving blend on this value — keep both sites in lockstep
 // with any retune of the field construction below.
 // (Shared constant kCloudPlacementFieldMean lives in atmosphere_common.slangh.)

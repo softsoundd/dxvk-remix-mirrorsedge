@@ -318,9 +318,10 @@ namespace dxvk {
           RemixGui::ColorEdit3("Single Scattering Albedo", &singleScatteringAlbedoObject());
           RemixGui::DragFloat("Anisotropy", &anisotropyObject(), 0.01f, -.99f, .99f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Fog Sun Visibility Gain", &fogSunVisibilityGainObject(), 0.05f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          // Sun-only counterpart to the gain above (issue #35): scales just the
-          // atmosphere sun's fog contribution, leaving scene-light fog untouched.
+          // Sun-only counterpart to the gain above (issue #35).
+          // Plus retired the volume_integrator consumer; knob retained for ME/docs parity.
           RemixGui::DragFloat("Atmosphere Sun Fog Scale", &RtxOptions::atmosphereSunVolumetricRadianceScaleObject(), 0.05f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Volumetric Consumer Gain", &volumetricConsumerGainObject(), 0.001f, 0.0f, 5.0f, "%.4f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Depth Offset", &depthOffsetObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
           RemixGui::Separator();
@@ -604,8 +605,8 @@ namespace dxvk {
     volumeArgs.multiScatteringEstimate = multiScatteringEstimate;
     volumeArgs.enableReferenceMode = enableReferenceMode();
     volumeArgs.volumetricFogAnisotropy = anisotropy();
-    volumeArgs.fogSunVisibilityGain = fogSunVisibilityGain();
-    volumeArgs.volumetricConsumerGain = volumetricConsumerGain();
+    volumeArgs.fogSunVisibilityGain = RtxOptions::skyMode() == SkyMode::Numos ? fogSunVisibilityGain() : 1.0f;
+    volumeArgs.volumetricConsumerGain = RtxOptions::skyMode() == SkyMode::Numos ? volumetricConsumerGain() : 1.0f;
 
     volumeArgs.enableNoiseFieldDensity = enableHeterogeneousFog();
     volumeArgs.noiseFieldSubStepSize = noiseFieldSubStepSizeMeters() * RtxOptions::getMeterToWorldUnitScale();

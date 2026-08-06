@@ -207,7 +207,7 @@ namespace dxvk {
   float SceneManager::getTotalMipBias() {
     auto& resourceManager = m_device->getCommon()->getResources();
   
-    const bool temporalUpscaling = RtxOptions::isDLSSOrRayReconstructionEnabled() || RtxOptions::isXeSSEnabled() || RtxOptions::isTAAEnabled();
+    const bool temporalUpscaling = RtxOptions::isDLSSOrRayReconstructionEnabled() || RtxOptions::isXeSSEnabled() || RtxOptions::isFSREnabled() || RtxOptions::isTAAEnabled();
     
     float totalUpscaleMipBias = 0.0f;
     
@@ -222,6 +222,8 @@ namespace dxvk {
           float xessMipBias = xess.calcRecommendedMipBias();
           totalUpscaleMipBias += xessMipBias;
         }
+      } else if (RtxOptions::isFSREnabled()) {
+        totalUpscaleMipBias = fork_hooks::fsrUpscalingMipBias(m_device);
       } else {
         // Restore original behavior for DLSS, TAA, and other upscalers
         totalUpscaleMipBias = log2(resourceManager.getUpscaleRatio()) + RtxOptions::upscalingMipBias();
@@ -234,7 +236,7 @@ namespace dxvk {
   float SceneManager::getCalculatedUpscalingMipBias() {
     auto& resourceManager = m_device->getCommon()->getResources();
     
-    const bool temporalUpscaling = RtxOptions::isXeSSEnabled();
+    const bool temporalUpscaling = RtxOptions::isXeSSEnabled() || RtxOptions::isFSREnabled();
     if (!temporalUpscaling) {
       return 0.0f;
     }
@@ -1866,6 +1868,13 @@ namespace dxvk {
       texturePresenceMask |= opaqueMaterialData.getSubsurfaceSingleScatteringAlbedoTexture().isImageEmpty() ? 0u : (1u << 10);
       texturePresenceMask |= opaqueMaterialData.getSubsurfaceRadiusTexture().isImageEmpty()          ? 0u : (1u << 11);
       preCreationHash = XXH64(&texturePresenceMask, sizeof(texturePresenceMask), preCreationHash);
+
+      // Fold in the sRGB-linearization toggle so flipping rtx.linearizeSrgbTextures at runtime invalidates
+      // cached opaque materials, forcing them to rebuild with the new albedo/emissive sRGB flags. Without this
+      // the preCreationHash cache below would keep serving materials built under the previous setting, so the
+      // change would only reach freshly-encountered materials. Enables a live A/B without reloading.
+      const uint32_t srgbLinearizeToggle = RtxOptions::linearizeSrgbTextures() ? 1u : 0u;
+      preCreationHash = XXH64(&srgbLinearizeToggle, sizeof(srgbLinearizeToggle), preCreationHash);
     }
 
     auto iter = m_preCreationSurfaceMaterialMap.find(preCreationHash);
@@ -2012,6 +2021,23 @@ namespace dxvk {
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
 
+      // Detect whether the albedo/emissive source textures use an sRGB VkFormat. If so, the sampler hardware
+      // linearizes them on read, so the shader must skip its own gammaToLinear() to avoid double linearization.
+      // Gated behind linearizeSrgbTextures() (default on) for A/B; when off the flags stay clear and the shader
+      // always applies the software conversion (legacy behavior). Uses the resolved image-view format, which is
+      // available here whenever the texture is loaded (an unloaded texture reports isImageEmpty(), which also
+      // feeds the material cache key, so the material is rebuilt with the correct flag once the texture resolves).
+      const bool srgbLinearizeEnabled = RtxOptions::linearizeSrgbTextures();
+      auto textureUsesSrgbFormat = [srgbLinearizeEnabled](const TextureRef& tex) -> bool {
+        if (!srgbLinearizeEnabled) {
+          return false;
+        }
+        const DxvkImageView* view = tex.getImageView();
+        return view != nullptr && TextureUtils::isSRGB(view->info().format);
+      };
+      const bool albedoTextureIsSrgb = textureUsesSrgbFormat(opaqueMaterialData.getAlbedoOpacityTexture());
+      const bool emissiveTextureIsSrgb = textureUsesSrgbFormat(opaqueMaterialData.getEmissiveColorTexture());
+
       const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
         tangentTextureIndex, heightTextureIndex, roughnessTextureIndex,
@@ -2021,10 +2047,12 @@ namespace dxvk {
         roughnessConstant, metallicConstant,
         emissiveColorConstant, enableEmissive,
         ignoreAlphaChannel, thinFilmEnable, alphaIsThinFilmThickness,
-        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut, 
+        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut,
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget, isHairCard,
         samplerFeedbackStamp,
-        secondaryTextureIndex
+        secondaryTextureIndex,
+        albedoTextureIsSrgb, emissiveTextureIsSrgb,
+        opaqueMaterialData.getSkyLitParticle()
       };
 
       surfaceMaterial.emplace(opaqueSurfaceMaterial);
@@ -2750,15 +2778,20 @@ namespace dxvk {
         std::make_shared<const std::vector<Matrix4>>(std::move(state.gpuInstancingTransforms));
     }
 
+    const XXH64_hash_t meshHash = reinterpret_cast<XXH64_hash_t>(state.mesh);
+
+    // Fetch submeshes once — they drive both the replacement path (needs submeshes[0]
+    // as geometry template) and the default iteration path.
     const auto& submeshes = m_pReplacer->accessExternalMesh(state.mesh);
     if (submeshes.empty()) {
-      const XXH64_hash_t meshHash = reinterpret_cast<XXH64_hash_t>(state.mesh);
       Logger::err(str::format("[RTX-Mesh] External mesh has no submeshes: 0x", std::hex, meshHash, std::dec));
       return;
     }
 
-    const XXH64_hash_t meshHash = reinterpret_cast<XXH64_hash_t>(state.mesh);
-
+    // Persistence-tracking setup happens before the replacement-lookup early-out
+    // so the same ReplacementInstance can be threaded through both paths —
+    // drawReplacements() requires a non-null instance and uses it to drive
+    // RtInstance reuse across frames for the replacement primitives.
     const XXH64_hash_t identityHash = state.computeExternalDrawIdentityHash();
     const XXH64_hash_t spatialMapHash = spatialMapHashForExternalDrawMesh(state.mesh);
     const Matrix4& xform = state.drawCall.getTransformData().objectToWorld;
@@ -2792,7 +2825,9 @@ namespace dxvk {
       const MaterialData* material = m_pReplacer->accessExternalMaterial(submeshes[i].externalMaterial);
       if (material != nullptr) {
         fork_hooks::externalDrawMaterialReplacement(*m_pReplacer, material);
+
         state.drawCall.modifyMaterialData().setHashOverride(material->getHash());
+
         fork_hooks::externalDrawTextureCategories(material, state.drawCall, textureHash);
       }
 

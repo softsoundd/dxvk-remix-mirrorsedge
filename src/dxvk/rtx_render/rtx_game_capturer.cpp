@@ -30,6 +30,8 @@
 #include "rtx_instance_manager.h"
 #include "rtx_scene_manager.h"
 #include "rtx_materials.h"
+#include "rtx_texture_manager.h"
+#include "rtx_fork_hooks.h"
 
 #include "../dxvk_device.h"
 

@@ -106,6 +106,12 @@ Texture3D<float> DebugViewCloudDAmbient;
 [[vk::binding(DEBUG_VIEW_BINDING_CLOUD_RENDER_RT_INPUT)]]
 Texture2D<float4> DebugViewCloudRenderRT;
 
+// Fork: cloud NVDF body SDF (Nubis3 conversion Phase A; R16F 3D, signed km,
+// negative inside, texture y = VERTICAL — see cloud_nvdf.h). Visualized by
+// DEBUG_VIEW_CLOUD_NVDF_SDF (enum 879).
+[[vk::binding(DEBUG_VIEW_BINDING_CLOUD_NVDF_SDF_INPUT)]]
+Texture3D<float> DebugViewCloudNvdfSdf;
+
 // Fork: the post-denoise cumulus shadow factor texture and its debug view
 // (enum 878) were removed 2026-06-19 with the screen-space cloud-shadow system.
 // The cloud shadow now folds onto the sun radiance in the NEE; enum 875/877
@@ -428,6 +434,37 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       const float opticalDepth = DebugViewCloudDAmbient.SampleLevel(LinearSampler, uvw, 0).r;
       const float intensity = saturate(opticalDepth * 0.2f);
       value = vec4(intensity, intensity, intensity, 1.0f);
+    }
+    break;
+  case DEBUG_VIEW_CLOUD_NVDF_SDF:
+    {
+      // Horizontal slice of the cloud NVDF body SDF (fork — Nubis3 Phase A).
+      // Screen X -> tile U (world X), screen Y -> tile W (world Z); the slice
+      // sits at height fraction 0.25 (lower quartile — where cloud bases and
+      // the fattest body cross-sections live). The SDF stores raw signed km,
+      // negative inside.
+      //   Inside:  warm ramp (deep core = bright red/orange)
+      //   Outside: cool ramp (far clear sky = dark blue)
+      //   |sdf| < ~half a voxel: green band — the zero-crossing iso-line.
+      // Validation: bodies read as smooth blobby cells, the green line traces
+      // their outlines with no speckle, and the pattern must be seamless
+      // across the tile wrap (the slice shows exactly one tile period).
+      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
+      const vec3 uvw = vec3(uv.x, 0.25f, uv.y);
+      const float sdfKm = DebugViewCloudNvdfSdf.SampleLevel(LinearSampler, uvw, 0).r;
+      // Half-voxel band at the default 12 km tile: ~23 m.
+      const float kIsoBandKm = 0.025f;
+      // Visualization ranges: inside distances saturate at ~1.5 km (deep
+      // cumulus core), outside at ~4 km (typical inter-cluster gap).
+      if (abs(sdfKm) < kIsoBandKm) {
+        value = vec4(0.0f, 1.0f, 0.0f, 1.0f);
+      } else if (sdfKm < 0.0f) {
+        const float t = saturate(-sdfKm / 1.5f);
+        value = vec4(0.3f + 0.7f * t, 0.3f * t, 0.0f, 1.0f);
+      } else {
+        const float t = saturate(sdfKm / 4.0f);
+        value = vec4(0.0f, 0.1f * (1.0f - t), 0.15f + 0.55f * (1.0f - t), 1.0f);
+      }
     }
     break;
   case DEBUG_VIEW_CLOUD_GROUND_SHADOW_PRODSHAPE:

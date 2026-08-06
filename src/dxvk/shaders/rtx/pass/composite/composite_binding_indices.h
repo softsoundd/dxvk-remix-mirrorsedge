@@ -50,6 +50,10 @@
 
 #define COMPOSITE_BSDF_FACTOR_INPUT                                 17
 #define COMPOSITE_BSDF_FACTOR2_INPUT                                18
+// Slot 19 was COMPOSITE_PRIMARY_CLOUD_SHADOW_FACTOR_INPUT (fork screen-space
+// cloud shadow). Removed 2026-06-19 when the cloud shadow moved onto the sun
+// term in the NEE; the number is left reserved (no descriptor bound) so the
+// remaining slot numbers stay stable rather than renumbering 20..26.
 
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT                20
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT                  21

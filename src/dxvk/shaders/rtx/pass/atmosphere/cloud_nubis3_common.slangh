@@ -1,0 +1,894 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+/*
+ * Nubis3 NVDF/SDF density model (fork — Nubis3 conversion Phase B).
+ *
+ * The profile-from-SDF density sampler (Nubis Cubed 2023, Sampling Density):
+ *
+ *   sdf'    = nvdfTap(pos) - coverageOffset          (coverage = level-set shift)
+ *   if (sdf' >= 0) -> empty air, early out           (the Nubis profile gate)
+ *   profile = saturate(-sdf' / profileDepth)         (gradient outside -> inside)
+ *   noise   = wispy/billowy composite (profile- and type-blended, animated)
+ *   density = ValueErosion(profile, noise)           (+ page-123 pow sharpen)
+ *
+ * ONE sampler serves the view march AND the shadow/optical-depth bakes —
+ * iso parity between the rendered clouds and the D_sun / D_ambient grids
+ * holds by construction (and this erases the legacy path's small parity gap:
+ * view gate softness 0.15 vs the shadow twin's hardcoded 0.25).
+ *
+ * Also hosts the D_sun / D_ambient bake integrals (moved here from
+ * atmosphere_common.slangh — their only callers are the two grid bakers, and
+ * they now branch on the density model, which must not drag the Nubis3
+ * sampler into every path-tracer translation unit).
+ *
+ * Included ONLY by cloud-owned passes (cloud_march_common.slangh consumers +
+ * the grid bakers) — never by anything the path tracer compiles.
+ */
+
+#pragma once
+
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/atmosphere/cloud_nvdf.h"
+
+// Schneider value-erosion remap: erode `value` from below by `erosion`,
+// renormalized so the surviving range still reaches 1 (Nubis Cubed p.123).
+float valueErosion(float value, float erosion) {
+  return saturate((value - erosion) / max(1.0f - erosion, 1e-4f));
+}
+
+// ---------------------------------------------------------------------------
+// Nubis3 density sampler.
+//
+// Out params (the lighting signals the Nubis3 evaluator core consumes):
+//   profileOut   — the dimensional profile [0,1] (0 at the live iso-surface,
+//                  1 at profileDepth into the body). Replaces the legacy
+//                  sampleDimProfile proxy AND (via pow(1-profile, 0.5)) the
+//                  ambient shape.
+//   detailSigned — zero-mean-ish erosion-field excursion at this sample, for
+//                  the billow micro-AO (same consumer as the legacy signal).
+//   sdfKmOut     — the LIVE (coverage-offset) signed distance in km. Negative
+//                  inside; the caller converts to meters for the sigma_ms
+//                  remap (replacing the legacy sampleCloudSdf proxy).
+//   sdfStepKmOut — the CONSERVATIVE distance (km) the caller may advance from
+//                  this sample without crossing any possible rendered surface
+//                  (Phase C sphere-trace stepping). Built from the MIN of the
+//                  hex taps (a blended distance is not metric), minus the
+//                  coverage offset and the wobble's maximum outward
+//                  excursion. The march applies nvdfStepScale as the final
+//                  safety factor. May be <= 0 inside / near bodies — step
+//                  normally there.
+//
+// cameraDistKm: distance from the camera to this sample (the march passes its
+// ray t). Drives the near-camera HF detail blend (Nubis p.125); bake /
+// optical-depth callers pass a huge value to keep it off.
+//
+// Coverage: the NVDF was baked at args.nvdfNominalCoverage; the live
+// coverageLocal shifts the iso-level at SAMPLE time, so weather-driven
+// coverage grows/shrinks/merges bodies with zero rebakes.
+//
+// Animation: wind translates the whole field (sample offset). The body SDF
+// itself only changes on (amortized) rebakes; the LIVE motion comes from the
+// erosion field — boil + evolution offsets scroll the detail taps, so
+// silhouettes churn and morph against the steady bodies. (The legacy model
+// applied evolution to the base noise instead; here the erosion field is the
+// only animated shape input, so it takes both offsets.)
+//
+// Hex de-tiling: the same CloudHexTile lattice offsets the legacy placement +
+// noise taps use are applied to the NVDF tap, so the SDF de-tiles in lockstep
+// with everything else. Blend-zone taps use a plain normalized weighted
+// average — valid for a SMOOTH field like a distance field (the variance-
+// preserving re-expansion the noise blend needs would amplify, not preserve,
+// an SDF). NOTE for Phase C: a blended distance is NOT metric — stepping must
+// use min(taps) with a safety factor, not this blend.
+// ---------------------------------------------------------------------------
+// coarseOd (fork — 2026-07-30, perf): the LIVE optical-depth taps only. A 2-tap
+// shadow integral over 3 km cannot see two of the sampler's features, so they are
+// dropped for those callers:
+//   * the hex 3-tap blend zone — it exists to hide the texture repeat's seams, and
+//     a seam cannot be seen inside an optical depth. Forced to the dominant-vertex
+//     tap, which the fast path already uses over ~70% of the plane.
+//   * the two-scale de-tile second tap (noiseB) — same reasoning: it hides the
+//     detail volume's repeat when a cloud face is viewed flat-on. Using noiseA
+//     directly keeps the mean EXACT (every channel is bake-normalized to 0.5) and
+//     restores full variance, so no re-expansion is needed.
+// Deliberately NOT dropped, despite both being tempting: the step-6d mid tap (its
+// shape-variety displacement is ±0.55 km of level-set motion at the shipping
+// setting — it CREATES the lobes whose self-shadowing the near-field refinement
+// exists to capture, so removing it would systematically un-shadow exactly the
+// target structure) and the page-123 sharpen pow (nubis3SharpenStrength defaults
+// to 1, so the exponent is part of the density definition, not a flourish).
+//
+// This flag is uniform per call site, so each inlined copy specializes and the
+// untaken branch is dead-code-eliminated. The D_sun / D_ambient BAKES must never
+// pass true — the shared sampler is what makes rendered clouds and the shadow grids
+// iso-consistent by construction; see sampleCloudDensityNubis3Coarse below, which
+// is wired only into the three live-tap sites.
+float sampleCloudDensityNubis3(vec3 worldPosKm,
+                               float heightFraction,
+                               float typeLocal,
+                               float coverageLocal,
+                               float densityScale,
+                               float cameraDistKm,
+                               AtmosphereArgs args,
+                               Texture3D<float> nvdfSdf,
+                               Texture3D<float4> detailNoise,
+                               SamplerState cloudSampler,
+                               bool coarseOd,
+                               out float profileOut,
+                               out float detailSigned,
+                               out float sdfKmOut,
+                               out float sdfStepKmOut) {
+  profileOut   = 0.0f;
+  detailSigned = 0.0f;
+  sdfKmOut     = 100.0f;  // matches the resolve pass's "empty air" sentinel
+  sdfStepKmOut = 0.0f;
+
+  // 1. Wind translation (same convention as the legacy sampler).
+  vec3 windOffset = vec3(args.cloudWindOffset.x, 0.0f, args.cloudWindOffset.y);
+  vec3 perturbed  = worldPosKm + windOffset;
+
+  // 2. NVDF texcoord. XZ tile-wraps at cloudNoiseTileKm (the bake domain);
+  //    the vertical axis clamps to the half-texel band so the REPEAT sampler
+  //    never wraps slab bottom into slab top.
+  const float kHalfTexelV = 0.5f / float(CLOUD_NVDF_SIZE_Y);
+  vec2 tileUV = vec2(frac(perturbed.x / args.cloudNoiseTileKm),
+                     frac(perturbed.z / args.cloudNoiseTileKm));
+  float v = clamp(heightFraction, kHalfTexelV, 1.0f - kHalfTexelV);
+
+  // 3. SDF tap, hex-de-tiled (dominant-vertex fast path covers ~70% of area).
+  //    sdfMinKm tracks the MINIMUM of the taps actually blended — the only
+  //    metrically-valid distance bound for Phase C stepping (the weighted
+  //    blend is not a distance). In the fast path the rendered field IS the
+  //    single dominant tap, so its distance is the right bound there.
+  // The per-tap frac() on the horizontal coords is dropped (fork — 2026-07-30,
+  // perf): tileUV is ALREADY fracced above and the hex offsets are in [0,1), so
+  // these operands are bounded to [0,2) and the sampler's REPEAT address mode
+  // wraps them identically. Safe precisely BECAUSE the range is small — see the
+  // note at the detail taps below, where the operand is unbounded and the frac
+  // is load-bearing.
+  float sdfKm;
+  float sdfMinKm;
+  if (args.cloudHexTilingEnable > 0.5f) {
+    CloudHexTile hex = computeCloudHexTile(vec2(perturbed.x, perturbed.z), args);
+    if (hex.w1 > 0.95f || coarseOd) {
+      sdfKm = nvdfSdf.SampleLevel(cloudSampler,
+          vec3(tileUV.x + hex.off1.x, v, tileUV.y + hex.off1.y), 0).r;
+      sdfMinKm = sdfKm;
+    } else {
+      float s1 = nvdfSdf.SampleLevel(cloudSampler,
+          vec3(tileUV.x + hex.off1.x, v, tileUV.y + hex.off1.y), 0).r;
+      float s2 = nvdfSdf.SampleLevel(cloudSampler,
+          vec3(tileUV.x + hex.off2.x, v, tileUV.y + hex.off2.y), 0).r;
+      float s3 = nvdfSdf.SampleLevel(cloudSampler,
+          vec3(tileUV.x + hex.off3.x, v, tileUV.y + hex.off3.y), 0).r;
+      sdfKm = hex.w1 * s1 + hex.w2 * s2 + hex.w3 * s3;
+      sdfMinKm = min(s1, min(s2, s3));
+    }
+  } else {
+    sdfKm = nvdfSdf.SampleLevel(cloudSampler, vec3(tileUV.x, v, tileUV.y), 0).r;
+    sdfMinKm = sdfKm;
+  }
+
+  // 4. Coverage as a live level-set offset: coverage above the baked nominal
+  //    pushes the iso-surface outward (bodies grow/merge), below shrinks them
+  //    toward their cores.
+  float offsetKm = (coverageLocal - args.nvdfNominalCoverage) * args.nvdfCoverageOffsetKm;
+  float sdfLive  = sdfKm - offsetKm;
+  sdfKmOut = sdfLive;
+
+  // 5. Silhouette wobble amplitude (anti-blobby pass — see step 6c). Rides the
+  //    cloudDetailStrength knob: its legacy additive-edge-detail role is gone,
+  //    but this keeps the SAME semantic ("how strongly the detail field moves
+  //    the silhouette"). The conservative early-out keeps the empty-air fast
+  //    path: a sample can only become cloud if the wobble's maximum outward
+  //    excursion (+0.5 signal x amplitude) could reach it.
+  const float kWobbleKmPerDetailStrength = 0.6f;
+  float wobbleKm = max(args.cloudDetailStrength, 0.0f) * kWobbleKmPerDetailStrength;
+
+  // Phase C stepping bound: guaranteed-empty radius around this sample =
+  // min-tap distance, minus the live coverage offset, minus the maximum
+  // outward pull of BOTH level-set displacements (+0.5 signal x amplitude
+  // each: the silhouette wobble and the step-6e shape-variety band). Valid
+  // on every return path — the early-out below is exactly where the march
+  // wants to skip.
+  float maxOutwardKm = 0.5f * (wobbleKm + args.nubis3ShapeVarietyKm);
+  sdfStepKmOut = sdfMinKm - offsetKm - maxOutwardKm;
+
+  if (sdfLive >= maxOutwardKm) {
+    return 0.0f;
+  }
+
+  // 6. Up-rez (Nubis p.125): animated wispy/billowy composite. Boil +
+  //    evolution + base shear all displace only the detail tap (see the
+  //    animation note in the header).
+  const vec3 kBoilDir = vec3(0.6092f, 0.7109f, 0.3517f);  // legacy edge-boil direction
+  vec3 boilPos = perturbed
+               + args.cloudBoilPhase * kBoilDir
+               + vec3(args.cloudEvolutionOffsetX, args.cloudEvolutionOffsetY, args.cloudEvolutionOffsetZ);
+  const vec2 kShearDir = vec2(0.8f, -0.6f);  // legacy base-shear azimuth
+  boilPos += vec3(kShearDir.x, 0.0f, kShearDir.y)
+           * ((1.0f - heightFraction) * args.cloudDetailBaseShearKm);
+  // Two-scale de-tile (fork — 2026-07-16). The detail volume repeats every
+  // cloudNoiseTileKm / cloudDetailScale (~2.8 km at defaults) and this tap
+  // is NOT hex-de-tiled (the hex lattice covers the SDF/placement taps
+  // only), so the repeat grid reads clearly when a cloud face is seen
+  // flat-on — worst looking straight up at the deck base. Blending a second
+  // tap at an incommensurate scale makes the combined pattern effectively
+  // non-repeating (no seams, unlike a hex offset on a raw noise field), and
+  // the added scale diversity also breaks the single-scale "synthetic
+  // alligator" read. Variance lost to the blend is re-expanded around 0.5 —
+  // every channel's mean is EXACTLY 0.5 by bake-time normalization (detail
+  // round 2026-07-16; the old vec4(.5,.5,.3,.3) here compensated unmeasured
+  // raw means, and was wrong for all four channels — measured wispy ~0.72,
+  // billowy ~0.155).
+  // NOTE on the frac() calls at the detail taps below: unlike the SDF taps
+  // above, these are LOAD-BEARING and must not be removed as "redundant under a
+  // REPEAT sampler". boilPos carries the world position plus the wind, boil and
+  // evolution offsets, which accumulate without bound over a session, so
+  // boilPos * detailFreq can reach the hundreds. Doing the wrap in fp32 here
+  // keeps the coordinate small before the texture unit converts it to its
+  // limited-precision fixed-point form; handing the raw magnitude to the
+  // sampler instead loses sub-texel precision and would show up as drift or
+  // wobble in the detail field late in a session.
+  float detailFreq = args.cloudDetailScale / args.cloudNoiseTileKm;
+
+  // Frequency blends key on a PROVISIONAL (pre-wobble) profile — the wobble
+  // itself is built from these channels, so the final profile isn't known yet.
+  // Outside the un-wobbled surface this is 0 -> pure low-frequency channels,
+  // which is exactly what Nubis wants at the silhouette anyway.
+  float profileProv = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
+
+  // Altitude-keyed erosion character (GT7's coverage x altitude octave
+  // weights, pp.236-237, approximated with the slab height fraction — fork,
+  // detail round 2026-07-16). Real cumulus erodes WISPY at the base (shear /
+  // evaporation strands) and BILLOWY at the top (convective lobes); keyed on
+  // type alone, bases and tops read identically "sprinkled". Shift the
+  // wispy<->billowy blend by ±kAltTypeSwing/2 across the low->high band.
+  // Applies to every character consumer below (erosion composite, HF fold,
+  // silhouette wobble + mid lobes, interior texture) so the whole look
+  // tracks; the D_sun/D_ambient bake integrands call this same sampler, so
+  // the grids follow automatically.
+  const float kAltTypeSwing = 0.5f;
+  float typeShaped = saturate(saturate(typeLocal)
+                              + (smoothstep(0.1f, 0.8f, heightFraction) - 0.5f) * kAltTypeSwing);
+
+  // 6d. Mid-frequency silhouette lobes (GT7 pp.229-230 — fork, detail round
+  //     2026-07-16). Silhouette spectrum audit: bodies are km-scale smooth
+  //     (JFA distance field), detail content spans 87-875 m — the 1-2.5 km
+  //     octave was EMPTY, and GT7's rule is that exactly this too-wide gap
+  //     between shape and detail scales is what reads as synthetic (worst
+  //     flat-on at the deck base). Their fix, verbatim: reuse the same
+  //     texture rescaled to fill the gap, zero new memory. A third tap at
+  //     0.193x the base frequency puts the LOW channels at ~2.4 km — pure
+  //     km-scale lobes (this tap's high channels would only duplicate
+  //     already-covered scales, so the low channels alone feed the signal;
+  //     both are mean-0.5 by the bake normalization, so the sum stays
+  //     zero-mean). The 60/40 blend keeps the combined signal in
+  //     [-0.5, 0.5], preserving the step-5 early-out bound and the
+  //     conservative sdfStepKmOut excursion term. This tap repeats every
+  //     ~14.5 km — beyond the noise tile itself — so it needs no de-tiling.
+  //
+  //     TAP ORDER (fork — 2026-07-30, perf): this tap moved AHEAD of the
+  //     two-scale base taps below so the surface gate can run on it alone.
+  //     The base taps are the expensive pair (two volume fetches plus the
+  //     whole erosion composite), and every sample inside the maxOutwardKm
+  //     skirt band used to pay for them before the step-7 gate threw the
+  //     result away — and the SDF sphere-trace deliberately parks samples in
+  //     exactly that band, ~11 of them per surface approach at the default
+  //     50 m adaptive step. Nothing above this point needs the base taps.
+  vec4 noiseMid = detailNoise.SampleLevel(cloudSampler,
+      frac(boilPos * (detailFreq * 0.193f) + vec3(0.71f, 0.29f, 0.53f)), 0);
+  float wobbleMid = lerp(noiseMid.r - 0.5f,
+                         noiseMid.b * 0.3f - 0.15f,
+                         typeShaped);
+
+  // Conservative surface gate on the mid tap alone. The final displacement is
+  //   sdfLive -= (0.6*w_n + 0.4*w_m) * wobbleKm + w_m * shapeVarietyKm
+  // with w_n (the step-6c base-tap wobble) bounded to [-0.5, 0.5] by
+  // construction, so its maximum outward pull is 0.3*wobbleKm. Anything still
+  // outside the surface by more than that after the mid terms is guaranteed
+  // empty for ANY value of w_n — skip the base taps entirely. At the shipping
+  // default cloudDetailStrength = 0 (wobbleKm = 0) this IS the exact step-7
+  // gate; above zero it stays strictly conservative, so the density this
+  // function returns is unchanged either way.
+  float sdfAfterMid = sdfLive - 0.4f * wobbleMid * wobbleKm
+                    - wobbleMid * args.nubis3ShapeVarietyKm;
+  if (sdfAfterMid >= 0.3f * wobbleKm) {
+    sdfKmOut = sdfAfterMid;
+    return 0.0f;
+  }
+
+  // Two-scale de-tile base taps (see the step-6 header note above).
+  vec4 noiseA = detailNoise.SampleLevel(cloudSampler, frac(boilPos * detailFreq), 0);
+  vec4 noise;
+  if (coarseOd) {
+    // De-tile blend dropped for optical-depth taps: noiseA is already mean-0.5 by
+    // bake normalization and carries full variance on its own, so no blend and no
+    // re-expansion — mean exact, variance within ~3% of the blended field.
+    noise = noiseA;
+  } else {
+    vec4 noiseB = detailNoise.SampleLevel(cloudSampler,
+        frac(boilPos * (detailFreq * 0.531f) + vec3(0.37f, 0.61f, 0.13f)), 0);
+    const vec4 kChannelMean = vec4(0.5f, 0.5f, 0.5f, 0.5f);
+    noise = saturate(kChannelMean + (lerp(noiseA, noiseB, 0.4f) - kChannelMean) * 1.35f);
+  }
+
+  // Wispy: low->high frequency over the profile (fine filaments deeper in).
+  float wispyNoise = lerp(noise.r, noise.g, profileProv);
+  // Billowy: rounded lobes at the edges, finer bubbles toward the core; the
+  // 0.3 scale keeps billowy erosion mild (Nubis p.125 verbatim).
+  float billowyTypeGradient = pow(profileProv, 0.25f);
+  float billowyNoise = lerp(noise.b * 0.3f, noise.a * 0.3f, billowyTypeGradient);
+  float noiseComposite = lerp(wispyNoise, billowyNoise, typeShaped);
+
+  // 6b. Near-camera HF detail (Nubis Cubed p.125 `inHFDetails`, ported
+  //     2026-07-16). Twice-folded noise: expand a channel to [-1,1] and
+  //     |fold| over zero twice — reuses the baked high-freq channels at ~4x
+  //     their frequency without another texture tap. It REPLACES a slice of
+  //     the erosion composite near the camera (paper: 10% at <50 m, gone by
+  //     150 m). Our range is scaled up (0.2 -> 2 km) to match this volume's
+  //     coarser cycles-per-km, and nubis3HFDetailStrength scales the paper's
+  //     10% max mix (1 = verbatim).
+  // Range rev 2 (2026-07-16 look check): the first port scaled the paper's
+  // 50-150 m range up to 0.2-2 km — but the deck BASE is only ~1.3 km
+  // overhead, so the HF fold (and the step-9 soften) repainted the entire
+  // zenith view ("the noise directly above is bad"). 0.1-0.6 km keeps it a
+  // true fly-through/close-approach effect, per the paper's intent.
+  const float kHFDetailNearKm = 0.1f;
+  const float kHFDetailFarKm  = 0.6f;
+  if (args.nubis3HFDetailStrength > 0.0f && cameraDistKm < kHFDetailFarKm) {
+    float hhfWispy   = 1.0f - pow(abs(abs(noise.g * 2.0f - 1.0f) * 2.0f - 1.0f), 4.0f);
+    float hhfBillowy = pow(abs(abs(noise.a * 2.0f - 1.0f) * 2.0f - 1.0f), 2.0f);
+    float hhfNoise   = saturate(lerp(hhfWispy, hhfBillowy, typeShaped));
+    float hfFloor    = 1.0f - 0.1f * args.nubis3HFDetailStrength;
+    float blender    = lerp(hfFloor, 1.0f, saturate((cameraDistKm - kHFDetailNearKm)
+                                                    / (kHFDetailFarKm - kHFDetailNearKm)));
+    noiseComposite   = lerp(hhfNoise, noiseComposite, blender);
+  }
+
+  // 6c. ZERO-MEAN silhouette wobble (anti-blobby pass — fork 2026-07-16).
+  //     ValueErosion alone can only carve INWARD from the smooth SDF surface,
+  //     so bodies read as convex blobs with eaten edges. Displacing the live
+  //     SDF by the mean-centered detail signal moves the iso-surface BOTH
+  //     ways: knuckles grow outward past the base silhouette, crevices carve
+  //     in — the same mechanism as the legacy rev-4 threshold wobble (the
+  //     validated anti-blobby lever), driven by the same knob. The centering
+  //     constants (0.5 / 0.15-after-0.3-scale) are EXACT since the bake-time
+  //     mean normalization (detail round 2026-07-16) — before it the signal
+  //     pushed wispy silhouettes outward ~+0.22 and billowy inward ~-0.10 —
+  //     so the wobble adds no net coverage shift and no micro-AO bias.
+  //     detailSigned reuses this signal: the field that grows a billow is
+  //     the field that shades it (coherent relief).
+  //
+  //     Spectrum (rev 2): the first attempt keyed the wobble on the PROFILE-
+  //     blended channels — at the silhouette (profile ~ 0) that collapses to
+  //     the pure low-frequency channels and the displacement reads as gentle
+  //     undulation, not cauliflower. A FIXED half-mix of the high-frequency
+  //     channels keeps the signal's range and zero mean while giving the
+  //     silhouette multi-scale relief.
+  const float kWobbleHiMix = 0.5f;
+  float wispyWobble   = lerp(noise.r, noise.g, kWobbleHiMix) - 0.5f;
+  float billowyWobble = lerp(noise.b, noise.a, kWobbleHiMix) * 0.3f - 0.15f;
+  float wobbleSignal  = lerp(wispyWobble, billowyWobble, typeShaped);
+
+  // 6d's mid tap + wobbleMid now run ABOVE, ahead of the base taps, so the
+  // surface gate can skip them (fork — 2026-07-30, perf). Only the blend is
+  // left here, in its original position and order.
+  wobbleSignal = wobbleSignal * 0.6f + wobbleMid * 0.4f;
+
+  // 6e. SHAPE VARIETY (fork — 2026-07-17, user direction from the GT7
+  //     low-vs-mid comparison: "we want it to actually change the SHAPE of
+  //     all of the clouds ... instead of nice round singular blobs with
+  //     edge detail"). The mid band gets its OWN level-set displacement
+  //     with structural amplitude, on top of the (edge-scaled) wobble mix:
+  //     ±0.5·nubis3ShapeVarietyKm of iso-surface push/pull at the 2.4 km
+  //     (+octaves 1.2/0.6 km) wavelengths. At the default 0.5 km that is
+  //     deep enough to carve lobes into — and fully split — km-scale
+  //     bodies where the field dips, turning round singles into varied
+  //     clusters (GT7's mid-frequency role). Level-set displacement moves
+  //     the WHOLE body surface (all depths), not just the silhouette
+  //     skirt; zero-mean signal → coverage-neutral on average; the step-5
+  //     bound and early-out already budget the extra excursion. Live knob,
+  //     no rebake; world-anchored (evolution/boil offsets animate it with
+  //     the rest of the detail field).
+  detailSigned = wobbleSignal;
+  sdfLive -= wobbleSignal * wobbleKm + wobbleMid * args.nubis3ShapeVarietyKm;
+  sdfKmOut = sdfLive;
+
+  // 7. The Nubis profile gate on the WOBBLED surface: outside it there is
+  //    nothing to erode.
+  if (sdfLive >= 0.0f) {
+    return 0.0f;
+  }
+  float profile = saturate(-sdfLive / max(args.nvdfProfileDepthKm, 1e-3f));
+  profileOut = profile;
+
+  // 7a. FINE-frequency band (fork — detail round follow-up 2026-07-16; the
+  //     GT7 pp.228-230 third band, prompted by "you might need another
+  //     higher-frequency noise texture"). The detail volume's finest content
+  //     is ~87 m, but the sqrt-adaptive march resolves 25-30 m steps near
+  //     the camera — the TEXTURE is now the detail ceiling within a few km.
+  //     A third incommensurate tap of the same volume at 2.63x pushes
+  //     content to ~177..33 m and folds into the erosion composite (here)
+  //     and the interior texture (step 8) — the two consumers where fine
+  //     grain reads as crisp cauliflower rather than silhouette shimmer.
+  //     Distance-gated: full inside ~2 km, gone by 8 km (sub-pixel there,
+  //     it would only feed noise into the temporal EMA); the gate also
+  //     keeps the OD bakes camera-independent for free (bake taps pass
+  //     cameraDistKm = 1e6). All channels are mean-0.5 by the bake
+  //     normalization and the fold is a mean-matched lerp, so coverage is
+  //     unchanged. Erosion/interior only — no wobble term — so the step-5
+  //     early-out and the conservative step bound are untouched. Placed
+  //     after the step-7 gate so gated-out samples never pay the tap.
+  // Rev 3 (same night, Fable-audit findings — "the fine detail slider isn't
+  // doing anything"): rev 1 routed the band through DENSITY-side consumers,
+  // which the audit showed is structurally muted twice over: (a) the
+  // erosion composite multiplies by nubis3ErosionStrength (validated conf
+  // runs 0.04 → ≤ ±1.4% density peak), and (b) zero-mean density
+  // modulation BELOW the mean free path (1/cloudDensity ≈ 556 m at conf)
+  // averages out along the view ray before it changes transmittance —
+  // 33-177 m features cannot read as density no matter the amplitude. What
+  // IS visible in this renderer at fine scales is the micro-AO relief
+  // shading (detailSigned → ±27-45% swing on the body lobe + ambient at
+  // defaults). Rev 3 therefore routes the band into:
+  //   1. detailSigned (the micro-AO relief signal) at 0.6·fineMix — fine
+  //      cauliflower granulation on lit/ambient faces, ~±12% shading at
+  //      slider 1. Lighting-only: no coverage, silhouette, step-bound, or
+  //      bake change (bake taps still pass cameraDistKm = 1e6). Slider 0
+  //      is an exact no-op.
+  //   2. The step-7b edge wisp cut's wispy signal (the conf's active edge
+  //      lever) — ±25-57 m fine scalloping of the wisp cutout boundary.
+  //   3. The erosion composite + interior fold stay for configs that run
+  //      real erosion strengths.
+  // Gate rev 3: tap ratio 2.63 → 2.11 (content ~220..41 m — the march's
+  // sqrt-adaptive step resolves ≥82 m past 2 km, so more of the injected
+  // spectrum is genuinely resolvable) and fade full < 3 km → zero at 9 km,
+  // matching the 177-220 m Nyquist horizon (~9.4 km) and keeping full
+  // strength on the 2.6-6 km slant range where the deck is actually viewed.
+  float fineMix = 0.0f;
+  float fineInteriorNoise = 0.5f;
+  if (args.nubis3FineDetailStrength > 0.0f && cameraDistKm < 9.0f) {
+    float fineFade = saturate(1.0f - (cameraDistKm - 3.0f) / 6.0f);
+    vec4 noiseFine = detailNoise.SampleLevel(cloudSampler,
+        frac(boilPos * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)), 0);
+    float fineWispy     = lerp(noiseFine.r, noiseFine.g, 0.5f);
+    float fineBillowy   = lerp(noiseFine.b, noiseFine.a, 0.5f) * 0.3f;
+    float fineComposite = lerp(fineWispy, fineBillowy, typeShaped);
+    fineMix = saturate(args.nubis3FineDetailStrength * 0.35f) * fineFade;
+    noiseComposite = lerp(noiseComposite, fineComposite, fineMix);
+    // Feeds ONLY the step-7b edge wisp cut below (noiseComposite already
+    // carries its own fold; wispyNoise's step-6 use happened above).
+    wispyNoise = lerp(wispyNoise, fineWispy, fineMix);
+    // Micro-AO relief fold — the rev-3 visibility fix. Same per-channel
+    // zero-mean centering as the wobble (wispy −0.5, billowy −0.15 after
+    // its 0.3 scale); substitution keeps the relief signal's range, so the
+    // AO clamp math is unchanged and silver linings stay exempt (lobe A
+    // never sees detailSigned).
+    float fineSigned = lerp(fineWispy - 0.5f, fineBillowy - 0.15f, typeShaped);
+    detailSigned = lerp(detailSigned, fineSigned, saturate(0.6f * fineMix));
+    fineInteriorNoise = lerp(lerp(noiseFine.r, noiseFine.g, 0.5f),
+                             lerp(noiseFine.b, noiseFine.a, 0.5f),
+                             typeShaped);
+  }
+
+  float erosion = noiseComposite * max(args.nubis3ErosionStrength, 0.0f);
+
+  // 7b. Edge wisp cut (fork — 2026-07-16, user feedback "erosion should cut
+  //     out wisps"; rev 2 same day: "the wisp cutouts don't work"). The base
+  //     erosion signal tops out well below 1 at sane strengths, so it can
+  //     only nibble the outer shell — silhouettes stay closed instead of
+  //     shredding into wisps. A CUTOUT requires the total erosion to EXCEED
+  //     the profile in strand-shaped regions (ValueErosion then returns a
+  //     hard 0, which even the sharpen lift can't resurrect — rev 1 failed
+  //     exactly there: its (1-profile)^2 band decayed before the term could
+  //     beat the profile, and everything it merely reduced was lifted back
+  //     by pow-sharpen). Rev 2: square the wispy signal (strand CORES cut
+  //     hardest, inter-strand regions barely touched — contrast, not fog),
+  //     linear band to mid-shell, 1.5x gain so strength 1 cuts through at
+  //     profile ~0.4 where the optical edge actually lives. Wispy-only:
+  //     billowy cores keep rounded cauliflower edges at any cloud type.
+  if (args.nubis3EdgeErosion > 0.0f) {
+    float edgeBand = saturate(1.0f - profile);
+    erosion += pow(wispyNoise, 2.0f) * args.nubis3EdgeErosion * edgeBand * 1.5f;
+  }
+
+  float density = valueErosion(profile, erosion);
+
+  // Page-123 sharpen: a sub-1 exponent lifts low densities, bringing out
+  // definition in wisps and edges. nubis3SharpenStrength lerps the exponent
+  // from 1 (off) to the paper's densityScale-keyed value.
+  if (args.nubis3SharpenStrength > 0.0f && density > 0.0f) {
+    float nubisExp = lerp(0.3f, 0.6f, pow(saturate(densityScale), 4.0f));
+    float exponent = lerp(1.0f, nubisExp, saturate(args.nubis3SharpenStrength));
+    density = pow(density, exponent);
+  }
+
+  // 8. INTERIOR TEXTURE (fork — 2026-07-16, the missing core feature both
+  //    reference looks share). ValueErosion saturates to a CONSTANT 1.0
+  //    deeper than profileDepth, so every cloud face beyond the thin
+  //    silhouette skirt rendered as a flat white mass — the "blobby" read
+  //    that survived every knob. Both references keep density proportional
+  //    to the noise field EVERYWHERE inside the body: iw3xo multiplies its
+  //    razor gate by the raw FBM value (`dens *= smoothstep(...)` on dens
+  //    itself), and Nubis3 multiplies by its authored per-voxel Density
+  //    Scale NVDF. We have no authored data, so the type-blended raw detail
+  //    channels stand in: sun/ambient transmittance now varies at billow
+  //    scale across the whole visible shell, which is what makes lit faces
+  //    read as cauliflower instead of cotton. Range [0.25, 1.75] around an
+  //    EXACTLY density-neutral mean of 1.0 (bake-time mean normalization,
+  //    detail round 2026-07-16 — before it, this factor hid a large density
+  //    cut on billowy cores and over-densified wispy interiors); the final
+  //    saturate clamps the top.
+  if (args.nubis3InteriorTexture > 0.0f) {
+    float interiorNoise = lerp(lerp(noise.r, noise.g, 0.5f),
+                               lerp(noise.b, noise.a, 0.5f),
+                               typeShaped);
+    // Mid-band fold (fork — 2026-07-17, GT7 mid-frequency follow-up): the
+    // step-6d 2.4 km tap also modulates INTERIOR density, so shape-variety
+    // lobes differ in optical thickness — brighter thin lobes against
+    // denser neighbors — instead of only in outline. Unlike the fine band
+    // (below the ~0.56 km mean free path, where zero-mean density
+    // modulation averages out along the ray — the rev-3 lesson), 2.4 km
+    // structure survives to transmittance. Keyed to the Shape Variety knob
+    // so ONE lever owns the whole mid band; mean-matched lerp of mean-0.5
+    // channels keeps the factor density-neutral. Shared sampler → the
+    // D_sun/D_ambient bakes and the near-field live sun taps track it.
+    float midMix = 0.35f * saturate(args.nubis3ShapeVarietyKm * 2.0f);
+    interiorNoise = lerp(interiorNoise,
+                         lerp(noiseMid.r, noiseMid.b, typeShaped),
+                         midMix);
+    // Fine-band fold (step 7a): near-to-mid range interiors pick up the
+    // ~33-177 m grain — small billows on lit faces. Mean-matched lerp
+    // (both signals are mean 0.5), so the factor stays density-neutral.
+    interiorNoise = lerp(interiorNoise, fineInteriorNoise, 0.5f * fineMix);
+    density *= lerp(1.0f, 0.25f + 1.5f * interiorNoise,
+                    saturate(args.nubis3InteriorTexture));
+  }
+
+  // 9. Near-camera density soften (Nubis p.125 — the companion half of the
+  //    HF-details branch, ported 2026-07-16 after the fly-through look
+  //    check: the HF fold without this reads harsh/over-dense up close).
+  //    Verbatim recipe over the same 0.1-0.6 km range as the HF fold
+  //    (rev 2 — the first 2 km range repainted the whole zenith deck base):
+  //    exponent 0.5 -> 1.0 and gain 0.666 -> 1.0 from nearest to far edge —
+  //    softens contrast and lowers density near the camera "to both add
+  //    details and reduce undersampling noise".
+  if (args.nubis3HFDetailStrength > 0.0f && cameraDistKm < 0.6f) {
+    float softenBlend = saturate((cameraDistKm - 0.1f) / (0.6f - 0.1f));
+    density = pow(max(density, 0.0f), lerp(0.5f, 1.0f, softenBlend))
+            * lerp(0.666f, 1.0f, softenBlend);
+  }
+
+  return saturate(density) * densityScale;
+}
+
+// Convenience overload without the shape out params (optical-depth taps).
+// The huge cameraDistKm keeps the near-camera HF detail off — bake grids and
+// shadow taps must not depend on the camera.
+//
+// FULL path (coarseOd = false). This is the overload the D_sun / D_ambient bake
+// integrands call, and it must stay full-fidelity: one sampler serving both the
+// view march and the bakes is what makes the rendered iso-surface and the shadow
+// grids consistent by construction.
+float sampleCloudDensityNubis3(vec3 worldPosKm,
+                               float heightFraction,
+                               float typeLocal,
+                               float coverageLocal,
+                               float densityScale,
+                               AtmosphereArgs args,
+                               Texture3D<float> nvdfSdf,
+                               Texture3D<float4> detailNoise,
+                               SamplerState cloudSampler) {
+  float profileUnused;
+  float detailUnused;
+  float sdfUnused;
+  float sdfStepUnused;
+  return sampleCloudDensityNubis3(worldPosKm, heightFraction, typeLocal, coverageLocal,
+                                  densityScale, 1e6f, args, nvdfSdf, detailNoise, cloudSampler,
+                                  /*coarseOd=*/false,
+                                  profileUnused, detailUnused, sdfUnused, sdfStepUnused);
+}
+
+// COARSE path (coarseOd = true) — LIVE optical-depth taps ONLY (the near-field sun
+// refinement and the two moon-shadow marches). Drops the hex blend zone and the
+// de-tile second tap: ~4.6 -> ~3.0 texture taps per call. Never call this from a
+// bake integrand; see the coarseOd note on the main sampler.
+float sampleCloudDensityNubis3Coarse(vec3 worldPosKm,
+                                     float heightFraction,
+                                     float typeLocal,
+                                     float coverageLocal,
+                                     float densityScale,
+                                     AtmosphereArgs args,
+                                     Texture3D<float> nvdfSdf,
+                                     Texture3D<float4> detailNoise,
+                                     SamplerState cloudSampler) {
+  float profileUnused;
+  float detailUnused;
+  float sdfUnused;
+  float sdfStepUnused;
+  return sampleCloudDensityNubis3(worldPosKm, heightFraction, typeLocal, coverageLocal,
+                                  densityScale, 1e6f, args, nvdfSdf, detailNoise, cloudSampler,
+                                  /*coarseOd=*/true,
+                                  profileUnused, detailUnused, sdfUnused, sdfStepUnused);
+}
+
+// ===========================================================================
+// D_sun / D_ambient bake integrals (moved from atmosphere_common.slangh,
+// Phase B — their only callers are cloud_sun_density_grid.comp.slang and
+// cloud_ambient_density_grid.comp.slang). The integrand samples the same
+// Nubis3 field the view march renders — the terrain cloud-shadow NEE fold
+// reads these grids with zero integrator changes.
+// ===========================================================================
+
+// Shared integrand tap.
+float sampleCloudBakeDensity(vec3 samplePos, float hf,
+                             float typeLocal, float coverageLocal,
+                             AtmosphereArgs args,
+                             SamplerState cloudSampler,
+                             Texture3D<float> nvdfSdf,
+                             Texture3D<float4> detailNoise) {
+  return sampleCloudDensityNubis3(samplePos, hf, typeLocal, coverageLocal,
+                                  1.0f, args, nvdfSdf, detailNoise, cloudSampler);
+}
+
+// Sun-direction optical-depth integral for the D_sun voxel grid bake.
+// Returns raw integral in (km * density); consumers exponentiate with the
+// chosen extinction sigma later (e.g. exp(-σ * D_sun)).
+// 8 uniform-step taps; coverage / type noise sampled once at the start
+// position (the cumulus wavelength is much longer than the tap span, so the
+// reuse is harmless and saves 2×kSamples FBM evaluations). The 2D field
+// sample is world-anchored via cameraWorldPosYUpKm (fork — 2026-05-17): the
+// ~300 km-wavelength coverage/type fields do not tile-wrap within the grid,
+// so without the anchor the bake read coverage at the world origin instead
+// of at the player.
+float sampleCloudSunOpticalDepthAtWorld(vec3 worldPosYUpKm, vec3 sunDirYUp,
+                                         AtmosphereArgs args,
+                                         SamplerState cloudSampler,
+                                         Texture3D<float> nvdfSdf,
+                                         Texture3D<float4> detailNoise) {
+  float opticalDepth = 0.0f;
+
+  float tExit;
+  if (!intersectCloudSlabRay(worldPosYUpKm, sunDirYUp, args, tExit)) {
+    // Sun at/below the horizon (or the voxel above the slab top). Returning
+    // 0 here was the "flash": the entire D_sun grid flipped to unoccluded
+    // the moment the intersect guard failed, so the deck lit up in
+    // horizon-orange for the band around sun elevation 0. Fully-occluded is
+    // the correct limit (matches the grazing ramp at the end of the
+    // function, so the transition through 0 is continuous). Voxels above
+    // the slab top only lose a shadow that was already ~zero there.
+    return 60.0f;  // kOccludedOD
+  }
+
+  // Sunset banding fix (fork — 2026-07-16). The original FIXED 8 taps were
+  // spread over the WHOLE slab path: fine at noon (~3 km path), garbage at
+  // sunset where a near-horizontal sun ray crosses 20-50 km — taps land
+  // kilometers apart, so neighboring grid voxels integrate essentially
+  // random cloud subsets. On screen that read as axis-aligned "squares"
+  // (the grid's world-space texels) and concentric "arcs" (the tap-distance
+  // quantization's onion shells perpendicular to the sun), cast into the
+  // deck — worst exactly at sunset, in BOTH density models (the grid
+  // predates Nubis3). Three-part fix:
+  //  1. Cap the integration path: beyond ~12 km the integral is saturated
+  //     for any extinction the deck uses (exp(-sigma*OD) is already ~0),
+  //     so the far tail only added noise.
+  //  2. Adaptive tap count (8..24) holds the step length near ~0.6 km
+  //     instead of path/8.
+  //  3. Deterministic per-position tap-phase jitter decorrelates neighbor
+  //     voxels — residual undersampling becomes smooth noise the grid's
+  //     bilinear filter absorbs, not shells. World-anchored hash = stable
+  //     across frames (no bake shimmer).
+  // Rev 2 (same-day look check): the plain 12 km cap ALSO removed real
+  // occlusion — at sunset the sun genuinely crosses 20-40 km of broken deck
+  // and that long-path extinction WAS the deep internal shadowing ("shadow
+  // casting gone or majorly reduced"). Dense taps keep the first 12 km
+  // accurate; a coarse jittered far tail (below) recovers the remaining
+  // mean extinction out to 40 km without the old per-voxel garbage.
+  // Rev 3 (2026-07-16, "sunset light looks inverted"): rev 2 also added a
+  // UNIFORM grazing ramp that forced OD 60 on every voxel below ~1.5 deg of
+  // sun elevation. That blanket kill hit exactly the prime sunset window:
+  // with D_sun saturated everywhere, T_primary and the body lobe die on
+  // SUN-FACING faces too, ambientShadow crushes the fill, and the
+  // sunset-ambient coolReachCurve = 1-exp(-60*reach) ~ 1 flips even lit
+  // faces to the ANTI-sun horizon color — the deck read as illuminated
+  // from the opposite side. Replaced by per-voxel physics: the far tail
+  // already measures this voxel's mean far-field density, so the UNRESOLVED
+  // path beyond the 40 km march is extrapolated with that measured mean
+  // (capped at a curved-shell escape length — the flat-slab intersect has
+  // no curvature, so its exit distance diverges at grazing angles while a
+  // real curved shell releases the ray). Cloud-top voxels whose rays hug
+  // thin/absent cover keep their rim light through sunset (farMean ~ 0);
+  // in-deck voxels under real cover go fully dark honestly. Only a tight
+  // ~0.15 deg micro-ramp remains, purely to bridge the intersect guard's
+  // hard fail at sunDir.y <= 0.001.
+  const float kMaxSunPathKm = 12.0f;
+  const int   kSamplesMax   = 24;
+  float tExitFull = tExit;
+  tExit = min(tExit, kMaxSunPathKm);
+  // (the old single [0, tExit] lattice's `samples` / `stepLen` are gone — the
+  // near and far sections below each derive their own, and together partition
+  // the path exactly.)
+  float tapJitter = hash31(worldPosYUpKm * 173.3f);
+
+  vec2 sampleXZKm = vec2(worldPosYUpKm.x + args.cameraWorldPosYUpKm.x,
+                         worldPosYUpKm.z + args.cameraWorldPosYUpKm.z);
+  float typeNoise     = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale,     200.0f);
+  float coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
+  float typeLocal     = saturate(args.cloudTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
+  float coverageLocal = saturate(args.cloudCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread);
+
+  // ===== DE-JITTERED NEAR SECTION (fork — 2026-07-30, perf) =====
+  //
+  // The near-field LIVE sun refinement in the view march exists, per its own
+  // comment, because "the grid bake integrates with ~0.6 km jittered taps and
+  // bilinear filtering smooths what survives, so lobe-scale self-shadowing is
+  // low-passed away". That explanation does not survive arithmetic:
+  //   * this bake already spends 5-8 taps inside the first 3 km (8 when the sun
+  //     path is short, 5 at 0.6 km steps on a long path) — DENSER along the sun
+  //     ray than the live refinement's 2 taps at 0.75 / 2.25 km;
+  //   * grid texels are ~47 m horizontally (12 km / 256) and ~95 m vertically —
+  //     far above Nyquist for the 1-2.5 km lobes in question, and trilinear
+  //     blur is ~1 texel.
+  // So the lobe signal is representable here and is NOT being low-passed away.
+  //
+  // What actually differs is estimator COHERENCE. The tap phase is
+  // hash31(worldPosYUpKm * 173.3) — decorrelated per voxel, world-anchored and
+  // FROZEN. Sampling 87-875 m detail content at ~0.5 km strata leaves a per-voxel
+  // OD standard deviation of roughly 0.15-0.25, and through exp(-sigma * OD) with
+  // sigma = 4 that is up to a ~2x static shading swing at 1-2 texel (50-150 m)
+  // granularity — worst exactly on lit faces, where low OD makes the exponential
+  // most sensitive. The lobe gradients ARE in the grid, buried under frozen
+  // mottle. The live refinement wins not by resolving more, but by being a
+  // DETERMINISTIC estimator whose taps are anchored to the shade point, so its
+  // (much larger) quadrature bias varies continuously and reads as shading
+  // structure instead of noise.
+  //
+  // Fix: make the near section a deterministic fixed-count quadrature and leave
+  // the far tail jittered. A FIXED count matters — the historical "concentric
+  // arcs" artifact came from the ceil(tExit / 0.6) count jumping between
+  // neighbouring voxels at km-scale steps, not from determinism, so a fixed
+  // 8-tap near section cannot reintroduce it. Cost is ~zero: those 5-8 taps were
+  // already being spent over this range.
+  //
+  // The far section keeps the original jittered scheme; its taps are the ones
+  // whose undersampling genuinely needs decorrelating, and its contribution is
+  // deep enough in the exponential that mottle there is invisible.
+  const float kCoherentNearKm  = 3.0f;   // matches nubis3SunNearFieldKm's range
+  const int   kCoherentNearTaps = 8;
+  float nearEnd = min(tExit, kCoherentNearKm);
+  float nearStep = nearEnd / float(kCoherentNearTaps);
+  [unroll]
+  for (int i = 0; i < kCoherentNearTaps; ++i) {
+    vec3 samplePos = worldPosYUpKm + (float(i) + 0.5f) * nearStep * sunDirYUp;
+    float hf = computeCloudHeightFraction(samplePos, args);
+    float density = sampleCloudBakeDensity(samplePos, hf, typeLocal, coverageLocal,
+                                           args, cloudSampler, nvdfSdf, detailNoise);
+    opticalDepth += density * nearStep;
+  }
+
+  // Far section: the original jittered scheme, RE-BASED to exactly partition
+  // [nearEnd, tExit]. Re-basing rather than skipping taps of the old [0, tExit]
+  // lattice matters — skipping would leave a jittered partial cell at the
+  // handoff, whose width varies per voxel, reintroducing exactly the per-voxel
+  // variance the near section exists to remove, right at the boundary. Here the
+  // tap weights sum to (tExit - nearEnd) by construction for every voxel.
+  float farLen = tExit - nearEnd;
+  if (farLen > 1e-4f) {
+    int   farSamples = clamp(int(ceil(farLen / 0.6f)), 4, kSamplesMax);
+    float farStep    = farLen / float(farSamples);
+    for (int i = 0; i < kSamplesMax; ++i) {
+      if (i >= farSamples) {
+        break;
+      }
+      vec3 samplePos = worldPosYUpKm
+                     + (nearEnd + (float(i) + tapJitter) * farStep) * sunDirYUp;
+      float hf = computeCloudHeightFraction(samplePos, args);
+      float density = sampleCloudBakeDensity(samplePos, hf, typeLocal, coverageLocal,
+                                             args, cloudSampler, nvdfSdf, detailNoise);
+      opticalDepth += density * farStep;
+    }
+  }
+
+  // Coarse far tail: 8 jittered taps over [12 km .. min(exit, 40 km)] —
+  // the mean long-path extinction that makes sunset light rake through a
+  // broken deck instead of ignoring everything past the cap. Jitter +
+  // bilinear grid filtering keep its variance smooth (no squares). Tap
+  // count 4 -> 8 (rev 3): the mean now also drives the grazing
+  // extrapolation below, so the single-tap OD lottery (one hit used to add
+  // a full 7 km x density) needed halving; bake-side amortized cost only.
+  if (tExitFull > kMaxSunPathKm) {
+    const int kFarTaps = 8;
+    float farEnd  = min(tExitFull, 40.0f);
+    float farStep = (farEnd - kMaxSunPathKm) / float(kFarTaps);
+    float farOD   = 0.0f;
+    for (int i = 0; i < kFarTaps; ++i) {
+      vec3 samplePos = worldPosYUpKm
+                     + (kMaxSunPathKm + (float(i) + tapJitter) * farStep) * sunDirYUp;
+      float hf = computeCloudHeightFraction(samplePos, args);
+      float density = sampleCloudBakeDensity(samplePos, hf, typeLocal, coverageLocal,
+                                             args, cloudSampler, nvdfSdf, detailNoise);
+      farOD += density * farStep;
+    }
+    opticalDepth += farOD;
+
+    // Grazing extrapolation (rev 3 — replaces the rev-2 uniform elevation
+    // ramp; see the header note). Extend this voxel's own measured far-field
+    // mean density over the path the march did not resolve, up to a curved-
+    // shell escape length (the flat-slab tExit diverges at grazing angles;
+    // a real curved shell at our ~952 km cloud-planet radius releases a
+    // near-horizontal ray after roughly sqrt(2*R*h) ~ 60 km).
+    const float kCurvedEscapeKm = 60.0f;
+    if (tExitFull > farEnd) {
+      float farMeanDensity = farOD / max(farEnd - kMaxSunPathKm, 1e-3f);
+      opticalDepth += farMeanDensity * (min(tExitFull, kCurvedEscapeKm) - farEnd);
+    }
+  }
+
+  // Guard-bridging micro-ramp (rev 3): the flat-slab intersect hard-fails to
+  // fully-occluded at sunDir.y <= 0.001; bridge that final flip over the
+  // last ~0.15 deg only. The sunset window above it keeps honest per-voxel
+  // directionality from the integral + extrapolation.
+  const float kGrazingSinElev = 0.0026f;  // sin(~0.15 deg)
+  const float kOccludedOD     = 60.0f;    // exp(-sigma*60) ~ 0 for any deck sigma
+  float grazing = saturate(sunDirYUp.y / kGrazingSinElev);
+  return lerp(kOccludedOD, opticalDepth, grazing);
+}
+
+// Zenith-direction optical-depth integral for the D_ambient voxel grid bake.
+// 6 uniform-step taps straight up from the voxel center to the slab top.
+// Returns raw integral; consumers exponentiate with their chosen sigma.
+float sampleCloudAmbientOpticalDepthAtWorld(vec3 worldPosYUpKm,
+                                             AtmosphereArgs args,
+                                             SamplerState cloudSampler,
+                                             Texture3D<float> nvdfSdf,
+                                             Texture3D<float4> detailNoise) {
+  const int kSamples = 6;
+  float opticalDepth = 0.0f;
+
+  const float slabTop = args.cloudAltitude + args.cloudVoxelGridVerticalKm;
+  const float distanceToTop = slabTop - worldPosYUpKm.y;
+  if (distanceToTop <= 0.0f) {
+    return 0.0f;
+  }
+  const float stepLen = distanceToTop / float(kSamples);
+
+  // Same world-anchored single-position coverage/type sample as the sun
+  // integral above.
+  vec2 sampleXZKm = vec2(worldPosYUpKm.x + args.cameraWorldPosYUpKm.x,
+                         worldPosYUpKm.z + args.cameraWorldPosYUpKm.z);
+  float typeNoise     = cloudControlField2D(sampleXZKm * args.cloudTypeNoiseScale,     200.0f);
+  float coverageNoise = cloudControlField2D(sampleXZKm * args.cloudCoverageNoiseScale, 250.0f);
+  float typeLocal     = saturate(args.cloudTypeMean     + (typeNoise     - 0.5f) * args.cloudTypeSpread);
+  float coverageLocal = saturate(args.cloudCoverageMean + (coverageNoise - 0.5f) * args.cloudCoverageSpread);
+
+  [unroll]
+  for (int i = 0; i < kSamples; ++i) {
+    vec3 samplePos = worldPosYUpKm + vec3(0.0f, (float(i) + 0.5f) * stepLen, 0.0f);
+    float hf = computeCloudHeightFraction(samplePos, args);
+    float density = sampleCloudBakeDensity(samplePos, hf, typeLocal, coverageLocal,
+                                           args, cloudSampler, nvdfSdf, detailNoise);
+    opticalDepth += density * stepLen;
+  }
+
+  return opticalDepth;
+}

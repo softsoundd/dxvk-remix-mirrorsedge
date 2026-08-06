@@ -69,6 +69,10 @@
 #include "dxvk_extensions.h"
 // NV-DXVK end
 
+// NV-DXVK start: FSR 3.1 runtime probe
+#include "rtx_render/rtx_fork_hooks.h"
+// NV-DXVK end
+
 namespace dxvk {
   // NV-DXVK start: initialize new static variables
   std::atomic<bool> DxvkInstance::s_aftermathEnabled{ false };
@@ -713,6 +717,13 @@ namespace dxvk {
       &insExtensions.khrExternalSemaphoreCapabilities
     } };
     extensionsAvailable.enableExtensions(dlfgExtList.size(), dlfgExtList.data(), extensionsEnabled);
+    // NV-DXVK end
+
+    // NV-DXVK start: FSR 3.1 — the FidelityFX Vulkan backend uses debug-utils
+    // object naming. Only requested when the FidelityFX runtime is actually
+    // present, so installs without it are byte-identical to upstream.
+    if (fork_hooks::fsrRuntimeAvailable() && extensionsAvailable.supports(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+      extensionsEnabled.add(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     // NV-DXVK end
 
     DxvkNameList extensionNameList = extensionsEnabled.toNameList();

@@ -27,6 +27,8 @@
 #include "rtx_fast_noise.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h"
 
+#include <atomic>
+
 namespace dxvk {
 
 class DxvkContext;
@@ -81,11 +83,6 @@ public:
   Resources::Resource getSkyViewLut() const { return m_skyViewLut; }
 
   /**
-   * \brief Get cloud noise 3D texture resource (Stage C)
-   */
-  Resources::Resource getCloudNoise3D() const { return m_cloudNoise3D; }  // Stage C
-
-  /**
    * \brief Get the cloud-occluded sky-ambient transmittance LUT (fork).
    *
    * 2D R16F texture keyed by (azimuth, elevation). Baked per frame from camera
@@ -115,6 +112,17 @@ public:
   const Resources::Resource& getCloudDAmbient() const { return m_cloudDAmbient; }
 
   /**
+   * \brief Get the published cloud NVDF SDF (fork — Nubis3 conversion Phase A).
+   *
+   * 256x64x256 R16F tile-periodic signed distance field of the cloud BODY
+   * (placement map + column model at the baked nominal coverage), in raw km,
+   * negative inside. Double-buffered; this returns the FRONT buffer — the last
+   * fully-published bake. Consumed by the enum 879 debug slice view (Phase A)
+   * and, from Phase B, by the Nubis3 density sampler + sphere-traced stepping.
+   */
+  const Resources::Resource& getCloudNvdfSdf() const { return m_cloudNvdfSdf[m_cloudNvdfSdfFront]; }
+
+  /**
    * \brief Get the cloud render RT (Nubis Cubed 2023, fork — 2026-05-12, C4).
    *
    * Screen-space RGBA16F at the downscale render extent containing per-pixel
@@ -124,19 +132,6 @@ public:
    * view; will feed the sky-miss composite (C5 of the 2026-05-12 workstream).
    */
   const Resources::Resource& getCloudRenderRT() const { return m_cloudRenderRT; }
-
-  /**
-   * \brief Get the cloud height LUT (slide 3 lift — RDR2 SIGGRAPH 2019,
-   * fork — 2026-05-15).
-   *
-   * 64x128 R8 baked once at startup by cloud_height_lut_baker.comp.slang.
-   * Indexed (typeSlice, heightFrac) -> per-altitude density modulator. Consumed
-   * by cloud_render.comp.slang's cloudHeightProfile() helper to replace the
-   * procedural cloudTypeProfile trapezoid with a richer per-type altitude
-   * shape family (anvil lift for cumulus, room to retune cirrus end without
-   * shader rebuilds).
-   */
-  const Resources::Resource& getCloudHeightLut() const { return m_cloudHeightLut; }
 
   /**
    * \brief Get the secondary-ray cloud LUT (fork — 2026-06-10, perf).
@@ -149,20 +144,6 @@ public:
    * per-ray cloud march.
    */
   const Resources::Resource& getCloudSecondaryLut() const { return m_cloudSecondaryLut; }
-
-  /**
-   * \brief Get the cloud placement map (fork — 2026-06-11, column-shaping
-   * rework).
-   *
-   * 512x512 RGBA8 tiled at cloudNoiseTileKm: R = cluster field (where clouds
-   * are, at cloud scale), G = per-cloud top-height jitter, B = base lift.
-   * Baked by cloud_placement_map_baker.comp.slang at init and re-baked live
-   * when cloudCellSizeKm / cloudNoiseTileKm change. Drives the per-column
-   * cloud model inside the density samplers (each cloud gets its own
-   * base/top and a per-cloud height axis for all vertical shaping +
-   * lighting).
-   */
-  const Resources::Resource& getCloudPlacementMap() const { return m_cloudPlacementMap; }
 
   /**
    * \brief Ensure the cloud render RT exists at the requested downscale extent.
@@ -273,21 +254,54 @@ public:
    */
   void advanceCloudMotion(float dt);
 
+  /**
+   * \brief Advance the lightning strike scheduler (fork — 2026-07-14)
+   *
+   * Decays the flash flicker envelope, fires restrike pulses, and schedules /
+   * places new strikes around the camera. MUST be called exactly once per
+   * frame (from updateAtmosphereConstants), after the camera-position push so
+   * placement uses this frame's camera. getAtmosphereArgs publishes the
+   * resulting envelope + strike position into the lightning CB fields.
+   */
+  void advanceLightning(float dt);
+
+  /**
+   * \brief Queue a lightning strike for the next advanceLightning tick
+   *
+   * ImGui "Test Strike" hook. Static so the panel code doesn't need the
+   * atmosphere instance; consumed (and cleared) once per frame. Ignored while
+   * lightningEnable is off.
+   */
+  static void requestLightningStrike();
+
 private:
   void createLutResources(Rc<DxvkContext> ctx);
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
-  void dispatchCloudNoise3DBake(Rc<DxvkContext> ctx);  // Stage C: baked at init + on bake-input change
-  bool needsCloudNoiseRebake() const;                  // true when a bake input (tile / worley*) changed
-  void cacheCloudNoiseBakeInputs();                    // snapshot the current bake inputs after a bake
-  void dispatchCloudHeightLutBake(Rc<DxvkContext> ctx);  // Fork: baked once at init (slide 3 lift)
   // Cloud placement map bake (fork — 2026-06-11, column-shaping rework).
   // At init + on bake-input change (cloudCellSizeKm / cloudNoiseTileKm).
   void dispatchCloudPlacementMapBake(Rc<DxvkContext> ctx);
   bool needsCloudPlacementRebake() const;
   void cacheCloudPlacementBakeInputs();
   void dispatchCloudSkyTransmittanceLut(Rc<DxvkContext> ctx);  // Fork: per-frame
+  // Cloud NVDF SDF bake chain (fork — Nubis3 conversion Phase A):
+  // occupancy voxelize -> JFA seed init -> 9 jump passes -> signed resolve
+  // into the back SDF buffer, then publish-swap. Full synchronous chain at
+  // init (runCloudNvdfBakeFull); at runtime stepCloudNvdfBake advances the
+  // state machine a couple of JFA passes per frame so weather-drift re-bakes
+  // never spike a frame. Dirty gate mirrors the placement-map pattern.
+  void dispatchCloudNvdfOccupancy(Rc<DxvkContext> ctx);
+  void dispatchCloudNvdfJfaPass(Rc<DxvkContext> ctx, uint32_t mode, uint32_t jumpSizeVoxels,
+                                uint32_t srcIdx, uint32_t dstIdx);
+  void dispatchCloudNvdfResolve(Rc<DxvkContext> ctx, uint32_t seedsIdx);
+  void runCloudNvdfBakeFull(Rc<DxvkContext> ctx);
+  void stepCloudNvdfBake(Rc<DxvkContext> ctx);
+  bool needsCloudNvdfRebake() const;
+  void cacheCloudNvdfBakeInputs();
+  // Nubis3 wispy/billowy detail volume bake (fork — Nubis3 conversion
+  // Phase B). Fixed pattern: baked once at init, no live inputs.
+  void dispatchCloudDetailNoiseBake(Rc<DxvkContext> ctx);
   // Cloud voxel grid bakes (Nubis Cubed 2023, fork — 2026-05-12). Round-robin
   // every 8 frames. Driven from computeLuts based on the device frame ID.
   void dispatchCloudSunDensityGrid(Rc<DxvkContext> ctx);
@@ -307,7 +321,6 @@ private:
   static constexpr uint32_t kMultiscatteringLutSize = 32;
   static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
   static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
-  static constexpr uint32_t kCloudNoise3DSize = 256;  // 3D R8, 16 MB VRAM (Stage C)
   // Cloud-occluded sky-ambient transmittance LUT (fork). Small 2D R16F texture
   // keyed by (azimuth, elevation). 32x16 chosen because cumulus features at the
   // bake scale are low-frequency relative to a 360x90 sweep — 32 azimuthal
@@ -324,17 +337,43 @@ private:
   // an 8x8x4 dispatch covering 256x256x32 voxels (~0.1-0.2 ms target).
   // Keep in lockstep with kGridX/Y/Z constants in
   // cloud_sun_density_grid.comp.slang / cloud_ambient_density_grid.comp.slang.
+  //
+  // AXIS FIX (fork — 2026-07-16, found in the GT7 cross-audit): the UVW
+  // mapping routes uvw.y = VERTICAL and uvw.z = world Z
+  // (cloudVoxelUVWToWorld), but the allocation had Y=256 / Z=32 — so the
+  // vertical axis burned 256 texels on a ~3 km slab (~12 m) while world-Z
+  // shadow texels were 375 m wide. Those fat Z-texels were the blocky
+  // "squares" cast into the deck (worst at sunset, both density models).
+  // Design intent (Nubis: 256x256x32 with 32 VERTICAL) restored: world
+  // X/Z get 256 (47 m at the 12 km tile), vertical gets 32 (~95 m).
   static constexpr uint32_t kCloudVoxelGridX = 256;
-  static constexpr uint32_t kCloudVoxelGridY = 256;
-  static constexpr uint32_t kCloudVoxelGridZ = 32;
+  static constexpr uint32_t kCloudVoxelGridY = 32;
+  static constexpr uint32_t kCloudVoxelGridZ = 256;
 
-  // Cloud height LUT (slide 3 lift — RDR2 SIGGRAPH 2019, fork — 2026-05-15).
-  // 64 type slices x 128 altitude entries x R8 = 8 KB VRAM. One-shot bake at
-  // startup. Keep in lockstep with the dispatch dimensions inside
-  // cloud_height_lut_baker.comp.slang and the LUT sample call in
-  // atmosphere_common.slangh's cloudHeightProfile.
-  static constexpr uint32_t kCloudHeightLutWidth  = 64;
-  static constexpr uint32_t kCloudHeightLutHeight = 128;
+  // Cloud NVDF (fork — Nubis3 conversion Phase A). 256x64x256 tile-periodic
+  // body grid: occupancy R8 (~4 MB), two R32_UINT JFA seed ping-pongs
+  // (~17 MB each), two R16F SDF buffers (~8 MB each, front/back publish
+  // pair) — ~54 MB total. Axis convention: texture y = VERTICAL (explicit —
+  // see cloud_nvdf.h; the D_sun grids' axis comments disagree with their own
+  // mapping, do not pattern-match them). ~47 m voxels at the 12 km / 3 km
+  // defaults. Keep in lockstep with CLOUD_NVDF_SIZE_XZ / CLOUD_NVDF_SIZE_Y
+  // in cloud_nvdf.h.
+  static constexpr uint32_t kCloudNvdfSizeXZ = 256;
+  static constexpr uint32_t kCloudNvdfSizeY  = 64;
+  // JFA jump schedule: standard halving from half the wrapped XZ extent,
+  // plus one extra 1-refinement pass (JFA+1).
+  static constexpr uint32_t kCloudNvdfJumpSchedule[] = { 128, 64, 32, 16, 8, 4, 2, 1, 1 };
+  static constexpr uint32_t kCloudNvdfJumpPassCount =
+      sizeof(kCloudNvdfJumpSchedule) / sizeof(kCloudNvdfJumpSchedule[0]);
+  // Runtime re-bake budget: JFA passes advanced per frame while a re-bake is
+  // in flight (~0.2-0.5 ms each; the full chain completes in ~5 frames).
+  static constexpr uint32_t kCloudNvdfJumpPassesPerFrame = 2;
+
+  // Nubis3 detail volume (fork — Nubis3 conversion Phase B). 128^3 RGBA8
+  // (~8 MB): R/G = low/high-frequency wispy, B/A = low/high-frequency
+  // billowy. Baked once at init. Keep in lockstep with kDetailVolumeSize in
+  // cloud_detail_noise_baker.comp.slang.
+  static constexpr uint32_t kCloudDetailNoise3DSize = 128;
 
   // Secondary-ray cloud LUT (fork — 2026-06-10, perf). 256 azimuth x 128
   // elevation RGBA16F = 256 KB VRAM. Elevation rows concentrate near the
@@ -358,12 +397,22 @@ private:
   Resources::Resource m_transmittanceLut;
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
-  Resources::Resource m_cloudNoise3D;  // Stage C: prebaked 3D Perlin FBM
   Resources::Resource m_cloudSkyTransmittanceLut;  // Fork: per-frame cloud occlusion of sky-ambient hemisphere
   // Cloud voxel grids (Nubis Cubed 2023, fork — 2026-05-12). Round-robin baked
   // every 8 frames by dispatchCloudSunDensityGrid / dispatchCloudAmbientDensityGrid.
   Resources::Resource m_cloudDSun;
   Resources::Resource m_cloudDAmbient;
+  // Cloud NVDF bake chain resources (fork — Nubis3 conversion Phase A).
+  // Occupancy + JFA ping-pong are bake scratch; the SDF pair is the
+  // published product (front = last complete bake, back = in-flight bake;
+  // stepCloudNvdfBake swaps after the resolve pass so consumers never read
+  // a half-baked field).
+  Resources::Resource m_cloudNvdfOccupancy;
+  Resources::Resource m_cloudNvdfJfa[2];
+  Resources::Resource m_cloudNvdfSdf[2];
+  uint32_t            m_cloudNvdfSdfFront = 0;
+  // Nubis3 wispy/billowy detail volume (fork — Nubis3 conversion Phase B).
+  Resources::Resource m_cloudDetailNoise3D;
   // Cloud render RT (Nubis Cubed 2023, fork — 2026-05-12, C4). Screen-space
   // RGBA16F at downscale extent; produced each frame by dispatchCloudRender.
   // m_cloudRenderExtent tracks the current allocation so resize triggers a
@@ -375,10 +424,6 @@ private:
   // fork — 2026-06-11). Published to shaders via
   // args.cloudRenderFullDimX/Y for the bilinear upsample at sky-miss.
   VkExtent2D          m_cloudRenderFullExtent = { 0u, 0u };
-
-  // Cloud height LUT (slide 3 lift — RDR2 SIGGRAPH 2019, fork — 2026-05-15).
-  // 64x128 R8, baked once at startup.
-  Resources::Resource m_cloudHeightLut;
 
   // Secondary-ray cloud LUT (fork — 2026-06-10, perf). 256x128 RGBA16F,
   // baked every frame by dispatchCloudSecondaryLut.
@@ -414,6 +459,18 @@ private:
   Vector2  m_cloudAdvectOffset     { 0.0f, 0.0f };  // wind translation (km)
   Vector3  m_cloudEvolutionOffset  { 0.0f, 0.0f, 0.0f };  // morph scroll (km)
   float    m_cloudBoilPhase        { 0.0f };  // edge-boil scroll phase (km)
+
+  // Lightning strike scheduler state (fork — 2026-07-14). Advanced once per
+  // frame by advanceLightning(); published by getAtmosphereArgs() into the
+  // lightning CB fields. See the scheduler comment in rtx_atmosphere.cpp for
+  // the envelope / restrike / inter-arrival model.
+  Vector3  m_lightningStrikePosKm       { 0.0f, 0.0f, 0.0f };
+  float    m_lightningEnvelope          { 0.0f };   // raw flicker envelope [0..~1.2]
+  float    m_lightningHistoryFade       { 0.0f };   // ghost-suppression window (outlasts the envelope)
+  int      m_lightningPulsesLeft        { 0 };      // restrike pulses of the active flash
+  float    m_lightningTimeToPulse       { 0.0f };   // seconds to the next restrike pulse
+  uint32_t m_lightningRngState          { 0x9E3779B9u };  // xorshift32 state
+  static std::atomic<bool> s_lightningStrikeRequested;    // ImGui Test Strike latch
 
   // Cloud history ping-pong (fork). Screen-space RGBA16F (premultiplied
   // radiance, alpha) used by the temporal-smoothing path inside
@@ -455,23 +512,36 @@ private:
   // cloud-noise re-bake path also zeroes it to force same-frame refresh.
   AtmosphereArgs m_cachedVoxelGridKey = {};
   // Cloud noise 3D re-bake gate (fork). The 256^3 noise volume bakes its
-  // periodic structure from cloudNoiseTileKm + the cloudWorley* inputs, while
-  // the runtime sampler divides world position by the *live* cloudNoiseTileKm.
-  // The bake originally ran only once at init, so changing a bake input at
-  // runtime (e.g. the ImGui tile slider) desynced the runtime divisor from the
-  // baked structure — rescaling cloud feature size and banding the horizon.
-  // These snapshot the last-baked inputs; needsCloudNoiseRebake() compares them
-  // against the live RtxOptions so the volume re-bakes only on an actual change.
-  float    m_cachedNoiseTileKm         = 0.0f;
-  float    m_cachedWorleyFrequency     = 0.0f;
-  uint32_t m_cachedWorleyOctaves       = 0u;
-  float    m_cachedWorleyCarveStrength = 0.0f;
-  float    m_cachedBaseFreqScale       = 0.0f;
   // Cloud placement map re-bake gate (fork — 2026-06-11, column-shaping
   // rework). Same pattern as the noise gate above: snapshot the last-baked
   // inputs, re-bake only on actual change.
   float    m_cachedPlacementCellSizeKm = 0.0f;
   float    m_cachedPlacementTileKm     = 0.0f;
+  // Cloud NVDF re-bake gate + state machine (fork — Nubis3 Phase A). Same
+  // snapshot pattern as the placement gate above. Deliberately NOT keys:
+  // live weather coverage (sample-time level-set offset — but see the
+  // quantized nominal below, which re-centers the bake when live coverage
+  // drifts > half a quantization step from it), wind / evolution / boil
+  // (sample-time translations of the erosion field), type / density / sun
+  // (never shape the body). cloudThickness quantizes to 0.25 km so the slow
+  // weather-drift blend can't rebake-storm.
+  struct CloudNvdfBakeKey {
+    float cellSizeKm       = 0.0f;
+    float tileKm           = 0.0f;
+    float columnFeather    = 0.0f;
+    float columnTopShape   = 0.0f;
+    float columnTopVar     = 0.0f;
+    float columnBaseVar    = 0.0f;
+    float nominalCoverage  = 0.0f;
+    float thicknessQ       = 0.0f;  // cloudThickness quantized to 0.25 km
+    float bodyErosion      = 0.0f;  // nvdfBodyErosionStrength (bake-time carve)
+  };
+  CloudNvdfBakeKey m_cachedNvdfKey = {};
+  // In-flight runtime re-bake: index into kCloudNvdfJumpSchedule of the next
+  // jump pass to run. Inactive when m_nvdfBakeActive is false. The full-chain
+  // init path never touches these.
+  bool     m_nvdfBakeActive = false;
+  uint32_t m_nvdfJumpIdx    = 0;
   bool m_initialized = false;
   bool m_lutsNeedRecompute = true;
 };

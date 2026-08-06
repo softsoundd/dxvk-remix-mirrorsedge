@@ -422,6 +422,12 @@ struct RaytraceArgs {
   float wboitDepthWeightTuning;
   uint wboitEnabled;
 
+  // Fork (2026-07-26): scale on the sky-ambient term that the resolver's
+  // opacity lighting approximation adds for sky-lit particle materials
+  // (weather precipitation). 0 disables the term entirely. Appended at the
+  // END of the struct so no existing field offsets move.
+  float particleSkyAmbientScale;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

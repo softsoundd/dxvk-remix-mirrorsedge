@@ -22,6 +22,9 @@
 #include <cstring>
 #include <cmath>
 #include <cassert>
+#include <array>
+#include <fstream>
+#include <chrono>
 
 #include "dxvk_device.h"
 #include "dxvk_gpu_query.h"
@@ -75,6 +78,9 @@
 
 #include "rtx_matrix_helpers.h"
 #include "../util/util_fastops.h"
+
+#include "rtx_fork_hooks.h"
+#include "rtx_fork_weather.h"
 
 // Destructor requires the struct definitions
 #include "rtx_sky.h"
@@ -276,6 +282,8 @@ namespace dxvk {
         uint32_t recommendedJitterLength = xess.calcRecommendedJitterSequenceLength();
         uint32_t currentJitterLength = RtxOptions::cameraJitterSequenceLength();
       }
+    } else if (RtxOptions::isFSREnabled()) {
+      fork_hooks::setFsrDownscaleExtent(*this, upscaleExtent, downscaleExtent);
     } else if (shouldUseNIS() || shouldUseTAA()) {
       auto resolutionScale = RtxOptions::resolutionScale();
       downscaleExtent.width = uint32_t(std::roundf(upscaleExtent.width * resolutionScale));
@@ -333,6 +341,8 @@ namespace dxvk {
       return InternalUpscaler::DLSS_RR;
     } else if (shouldUseXeSS() && m_common->metaXeSS().isActive()) {
       return InternalUpscaler::XeSS;
+    } else if (fork_hooks::isFsrUpscalerActive(*this)) {
+      return InternalUpscaler::FSR;
     } else if (shouldUseNIS()) {
       return InternalUpscaler::NIS;
     } else if (shouldUseTAA()) {
@@ -646,6 +656,11 @@ namespace dxvk {
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
+      // Fork: submit the weather precipitation emitter. Must precede
+      // prepareSceneData -- that is where RtxParticleSystemManager::simulate
+      // consumes this frame's spawn contexts.
+      fork_hooks::submitPrecipitation(*this);
+
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
 
@@ -734,6 +749,9 @@ namespace dxvk {
         } else if (m_currentUpscaler == InternalUpscaler::XeSS) {
           m_common->metaAutoExposure().createResources(this);
           dispatchXeSS(rtOutput);
+        } else if (m_currentUpscaler == InternalUpscaler::FSR) {
+          m_common->metaAutoExposure().createResources(this);
+          fork_hooks::dispatchFsrUpscale(*this, rtOutput);
         } else if (m_currentUpscaler == InternalUpscaler::NIS) {
           dispatchNIS(rtOutput);
         } else if (m_currentUpscaler == InternalUpscaler::TAAU){
@@ -748,6 +766,7 @@ namespace dxvk {
             { 0, 0, 0 },
             rtOutput.m_compositeOutputExtent);
         }
+        fork_hooks::dispatchRcasSharpening(*this, rtOutput);
         m_previousUpscaler = m_currentUpscaler;
 
         RtxDustParticles& dust = m_common->metaDustParticles();
@@ -772,6 +791,9 @@ namespace dxvk {
         dispatchSRGBDither(rtOutput, performSRGBConversion);
         dispatchScreenOverlay(rtOutput);
 
+        // Composite screen overlay (from external C API) after tone mapping, before screenshot capture.
+        dispatchScreenOverlay(rtOutput);
+
         if (captureScreenImage) {
           if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
             takeScreenshot("rtxImagePostTonemapping", rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image);
@@ -792,6 +814,9 @@ namespace dxvk {
         dispatchDebugView(srcImage, rtOutput, captureScreenImage);
 
         dispatchDLFG();
+
+        // Match FSR-3.1 sequencing: configure/prepare frame generation before final game-target blit.
+        fork_hooks::dispatchFsrFrameGeneration(*this, srcImage);
 
         // Blit to the game target
         {
@@ -1029,6 +1054,14 @@ namespace dxvk {
 
   void RtxContext::commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state) {
     getSceneManager().submitExternalDraw(this, std::move(state));
+  }
+
+  void RtxContext::setScreenOverlayData(Rc<DxvkBuffer> stagingBuffer, uint32_t width, uint32_t height, VkFormat format, float opacity) {
+    m_pendingScreenOverlay = ScreenOverlayFrame {
+      std::move(stagingBuffer),
+      width, height,
+      format, opacity
+    };
   }
 
   static uint32_t jenkinsHash(uint32_t a) {
@@ -1828,6 +1861,10 @@ namespace dxvk {
       rtOutput, GlobalTime::get().deltaTimeMs());
 
     setFramePassStage(RtxFramePassStage::ToneMapping);
+    // Operator-only tonemapping (dynamic tone curve removed in the fork's 2026-05-13 refactor).
+    // sRGB conversion + dithering are deferred to dispatchSRGBDither (upstream's post-FX
+    // pipeline refactor), so the tonemapper runs with performSRGBConversion=false and leaves
+    // the image in linear space for the final output pass.
     {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
       toneMapper.dispatch(this,
@@ -1894,14 +1931,6 @@ namespace dxvk {
 
   void RtxContext::dispatchScreenOverlay(Resources::RaytracingOutput& rtOutput) {
     fork_hooks::dispatchScreenOverlay(*this, rtOutput);
-  }
-
-  void RtxContext::setScreenOverlayData(Rc<DxvkBuffer> stagingBuffer, uint32_t width, uint32_t height, VkFormat format, float opacity) {
-    m_pendingScreenOverlay = ScreenOverlayFrame {
-      std::move(stagingBuffer),
-      width, height,
-      format, opacity
-    };
   }
 
   void RtxContext::dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage)  {

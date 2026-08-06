@@ -28,6 +28,10 @@
 #include "../d3d9/d3d9_state.h"
 #include "../d3d9/d3d9_spec_constants.h"
 
+// NV-DXVK start: FSR FG integration
+#include "rtx_render/rtx_fork_hooks.h"
+// NV-DXVK end
+
 namespace dxvk {
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
     : m_device(device),
@@ -67,6 +71,12 @@ namespace dxvk {
 
   uint32_t DxvkContext::dlfgMaxSupportedInterpolatedFrameCount() const {
     return m_common->metaNGXContext().supportsDLFG() ? m_common->metaNGXContext().dlfgMaxInterpolatedFrames() : 0;
+  }
+  // NV-DXVK end
+
+  // NV-DXVK start: FSR FG integration
+  bool DxvkContext::isFSRFGEnabled() const {
+    return fork_hooks::isFsrFrameGenEnabled(m_device.ptr());
   }
   // NV-DXVK end
 

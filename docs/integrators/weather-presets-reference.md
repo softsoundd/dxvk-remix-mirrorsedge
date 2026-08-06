@@ -1,6 +1,6 @@
 # Weather Presets -- Parameter Reference
 
-Lookup table of every preset's shipped default for each of the 42 parameters.
+Lookup table of every preset's shipped default for each of the weather parameters.
 
 > **Expanded 2026-06-28.** The volumetric-fog bucket grew from 4 to 23 fields
 > (heterogeneous-fog noise field, fog remap, sun/brightness gains, fog reach).
@@ -227,6 +227,113 @@ All presets: `1.0`
 | clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
 |-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
 | 0.0 | 0.05 | 0.05 | 0.30 | 0.0 | 0.10 | 0.10 | 0.0 | 0.0 | 0.0 | 0.60 | 0.20 |
+
+---
+
+## Precipitation Bucket (10 parameters)
+
+Rain / snow / blowing sand particles, added 2026-07-25. These fields drive the
+live `rtx.weather.precipitation.*` options consumed by the precipitation
+particle system; the budget and spawn-volume settings (`maxParticles`,
+`spawnRadiusMeters`, `spawnHeightMeters`, `enableCollision`, ...) are
+deliberately global rather than per-preset, since they are performance and
+integration choices rather than weather look.
+
+Presets with intensity 0 keep neutral values in the remaining fields so a blend
+*into* rain ramps the amount up rather than snapping the look.
+
+The blender writes the ten fields as a block, gated on whether ANY preset has a
+nonzero `precipitationIntensity` (differing-or-nonzero across the 12 presets).
+A game that authors intensity 0 into every preset therefore never has its
+`rtx.weather.precipitation.*` options touched -- hand-authored values for an
+integration that drives the emitter directly stay intact. A game that authors
+the SAME nonzero intensity everywhere (constant-rain worlds) is still driven.
+
+### precipitationIntensity
+
+Master dial. 0 = this weather has no precipitation and the system stays dormant; 1 saturates `rtx.weather.precipitation.maxParticles`.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 0 | 0 | 0 | 0 | 0.06 | 0.28 | 0.80 | 1.00 | 0.45 | 1.00 | 0.85 | 0 |
+
+### precipitationFallSpeed
+
+Vertical fall speed, m/s.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 8.0 | 8.0 | 8.0 | 8.0 | 3.0 | 5.5 | 9.5 | 11.0 | 1.1 | 2.2 | 1.6 | 8.0 |
+
+### precipitationWindResponse
+
+Fraction of `cloudWindSpeed` applied as horizontal drift; also tilts the spawn plane so the fall slants with the storm. Keep it SMALL. The cloud wind is an altitude wind defaulting to ~20 m/s, and the slant is fixed in WORLD space, so it re-projects on screen as the camera turns - a slant big enough to notice reads as the rain changing direction when you look around. 0.06 gives ~1.2 m/s (~7 deg on 9.5 m/s rain). Above ~0.1 is for deliberately wind-driven looks where near-horizontal travel is the point.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 0.04 | 0.04 | 0.04 | 0.04 | 0.02 | 0.03 | 0.06 | 0.09 | 0.02 | 0.10 | 0.16 | 0.04 |
+
+### precipitationTurbulence
+
+Flutter force, m/s^2. Zero for rain (falls straight); high for snow and blowing grit.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 0 | 0 | 0 | 0 | 0.10 | 0.06 | 0.10 | 0.20 | 0.35 | 0.80 | 0.80 | 0 |
+
+### precipitationDrag
+
+Air resistance, 1/s. Balanced against gravity so the VERTICAL terminal velocity still equals fall speed - it is what lets turbulence perturb a flake and then decay back. There is no opposing horizontal force, so drag also bleeds off the wind push with time constant 1/drag; that is why the wind-driven presets (blizzard, sandstorm) use LOW drag with high turbulence.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 0 | 0 | 0 | 0 | 0.50 | 0.10 | 0 | 0 | 0.70 | 0.30 | 0.25 | 0 |
+
+### precipitationStreak
+
+Motion-trail multiplier. 0 = round particles (snow); 1 = stretched by exactly one frame of motion (rain).
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 1.00 | 1.00 | 1.00 | 1.00 | 0.50 | 0.80 | 1.30 | 1.60 | 0.00 | 0.15 | 0.25 | 1.00 |
+
+### precipitationDropWidth
+
+Particle width across travel, cm.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 0.35 | 0.35 | 0.35 | 0.35 | 0.18 | 0.20 | 0.32 | 0.38 | 1.60 | 1.30 | 0.90 | 0.35 |
+
+### precipitationDropLength
+
+Particle length along travel, cm (before motion-trail stretching).
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 4.00 | 4.00 | 4.00 | 4.00 | 1.20 | 2.20 | 6.50 | 9.00 | 1.60 | 1.80 | 1.40 | 4.00 |
+
+### precipitationOpacity
+
+Per-particle alpha, modulated with the drop texture.
+
+| clear | partlyCloudy | overcast | hazy | foggy | drizzle | rainstorm | thunderstorm | snow | blizzard | sandstorm | smoggy |
+|-------|-------------|---------|------|-------|---------|-----------|-------------|------|----------|-----------|--------|
+| 0.60 | 0.60 | 0.60 | 0.60 | 0.35 | 0.45 | 0.70 | 0.80 | 0.85 | 0.95 | 0.55 | 0.60 |
+
+### precipitationColor
+
+Per-particle tint, modulated with the drop texture's albedo.
+
+| preset | value |
+|--------|-------|
+| clear / partlyCloudy / overcast / hazy / smoggy | (0.75, 0.80, 0.90) |
+| foggy | (0.80, 0.84, 0.90) |
+| drizzle | (0.78, 0.83, 0.92) |
+| rainstorm | (0.72, 0.78, 0.90) |
+| thunderstorm | (0.70, 0.76, 0.90) |
+| snow / blizzard | (1.00, 1.00, 1.00) |
+| sandstorm | (0.78, 0.63, 0.40) |
 
 ---
 

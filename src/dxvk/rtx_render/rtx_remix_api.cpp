@@ -404,6 +404,7 @@ namespace {
           src.getMetallicConstant(),
           src.getEmissiveColorConstant(),
           src.getEnableEmission(),
+          src.getSkyLitParticle(), // fork (2026-07-26): sky-lit particle flag rides through preload
           src.getSpriteSheetRows(),
           src.getSpriteSheetCols(),
           src.getSpriteSheetFPS(),
@@ -501,6 +502,7 @@ namespace {
           extOpaque->metallicConstant,
           tovec3(info.emissiveColorConstant),
           info.emissiveIntensity > 0.f,
+          false, // fork (2026-07-26): OpaqueMaterial::SkyLitParticle - not exposed via remixapi
           info.spriteSheetRow,
           info.spriteSheetCol,
           info.spriteSheetFps,
@@ -1428,6 +1430,14 @@ namespace {
 
     // Ensure any meshes queued via remixapi_CreateMeshBatched are registered
     // with the asset replacer before this draw references them.
+    flushPendingMeshes(remixDevice);
+
+    // beginScene on first draw per frame (callback state lives in fork file)
+    dxvk::fork_hooks::notifyBeginScene();
+
+    // Ensure any meshes queued via remixapi_CreateMeshBatched are registered
+    // with the asset replacer before this draw references them. Takes s_mutex
+    // itself, so it must run before the lock_guard below.
     flushPendingMeshes(remixDevice);
 
     // Hoist conversion outside of mutex

@@ -105,6 +105,21 @@ struct GpuParticleSystemDesc {
   uint8_t restrictVelocityX : 1;
   uint8_t restrictVelocityY : 1;
   uint8_t restrictVelocityZ : 1;
+  // Fork-touchpoint inline tweak (2026-07-25): trace ONE ray against the scene
+  // acceleration structure at spawn time, along the particle's initial
+  // velocity, and shorten its lifetime so it dies where it would hit geometry.
+  //
+  // This is a different mechanism from enableCollisionDetection, which
+  // reprojects into the previous frame's G-buffer: that test is screen-space,
+  // so it cannot see anything off-screen or behind the camera, which makes it
+  // useless for the "is this raindrop under a roof" question. Tracing the real
+  // TLAS is view-independent and exact for ballistic particles, and costs one
+  // ray per SPAWNED particle rather than one test per particle per frame.
+  //
+  // Approximation: the ray is a straight line along the spawn velocity, so
+  // strongly curved trajectories (high turbulence / drag) are only approximate.
+  // For straight-falling precipitation it is exact.
+  uint8_t traceSpawnOcclusion : 1;
 
 // Note: Spatial fields (collisionThickness, attractorRadius, gravityForce,
   // initialVelocityFromNormal, attractorForce, turbulenceForce, turbulenceFrequency)
@@ -164,6 +179,7 @@ struct RtxParticleSystemDesc : GpuParticleSystemDesc {
     restrictVelocityX = 0;
     restrictVelocityY = 0;
     restrictVelocityZ = 0;
+    traceSpawnOcclusion = 0;
   }
 
   XXH64_hash_t calcHash() const {
@@ -239,5 +255,10 @@ struct ParticleSystemConstants {
   float resolveTransparencyThreshold;
   float minParticleSize;
   float sceneScale;
-  uint pad1;
+  // Non-zero when topLevelAS holds a usable (previous-frame) acceleration
+  // structure. Particle simulation runs BEFORE this frame's TLAS is built, so
+  // the bound structure is last frame's — fine for occlusion, but it does not
+  // exist at all on the first frames of a scene, and tracing an unbuilt AS is
+  // undefined. traceSpawnOcclusion is skipped entirely while this is 0.
+  uint sceneTlasValid;
 };

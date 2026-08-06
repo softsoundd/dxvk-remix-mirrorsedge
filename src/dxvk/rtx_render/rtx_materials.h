@@ -587,7 +587,9 @@ struct RtOpaqueSurfaceMaterial {
     uint32_t samplerIndex, float displaceIn, float displaceOut,
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget, bool isHairCard,
     uint16_t samplerFeedbackStamp,
-    uint32_t secondaryTextureIndex = 0
+    uint32_t secondaryTextureIndex = 0,
+    bool albedoTextureIsSrgb = false, bool emissiveTextureIsSrgb = false,
+    bool skyLitParticle = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -599,7 +601,9 @@ struct RtOpaqueSurfaceMaterial {
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp }
+    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp },
+    m_albedoTextureIsSrgb{ albedoTextureIsSrgb }, m_emissiveTextureIsSrgb{ emissiveTextureIsSrgb },
+    m_skyLitParticle{ skyLitParticle }
   {
     updateCachedData();
     updateCachedHash();
@@ -634,6 +638,21 @@ struct RtOpaqueSurfaceMaterial {
 
     if (m_isHairCard) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+    }
+
+    // When the source texture is sRGB-formatted the sampler already linearizes it, so the shader must skip
+    // its own gamma correction for that channel to avoid double linearization.
+    if (m_albedoTextureIsSrgb) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_TEXTURE_IS_SRGB;
+    }
+    if (m_emissiveTextureIsSrgb) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TEXTURE_IS_SRGB;
+    }
+
+    // Fork (2026-07-26): sky-lit particle materials (precipitation) get a sky-ambient
+    // term in the resolver's opacity lighting approximation - see shared_constants.h.
+    if (m_skyLitParticle) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_SKY_LIT_PARTICLE;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -811,7 +830,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 120,
+      sizeof(*this) == 128,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -841,6 +860,9 @@ private:
       uint32_t isHairCard;                // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
+      uint32_t albedoTextureIsSrgb;       // NOTE: uint32_t to avoid padding
+      uint32_t emissiveTextureIsSrgb;     // NOTE: uint32_t to avoid padding
+      uint32_t skyLitParticle;            // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -871,6 +893,9 @@ private:
       m_isHairCard,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
+      m_albedoTextureIsSrgb,
+      m_emissiveTextureIsSrgb,
+      m_skyLitParticle,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -920,6 +945,14 @@ private:
 
   bool m_isRaytracedRenderTarget;
   bool m_isHairCard;
+
+  // True if the albedo/emissive source texture uses an sRGB VkFormat (sampler linearizes on read), so the
+  // shader skips its software gamma correction for that channel. Derived from the texture format on the CPU.
+  bool m_albedoTextureIsSrgb;
+  bool m_emissiveTextureIsSrgb;
+
+  // Fork (2026-07-26): sky-ambient term in the resolver's particle lighting approximation.
+  bool m_skyLitParticle;
 
   uint16_t m_samplerFeedbackStamp;
 
