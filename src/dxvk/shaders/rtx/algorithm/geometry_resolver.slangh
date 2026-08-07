@@ -1690,6 +1690,39 @@ void updateNrcOnGBufferHitTrainingAndQueryPaths(
 #endif
 }
 
+// Stochastic PSR distance gate. Uses a dedicated RNG offset so fade decisions do not
+// perturb other sampling streams that share (pixel, frame).
+bool evaluatePsrMaxDistanceAllow(float accumulatedHitDistance, uvec2 pixelCoordinate, uint bounceSalt)
+{
+  if (cb.psrMaxDistance <= 0.0f)
+  {
+    return true;
+  }
+
+  if (accumulatedHitDistance > cb.psrMaxDistance)
+  {
+    return false;
+  }
+
+  if (cb.psrMaxDistanceFade <= 0.0f)
+  {
+    return true;
+  }
+
+  const float fadeStart = max(cb.psrMaxDistance - cb.psrMaxDistanceFade, 0.0f);
+  if (accumulatedHitDistance <= fadeStart)
+  {
+    return true;
+  }
+
+  const float fadeSpan = cb.psrMaxDistance - fadeStart;
+  const float probability = 1.0f - saturate((accumulatedHitDistance - fadeStart) / fadeSpan);
+
+  const uint kPsrMaxDistanceRngOffset = 113;
+  RNG rng = createRNG(pixelCoordinate, cb.frameIdx + bounceSalt, kPsrMaxDistanceRngOffset);
+  return getNextSampleBlueNoise(rng) < probability;
+}
+
 void geometryResolverVertex(
   EmptyExtraArgs extraArgs, RayHitInfo rayHitInfo,
   inout GeometryResolverState geometryResolverState)
@@ -1985,19 +2018,33 @@ void geometryResolverVertex(
         diffuseLayerWeight, geometryResolverState.reflectionSelectedIntegrationSurface, selectedIntegrationSurfacePdf,
         geometryResolverState.insideMedium, pstrPenetrateSurface);
 
+      const bool withinPsrMaxDistance = evaluatePsrMaxDistanceAllow(
+        geometryResolverState.accumulatedHitDistance, geometryResolverState.pixelCoordinate, 0);
+
       geometryResolverState.performPSRR =
         enablePSRR &&
+        withinPsrMaxDistance &&
         surfaceMaterialInteractionReflectionPSRSample.performPSR;
       geometryResolverState.performPSTR =
         enablePSTR &&
+        withinPsrMaxDistance &&
         surfaceMaterialInteractionTransmissionPSRSample.performPSR;
     }
     else
-#endif
     {
+      // Distance is gated in geometryPSRPreparePass (single stochastic decision).
       geometryResolverState.performPSRR = enablePSRR;
       geometryResolverState.performPSTR = enablePSTR;
     }
+#else
+    {
+      const bool withinPsrMaxDistance = evaluatePsrMaxDistanceAllow(
+        geometryResolverState.accumulatedHitDistance, geometryResolverState.pixelCoordinate, 0);
+
+      geometryResolverState.performPSRR = enablePSRR && withinPsrMaxDistance;
+      geometryResolverState.performPSTR = enablePSTR && withinPsrMaxDistance;
+    }
+#endif
   }
 
   // GBuffer surface radiance - emissive + diffuse layer (i.e. all except
@@ -2349,6 +2396,15 @@ void geometryPSRResolverEvaluateContinuation(
 
   // We currently don't support reflections off of POM
   if (!cb.pomEnablePSR && polymorphicSurfaceMaterialInteractionHasHeightTexture(polymorphicSurfaceMaterialInteraction))
+  {
+    shouldTerminate = true;
+  }
+
+  if (!shouldTerminate &&
+      !evaluatePsrMaxDistanceAllow(
+        geometryPSRResolverState.accumulatedHitDistance,
+        geometryPSRResolverState.pixelCoordinate,
+        uint(geometryPSRResolverState.bounceIteration)))
   {
     shouldTerminate = true;
   }
@@ -3464,8 +3520,11 @@ void geometryPSRPreparePass(ivec2 pixelCoordinate) {
     diffuseLayerWeight, reflectionSelectedIntegrationSurface, selectedIntegrationSurfacePdf,
     insideMedium, pstrPenetrateSurface);
 
-  const bool performPSRR = candidatePSRR && reflectionPSRSample.performPSR;
-  const bool performPSTR = candidatePSTR && transmissionPSRSample.performPSR;
+  const bool withinPsrMaxDistance = evaluatePsrMaxDistanceAllow(
+    PrimaryHitDistance[pixelCoordinate], pixelCoordinate, 0);
+
+  const bool performPSRR = candidatePSRR && withinPsrMaxDistance && reflectionPSRSample.performPSR;
+  const bool performPSTR = candidatePSTR && withinPsrMaxDistance && transmissionPSRSample.performPSR;
 
   vec3 radiance = vec3(SharedRadianceRG[pixelCoordinate], SharedRadianceB[pixelCoordinate]);
   const vec3 attenuation = r11g11b10ToColor(PrimaryAttenuation[pixelCoordinate]);

@@ -1161,6 +1161,10 @@ namespace dxvk {
     constants.enablePSTRSecondaryIncidentSplitApproximation = RtxOptions::enablePSTRSecondaryIncidentSplitApproximation();
     constants.psrrNormalDetailThreshold = RtxOptions::psrrNormalDetailThreshold();
     constants.pstrNormalDetailThreshold = RtxOptions::pstrNormalDetailThreshold();
+    const float meterToWorld = RtxOptions::getMeterToWorldUnitScale();
+    constants.psrMaxDistance = RtxOptions::psrMaxDistanceMeters() * meterToWorld;
+    constants.psrMaxDistanceFade = std::min(
+      RtxOptions::psrMaxDistanceFadeMeters(), RtxOptions::psrMaxDistanceMeters()) * meterToWorld;
     constants.enableDirectLighting = RtxOptions::enableDirectLighting();
     constants.enableStochasticAlphaBlend = m_common->metaComposite().enableStochasticAlphaBlend();
     constants.enableSeparateUnorderedApproximations = RtxOptions::enableSeparateUnorderedApproximations() && getResourceManager().getTLAS(Tlas::Unordered).accelStructure != nullptr;

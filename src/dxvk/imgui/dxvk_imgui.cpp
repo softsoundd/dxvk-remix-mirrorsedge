@@ -3935,6 +3935,10 @@ namespace dxvk {
         RemixGui::Checkbox("Incident Transmission Approx Enabled", &RtxOptions::enablePSTRSecondaryIncidentSplitApproximationObject());
         RemixGui::DragFloat("Reflection PSR Normal Detail Threshold", &RtxOptions::psrrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
         RemixGui::DragFloat("Transmission PSR Normal Detail Threshold", &RtxOptions::pstrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
+        RemixGui::DragFloat("PSR Max Distance (m)", &RtxOptions::psrMaxDistanceMetersObject(), 0.5f, 0.f, FLT_MAX, "%.1f", sliderFlags);
+        ImGui::BeginDisabled(RtxOptions::psrMaxDistanceMeters() <= 0.0f);
+        RemixGui::DragFloat("PSR Max Distance Fade (m)", &RtxOptions::psrMaxDistanceFadeMetersObject(), 0.5f, 0.f, FLT_MAX, "%.1f", sliderFlags);
+        ImGui::EndDisabled();
 
         ImGui::Unindent();
       }

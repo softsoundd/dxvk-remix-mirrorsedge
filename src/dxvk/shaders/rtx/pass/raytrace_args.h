@@ -317,6 +317,9 @@ struct RaytraceArgs {
   uint enablePSTRSecondaryIncidentSplitApproximation;
   float psrrNormalDetailThreshold;
   float pstrNormalDetailThreshold;
+  // World units (converted from meters). 0 = unlimited / no fade.
+  float psrMaxDistance;
+  float psrMaxDistanceFade;
 
   uint enableEnhanceBSDFDetail;
   uint enhanceBSDFIndirectMode;

@@ -797,6 +797,15 @@ namespace dxvk {
                "A threshold value to indicate that the denoiser's alternate disocclusion threshold should be used when normal map \"detail\" on a transmission PSR surface exceeds a desired amount.\n"
                "Normal detail is defined as 1-dot(tangent_normal, vec3(0, 0, 1)), or in other words it is 0 when no normal mapping is used, and 1 when the normal mapped normal is perpendicular to the underlying normal.\n"
                "This is typically used to reduce flickering artifacts resulting from refraction on surfaces like glass leveraging normal maps as often the denoiser is too aggressive with disocclusion checks frame to frame when DLSS or other camera jittering is in use.");
+    RTX_OPTION_ARGS("rtx", float, psrMaxDistanceMeters, 0.0f,
+               "Maximum accumulated hit distance in meters for PSR (Primary Surface Replacement).\n"
+               "Beyond this distance PSR is disabled and the current surface remains in the G-Buffer.\n"
+               "0 disables the limit. See also psrMaxDistanceFadeMeters.",
+               args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx", float, psrMaxDistanceFadeMeters, 0.0f,
+               "Fade span in meters ending at psrMaxDistanceMeters. PSR probability decreases from 1 to 0 across this span.\n"
+               "0 is a hard cutoff at psrMaxDistanceMeters.",
+               args.minValue = 0.0f);
 
     // Shader Execution Reordering Options
     RTX_OPTION_ENV("rtx", bool, isShaderExecutionReorderingSupported, true, "DXVK_IS_SHADER_EXECUTION_REORDERING_SUPPORTED", "Enables Shader Execution Reordering (SER) if it is supported by the target HW and SW."); 
