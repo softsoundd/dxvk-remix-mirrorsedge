@@ -15,6 +15,7 @@
 #include "d3d9_texture.h"
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
 #include "../dxvk/imgui/dxvk_imgui.h"
 
 #include <algorithm>
@@ -4399,12 +4400,22 @@ namespace dxvk {
         return info;
       }
 
-      auto markName = [&](const std::string& lowerName, const bool isSampler) {
+      auto markName = [&](const std::string& lowerName, const bool isSampler, const bool isFloat4, const uint32_t registerIndex) {
         if (isSampler) {
           const uint8_t semanticFlags = classifyPixelSamplerSemanticFlags(lowerName);
           info.hasMaterialSampler |= (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
           info.hasEngineAuxSampler |= (semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
           info.hasVideoSampler |= (semanticFlags & kPsSamplerSemanticVideo) != 0;
+
+          // TdToneMapping capture: record the exact sampler indices of the
+          // baked colour curve LUT textures.
+          if (registerIndex < 0xFF) {
+            if (lowerName == "colorcurvesktexture") {
+              info.colorCurvesKSamplerIndex = uint8_t(registerIndex);
+            } else if (lowerName == "colorcurvesmtexture") {
+              info.colorCurvesMSamplerIndex = uint8_t(registerIndex);
+            }
+          }
 
           info.hasSceneColorSampler |= containsToken(lowerName, "scenecolor");
           info.hasSceneDepthSampler |= containsToken(lowerName, "scenedepth") ||
@@ -4478,11 +4489,31 @@ namespace dxvk {
         info.hasUiCompositeConstants |= lowerName == "fade" ||
                                         containsToken(lowerName, "scenecolorui") ||
                                         containsToken(lowerName, "bluramount");
+
+        // TdToneMapping capture: record the exact float register indices of
+        // the grade constants so the (skipped) tonemap pass's pixel shader
+        // constants can be read at draw time.
+        if (isFloat4 && registerIndex <= 0x7FFF) {
+          if (lowerName == "sceneshadowsanddesaturation") {
+            info.toneMapSceneShadowsReg = int16_t(registerIndex);
+          } else if (lowerName == "sceneinversehighlights") {
+            info.toneMapInverseHighLightsReg = int16_t(registerIndex);
+          } else if (lowerName == "scenemidtones") {
+            info.toneMapMidTonesReg = int16_t(registerIndex);
+          } else if (lowerName == "scenescaledluminanceweights") {
+            info.toneMapScaledLumaWeightsReg = int16_t(registerIndex);
+          } else if (lowerName == "gammacolorscaleandinverse") {
+            info.toneMapGammaColorScaleReg = int16_t(registerIndex);
+          } else if (lowerName == "gammaoverlaycolor") {
+            info.toneMapGammaOverlayReg = int16_t(registerIndex);
+          }
+        }
       };
 
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
         const bool isSampler = c.registerSet == kD3dxRegisterSetSampler;
-        markName(toLowerAscii(c.name), isSampler);
+        const bool isFloat4 = c.registerSet == kD3dxRegisterSetFloat4;
+        markName(toLowerAscii(c.name), isSampler, isFloat4, c.registerIndex);
       }
     } catch (...) {
     }
@@ -4698,6 +4729,205 @@ namespace dxvk {
     case Ue3PassType::SceneCapture: return "SceneCapture";
     }
     return "Unknown";
+  }
+
+  namespace {
+    // IEEE 754 half -> float (no denormal flush; curve data never relies on
+    // half denormals, but decode them correctly anyway)
+    float ue3HalfToFloat(const uint16_t half) {
+      const uint32_t sign = (half & 0x8000u) << 16;
+      uint32_t exponent = (half & 0x7C00u) >> 10;
+      uint32_t mantissa = half & 0x03FFu;
+
+      if (exponent == 0) {
+        if (mantissa == 0) {
+          const uint32_t bits = sign;
+          float result;
+          std::memcpy(&result, &bits, sizeof(result));
+          return result;
+        }
+        // subnormal half: normalize
+        while ((mantissa & 0x0400u) == 0) {
+          mantissa <<= 1;
+          exponent--;
+        }
+        exponent++;
+        mantissa &= ~0x0400u;
+      } else if (exponent == 0x1F) {
+        const uint32_t bits = sign | 0x7F800000u | (mantissa << 13);
+        float result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+      }
+
+      const uint32_t bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+      float result;
+      std::memcpy(&result, &bits, sizeof(result));
+      return result;
+    }
+  }
+
+  void D3D9Rtx::onUe3CurveTextureUpload(const D3D9CommonTexture* dstTexture, D3D9CommonTexture* srcTexture, const uint32_t srcSubresource,
+                                        const uint32_t srcTexelOffsetX, const uint32_t dstTexelOffsetX,
+                                        const uint32_t texelWidth, const uint32_t texelHeight) {
+    if (!m_frameOptions.ue3EngineMode || dstTexture == nullptr || srcTexture == nullptr) {
+      return;
+    }
+
+    // The curve LUTs are 16x1 float RGBA textures (one texel per curve segment)
+    const auto* desc = dstTexture->Desc();
+    if (desc->Width != kUe3CurveTexelCount || desc->Height != 1) {
+      return;
+    }
+
+    const D3D9Format format = desc->Format;
+    if (format != D3D9Format::A32B32G32R32F && format != D3D9Format::A16B16G16R16F) {
+      // Near-miss diagnostic: a 16x1 destination in an unexpected format would
+      // mean the game's curve textures need another decode path.
+      ONCE(Logger::info(str::format("[RTX-UE3-Tonemap] Ignoring 16x1 texture upload in unsupported format ",
+                                    uint32_t(format), " (expected A32B32G32R32F/A16B16G16R16F).")));
+      return;
+    }
+
+    if (texelHeight != 1 || texelWidth == 0 || dstTexelOffsetX >= kUe3CurveTexelCount) {
+      return;
+    }
+
+    const void* srcData = srcTexture->GetMappedSlice(srcSubresource).mapPtr;
+    if (srcData == nullptr) {
+      return;
+    }
+
+    // Bounded cache: keys are only ever compared against currently-bound
+    // textures (never dereferenced), so stale entries are harmless; still keep
+    // the map tiny since only a handful of curve textures ever exist.
+    if (m_ue3CurveTexelCache.size() > 16 && m_ue3CurveTexelCache.find(dstTexture) == m_ue3CurveTexelCache.end()) {
+      m_ue3CurveTexelCache.clear();
+    }
+    Ue3CurveTexels& payload = m_ue3CurveTexelCache[dstTexture];
+
+    const uint32_t count = std::min(texelWidth, kUe3CurveTexelCount - dstTexelOffsetX);
+
+    if (format == D3D9Format::A32B32G32R32F) {
+      const float* texels = reinterpret_cast<const float*>(srcData) + srcTexelOffsetX * 4;
+      for (uint32_t i = 0; i < count; i++) {
+        payload.texels[dstTexelOffsetX + i] = Vector4(texels[i * 4 + 0], texels[i * 4 + 1], texels[i * 4 + 2], texels[i * 4 + 3]);
+      }
+    } else {
+      const uint16_t* texels = reinterpret_cast<const uint16_t*>(srcData) + srcTexelOffsetX * 4;
+      for (uint32_t i = 0; i < count; i++) {
+        payload.texels[dstTexelOffsetX + i] = Vector4(ue3HalfToFloat(texels[i * 4 + 0]),
+                                                      ue3HalfToFloat(texels[i * 4 + 1]),
+                                                      ue3HalfToFloat(texels[i * 4 + 2]),
+                                                      ue3HalfToFloat(texels[i * 4 + 3]));
+      }
+    }
+
+    ONCE(Logger::info(str::format("[RTX-UE3-Tonemap] Snooping curve LUT texture uploads (",
+                                  format == D3D9Format::A32B32G32R32F ? "fp32" : "fp16",
+                                  ", rect x=", dstTexelOffsetX, " w=", count, ").")));
+  }
+
+  void D3D9Rtx::maybeCaptureUe3ToneMapState() {
+    if (m_ue3ToneMapCapturedThisFrame || !m_frameOptions.ue3EngineMode) {
+      return;
+    }
+
+    // Only spend effort when the Mirror's Edge tonemapper consumes the capture
+    if (RtxOptions::tonemappingMode() != TonemappingMode::MirrorsEdge) {
+      return;
+    }
+
+    if (!m_parent->UseProgrammablePS() || d3d9State().pixelShader == nullptr) {
+      return;
+    }
+
+    const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+
+    // Only the TdToneMapping main pass carries the full grade constant set;
+    // require the core registers so exposure/motion-blur helper passes that
+    // merely mention ExposureSettings never get captured.
+    if (!psInfo.hasToneMapConstants || !psInfo.hasGammaConstants ||
+        psInfo.toneMapSceneShadowsReg < 0 || psInfo.toneMapGammaColorScaleReg < 0 ||
+        psInfo.toneMapMidTonesReg < 0) {
+      return;
+    }
+
+    Ue3ToneMapCapture capture;
+
+    const auto readConstant = [&](const int16_t reg, Vector4& target) {
+      if (reg >= 0 && reg < int16_t(caps::MaxFloatConstantsPS)) {
+        target = d3d9State().psConsts.fConsts[reg];
+      }
+    };
+    readConstant(psInfo.toneMapSceneShadowsReg, capture.sceneShadowsAndDesaturation);
+    readConstant(psInfo.toneMapInverseHighLightsReg, capture.sceneInverseHighLights);
+    readConstant(psInfo.toneMapMidTonesReg, capture.sceneMidTones);
+    readConstant(psInfo.toneMapScaledLumaWeightsReg, capture.sceneScaledLuminanceWeights);
+    readConstant(psInfo.toneMapGammaColorScaleReg, capture.gammaColorScaleAndInverse);
+    readConstant(psInfo.toneMapGammaOverlayReg, capture.gammaOverlayColor);
+    capture.hasConstants = true;
+
+    const auto resolveCurveTexels = [&](const uint8_t samplerIndex, std::array<Vector4, kUe3CurveTexelCount>& target) {
+      if (samplerIndex >= caps::MaxTexturesPS) {
+        return false;
+      }
+      IDirect3DBaseTexture9* texture = d3d9State().textures[samplerIndex];
+      if (texture == nullptr) {
+        return false;
+      }
+      const auto it = m_ue3CurveTexelCache.find(GetCommonTexture(texture));
+      if (it == m_ue3CurveTexelCache.end()) {
+        return false;
+      }
+      target = it->second.texels;
+      return true;
+    };
+
+    capture.hasCurves = resolveCurveTexels(psInfo.colorCurvesKSamplerIndex, capture.curveK) &&
+                        resolveCurveTexels(psInfo.colorCurvesMSamplerIndex, capture.curveM);
+
+    // Capture the sampler filter bound for the curve LUTs so the tonemapper's
+    // lookup matches the game exactly (point snaps to one segment texel,
+    // bilinear blends adjacent ones).
+    if (psInfo.colorCurvesKSamplerIndex < caps::MaxTexturesPS) {
+      const DWORD magFilter = d3d9State().samplerStates[psInfo.colorCurvesKSamplerIndex][D3DSAMP_MAGFILTER];
+      capture.curvePointFiltering = (magFilter == D3DTEXF_POINT || magFilter == D3DTEXF_NONE);
+      if (capture.curvePointFiltering) {
+        ONCE(Logger::info("[RTX-UE3-Tonemap] Game samples its curve LUTs with point filtering; matching in the tonemapper."));
+      }
+    }
+
+    m_ue3ToneMapCapturedThisFrame = true;
+
+    ONCE(Logger::info(str::format("[RTX-UE3-Tonemap] Capturing TdToneMapping pass state (curve textures resolved: ",
+                                  capture.hasCurves ? "yes" : "no", ")")));
+
+    if (!capture.hasCurves) {
+      // Pinpoint why curve resolution failed: missing CTAB sampler indices,
+      // nothing bound at the slots, or no snooped upload for the bound texture.
+      const auto describeCurveSampler = [&](const uint8_t samplerIndex) -> std::string {
+        if (samplerIndex >= caps::MaxTexturesPS) {
+          return "sampler not in CTAB";
+        }
+        IDirect3DBaseTexture9* texture = d3d9State().textures[samplerIndex];
+        if (texture == nullptr) {
+          return str::format("slot ", uint32_t(samplerIndex), ": no texture bound");
+        }
+        const auto* common = GetCommonTexture(texture);
+        const auto* desc = common->Desc();
+        const bool snooped = m_ue3CurveTexelCache.find(common) != m_ue3CurveTexelCache.end();
+        return str::format("slot ", uint32_t(samplerIndex), ": ", desc->Width, "x", desc->Height,
+                           " fmt=", uint32_t(desc->Format), snooped ? " [snooped]" : " [no snooped upload]");
+      };
+      ONCE(Logger::warn(str::format("[RTX-UE3-Tonemap] Curve textures unresolved at tonemap pass. K={",
+                                    describeCurveSampler(psInfo.colorCurvesKSamplerIndex), "} M={",
+                                    describeCurveSampler(psInfo.colorCurvesMSamplerIndex), "}")));
+    }
+
+    m_parent->EmitCs([capture](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->setUe3ToneMapCapture(capture);
+    });
   }
 
   const char* D3D9Rtx::describeGeometryStatus(const RtxGeometryStatus status) {
@@ -6956,6 +7186,14 @@ namespace dxvk {
     assert(m_activePresentParams.has_value());
 
     m_currentUe3PassType = classifyUe3Pass(drawContext);
+
+    // Capture the TdToneMapping pass state for the Mirror's Edge tonemapping
+    // mode at classification time - the draw can be routed differently
+    // afterwards (ignored, or rasterized to primary).
+    if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess) {
+      maybeCaptureUe3ToneMapState();
+    }
+
     switch (m_currentUe3PassType) {
     case Ue3PassType::DepthPrepass:
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "position-only depth prepass");
@@ -11357,6 +11595,9 @@ namespace dxvk {
     // Refresh the per-frame option snapshot: EndFrame's own consumers (deferred UI
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
+
+    // Allow the next frame's TdToneMapping pass to be captured again
+    m_ue3ToneMapCapturedThisFrame = false;
 
     if (m_frameOptions.ue3LogOcclusionQueries) {
       flushOcclusionQueryDiagnostics();

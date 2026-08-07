@@ -849,6 +849,12 @@ namespace dxvk {
       dstTextureInfo->SetupForRtxFrom(srcTextureInfo);
     }
 
+    // NV-DXVK start: UE3/Mirror's Edge tonemap colour curve capture
+    m_rtx.onUe3CurveTextureUpload(dstTextureInfo, srcTextureInfo, src->GetSubresource(),
+                                  uint32_t(srcBlockOffset.x), uint32_t(dstOffset.x),
+                                  copyExtent.width, copyExtent.height);
+    // NV-DXVK end
+
     EmitCs([
       cDstImage   = std::move(dstImage),
       cSrcSlice   = slice.slice,
@@ -898,6 +904,11 @@ namespace dxvk {
 
     // Set up the destination texture from the source texture for RTX use
     dstTexInfo->SetupForRtxFrom(srcTexInfo);
+
+    // NV-DXVK start: UE3/Mirror's Edge tonemap colour curve capture
+    m_rtx.onUe3CurveTextureUpload(dstTexInfo, srcTexInfo, srcTexInfo->CalcSubresource(0, 0),
+                                  0, 0, dstTexInfo->Desc()->Width, dstTexInfo->Desc()->Height);
+    // NV-DXVK end
 
     for (uint32_t a = 0; a < arraySlices; a++) {
       const D3DBOX& box = srcTexInfo->GetDirtyBox(a);
@@ -4855,6 +4866,15 @@ namespace dxvk {
       return D3D_OK;
 
     pResource->SetLocked(Subresource, false);
+
+    // NV-DXVK start: UE3/Mirror's Edge tonemap colour curve capture
+    // The game fills its curve LUTs via Lock/Unlock; snoop the freshly
+    // written mapping buffer before it can be discarded below.
+    if (Subresource == 0) {
+      m_rtx.onUe3CurveTextureUpload(pResource, pResource, 0, 0, 0,
+                                    pResource->Desc()->Width, pResource->Desc()->Height);
+    }
+    // NV-DXVK end
 
     // Flush image contents from staging if we aren't read only
     // and we aren't deferring for managed.

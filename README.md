@@ -22,6 +22,7 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 - Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
 - Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
+- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`) reproduces the game's native tonemapping/colour curve display transform - exposure, per-channel highlights/shadows/midtones grade, display gamma 2.0 and the per-map 16-segment colour curves - on Remix's path-traced output, with hue-preserving modernizations as toggles. Per-map curves and grade constants are captured live from the game's (skipped) tonemap pass. See [Mirror's Edge tonemapper and colour curves](#mirrors-edge-tonemapper-and-colour-curves).
 
 ### 2) Mirror's Edge/UE3 setup:
 
@@ -36,7 +37,6 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```
 scale set TdBicubicFiltering false
-scale set TdTonemapping false
 scale set MaxMultisamples 0
 scale set MaxAnisotropy 0
 scale set DynamicLights false
@@ -57,7 +57,6 @@ scale set UpscaleScreenPercentage false
 scale set ScreenPercentage 100
 scale set OnlyStreamInTextures true
 toggleocclusion
-ToggleDynamicContrast
 viewmode unlit
 show scenecapture
 show dynamicshadows
@@ -74,6 +73,20 @@ show fog
 	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
 
 ### 3) Extra fork notes/debugging
+
+#### Mirror's Edge tonemapper and colour curves
+
+Select "Mirror's Edge (UE3)" under Tonemapping in the developer menu, or set:
+
+```
+rtx.tonemappingMode = 2
+```
+
+This mode applies the game's TdToneMapping display transform to Remix's path-traced HDR: exposure (Remix auto exposure plus `rtx.tonemap.ue3.exposureBias`), the per-channel `SceneShadows` / `SceneHighLights` / `SceneMidTones` grade, desaturation, display gamma (Mirror's Edge authors around 2.0, not stock UE3's 2.2), and per-map colour curves matching the PC shader. Because the output is already display-encoded, the final sRGB pass skips its own conversion. Dithering still applies.
+
+Pathtraced radiance is unbounded where the original renderer hard-clipped at scene white, so [FaithfulLuma](https://softsoundd.github.io/posts/faithful-luma-overview/) modernisations are enabled by default to correct this.
+
+The game's curves and grade constants are captured live: with `TdTonemapping` on, the engine blends and uploads them every frame (e.g. curves blending off when entering certain indoor areas). The fork skips that fullscreen pass and forwards the captured data to the tonemapper, giving per-map curves, volume blends, and SKU-adjusted values.
 
 #### Material identity and replacement anchor stability
 

@@ -764,8 +764,10 @@ namespace dxvk {
         // Final output pass converts the linear post-tonemap LDR image to sRGB and applies
         // dithering as the very last step. SRGB conversion is suppressed for screenshot
         // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
-        // for 16bit float formats).
-        const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
+        // for 16bit float formats), and when the Mirror's Edge (UE3) tonemapper ran: its
+        // output is already display-encoded (gamma 2.0 + colour curves), matching what the
+        // game wrote to its backbuffer, so only dithering applies.
+        const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
         dispatchSRGBDither(rtOutput, performSRGBConversion);
 
         if (captureScreenImage) {
@@ -933,6 +935,10 @@ namespace dxvk {
     for (uint32_t i = 0; i < numLights; i++) {
       getSceneManager().addLight(pLights[i]);
     }
+  }
+
+  void RtxContext::setUe3ToneMapCapture(const Ue3ToneMapCapture& capture) {
+    m_common->metaUe3ToneMapping().onCapture(capture, m_device->getCurrentFrameId());
   }
 
   void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
@@ -1866,6 +1872,8 @@ namespace dxvk {
   void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
 
+    m_ue3DisplayTransformApplied = false;
+
     if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PRE_TONEMAP_OUTPUT) {
       return;
     }
@@ -1890,6 +1898,17 @@ namespace dxvk {
         GlobalTime::get().deltaTimeMs(),
         resetToneMapperHistory,
         autoExposure.enabled());
+    } else if (RtxOptions::tonemappingMode() == TonemappingMode::MirrorsEdge) {
+      // Mirror's Edge (UE3) display transform: outputs display-encoded color
+      // (gamma + colour curves), consumed by the srgb_dither pass with its
+      // sRGB conversion skipped.
+      DxvkUe3ToneMapping& ue3ToneMapper = m_common->metaUe3ToneMapping();
+      ue3ToneMapper.dispatch(this,
+        getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+        autoExposure.getExposureTexture().view,
+        rtOutput,
+        autoExposure.enabled());
+      m_ue3DisplayTransformApplied = true;
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
     if (localTonemapper.isActive()) {

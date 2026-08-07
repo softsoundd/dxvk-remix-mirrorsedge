@@ -349,6 +349,8 @@ dxvk_src = files([
   'rtx_render/rtx_tone_mapping.h',
   'rtx_render/rtx_types.cpp',
   'rtx_render/rtx_types.h',
+  'rtx_render/rtx_ue3_tone_mapping.cpp',
+  'rtx_render/rtx_ue3_tone_mapping.h',
   'rtx_render/rtx_utils.h',
   'rtx_render/rtx_xess.cpp',
   'rtx_render/rtx_xess.h',

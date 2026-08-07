@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 #include <optional>
+#include <unordered_map>
 
 namespace dxvk {
   struct D3D9BufferSlice;
@@ -564,6 +565,16 @@ namespace dxvk {
     void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
 
     /**
+      * \brief: Called from texture upload/unlock paths with the sysmem source
+      * of the data; stashes 16x1 float RGBA payloads (the game's baked tonemap
+      * colour curve LUTs) for the Mirror's Edge tonemapping mode's live
+      * capture. Partial-rect updates are merged; offsets/counts are in texels.
+      */
+    void onUe3CurveTextureUpload(const D3D9CommonTexture* dstTexture, D3D9CommonTexture* srcTexture, uint32_t srcSubresource,
+                                 uint32_t srcTexelOffsetX, uint32_t dstTexelOffsetX,
+                                 uint32_t texelWidth, uint32_t texelHeight);
+
+    /**
       * \brief: Signal that we're about to present the image.
       */
     void OnPresent(const Rc<DxvkImage>& targetImage);
@@ -768,6 +779,18 @@ namespace dxvk {
       bool hasFogConstants = false;
       bool hasHazeConstants = false;
       bool hasUiCompositeConstants = false;
+
+      // TdToneMapping capture support: sampler indices of the baked colour
+      // curve LUT textures and float register indices of the grade constants
+      // (-1 / 0xFF when not present in the shader's CTAB).
+      uint8_t colorCurvesKSamplerIndex = 0xFF;
+      uint8_t colorCurvesMSamplerIndex = 0xFF;
+      int16_t toneMapSceneShadowsReg = -1;         // SceneShadowsAndDesaturation
+      int16_t toneMapInverseHighLightsReg = -1;    // SceneInverseHighLights
+      int16_t toneMapMidTonesReg = -1;             // SceneMidTones
+      int16_t toneMapScaledLumaWeightsReg = -1;    // SceneScaledLuminanceWeights
+      int16_t toneMapGammaColorScaleReg = -1;      // GammaColorScaleAndInverse
+      int16_t toneMapGammaOverlayReg = -1;         // GammaOverlayColor
     };
 
     fast_unordered_cache<Ue3ShaderFeatureInfo> m_ue3ShaderFeatureCache;
@@ -782,6 +805,23 @@ namespace dxvk {
                               const char* reason);
     bool trackUe3MovieTextureRenderTarget(const char* reason);
     bool isUe3MovieTextureDescHash(XXH64_hash_t descHash) const;
+
+    // TdToneMapping capture: the game uploads its baked/blended colour curves
+    // as two 16x1 float textures (ColorCurvesK/ColorCurvesM) each frame; the
+    // texel payloads are snooped at upload/unlock time (keyed by destination
+    // texture) and joined with the tonemap pass's pixel shader constants when
+    // the fullscreen tonemap draw is classified.
+    static constexpr uint32_t kUe3CurveTexelCount = 16;
+    struct Ue3CurveTexels {
+      std::array<Vector4, kUe3CurveTexelCount> texels = {};
+    };
+    std::unordered_map<const D3D9CommonTexture*, Ue3CurveTexels> m_ue3CurveTexelCache;
+    bool m_ue3ToneMapCapturedThisFrame = false;
+
+    // Captures the TdToneMapping grade constants + curve texels once per
+    // frame at the (not raytraced) tonemap draw and forwards them to the
+    // renderer.
+    void maybeCaptureUe3ToneMapState();
 
     struct Ue3VsShaderCtabInfo {
       bool initialized = false;

@@ -43,6 +43,7 @@ namespace dxvk {
   class SceneManager;
   class TerrainBaker;
   struct ExternalDrawState;
+  struct Ue3ToneMapCapture;
 
   struct D3D9RtxVertexCaptureData;
   struct D3D9SharedPS;
@@ -109,6 +110,16 @@ namespace dxvk {
       * \param [in] numLights: number of lights
       */
     void addLights(const D3DLIGHT9* pLights, const uint32_t numLights);
+
+    /**
+      * \brief Stores a capture of the game's UE3 TdToneMapping pass state
+      *        (grade constants and baked colour curve texels) for the
+      *        Mirror's Edge tonemapping mode. Called from the D3D9 layer
+      *        via EmitCs when the skipped native tonemap draw is seen.
+      *
+      * \param [in] capture: captured tonemap state
+      */
+    void setUe3ToneMapCapture(const Ue3ToneMapCapture& capture);
 
     void clearRenderTarget(const Rc<DxvkImageView>& imageView, VkImageAspectFlags clearAspects, VkClearValue clearValue);
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
@@ -256,6 +267,11 @@ namespace dxvk {
     bool m_dlssSupported;
     bool m_submitContainsInjectRtx = false;
     uint64_t m_cachedReflexFrameId = 0;
+
+    // True when the Mirror's Edge (UE3) tonemapper ran this frame: its output
+    // is already display-encoded (gamma + colour curves), so the final
+    // srgb_dither pass must skip its linear -> sRGB conversion.
+    bool m_ue3DisplayTransformApplied = false;
 
     bool m_resetHistory = true;    // Discards use of temporal data in passes
 
