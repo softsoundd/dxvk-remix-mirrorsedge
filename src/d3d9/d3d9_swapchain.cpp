@@ -247,11 +247,14 @@ namespace dxvk {
     D3DDEVICE_CREATION_PARAMETERS create_parms; D3DPRESENT_PARAMETERS present_parms;
     windowData.swapchain->GetDevice()->GetCreationParameters(&create_parms);
     windowData.swapchain->GetPresentParameters(&present_parms);
-    
+
+    // Client owns minimize/restore under Remix Bridge; don't mutate the HWND here too.
+    const bool bridgeOwnsWindowMgmt = env::isRemixBridgeActive();
+
     if (!present_parms.Windowed && !(message == WM_NCCALCSIZE && wParam == TRUE)) {
       if (message == WM_DESTROY)
         ResetWindowProc(window);
-      else if (message == WM_ACTIVATEAPP) {
+      else if (message == WM_ACTIVATEAPP && !bridgeOwnsWindowMgmt) {
 
         if (!(create_parms.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES)) {
           if (wParam) {
@@ -268,40 +271,50 @@ namespace dxvk {
         }
       }
     }
-    else if (message == WM_SIZE)
+    else if (message == WM_SIZE && !bridgeOwnsWindowMgmt)
     {
       if (!(create_parms.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES) && !IsIconic(window))
         PostMessageW(window, WM_ACTIVATEAPP, 1, GetCurrentThreadId());
     }
 
     // Safe from bSkipSwapchainActions as we're just getting a handle that shouldn't
-    // be invalidated
+    // be invalidated. Skip focus/size ImGui traffic under Bridge (wrong thread vs Present).
     auto& gui = windowData.swapchain->getDxvkDevice()->getCommon()->getImgui();
-    if(gui.isInit()) {
-      gui.wndProcHandler(window, message, wParam, lParam);
+    if (gui.isInit()) {
+      const bool skipImguiFocusMsgs = bridgeOwnsWindowMgmt && (
+           message == WM_ACTIVATEAPP
+        || message == WM_ACTIVATE
+        || message == WM_NCACTIVATE
+        || message == WM_SETFOCUS
+        || message == WM_KILLFOCUS
+        || message == WM_SIZE
+        || message == WM_MOVE
+        || message == WM_WINDOWPOSCHANGING
+        || message == WM_WINDOWPOSCHANGED);
+      if (!skipImguiFocusMsgs)
+        gui.wndProcHandler(window, message, wParam, lParam);
     }
 
-    if(!bSkipSwapchainActions) {
-      if (!present_parms.Windowed && env::isRemixBridgeActive()) {
+    if (!bSkipSwapchainActions) {
+      // Skip unless APPLICATION_CONTROLLED FSE (default off).
+      if (!present_parms.Windowed && env::isRemixBridgeActive() && RtxOptions::allowFSE()) {
         FSEState state = ProcessFullscreenExclusiveMessages(window, message, wParam, lParam);
 
-        // Update FSE state
         if (state == FSEState::Acquire) {
           windowData.swapchain->AcquireFullscreenExclusive();
         } else if (state == FSEState::Release) {
           windowData.swapchain->ReleaseFullscreenExclusive();
         }
       }
+
+      // Before CallWindowProc so deactivate EndFrame still sees this swapchain.
+      windowData.swapchain->onWindowMessageEvent(message, wParam);
     }
 
     if (windowData.proc) {
       return CallCharsetFunction(
         CallWindowProcW, CallWindowProcA, unicode,
           windowData.proc, window, message, wParam, lParam);
-    }
-
-    if(!bSkipSwapchainActions) {
-      windowData.swapchain->onWindowMessageEvent(message, wParam);
     }
 
     // NV-DXVK end
@@ -447,6 +460,28 @@ namespace dxvk {
           DWORD    dwFlags) {
     ScopedCpuProfileZone();
 
+    HWND window = m_presentParams.hDeviceWindow;
+    if (hDestWindowOverride != nullptr)
+      window = hDestWindowOverride;
+
+    // Skip Present while iconic. One EndFrame on the transition (not every call).
+    if (window && IsIconic(window)) {
+      D3D9DeviceLock lock = m_parent->LockDevice();
+      m_window = window;
+      if (!m_skippedPresentWhileIconic) {
+        m_skippedPresentWhileIconic = true;
+        if (!m_backBuffers.empty() && m_backBuffers[0] != nullptr) {
+          m_parent->m_rtx.EndFrame(
+            m_backBuffers[0]->GetCommonTexture()->GetImage(), false);
+          m_parent->EmitCs([](DxvkContext* ctx) {
+            ctx->getDevice()->incrementPresentCount();
+          });
+        }
+      }
+      return D3D_OK;
+    }
+    m_skippedPresentWhileIconic = false;
+
     // NV-DXVK start: Restart RTX capture on the new frame
     m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
     // NV-DXVK end
@@ -486,10 +521,6 @@ namespace dxvk {
     // NV-DXVK end
 
     bool vsync  = presentInterval != 0;
-
-    HWND window = m_presentParams.hDeviceWindow;
-    if (hDestWindowOverride != nullptr)
-      window    = hDestWindowOverride;
 
     bool recreate = false;
     // NV-DXVK start: DLFG integration
@@ -1331,6 +1362,11 @@ namespace dxvk {
     } else {
       assert(status != VK_EVENT_SET);
     }
+
+    // Idle + drop image views before Presenter destroys VkImages (matches CreatePresenter).
+    m_parent->SynchronizeCsThread();
+    m_device->waitForIdle();
+    m_imageViews.clear();
     // NV-DXVK end
 
     m_presentStatus.result = VK_SUCCESS;
@@ -1752,25 +1788,29 @@ namespace dxvk {
   // NV-DXVK start: 
   void D3D9SwapChainEx::onWindowMessageEvent(UINT message, WPARAM wParam) {
   
-    // Ensure RTX end of frame events happen when the app window minimizes or loses focus when in fullscreen mode.
-    // RTX logic assumes that present() occurs every frame and calls end of frame events there to ensure valid state for the subsequent frame.
-    // Therefore call the required end of frame events explicitly on such events.
+    // Present may not run while unfocused; EndFrame here keeps RTX state coherent.
+    // Omit SIZE_RESTORED — it races restore-time draws on the message thread.
     const bool triggerRtxEndOfFrameEvents =
       (message == WM_ACTIVATE && wParam == WA_INACTIVE) ||
-      (message == WM_SIZE && (wParam == SIZE_MINIMIZED || wParam == SIZE_RESTORED));
-  
-    if (triggerRtxEndOfFrameEvents) {
-      // Don't artificially and unnecessarily inject RTX when no present is called
-      const bool callInjectRtx = false;
-      
-      m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage(), callInjectRtx);
+      (message == WM_ACTIVATEAPP && wParam == FALSE) ||
+      (message == WM_SIZE && wParam == SIZE_MINIMIZED);
 
-      // Need to increment present counter as it's used to reject repeated injectRtx calls.
-      // Failing to do that will make next frame injection get rejected
-      m_parent->EmitCs([](DxvkContext* ctx) {
-        ctx->getDevice()->incrementPresentCount();
-      });
-    }
+    if (!triggerRtxEndOfFrameEvents)
+      return;
+
+    // Bridge delivers WndProc off the D3D thread; Present handles EndFrame on resume.
+    if (env::isRemixBridgeActive())
+      return;
+
+    if (m_backBuffers.empty() || m_backBuffers[0] == nullptr)
+      return;
+
+    m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage(), /*callInjectRtx=*/false);
+
+    // Present counter gates injectRtx; bump it even when we skip injection.
+    m_parent->EmitCs([](DxvkContext* ctx) {
+      ctx->getDevice()->incrementPresentCount();
+    });
   }
     // NV-DXVK end
   

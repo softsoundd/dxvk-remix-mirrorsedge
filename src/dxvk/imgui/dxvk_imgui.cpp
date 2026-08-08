@@ -4643,6 +4643,11 @@ namespace dxvk {
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
 
+    // Ordering: DisplaySize must be set before flushing deferred overlay ImGui events.
+    if (m_overlayWin.ptr() != nullptr) {
+      m_overlayWin->flushPendingImGuiEvents();
+    }
+
     ImGui::NewFrame();
 
     update(ctx);

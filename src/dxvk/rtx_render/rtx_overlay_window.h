@@ -26,6 +26,8 @@
 #include "../../util/rc/util_rc_ptr.h"
 #include "rtx_common_object.h"
 
+#include <atomic>
+
 namespace dxvk {
   class GameOverlay : public RcObject {
   public:
@@ -40,6 +42,8 @@ namespace dxvk {
 
     void gameWndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT overlayWndProc(HWND, UINT, WPARAM, LPARAM);
+
+    void flushPendingImGuiEvents(); // Present/render thread only
 
     void setDebugDraw(bool enable, BYTE alpha = 96) {
       m_debugDraw = enable;
@@ -70,6 +74,13 @@ namespace dxvk {
     UINT m_w = 1, m_h = 1;
 
     bool  m_mouseInsideOverlay = false;
+
+    // -1 = none, 0 = kill focus, 1 = set focus
+    std::atomic<int>  m_pendingImGuiFocus { -1 };
+    std::atomic<bool> m_pendingImGuiMouseLeave { false };
+    // Cached for overlay-thread reads (updated in flushPendingImGuiEvents).
+    std::atomic<float> m_displaySizeX { 0.0f };
+    std::atomic<float> m_displaySizeY { 0.0f };
 
     bool  m_debugDraw = false;
     BYTE  m_debugAlpha = 96;
