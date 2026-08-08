@@ -109,8 +109,12 @@ bool isValidMotionBlurPixel(const uint2 pixelPos, inout bool isStaticPixel)
   MotionBlurSurfaceFlags motionBlurSurfaceFlags = motionBlurSurfaceFlagsReadFromGBuffer(PrimarySurfaceFlags[inputPosInt]);
   isStaticPixel = motionBlurSurfaceFlags.isStatic;
 
-  // Valid motion blur pixels: emissive opaque (if it's enabled by setting), non-ViewModel
-  return (cb.enableMotionBlurEmissive || !motionBlurSurfaceFlags.isEmissive) && (!motionBlurSurfaceFlags.isViewModel) && (!motionBlurSurfaceFlags.isMaskOut);
+  // Valid motion blur pixels: emissive opaque and view-model surfaces only when enabled by
+  // their settings (view models with animated first-person meshes benefit from blur; static
+  // held items are better excluded), never masked-out surfaces.
+  return (cb.enableMotionBlurEmissive || !motionBlurSurfaceFlags.isEmissive) &&
+         (cb.enableMotionBlurViewModel || !motionBlurSurfaceFlags.isViewModel) &&
+         (!motionBlurSurfaceFlags.isMaskOut);
 }
 
 float3 calculatedBlurredColor(

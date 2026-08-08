@@ -213,6 +213,7 @@ namespace dxvk {
   std::vector<RtxTextureOption> rtxGeometryOptions = {
     {"viewmodelgeometries", "View Model Geometry (optional)", &RtxOptions::viewModelGeometriesObject()},
     {"playermodelgeometries", "Player Model Geometry (optional)", &RtxOptions::playerModelGeometriesObject()},
+    {"playermodelbodygeometries", "Player Model Body Geometry (optional)", &RtxOptions::playerModelBodyGeometriesObject()},
   };
 
   RemixGui::ComboWithKey<RenderPassGBufferRaytraceMode> renderPassGBufferRaytraceModeCombo {

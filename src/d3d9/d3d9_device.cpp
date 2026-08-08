@@ -1588,6 +1588,8 @@ namespace dxvk {
 
     D3D9DeviceLock lock = LockDevice();
 
+    m_rtx.OnClear(Flags);
+
     const auto& vp = m_state.viewport;
     const auto& sc = m_state.scissorRect;
 

@@ -400,6 +400,30 @@ public:
 
   void createPlayerModelVirtualInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
+  // Classifies the world-space shadow copies of held equipment as player-model instances:
+  // per topology hash drawn through the view-model camera this frame, the world instance
+  // closest to the camera. Copies without a view-model twin (dropped / NPC-held duplicates
+  // of the same mesh) keep their regular world classification.
+  void detectHeldEquipmentInstances(const fast_unordered_set& viewModelTopologyHashes, const CameraManager& cameraManager);
+
+  // Caches this frame's main-camera distance to the player (minimum over player-model
+  // instances); negative when none exist. Drives the external-camera auto primary-space
+  // rule (rtx.playerModel.autoEnableInPrimarySpaceBodyDistance).
+  void updatePlayerModelBodyCameraDistance(const CameraManager& cameraManager);
+  float getPlayerModelBodyCameraDistance() const { return m_playerModelBodyCameraDistance; }
+
+  // This frame's camera regime, computed once by SceneManager::prepareSceneData: true when
+  // the main camera is not the first-person view (player model shown on primary rays,
+  // view-model copies hidden, held-equipment classification suspended).
+  void setExternalCameraRegime(bool external) { m_externalCameraRegime = external; }
+  bool isExternalCameraRegime() const { return m_externalCameraRegime; }
+
+  // True while the view model is force-hidden (e.g. scoped zoom: FOV below
+  // rtx.viewModel.hideBelowFovDegrees or near plane past rtx.viewModel.maxNearPlane).
+  // Computed by SceneManager::prepareSceneData alongside the camera regime.
+  void setViewModelHidden(bool hidden) { m_viewModelHidden = hidden; }
+  bool isViewModelHidden() const { return m_viewModelHidden; }
+
   void findPortalForVirtualInstances(const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
   int getVirtualInstancePortalIndex() const { return m_virtualInstancePortalIndex; }
@@ -421,6 +445,23 @@ private:
   uint64_t m_sceneGeneration = 0;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
+
+  // Held-equipment transition logging (see detectHeldEquipmentInstances)
+  size_t m_heldEquipmentLastWinnerCount = SIZE_MAX;
+
+  // Previous frame's view-model FOV, for detecting in-progress zoom transitions.
+  float m_heldEquipmentPrevFovDegrees = -1.f;
+
+  // Negative when no player-model instance was drawn this frame.
+  float m_playerModelBodyCameraDistance = -1.f;
+  bool m_externalCameraRegime = false;
+  bool m_viewModelHidden = false;
+
+  // World instances currently classified as held equipment, mapped to the frame their
+  // view-model twin last confirmed them. Classification outlives twin loss through a short
+  // jitter grace and through zoom transitions (see detectHeldEquipmentInstances).
+  // Pruned in removeInstance.
+  std::unordered_map<RtInstance*, uint32_t> m_heldEquipmentInstances;
   std::vector<RtInstance*> m_playerModelInstances;
   uint32_t m_playerModelInstancesFrameId = kInvalidFrameIndex;
   std::vector<IntersectionBillboard> m_billboards;

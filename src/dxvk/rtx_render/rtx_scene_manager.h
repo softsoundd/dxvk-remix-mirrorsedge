@@ -377,6 +377,11 @@ private:
 
   FogState m_fog;
   fast_unordered_cache<FogState> m_fogStates;
+
+  // Topology hashes of meshes drawn through the view-model camera, accumulated between RTX
+  // injections (view-model draws often happen after injection and belong to the next scene).
+  // Consumed and cleared by the detectHeldEquipmentInstances call during scene preparation.
+  fast_unordered_set m_viewModelTopologyHashes;
   std::mutex m_startInMediumMaterialMutex;
   std::optional<MaterialData> m_pendingStartInMediumMaterial;
   bool m_pendingClearStartInMediumMaterial = false;

@@ -145,6 +145,7 @@ namespace dxvk {
     match->vertexPositionHash = key.vertexPositionHash;
     match->materialHash = key.materialHash;
     match->centroid = key.worldPos;
+    match->isViewModelDraw = key.isViewModelDraw;
 
     if (moveInAssetMap) {
       match->spatialCacheTransformHash = moveInAssetMap->move(
@@ -201,7 +202,8 @@ namespace dxvk {
 
     auto l2Filter = [&](const ReplacementInstance* candidate) {
       return candidate->frameLastSeen != currentFrameId &&
-             candidate->materialHash == key.materialHash;
+             candidate->materialHash == key.materialHash &&
+             candidate->isViewModelDraw == key.isViewModelDraw;
     };
 
     auto spatialMapIter = m_assetSpatialMaps.find(key.spatialMapHash);
@@ -276,7 +278,8 @@ namespace dxvk {
       drawCallState.getGeometryData().boundingBox.getTransformedCentroid(objectToWorld),
       objectToWorld,
       drawCallState.getTransformData().textureTransform,
-      drawCallState.getTransformData().texgenMode
+      drawCallState.getTransformData().texgenMode,
+      drawCallState.cameraType == CameraType::ViewModel
     };
 
     ReplacementInstance* result = findOrCreateReplacementInstance(key);
@@ -315,7 +318,8 @@ namespace dxvk {
     auto portalFilter = [&](const ReplacementInstance* candidate) {
       return candidate != newInstance &&
              candidate->frameLastSeen != currentFrameId &&
-             candidate->materialHash == key.materialHash;
+             candidate->materialHash == key.materialHash &&
+             candidate->isViewModelDraw == key.isViewModelDraw;
     };
 
     for (auto& rayPortalPair : rayPortalManager.getRayPortalPairInfos()) {

@@ -237,6 +237,12 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, playerModelGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) for third-person player model draw calls.\n"
                   "Use when Mesh3p shares materials with the first-person mesh.");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelBodyGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) identifying the player model body/root position.\n"
+                  "Geometry-based equivalent of rtx.playerModelBodyTextures; implies the player-model category.\n"
+                  "The tagged body instance anchors the player-model distance filter (rtx.playerModel.horizontal/verticalDetectionDistance):\n"
+                  "player-model-tagged instances beyond that capsule revert to regular world geometry each frame.\n"
+                  "Optional - held weapons are classified automatically (rtx.playerModel.autoDetectHeldEquipment) and need no tagging.");
     RTX_OPTION("rtx", fast_unordered_set, viewModelTextures, {},
                   "Textures / material hashes for first-person view-model draw calls (e.g. Mesh1p arms, FP weapon).\n"
                   "Forces CameraType::ViewModel when rtx.viewModel.enable is true.\n"
@@ -462,6 +468,17 @@ namespace dxvk {
       RTX_OPTION("rtx.viewModel", bool, enableVirtualInstances, true, "If true, virtual instances are created to render the view models behind a portal.");
       RTX_OPTION("rtx.viewModel", bool, perspectiveCorrection, true, "If true, apply correction to view models (e.g. different FOV is used for view models).");
       RTX_OPTION("rtx.viewModel", float, maxZThreshold, 0.0f, "If a draw call's viewport has max depth less than or equal to this threshold, then assume that it's a view model.");
+      RTX_OPTION("rtx.viewModel", float, maxNearPlane, 0.f,
+                 "Hide view-model instances while the game's near clipping plane exceeds this value (world units). 0 disables.\n"
+                 "Games hide the first-person view model by pushing the raster near plane past it during scoped zoom;\n"
+                 "ray tracing ignores raster clipping, so this mirrors that intent.\n"
+                 "Set between the game's normal and pushed-out near plane values. Unreliable when mods rewrite the\n"
+                 "near plane per frame - prefer hideBelowFovDegrees in that case.");
+      RTX_OPTION("rtx.viewModel", float, hideBelowFovDegrees, 0.f,
+                 "Hide view-model instances while the view-model camera's vertical FOV is below this many degrees. 0 disables.\n"
+                 "Scoped zoom shrinks the FOV drastically (e.g. Mirror's Edge sniper zoom: ~59 down to ~7 degrees), and games\n"
+                 "hide the first-person view model while zoomed via raster tricks ray tracing ignores. The FOV itself is the\n"
+                 "most robust zoom signal: it works regardless of how the game or mods manage clipping planes.");
     } viewModel;
 
     struct PlayerModel {
@@ -473,7 +490,25 @@ namespace dxvk {
       RTX_OPTION("rtx.playerModel", bool, autoEnableInPrimarySpaceWhenNoViewModel, false,
                  "Show player-model instances on primary rays in frames with no ViewModel camera\n"
                  "(cutscenes / flyovers that do not draw Mesh1p). Does not override enableInPrimarySpace.");
+      RTX_OPTION("rtx.playerModel", float, autoEnableInPrimarySpaceBodyDistance, 0.f,
+                 "Show player-model instances on primary rays when the main camera is farther than this\n"
+                 "many world units from the player (external / third-person / cutscene cameras). Catches\n"
+                 "cameras that detach while the game still draws first-person overlay geometry, which\n"
+                 "defeats the no-ViewModel heuristic. 0 disables.\n"
+                 "The player position is the minimum camera distance across this frame's player-model\n"
+                 "instances (anything tagged via rtx.playerModelTextures / rtx.playerModelGeometries).");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
+      RTX_OPTION("rtx.playerModel", bool, autoDetectHeldEquipment, true,
+                 "Automatically treat the world-space copy of view-model-drawn meshes as player-model geometry.\n"
+                 "Held equipment (e.g. weapons) often renders twice: a view-model copy for the point of view and\n"
+                 "a world-space copy kept as shadow caster. When a mesh is drawn both ways in one frame, the world\n"
+                 "instance closest to the camera is classified as player model: hidden from primary rays, still\n"
+                 "casting shadows and appearing in reflections. Instances without a view-model twin that frame\n"
+                 "(dropped or NPC-held duplicates of the same mesh) remain regular world geometry.\n"
+                 "Such meshes need no texture or geometry tagging at all.");
+      RTX_OPTION("rtx.playerModel", float, heldEquipmentMaxDistance, 200.f,
+                 "Maximum distance (world units) from the camera for autoDetectHeldEquipment candidates.\n"
+                 "Guards against classifying a distant duplicate when the real held copy is absent (e.g. culled).");
       RTX_OPTION("rtx.playerModel", float, backwardOffset, 0.f, "");
       RTX_OPTION("rtx.playerModel", float, horizontalDetectionDistance, 34.f, "");
       RTX_OPTION("rtx.playerModel", float, verticalDetectionDistance, 64.f, "");
@@ -481,13 +516,9 @@ namespace dxvk {
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleRadius, 24.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleHeight, 68.f, "");
 
-      // enableInPrimarySpace wins; otherwise auto-enable when Mesh1p/ViewModel was not drawn.
-      static bool resolveEnableInPrimarySpace(bool viewModelCameraValidThisFrame) {
-        if (enableInPrimarySpace()) {
-          return true;
-        }
-        return autoEnableInPrimarySpaceWhenNoViewModel() && !viewModelCameraValidThisFrame;
-      }
+      // The effective per-frame decision (external-camera regime) is computed once in
+      // SceneManager::prepareSceneData from enableInPrimarySpace, the no-ViewModel rule,
+      // and the camera-to-player distance; consumers read it from the InstanceManager.
     } playerModel;
 
     struct Displacement {

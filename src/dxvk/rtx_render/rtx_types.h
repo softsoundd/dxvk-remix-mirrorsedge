@@ -135,6 +135,10 @@ struct ReplacementInstance {
     // so they don't churn dirty flags.
     Matrix4 textureTransform = Matrix4();
     TexGenMode texgenMode = TexGenMode::None;
+    // View-model draws must never spatially match world instances (and vice versa): held
+    // equipment renders the same mesh both ways per frame with near-identical keys, and
+    // cross-matching leaks view-model state onto the world shadow copy.
+    bool isViewModelDraw = false;
   };
 
   ReplacementInstance() = delete;
@@ -213,6 +217,9 @@ struct ReplacementInstance {
   // Stored as raw bits because CategoryFlags is defined later in this file.
   uint32_t categoryFlags = 0;
   bool isSkinned = false;
+
+  // See LookupKey::isViewModelDraw; spatial matching filters on this affinity.
+  bool isViewModelDraw = false;
 
   // When true, the aggregate object-space bounding boxes (geometryBoundingBox,
   // lightBoundingBox) will be recomputed from the replacement mesh/light data
@@ -656,6 +663,16 @@ enum class InstanceCategories : uint32_t {
 
 using CategoryFlags = Flags<InstanceCategories>;
 
+// External-camera regime flag written by SceneManager::prepareSceneData: while true, UE3
+// foreground-DPG draws skip the ViewModel category override and render as world geometry
+// (first-person overlay meshes like the held weapon show normally on external cameras).
+extern bool g_ue3ForegroundDemoteToWorld;
+
+// Number of foreground draws demoted since the last scene preparation; sampled and reset
+// there. Distinguishes self-inflicted ViewModel-camera absence (we demoted the overlay)
+// from genuine absence (the game drew no first-person overlay at all).
+extern uint32_t g_ue3ForegroundDemotedDrawCount;
+
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
 struct DrawCallState {
@@ -764,6 +781,11 @@ struct DrawCallState {
 
   // UE3 pass classification for diagnostics (points to a static string)
   const char* ue3PassDescription = "Unknown";
+
+  // Draw happened in UE3's SDPG_Foreground segment (after the mid-scene depth-only clear):
+  // first-person overlay geometry such as arms, held weapon, muzzle flash.
+  // See rtx.d3d9.ue3ForegroundDpgIsViewModel.
+  bool isUe3ForegroundDpg = false;
 
   float minZ = 0.0f;
   float maxZ = 1.0f;

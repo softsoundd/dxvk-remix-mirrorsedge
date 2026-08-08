@@ -22,7 +22,8 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 - Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
 - Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
-- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`) reproduces the game's native tonemapping/colour curve display transform - exposure, per-channel highlights/shadows/midtones grade, display gamma 2.0 and the per-map 16-segment colour curves - on Remix's path-traced output, with hue-preserving modernizations as toggles. Per-map curves and grade constants are captured live from the game's (skipped) tonemap pass. See [Mirror's Edge tonemapper and colour curves](#mirrors-edge-tonemapper-and-colour-curves).
+- First person geometry (arms, held weapon) is detected via UE3's `SDPG_Foreground` boundary (mid-scene depth-only clear) and classified as ViewModel, overriding player-model tags (`rtx.d3d9.ue3ForegroundDpgIsViewModel`).
+- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`) reproduces the game's native tonemapping/colour curve display transform - exposure, per-channel highlights/shadows/midtones grade, display gamma 2.0 and the per-map 16-segment colour curves - on Remix's path-traced output, with hue-preserving modernisations as toggles. Per-map curves and grade constants are captured live from the game's (skipped) tonemap pass. See [Mirror's Edge tonemapper and colour curves](#mirrors-edge-tonemapper-and-colour-curves).
 
 ### 2) Mirror's Edge/UE3 setup:
 

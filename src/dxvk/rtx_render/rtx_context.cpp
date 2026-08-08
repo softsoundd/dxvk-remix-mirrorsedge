@@ -1207,8 +1207,7 @@ namespace dxvk {
     constants.directLightBoilingThreshold = m_common->metaDemodulate().directLightBoilingThreshold();
     constants.translucentDecalAlbedoFactor = RtxOptions::translucentDecalAlbedoFactor();
     constants.enablePlayerModelInPrimarySpace =
-      RtxOptions::PlayerModel::resolveEnableInPrimarySpace(
-        getSceneManager().getCameraManager().isCameraValid(CameraType::ViewModel));
+      getSceneManager().getInstanceManager().isExternalCameraRegime();
     constants.enablePlayerModelPrimaryShadows = RtxOptions::PlayerModel::enablePrimaryShadows();
     constants.enablePreviousTLAS = RtxOptions::enablePreviousTLAS() && m_common->getSceneManager().isPreviousFrameSceneAvailable();
 

@@ -4975,7 +4975,42 @@ namespace dxvk {
       " vsHash=0x", std::hex, vsHash,
       " psHash=0x", psHash, std::dec,
       " rt=", rtWidth, "x", rtHeight,
+      " fg=", m_ue3ForegroundDpgActive ? 1 : 0,
       " reason=", reason));
+  }
+
+  void D3D9Rtx::OnClear(DWORD flags) {
+    if (!m_frameOptions.ue3EngineMode || !m_frameOptions.ue3ForegroundDpgIsViewModel) {
+      return;
+    }
+
+    // UE3 renders SDPG_Foreground (first-person arms, held weapon, muzzle flash) after the
+    // world DPG behind a depth-only clear so foreground meshes never depth-clash with the
+    // world. A z-only clear on a main-view-sized viewport after this frame's world draws
+    // marks every subsequent draw as foreground until EndFrame.
+    if ((flags & D3DCLEAR_TARGET) != 0 || (flags & D3DCLEAR_ZBUFFER) == 0) {
+      return;
+    }
+    if (m_ue3ForegroundDpgActive || !m_ue3SeenMainViewWorldDraw) {
+      return;
+    }
+    if (d3d9State().depthStencil == nullptr || !m_activePresentParams.has_value()) {
+      return;
+    }
+
+    // Shadow map and scene-capture targets clear depth too, but on sub-half-backbuffer viewports.
+    const D3DVIEWPORT9& vp = d3d9State().viewport;
+    const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+    const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+    if (bbW == 0 || bbH == 0 || vp.Width * 2 < bbW || vp.Height * 2 < bbH) {
+      return;
+    }
+
+    m_ue3ForegroundDpgActive = true;
+    ONCE(Logger::info("[RTX-Compatibility-Info] UE3 foreground DPG boundary detected (mid-scene depth-only clear); subsequent draws classify as ViewModel."));
+    if (m_frameOptions.ue3LogClassification) {
+      Logger::debug(str::format("[RTX-Compatibility][UE3] Foreground DPG boundary after draw=", m_activeDrawCallState.drawCallID));
+    }
   }
 
   bool D3D9Rtx::trackUe3MovieTextureRenderTarget(const char* reason) {
@@ -5100,6 +5135,7 @@ namespace dxvk {
     o.ue3SkipShadowDepthPasses = ue3SkipShadowDepthPassesObject().get();
     o.ue3SkipDepthTestDisabledTranslucency = ue3SkipDepthTestDisabledTranslucencyObject().get();
     o.ue3SkipSceneCapturePasses = ue3SkipSceneCapturePassesObject().get();
+    o.ue3ForegroundDpgIsViewModel = ue3ForegroundDpgIsViewModelObject().get();
     o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
@@ -6298,6 +6334,7 @@ namespace dxvk {
     m_activeDrawCallState.allowMainCameraUpdate = true;
     m_activeDrawCallState.programmableVertexShaderBytecodeHash = 0;
     m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
+    m_activeDrawCallState.isUe3ForegroundDpg = m_ue3ForegroundDpgActive;
     m_activeDrawCallState.ue3LightmapPermutationAlternateHashes.reset();
 
     const bool isUe3Mode = m_frameOptions.ue3EngineMode;
@@ -7227,6 +7264,22 @@ namespace dxvk {
       return { RtxGeometryStatus::Rasterized, false };
     default:
       break;
+    }
+
+    // Foreground DPG boundary gate: the mid-scene depth clear only counts once this frame's
+    // main-view world draws have been seen, rejecting the scene-start depth clear and
+    // capture-probe clears (which precede any main-view-sized world geometry).
+    if (m_frameOptions.ue3EngineMode &&
+        !m_ue3SeenMainViewWorldDraw &&
+        m_currentUe3PassType == Ue3PassType::Material &&
+        isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
+        m_activePresentParams.has_value()) {
+      const D3DVIEWPORT9& vp = d3d9State().viewport;
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+      if (bbW != 0 && bbH != 0 && vp.Width * 2 >= bbW && vp.Height * 2 >= bbH) {
+        m_ue3SeenMainViewWorldDraw = true;
+      }
     }
 
     // Deferred UI overlays (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders, e.g. UE3
@@ -11598,6 +11651,10 @@ namespace dxvk {
 
     // Allow the next frame's TdToneMapping pass to be captured again
     m_ue3ToneMapCapturedThisFrame = false;
+
+    // New frame: forget the UE3 foreground DPG segment
+    m_ue3SeenMainViewWorldDraw = false;
+    m_ue3ForegroundDpgActive = false;
 
     if (m_frameOptions.ue3LogOcclusionQueries) {
       flushOcclusionQueryDiagnostics();

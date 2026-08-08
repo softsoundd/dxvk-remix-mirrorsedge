@@ -253,6 +253,15 @@ namespace dxvk {
                "extracts). Skipped draws are removed entirely while ray tracing, so probe target textures show "
                "their last resolved content - visually equivalent to running with 'show scenecapture' toggled "
                "off. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ForegroundDpgIsViewModel, true,
+               "UE3 compat: classify SDPG_Foreground draws as view-model (first-person overlay) geometry. "
+               "UE3 renders the foreground depth priority group (first-person arms, held weapon, muzzle flash) "
+               "after the world DPG behind a mid-scene depth-only clear so foreground meshes never depth-clash "
+               "with the world. Draws after that boundary receive the ViewModel category and override any "
+               "player-model tag, so a weapon mesh shared between first- and third-person components can be "
+               "tagged as Player Model Geometry to control the third-person copy while the first-person copy "
+               "stays a view model. Only active in rtx.d3d9.ue3EngineMode; promotion to the ViewModel camera "
+               "additionally requires rtx.viewModel.enable.");
     RTX_OPTION("rtx.d3d9", bool, conservativeOcclusionQueries, false,
                "Answer hardware occlusion queries with conservative results suited to path tracing instead "
                "of GPU-measured raster visibility: readbacks return immediately with full-backbuffer "
@@ -565,6 +574,12 @@ namespace dxvk {
     void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
 
     /**
+      * \brief: Signal a device Clear call. Used to detect the UE3 foreground DPG boundary
+      * (mid-scene depth-only clear before first-person arms/weapon draws).
+      */
+    void OnClear(DWORD flags);
+
+    /**
       * \brief: Called from texture upload/unlock paths with the sysmem source
       * of the data; stashes 16x1 float RGBA payloads (the game's baked tonemap
       * colour curve LUTs) for the Mirror's Edge tonemapping mode's live
@@ -748,6 +763,11 @@ namespace dxvk {
 
     Ue3PassType m_currentUe3PassType = Ue3PassType::Unknown;
     fast_unordered_cache<Ue3VertexFactoryType> m_ue3VertexFactoryCache;
+
+    // UE3 SDPG_Foreground tracking: the foreground DPG (first-person arms/weapon) renders
+    // after the world DPG behind a mid-scene depth-only clear. Both reset in EndFrame.
+    bool m_ue3SeenMainViewWorldDraw = false;
+    bool m_ue3ForegroundDpgActive = false;
 
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
     static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
@@ -1318,6 +1338,7 @@ namespace dxvk {
       bool ue3SkipShadowDepthPasses = false;
       bool ue3SkipDepthTestDisabledTranslucency = false;
       bool ue3SkipSceneCapturePasses = false;
+      bool ue3ForegroundDpgIsViewModel = false;
       bool conservativeOcclusionQueries = false;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;

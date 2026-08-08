@@ -815,6 +815,17 @@ namespace dxvk {
     }
 
 
+    // Track meshes drawn through the view-model camera so held-equipment world copies
+    // (shadow casters sharing the same mesh) can be auto-classified at the next scene
+    // preparation. Primitive-count floor keeps trivial shared topologies (particle
+    // quads, billboards) out of the pairing.
+    if (input.cameraType == CameraType::ViewModel &&
+        RtxOptions::PlayerModel::autoDetectHeldEquipment() &&
+        input.getGeometryData().calculatePrimitiveCount() > 8) {
+      m_viewModelTopologyHashes.insert(
+        input.getGeometryData().getHashForRule<rules::TopologicalHash>());
+    }
+
     const XXH64_hash_t activeReplacementHash = input.getHash(RtxOptions::geometryAssetHashRule());
     
     // Track this mesh hash for mesh hash checking
@@ -2522,7 +2533,57 @@ namespace dxvk {
     particles.simulate(ctx.ptr());
 
     m_instanceManager.findPortalForVirtualInstances(m_cameraManager, m_rayPortalManager);
+    m_instanceManager.updatePlayerModelBodyCameraDistance(m_cameraManager);
+
+    // Single per-frame camera-regime decision consumed by the raytrace constants
+    // (player model on primary rays), view-model instance creation (hide view-model
+    // copies), held-equipment detection (suspend classification), and the UE3
+    // foreground-DPG category override (demote first-person overlay draws to world
+    // geometry so e.g. the held weapon renders normally on external cameras).
+    {
+      const bool viewModelCameraValid = m_cameraManager.isCameraValid(CameraType::ViewModel);
+      const float playerDistance = m_instanceManager.getPlayerModelBodyCameraDistance();
+      const float maxDistance = RtxOptions::PlayerModel::autoEnableInPrimarySpaceBodyDistance();
+      const bool distanceExternal = maxDistance > 0.f && playerDistance > maxDistance;
+      // The no-ViewModel rule must not read back the regime's own effect: while external,
+      // foreground draws are demoted to world, which itself invalidates the ViewModel
+      // camera. Suppress the rule only when the absence is self-inflicted (we demoted
+      // overlay draws since the last scene prep); a genuine absence - the game drew no
+      // first-person overlay at all - fires it stably every frame.
+      const bool demotedForeground = g_ue3ForegroundDemotedDrawCount > 0;
+      g_ue3ForegroundDemotedDrawCount = 0;
+      const bool noViewModelExternal = RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModel() &&
+                                       !viewModelCameraValid && !demotedForeground;
+      const bool externalCameraRegime = RtxOptions::PlayerModel::enableInPrimarySpace() ||
+                                        distanceExternal ||
+                                        noViewModelExternal;
+      m_instanceManager.setExternalCameraRegime(externalCameraRegime);
+      g_ue3ForegroundDemoteToWorld = externalCameraRegime;
+
+      // Scoped-zoom view-model hiding (see rtx.viewModel.hideBelowFovDegrees / maxNearPlane).
+      // Computed here so held-equipment detection can freeze its classification while the
+      // game force-hides the view model and twins are expected to be absent.
+      bool viewModelHidden = false;
+      if (viewModelCameraValid) {
+        const RtCamera& viewModelCamera = m_cameraManager.getCamera(CameraType::ViewModel);
+        const float maxNearPlane = RtxOptions::ViewModel::maxNearPlane();
+        const float hideBelowFovDegrees = RtxOptions::ViewModel::hideBelowFovDegrees();
+        const float fovDegrees = viewModelCamera.getFov() * 180.f / 3.14159265f;
+        viewModelHidden = (maxNearPlane > 0.f && viewModelCamera.getNearPlane() > maxNearPlane) ||
+                          (hideBelowFovDegrees > 0.f && fovDegrees < hideBelowFovDegrees);
+      }
+      m_instanceManager.setViewModelHidden(viewModelHidden);
+    }
+
+    // Held-equipment detection runs before view-model instance creation: its exclusions
+    // rely on camera registration / custom-index bits rather than the reference masks
+    // createViewModelInstances zeroes.
+    m_instanceManager.detectHeldEquipmentInstances(m_viewModelTopologyHashes, m_cameraManager);
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
+    // Consume-and-clear rather than clearing at frame end: view-model draws (e.g. UE3's
+    // foreground DPG) are often submitted after RTX injection and accumulate for the next
+    // injection's scene - a frame-end clear would wipe them before they are ever consumed.
+    m_viewModelTopologyHashes.clear();
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());

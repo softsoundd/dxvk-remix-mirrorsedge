@@ -136,8 +136,12 @@ namespace dxvk {
       // Mesh1p as ViewModel; Mesh3p as player model (hidden in FP primary, visible in cutscenes).
       { "rtx.viewModel.enable",                                      "True" },
       { "rtx.viewModel.enableVirtualInstances",                      "False" },
+      // Scoped zoom hides the view model in stock rendering; FOV is the zoom signal
+      { "rtx.viewModel.hideBelowFovDegrees",                         "45.0" },
+      { "rtx.postfx.enableMotionBlurViewModel",                      "True" },
       { "rtx.playerModel.enableInPrimarySpace",                      "False" },
       { "rtx.playerModel.autoEnableInPrimarySpaceWhenNoViewModel",   "True" },
+      { "rtx.playerModel.autoEnableInPrimarySpaceBodyDistance",      "100.0" },
       { "rtx.playerModel.enablePrimaryShadows",                      "True" },
     }} },
     /* Star Wars Battlefront (2015)               */
