@@ -65,14 +65,26 @@ namespace dxvk {
       float transmittanceMeasurementDistance;
       Vector3 singleScatteringAlbedo;
       float anisotropy;
+      // Physical Atmosphere lighting knobs (presets do not set fogDensityScaleHeight).
+      float atmosphereVolumeAmbientScale;
+      float fogSunVisibilityGain;
+      float multiScatterResidualScale;
+      float fogSkyAttenuationPower;
+      float groundBounceScale;
 
-      // Constructor for easier initialization
       Preset(Vector3 transmittanceColor, float transmittanceDistance,
-        Vector3 scatteringAlbedo, float aniso)
+        Vector3 scatteringAlbedo, float aniso,
+        float skyAmbient = 0.75f, float sunGain = 1.2f,
+        float msResidual = 0.04f, float skyAttnPow = 0.65f, float groundBounce = 0.15f)
         : transmittanceColor(transmittanceColor),
         transmittanceMeasurementDistance(transmittanceDistance),
         singleScatteringAlbedo(scatteringAlbedo),
-        anisotropy(aniso) { }
+        anisotropy(aniso),
+        atmosphereVolumeAmbientScale(skyAmbient),
+        fogSunVisibilityGain(sunGain),
+        multiScatterResidualScale(msResidual),
+        fogSkyAttenuationPower(skyAttnPow),
+        groundBounceScale(groundBounce) { }
     };
 
     static void onFroxelResourceOptionsChanged(DxvkDevice* device);
@@ -135,14 +147,17 @@ namespace dxvk {
     RTX_OPTION("rtx.volumetrics", bool, enableTranslucentShadows, false,
                "Calculate coloured shadows from translucent materials (i.e. glass, water) in volumetric lighting. In engineering terms: include OBJECT_MASK_TRANSLUCENT into volumetric visibility rays.");
     RTX_OPTION_ARGS("rtx.volumetrics", Vector3, transmittanceColor, Vector3(0.999f, 0.999f, 0.999f),
-               "The color to use for calculating transmittance measured at a specific distance.\n"
-               "Note that this color is assumed to be in sRGB space and gamma encoded as it will be converted to linear for use in volumetrics.",
+               "NOT fog paint color. Fraction of light remaining after transmittanceMeasurementDistanceMeters (sRGB/gamma).\n"
+               "Darker = higher extinction. Visible fog brightness comes from in-scattered lighting, not this swatch alone.\n"
+               "sigma_t = -ln(linear(transmittanceColor)) / measurementDistance; sigma_s = sigma_t * singleScatteringAlbedo.\n"
+               "With inheritAtmosphereLightingColor, low sun desaturates σ_s and applies a mild warm bias without disabling these knobs at high sun.",
                args.minValue = Vector3(0.0f, 0.0f, 0.0f), args.maxValue = Vector3(1.0f, 1.0f, 1.0f));
-    RTX_OPTION_ARGS("rtx.volumetrics", float, transmittanceMeasurementDistanceMeters, 200.0f, "The distance the specified transmittance color was measured at. Lower distances indicate a denser medium.  The unit of measurement is meters, respects scene scale.",
+    RTX_OPTION_ARGS("rtx.volumetrics", float, transmittanceMeasurementDistanceMeters, 200.0f,
+                    "Distance at which transmittanceColor was measured. Lower = denser medium (higher extinction). Units are meters, respects scene scale.",
                     args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", Vector3, singleScatteringAlbedo, Vector3(0.999f, 0.999f, 0.999f),
-               "The single scattering albedo (otherwise known as the particle albedo) representing the ratio of scattering to absorption.\n"
-               "While color-like in many ways this value is assumed to be more of a mathematical albedo (unlike material albedo which is treated more as a color), and is therefore treated as linearly encoded data (not gamma).",
+               "Ratio of scattering to extinction (sigma_s / sigma_t), linearly encoded. Near 1 = almost all extinction is scatter (bright, lit fog); lower = more pure absorption (less in-scatter for the same density).\n"
+               "This is not a fog tint swatch — lit fog color comes from scene/atmosphere lights sampled into the froxel cache.",
                args.minValue = Vector3(0.0f, 0.0f, 0.0f), args.maxValue = Vector3(1.0f, 1.0f, 1.0f));
     RTX_OPTION_ARGS("rtx.volumetrics", float, anisotropy, 0.0f, "The anisotropy of the scattering phase function (-1 being backscattering, 0 being isotropic, 1 being forward scattering).",
                     args.minValue = -1.0f, args.maxValue = 1.0f);
@@ -173,15 +188,36 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.volumetrics", float, noiseFieldGain, 0.5f, "Visual Parameter: A scale factor in the range (0, infinity) to apply to the noise amplitude with each noise octave. Larger values typically make the noise field more jagged whereas lower values make the noise field smoother.",
                     args.minValue = 0.0f);
     RTX_OPTION("rtx.volumetrics", float, depthOffset, 0.5f, "Depth offset to avoid volumetric light leaking.");
-    RTX_OPTION("rtx.volumetrics", bool, enableAtmosphere, false,
-               "Enables a finite atmosphere in the volumetrics system.\n"
-               "When false, the volumetric volume is assumed to reach to infinity in every direction, when true the volumetric volume will be limited to that a finite atmosphere controlled by parameters describing atmosphere height and its curvature via a planetary radius.\n"
-               "This option should generally be enabled if volumetrics are used in outdoor settings as without a finite atmosphere infinite light sources such as the skybox and distant lights will not function properly.");
+    RTX_OPTION("rtx.volumetrics", bool, enableAtmosphere, true,
+               "Enables a finite atmosphere shell in the volumetrics system (planet radius + height).\n"
+               "When false, the volumetric volume is assumed to reach to infinity in every direction; when true the volumetric volume is limited to a finite atmosphere controlled by atmosphereHeightMeters and atmospherePlanetRadiusMeters.\n"
+               "This should be enabled for outdoor settings: without a finite atmosphere, infinite light sources such as distant lights (including the Physical Atmosphere sun injected as an RtDistantLight) will not light fog correctly.\n"
+               "Note: this geometric shell is unrelated to rtx.skyMode Physical Atmosphere (Hillaire sky); both are typically needed together outdoors.");
     RTX_OPTION("rtx.volumetrics", float, atmospherePlanetRadiusMeters, 10000.f, "Radius of the planet in meters, respects scene scale.");
-    RTX_OPTION("rtx.volumetrics", float, atmosphereHeightMeters, 30.0f, "Height of the atmosphere in meters, respects scene scale.");
+    RTX_OPTION("rtx.volumetrics", float, atmosphereHeightMeters, 80.0f, "Height of the atmosphere in meters, respects scene scale.");
     RTX_OPTION("rtx.volumetrics", bool, atmosphereInverted, false,
                "A flag to invert the rendering of the volumetric atmosphere if rtx.volumetrics.enableAtmosphere is enabled.\n"
                "Some games render the world upside down and that cannot be detected automatically, this setting can be used to correct that inversion for the volumetric atmosphere.");
+    RTX_OPTION_ARGS("rtx.volumetrics", float, fogDensityScaleHeightMeters, 15.0f,
+               "Exponential fog density scale height in meters (σ falls as exp(-h/H) above the planet surface).\n"
+               "0 disables height falloff (homogeneous). Typical ground fog: 10–20 m.\n"
+               "Works with or without enableAtmosphere; outdoor maps should keep the atmosphere shell on.",
+               args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, groundBounceScale, 0.15f,
+               "Physical Atmosphere only. Scales sun×ground-albedo upward lobe injected into froxel SH (cheap bounce approx, not GI).",
+               args.minValue = 0.0f, args.maxValue = 2.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, fogSkyAttenuationPower, 0.65f,
+               "Physical Atmosphere only. Softens volume transmittance on primary-miss SharedRadiance under optically thick fog.\n"
+               "Effective power lerps from 1 (full Beer) toward this value as optical depth grows. 1 = never soften.",
+               args.minValue = 0.05f, args.maxValue = 2.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, fogSunFireflyScale, 4.0f,
+               "Physical Atmosphere only. Multiplies froxel firefly luminance threshold for distant lights so sun shafts are less clipped.",
+               args.minValue = 1.0f, args.maxValue = 32.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, multiScatterResidualScale, 0.04f,
+               "Physical Atmosphere only. Small isotropic multi-scatter residual from the sky mean.\n"
+               "When sky ambient strength > 0 this is injected into froxel SH on the GPU (CPU residual is skipped to avoid double-counting).\n"
+               "Directional sky lighting comes from the sky-view LUT hemisphere; keep this low.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION_FLAG("rtx.volumetrics", bool, debugDisableRadianceScaling, false, RtxOptionFlags::NoSave,
                "Disables the volumetric radiance scaling feature, this effectively sets the per light radiance scaling to 1.f.  Useful when debugging issues when this feature is suspected.\n"
                "Do not ship your mod with this in the rtx.conf.");
@@ -228,6 +264,19 @@ namespace dxvk {
                "This scaling factor is applied to the fixed function fog's color and becomes a multiscattering approximation in the volumetrics system.\n"
                "Sometimes useful but this multiscattering approximation is very basic (just a simple ambient term for now essentially) and may not look very good depending on various conditions.",
                args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, atmosphereVolumeAmbientScale, 0.75f,
+               "Physical Atmosphere only. Strength of the directional sky-view LUT hemisphere injected into froxel SH.\n"
+               "0 disables sky→froxel lighting. Typical range 0.5–1.5.",
+               args.minValue = 0.0f, args.maxValue = 4.0f);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, fogSunVisibilityGain, 1.2f,
+               "Artistic gain on directional froxel in-scatter (sun shafts / anisotropic lobe excess over isotropic sky fill).\n"
+               "Does not scale the isotropic sky floor or multiScatteringEstimate — raise for stronger shafts without washing ambient fog.\n"
+               "Only applied when rtx.skyMode is Physical Atmosphere; otherwise forced to 1. 1 = physical balance of the SH eval.",
+               args.minValue = 0.0f, args.maxValue = 50.0f);
+    RTX_OPTION("rtx.volumetrics", bool, inheritAtmosphereLightingColor, true,
+               "Physical Atmosphere only. At low sun elevation, desaturate σ_s and apply a mild warm bias so cool media\n"
+               "respond realistically to warm sunlight. High sun keeps full artistic albedo/transmittance colour.\n"
+               "Disable to keep fog colour fixed regardless of sun elevation.");
 
     enum class RaytraceMode {
       RayQuery = 0,
@@ -275,6 +324,8 @@ namespace dxvk {
     Resources::Resource m_volumeAccumulatedRadianceAge[2];
     bool m_swapTextures = false;
     bool m_rebuildFroxels = false;
+    // Set by setPreset; consumed (and cleared) in getVolumeArgs.
+    mutable bool m_forceResetVolumeHistory = false;
 
     DxvkRaytracingPipelineShaders getPipelineShaders(bool useRayQuery) const;
 

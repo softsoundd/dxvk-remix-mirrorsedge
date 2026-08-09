@@ -446,15 +446,13 @@ vec3 evalAtmosphereRadiance(
 // Sun disk angular radius is now dynamic (args.sunAngularRadius)
 // static const float kSunAngularRadius = 0.00873f;
 
-// Compute transmittance from a point to the sun (simplified for ground-level surfaces)
-// Must match the ray-marching in evalAtmosphereRadiance() to avoid color mismatch
-// between the sky and cast sunlight.
-vec3 getTransmittanceToSun(vec3 worldPos, AtmosphereArgs args, bool isZUp = false) {
-  // Transform sun direction to Y-up space for horizon check
+// Transmittance from altitude (km above sea level) to the sun.
+// Optical depth scales with local density exp(-h/H) so higher samples see a
+// shorter remaining atmospheric column (brighter / less reddened sun).
+vec3 getTransmittanceToSunAtAltitude(float altitudeKm, AtmosphereArgs args) {
   vec3 sunDirYUp = args.sunDirection;
-  float sunZenithCosAngle = sunDirYUp.y;  // In Y-up space, Y component is zenith angle
-  
-  // Exponential twilight fade matching the ray marching
+  float sunZenithCosAngle = sunDirYUp.y;
+
   float twilightFade;
   if (sunZenithCosAngle >= 0.0f) {
     twilightFade = 1.0f;
@@ -462,44 +460,41 @@ vec3 getTransmittanceToSun(vec3 worldPos, AtmosphereArgs args, bool isZUp = fals
     float angleBelow = -sunZenithCosAngle;
     twilightFade = exp(-angleBelow * 15.0f);
   }
-  
-  // Compute air mass using the same method as the ray-marching path.
-  // Air mass = how many vertical atmosphere columns the sunlight traverses.
+
   float sunElevationRad = acos(clamp(sunZenithCosAngle, -1.0f, 1.0f));
   float sunElevationDeg = degrees(sunElevationRad);
-  
+
   float airMass;
   if (sunZenithCosAngle > 0.01f) {
-    // Kasten-Young approximation for air mass (matches ray-marching)
     airMass = 1.0f / (sunZenithCosAngle + 0.15f * pow(93.885f - sunElevationDeg, -1.253f));
   } else {
-    // At/below horizon: smoothly extended air mass (matches ray-marching)
     float horizonAirMass = 40.0f;
     float belowHorizonFactor = exp(-sunZenithCosAngle * 10.0f);
     airMass = horizonAirMass * belowHorizonFactor;
   }
   airMass = min(airMass, 200.0f);
-  
-  // Optical depth = scatteringCoefficient * scaleHeight * airMass
-  // The scale height is the integral of the exponential density profile over the
-  // full atmosphere column. Without it, extinction is underestimated by ~8x for
-  // Rayleigh, causing transmitted sunlight to be far too white/orange instead of
-  // matching the red/pink sunset colors in the sky.
-  float H_R = args.rayleighScaleHeight;  // ~8 km for Earth
-  float H_M = args.mieScaleHeight;       // ~1.2 km for Earth
-  
-  float rayleighOpticalDepth = H_R * airMass;  // at ground level, exp(-0/H) = 1
-  float mieOpticalDepth = H_M * airMass;
-  float ozonePathLength = ozoneDensity(args.ozoneLayerAltitude, args) * airMass;
-  
+
+  float H_R = args.rayleighScaleHeight;
+  float H_M = args.mieScaleHeight;
+  float h = max(altitudeKm, 0.0f);
+  float rayleighDensity = exp(-h / max(H_R, 1e-3f));
+  float mieDensity = exp(-h / max(H_M, 1e-3f));
+
+  float rayleighOpticalDepth = H_R * airMass * rayleighDensity;
+  float mieOpticalDepth = H_M * airMass * mieDensity;
+  float ozonePathLength = ozoneDensity(args.ozoneLayerAltitude, args) * airMass * rayleighDensity;
+
   vec3 extinction = args.rayleighScattering * rayleighOpticalDepth +
                     args.mieScattering * mieOpticalDepth +
-                    args.ozoneAbsorption * ozonePathLength * 0.15f;  // matches ray-marching
-  
-  vec3 transmittance = exp(-extinction);
-  
-  // Fade out smoothly during twilight instead of hard cutoff
-  return transmittance * twilightFade;
+                    args.ozoneAbsorption * ozonePathLength * 0.15f;
+
+  return exp(-extinction) * twilightFade;
+}
+
+// Transmittance to the sun at viewAltitude (ground bake / surface paths).
+// Prefer getTransmittanceToSunAtAltitude when froxel/surface height is known.
+vec3 getTransmittanceToSun(vec3 worldPos, AtmosphereArgs args, bool isZUp = false) {
+  return getTransmittanceToSunAtAltitude(args.viewAltitude, args);
 }
 
 // Evaluate sun disk contribution (for sky miss shaders)
@@ -673,6 +668,11 @@ struct AtmosphereVolumeSunSample {
 // froxel SH is raw incoming radiance. The phase function is applied later when
 // the SH is evaluated with evaluateHenyeyGreenstein() during volumetric compositing.
 // Baking it in here would cause double-application of the phase function.
+//
+// Intentionally unused: Physical Atmosphere injects the sun as an RtDistantLight
+// (RtxAtmosphere::syncDistantSunLight) so Volume ReSTIR/NEE lights the froxel cache.
+// Calling this helper from integrateVolume would double-count the sun (Remix Plus
+// issue #35). Kept as reference for the radiance convention only.
 AtmosphereVolumeSunSample sampleAtmosphereSunLightVolume(vec3 volumePos, vec3 viewDir, AtmosphereArgs args, bool isZUp = false) {
   AtmosphereVolumeSunSample result;
   
@@ -869,4 +869,13 @@ vec3 sampleSkyViewLutRadiance(
   const vec3 radiance = mix(mix(t00, t10, filterWeight.x), mix(t01, t11, filterWeight.x), filterWeight.y);
 
   return max(radiance, vec3(0.0f));
+}
+
+// Cloud-free sky-view LUT ambient for volumetrics (Plus sampleSkyAmbientForVolume
+// without cloud transmittance). Above-horizon only.
+vec3 sampleSkyAmbientForVolume(vec3 dirYUp, AtmosphereArgs args, Texture2D skyViewLut) {
+  if (dirYUp.y < 0.0f) {
+    return vec3(0.0f);
+  }
+  return sampleSkyViewLutRadiance(skyViewLut, dirYUp, args, false);
 }

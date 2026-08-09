@@ -47,6 +47,13 @@ layout(binding = COMPOSITE_PRIMARY_LINEAR_VIEW_Z_INPUT)
 Texture2D<float> PrimaryLinearViewZ;
 layout(rgba16, binding = COMPOSITE_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_INPUT)
 Texture2D<float4> PrimaryVirtualWorldNormalPerceptualRoughness;
+// PSR fog inputs (see geometry_resolver / composite dual integrate).
+layout(binding = COMPOSITE_PSR_FIRST_HIT_DISTANCE_INPUT)
+Texture2D<float> PsrFirstHitDistance;
+layout(binding = COMPOSITE_PSR_REFLECTION_SEGMENT_INPUT)
+Texture2D<float> PsrReflectionSegmentLength;
+layout(binding = COMPOSITE_PSR_REFLECTION_DIRECTION_INPUT)
+Texture2D<float2> PsrReflectionDirection;
 
 layout(binding = COMPOSITE_SECONDARY_ATTENUATION_INPUT)
 RWTexture2D<uint> SecondaryAttenuation;

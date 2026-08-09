@@ -36,6 +36,8 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
 #include "rtx_imgui.h"
+#include "rtx_atmosphere.h"
+#include "rtx_options.h"
 
 namespace dxvk {
 
@@ -126,47 +128,58 @@ namespace dxvk {
   }
 
   static const std::array<RtxGlobalVolumetrics::Preset, RtxGlobalVolumetrics::PresetCount> Presets = {
+      // transmittance, measDist, albedo, aniso, skyAmb, sunGain, msRes, skyPow, ground
       RtxGlobalVolumetrics::Preset( // Default
-          Vector3(0.999f, 0.999f, 0.999f),  // transmittanceColor
-          200.0f,                         // transmittanceMeasurementDistance
-          Vector3(0.999f, 0.999f, 0.999f),  // singleScatteringAlbedo
-          0.0f                             // anisotropy
+          Vector3(0.999f, 0.999f, 0.999f),
+          200.0f,
+          Vector3(0.999f, 0.999f, 0.999f),
+          0.0f,
+          0.75f, 1.2f, 0.04f, 0.65f, 0.15f
       ),
       RtxGlobalVolumetrics::Preset( // HeavyFog
-          Vector3(0.85f, 0.85f, 0.85f),
-          5.0f,
-          Vector3(0.9f, 0.9f, 0.9f),
-          -0.2f
+          // Dense, high-albedo medium: extinction from short measurement distance;
+          // near-white T + high albedo so thick fog fills with in-scatter. Forward anisotropy.
+          // Presets do not write fogDensityScaleHeight (scene/altitude choice).
+          Vector3(0.97f, 0.97f, 0.97f),
+          8.0f,
+          Vector3(0.99f, 0.99f, 0.99f),
+          0.3f,
+          0.9f, 1.35f, 0.08f, 0.55f, 0.28f
       ),
       RtxGlobalVolumetrics::Preset( // LightFog
-          Vector3(0.93f, 0.93f, 0.93f),
-          15.0f,
-          Vector3(0.95f, 0.95f, 0.95f),
-          -0.1f
+          Vector3(0.96f, 0.96f, 0.96f),
+          20.0f,
+          Vector3(0.99f, 0.99f, 0.99f),
+          0.2f,
+          0.8f, 1.25f, 0.06f, 0.65f, 0.22f
       ),
       RtxGlobalVolumetrics::Preset( // Mist
           Vector3(0.96f, 0.96f, 0.96f),
           50.0f,
           Vector3(0.98f, 0.98f, 0.98f),
-          0.1f
+          0.1f,
+          0.7f, 1.15f, 0.05f, 0.7f, 0.18f
       ),
       RtxGlobalVolumetrics::Preset( // Haze
           Vector3(0.9f, 0.85f, 0.75f),
           70.0f,
           Vector3(0.8f, 0.8f, 0.8f),
-          0.2f
+          0.2f,
+          0.65f, 1.2f, 0.05f, 0.75f, 0.15f
       ),
       RtxGlobalVolumetrics::Preset( // Dust
           Vector3(0.87f, 0.73f, 0.5f),
           60.0f,
           Vector3(0.85f, 0.75f, 0.65f),
-          0.4f
+          0.4f,
+          0.7f, 1.3f, 0.06f, 0.6f, 0.2f
       ),
       RtxGlobalVolumetrics::Preset( // Smoke
           Vector3(0.87f, 0.73f, 0.5f),
           20.0f,
           Vector3(0.85f, 0.75f, 0.65f),
-          0.6f
+          0.6f,
+          0.55f, 1.15f, 0.04f, 0.7f, 0.12f
       )
   };
 
@@ -322,9 +335,33 @@ namespace dxvk {
         if (showAdvanced) {
           RemixGui::Checkbox("Enable Translucent Shadows", &enableTranslucentShadowsObject());
           RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f");
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Chromatic extinction (not fog paint alone). Darker = higher extinction.\n"
+            "With Inherit Atmosphere Lighting Color, low sun reduces scatter chroma while keeping this density control.");
+          RemixGui::Checkbox("Inherit Atmosphere Lighting Color", &inheritAtmosphereLightingColorObject());
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Physical Atmosphere: at low sun elevation, desaturate σ_s and apply a mild warm bias\n"
+            "so cool media respond realistically to warm sunlight. High sun keeps artistic colour.");
           RemixGui::DragFloat("Transmittance Measurement Distance", &transmittanceMeasurementDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::SetTooltipToLastWidgetOnHover("Lower distance = denser medium (same transmittance color implies more extinction per meter).");
           RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f");
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Scatter / extinction ratio. Near 1 = bright lit fog; lower = more absorption, less in-scatter.\n"
+            "Lit fog colour comes from the sun/lights in the froxel cache, not from this as a tint.");
           RemixGui::DragFloat("Anisotropy", &anisotropyObject(), 0.01f, -.99f, .99f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Sky Ambient Strength", &atmosphereVolumeAmbientScaleObject(), 0.01f, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Physical Atmosphere only. Strength of sky-view LUT hemisphere injected into froxel SH.");
+          RemixGui::DragFloat("Fog Density Scale Height (m)", &fogDensityScaleHeightMetersObject(), 0.25f, 0.0f, 200.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Exponential height falloff; 0 = homogeneous shell. Typical ground fog 10-20 m.");
+          RemixGui::DragFloat("Ground Bounce Scale", &groundBounceScaleObject(), 0.01f, 0.0f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Fog Sky Attenuation Power", &fogSkyAttenuationPowerObject(), 0.01f, 0.05f, 2.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Fog Sun Firefly Scale", &fogSunFireflyScaleObject(), 0.1f, 1.0f, 32.0f, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Multi-Scatter Residual", &multiScatterResidualScaleObject(), 0.005f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Fog Sun Visibility Gain", &fogSunVisibilityGainObject(), 0.05f, 0.0f, 50.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Physical Atmosphere only. Boosts directional froxel in-scatter (shafts) without scaling isotropic sky fill.");
           RemixGui::DragFloat("Depth Offset", &depthOffsetObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
           RemixGui::Separator();
@@ -419,12 +456,22 @@ namespace dxvk {
   void RtxGlobalVolumetrics::setPreset(const PresetType presetType) {
     const RtxGlobalVolumetrics::Preset& preset = Presets[presetType];
 
-    // Set RTX options using the values from the preset
-    transmittanceColor.setDeferred(preset.transmittanceColor);
-    transmittanceMeasurementDistanceMeters.setDeferred(preset.transmittanceMeasurementDistance);
-    singleScatteringAlbedo.setDeferred(preset.singleScatteringAlbedo);
-    anisotropy.setDeferred(preset.anisotropy);
-    enableFogRemap.setDeferred(false);
+    // Apply immediately so same-frame ImGui / froxels see the new values
+    // (setDeferred can be overwritten by DragFloats later in the frame).
+    transmittanceColor.setImmediately(preset.transmittanceColor);
+    transmittanceMeasurementDistanceMeters.setImmediately(preset.transmittanceMeasurementDistance);
+    singleScatteringAlbedo.setImmediately(preset.singleScatteringAlbedo);
+    anisotropy.setImmediately(preset.anisotropy);
+    enableFogRemap.setImmediately(false);
+
+    // Physical Atmosphere lighting knobs only — not fogDensityScaleHeight (altitude choice).
+    atmosphereVolumeAmbientScale.setImmediately(preset.atmosphereVolumeAmbientScale);
+    fogSunVisibilityGain.setImmediately(preset.fogSunVisibilityGain);
+    multiScatterResidualScale.setImmediately(preset.multiScatterResidualScale);
+    fogSkyAttenuationPower.setImmediately(preset.fogSkyAttenuationPower);
+    groundBounceScale.setImmediately(preset.groundBounceScale);
+
+    m_forceResetVolumeHistory = true;
   }
 
   // This function checks the fog density to determine using physical fog or fix function fog.
@@ -539,8 +586,19 @@ namespace dxvk {
       multiScatteringEstimate = fogState.color * fogRemapColorMultiscatteringScale();
     }
 
-    // Calculate scattering and attenuation coefficients for the volume
+    // Prefer GPU sky-view LUT froxel inject; CPU residual only when sky ambient is off.
+    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere
+        && multiScatterResidualScale() > 0.0f
+        && atmosphereVolumeAmbientScale() <= 0.0f) {
+      const Vector3 skyHint = RtxAtmosphere::estimateVolumeAmbientRadiance(
+        RtxAtmosphere::buildAtmosphereArgsFromOptions());
+      const Vector3 albedo = singleScatteringAlbedo();
+      const float avgA = (albedo.x + albedo.y + albedo.z) * (1.0f / 3.0f);
+      const float msFactor = avgA / std::max(1.0f - 0.9f * avgA, 1e-3f);
+      multiScatteringEstimate += skyHint * (multiScatterResidualScale() * msFactor);
+    }
 
+    // Chromatic medium coeffs from artistic knobs; low-sun warmth is a separate composite blend.
     Vector3 const volumetricAttenuationCoefficient{
       -log(transmittanceColorLinear.x) / transmittanceMeasurementDistance,
       -log(transmittanceColorLinear.y) / transmittanceMeasurementDistance,
@@ -574,6 +632,8 @@ namespace dxvk {
     volumeArgs.attenuationCoefficient = volumetricAttenuationCoefficient;
     volumeArgs.enable = enable() && canUsePhysicalFog;
     volumeArgs.enableTranslucentShadows = volumeArgs.enable && enableTranslucentShadows();
+    volumeArgs.physicalAtmosphereEnabled =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? 1u : 0u;
     volumeArgs.scatteringCoefficient = volumetricScatteringCoefficient;
     volumeArgs.enableVolumeRISInitialVisibility = enableInitialVisibility();
     volumeArgs.enablevisibilityReuse = visibilityReuse();
@@ -592,6 +652,31 @@ namespace dxvk {
     volumeArgs.multiScatteringEstimate = multiScatteringEstimate;
     volumeArgs.enableReferenceMode = enableReferenceMode();
     volumeArgs.volumetricFogAnisotropy = anisotropy();
+    volumeArgs.fogSunVisibilityGain =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? fogSunVisibilityGain() : 1.0f;
+    volumeArgs.skyAmbientStrength =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? atmosphereVolumeAmbientScale() : 0.0f;
+    volumeArgs.fogDensityScaleHeight = fogDensityScaleHeightMeters() * RtxOptions::getMeterToWorldUnitScale();
+    volumeArgs.groundBounceScale =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? groundBounceScale() : 0.0f;
+    volumeArgs.fogSkyAttenuationPower =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? fogSkyAttenuationPower() : 1.0f;
+    volumeArgs.fogSunFireflyScale =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? fogSunFireflyScale() : 1.0f;
+    volumeArgs.worldUnitsPerMeter = RtxOptions::getMeterToWorldUnitScale();
+    volumeArgs.multiScatterResidualScale =
+      RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? multiScatterResidualScale() : 0.0f;
+
+    Vector3 sunsetTint(1.0f, 1.0f, 1.0f);
+    float sunsetBlend = 0.0f;
+    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere && inheritAtmosphereLightingColor()) {
+      RtxAtmosphere::estimateVolumeSunsetWarmTint(
+        RtxAtmosphere::buildAtmosphereArgsFromOptions(), sunsetTint, sunsetBlend);
+      sunsetBlend = std::min(sunsetBlend, 1.0f);
+    }
+    volumeArgs.fogSunsetColorBlend = sunsetBlend;
+    volumeArgs.fogSunsetWarmTint = sunsetTint;
+    volumeArgs.pad1 = 0.0f;
 
     volumeArgs.enableNoiseFieldDensity = enableHeterogeneousFog();
     volumeArgs.noiseFieldSubStepSize = noiseFieldSubStepSizeMeters() * RtxOptions::getMeterToWorldUnitScale();
@@ -651,7 +736,9 @@ namespace dxvk {
     }
 
     // Note: We need to invalidate the volumetric history buffers (radiance and age buffers) when detecting camera cut to avoid accumulating the history from different scenes
-    volumeArgs.resetHistory = isViewHistoryInvalidated;
+    // Also force-reset when a visual fog preset is applied.
+    volumeArgs.resetHistory = isViewHistoryInvalidated || m_forceResetVolumeHistory;
+    m_forceResetVolumeHistory = false;
 
     return volumeArgs;
   }

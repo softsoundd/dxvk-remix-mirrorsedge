@@ -643,6 +643,16 @@ namespace dxvk {
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
+      // Sync PA sun before prepareSceneData so Volume ReSTIR / NEE see it this frame.
+      if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+        if (!m_atmosphere) {
+          m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
+        }
+        m_atmosphere->syncDistantSunLight(*this, m_atmosphere->getAtmosphereArgs());
+      } else if (m_atmosphere) {
+        m_atmosphere->dropDistantSunLight();
+      }
+
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
 
@@ -1416,6 +1426,8 @@ namespace dxvk {
         if (skyMatte.view != nullptr) {
           DxvkContext::clearRenderTarget(skyMatte.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
         }
+      } else if (m_atmosphere) {
+        m_atmosphere->dropDistantSunLight();
       }
 
       m_lastSkyMode = currentSkyMode;
@@ -1430,6 +1442,7 @@ namespace dxvk {
       m_atmosphere->initialize(this);
       m_atmosphere->computeLuts(this);
       constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
+      m_atmosphere->syncDistantSunLight(*this, constants.atmosphereArgs);
     }
 
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);

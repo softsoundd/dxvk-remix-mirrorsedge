@@ -24,8 +24,14 @@
 #include "dxvk_context.h"
 #include "rtx_options.h"
 #include "rtx_context.h"
+#include "rtx_scene_manager.h"
+#include "rtx_light_manager.h"
+#include "rtx_lights.h"
+#include "rtx_global_volumetrics.h"
 #include "rtx_render/rtx_shader_manager.h"
+#include "../../util/util_color.h"
 #include <rtx_shaders/sky_view_lut.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -49,6 +55,51 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(SkyViewLutShader);
+
+    constexpr float kAtmPi = 3.14159265358979323846f;
+
+    float atmSmoothstep(float e0, float e1, float x) {
+      const float denom = e1 - e0;
+      float t = (denom != 0.0f) ? (x - e0) / denom : 0.0f;
+      t = std::min(std::max(t, 0.0f), 1.0f);
+      return t * t * (3.0f - 2.0f * t);
+    }
+
+    Vector3 atmMul(const Vector3& a, const Vector3& b) {
+      return Vector3(a.x * b.x, a.y * b.y, a.z * b.z);
+    }
+
+    // CPU port of getAtmosphericTransmittanceForDir / getTransmittanceToSunAtAltitude.
+    // dirYUp must be normalized, Y-up. Ozone density at the layer altitude is 1.
+    // altitudeKm scales remaining optical depth by exp(-h/H).
+    Vector3 atmTransmittanceYUp(const AtmosphereArgs& a, const Vector3& dirYUp, float altitudeKm = 0.0f) {
+      const float H = a.rayleighScaleHeight;
+      const float zc = dirYUp.y;
+      float airMass;
+      if (zc > 0.01f) {
+        const float zenithRad = std::acos(std::min(std::max(zc, -1.0f), 1.0f));
+        const float zenithDeg = zenithRad * (180.0f / kAtmPi);
+        airMass = 1.0f / (zc + 0.15f * std::pow(93.885f - zenithDeg, -1.253f));
+      } else {
+        airMass = 40.0f * std::exp(-zc * 10.0f);
+      }
+      airMass = std::min(airMass, 200.0f);
+      const float h = std::max(altitudeKm, 0.0f);
+      const float rayleighDensity = std::exp(-h / std::max(H, 1e-3f));
+      const float mieDensity = std::exp(-h / std::max(a.mieScaleHeight, 1e-3f));
+      const float rayleighOD = H * airMass * rayleighDensity;
+      const float mieOD = a.mieScaleHeight * airMass * mieDensity;
+      const float ozonePath = airMass * rayleighDensity;
+      Vector3 t(
+        std::exp(-(a.rayleighScattering.x * rayleighOD + a.mieScattering.x * mieOD + a.ozoneAbsorption.x * ozonePath * 0.15f)),
+        std::exp(-(a.rayleighScattering.y * rayleighOD + a.mieScattering.y * mieOD + a.ozoneAbsorption.y * ozonePath * 0.15f)),
+        std::exp(-(a.rayleighScattering.z * rayleighOD + a.mieScattering.z * mieOD + a.ozoneAbsorption.z * ozonePath * 0.15f)));
+      if (zc < 0.0f) {
+        const float f = std::exp(-(-zc) * 15.0f);
+        t = Vector3(t.x * f, t.y * f, t.z * f);
+      }
+      return t;
+    }
   }
 
 RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
@@ -63,6 +114,7 @@ RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
 }
 
 RtxAtmosphere::~RtxAtmosphere() {
+  dropDistantSunLight();
 }
 
 void RtxAtmosphere::initialize(Rc<DxvkContext> ctx) {
@@ -75,7 +127,7 @@ void RtxAtmosphere::initialize(Rc<DxvkContext> ctx) {
   m_lutsNeedRecompute = true;
 }
 
-AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
+AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   AtmosphereArgs args = {};
 
   // Convert sun angles to direction vector (in Y-up space, for LUT generation)
@@ -270,6 +322,154 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
 void RtxAtmosphere::bindResources(Rc<DxvkContext> ctx, VkPipelineBindPoint pipelineBindPoint) {
   // TODO: Bind atmosphere LUT resources to the pipeline
   // This will be called from RtxContext to make the LUTs available to shaders
+}
+
+void RtxAtmosphere::dropDistantSunLight() {
+  if (m_sunDistantLight != nullptr) {
+    m_sunDistantLight->markForGarbageCollection();
+    m_sunDistantLight = nullptr;
+  }
+}
+
+Vector3 RtxAtmosphere::estimateVolumeAmbientRadiance(const AtmosphereArgs& args) {
+  // Fallback isotropic fill from ground-reaching sun irradiance (Rayleigh-ish tint).
+  // Prefer the sky-view LUT froxel path when sky ambient strength > 0.
+  const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
+  constexpr float kTwilightLo = -0.259f; // -15 deg
+  constexpr float kTwilightHi = 0.15f;
+  const float elevFade = atmSmoothstep(kTwilightLo, kTwilightHi, sunDirYUp.y);
+  if (elevFade <= 0.0f) {
+    return Vector3(0.0f, 0.0f, 0.0f);
+  }
+
+  const Vector3 T = atmTransmittanceYUp(args, sunDirYUp, args.viewAltitude);
+  const Vector3 sunIll(args.sunIlluminance.x, args.sunIlluminance.y, args.sunIlluminance.z);
+  const Vector3 groundIlluminance = atmMul(sunIll, T) * args.sunRayBrightness;
+
+  // /pi: multiScatteringEstimate is radiance beside froxel SH; sunIll*T is irradiance-like.
+  const Vector3 skyTint(0.65f, 0.78f, 1.0f);
+  return atmMul(groundIlluminance, skyTint) * (elevFade / kAtmPi);
+}
+
+void RtxAtmosphere::estimateVolumeSunsetWarmTint(const AtmosphereArgs& args, Vector3& outTint, float& outBlend) {
+  outTint = Vector3(1.0f, 1.0f, 1.0f);
+  outBlend = 0.0f;
+
+  const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
+  // Ramp in from ~40° elevation so low-sun haze responds before the horizon.
+  outBlend = 1.0f - atmSmoothstep(0.05f, 0.65f, sunDirYUp.y);
+  if (outBlend <= 1e-4f) {
+    return;
+  }
+
+  Vector3 dirForT = sunDirYUp;
+  if (dirForT.y < 0.02f) {
+    dirForT.y = 0.02f;
+    const float len = std::sqrt(dirForT.x * dirForT.x + dirForT.y * dirForT.y + dirForT.z * dirForT.z);
+    dirForT = Vector3(dirForT.x / len, dirForT.y / len, dirForT.z / len);
+  }
+  const Vector3 T = atmTransmittanceYUp(args, dirForT, args.viewAltitude);
+  const float tLum = std::max(sRGBLuminance(T), 1e-4f);
+  const float blueLoss = std::min(std::max(1.0f - (T.z / tLum), 0.0f), 1.0f);
+
+  // Mild warm multipliers; reduce G with B so cool media stay realistic under warm T.
+  outTint = Vector3(
+    1.0f + 0.05f + 0.04f * blueLoss,
+    1.0f - 0.08f - 0.06f * blueLoss,
+    1.0f - 0.14f - 0.10f * blueLoss);
+}
+
+void RtxAtmosphere::syncDistantSunLight(RtxContext& ctx, const AtmosphereArgs& args) {
+  // Sole Physical Atmosphere sun for surface NEE + Volume ReSTIR.
+  // Radiance matches sampleAtmosphereSunLight / pi (distant-light solid-angle concentration).
+  LightManager& lm = ctx.getSceneManager().getLightManager();
+  const bool isZUp = RtxOptions::zUp();
+  constexpr float kMinHalfAngle = 0.0005f;
+  constexpr float kTwilightLo = -0.259f; // -15 deg
+  constexpr float kTwilightHi = 0.05f;
+
+  const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
+  const float elevFade = atmSmoothstep(kTwilightLo, kTwilightHi, sunDirYUp.y);
+
+  Vector3 radiance(0.0f, 0.0f, 0.0f);
+  Vector3 T(1.0f, 1.0f, 1.0f);
+  if (elevFade > 0.0f) {
+    const float mieModulation = 0.3f + 1.7f * args.mieAnisotropy;
+    const float sunVisibility = 0.05f + 0.95f * atmSmoothstep(0.0f, 0.8f, args.mieAnisotropy);
+    Vector3 dirForT = sunDirYUp;
+    if (dirForT.y < 0.02f) {
+      dirForT.y = 0.02f;
+      const float len = std::sqrt(dirForT.x * dirForT.x + dirForT.y * dirForT.y + dirForT.z * dirForT.z);
+      dirForT = Vector3(dirForT.x / len, dirForT.y / len, dirForT.z / len);
+    }
+    T = atmTransmittanceYUp(args, dirForT, args.viewAltitude);
+    const Vector3 sunIll(args.sunIlluminance.x, args.sunIlluminance.y, args.sunIlluminance.z);
+    const Vector3 sample = atmMul(sunIll, T) * (mieModulation * sunVisibility * args.sunRayBrightness * 0.5f * elevFade);
+    radiance = sample * (1.0f / kAtmPi);
+  }
+
+  const Vector3 toSun = isZUp
+    ? Vector3(sunDirYUp.x, sunDirYUp.z, sunDirYUp.y)
+    : sunDirYUp;
+  // Propagation toward the ground (= -toBody).
+  const Vector3 propDir = (elevFade > 0.0f)
+    ? Vector3(-toSun.x, -toSun.y, -toSun.z)
+    : Vector3(0.0f, -1.0f, 0.0f);
+
+  // Soft shadows = distant-light cone half-angle. Widen with atmosphere/fog OD.
+  // Do not rescale radiance by sin²θ: GPU samples use radiance/sin²θ while ReSTIR
+  // weights use raw radiance, so energy-preserving scales over-select the sun.
+  const float baseHalfAngle = std::max(args.sunAngularRadius, kMinHalfAngle);
+  float extraHalfAngle = 0.0f;
+  if (elevFade > 0.0f) {
+    const float avgT = std::max((T.x + T.y + T.z) * (1.0f / 3.0f), 1e-4f);
+    const float atmOd = -std::log(avgT);
+    extraHalfAngle += std::min(atmOd * 0.035f, 6.0f * (kAtmPi / 180.0f));
+
+    if (RtxGlobalVolumetrics::enable()) {
+      const Vector3 tcLin = sRGBGammaToLinear(RtxGlobalVolumetrics::transmittanceColor());
+      const float tLum = std::min(std::max(sRGBLuminance(tcLin), 1e-4f), 0.999f);
+      const float meas = std::max(
+        RtxGlobalVolumetrics::transmittanceMeasurementDistanceMeters() * RtxOptions::getMeterToWorldUnitScale(),
+        1e-3f);
+      const float sigma = -std::log(tLum) / meas;
+      const Vector3 alb = RtxGlobalVolumetrics::singleScatteringAlbedo();
+      const float aLum = std::min(std::max(sRGBLuminance(alb), 0.0f), 1.0f);
+      const float scenicMeters = std::max(
+        RtxGlobalVolumetrics::froxelMaxDistanceMeters() * 3.0f,
+        120.0f);
+      const float scenicPath = scenicMeters * RtxOptions::getMeterToWorldUnitScale();
+      const float extOd = sigma * scenicPath;
+      const float absorbOd = sigma * (1.0f - aLum) * scenicPath;
+      const float fogOd = std::min(extOd + 1.5f * absorbOd, 8.0f);
+      // Thin media stay near the geometric disk; dense fog ramps to full widen.
+      constexpr float kFogOdSoftStart = 0.35f;
+      constexpr float kFogOdSoftFull = 2.0f;
+      const float fogSoft = atmSmoothstep(kFogOdSoftStart, kFogOdSoftFull, fogOd);
+      extraHalfAngle += fogSoft * (10.0f * (kAtmPi / 180.0f));
+    }
+  }
+  constexpr float kMaxHalfAngle = 12.0f * (kAtmPi / 180.0f);
+  const float halfAngle = std::min(baseHalfAngle + extraHalfAngle, kMaxHalfAngle);
+
+  const Vector3 clamped(
+    std::max(radiance.x, 0.0f),
+    std::max(radiance.y, 0.0f),
+    std::max(radiance.z, 0.0f));
+
+  auto dl = RtDistantLight::tryCreate(propDir, halfAngle, clamped);
+  if (!dl) {
+    return;
+  }
+
+  RtLight rtl(*dl);
+  rtl.isDynamic = true; // Keep sun direction updating each frame.
+
+  if (m_sunDistantLight == nullptr) {
+    m_sunDistantLight = lm.createExternallyTrackedLight(rtl);
+  } else {
+    lm.updateExternallyTrackedLight(m_sunDistantLight, rtl);
+  }
 }
 
 } // namespace dxvk

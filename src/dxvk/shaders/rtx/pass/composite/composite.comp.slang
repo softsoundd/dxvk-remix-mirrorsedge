@@ -403,6 +403,10 @@ void applyVolumetricLighting(
   float volumetricRadianceScale,
   vec3 remodulatedTotalSecondaryRadiance,
   vec3 sharedRadiance,
+  // PSR one-bounce fog: firstHit > 0 enables dual froxel integrate.
+  float psrFirstHitDistance,
+  float psrReflectionSegmentSigned,
+  float3 psrReflectionDirection,
   out vec3 volumetricPreintegratedRadiance,
   out vec3 volumeAttenuation,
   out vec3 alphaBlendOutput,
@@ -434,10 +438,45 @@ void applyVolumetricLighting(
   {
     vec2 volumeUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
     volumeUV.x /= cb.volumeArgs.numFroxelVolumes;
-    integrateVolumetricNEE(
-      randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
-      cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, primaryMiss, cameraGetWorldPosition(cb.camera), viewDistance, primaryRayDirections.worldDirection,
-      volumetricPreintegratedRadiance, volumeAttenuation);
+
+    const bool psrReflectionFog = psrFirstHitDistance > 0.0f
+      && abs(psrReflectionSegmentSigned) > 0.0f
+      && dot(psrReflectionDirection, psrReflectionDirection) > 0.0f;
+
+    if (psrReflectionFog)
+    {
+      // Camera→mirror, then along the reflection ray. Froxels are camera-frustum grids
+      // (samples outside the frustum are approximate). T = T0*T1; S = S0 + T0*S1.
+      const float3 cameraPos = cameraGetWorldPosition(cb.camera);
+      float3 t0 = vec3(1.0f);
+      float3 s0 = vec3(0.0f);
+      integrateVolumetricNEE(
+        randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
+        cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, false,
+        cameraPos, psrFirstHitDistance, primaryRayDirections.worldDirection,
+        s0, t0);
+
+      const float3 mirrorPos = cameraPos + primaryRayDirections.worldDirection * psrFirstHitDistance;
+      const bool reflMiss = psrReflectionSegmentSigned < 0.0f;
+      const float reflSeg = abs(psrReflectionSegmentSigned);
+      float3 t1 = vec3(1.0f);
+      float3 s1 = vec3(0.0f);
+      integrateVolumetricNEE(
+        randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
+        cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, reflMiss,
+        mirrorPos, reflSeg, psrReflectionDirection,
+        s1, t1);
+
+      volumeAttenuation = t0 * t1;
+      volumetricPreintegratedRadiance = s0 + t0 * s1;
+    }
+    else
+    {
+      integrateVolumetricNEE(
+        randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
+        cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, primaryMiss, cameraGetWorldPosition(cb.camera), viewDistance, primaryRayDirections.worldDirection,
+        volumetricPreintegratedRadiance, volumeAttenuation);
+    }
   }
 
   // Stochastic alpha blend
@@ -579,6 +618,12 @@ void applySkyContribution(
     return;
   }
 
+  // Physical Atmosphere sky is already in SharedRadiance — skip SkyMatte/SkyLight.
+  if (cb.volumeArgs.physicalAtmosphereEnabled != 0)
+  {
+    return;
+  }
+
   vec3 skyContribution;
   if (cb.domeLightArgs.active)
   {
@@ -697,7 +742,30 @@ vec4 compositeResult(
   const vec3 viewPosition = cameraReconstructViewPosition(cb.camera, primaryRayDirections.viewDirection, primaryLinearViewZ);
   // Note: Should be equal to the virtual hit distance just without needing to read it (since we need the linear view Z in world space for
   // other calculations here anyways and can just use it to reconstruct this).
-  const float viewDistance = length(viewPosition);
+  // PSR replaces PrimaryLinearViewZ with virtual path length — do not use it for froxel distance.
+  // Reflection PSR: dual-integrate using stashed first-bounce segment + direction.
+  // Transmission-only: fog along camera→first-hit (no reflection stash).
+  float viewDistance = length(viewPosition);
+  float volumeHitDistance = viewDistance;
+  float psrFirstHitDistance = -1.0f;
+  float psrReflectionSegmentSigned = 0.0f;
+  float3 psrReflectionDirection = float3(0.0f, 0.0f, 0.0f);
+  if (geometryFlags.performedAnyPSR() && !geometryFlags.secondarySurfaceMask)
+  {
+    const float firstHit = PsrFirstHitDistance[pixelCoordinate];
+    if (firstHit > 0.0f)
+    {
+      volumeHitDistance = firstHit;
+      viewDistance = firstHit;
+      // Dual integrate only when reflection PSR stashed segment/direction (PSTR leaves those buffers uncleared).
+      if (geometryFlags.performPSRR)
+      {
+        psrFirstHitDistance = firstHit;
+        psrReflectionSegmentSigned = PsrReflectionSegmentLength[pixelCoordinate];
+        psrReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[pixelCoordinate]);
+      }
+    }
+  }
 
   vec3 sharedRadiance;
   vec3 remodulatedTotalPrimaryRadiance;
@@ -761,8 +829,9 @@ vec4 compositeResult(
 
   // Calculate volumetric lighting
   applyVolumetricLighting(
-    pixelCoordinate, randomState, primaryRayDirections, pixelIsActive, primaryMiss, viewDistance,
+    pixelCoordinate, randomState, primaryRayDirections, pixelIsActive, primaryMiss, volumeHitDistance,
     radianceScale, volumetricRadianceScale, remodulatedTotalSecondaryRadiance, sharedRadiance,
+    psrFirstHitDistance, psrReflectionSegmentSigned, psrReflectionDirection,
     volumetricPreintegratedRadiance, volumeAttenuation, alphaBlendOutput, backgroundAlpha,
     radianceOutput, particleLayerOutput);
 
@@ -771,13 +840,28 @@ vec4 compositeResult(
   // while accumulating already), so it can be added in here without issue.
   radianceOutput += remodulatedTotalPrimaryRadiance * volumeAttenuation;
 
-  // Note: Shared radiance should always be pre-attenuated so no need to factor that in here - it contains multiple layers of signal so each contribution must be attenuated inline.
-  radianceOutput += sharedRadiance;
+  // SharedRadiance on a primary HIT is pre-attenuated. On a MISS it holds sky without
+  // froxel volumetrics yet — apply volumeAttenuation so sky and geometry share fog.
+  // Soften under Physical Atmosphere as OD grows (fogSkyAttenuationPower).
+  // PSR forces primaryMiss=false even for reflection sky; treat that like a miss here.
+  const bool psrReflectionSkyMiss = geometryFlags.performPSRR
+    && !geometryFlags.secondarySurfaceMask
+    && psrReflectionSegmentSigned < 0.0f;
+  const bool attenuateSharedAsSky = primaryMiss || psrReflectionSkyMiss;
+  vec3 skyVolumeAttenuation = volumeAttenuation;
+  if (attenuateSharedAsSky && cb.volumeArgs.physicalAtmosphereEnabled != 0)
+  {
+    const float3 T = max(volumeAttenuation, vec3(1e-6f));
+    const float avgT = (T.x + T.y + T.z) * (1.0f / 3.0f);
+    const float opticalDepth = -log(avgT);
+    const float softAmount = saturate(opticalDepth / 2.0f);
+    const float skyPower = lerp(1.0f, max(cb.volumeArgs.fogSkyAttenuationPower, 1e-3f), softAmount);
+    skyVolumeAttenuation = pow(T, skyPower);
+  }
+  radianceOutput += attenuateSharedAsSky ? (sharedRadiance * skyVolumeAttenuation) : sharedRadiance;
 
-  // Add sky radiance
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
-  // Apply fog 
   applyFog(viewDistance, radianceScale, radianceOutput, particleLayerOutput);
 
   // DLSS-RR needs to do alpha blending using the backgroundAlpha, so the input is untouched here.

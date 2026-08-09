@@ -50,6 +50,10 @@
 
 #define COMPOSITE_BSDF_FACTOR_INPUT                                 17
 #define COMPOSITE_BSDF_FACTOR2_INPUT                                18
+// PSR fog: first-hit distance, reflection segment (neg ⇒ miss), reflection direction.
+#define COMPOSITE_PSR_FIRST_HIT_DISTANCE_INPUT                      19
+#define COMPOSITE_PSR_REFLECTION_SEGMENT_INPUT                      29
+#define COMPOSITE_PSR_REFLECTION_DIRECTION_INPUT                    32
 
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT                20
 #define COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT                  21

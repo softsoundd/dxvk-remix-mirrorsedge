@@ -98,8 +98,30 @@ struct VolumeArgs {
   float maxAttenuationDistanceForNoAtmosphere;
   uint resetHistory;
   uint16_t enableTranslucentShadows;
-  uint16_t pad0;
-  uint pad1;
+  // Non-zero when rtx.skyMode is Physical Atmosphere (composite CB has no skyMode).
+  uint16_t physicalAtmosphereEnabled;
+  // Artistic gain on froxel-cache in-scatter (Physical Atmosphere). 1 = physical.
+  float fogSunVisibilityGain;
+
+  // Physical Atmosphere froxel lighting (sky-view LUT hemisphere strength).
+  float skyAmbientStrength;
+  // Exponential fog density scale height in world units; <=0 disables falloff.
+  float fogDensityScaleHeight;
+  // Sun x ground-albedo upward lobe into froxel SH.
+  float groundBounceScale;
+  // Softens Beer on primary-miss SharedRadiance under thick fog (<1).
+  float fogSkyAttenuationPower;
+
+  // Multiplies froxel firefly threshold for distant lights under Physical Atmosphere.
+  float fogSunFireflyScale;
+  // World units per meter (= getMeterToWorldUnitScale).
+  float worldUnitsPerMeter;
+  float multiScatterResidualScale;
+  // 0 = keep artistic medium colour; >0 desats σ_s + mild warm bias at low sun.
+  float fogSunsetColorBlend;
+
+  vec3 fogSunsetWarmTint;
+  float pad1;
 };
 
 #ifdef __cplusplus

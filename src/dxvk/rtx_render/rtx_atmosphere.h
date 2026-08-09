@@ -29,12 +29,14 @@ namespace dxvk {
 
 class DxvkContext;
 class DxvkDevice;
+class RtxContext;
+struct RtLight;
 
 /**
  * \brief Hillaire Physically-Based Atmospheric Scattering
- * 
- * Manages lookup table (LUT) resources and compute shader dispatch
- * for atmospheric scattering based on Sebastien Hillaire's method.
+ *
+ * Manages LUT resources and compute dispatch for Hillaire atmosphere, and injects
+ * the sun as an RtDistantLight shared by surface NEE and Volume ReSTIR.
  */
 class RtxAtmosphere : public CommonDeviceObject {
 public:
@@ -79,9 +81,39 @@ public:
   Resources::Resource getSkyViewLut() const { return m_skyViewLut; }
 
   /**
+   * \brief Build atmosphere parameters from current RtxOptions (no GPU state).
+   */
+  static AtmosphereArgs buildAtmosphereArgsFromOptions();
+
+  /**
    * \brief Get current atmosphere parameters
    */
-  AtmosphereArgs getAtmosphereArgs() const;
+  AtmosphereArgs getAtmosphereArgs() const {
+    return buildAtmosphereArgsFromOptions();
+  }
+
+  /**
+   * \brief Isotropic sky ambient estimate for volumetric multi-scatter fill.
+   * Scale is applied by the caller. Prefer sky-view LUT froxel inject when available.
+   */
+  static Vector3 estimateVolumeAmbientRadiance(const AtmosphereArgs& args);
+
+  /**
+   * \brief Low-sun warm tint for froxel composite (σ_s desaturation + mild warm bias).
+   *
+   * outBlend is 0 at high sun and rises toward the horizon. Keeps artistic medium colour
+   * at high sun while shifting in-scatter toward expected low-sun haze behaviour.
+   */
+  static void estimateVolumeSunsetWarmTint(const AtmosphereArgs& args, Vector3& outTint, float& outBlend);
+
+  /**
+   * \brief Sync the atmosphere sun into the scene light pool as an RtDistantLight.
+   * Sole sun path for surface NEE and Volume ReSTIR while Physical Atmosphere is active.
+   */
+  void syncDistantSunLight(RtxContext& ctx, const AtmosphereArgs& args);
+
+  /** \brief Remove the injected sun distant light. */
+  void dropDistantSunLight();
 
 private:
   void createLutResources(Rc<DxvkContext> ctx);
@@ -108,6 +140,8 @@ private:
   AtmosphereArgs m_cachedArgs;
   bool m_initialized = false;
   bool m_lutsNeedRecompute = true;
+
+  RtLight* m_sunDistantLight = nullptr; // LightManager-owned; pointer only.
 };
 
 } // namespace dxvk

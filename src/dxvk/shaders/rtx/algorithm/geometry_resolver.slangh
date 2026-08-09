@@ -2645,6 +2645,28 @@ void geometryPSRResolverVertex(
     }
   }
 
+  // Volumetrics: SecondaryHitDistance stays camera→first-mirror.
+  // Bounce 1 stashes reflection segment length + direction for composite froxel integrate.
+  // Do not use SecondaryWorldPosition (aliased with IndirectRayOriginDirection).
+  // bounceIteration is 1-based after the loop increment.
+  if (geometryPSRResolverState.bounceIteration == 1 && !geometryPSRResolverState.isTransmissionPSR)
+  {
+    const GeometryFlags gf = geometryFlagsReadFromGBuffer(
+      geometryPSRResolverState.pixelCoordinate, SharedFlags);
+    if (!gf.secondarySurfaceMask)
+    {
+      const bool reflHit = rayInteractionHasHit(rayInteraction);
+      const float segmentLength = reflHit
+        ? geometryPSRResolverState.segmentHitDistance
+        : cb.volumeArgs.froxelMaxDistance;
+      // Negative length ⇒ reflection sky miss (infinite froxel/atmosphere tail).
+      SecondaryLinearViewZ[geometryPSRResolverState.pixelCoordinate] =
+        reflHit ? segmentLength : -segmentLength;
+      SecondaryViewDirection[geometryPSRResolverState.pixelCoordinate] =
+        sphereDirectionToSignedOctahedral(geometryPSRResolverState.direction);
+    }
+  }
+
   // Note: Emissive radiance handled first so objects with opacity do not attenuate themselves.
   geometryPSRResolverState.radiance += emissiveRadiance * geometryPSRResolverState.attenuation;
 
@@ -3116,8 +3138,10 @@ void geometryResolver(ivec2 pixelCoordinate) {
 
   // Output miss data for the secondary surface if it is not present
   // Note: Known to not be the selected surface in this case, hence why false is passed for this.
+  // When PSR will run, SecondaryHitDistance holds camera→first-hit — keep it so
+  // composite does not use the accumulated virtual PSR path. Transmission PSR also seeds from this.
 
-  if (!secondarySurfaceMask)
+  if (!secondarySurfaceMask && !geometryResolverState.performedAnyPSR())
   {
     geometryResolverOutputMiss<false, false>(geometryResolverState.pixelCoordinate);
   }
@@ -3631,7 +3655,8 @@ void geometryPSRPreparePass(ivec2 pixelCoordinate) {
   SecondaryHitDistance[pixelCoordinate] = PrimaryHitDistance[pixelCoordinate];
   PrimaryDisocclusionThresholdMix[pixelCoordinate] = useAlternateDisocclusionThreshold ? 1.0f : 0.0f;
 
-  if (!geometryFlags.secondarySurfaceMask)
+  // Keep SecondaryHitDistance as camera→first-hit when PSR will run (see geometryResolver).
+  if (!geometryFlags.secondarySurfaceMask && !geometryFlags.performedAnyPSR())
   {
     geometryResolverOutputMiss<false, false>(pixelCoordinate);
   }

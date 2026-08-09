@@ -113,6 +113,9 @@ namespace dxvk {
         CONSTANT_BUFFER(COMPOSITE_CONSTANTS_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR2_INPUT)
+        TEXTURE2D(COMPOSITE_PSR_FIRST_HIT_DISTANCE_INPUT)
+        TEXTURE2D(COMPOSITE_PSR_REFLECTION_SEGMENT_INPUT)
+        TEXTURE2D(COMPOSITE_PSR_REFLECTION_DIRECTION_INPUT)
         TEXTURE2D(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT)
         TEXTURE2D(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT)
@@ -328,6 +331,10 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_PRIMARY_SPECULAR_ALBEDO_INPUT, rtOutput.m_primarySpecularAlbedo.view(Resources::AccessType::Read), nullptr);
     ctx->bindResourceView(COMPOSITE_PRIMARY_LINEAR_VIEW_Z_INPUT, rtOutput.m_primaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(COMPOSITE_PRIMARY_VIRTUAL_WORLD_SHADING_NORMAL_INPUT, rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness.view, nullptr);
+    // PSR fog: first-hit distance, reflection segment, reflection direction.
+    ctx->bindResourceView(COMPOSITE_PSR_FIRST_HIT_DISTANCE_INPUT, rtOutput.m_secondaryHitDistance.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PSR_REFLECTION_SEGMENT_INPUT, rtOutput.m_secondaryLinearViewZ.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PSR_REFLECTION_DIRECTION_INPUT, rtOutput.m_secondaryViewDirection.view(Resources::AccessType::Read), nullptr);
 
     ctx->bindResourceView(COMPOSITE_SECONDARY_ATTENUATION_INPUT, rtOutput.m_secondaryAttenuation.view, nullptr);
     ctx->bindResourceView(COMPOSITE_SECONDARY_ALBEDO_INPUT, rtOutput.m_secondaryAlbedo.view, nullptr);
