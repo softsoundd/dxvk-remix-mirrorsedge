@@ -331,7 +331,9 @@ namespace dxvk {
                "constant-differentiated sibling sets of any size do not trip it. Only active when material "
                "instance hashing is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
-               "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
+               "UE3 compat: log pass/vertex-factory classification decisions for draw routing. "
+               "Also emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
+               "for Particle / ParticleBeamTrail / LensFlare draws.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
@@ -1016,6 +1018,7 @@ namespace dxvk {
                                  uint32_t usedSamplerMask,
                                  uint32_t usedTextureMask,
                                  const PsSamplerTexcoordEntry* inferredEntry);
+    void logUe3ParticleDrawOnce();
 
     struct Ue3VsTexcoordTraceEntry {
       bool initialized = false;

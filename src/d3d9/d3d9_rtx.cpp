@@ -8420,6 +8420,87 @@ namespace dxvk {
       constantLog));
   }
 
+  void D3D9Rtx::logUe3ParticleDrawOnce() {
+    if (!m_frameOptions.ue3LogClassification || !m_frameOptions.ue3EngineMode) {
+      return;
+    }
+
+    const Ue3VertexFactoryType vf = m_currentUe3VertexFactory;
+    if (vf != Ue3VertexFactoryType::Particle &&
+        vf != Ue3VertexFactoryType::ParticleBeamTrail &&
+        vf != Ue3VertexFactoryType::LensFlare) {
+      return;
+    }
+
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+    const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+    const XXH64_hash_t textureSetShaderHash = m_activeDrawCallState.materialData.getTextureSetAndShaderHash();
+    const bool hasAlbedo = m_activeDrawCallState.materialData.colorTextures[0].isValid();
+    const bool hasConstantAlbedo = m_activeDrawCallState.materialData.hasUe3ConstantAlbedo;
+
+    const auto& cats = m_activeDrawCallState.getCategoryFlags();
+    const bool particleTagged = cats.test(InstanceCategories::Particle);
+    const bool beamTagged = cats.test(InstanceCategories::Beam);
+    const bool hideTagged = cats.test(InstanceCategories::Hidden);
+    const bool ignoreTagged = cats.test(InstanceCategories::Ignore);
+
+    // Include category bits so author tag toggles produce a fresh line.
+    XXH64_hash_t key = XXH3_64bits_withSeed(&vf, sizeof(vf), 0);
+    key = XXH3_64bits_withSeed(&psHash, sizeof(psHash), key);
+    key = XXH3_64bits_withSeed(&materialHash, sizeof(materialHash), key);
+    key = XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), key);
+    const uint32_t categoryBits =
+      (particleTagged ? 1u : 0u) |
+      (beamTagged ? 2u : 0u) |
+      (hideTagged ? 4u : 0u) |
+      (ignoreTagged ? 8u : 0u);
+    key = XXH3_64bits_withSeed(&categoryBits, sizeof(categoryBits), key);
+
+    static fast_unordered_set s_loggedParticleDraws;
+    if (!s_loggedParticleDraws.insert(key).second) {
+      return;
+    }
+
+    const bool alphaBlend = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+    const DWORD srcBlend = d3d9State().renderStates[D3DRS_SRCBLEND];
+    const DWORD dstBlend = d3d9State().renderStates[D3DRS_DESTBLEND];
+    const bool likelyEmissiveBlend =
+      alphaBlend &&
+      ((srcBlend == D3DBLEND_SRCALPHA && dstBlend == D3DBLEND_ONE) ||
+       (srcBlend == D3DBLEND_ONE && dstBlend == D3DBLEND_ONE) ||
+       (srcBlend == D3DBLEND_SRCCOLOR && dstBlend == D3DBLEND_ONE) ||
+       (srcBlend == D3DBLEND_ONE && dstBlend == D3DBLEND_SRCCOLOR));
+
+    std::string constantAlbedoLog;
+    if (hasConstantAlbedo) {
+      const Vector4& c = m_activeDrawCallState.materialData.ue3ConstantAlbedo;
+      constantAlbedoLog = str::format(" constantAlbedo=(", c.x, ",", c.y, ",", c.z, ",", c.w, ")");
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Particle] vf=", describeUe3VertexFactory(vf),
+      " ps=0x", std::hex, psHash,
+      " materialHash=0x", materialHash,
+      " textureHash=0x", textureHash,
+      " textureSetShaderHash=0x", textureSetShaderHash, std::dec,
+      " hasAlbedo=", hasAlbedo ? 1 : 0,
+      " hasConstantAlbedo=", hasConstantAlbedo ? 1 : 0,
+      " particleTagged=", particleTagged ? 1 : 0,
+      " beamTagged=", beamTagged ? 1 : 0,
+      " hideTagged=", hideTagged ? 1 : 0,
+      " ignoreTagged=", ignoreTagged ? 1 : 0,
+      " alphaBlend=", alphaBlend ? 1 : 0,
+      " srcBlend=", srcBlend,
+      " dstBlend=", dstBlend,
+      " likelyEmissiveBlend=", likelyEmissiveBlend ? 1 : 0,
+      constantAlbedoLog));
+  }
+
   PrepareDrawFlags D3D9Rtx::internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext) {
     ScopedCpuProfileZone();
 
@@ -9435,6 +9516,38 @@ namespace dxvk {
             chosenStages[1] = cachedSelection->second.chosenStages[1];
             strictCubemapFallbackStage = cachedSelection->second.cubemapFallbackStage;
             selectionFromCache = true;
+
+            // Reject cached picks that landed on a non-movie render target so a real
+            // material sampler can re-compete (UE3 soft-particle scene buffers, etc.).
+            if (m_frameOptions.ue3EngineMode &&
+                chosenStages[0] != kInvalidStage &&
+                chosenStages[0] < SamplerCount &&
+                d3d9State().textures[chosenStages[0]] != nullptr) {
+              D3D9CommonTexture* cachedPrimary =
+                GetCommonTexture(d3d9State().textures[chosenStages[0]]);
+              if (cachedPrimary != nullptr && cachedPrimary->IsRenderTarget()) {
+                const XXH64_hash_t cachedDescHash =
+                  cachedPrimary->GetImage() != nullptr
+                    ? cachedPrimary->GetImage()->getDescriptorHash()
+                    : kEmptyHash;
+                bool cachedLooksMovie = isUe3MovieTextureDescHash(cachedDescHash);
+                if (!cachedLooksMovie &&
+                    inferredPsEntry != nullptr &&
+                    chosenStages[0] < caps::MaxTexturesPS) {
+                  cachedLooksMovie =
+                    (inferredPsEntry->samplerSemanticFlags[chosenStages[0]] &
+                     kPsSamplerSemanticMovieTexture) != 0;
+                }
+                if (!cachedLooksMovie) {
+                  chosenStages[0] = kInvalidStage;
+                  chosenStages[1] = kInvalidStage;
+                  strictCubemapFallbackStage = kInvalidStage;
+                  selectionFromCache = false;
+                  m_ue3DiffuseSelectionCache.erase(cachedSelection);
+                  m_loggedAlbedoSelections.erase(selectionCacheKey);
+                }
+              }
+            }
           } else {
             // superseding re-score: let ue3LogAlbedoSelection dump the authoritative decision
             m_loggedAlbedoSelections.erase(selectionCacheKey);
@@ -9614,6 +9727,13 @@ namespace dxvk {
         if (texHash == kEmptyHash)
           continue;
 
+        // UE3: reject hashed non-movie render targets as legacy albedo. Soft-particle /
+        // scene-color buffers often carry a content hash, and at high resolutions their
+        // pixel-area score outranks the RT penalties below (displacing the real material
+        // texture). Movie surfaces remain eligible. Non-UE3 keeps the score penalties only.
+        if (m_frameOptions.ue3EngineMode && isRenderTarget && !isMovieTexture)
+          continue;
+
         // effective area: a small texture tiled NxM times covers N*M times its pixel area
         // (UE3 TexCoord UTiling/VTiling folded into shader literals, or held in a scalar-parameter
         // constant resolved at decision time; ue3StableDiffuseSelection pins the resulting pick).
@@ -9710,8 +9830,9 @@ namespace dxvk {
         // sky/ambient lighting terms but can never be a surface albedo.
         score += (looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
                   inferredSamplerExprDiffuseAnchor) ? 2'500'000 : 0;
-        // normal maps get no size credit - resolution advantage must not offset the decode penalty
-        score += normalDecodeActive
+        // normal maps get no size credit - resolution advantage must not offset the decode penalty.
+        // Non-movie RTs also get none: their near-backbuffer area otherwise dominates scoring.
+        score += (normalDecodeActive || (isRenderTarget && !isMovieTexture))
           ? 0
           : int64_t(std::min<uint64_t>(effectiveArea, 16ull * 1024ull * 1024ull));
         // near-exact ties among color-chain candidates (magnitudes stay below any real signal):
@@ -9861,7 +9982,7 @@ namespace dxvk {
 
       // if no candidate scored, fall back to the lowest PS-used sampler holding a bindable
       // (hashed) texture - never raw stage 0, which may hold a stale texture the shader
-      // never samples, and never a hashless render target the binding loop would reject
+      // never samples, and never a hashless / UE3 non-movie render target
       if (chosenStages[0] == kInvalidStage) {
         for (uint32_t stage : bit::BitMask(usedTextureMask)) {
           if (stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
@@ -9870,6 +9991,15 @@ namespace dxvk {
           if (texture == nullptr || texture->GetImage() == nullptr ||
               texture->GetImage()->getHash() == kEmptyHash)
             continue;
+          if (m_frameOptions.ue3EngineMode && texture->IsRenderTarget()) {
+            const XXH64_hash_t fallbackDescHash = texture->GetImage()->getDescriptorHash();
+            const bool fallbackLooksMovie =
+              isUe3MovieTextureDescHash(fallbackDescHash) ||
+              (inferredPsEntry != nullptr && stage < caps::MaxTexturesPS &&
+               (inferredPsEntry->samplerSemanticFlags[stage] & kPsSamplerSemanticMovieTexture) != 0);
+            if (!fallbackLooksMovie)
+              continue;
+          }
           chosenStages[0] = uint8_t(stage);
           break;
         }
@@ -10698,6 +10828,7 @@ namespace dxvk {
       }
 
       m_activeDrawCallState.setupCategoriesForTexture();
+      logUe3ParticleDrawOnce();
 
       // Track the material hash before checking if it should be ignored
       // This ensures we track all materials sent by the game, not just the ones that are actually rendered.
