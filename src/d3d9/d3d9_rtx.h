@@ -380,8 +380,8 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", fast_unordered_set, deferredUiPixelShaders, {},
                "Pixel shader bytecode hashes whose draws are treated as deferred UI overlays (see rtx.deferredUiTextures).\n"
                "Prefer this over texture tagging when the overlay samples a render target (e.g. UE3's scene color copy): "
-               "render-target texture hashes change every time the game recreates the target (respawn/level load), while "
-               "the overlay material's pixel shader hash is stable across respawns, level loads and sessions. Whenever a "
+               "RT image hashes change on recreation. Prefer a pixel shader tag, or the resolution-agnostic RT "
+               "descriptor hash from the texture picker via rtx.deferredUiTextures. Whenever a "
                "tagged texture matches a draw, the runtime logs that draw's pixel shader hash ([RTX-DeferredUI] log lines) "
                "so the tag can be moved into this option.\n"
                "A pixel shader tag is treated as explicit intent: unlike texture tags it is not subject to the engine "
@@ -1029,6 +1029,10 @@ namespace dxvk {
     fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
     fast_unordered_set m_ue3MovieTextureDescHashes;
 
+    // True if the image's resolution-agnostic RT descriptor hash is tagged in
+    // rtx.raytracedRenderTargetTextures (and optionally the auto-detected set).
+    bool isTaggedRaytracedRenderTarget(const Rc<DxvkImage>& image, bool includeAutoDetected) const;
+
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,
     //       but only relative values, see USE_TRUE_CAMERA_POSITION_FOR_COMPARISON
@@ -1246,11 +1250,9 @@ namespace dxvk {
     // [RTX-DeferredUI] tag diagnostics
     fast_unordered_set m_deferredUiLoggedDecisions;
 
-    // Checks whether the draw matches rtx.deferredUiTextures (by texture image hash, or by the
-    // stable descriptor hash for render-target textures) or rtx.d3d9.deferredUiPixelShaders.
-    bool isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash = nullptr,
-                                bool* pMatchedTextureIsRenderTarget = nullptr,
-                                XXH64_hash_t* pMatchedRtDescriptorHash = nullptr) const;
+    // Checks whether the draw matches rtx.deferredUiTextures (image hash for non-RTs, or
+    // resolution-agnostic RT descriptor hash) or rtx.d3d9.deferredUiPixelShaders.
+    bool isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash = nullptr) const;
 
     bool captureDeferredUiDraw(const IndexContext& indexContext,
                                const VertexContext vertexContext[caps::MaxStreams],
@@ -1283,9 +1285,11 @@ namespace dxvk {
     struct BoundTextureSnapshotEntry {
       D3D9CommonTexture* texture = nullptr;
       XXH64_hash_t imageHash = kEmptyHash;
-      // Descriptor hash of render targets only; deferred-UI tag matching relies on this
-      // being zero for non-RT textures (a descriptor-hash match implies "is an RT").
+      // RT-only absolute descriptor hash (includes Width/Height); also copied into
+      // descriptorHash below for MIC / identity paths that need a size-dependent key.
       XXH64_hash_t rtDescriptorHash = 0;
+      // RT-only aspect-normalized descriptor hash used by deferred-UI / raytraced-RT tagging.
+      XXH64_hash_t rtResolutionAgnosticDescriptorHash = 0;
       // Descriptor hash of every image (stable across recreation, unlike imageHash for
       // GPU-written or session-composited textures).
       XXH64_hash_t descriptorHash = 0;

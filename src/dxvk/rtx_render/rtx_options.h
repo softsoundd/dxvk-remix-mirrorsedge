@@ -214,7 +214,9 @@ namespace dxvk {
                   "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
                   "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
                   "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
-                  "For render-target textures the stable descriptor hash matches in addition to the (recreation-dependent) image hash, and rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
+                  "For render-target textures, matching accepts the resolution-agnostic descriptor hash "
+                  "(aspect-normalized Width/Height; what the texture picker registers for RTs). Non-RT textures "
+                  "match by image hash. rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
                   "Tagging is not absolute: depth-writing draws, world geometry (anything beyond trivial depth-test-off overlay quads), and engine post-process shaders are refused deferral and classified normally, so shared textures cannot pull scene geometry out of the ray-traced world.\n"
                   "See rtx.d3d9.deferredUiReplay and rtx.d3d9.deferredUiRefreshSceneColor for the replay behavior.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
@@ -342,7 +344,8 @@ namespace dxvk {
                   args.onChangeCallback = &geometryAssetHashRuleStringOnChange,
                   args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION_ARGS("rtx", fast_unordered_set, raytracedRenderTargetTextures, {},
-                    "DescriptorHashes for Render Targets. (Screens that should display the output of another camera).",
+                    "Resolution-agnostic descriptor hashes for render targets that should display the output of "
+                    "another camera (what the texture picker registers for RTs).",
                     args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION("rtx", fast_unordered_set, particleEmitterTextures, {}, "Objects rendered with these textures will emit particles that inherit the material of the object itself.");
     RTX_OPTION("rtx", fast_unordered_set, smoothNormalsTextures, {},

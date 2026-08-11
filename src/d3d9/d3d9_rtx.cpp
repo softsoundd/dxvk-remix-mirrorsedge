@@ -7125,9 +7125,7 @@ namespace dxvk {
         if (!texture || texture->GetImage() == nullptr)
           continue;
 
-        const XXH64_hash_t texDescHash = texture->GetImage()->getDescriptorHash();
-        if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, texDescHash) ||
-            lookupHash(m_autoRaytracedRenderTargetDescHashes, texDescHash)) {
+        if (isTaggedRaytracedRenderTarget(texture->GetImage(), true)) {
           m_activeDrawCallState.isUsingRaytracedRenderTarget = true;
         }
       }
@@ -7163,14 +7161,10 @@ namespace dxvk {
     // depth-test-disabled translucency skip directly below and the deferred-overlay
     // branch further down.
     XXH64_hash_t deferredUiMatchedTextureHash = 0;
-    bool deferredUiMatchedTextureIsRenderTarget = false;
-    XXH64_hash_t deferredUiMatchedRtDescriptorHash = 0;
     int deferredUiTagState = -1;
     auto isDeferredUiTagged = [&]() {
       if (deferredUiTagState < 0) {
-        deferredUiTagState = isDeferredUiTaggedDraw(&deferredUiMatchedTextureHash,
-                                                    &deferredUiMatchedTextureIsRenderTarget,
-                                                    &deferredUiMatchedRtDescriptorHash) ? 1 : 0;
+        deferredUiTagState = isDeferredUiTaggedDraw(&deferredUiMatchedTextureHash) ? 1 : 0;
       }
       return deferredUiTagState == 1;
     };
@@ -7292,8 +7286,6 @@ namespace dxvk {
     // meshes) must not pull geometry out of the ray-traced scene.
     if (!m_frameOptions.deferredUiTextures->empty() || !m_frameOptions.deferredUiPixelShaders->empty()) {
       const XXH64_hash_t& matchedTextureHash = deferredUiMatchedTextureHash;
-      const bool& matchedTextureIsRenderTarget = deferredUiMatchedTextureIsRenderTarget;
-      const XXH64_hash_t& matchedRtDescriptorHash = deferredUiMatchedRtDescriptorHash;
 
       if (isDeferredUiTagged()) {
         const bool matchedByPixelShaderTag = matchedTextureHash == 0;
@@ -7361,18 +7353,6 @@ namespace dxvk {
             " ztest=", depthTestDisabled ? 0 : 1,
             " zwrite=", zWriteEnabled ? 1 : 0,
             matchedDescription));
-
-          if (eligible && matchedTextureIsRenderTarget) {
-            Logger::info(str::format(
-              "[RTX-DeferredUI] Tagged texture 0x", std::hex, matchedTextureHash, std::dec,
-              " is a render target: its texture hash changes every time the game recreates it "
-              "(respawn/level load). For a stable tag use the pixel shader instead: add 0x",
-              std::hex, psHash, std::dec, " to rtx.d3d9.deferredUiPixelShaders",
-              matchedRtDescriptorHash != 0
-                ? str::format(" (the render target's stable descriptor hash 0x", std::hex, matchedRtDescriptorHash, std::dec, " also matches this category)")
-                : std::string(),
-              "."));
-          }
         }
 
         if (eligible) {
@@ -7420,13 +7400,9 @@ namespace dxvk {
       D3D9CommonTexture* texture = GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture());
       if (texture) {
         const Rc<DxvkImage> image = texture->GetImage();
-        if (image != nullptr) {
-          const XXH64_hash_t descHash = image->getDescriptorHash();
-          if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, descHash) ||
-              lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash)) {
-            m_activeDrawCallState.isDrawingToRaytracedRenderTarget = true;
-            return { RtxGeometryStatus::RayTraced, false };
-          }
+        if (image != nullptr && isTaggedRaytracedRenderTarget(image, true)) {
+          m_activeDrawCallState.isDrawingToRaytracedRenderTarget = true;
+          return { RtxGeometryStatus::RayTraced, false };
         }
       }
     }
@@ -7486,6 +7462,9 @@ namespace dxvk {
           if (!tex || tex->GetImage() == nullptr)
             continue;
 
+          if (isTaggedRaytracedRenderTarget(tex->GetImage(), true))
+            continue;
+
           const auto* desc = tex->Desc();
           if (!desc)
             continue;
@@ -7497,13 +7476,11 @@ namespace dxvk {
           const uint64_t area = uint64_t(desc->Width) * uint64_t(desc->Height);
           if (area > bestArea) {
             bestArea = area;
-            bestHash = tex->GetImage()->getDescriptorHash();
+            bestHash = tex->GetImage()->getResolutionAgnosticDescriptorHash();
           }
         }
 
-        if (bestHash != 0 &&
-            !lookupHash(*m_frameOptions.raytracedRenderTargetTextures, bestHash) &&
-            m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
+        if (bestHash != 0 && m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
           Logger::info(str::format(
             "[RTX-Compatibility] Auto-selected Raytraced Render Target from fullscreen composite: texDescHash=0x",
             std::hex, bestHash, std::dec, "."));
@@ -7604,6 +7581,8 @@ namespace dxvk {
       entry.imageHash = entry.hasImage ? image->getHash() : kEmptyHash;
       entry.isRenderTarget = texture->IsRenderTarget();
       entry.rtDescriptorHash = (entry.isRenderTarget && entry.hasImage) ? image->getDescriptorHash() : 0;
+      entry.rtResolutionAgnosticDescriptorHash =
+        (entry.isRenderTarget && entry.hasImage) ? image->getResolutionAgnosticDescriptorHash() : 0;
       // Non-RT images carry no descriptor hash on the DxvkImage; compute one only when
       // the identity exclusion option or the replacement diagnostics actually consume it.
       const bool wantDescriptorHashes =
@@ -7654,9 +7633,22 @@ namespace dxvk {
     return checkBoundTextureCategory(*m_frameOptions.uiTextures);
   }
 
-  bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash,
-                                       bool* pMatchedTextureIsRenderTarget,
-                                       XXH64_hash_t* pMatchedRtDescriptorHash) const {
+  bool D3D9Rtx::isTaggedRaytracedRenderTarget(const Rc<DxvkImage>& image, bool includeAutoDetected) const {
+    if (image == nullptr) {
+      return false;
+    }
+
+    const XXH64_hash_t agnosticHash = image->getResolutionAgnosticDescriptorHash();
+    if (agnosticHash == kEmptyHash) {
+      return false;
+    }
+    if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, agnosticHash)) {
+      return true;
+    }
+    return includeAutoDetected && lookupHash(m_autoRaytracedRenderTargetDescHashes, agnosticHash);
+  }
+
+  bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash) const {
     // Pixel shader tag: stable across texture streaming and render target recreation
     if (!m_frameOptions.deferredUiPixelShaders->empty() &&
         m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
@@ -7679,32 +7671,26 @@ namespace dxvk {
         continue;
       }
 
-      const bool isRenderTarget = entry.isRenderTarget;
-      const XXH64_hash_t descriptorHash = entry.rtDescriptorHash;
-
-      const auto reportMatch = [&](XXH64_hash_t matchedHash, bool matchedIsRenderTarget) {
+      const auto reportMatch = [&](XXH64_hash_t matchedHash) {
         if (pMatchedTextureHash) {
           *pMatchedTextureHash = matchedHash;
-        }
-        if (pMatchedTextureIsRenderTarget) {
-          *pMatchedTextureIsRenderTarget = matchedIsRenderTarget;
-        }
-        if (pMatchedRtDescriptorHash) {
-          *pMatchedRtDescriptorHash = descriptorHash;
         }
         return true;
       };
 
-      const XXH64_hash_t texHash = entry.imageHash;
-      if (texHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
-        return reportMatch(texHash, isRenderTarget);
+      // Non-RT overlays: image hash. RTs: resolution-agnostic descriptor hash only.
+      if (!entry.isRenderTarget) {
+        const XXH64_hash_t texHash = entry.imageHash;
+        if (texHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
+          return reportMatch(texHash);
+        }
+        continue;
       }
 
-      // Render targets: also match by descriptor hash, which is derived from the target's
-      // properties and thus stable across recreation (the image hash embeds a creation-order
-      // counter and changes on every respawn/level load).
-      if (descriptorHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, descriptorHash)) {
-        return reportMatch(descriptorHash, true);
+      const XXH64_hash_t resolutionAgnosticDescriptorHash = entry.rtResolutionAgnosticDescriptorHash;
+      if (resolutionAgnosticDescriptorHash != 0 &&
+          lookupHash(*m_frameOptions.deferredUiTextures, resolutionAgnosticDescriptorHash)) {
+        return reportMatch(resolutionAgnosticDescriptorHash);
       }
     }
 
@@ -8467,10 +8453,7 @@ namespace dxvk {
         if (texture) {
           const Rc<DxvkImage> image = texture->GetImage();
           if (image != nullptr) {
-            const XXH64_hash_t descHash = image->getDescriptorHash();
-            isRaytracedRenderTarget =
-              lookupHash(*m_frameOptions.raytracedRenderTargetTextures, descHash) ||
-              lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash);
+            isRaytracedRenderTarget = isTaggedRaytracedRenderTarget(image, true);
           }
         }
       }
@@ -8599,9 +8582,11 @@ namespace dxvk {
         // Try and find the has of the positions
         for (uint32_t i : bit::BitMask(m_parent->GetActiveRTTextures())) {
           D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-          auto hash = texture->GetImage()->getDescriptorHash();
-          if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, hash)) {
-            // Mark this as a valid Raytraced Render Target draw call
+          if (texture == nullptr || texture->GetImage() == nullptr) {
+            continue;
+          }
+          // Manual tags only here (auto-detection applies to drawing *to* an RT, not sampling it).
+          if (isTaggedRaytracedRenderTarget(texture->GetImage(), false)) {
             m_activeDrawCallState.isUsingRaytracedRenderTarget = true;
           }
         }

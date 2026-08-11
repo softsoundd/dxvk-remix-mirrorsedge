@@ -16,6 +16,17 @@
 #include <charconv>
 
 namespace dxvk {
+
+  XXH64_hash_t D3D9_COMMON_TEXTURE_DESC::CalculateResolutionAgnosticHash() const {
+    assert(sizeof(D3D9_COMMON_TEXTURE_DESC) == 44);
+
+    D3D9_COMMON_TEXTURE_DESC normalized = *this;
+    const UINT aspectGcd = std::max(1u, std::gcd(Width, Height));
+    normalized.Width = Width / aspectGcd;
+    normalized.Height = Height / aspectGcd;
+    return XXH3_64bits(&normalized, sizeof(normalized));
+  }
+
   D3D9CommonTexture::D3D9CommonTexture(
           D3D9DeviceEx*             pDevice,
     const D3D9_COMMON_TEXTURE_DESC* pDesc,
@@ -101,6 +112,9 @@ namespace dxvk {
       }
       if (m_image->getDescriptorHash() != kEmptyHash) {
         ImGUI::ReleaseTexture(m_image->getDescriptorHash());
+      }
+      if (m_image->getResolutionAgnosticDescriptorHash() != kEmptyHash) {
+        ImGUI::ReleaseTexture(m_image->getResolutionAgnosticDescriptorHash());
       }
     }
   }
@@ -355,9 +369,11 @@ namespace dxvk {
 
       // Generate descriptor hash from the image properties (not including actual pixel data)
       XXH64_hash_t descriptorHash = m_desc.CalculateHash();
+      XXH64_hash_t resolutionAgnosticDescriptorHash = m_desc.CalculateResolutionAgnosticHash();
 
       // save hash to dxvkImage
       image->setDescriptorHash(descriptorHash);
+      image->setResolutionAgnosticDescriptorHash(resolutionAgnosticDescriptorHash);
     }
     return image;
     // NV-DXVK end
@@ -646,7 +662,11 @@ namespace dxvk {
       // Assumption: All image hashes are created before creating sample view. Put assert here to track hash bugs.
       assert(m_image->getHash() != kEmptyHash);
       ImGUI::AddTexture(m_image->getHash(), m_sampleView.Color, ImGUI::kTextureFlagsDefault);
-      ImGUI::AddTexture(m_image->getDescriptorHash(), m_sampleView.Color, ImGUI::kTextureFlagsRenderTarget);
+      // Register the resolution-agnostic descriptor hash for RT category tagging.
+      const XXH64_hash_t agnosticHash = m_image->getResolutionAgnosticDescriptorHash();
+      if (agnosticHash != kEmptyHash) {
+        ImGUI::AddTexture(agnosticHash, m_sampleView.Color, ImGUI::kTextureFlagsRenderTarget);
+      }
     }
   }
 
@@ -770,9 +790,11 @@ namespace dxvk {
     if (IsRenderTarget()) {
       // Generate descriptor hash from the image properties (not including actual pixel data)
       XXH64_hash_t descriptorHash = m_desc.CalculateHash();
+      XXH64_hash_t resolutionAgnosticDescriptorHash = m_desc.CalculateResolutionAgnosticHash();
       m_image->setDescriptorHash(descriptorHash);
+      m_image->setResolutionAgnosticDescriptorHash(resolutionAgnosticDescriptorHash);
 
-      ImGUI::AddTexture(descriptorHash, texturePickerView, ImGUI::kTextureFlagsRenderTarget);
+      ImGUI::AddTexture(resolutionAgnosticDescriptorHash, texturePickerView, ImGUI::kTextureFlagsRenderTarget);
     }
   }
 
@@ -793,6 +815,11 @@ namespace dxvk {
     if (m_image->getDescriptorHash() != kEmptyHash) {
       ImGUI::ReleaseTexture(m_image->getDescriptorHash());
       m_image->setDescriptorHash(kEmptyHash);
+    }
+
+    if (m_image->getResolutionAgnosticDescriptorHash() != kEmptyHash) {
+      ImGUI::ReleaseTexture(m_image->getResolutionAgnosticDescriptorHash());
+      m_image->setResolutionAgnosticDescriptorHash(kEmptyHash);
     }
   }
 
