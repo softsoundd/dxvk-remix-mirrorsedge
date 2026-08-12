@@ -123,9 +123,6 @@ namespace dxvk {
     /* Mirror's Edge (2008)                       */
     { R"(\\MirrorsEdge\.exe$)", {{
       { "rtx.d3d9.ue3EngineMode",                                    "True" },
-      { "rtx.zUp",                                                   "True" },
-      { "rtx.sceneScale",                                            "1.0" },
-      { "rtx.d3d9.autoRaytracedRenderTargetFromFullscreenComposite", "True" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",            "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
       { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
@@ -142,7 +139,6 @@ namespace dxvk {
       { "rtx.playerModel.enableInPrimarySpace",                      "False" },
       { "rtx.playerModel.autoEnableInPrimarySpaceWhenNoViewModel",   "True" },
       { "rtx.playerModel.autoEnableInPrimarySpaceBodyDistance",      "100.0" },
-      { "rtx.playerModel.enablePrimaryShadows",                      "True" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

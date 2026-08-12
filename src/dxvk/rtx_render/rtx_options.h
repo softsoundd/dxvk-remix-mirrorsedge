@@ -1533,6 +1533,17 @@ namespace dxvk {
       // Need to set this to true after conf files are parsed, but before any options are accessed.
       RtxOptionImpl::setInitialized(true);
 
+      // Unreal Engine 3 is a Z-up engine, so its compatibility mode implies rtx.zUp. Only applied
+      // when no config file states an opinion, which leaves user.conf free to override it and
+      // saves every UE3 game profile from having to repeat it.
+      {
+        const Config& mergedConfig = RtxOptionLayer::getMergedConfig();
+        if (mergedConfig.getOption<bool>("rtx.d3d9.ue3EngineMode", false) &&
+            !mergedConfig.findOption("rtx.zUp")) {
+          zUp.setDeferred(true);
+        }
+      }
+
       // Replacement options
       if (env::getEnvVar("DXVK_DISABLE_ASSET_REPLACEMENT") == "1") {
         enableReplacementAssets.setDeferred(false);

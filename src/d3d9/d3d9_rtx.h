@@ -104,7 +104,8 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useVertexCapturedTexcoords, false, "When enabled, vertex shader output texcoords always override input texcoords from the vertex declaration. Enable for games where the vertex shader applies meaningful UV transformations that should be used for ray tracing (e.g. animated UVs via shader constants).");
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
     RTX_OPTION("rtx.d3d9", bool, ue3EngineMode, false,
-               "Master toggle for Unreal Engine 3 D3D9 compatibility.");
+               "Master toggle for Unreal Engine 3 D3D9 compatibility. Also defaults rtx.zUp to True, UE3 being a "
+               "Z-up engine, unless a config file sets it explicitly.");
     RTX_OPTION("rtx.d3d9", bool, ue3CameraFromShaderConstants, false,
                "UE3 compat: derive World/View and View/Projection matrices from UE3 reserved shader constants. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
