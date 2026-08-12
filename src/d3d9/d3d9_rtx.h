@@ -247,10 +247,12 @@ namespace dxvk {
                "geometry is ingested into the ray-traced scene through mirrored or oblique-clipped views, "
                "corrupting it. World-geometry draws are dropped when any capture signal matches: viewport "
                "strictly smaller than half the backbuffer in both dimensions (probe-sized targets; exact-half "
-               "splitscreen viewports are never matched), a mirrored view-projection (negative 3x3 determinant, "
-               "reflect probes' FMirrorMatrix), or a CTAB-declared camera that fails plausibility extraction "
-               "(reflect/portal probes' oblique FClipProjectionMatrix near-plane clip; the main view always "
-               "extracts). Skipped draws are removed entirely while ray tracing, so probe target textures show "
+               "splitscreen viewports are never matched), a sub-full viewport whose aspect does not match the "
+               "backbuffer (e.g. square probe RTs on widescreen), a mirrored view-projection (negative 3x3 "
+               "determinant, reflect probes' FMirrorMatrix), or a CTAB-declared camera that fails plausibility "
+               "extraction (reflect/portal probes' oblique FClipProjectionMatrix near-plane clip; the main "
+               "view always extracts). Sub-main-view-sized world draws also cannot update the Main camera. "
+               "Skipped draws are removed entirely while ray tracing, so probe target textures show "
                "their last resolved content - visually equivalent to running with 'show scenecapture' toggled "
                "off. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3ForegroundDpgIsViewModel, true,
@@ -774,6 +776,11 @@ namespace dxvk {
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
     static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
 
+    // Half-or-larger in both dims (allows ScreenPercentage >50%) and aspect-matched to the
+    // backbuffer so square SceneCapture RTs cannot pass as main-view-sized on widescreen.
+    static bool ue3ViewportAspectMatchesBackbuffer(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
+    static bool ue3ViewportIsMainViewSized(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
+
     struct Ue3ShaderFeatureInfo {
       bool initialized = false;
       bool hasMaterialSampler = false;
@@ -784,6 +791,8 @@ namespace dxvk {
       bool hasShadowSampler = false;
       bool hasVelocitySampler = false;
       bool hasExposureOrToneSampler = false;
+      bool hasBlurredImageSampler = false;
+      bool hasFilterTextureSampler = false;
       bool hasUiSampler = false;
       bool hasDistortionSampler = false;
       bool hasVideoSampler = false;
@@ -801,6 +810,16 @@ namespace dxvk {
       bool hasFogConstants = false;
       bool hasHazeConstants = false;
       bool hasUiCompositeConstants = false;
+      // DOFAndBloom / UberPostProcess CTAB tokens (DepthOfFieldCommon / FilterPixelShader).
+      bool hasDofPackedParameters = false;
+      bool hasDofMinMaxBlurClamp = false;
+      bool hasFilterSampleWeights = false;
+
+      bool looksLikeDofAndBloomPostProcess() const {
+        return hasBlurredImageSampler ||
+               (hasDofPackedParameters && hasDofMinMaxBlurClamp) ||
+               (hasFilterTextureSampler && hasFilterSampleWeights);
+      }
 
       // TdToneMapping capture support: sampler indices of the baked colour
       // curve LUT textures and float register indices of the grade constants

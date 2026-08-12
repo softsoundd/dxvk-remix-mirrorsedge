@@ -17,7 +17,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` toggle which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
 
 - Camera and object transforms are read from UE3's reserved shader constants (CTAB parsing).
-- Depth prepass, shadow depth, SceneCapture, and depth-test-disabled translucency passes are skipped so only real base-pass geometry gets ray traced.
+- Depth prepass, shadow depth, SceneCapture, depth-test-disabled translucency, and fullscreen postprocess are skipped so only real base-pass geometry gets ray traced.
 - Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level: tags, categories and asset replacements survive texture streaming, settings changes, and restarts.
 - Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.

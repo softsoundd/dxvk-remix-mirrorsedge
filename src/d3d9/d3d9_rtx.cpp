@@ -4427,11 +4427,13 @@ namespace dxvk {
                                    containsToken(lowerName, "shadowvariance");
           info.hasVelocitySampler |= containsToken(lowerName, "velocitybuffer") ||
                                      containsToken(lowerName, "velocitytexture");
+          info.hasBlurredImageSampler |= containsToken(lowerName, "blurredimage");
+          info.hasFilterTextureSampler |= containsToken(lowerName, "filtertexture");
           info.hasExposureOrToneSampler |= containsToken(lowerName, "exposure") ||
                                            containsToken(lowerName, "colorcurves") ||
                                            containsToken(lowerName, "saturationmask") ||
-                                           containsToken(lowerName, "blurredimage") ||
-                                           containsToken(lowerName, "filtertexture");
+                                           info.hasBlurredImageSampler ||
+                                           info.hasFilterTextureSampler;
           info.hasUiSampler |= containsToken(lowerName, "scenecoloruitexture") ||
                                containsToken(lowerName, "blurredui") ||
                                containsToken(lowerName, "uitexture") ||
@@ -4489,6 +4491,9 @@ namespace dxvk {
         info.hasUiCompositeConstants |= lowerName == "fade" ||
                                         containsToken(lowerName, "scenecolorui") ||
                                         containsToken(lowerName, "bluramount");
+        info.hasDofPackedParameters |= containsToken(lowerName, "packedparameters");
+        info.hasDofMinMaxBlurClamp |= containsToken(lowerName, "minmaxblurclamp");
+        info.hasFilterSampleWeights |= containsToken(lowerName, "sampleweights");
 
         // TdToneMapping capture: record the exact float register indices of
         // the grade constants so the (skipped) tonemap pass's pixel shader
@@ -4539,6 +4544,24 @@ namespace dxvk {
     default:
       return false;
     }
+  }
+
+  bool D3D9Rtx::ue3ViewportAspectMatchesBackbuffer(
+      const uint32_t vpW, const uint32_t vpH, const uint32_t bbW, const uint32_t bbH) {
+    if (vpW == 0 || vpH == 0 || bbW == 0 || bbH == 0) {
+      return false;
+    }
+    const double a = double(vpW) * double(bbH);
+    const double b = double(vpH) * double(bbW);
+    const double denom = std::max(a, b);
+    return denom > 0.0 && (std::abs(a - b) / denom) < 0.05;
+  }
+
+  bool D3D9Rtx::ue3ViewportIsMainViewSized(
+      const uint32_t vpW, const uint32_t vpH, const uint32_t bbW, const uint32_t bbH) {
+    return bbW != 0 && bbH != 0 &&
+           vpW * 2 >= bbW && vpH * 2 >= bbH &&
+           ue3ViewportAspectMatchesBackbuffer(vpW, vpH, bbW, bbH);
   }
 
   D3D9Rtx::Ue3PassType D3D9Rtx::classifyUe3Pass(const DrawContext& drawContext) {
@@ -4597,25 +4620,27 @@ namespace dxvk {
     if (psInfo.hasUiSampler || psInfo.hasUiCompositeConstants)
       return Ue3PassType::UiComposite;
 
-    // UE3 SceneCapture probes (SceneCapture2D/Reflect/Portal actors: security monitors,
-    // mirrors) re-render the world from their own camera before the main view, into the same
-    // shared SceneColor render target - only the viewport, sized to the probe's
-    // TextureRenderTarget, tells capture draws apart from main-view draws. Their shaders
-    // declare genuine ViewProjectionMatrix/CameraPosition constants, so CTAB camera
-    // verification alone cannot keep them from steering the Main camera.
+    // UE3 SceneCapture probes re-render the world before the main view; viewport size/aspect
+    // (and later mirrored/undecomposable camera checks) keep them from stealing Main.
     if ((m_frameOptions.ue3SkipSceneCapturePasses || m_frameOptions.ue3EngineMode) &&
         isWorldGeometry &&
         m_activePresentParams.has_value()) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
       const uint32_t bbW = m_activePresentParams->BackBufferWidth;
       const uint32_t bbH = m_activePresentParams->BackBufferHeight;
-      // strictly under half the backbuffer in both dimensions: capture probe targets are small
-      // (typically 256-1024) while the main view renders at backbuffer size or a screen
-      // percentage well above one half; exact-half viewports (splitscreen) stay untouched
-      if (bbW != 0 && bbH != 0 &&
-          vp.Width != 0 && vp.Height != 0 &&
-          vp.Width * 2 < bbW && vp.Height * 2 < bbH) {
-        return Ue3PassType::SceneCapture;
+      if (bbW != 0 && bbH != 0 && vp.Width != 0 && vp.Height != 0) {
+        if (vp.Width * 2 < bbW && vp.Height * 2 < bbH) {
+          return Ue3PassType::SceneCapture;
+        }
+        // Exact-half splitscreen must not be treated as a mismatched-aspect probe.
+        const bool exactHalfSplit =
+          (vp.Width * 2 == bbW && vp.Height == bbH) ||
+          (vp.Height * 2 == bbH && vp.Width == bbW);
+        if (!exactHalfSplit &&
+            (vp.Width < bbW || vp.Height < bbH) &&
+            !ue3ViewportAspectMatchesBackbuffer(vp.Width, vp.Height, bbW, bbH)) {
+          return Ue3PassType::SceneCapture;
+        }
       }
     }
 
@@ -4653,6 +4678,14 @@ namespace dxvk {
 
     if ((psInfo.hasVelocitySampler || psInfo.hasMotionBlurConstants) &&
         (samplesRenderTarget || likelyFullscreen)) {
+      return Ue3PassType::FullscreenPostProcess;
+    }
+
+    // Explicit DOFAndBloom/Uber signals (also covered by the catch-all below for typical
+    // ME shaders); kept so FilterColor blur is classified even if z-write state is atypical.
+    if (!isWorldGeometry &&
+        (likelyFullscreen || psSamplesRenderTarget) &&
+        psInfo.looksLikeDofAndBloomPostProcess()) {
       return Ue3PassType::FullscreenPostProcess;
     }
 
@@ -4844,12 +4877,13 @@ namespace dxvk {
 
     const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
 
-    // Only the TdToneMapping main pass carries the full grade constant set;
-    // require the core registers so exposure/motion-blur helper passes that
-    // merely mention ExposureSettings never get captured.
+    // Only the TdToneMapping pass declares ColorCurvesK/M; require those sampler
+    // indices so UberPostProcessBlend (grade+gamma only) cannot lock out capture.
     if (!psInfo.hasToneMapConstants || !psInfo.hasGammaConstants ||
         psInfo.toneMapSceneShadowsReg < 0 || psInfo.toneMapGammaColorScaleReg < 0 ||
-        psInfo.toneMapMidTonesReg < 0) {
+        psInfo.toneMapMidTonesReg < 0 ||
+        psInfo.colorCurvesKSamplerIndex >= caps::MaxTexturesPS ||
+        psInfo.colorCurvesMSamplerIndex >= caps::MaxTexturesPS) {
       return;
     }
 
@@ -4998,11 +5032,11 @@ namespace dxvk {
       return;
     }
 
-    // Shadow map and scene-capture targets clear depth too, but on sub-half-backbuffer viewports.
+    // Shadow / SceneCapture depth clears use sub-main-view viewports; ignore those.
     const D3DVIEWPORT9& vp = d3d9State().viewport;
     const uint32_t bbW = m_activePresentParams->BackBufferWidth;
     const uint32_t bbH = m_activePresentParams->BackBufferHeight;
-    if (bbW == 0 || bbH == 0 || vp.Width * 2 < bbW || vp.Height * 2 < bbH) {
+    if (!ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
       return;
     }
 
@@ -6726,6 +6760,11 @@ namespace dxvk {
 
       auto classifySceneCaptureView = [&](const char* reason) {
         m_currentUe3PassType = Ue3PassType::SceneCapture;
+        // Undo probe draws that armed the main-view gate before mirror/oblique detection.
+        if (!m_ue3ForegroundDpgActive) {
+          m_ue3SeenMainViewWorldDraw = false;
+        }
+        m_activeDrawCallState.allowMainCameraUpdate = false;
         m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
         logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, reason);
       };
@@ -6763,6 +6802,20 @@ namespace dxvk {
 
         if ((m_frameOptions.ue3RequireCtabCameraConstants || isUe3Mode) && !ctabVerifiedCamera) {
           m_activeDrawCallState.allowMainCameraUpdate = false;
+        }
+
+        // Non-main-view-sized world draws (below half and/or wrong aspect) must not steer Main.
+        if (isUe3Mode &&
+            isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
+            m_activePresentParams.has_value() &&
+            m_activeDrawCallState.allowMainCameraUpdate) {
+          const D3DVIEWPORT9& vp = d3d9State().viewport;
+          if (!ue3ViewportIsMainViewSized(
+                vp.Width, vp.Height,
+                m_activePresentParams->BackBufferWidth,
+                m_activePresentParams->BackBufferHeight)) {
+            m_activeDrawCallState.allowMainCameraUpdate = false;
+          }
         }
 
         // Once per vertex shader, so info level stays low-volume
@@ -7218,9 +7271,7 @@ namespace dxvk {
 
     m_currentUe3PassType = classifyUe3Pass(drawContext);
 
-    // Capture the TdToneMapping pass state for the Mirror's Edge tonemapping
-    // mode at classification time - the draw can be routed differently
-    // afterwards (ignored, or rasterized to primary).
+    // Capture TdToneMapping state before the draw is ignored below.
     if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess) {
       maybeCaptureUe3ToneMapState();
     }
@@ -7242,8 +7293,19 @@ namespace dxvk {
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native modulated shadow projection");
       return { RtxGeometryStatus::Ignored, false };
     case Ue3PassType::SceneCapture:
-      ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 scene capture offscreen view draw (world geometry, sub-half-backbuffer viewport)."));
+      if (!m_ue3ForegroundDpgActive) {
+        m_ue3SeenMainViewWorldDraw = false;
+      }
+      ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 scene capture offscreen view draw (world geometry, probe viewport)."));
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "scene capture offscreen view");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::FullscreenPostProcess:
+      // Ignore before the non-primary RT → Rasterized fallback; DoF gather/blur/blend
+      // target FilterColor/SceneColor and would otherwise still execute.
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+      return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::FogOrDistortion:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
       return { RtxGeometryStatus::Ignored, false };
     case Ue3PassType::UiComposite:
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "UI composite");
@@ -7260,9 +7322,7 @@ namespace dxvk {
       break;
     }
 
-    // Foreground DPG boundary gate: the mid-scene depth clear only counts once this frame's
-    // main-view world draws have been seen, rejecting the scene-start depth clear and
-    // capture-probe clears (which precede any main-view-sized world geometry).
+    // Arm the foreground-DPG gate only after a true main-view-sized world draw.
     if (m_frameOptions.ue3EngineMode &&
         !m_ue3SeenMainViewWorldDraw &&
         m_currentUe3PassType == Ue3PassType::Material &&
@@ -7271,7 +7331,7 @@ namespace dxvk {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
       const uint32_t bbW = m_activePresentParams->BackBufferWidth;
       const uint32_t bbH = m_activePresentParams->BackBufferHeight;
-      if (bbW != 0 && bbH != 0 && vp.Width * 2 >= bbW && vp.Height * 2 >= bbH) {
+      if (ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
         m_ue3SeenMainViewWorldDraw = true;
       }
     }
@@ -7511,12 +7571,6 @@ namespace dxvk {
         ONCE(Logger::info("[RTX-Compatibility] Rasterizing likely fullscreen composite pass to primary RT (post-process)."));
         return { RtxGeometryStatus::Rasterized, false };
       }
-    }
-
-    if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess ||
-        m_currentUe3PassType == Ue3PassType::FogOrDistortion) {
-      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
-      return { RtxGeometryStatus::Ignored, false };
     }
 
     // Detect stencil shadow draws and ignore them
