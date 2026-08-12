@@ -7221,6 +7221,15 @@ namespace dxvk {
       }
       return deferredUiTagState == 1;
     };
+    // A matched hash of zero means the pixel shader tag matched, which the option documents as
+    // explicit intent - unlike a texture tag, which a shared texture can trigger on any draw.
+    // The emptiness test keeps post-process draws from building a bound-texture snapshot just
+    // to discover that no pixel shader tag exists to find.
+    auto isDeferredUiPixelShaderTagged = [&]() {
+      return !m_frameOptions.deferredUiPixelShaders->empty() &&
+             isDeferredUiTagged() &&
+             deferredUiMatchedTextureHash == kEmptyHash;
+    };
 
     // UE3 depth test disabled translucency -  NeedsDepthTestDisabled materials, fog volume composites,
     // and fullscreen overlays use alpha blend + depth test off + depth write off
@@ -7300,13 +7309,16 @@ namespace dxvk {
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "scene capture offscreen view");
       return { RtxGeometryStatus::Ignored, false };
     case Ue3PassType::FullscreenPostProcess:
-      // Ignore before the non-primary RT → Rasterized fallback; DoF gather/blur/blend
-      // target FilterColor/SceneColor and would otherwise still execute.
-      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
-      return { RtxGeometryStatus::Ignored, false };
     case Ue3PassType::FogOrDistortion:
-      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
-      return { RtxGeometryStatus::Ignored, false };
+      // Ignore before the non-primary RT → Rasterized fallback; DoF gather/blur/blend
+      // target FilterColor/SceneColor and would otherwise still execute. Only a deferred-UI
+      // pixel shader tag outranks this: these passes sample the scene-colour target, so a
+      // texture tag on it matches every one of them and would replay DoF over the frame.
+      if (!isDeferredUiPixelShaderTagged()) {
+        logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+        return { RtxGeometryStatus::Ignored, false };
+      }
+      break;
     case Ue3PassType::UiComposite:
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "UI composite");
       return { RtxGeometryStatus::Rasterized, true };
@@ -7339,25 +7351,28 @@ namespace dxvk {
     // Deferred UI overlays (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders, e.g. UE3
     // MaterialEffect fullscreen fades): rasterized on top of the ray-traced image WITHOUT
     // triggering RTX injection - the draw is captured and replayed after injection fires later
-    // in the frame. Placed after the pass switch above so UI composites and video passes can
-    // never be deferred, and before the fullscreen-composite/post-process filters below so
-    // tagging wins over those. World geometry and depth-writing draws are never deferred even
+    // in the frame. Placed after the pass switch above, so UI composites, video passes and the
+    // screen-space contribution passes can never be deferred by a texture tag (only a pixel
+    // shader tag reaches here from those), and before the fullscreen-composite filter below so
+    // tagging wins over that. World geometry and depth-writing draws are never deferred even
     // when tagged: shared textures (e.g. a scene-color render target sampled by translucent
     // meshes) must not pull geometry out of the ray-traced scene.
     if (!m_frameOptions.deferredUiTextures->empty() || !m_frameOptions.deferredUiPixelShaders->empty()) {
       const XXH64_hash_t& matchedTextureHash = deferredUiMatchedTextureHash;
 
       if (isDeferredUiTagged()) {
-        const bool matchedByPixelShaderTag = matchedTextureHash == 0;
+        const bool matchedByPixelShaderTag = isDeferredUiPixelShaderTagged();
         const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
         const bool isWorldGeometryVertexFactory = isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory);
 
         // Engine post-process/composite shaders (gamma-correction scene copy, tone mapping,
-        // motion blur, distortion, fog) legitimately sample the scene render target but must
-        // never be deferred: replaying e.g. the gamma copy over the ray-traced image uniformly
-        // brightens the whole screen and, being opaque and later in the frame, overwrites the
-        // real overlay effects. Only texture tags skip them - an explicit pixel shader tag is
-        // taken as user intent and still defers.
+        // motion blur, distortion, fog, depth of field, bloom) legitimately sample the scene
+        // render target but must never be deferred: replaying e.g. the gamma copy over the
+        // ray-traced image uniformly brightens the whole screen and, being opaque and later in
+        // the frame, overwrites the real overlay effects; replaying a DoF gather paints a flat
+        // rectangle over it. This is the only guard for a texture tag once the draw classifies
+        // as anything but a screen-space contribution pass, so it matches the same DoF/bloom
+        // signatures the pass classifier uses. An explicit pixel shader tag still defers.
         bool isEnginePostProcessShader = false;
         if (!matchedByPixelShaderTag && m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
           const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
@@ -7368,7 +7383,8 @@ namespace dxvk {
                                       psInfo.hasVelocitySampler ||
                                       psInfo.hasDistortionSampler ||
                                       psInfo.hasFogConstants ||
-                                      psInfo.hasHazeConstants;
+                                      psInfo.hasHazeConstants ||
+                                      psInfo.looksLikeDofAndBloomPostProcess();
         }
 
         // Fullscreen overlay tiles (UE3 MaterialEffect quads via FTileRenderer) use a
@@ -7420,7 +7436,16 @@ namespace dxvk {
           logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "deferred UI overlay");
           return { RtxGeometryStatus::Rasterized, false, true };
         }
-        // Ineligible tagged draws fall through to normal classification - never suppressed.
+
+        // Screen-space contribution passes only reached this branch through a pixel shader tag;
+        // a refusal here restores the pass switch's decision rather than promoting a DoF/fog
+        // draw to normal classification.
+        if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess ||
+            m_currentUe3PassType == Ue3PassType::FogOrDistortion) {
+          logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+          return { RtxGeometryStatus::Ignored, false };
+        }
+        // Other ineligible tagged draws fall through to normal classification - never suppressed.
       }
     }
 
@@ -7483,8 +7508,10 @@ namespace dxvk {
                   "[RTX-Compatibility] Non-primary RT0 encountered: ",
                   rtDesc->Width, "x", rtDesc->Height,
                   " (backbuffer ", m_activePresentParams->BackBufferWidth, "x", m_activePresentParams->BackBufferHeight, "), ",
-                  "rtDescHash=0x", std::hex, rtDescHash, std::dec,
-                  ". If this RT contains the main scene, add it to rtx.raytracedRenderTargetTextures."));
+                  "rtDescHash=0x", std::hex, rtDescHash,
+                  " resolutionAgnosticDescHash=0x", rtTex->GetImage()->getResolutionAgnosticDescriptorHash(), std::dec,
+                  ". If this RT contains the main scene, add either hash to rtx.raytracedRenderTargetTextures "
+                  "(the resolution-agnostic one survives resolution changes)."));
               }
             }
           }
@@ -7515,6 +7542,7 @@ namespace dxvk {
         };
 
         XXH64_hash_t bestHash = 0;
+        XXH64_hash_t bestAgnosticHash = 0;
         uint64_t bestArea = 0;
 
         for (uint32_t i : bit::BitMask(rtSamplerMask)) {
@@ -7536,14 +7564,20 @@ namespace dxvk {
           const uint64_t area = uint64_t(desc->Width) * uint64_t(desc->Height);
           if (area > bestArea) {
             bestArea = area;
-            bestHash = tex->GetImage()->getResolutionAgnosticDescriptorHash();
+            // Absolute hash: this set is session-local, and the aspect-normalized hash would
+            // alias the backbuffer-sized target skipped above.
+            bestHash = tex->GetImage()->getDescriptorHash();
+            bestAgnosticHash = tex->GetImage()->getResolutionAgnosticDescriptorHash();
           }
         }
 
-        if (bestHash != 0 && m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
+        // Already-tagged targets were skipped as candidates above, so anything reaching here is new.
+        if (bestHash != kEmptyHash && m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
           Logger::info(str::format(
             "[RTX-Compatibility] Auto-selected Raytraced Render Target from fullscreen composite: texDescHash=0x",
-            std::hex, bestHash, std::dec, "."));
+            std::hex, bestHash,
+            " resolutionAgnosticDescHash=0x", bestAgnosticHash, std::dec,
+            " (tag either in rtx.raytracedRenderTargetTextures to pin it)."));
         }
       }
 
@@ -7559,7 +7593,8 @@ namespace dxvk {
             Logger::debug(str::format(
               "[RTX-Compatibility] Sampled render-target texture: ",
               desc->Width, "x", desc->Height,
-              ", texDescHash=0x", std::hex, texDescHash, std::dec,
+              ", texDescHash=0x", std::hex, texDescHash,
+              " resolutionAgnosticDescHash=0x", tex->GetImage()->getResolutionAgnosticDescriptorHash(), std::dec,
               " (sampler ", i, ")."));
           }
         }
@@ -7692,14 +7727,47 @@ namespace dxvk {
       return false;
     }
 
-    const XXH64_hash_t agnosticHash = image->getResolutionAgnosticDescriptorHash();
-    if (agnosticHash == kEmptyHash) {
-      return false;
-    }
-    if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, agnosticHash)) {
+    const XXH64_hash_t descriptorHash = image->getDescriptorHash();
+
+    if (matchAuthoredRenderTargetTag(*m_frameOptions.raytracedRenderTargetTextures,
+                                     descriptorHash,
+                                     image->getResolutionAgnosticDescriptorHash()) != kEmptyHash) {
       return true;
     }
-    return includeAutoDetected && lookupHash(m_autoRaytracedRenderTargetDescHashes, agnosticHash);
+
+    // Auto-detection is session-local and keys on the absolute hash: the aspect-normalized hash
+    // aliases every same-format target of the same aspect, including the backbuffer-sized target
+    // the detector deliberately skips. The size check catches a resolution change turning a
+    // previously detected size into the backbuffer's.
+    return includeAutoDetected &&
+           descriptorHash != kEmptyHash &&
+           lookupHash(m_autoRaytracedRenderTargetDescHashes, descriptorHash) &&
+           !isBackBufferSizedImage(image);
+  }
+
+  XXH64_hash_t D3D9Rtx::matchAuthoredRenderTargetTag(const fast_unordered_set& tags,
+                                                     const XXH64_hash_t descriptorHash,
+                                                     const XXH64_hash_t resolutionAgnosticDescriptorHash) {
+    if (tags.empty()) {
+      return kEmptyHash;
+    }
+    if (resolutionAgnosticDescriptorHash != kEmptyHash &&
+        lookupHash(tags, resolutionAgnosticDescriptorHash)) {
+      return resolutionAgnosticDescriptorHash;
+    }
+    if (descriptorHash != kEmptyHash && lookupHash(tags, descriptorHash)) {
+      return descriptorHash;
+    }
+    return kEmptyHash;
+  }
+
+  bool D3D9Rtx::isBackBufferSizedImage(const Rc<DxvkImage>& image) const {
+    if (image == nullptr || !m_activePresentParams.has_value()) {
+      return false;
+    }
+    const VkExtent3D& extent = image->info().extent;
+    return extent.width == m_activePresentParams->BackBufferWidth &&
+           extent.height == m_activePresentParams->BackBufferHeight;
   }
 
   bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash) const {
@@ -7732,19 +7800,21 @@ namespace dxvk {
         return true;
       };
 
-      // Non-RT overlays: image hash. RTs: resolution-agnostic descriptor hash only.
+      // Non-RT overlays carry no descriptor hash, so they can only match by image hash.
       if (!entry.isRenderTarget) {
         const XXH64_hash_t texHash = entry.imageHash;
-        if (texHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
+        if (texHash != kEmptyHash && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
           return reportMatch(texHash);
         }
         continue;
       }
 
-      const XXH64_hash_t resolutionAgnosticDescriptorHash = entry.rtResolutionAgnosticDescriptorHash;
-      if (resolutionAgnosticDescriptorHash != 0 &&
-          lookupHash(*m_frameOptions.deferredUiTextures, resolutionAgnosticDescriptorHash)) {
-        return reportMatch(resolutionAgnosticDescriptorHash);
+      const XXH64_hash_t matchedHash =
+        matchAuthoredRenderTargetTag(*m_frameOptions.deferredUiTextures,
+                                     entry.rtDescriptorHash,
+                                     entry.rtResolutionAgnosticDescriptorHash);
+      if (matchedHash != kEmptyHash) {
+        return reportMatch(matchedHash);
       }
     }
 
@@ -8515,8 +8585,7 @@ namespace dxvk {
       (ignoreTagged ? 8u : 0u);
     key = XXH3_64bits_withSeed(&categoryBits, sizeof(categoryBits), key);
 
-    static fast_unordered_set s_loggedParticleDraws;
-    if (!s_loggedParticleDraws.insert(key).second) {
+    if (!m_loggedUe3ParticleDraws.insert(key).second) {
       return;
     }
 
@@ -8553,6 +8622,29 @@ namespace dxvk {
       " dstBlend=", dstBlend,
       " likelyEmissiveBlend=", likelyEmissiveBlend ? 1 : 0,
       constantAlbedoLog));
+  }
+
+  bool D3D9Rtx::isUe3RenderTargetRefusedAsAlbedo(D3D9CommonTexture* texture,
+                                                 const uint32_t stage,
+                                                 const PsSamplerTexcoordEntry* inferredEntry) const {
+    if (texture == nullptr || !texture->IsRenderTarget() || texture->GetImage() == nullptr) {
+      return false;
+    }
+
+    const Rc<DxvkImage>& image = texture->GetImage();
+    if (isUe3MovieTextureDescHash(image->getDescriptorHash())) {
+      return false;
+    }
+    if (inferredEntry != nullptr && stage < caps::MaxTexturesPS &&
+        (inferredEntry->samplerSemanticFlags[stage] & kPsSamplerSemanticMovieTexture) != 0) {
+      return false;
+    }
+    // Author intent wins: a preferred-albedo tag, or a screen whose material needs the target
+    // itself bound as the albedo.
+    if (lookupHash(*m_frameOptions.preferredAlbedoTextures, image->getHash())) {
+      return false;
+    }
+    return !isTaggedRaytracedRenderTarget(image, true);
   }
 
   PrepareDrawFlags D3D9Rtx::internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext) {
@@ -9571,36 +9663,26 @@ namespace dxvk {
             strictCubemapFallbackStage = cachedSelection->second.cubemapFallbackStage;
             selectionFromCache = true;
 
-            // Reject cached picks that landed on a non-movie render target so a real
-            // material sampler can re-compete (UE3 soft-particle scene buffers, etc.).
-            if (m_frameOptions.ue3EngineMode &&
-                chosenStages[0] != kInvalidStage &&
-                chosenStages[0] < SamplerCount &&
-                d3d9State().textures[chosenStages[0]] != nullptr) {
-              D3D9CommonTexture* cachedPrimary =
-                GetCommonTexture(d3d9State().textures[chosenStages[0]]);
-              if (cachedPrimary != nullptr && cachedPrimary->IsRenderTarget()) {
-                const XXH64_hash_t cachedDescHash =
-                  cachedPrimary->GetImage() != nullptr
-                    ? cachedPrimary->GetImage()->getDescriptorHash()
-                    : kEmptyHash;
-                bool cachedLooksMovie = isUe3MovieTextureDescHash(cachedDescHash);
-                if (!cachedLooksMovie &&
-                    inferredPsEntry != nullptr &&
-                    chosenStages[0] < caps::MaxTexturesPS) {
-                  cachedLooksMovie =
-                    (inferredPsEntry->samplerSemanticFlags[chosenStages[0]] &
-                     kPsSamplerSemanticMovieTexture) != 0;
-                }
-                if (!cachedLooksMovie) {
-                  chosenStages[0] = kInvalidStage;
-                  chosenStages[1] = kInvalidStage;
-                  strictCubemapFallbackStage = kInvalidStage;
-                  selectionFromCache = false;
-                  m_ue3DiffuseSelectionCache.erase(cachedSelection);
-                  m_loggedAlbedoSelections.erase(selectionCacheKey);
-                }
+            // Drop cached picks that landed on a refused render target so a real material
+            // sampler can re-compete. Reusing the scoring-loop predicate keeps a legitimately
+            // tagged pick from being discarded and re-scored every frame.
+            const auto cachedPickRefused = [&](const uint8_t stage) {
+              if (stage == kInvalidStage || stage >= SamplerCount ||
+                  d3d9State().textures[stage] == nullptr) {
+                return false;
               }
+              return isUe3RenderTargetRefusedAsAlbedo(
+                GetCommonTexture(d3d9State().textures[stage]), stage, inferredPsEntry);
+            };
+
+            if (m_frameOptions.ue3EngineMode &&
+                (cachedPickRefused(chosenStages[0]) || cachedPickRefused(chosenStages[1]))) {
+              chosenStages[0] = kInvalidStage;
+              chosenStages[1] = kInvalidStage;
+              strictCubemapFallbackStage = kInvalidStage;
+              selectionFromCache = false;
+              m_ue3DiffuseSelectionCache.erase(cachedSelection);
+              m_loggedAlbedoSelections.erase(selectionCacheKey);
             }
           } else {
             // superseding re-score: let ue3LogAlbedoSelection dump the authoritative decision
@@ -9781,11 +9863,9 @@ namespace dxvk {
         if (texHash == kEmptyHash)
           continue;
 
-        // UE3: reject hashed non-movie render targets as legacy albedo. Soft-particle /
-        // scene-color buffers often carry a content hash, and at high resolutions their
-        // pixel-area score outranks the RT penalties below (displacing the real material
-        // texture). Movie surfaces remain eligible. Non-UE3 keeps the score penalties only.
-        if (m_frameOptions.ue3EngineMode && isRenderTarget && !isMovieTexture)
+        // Non-UE3 keeps the score penalties below instead.
+        if (m_frameOptions.ue3EngineMode &&
+            isUe3RenderTargetRefusedAsAlbedo(texture, stage, inferredPsEntry))
           continue;
 
         // effective area: a small texture tiled NxM times covers N*M times its pixel area
@@ -9885,8 +9965,11 @@ namespace dxvk {
         score += (looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
                   inferredSamplerExprDiffuseAnchor) ? 2'500'000 : 0;
         // normal maps get no size credit - resolution advantage must not offset the decode penalty.
-        // Non-movie RTs also get none: their near-backbuffer area otherwise dominates scoring.
-        score += (normalDecodeActive || (isRenderTarget && !isMovieTexture))
+        // Under UE3 the same applies to render targets that only survived the refusal above
+        // through an explicit tag: their near-backbuffer area would dominate every other signal.
+        const bool renderTargetSizeCreditDenied =
+          m_frameOptions.ue3EngineMode && isRenderTarget && !isMovieTexture;
+        score += (normalDecodeActive || renderTargetSizeCreditDenied)
           ? 0
           : int64_t(std::min<uint64_t>(effectiveArea, 16ull * 1024ull * 1024ull));
         // near-exact ties among color-chain candidates (magnitudes stay below any real signal):
@@ -10036,8 +10119,12 @@ namespace dxvk {
 
       // if no candidate scored, fall back to the lowest PS-used sampler holding a bindable
       // (hashed) texture - never raw stage 0, which may hold a stale texture the shader
-      // never samples, and never a hashless / UE3 non-movie render target
-      if (chosenStages[0] == kInvalidStage) {
+      // never samples, and never a hashless texture.
+      // The second pass relaxes the render-target refusal: a refused target must not displace a
+      // real material texture, but when the shader samples nothing else it is the material's only
+      // colour source, and dropping it leaves the surface with no albedo and no taggable hash.
+      for (uint32_t pass = 0; pass < 2 && chosenStages[0] == kInvalidStage; pass++) {
+        const bool allowRefusedRenderTargets = pass == 1;
         for (uint32_t stage : bit::BitMask(usedTextureMask)) {
           if (stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
             continue;
@@ -10045,15 +10132,9 @@ namespace dxvk {
           if (texture == nullptr || texture->GetImage() == nullptr ||
               texture->GetImage()->getHash() == kEmptyHash)
             continue;
-          if (m_frameOptions.ue3EngineMode && texture->IsRenderTarget()) {
-            const XXH64_hash_t fallbackDescHash = texture->GetImage()->getDescriptorHash();
-            const bool fallbackLooksMovie =
-              isUe3MovieTextureDescHash(fallbackDescHash) ||
-              (inferredPsEntry != nullptr && stage < caps::MaxTexturesPS &&
-               (inferredPsEntry->samplerSemanticFlags[stage] & kPsSamplerSemanticMovieTexture) != 0);
-            if (!fallbackLooksMovie)
-              continue;
-          }
+          if (!allowRefusedRenderTargets && m_frameOptions.ue3EngineMode &&
+              isUe3RenderTargetRefusedAsAlbedo(texture, stage, inferredPsEntry))
+            continue;
           chosenStages[0] = uint8_t(stage);
           break;
         }

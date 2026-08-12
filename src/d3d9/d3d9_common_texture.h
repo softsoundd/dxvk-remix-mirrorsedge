@@ -488,6 +488,10 @@ namespace dxvk {
     XXH64_hash_t ComputeUe3StreamingStableHash(const D3D9CommonTexture* source) const;
     // NV-DXVK end
 
+    // NV-DXVK start: resolution-agnostic render target tagging
+    void RegisterRenderTargetDescriptorHashes(const Rc<DxvkImageView>& pickerView);
+    // NV-DXVK end
+
     D3D9DeviceEx*                 m_device;
     D3D9_COMMON_TEXTURE_DESC      m_desc;
     D3DRESOURCETYPE               m_type;

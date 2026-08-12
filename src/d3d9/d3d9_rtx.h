@@ -384,12 +384,14 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", fast_unordered_set, deferredUiPixelShaders, {},
                "Pixel shader bytecode hashes whose draws are treated as deferred UI overlays (see rtx.deferredUiTextures).\n"
                "Prefer this over texture tagging when the overlay samples a render target (e.g. UE3's scene color copy): "
-               "RT image hashes change on recreation. Prefer a pixel shader tag, or the resolution-agnostic RT "
-               "descriptor hash from the texture picker via rtx.deferredUiTextures. Whenever a "
+               "RT image hashes change on recreation. Prefer a pixel shader tag, or one of the RT descriptor hashes the "
+               "texture picker offers via rtx.deferredUiTextures. Whenever a "
                "tagged texture matches a draw, the runtime logs that draw's pixel shader hash ([RTX-DeferredUI] log lines) "
                "so the tag can be moved into this option.\n"
                "A pixel shader tag is treated as explicit intent: unlike texture tags it is not subject to the engine "
-               "post-process shader exclusion (the world-geometry and depth-write guards still apply).");
+               "post-process shader exclusion, and it alone outranks the UE3 fullscreen post-process / fog-distortion "
+               "classification, so an overlay whose shader looks like a screen-space contribution pass is still "
+               "deferred rather than dropped (the world-geometry and depth-write guards still apply).");
     RTX_OPTION("rtx.d3d9", bool, deferredUiRefreshSceneColor, true,
                "When replaying deferred UI overlay draws, first copy the ray-traced output into any scene-color "
                "render-target texture the overlay samples (e.g. UE3's resolved SceneColorTexture). Overlay materials "
@@ -1002,6 +1004,9 @@ namespace dxvk {
     // selection cache keys already dumped by rtx.d3d9.ue3LogAlbedoSelection
     fast_unordered_set m_loggedAlbedoSelections;
 
+    // draw identities already dumped as [UE3-Particle] by rtx.d3d9.ue3LogClassification
+    fast_unordered_set m_loggedUe3ParticleDraws;
+
     // per-texture spread over distinct pixel shaders: textures sampled by many unrelated
     // materials are shared detail/pattern/tint overlays rather than surface identity albedo.
     // Persisted across sessions (rtx-remix/ue3TextureSpread.cache) so the spread penalty is
@@ -1039,6 +1044,14 @@ namespace dxvk {
                                  const PsSamplerTexcoordEntry* inferredEntry);
     void logUe3ParticleDrawOnce();
 
+    // UE3 albedo selection refuses render targets: soft-particle and scene-colour buffers carry a
+    // content hash and near-backbuffer area, so at high resolutions they outscore the real material
+    // texture. Movie surfaces and explicitly tagged targets stay eligible. Only meaningful under
+    // rtx.d3d9.ue3EngineMode, which callers gate on.
+    bool isUe3RenderTargetRefusedAsAlbedo(D3D9CommonTexture* texture,
+                                          uint32_t stage,
+                                          const PsSamplerTexcoordEntry* inferredEntry) const;
+
     struct Ue3VsTexcoordTraceEntry {
       bool initialized = false;
       Ue3VsUvTraceKind kind = Ue3VsUvTraceKind::Invalid;
@@ -1051,9 +1064,17 @@ namespace dxvk {
     fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
     fast_unordered_set m_ue3MovieTextureDescHashes;
 
-    // True if the image's resolution-agnostic RT descriptor hash is tagged in
-    // rtx.raytracedRenderTargetTextures (and optionally the auto-detected set).
+    // True if the image is tagged in rtx.raytracedRenderTargetTextures (and optionally
+    // present in the auto-detected set).
     bool isTaggedRaytracedRenderTarget(const Rc<DxvkImage>& image, bool includeAutoDetected) const;
+
+    // Authored render-target tags accept the aspect-normalized descriptor hash (registered by
+    // the texture picker, stable across resolution changes) or the absolute one. Returns the
+    // hash that matched, so diagnostics can name the identity the author actually tagged.
+    static XXH64_hash_t matchAuthoredRenderTargetTag(const fast_unordered_set& tags,
+                                                     XXH64_hash_t descriptorHash,
+                                                     XXH64_hash_t resolutionAgnosticDescriptorHash);
+    bool isBackBufferSizedImage(const Rc<DxvkImage>& image) const;
 
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,

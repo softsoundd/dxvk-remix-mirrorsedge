@@ -662,11 +662,7 @@ namespace dxvk {
       // Assumption: All image hashes are created before creating sample view. Put assert here to track hash bugs.
       assert(m_image->getHash() != kEmptyHash);
       ImGUI::AddTexture(m_image->getHash(), m_sampleView.Color, ImGUI::kTextureFlagsDefault);
-      // Register the resolution-agnostic descriptor hash for RT category tagging.
-      const XXH64_hash_t agnosticHash = m_image->getResolutionAgnosticDescriptorHash();
-      if (agnosticHash != kEmptyHash) {
-        ImGUI::AddTexture(agnosticHash, m_sampleView.Color, ImGUI::kTextureFlagsRenderTarget);
-      }
+      RegisterRenderTargetDescriptorHashes(m_sampleView.Color);
     }
   }
 
@@ -794,7 +790,28 @@ namespace dxvk {
       m_image->setDescriptorHash(descriptorHash);
       m_image->setResolutionAgnosticDescriptorHash(resolutionAgnosticDescriptorHash);
 
-      ImGUI::AddTexture(resolutionAgnosticDescriptorHash, texturePickerView, ImGUI::kTextureFlagsRenderTarget);
+      RegisterRenderTargetDescriptorHashes(texturePickerView);
+    }
+  }
+
+  // Both render-target identities are offered to the picker: the aspect-normalized hash tags a
+  // target across resolution changes, while the absolute hash keeps every target individually
+  // selectable (the aspect-normalized one is shared by same-format targets of the same aspect,
+  // e.g. a scene colour buffer and its half-resolution post-process chain).
+  void D3D9CommonTexture::RegisterRenderTargetDescriptorHashes(const Rc<DxvkImageView>& pickerView) {
+    if (m_image == nullptr || pickerView == nullptr) {
+      return;
+    }
+
+    const XXH64_hash_t descriptorHash = m_image->getDescriptorHash();
+    if (descriptorHash != kEmptyHash) {
+      ImGUI::AddTexture(descriptorHash, pickerView, ImGUI::kTextureFlagsRenderTarget);
+    }
+
+    const XXH64_hash_t resolutionAgnosticDescriptorHash = m_image->getResolutionAgnosticDescriptorHash();
+    if (resolutionAgnosticDescriptorHash != kEmptyHash &&
+        resolutionAgnosticDescriptorHash != descriptorHash) {
+      ImGUI::AddTexture(resolutionAgnosticDescriptorHash, pickerView, ImGUI::kTextureFlagsRenderTarget);
     }
   }
 
