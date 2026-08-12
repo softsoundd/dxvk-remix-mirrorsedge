@@ -1268,7 +1268,10 @@ namespace dxvk {
                       args.maxValue = 1024 * 32);
       RTX_OPTION_ENV("rtx.texturemanager", bool, samplerFeedbackEnable, true, "DXVK_TEXTURES_SAMPLER_FEEDBACK_ENABLE",
                  "Enable texture sampler feedback. If true, a texture prioritization logic considers the amount of mip-levels that was sampled by a GPU while rendering a scene."
-                 "(For example, if a texture is in the distance, it will have a lower priority compared to a texture rendered just in front of the camera).");
+                 "(For example, if a texture is in the distance, it will have a lower priority compared to a texture rendered just in front of the camera).\n"
+                 "If false, texture streaming is disabled altogether and every replacement texture is loaded at its full resolution, ignoring the texture budget. "
+                 "Useful to rule out streaming when diagnosing blurry replacements, at the cost of higher VRAM usage.\n"
+                 "Note that disabling this at runtime is one-way: textures pinned to full resolution stay pinned until the game is restarted.");
       RTX_OPTION_FLAG_ENV("rtx.texturemanager", bool, neverDowngradeTextures, false, RtxOptionFlags::NoSave, "DXVK_TEXTURES_NEVER_DOWNGRADE", 
                  "Debug option to forcibly prevent uploading lower resolution data, if the texture already has been promoted to a high resolution.");
       RTX_OPTION("rtx.texturemanager", int, stagingBufferSizeMiB, 96,

@@ -817,6 +817,7 @@ namespace dxvk {
     m_sf.m_noisyMipcount = new uint8_t[SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT]{ /* zero-init */ };
     m_sf.m_accumulatedMipcount = new FeedbackAccum[SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT]{ /* zero-init */ };
     m_sf.m_cachedAssetMipcount = new uint8_t[SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT]{ /* zero-init */ };
+    m_sf.m_cachedReferenceMipcount = new uint8_t[SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT]{ /* zero-init */ };
     m_sf.m_cachedGpubuf = new uint32_t[SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT]; // NO zero-init
 
     // SAMPLER_FEEDBACK_INVALID must be 0xFFFF (all-0xFF bytes) for memset to fill
@@ -839,6 +840,7 @@ namespace dxvk {
     FileWatch::get().endThread(this);
 
     delete m_sf.m_cachedGpubuf;
+    delete m_sf.m_cachedReferenceMipcount;
     delete m_sf.m_cachedAssetMipcount;
     delete m_sf.m_accumulatedMipcount;
     delete m_sf.m_noisyMipcount;
@@ -940,7 +942,9 @@ namespace dxvk {
       return;
     }
 
-    if (!async || RtxOptions::TextureManager::neverDowngradeTextures()) {
+    // Only a material's albedo carries a stamp that the GPU writes to, so with feedback off every
+    // other texture would report a zero mip count and stay pinned to its smallest mips.
+    if (!async || RtxOptions::TextureManager::neverDowngradeTextures() || !RtxOptions::TextureManager::samplerFeedbackEnable()) {
       tex->m_canDemote = false;
       tex->requestMips(MAX_MIPS);
       scheduleTextureLoad(tex, false);
@@ -950,10 +954,7 @@ namespace dxvk {
   }
 
   void RtxTextureManager::updateSamplerFeedback(const Rc<ManagedTexture>& tex, uint16_t associatedFeedbackStamp) {
-    m_sf.associate(
-      RtxOptions::TextureManager::samplerFeedbackEnable() ? associatedFeedbackStamp : SAMPLER_FEEDBACK_INVALID,
-      tex->m_samplerFeedbackStamp
-    );
+    m_sf.associate(associatedFeedbackStamp, tex->m_samplerFeedbackStamp);
   }
 
   void RtxTextureManager::assertAllRefCountsZero() {
@@ -1213,6 +1214,27 @@ namespace dxvk {
     return false;
   }
 
+  namespace {
+    static_assert((1u << (SAMPLER_FEEDBACK_REFERENCE_MIP_COUNT - 1)) == SAMPLER_FEEDBACK_REFERENCE_TEXTURE_SIZE,
+                  "Sampler feedback reference mip count must describe its reference texture size");
+
+    // Mip count that a GPU-reported feedback index counts down from, for a given asset.
+    //
+    // Two corrections to the shared reference are needed. Non-square assets need log2(aspect) more,
+    // because the shader reduces both gradients to one isotropic length against a square box, which
+    // reports the mip of the longer texture axis and under-serves the shorter one. Assets larger
+    // than the reference need their own chain length, because the shader clamps the reported index
+    // at zero and so cannot express a need finer than the reference's top mip.
+    uint8_t calcReferenceMipCount(const AssetInfo& assetInfo) {
+      const uint32_t longSide = std::max({ assetInfo.extent.width, assetInfo.extent.height, 1u });
+      const uint32_t shortSide = std::max({ std::min(assetInfo.extent.width, assetInfo.extent.height), 1u });
+      const uint32_t aspectMips = bit::lzcnt(shortSide) - bit::lzcnt(longSide);
+
+      const uint32_t referenceMips = std::max(SAMPLER_FEEDBACK_REFERENCE_MIP_COUNT + aspectMips, assetInfo.mipLevels);
+      return uint8_t(std::min<uint32_t>(referenceMips, MAX_MIPS));
+    }
+  } // unnamed namespace
+
   uint32_t SamplerFeedback::fetchNoisyMipCounts(const uint32_t* src_gpubuf) {
     uint32_t textureCount;
     {
@@ -1227,12 +1249,15 @@ namespace dxvk {
       // improves cache efficiency
       if (m_cachedAssetMipcount_length != textureCount) {
         memset(m_cachedAssetMipcount, 0, textureCount * sizeof(m_cachedAssetMipcount[0]));
+        memset(m_cachedReferenceMipcount, 0, textureCount * sizeof(m_cachedReferenceMipcount[0]));
         m_cachedAssetMipcount_length = uint32_t(textureCount);
         for (uint32_t stamp = 0; stamp < textureCount; stamp++) {
           const Rc<ManagedTexture>& tex = m_idToTexture[stamp];
           assert(stamp == tex->m_samplerFeedbackStamp);
           if (tex.ptr()) {
-            m_cachedAssetMipcount[stamp] = uint8_t(std::min(tex->m_assetData->info().mipLevels, uint32_t(MAX_MIPS)));
+            const AssetInfo& assetInfo = tex->m_assetData->info();
+            m_cachedAssetMipcount[stamp] = uint8_t(std::min(assetInfo.mipLevels, uint32_t(MAX_MIPS)));
+            m_cachedReferenceMipcount[stamp] = calcReferenceMipCount(assetInfo);
           }
         }
       }
@@ -1246,10 +1271,11 @@ namespace dxvk {
     for (uint32_t stamp = 0; stamp < textureCount; stamp++) {
       uint8_t newMipCount;
       {
+        const uint32_t referenceMipCount = m_cachedReferenceMipcount[stamp];
         const uint32_t assetMipCount = m_cachedAssetMipcount[stamp];
 
-        const uint32_t mipAccessed = std::min(m_cachedGpubuf[stamp], assetMipCount);
-        newMipCount = uint8_t(assetMipCount - mipAccessed);
+        const uint32_t mipAccessed = std::min(m_cachedGpubuf[stamp], referenceMipCount);
+        newMipCount = uint8_t(std::min(referenceMipCount - mipAccessed, assetMipCount));
       }
       m_noisyMipcount[stamp] = std::max(m_noisyMipcount[stamp], newMipCount);
     }

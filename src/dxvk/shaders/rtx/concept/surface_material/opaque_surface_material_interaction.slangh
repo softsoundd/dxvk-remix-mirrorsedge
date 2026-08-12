@@ -442,8 +442,7 @@ void storeColorOverlayedWithTextureResolutionCheckersInDebugView(vec3 colorValue
 
 uint8_t calcMipLevelAccessedForSamplerFeedback(SurfaceInteraction surfaceInteraction)
 {
-  // assume fixed 4k size to report stable accessed mip for differently sized textures
-  const uint2 fullBoxSize = uint2(4096, 4096);
+  const uint2 fullBoxSize = uint2(SAMPLER_FEEDBACK_REFERENCE_TEXTURE_SIZE, SAMPLER_FEEDBACK_REFERENCE_TEXTURE_SIZE);
 
   vec2 ddx_tex = surfaceInteraction.textureGradientX * cb.upscaleFactor;
   vec2 ddy_tex = surfaceInteraction.textureGradientY * cb.upscaleFactor;

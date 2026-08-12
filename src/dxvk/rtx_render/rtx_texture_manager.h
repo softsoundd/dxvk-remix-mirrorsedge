@@ -49,6 +49,8 @@ namespace dxvk {
     // Variables needed for optimization
     std::atomic_uint16_t  m_idToTexture_count{ 0 };
     uint8_t*              m_cachedAssetMipcount{};
+    // Per texture, the mip count that a GPU-reported feedback index counts down from.
+    uint8_t*              m_cachedReferenceMipcount{};
     uint32_t              m_cachedAssetMipcount_length{ 0 };
     uint32_t*             m_cachedGpubuf{ 0 };
 
