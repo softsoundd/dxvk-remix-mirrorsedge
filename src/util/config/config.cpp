@@ -133,12 +133,25 @@ namespace dxvk {
       // Mesh1p as ViewModel; Mesh3p as player model (hidden in FP primary, visible in cutscenes).
       { "rtx.viewModel.enable",                                      "True" },
       { "rtx.viewModel.enableVirtualInstances",                      "False" },
-      // Scoped zoom hides the view model in stock rendering; FOV is the zoom signal
-      { "rtx.viewModel.hideBelowFovDegrees",                         "45.0" },
+      // Scoped zoom hides the view model in stock rendering; FOV is the zoom signal. Sits well
+      // below the ~43 degrees scripted cinematics pull the FOV in to, since the sniper ramps on
+      // down to ~7 and only the depth of the zoom tells the two apart.
+      { "rtx.viewModel.hideBelowFovDegrees",                         "25.0" },
       { "rtx.postfx.enableMotionBlurViewModel",                      "True" },
       { "rtx.playerModel.enableInPrimarySpace",                      "False" },
       { "rtx.playerModel.autoEnableInPrimarySpaceWhenNoViewModel",   "True" },
-      { "rtx.playerModel.autoEnableInPrimarySpaceBodyDistance",      "100.0" },
+      // Camera-to-player distance cannot decide the external camera here: scripted sequences park
+      // the pawn at its destination and fly the first-person camera in separately, so the distance
+      // leaves the first-person range without the view ever leaving Faith. View-model presence
+      // carries that state on its own.
+      { "rtx.playerModel.autoEnableInPrimarySpaceBodyDistance",      "0.0" },
+      // Camera cuts cost a frame of overlay geometry; require sustained absence.
+      { "rtx.playerModel.autoEnableInPrimarySpaceDelayFrames",       "5" },
+      // The parked pawn above still draws Mesh3p under the modded TdGame.u, leaving Faith standing
+      // at the destination casting a shadow for the seconds the camera takes to arrive. First-person
+      // play measures 54-192 units from the anchor bone and the fly-in 625 and up, so anything
+      // between those only decides how close the camera gets before the shadow returns.
+      { "rtx.playerModel.firstPersonMaxDistance",                    "250.0" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

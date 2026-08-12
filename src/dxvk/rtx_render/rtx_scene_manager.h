@@ -346,6 +346,11 @@ private:
 
   void createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance);
 
+  // Logs the external-camera regime decision when its inputs change (rtx.playerModel.logCameraRegime).
+  void logCameraRegimeChange(bool externalCameraRegime, bool viewModelCameraValid, bool demotedForeground,
+                             bool distanceExternal, bool noViewModelExternal, float playerDistance,
+                             bool viewModelHidden, float viewModelFovDegrees);
+
   // Print all RtInstances for debugging
   void printAllRtInstances();
   
@@ -355,6 +360,15 @@ private:
   uint32_t m_beginUsdExportFrameNum = -1;
   bool m_enqueueDelayedClear = false;
   bool m_previousFrameSceneAvailable = false;
+
+  // Last camera-regime state logged and when, so logCameraRegimeChange reports transitions
+  // plus a periodic repeat rather than every frame.
+  uint32_t m_lastLoggedCameraRegime = UINT32_MAX;
+  uint32_t m_lastLoggedCameraRegimeFrame = 0;
+
+  // Consecutive frames the automatic external-camera rules have agreed
+  // (rtx.playerModel.autoEnableInPrimarySpaceDelayFrames).
+  uint32_t m_autoExternalCameraFrames = 0;
 
   RtxGlobals m_globals;
 

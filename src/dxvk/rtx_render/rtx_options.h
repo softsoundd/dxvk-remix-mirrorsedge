@@ -485,7 +485,10 @@ namespace dxvk {
                  "Hide view-model instances while the view-model camera's vertical FOV is below this many degrees. 0 disables.\n"
                  "Scoped zoom shrinks the FOV drastically (e.g. Mirror's Edge sniper zoom: ~59 down to ~7 degrees), and games\n"
                  "hide the first-person view model while zoomed via raster tricks ray tracing ignores. The FOV itself is the\n"
-                 "most robust zoom signal: it works regardless of how the game or mods manage clipping planes.");
+                 "most robust zoom signal: it works regardless of how the game or mods manage clipping planes.\n"
+                 "Set it well below the narrowest FOV the game uses for anything else. Cinematics pull the FOV in too\n"
+                 "(Mirror's Edge scripted sequences reach ~43 degrees), and a threshold above that hides the first-person\n"
+                 "overlay for the length of the cutscene. Only the depth of the zoom separates the two cases.");
     } viewModel;
 
     struct PlayerModel {
@@ -503,7 +506,31 @@ namespace dxvk {
                  "cameras that detach while the game still draws first-person overlay geometry, which\n"
                  "defeats the no-ViewModel heuristic. 0 disables.\n"
                  "The player position is the minimum camera distance across this frame's player-model\n"
-                 "instances (anything tagged via rtx.playerModelTextures / rtx.playerModelGeometries).");
+                 "instances (anything tagged via rtx.playerModelTextures / rtx.playerModelGeometries).\n"
+                 "Check the distance a game actually reports before setting this. Where the pawn is parked\n"
+                 "away from the camera during scripted sequences, or extra copies of the player mesh share\n"
+                 "its tags, the measured distance leaves the first-person range during ordinary play and any\n"
+                 "threshold inside that spread flickers the body in and out.");
+      RTX_OPTION("rtx.playerModel", float, firstPersonMaxDistance, 0.f,
+                 "While the camera is the first-person view, drop player-model instances farther than this\n"
+                 "many world units from it entirely - no primary rays, no shadows, no reflections. 0 disables.\n"
+                 "Primary shadows exist so the player casts a shadow of their own body. A player model parked\n"
+                 "far from the camera is not that: scripted sequences move the pawn to where it needs to be and\n"
+                 "fly the camera in separately, and a game modified to always draw its third-person mesh leaves\n"
+                 "that copy standing in the scene casting a shadow nobody is there to cast. The instance\n"
+                 "returns to normal once the camera reaches it.");
+      RTX_OPTION("rtx.playerModel", uint32_t, autoEnableInPrimarySpaceDelayFrames, 0,
+                 "Consecutive frames the automatic rules must agree before the player model moves onto\n"
+                 "primary rays. Leaving the external-camera state is always immediate, so returning to\n"
+                 "first person never leaves the body standing in the camera.\n"
+                 "Guards against momentary signal dropouts - a camera cut that costs one frame of overlay\n"
+                 "geometry, a frame where the player's own draws leave the tagged set - flipping the body\n"
+                 "into view. Does not apply to enableInPrimarySpace.");
+      RTX_OPTION_FLAG("rtx.playerModel", bool, logCameraRegime, false, RtxOptionFlags::NoSave,
+                      "Log the external-camera regime decision whenever its inputs change, and every\n"
+                      "player-model instance's pose and world anchor once a second. Use when the player model\n"
+                      "or its shadow appears on primary rays at the wrong time, or when a character renders\n"
+                      "in bind pose (which means its instance is not being told apart from another copy).");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
       RTX_OPTION("rtx.playerModel", bool, autoDetectHeldEquipment, true,
                  "Automatically treat the world-space copy of view-model-drawn meshes as player-model geometry.\n"
@@ -524,8 +551,7 @@ namespace dxvk {
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleHeight, 68.f, "");
 
       // The effective per-frame decision (external-camera regime) is computed once in
-      // SceneManager::prepareSceneData from enableInPrimarySpace, the no-ViewModel rule,
-      // and the camera-to-player distance; consumers read it from the InstanceManager.
+      // SceneManager::prepareSceneData; consumers read it from the InstanceManager.
     } playerModel;
 
     struct Displacement {

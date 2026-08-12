@@ -1830,6 +1830,70 @@ namespace dxvk {
     }
 
     m_playerModelBodyCameraDistance = std::sqrt(minDistanceSqr);
+
+    logPlayerModelInstances(cameraPosition);
+  }
+
+  void InstanceManager::hideDistantPlayerModelInstances(const CameraManager& cameraManager) {
+    const float maxDistance = RtxOptions::PlayerModel::firstPersonMaxDistance();
+
+    // Only meaningful while the player model is standing in for the camera's own body. External
+    // cameras are supposed to see it wherever it is.
+    if (maxDistance <= 0.f || m_externalCameraRegime || m_playerModelInstances.empty()) {
+      return;
+    }
+
+    const Vector3 cameraPosition = cameraManager.getMainCamera().getPosition(/* freecam = */ false);
+    const float maxDistanceSq = maxDistance * maxDistance;
+
+    for (size_t i = 0; i < m_playerModelInstances.size();) {
+      RtInstance* instance = m_playerModelInstances[i];
+      if (lengthSqr(getPlayerModelInstancePosition(*instance) - cameraPosition) <= maxDistanceSq) {
+        ++i;
+        continue;
+      }
+
+      instance->getVkInstance().mask = 0;
+      // Particle instances carry their visibility on the billboards rather than the instance mask.
+      for (uint32_t billboardIndex = 0; billboardIndex < instance->m_billboardCount; ++billboardIndex) {
+        m_billboards[billboardIndex + instance->m_firstBillboard].instanceMask = 0;
+      }
+
+      // Dropped from the list so virtual instances are not created for it either.
+      m_playerModelInstances.erase(m_playerModelInstances.begin() + i);
+    }
+  }
+
+  void InstanceManager::logPlayerModelInstances(const Vector3& cameraPosition) {
+    if (!RtxOptions::PlayerModel::logCameraRegime()) {
+      return;
+    }
+
+    // Throttled: this walks every player-model draw, and the question it answers - whether a
+    // second, stationary copy of the player mesh is being submitted - is visible at any sample.
+    constexpr uint32_t kIntervalFrames = 60;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (frameId - m_lastLoggedPlayerModelInstancesFrame < kIntervalFrames) {
+      return;
+    }
+    m_lastLoggedPlayerModelInstancesFrame = frameId;
+
+    for (const RtInstance* instance : m_playerModelInstances) {
+      const DrawCallState& input = instance->getBlas()->input;
+      const Vector3 anchor = getPlayerModelInstancePosition(*instance);
+
+      // A bone hash that never changes means the game is submitting the same pose every frame.
+      // One that changes while the mesh still renders in bind pose means the instance is being
+      // handed another copy's geometry instead of its own.
+      Logger::info(str::format(
+        "[RTX-PlayerModel] topologyHash=0x",
+        std::hex, std::uppercase, input.getGeometryData().getHashForRule<rules::TopologicalHash>(),
+        " boneHash=0x", input.getSkinningState().boneHash, std::nouppercase, std::dec,
+        " hasAnchor=", input.hasSkinnedWorldAnchor() ? 1 : 0,
+        " anchor=(", anchor.x, ", ", anchor.y, ", ", anchor.z, ")",
+        " camDist=", length(anchor - cameraPosition),
+        " frame=", frameId));
+    }
   }
 
   void InstanceManager::detectHeldEquipmentInstances(const fast_unordered_set& viewModelTopologyHashes,

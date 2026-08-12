@@ -4491,7 +4491,9 @@ namespace dxvk {
                         &RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModelObject());
       if (ImGui::IsItemHovered()) {
         RemixGui::SetTooltipUnformatted(
-          "Shows player-model geometry on primary rays when no ViewModel camera was submitted this frame.");
+          "Shows player-model geometry on primary rays when no ViewModel camera was submitted this frame,\n"
+          "provided the camera has also moved clear of the player. Games stop drawing first-person overlay\n"
+          "geometry during scripted first-person sequences without moving the camera off the player's head.");
       }
       RemixGui::Checkbox("Create Virtual Instances", &RtxOptions::PlayerModel::enableVirtualInstancesObject());
       if (RemixGui::CollapsingHeader("Calibration", collapsingHeaderClosedFlags)) {
@@ -4499,6 +4501,34 @@ namespace dxvk {
         RemixGui::DragFloat("Backward Offset", &RtxOptions::PlayerModel::backwardOffsetObject(), 0.01f, 0.f, 100.f);
         RemixGui::DragFloat("Horizontal Detection Distance", &RtxOptions::PlayerModel::horizontalDetectionDistanceObject(), 0.01f, 0.f, 100.f);
         RemixGui::DragFloat("Vertical Detection Distance", &RtxOptions::PlayerModel::verticalDetectionDistanceObject(), 0.01f, 0.f, 100.f);
+        RemixGui::DragFloat("Auto Primary Space Body Distance", &RtxOptions::PlayerModel::autoEnableInPrimarySpaceBodyDistanceObject(), 0.1f, 0.f, 1000.f);
+        if (ImGui::IsItemHovered()) {
+          RemixGui::SetTooltipUnformatted(
+            "Camera-to-player distance past which the player model always shows on primary rays. 0 disables.");
+        }
+        RemixGui::DragFloat("First Person Max Distance", &RtxOptions::PlayerModel::firstPersonMaxDistanceObject(), 0.1f, 0.f, 2000.f);
+        if (ImGui::IsItemHovered()) {
+          RemixGui::SetTooltipUnformatted(
+            "In the first-person view, player-model instances farther than this are dropped entirely,\n"
+            "shadows included, so a body parked elsewhere in the level cannot cast one. 0 disables.");
+        }
+        RemixGui::DragInt("Auto Primary Space Delay Frames", &RtxOptions::PlayerModel::autoEnableInPrimarySpaceDelayFramesObject(), 1.f, 0, 60, "%d", sliderFlags);
+        if (ImGui::IsItemHovered()) {
+          RemixGui::SetTooltipUnformatted(
+            "Consecutive frames the automatic rules must agree before the player model shows on primary rays.\n"
+            "Leaving the external-camera state is always immediate.");
+        }
+        RemixGui::Checkbox("Log Camera Regime", &RtxOptions::PlayerModel::logCameraRegimeObject());
+
+        const InstanceManager& instanceManager = common->getSceneManager().getInstanceManager();
+        const float playerDistance = instanceManager.getPlayerModelBodyCameraDistance();
+        ImGui::Text("Camera: %s", instanceManager.isExternalCameraRegime() ? "external" : "first person");
+        ImGui::Text("Player model instances: %zu", instanceManager.getPlayerModelInstanceCount());
+        if (playerDistance < 0.f) {
+          ImGui::TextUnformatted("Camera to player: no player model drawn");
+        } else {
+          ImGui::Text("Camera to player: %.2f", playerDistance);
+        }
         ImGui::Unindent();
       }
       ImGui::Unindent();

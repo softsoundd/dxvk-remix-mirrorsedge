@@ -153,4 +153,9 @@ class "RemixInstanceCategoryAPI" (
         displayGroup = "Remix Categories"
         displayName = "Hair Cards"
     )
+    bool remix_category:view_model = 0 (
+        doc = "Textures / material hashes for first-person view-model draw calls (e.g. Mesh1p arms, FP weapon).\nForces CameraType::ViewModel when rtx.viewModel.enable is true.\nPrefer rtx.viewModelGeometries when the same material is also used on the third-person body."
+        displayGroup = "Remix Categories"
+        displayName = "View Model"
+    )
 }

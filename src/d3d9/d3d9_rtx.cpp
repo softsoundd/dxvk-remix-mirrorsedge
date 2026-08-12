@@ -8840,11 +8840,12 @@ namespace dxvk {
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
 
-    // for UE3 vertex shader skinned (GPUSkin) draws the LocalToWorld placement is baked into the
-    // bone matrices where objectToWorld stays identity and the captured vertices are already in world
-    // space. We should derive a per-instance worldspace anchor from the first bone's translation so the
-    // BLAS cache can spatially determine simultaneous instances of a shared skeletal mesh and
-    // give skinningData a real bone hash so the geometry refit decision tracks the animated pose
+    // UE3 vertex shader skinned (GPUSkin) draws share one bind-pose vertex buffer and bounding box
+    // across every instance of a skeletal mesh, so the BLAS cache cannot tell simultaneous instances
+    // apart on geometry alone. The first bone's translation separates them, and its bone hash gives
+    // the geometry refit decision a handle on the animated pose. The bone matrices are RefToLocal,
+    // so that translation only becomes a world position once carried through the LocalToWorld
+    // processRenderState resolved above; used raw, every instance anchors near the world origin.
     m_activeDrawCallState.m_hasSkinnedWorldAnchor = false;
     // Reset the per-draw skinning identity: only VS-skinned draws (re)assign a bone hash
     // below, and processSkinning() leaves programmable-VS skinningData untouched. Without
@@ -8867,12 +8868,14 @@ namespace dxvk {
         std::min(m_currentUe3CtabInfo->boneMatricesRegisterCount, floatConstRegCount > boneReg ? floatConstRegCount - boneReg : 0u);
       if (boneRegCount >= 3) {
         const auto& fConsts = d3d9State().vsConsts.fConsts;
-        // UE3 bone matrices are float4x3 (3 float4 rows per bone) and the world translation lives in
+        // UE3 bone matrices are float4x3 (3 float4 rows per bone) and the translation lives in
         // the .w of the first three rows of the first bone
-        m_activeDrawCallState.m_skinnedWorldAnchor = Vector3(
+        const Vector3 boneTranslation(
           fConsts[boneReg + 0].w,
           fConsts[boneReg + 1].w,
           fConsts[boneReg + 2].w);
+        m_activeDrawCallState.m_skinnedWorldAnchor =
+          (m_activeDrawCallState.transformData.objectToWorld * Vector4(boneTranslation, 1.0f)).xyz();
         m_activeDrawCallState.m_hasSkinnedWorldAnchor = true;
 
         // processSkinning() returns no SkinningData for programmable-VS draws, so skinningData

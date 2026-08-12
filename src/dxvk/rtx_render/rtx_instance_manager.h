@@ -412,6 +412,14 @@ public:
   void updatePlayerModelBodyCameraDistance(const CameraManager& cameraManager);
   float getPlayerModelBodyCameraDistance() const { return m_playerModelBodyCameraDistance; }
 
+  // Player-model instances drawn this frame. Zero means nothing carried a player-model tag,
+  // so the camera regime cannot affect the body at all - it is plain world geometry.
+  size_t getPlayerModelInstanceCount() const { return m_playerModelInstances.size(); }
+
+  // Drops player-model instances too far from a first-person camera to be its own body
+  // (rtx.playerModel.firstPersonMaxDistance). Runs after the camera regime is decided.
+  void hideDistantPlayerModelInstances(const CameraManager& cameraManager);
+
   // This frame's camera regime, computed once by SceneManager::prepareSceneData: true when
   // the main camera is not the first-person view (player model shown on primary rays,
   // view-model copies hidden, held-equipment classification suspended).
@@ -456,6 +464,12 @@ private:
   float m_playerModelBodyCameraDistance = -1.f;
   bool m_externalCameraRegime = false;
   bool m_viewModelHidden = false;
+
+  // Reports each player-model instance's pose and world anchor (rtx.playerModel.logCameraRegime).
+  // Shows whether instances of a shared skeletal mesh are being told apart, and where each one
+  // actually sits relative to the camera.
+  void logPlayerModelInstances(const Vector3& cameraPosition);
+  uint32_t m_lastLoggedPlayerModelInstancesFrame = 0;
 
   // World instances currently classified as held equipment, mapped to the frame their
   // view-model twin last confirmed them. Classification outlives twin loss through a short
