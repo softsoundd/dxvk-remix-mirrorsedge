@@ -5174,7 +5174,9 @@ namespace dxvk {
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
     o.ue3StaticGeometryHashMemoization = ue3StaticGeometryHashMemoizationObject().get();
-    o.ue3VertexCaptureCameraCellSize = ue3VertexCaptureCameraCellSizeObject().get();
+    o.ue3ExactVertexCapture = ue3ExactVertexCaptureObject().get();
+    o.ue3RequireExactVertexCapture = ue3RequireExactVertexCaptureObject().get();
+    o.ue3VertexCaptureSourceOverride = ue3VertexCaptureSourceOverrideObject().get();
     o.ue3NativeLocalMeshVertexCapture = ue3NativeLocalMeshVertexCaptureObject().get();
     o.ue3RequireCtabCameraConstants = ue3RequireCtabCameraConstantsObject().get();
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
@@ -5225,80 +5227,140 @@ namespace dxvk {
     o.valid = true;
   }
 
-  bool D3D9Rtx::shouldUseUe3CameraHashCell() const {
-    return (m_frameOptions.ue3CameraFromShaderConstants || m_frameOptions.ue3EngineMode) &&
-           m_frameOptions.ue3VertexCaptureCameraCellSize > 0.0f;
+  const char* D3D9Rtx::describeUe3CapturePositionSource(const Ue3CapturePositionSource source) {
+    switch (source) {
+    case Ue3CapturePositionSource::ClipReconstruction: return "ClipReconstruction";
+    case Ue3CapturePositionSource::InputAssembler: return "InputAssembler";
+    case Ue3CapturePositionSource::PreProjectionRegister: return "PreProjectionRegister";
+    }
+    return "Unknown";
   }
 
-  bool D3D9Rtx::computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const {
-    if (!shouldUseUe3CameraHashCell()) {
+  // Requires the vertex shader's oPos transform to have been recognised at compile time AND
+  // its matrix register to be the one the CTAB names ViewProjectionMatrix. The analyzer only
+  // proves "this register is multiplied by a matrix to make oPos"; the CTAB match is what
+  // proves the register holds a world position rather than some factory-local space.
+  bool D3D9Rtx::canUseUe3PreProjectionVertexCapture(const char** outReason) const {
+    auto fail = [&](const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
       return false;
+    };
+
+    if (!m_frameOptions.ue3ExactVertexCapture) {
+      return fail("exact capture disabled");
+    }
+    if (!m_frameOptions.ue3EngineMode) {
+      return fail("UE3 engine mode disabled");
     }
 
-    const float cellSize = m_frameOptions.ue3VertexCaptureCameraCellSize;
-    if (!std::isfinite(cellSize) || cellSize <= 0.0f) {
-      return false;
+    const D3D9CommonShader* vertexShader = GetCommonShader(d3d9State().vertexShader);
+    if (vertexShader == nullptr) {
+      return fail("no vertex shader");
     }
 
-    // Memoized on the exact (worldToView, cellSize) inputs: this runs up to twice per
-    // draw (static vertex-capture key + live geometry VS hash component) and the view
-    // matrix repeats across most draws of a frame, so the affine inverse below would
-    // otherwise be paid thousands of times per frame for one or two distinct views.
-    const Matrix4& worldToView = m_activeDrawCallState.transformData.worldToView;
-    if (m_ue3CameraCellMemoValid &&
-        m_ue3CameraCellMemoCellSize == cellSize &&
-        std::memcmp(&m_ue3CameraCellMemoWorldToView, &worldToView, sizeof(Matrix4)) == 0) {
-      outCell = m_ue3CameraCellMemoCell;
-      return m_ue3CameraCellMemoResult;
+    const DxsoPreProjectionPositionInfo& preProj = vertexShader->GetPreProjectionPositionInfo();
+    if (!preProj.valid) {
+      // The analyzer's own reason is more specific than anything this layer could say.
+      return fail(preProj.failureReason);
     }
 
-    // compute the full result first, then publish to the memo, so the memo can never
-    // hold a half-written entry regardless of how the paths below evolve
-    Ue3CameraHashCell cell = {};
-    bool result = false;
-
-    const Matrix4 cameraViewToWorld = inverseAffine(worldToView);
-    const Vector3 cameraPos = cameraViewToWorld[3].xyz();
-    if (std::isfinite(cameraPos.x) && std::isfinite(cameraPos.y) && std::isfinite(cameraPos.z)) {
-      cell = {
-        int32_t(std::floor(cameraPos.x / cellSize)),
-        int32_t(std::floor(cameraPos.y / cellSize)),
-        int32_t(std::floor(cameraPos.z / cellSize)),
-      };
-      result = true;
+    if (!m_currentUe3CtabInfo.has_value() || !m_currentUe3CtabInfo->hasViewProjectionMatrix) {
+      return fail("CTAB declares no ViewProjectionMatrix");
+    }
+    if (preProj.matrixConstBase != m_currentUe3CtabInfo->viewProjectionMatrixRegisterIndex) {
+      return fail("oPos matrix is not ViewProjectionMatrix");
     }
 
-    m_ue3CameraCellMemoWorldToView = worldToView;
-    m_ue3CameraCellMemoCellSize = cellSize;
-    m_ue3CameraCellMemoCell = cell;
-    m_ue3CameraCellMemoResult = result;
-    m_ue3CameraCellMemoValid = true;
-
-    outCell = cell;
-    return result;
+    if (outReason != nullptr) {
+      *outReason = "";
+    }
+    return true;
   }
 
-  bool D3D9Rtx::areUe3CameraHashCellsEqual(const Ue3CameraHashCell& a, const Ue3CameraHashCell& b) {
-    return a.x == b.x && a.y == b.y && a.z == b.z;
+  Ue3CapturePositionSource D3D9Rtx::resolveUe3CapturePositionSource(
+      const IndexContext& indexContext,
+      const VertexContext vertexContext[caps::MaxStreams],
+      const RasterGeometry& geoData,
+      const char** outReason) const {
+    const char* preProjReason = "";
+    const bool canPreProj = canUseUe3PreProjectionVertexCapture(&preProjReason);
+    const bool canInputAssembler = canUseUe3NativeLocalVertexCapture(indexContext, vertexContext, geoData);
+
+    auto pick = [&](Ue3CapturePositionSource source, const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
+      return source;
+    };
+
+    switch (m_frameOptions.ue3VertexCaptureSourceOverride) {
+    case Ue3CapturePositionSourceOverride::ForcePreProjection:
+      // A forced source that does not apply falls through rather than producing geometry in
+      // the wrong space, so the override stays safe to leave on while investigating.
+      if (canPreProj) {
+        return pick(Ue3CapturePositionSource::PreProjectionRegister, "forced");
+      }
+      return pick(Ue3CapturePositionSource::ClipReconstruction, preProjReason);
+
+    case Ue3CapturePositionSourceOverride::ForceInputAssembler:
+      if (canInputAssembler) {
+        return pick(Ue3CapturePositionSource::InputAssembler, "forced");
+      }
+      return pick(Ue3CapturePositionSource::ClipReconstruction, "not a conservative static local mesh");
+
+    case Ue3CapturePositionSourceOverride::ForceReconstruction:
+      return pick(Ue3CapturePositionSource::ClipReconstruction, "forced");
+
+    case Ue3CapturePositionSourceOverride::Auto:
+      break;
+    }
+
+    if (canPreProj) {
+      return pick(Ue3CapturePositionSource::PreProjectionRegister, "");
+    }
+    if (canInputAssembler) {
+      return pick(Ue3CapturePositionSource::InputAssembler, preProjReason);
+    }
+    return pick(Ue3CapturePositionSource::ClipReconstruction, preProjReason);
   }
 
-  void D3D9Rtx::logUe3CameraHashCellIfChanged(const Ue3CameraHashCell& cell, const char* reason) {
-    if (!m_frameOptions.ue3LogCapturePrecision && Logger::logLevel() > LogLevel::Debug) {
+  void D3D9Rtx::logUe3CapturePositionSource(const Ue3CapturePositionSource source, const char* reason) const {
+    if (!m_frameOptions.ue3LogCapturePrecision) {
       return;
     }
 
-    if (m_hasLoggedUe3CameraHashCell &&
-        areUe3CameraHashCellsEqual(m_lastLoggedUe3CameraHashCell, cell)) {
+    const D3D9CommonShader* vertexShader = GetCommonShader(d3d9State().vertexShader);
+    const XXH64_hash_t vsHash = vertexShader != nullptr ? vertexShader->GetBytecodeHash() : kEmptyHash;
+
+    // One line per shader per outcome: enough to enumerate everything that would be dropped
+    // by ue3RequireExactVertexCapture without the volume of a per-draw log.
+    static fast_unordered_set s_loggedSources;
+    const XXH64_hash_t logKey =
+      vsHash ^ (XXH64_hash_t(source) << 48) ^ (XXH64_hash_t(m_currentUe3VertexFactory) << 56);
+    if (!s_loggedSources.insert(logKey).second) {
       return;
     }
 
-    m_hasLoggedUe3CameraHashCell = true;
-    m_lastLoggedUe3CameraHashCell = cell;
-    Logger::debug(str::format(
-      "[RTX-Compatibility][UE3-Capture] cameraCell=(",
-      cell.x, ",", cell.y, ",", cell.z,
-      "), cellSize=", m_frameOptions.ue3VertexCaptureCameraCellSize,
-      ", reason=", reason));
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Capture] position source=", describeUe3CapturePositionSource(source),
+      ", vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      ", vs=0x", std::hex, vsHash, std::dec,
+      (reason != nullptr && reason[0] != '\0') ? ", reason=" : "",
+      (reason != nullptr) ? reason : ""));
+
+    // On a fallback, follow up with what the shader's position math actually looked like -
+    // a compiler is free to emit the same matrix multiply many ways, and this is the only
+    // way to tell an unsupported shape apart from a detector bug without a debugger.
+    if (source == Ue3CapturePositionSource::ClipReconstruction && vertexShader != nullptr) {
+      const DxsoPreProjectionPositionInfo& preProj = vertexShader->GetPreProjectionPositionInfo();
+      if (!preProj.positionDefinitions.empty()) {
+        Logger::info(str::format(
+          "[RTX-Compatibility][UE3-Capture]   vs=0x", std::hex, vsHash, std::dec,
+          " oPos math: ", preProj.positionDefinitions));
+      }
+    }
   }
 
   // Static in the cross-frame sense: content only changes through an explicit upload,
@@ -5330,7 +5392,26 @@ namespace dxvk {
     if (!m_frameOptions.useVertexCapture) {
       return false;
     }
-    if (m_currentUe3VertexFactory != Ue3VertexFactoryType::Local) {
+    // Only exact sources are camera-independent, so only they can be reused across frames.
+    // A cached clip-space reconstruction would pin the mesh to the reconstruction error of
+    // whichever frame captured it, which is worse than recapturing every frame.
+    if (!isUe3ExactCapturePositionSource(m_activeCapturePositionSource)) {
+      return false;
+    }
+    // The cache key deliberately omits the camera constant registers, so it can only serve
+    // factories whose world position is a function of the input assembler plus object and
+    // bone constants. Camera-facing factories (sprites, billboards, leaf cards) and morphing
+    // terrain move their vertices with the view and would be served a stale pose. Terrain is
+    // also left out because a cache hit suppresses the original draw, which the terrain baker
+    // needs to rasterize.
+    switch (m_currentUe3VertexFactory) {
+    case Ue3VertexFactoryType::Local:
+    case Ue3VertexFactoryType::LocalDecal:
+    case Ue3VertexFactoryType::GPUSkin:
+    case Ue3VertexFactoryType::GPUSkinMorph:
+    case Ue3VertexFactoryType::Foliage:
+      break;
+    default:
       return false;
     }
     if (!m_currentUe3CtabInfo.has_value()) {
@@ -5342,9 +5423,6 @@ namespace dxvk {
     if (!geoData.positionBuffer.defined()) {
       return false;
     }
-    if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
-      return false;
-    }
     if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::WorldUI) ||
         m_activeDrawCallState.testCategoryFlags(InstanceCategories::Terrain)) {
       return false;
@@ -5354,13 +5432,6 @@ namespace dxvk {
     }
 
     const auto& elements = d3d9State().vertexDecl->GetElements();
-    const VDeclSignature sig = buildVDeclSignature(elements);
-    // UE3 static meshes use FPositionVertexBuffer for POSITION and FStaticMeshVertexBuffer
-    // for tangent/normal/UV data. Ref-pose skeletal LocalVertexFactory draws use a unified
-    // stream and are not stable static-local cache candidates.
-    if (sig.positionStream == sig.tangentStream || sig.positionStream == sig.normalStream) {
-      return false;
-    }
 
     if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticD3D9Buffer(indexContext.ibo)) {
       return false;
@@ -5540,9 +5611,9 @@ namespace dxvk {
 
   // IA-only identity for the geometry hash/AABB memo: draw range, decl, texcoord selection
   // (it decides which stream feeds the hashed texcoord region) and per-buffer physical
-  // identity + content generation. Deliberately excludes the stable VS-constant hash, the
-  // object transform and the camera cell, so every instance of a mesh - and every animation
-  // pose of a skinned mesh - shares one entry.
+  // identity + content generation. Deliberately excludes the stable VS-constant hash and
+  // the object transform, so every instance of a mesh - and every animation pose of a
+  // skinned mesh - shares one entry.
   XXH64_hash_t D3D9Rtx::computeUe3IaGeometryMemoKey(const IndexContext& indexContext,
                                                     const VertexContext vertexContext[caps::MaxStreams],
                                                     const DrawContext& drawContext,
@@ -5564,15 +5635,13 @@ namespace dxvk {
       Ue3IaMemoKeyHeader iaHeader; // shared IA identity block
       uint32_t cullMode;
       uint32_t frontFace;
-      uint32_t nativeLocalCapture;
-      uint32_t cameraCellValid;
+      uint32_t positionSource;
+      uint32_t explicitPad0;
       uint64_t stableVsHash;
       Matrix4 objectToWorld;
-      int32_t cameraCell[3];
-      uint32_t explicitPad0;
     };
     static_assert(sizeof(Ue3VertexCaptureKeyHeader) ==
-                    sizeof(Ue3IaMemoKeyHeader) + 4 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(Matrix4) + 4 * sizeof(int32_t),
+                    sizeof(Ue3IaMemoKeyHeader) + 4 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(Matrix4),
                   "Ue3VertexCaptureKeyHeader must have no implicit padding (it is hashed by memory).");
   }
 
@@ -5590,22 +5659,21 @@ namespace dxvk {
         uint32_t(m_uvResolutionMode), m_forceIaTexcoordForOutlier);
     header.cullMode = uint32_t(geoData.cullMode);
     header.frontFace = uint32_t(geoData.frontFace);
-    header.nativeLocalCapture = m_frameOptions.ue3NativeLocalMeshVertexCapture ? 1u : 0u;
+    // Positions from different sources are not interchangeable, so switching source (e.g. via
+    // ue3VertexCaptureSourceOverride) must not serve an entry captured through the other one.
+    header.positionSource = uint32_t(m_activeCapturePositionSource);
     // computed once per draw in internalPrepareDraw and shared with computeHash
     header.stableVsHash = m_activeStableVsHash;
     header.objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
-    Ue3CameraHashCell cameraCell;
-    if (computeUe3CameraHashCell(cameraCell)) {
-      header.cameraCellValid = 1u;
-      header.cameraCell[0] = cameraCell.x;
-      header.cameraCell[1] = cameraCell.y;
-      header.cameraCell[2] = cameraCell.z;
-    }
 
     const XXH64_hash_t headerHash = XXH3_64bits_withSeed(&header, sizeof(header), kSeed);
     return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash);
   }
 
+  // Second-choice exact source, for shaders whose oPos transform was not recognised. Only
+  // safe where the shader does nothing to the position but move it rigidly by LocalToWorld,
+  // so the conditions here stay deliberately narrow: static LocalVertexFactory meshes with
+  // no skinning, decal, wind or view-space CTAB constants in play.
   bool D3D9Rtx::canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                                   const VertexContext vertexContext[caps::MaxStreams],
                                                   const RasterGeometry& geoData) const {
@@ -5923,7 +5991,7 @@ namespace dxvk {
     return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppBuffer, "Vertex Capture Buffer"));
   }
 
-  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const bool capturePositionFromInput) {
+  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const Ue3CapturePositionSource positionSource) {
     ScopedCpuProfileZone();
 
     static_assert(sizeof CapturedVertex == 48, "The injected shader code is expecting this exact structure size to work correctly, see emitVertexCaptureWrite in dxso_compiler.cpp");
@@ -5938,7 +6006,12 @@ namespace dxvk {
       };
 
       const auto& t = m_activeDrawCallState.transformData;
-      if (!detOk(t.viewToProjection) || !detOk(t.worldToView) || !detOk(t.objectToWorld)) {
+      // objectToWorld is inverted for every source; the projection and view inverses only
+      // matter to the clip-space path, so a singular projection cannot veto an exact capture.
+      const bool transformsOk = detOk(t.objectToWorld)
+        && (positionSource != Ue3CapturePositionSource::ClipReconstruction
+            || (detOk(t.viewToProjection) && detOk(t.worldToView)));
+      if (!transformsOk) {
         ONCE(Logger::warn("[RTX-Compatibility] Skipping vertex capture due to non-invertible transform(s)."));
         return false;
       }
@@ -6097,8 +6170,8 @@ namespace dxvk {
     }
 
     // normals for vertex-capture draws
-    // positions are captured from VS output (post-skinning for GPU-skinned draws) then unprojected to object
-    // space, when a skinned shader doesn't output a normal semantic IA normals alone are bind-pose and do not
+    // captured positions are post-skinning for GPU-skinned draws whichever source they come from, so when a
+    // skinned shader doesn't output a normal semantic IA normals alone are bind-pose and do not
     // match captured positions, for UE3 we therefore prioritise:
     // 1 VS NORMAL output when available
     // 2 VS COLOR0 encoded skinned normal output
@@ -6160,8 +6233,15 @@ namespace dxvk {
     }
 
     uint32_t vertexCaptureFlags = 0;
-    if (capturePositionFromInput) {
+    switch (positionSource) {
+    case Ue3CapturePositionSource::InputAssembler:
       vertexCaptureFlags |= kVertexCaptureFlag_PositionFromInput;
+      break;
+    case Ue3CapturePositionSource::PreProjectionRegister:
+      vertexCaptureFlags |= kVertexCaptureFlag_PositionFromPreProjection;
+      break;
+    case Ue3CapturePositionSource::ClipReconstruction:
+      break;
     }
 
     if (vsOutputsNormal && (m_frameOptions.useVertexCapturedNormals || m_frameOptions.ue3EngineMode)) {
@@ -6202,7 +6282,7 @@ namespace dxvk {
       // keep bind-pose IA normals as smooth fallback, they're in the wrong orientation for animated poses (missing bone transform), but provide smooth per-vertex interpolation
       ONCE(Logger::info("[RTX-Compatibility] UE3 GPU-skinned mesh without COLOR0 output: using bind-pose IA normals as smooth fallback."));
     }
-    // 3 : non-skinned, VS doesn't output NORMAL, just keep IA normals from processVertices they're in the same object space as the un-projected captured positions anyway..
+    // 3 : non-skinned, VS doesn't output NORMAL, just keep IA normals from processVertices they're in the same object space as the captured positions anyway..
 
     // Check if we should/can get colors
     if (BoundShaderHas(vertexShader, DxsoUsage::Color, false) && d3d9State().pixelShader.ptr() == nullptr) {
@@ -6215,8 +6295,16 @@ namespace dxvk {
 
     // Upload
     auto& data = *reinterpret_cast<D3D9RtxVertexCaptureData*>(constants.mapPtr);
-    data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
-    data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
+    // Only the clip-space path consumes these, and only it required them to be invertible
+    // above, so inverting them unconditionally would trip math validation on a draw whose
+    // projection is singular but whose position comes from an exact source.
+    if (positionSource == Ue3CapturePositionSource::ClipReconstruction) {
+      data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
+      data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
+    } else {
+      data.invProj = Matrix4();
+      data.viewToWorld = Matrix4();
+    }
     data.worldToObject = inverseAffine(m_activeDrawCallState.transformData.objectToWorld);
     data.normalTransform = m_activeDrawCallState.transformData.objectToWorld;
     // note - BaseVertexIndex can be negative, so we store the raw value as uint32 so the shader's unsigned
@@ -8885,6 +8973,23 @@ namespace dxvk {
       }
     }
 
+    // Resolve where this draw's positions come from before anything keys off it: the capture
+    // cache is only valid for exact sources, and the strict gate below refuses the inexact one.
+    m_activeCapturePositionSource = Ue3CapturePositionSource::ClipReconstruction;
+    if (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture) {
+      const char* positionSourceReason = "";
+      m_activeCapturePositionSource = resolveUe3CapturePositionSource(
+        indexContext, vertexContext, geoData, &positionSourceReason);
+      logUe3CapturePositionSource(m_activeCapturePositionSource, positionSourceReason);
+
+      if (m_frameOptions.ue3RequireExactVertexCapture &&
+          !isUe3ExactCapturePositionSource(m_activeCapturePositionSource)) {
+        m_ue3LastDrawDecision = "no exact vertex capture position source";
+        ONCE(Logger::info("[RTX-Compatibility-Info] Ignoring draw without an exact vertex capture position source (rtx.d3d9.ue3RequireExactVertexCapture)."));
+        return finishPrepare(prepareFlagsForIgnoredDraws);
+      }
+    }
+
     bool canUseCachedVertexCapture = false;
     XXH64_hash_t vertexCaptureCacheKey = kEmptyHash;
     {
@@ -8892,9 +8997,8 @@ namespace dxvk {
 
       // Stable VS hash (bytecode + camera-excluded constants), computed once per draw and
       // shared between the geometry hash below and the static vertex-capture cache key.
-      m_activeStableVsHashUsedExclusions = false;
       m_activeStableVsHash = (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture)
-        ? computeUe3StableVertexShaderHash(&m_activeStableVsHashUsedExclusions)
+        ? computeUe3StableVertexShaderHash()
         : kEmptyHash;
 
       // Static-draw identity for the vertex-capture cache.
@@ -8966,21 +9070,6 @@ namespace dxvk {
     // Note: the material hash was already updated inside processTextures; nothing
     // mutates material data after that point, so no second update is needed here.
 
-    const bool useUe3NativeLocalCapture =
-      canUseUe3NativeLocalVertexCapture(indexContext, vertexContext, geoData);
-    if (useUe3NativeLocalCapture) {
-      ONCE(Logger::info("[RTX-Compatibility] UE3 native LocalVertexFactory capture: using IA object-space positions for conservative static local meshes."));
-      if (m_frameOptions.ue3LogCapturePrecision && Logger::logLevel() <= LogLevel::Debug) {
-        static fast_unordered_set s_loggedNativeLocalDraws;
-        const XXH64_hash_t nativeKey = XXH3_64bits(&m_activeDrawCallState.transformData.objectToWorld, sizeof(Matrix4));
-        if (s_loggedNativeLocalDraws.insert(nativeKey).second) {
-          Logger::debug(str::format(
-            "[RTX-Compatibility][UE3-Capture] native local mesh capture active, vertices=",
-            geoData.vertexCount, ", indices=", geoData.indexCount));
-        }
-      }
-    }
-
     const bool reusedCachedVertexCapture =
       canUseCachedVertexCapture &&
       tryReuseUe3StaticVertexCapture(vertexCaptureCacheKey, geoData);
@@ -8991,7 +9080,7 @@ namespace dxvk {
       const XXH64_hash_t logKey = vertexCaptureCacheKey ^ (reusedCachedVertexCapture ? 0x9E3779B97F4A7C15ull : 0xD1B54A32D192ED03ull);
       if (s_loggedCacheReuse.insert(logKey).second) {
         Logger::debug(str::format(
-          "[RTX-Compatibility][UE3-Capture] static local vertex capture cache ",
+          "[RTX-Compatibility][UE3-Capture] static vertex capture cache ",
           reusedCachedVertexCapture ? "reused" : "recapturing",
           ", key=0x", std::hex, vertexCaptureCacheKey, std::dec,
           ", vertices=", geoData.vertexCount));
@@ -9004,7 +9093,7 @@ namespace dxvk {
       m_frameOptions.useVertexCapture &&
       !reusedCachedVertexCapture;
     if (needVertexCapture) {
-      needVertexCapture = prepareVertexCapture(vertexIndexOffset, useUe3NativeLocalCapture);
+      needVertexCapture = prepareVertexCapture(vertexIndexOffset, m_activeCapturePositionSource);
     }
     if (canUseCachedVertexCapture && !reusedCachedVertexCapture && needVertexCapture) {
       updateUe3StaticVertexCaptureCache(vertexCaptureCacheKey, geoData);

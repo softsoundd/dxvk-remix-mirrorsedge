@@ -17,6 +17,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` toggle which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
 
 - Camera and object transforms are read from UE3's reserved shader constants (CTAB parsing).
+- Vertex positions are captured from the register the game's vertex shader multiplies by ViewProjectionMatrix, not from unprojecting its clip-space output, so accuracy does not depend on view distance. See [Exact vertex position capture](#exact-vertex-position-capture).
 - Depth prepass, shadow depth, SceneCapture, depth-test-disabled translucency, and fullscreen postprocess are skipped so only real base-pass geometry gets ray traced.
 - Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level: tags, categories and asset replacements survive texture streaming, settings changes, and restarts.
 - Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
@@ -74,6 +75,33 @@ show fog
 	- Use a hex editor to locate offset 008E3C6C and patch `0F 84 EE 06 00 00` to `90 90 90 90 90 90`. This has been tested against the GOG version only.
 
 ### 3) Extra fork notes/debugging
+
+#### Exact vertex position capture
+
+Remix injects code at the end of every compiled vertex shader that writes each vertex's position into a capture buffer. That position is either the untransformed value the shader computed before the clip-space multiply, or an unproject of clip-space `oPos` through `inverse(projection)`, `inverse(view)` and `inverse(world)`.
+
+Unprojecting is what distorts distant meshes. UE3 uses an infinite far plane (`clip.z = viewDepth - near`, `clip.w = viewDepth`), so the inverse projection's w row evaluates `(clip.w - clip.z) / near`: two numbers the size of view depth, subtracted to produce `near`. The reconstructed position is divided by that, and the error grows roughly as `viewDepth² · 2⁻²⁴ / near`. It is negligible up close, around 2 units at 20k depth and 15 at 50k with UE3's 10-unit near plane. The error is per-vertex rounding, not a constant offset, so it appears as shear that swims as the camera moves. No matrix precision can remove it, because the cancellation is already present in the `oPos` the game itself computed.
+
+Reading the register back has no such term. Every UE3 vertex factory (`Local`, `GpuSkin` after skinning, `ParticleSprite`, `Foliage`, `Terrain`, `LocalDecal`, `SpeedTree`) goes through `BasePassVertexShader.usf`:
+
+```hlsl
+float4 WorldPosition = VertexFactoryGetWorldPosition(Input);
+Position = MulMatrix(ViewProjectionMatrix, WorldPosition);
+```
+
+`WorldPosition` stays live because fog, `CameraVector` and `PixelPosition` also use it. The DXSO analyzer recovers it from the dataflow of `oPos` rather than a fixed instruction pattern, which `fxc` does not emit stably, then snapshots that register and takes it to object space through one well-conditioned affine inverse. Error stays around 0.002 units at any distance.
+
+A draw uses this path (`rtx.d3d9.ue3ExactVertexCapture`) only when the transform is recognised and the CTAB names the matrix `ViewProjectionMatrix`. The analyzer proves the register is multiplied by a matrix to make `oPos`; the CTAB name is what proves it is a *world* position, not factory-local space. Shaders that adjust position after the transform are rejected.
+
+If the transform is not recognised, conservative static `LocalVertexFactory` meshes use their input-assembler object-space positions (`rtx.d3d9.ue3NativeLocalMeshVertexCapture`), which is equally exact. Anything else unprojects.
+
+Diagnostics:
+
+- `rtx.d3d9.ue3LogCapturePrecision` logs the resolved source per unique (vertex shader, vertex factory). On fallback it also dumps the instructions that produced each `oPos` component.
+- `rtx.d3d9.ue3RequireExactVertexCapture` drops draws that would unproject, so distance-dependent distortion cannot occur, at the cost of losing whatever the exact paths miss.
+- `rtx.d3d9.ue3VertexCaptureSourceOverride` forces one source for every draw. Toggling `0` (Auto) and `3` (Clip Reconstruction) on a long outdoor view is the A/B for the distortion.
+
+The static vertex-capture cache (`rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache`) covers factories whose world position is a function of the input assembler plus object and bone constants: local meshes, skinned meshes, decals and foliage. Exact-source captures are camera independent, so they stay valid across frames. It refuses reconstruction-sourced captures, which depend on where the camera was when they were taken; camera-facing factories (sprites, billboards, leaf cards) and morphing terrain, whose vertices move with the view; and terrain generally, since a cache hit suppresses the original draw the terrain baker needs to rasterize.
 
 #### Mirror's Edge tonemapper and colour curves
 

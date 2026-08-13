@@ -134,24 +134,13 @@ namespace dxvk {
       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
         vertexShaderHash = m_activeStableVsHash;
 
-        if (m_activeStableVsHashUsedExclusions) {
-          // refresh geometry as the camera travels by folding a coarse camera anchor into the hash
-          // doing this to avoid the distortion that grows with distance from the location where RT was enabled
-          // todo: revisit this, it still doesn't solve scene capture distortion
-          Ue3CameraHashCell cameraCell;
-          if (computeUe3CameraHashCell(cameraCell)) {
-            logUe3CameraHashCellIfChanged(cameraCell, "geometry hash");
-            vertexShaderHash = XXH3_64bits_withSeed(
-              &cameraCell,
-              sizeof(cameraCell),
-              vertexShaderHash);
-          }
-          if (m_frameOptions.ue3LogCapturePrecision && Logger::logLevel() <= LogLevel::Debug) {
-            ONCE(Logger::debug(str::format(
-              "[RTX-Compatibility][UE3-Capture] VS camera constants excluded from geometry hash, cameraCellEnabled=",
-              shouldUseUe3CameraHashCell())));
-          }
-        }
+        // Captured positions from different sources are not interchangeable, so a source
+        // change has to mint a new geometry hash rather than refit the previous geometry.
+        const uint64_t positionSourceHashMode = uint64_t(m_activeCapturePositionSource);
+        vertexShaderHash = XXH3_64bits_withSeed(
+          &positionSourceHashMode,
+          sizeof(positionSourceHashMode),
+          vertexShaderHash);
 
         if (m_forceIaTexcoordForOutlier) {
           // compat cache key - outlier draws force IA texcoords in vertex capture
@@ -255,7 +244,7 @@ namespace dxvk {
 
       // Publish into the static-geometry memo entry so later frames can reuse the
       // result without recomputing (entry storage is heap-pinned via shared_ptr).
-      // The VertexShader component is per-draw (stable VS-constant hash, camera cell)
+      // The VertexShader component is per-draw (stable VS-constant hash, position source)
       // and is recombined live by the memo consumer, so it is not stored.
       if (publishTo != nullptr) {
         for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {

@@ -99,4 +99,21 @@ exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_director
 test('test_f16tof32', exe, env: test_env)
 tests += exe
 
+dxso_analysis_src = files([
+  '../../../src/dxso/dxso_analysis.cpp',
+  '../../../src/dxso/dxso_decoder.cpp',
+  '../../../src/dxso/dxso_ctab.cpp',
+  '../../../src/dxso/dxso_code.cpp',
+  '../../../src/dxso/dxso_reader.cpp',
+  '../../../src/dxso/dxso_tables.cpp',
+  '../../../src/dxso/dxso_enums.cpp',
+  '../../../src/dxso/dxso_common.cpp',
+])
+
+# The analyzer sources are compiled in directly rather than linked from libdxso, whose
+# compiler object also pulls in the d3d9 fixed-function SPIR-V helpers.
+exe = executable('test_dxso_preproj_position',  files('test_dxso_preproj_position.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dxso_preproj_position', exe, env: test_env)
+tests += exe
+
 alias_target('unit_tests', tests)

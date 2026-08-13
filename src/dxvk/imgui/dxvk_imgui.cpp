@@ -3020,6 +3020,11 @@ namespace dxvk {
         RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
         RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
         RemixGui::Separator();
+        RemixGui::Checkbox("Exact Position Capture (UE3)", &D3D9Rtx::ue3ExactVertexCaptureObject());
+        RemixGui::Checkbox("Require Exact Position Capture (UE3)", &D3D9Rtx::ue3RequireExactVertexCaptureObject());
+        RemixGui::Combo("Position Source Override (UE3)", &D3D9Rtx::ue3VertexCaptureSourceOverrideObject(),
+                        "Auto\0Pre-Projection Register\0Input Assembler\0Clip Reconstruction\0");
+        RemixGui::Separator();
         RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
         ImGui::Unindent();
       }

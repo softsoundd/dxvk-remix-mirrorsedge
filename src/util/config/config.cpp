@@ -125,32 +125,19 @@ namespace dxvk {
       { "rtx.d3d9.ue3EngineMode",                                    "True" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",            "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
+      { "rtx.d3d9.ue3ExactVertexCapture",                            "True" },
       { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
-      { "rtx.d3d9.ue3VertexCaptureCameraCellSize",                   "0" },
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },
       { "rtx.fallbackLightMode",                                     "0" },
       { "rtx.numGeometryProcessingThreads",                          "4" },
-      // Mesh1p as ViewModel; Mesh3p as player model (hidden in FP primary, visible in cutscenes).
       { "rtx.viewModel.enable",                                      "True" },
       { "rtx.viewModel.enableVirtualInstances",                      "False" },
-      // Scoped zoom hides the view model in stock rendering; FOV is the zoom signal. Sits well
-      // below the ~43 degrees scripted cinematics pull the FOV in to, since the sniper ramps on
-      // down to ~7 and only the depth of the zoom tells the two apart.
       { "rtx.viewModel.hideBelowFovDegrees",                         "25.0" },
       { "rtx.postfx.enableMotionBlurViewModel",                      "True" },
       { "rtx.playerModel.enableInPrimarySpace",                      "False" },
       { "rtx.playerModel.autoEnableInPrimarySpaceWhenNoViewModel",   "True" },
-      // Camera-to-player distance cannot decide the external camera here: scripted sequences park
-      // the pawn at its destination and fly the first-person camera in separately, so the distance
-      // leaves the first-person range without the view ever leaving Faith. View-model presence
-      // carries that state on its own.
       { "rtx.playerModel.autoEnableInPrimarySpaceBodyDistance",      "0.0" },
-      // Camera cuts cost a frame of overlay geometry; require sustained absence.
       { "rtx.playerModel.autoEnableInPrimarySpaceDelayFrames",       "5" },
-      // The parked pawn above still draws Mesh3p under the modded TdGame.u, leaving Faith standing
-      // at the destination casting a shadow for the seconds the camera takes to arrive. First-person
-      // play measures 54-192 units from the anchor bone and the fly-in 625 and up, so anything
-      // between those only decides how close the camera gets before the shadow returns.
       { "rtx.playerModel.firstPersonMaxDistance",                    "250.0" },
     }} },
     /* Star Wars Battlefront (2015)               */

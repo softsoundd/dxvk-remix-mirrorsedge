@@ -90,6 +90,22 @@ namespace dxvk {
     OriginOnly,      // origin proven but the VS math is not representable as an affine transform
   };
 
+  // Where vertex capture reads a draw's positions from. Both exact sources are independent
+  // of view depth; ClipReconstruction inverts the projection, whose error grows with the
+  // square of view depth over the near plane and shears distant geometry.
+  enum class Ue3CapturePositionSource : uint8_t {
+    ClipReconstruction = 0, // unproject the vertex shader's clip-space output (inexact)
+    InputAssembler,         // IA object-space positions, for meshes the shader only moves rigidly
+    PreProjectionRegister,  // the world position the shader itself computed, read back directly
+  };
+
+  enum class Ue3CapturePositionSourceOverride : int {
+    Auto = 0,
+    ForcePreProjection,
+    ForceInputAssembler,
+    ForceReconstruction,
+  };
+
   //This class handles all of the RTX operations that are required from the D3D9 side.
   struct D3D9Rtx {
     friend class ImGUI; // <-- we want to modify these values directly.
@@ -281,9 +297,12 @@ namespace dxvk {
                "pixel-count consumers (e.g. UE3 lens flare fading) see fully-visible. Only active while ray "
                "tracing is enabled. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
-               "UE3 compat: for stable static LocalVertexFactory draws, reuse previously captured vertex shader output instead of preserving a new vertex-capture draw.");
+               "UE3 compat: for static draws captured through an exact position source, reuse the vertex shader "
+               "output captured on an earlier frame rather than preserving a new vertex-capture draw. Only exact "
+               "sources qualify: a clip-space reconstruction depends on where the camera was when it was taken, so "
+               "reusing one across frames would freeze that frame's reconstruction error into the mesh.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
-               "UE3 compat: number of matching captures before a static LocalVertexFactory draw can reuse cached vertex-capture output.");
+               "UE3 compat: number of matching captures before a static draw can reuse cached vertex-capture output.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticGeometryHashMemoization, true,
                "UE3 CPU optimization: reuse geometry hash and bounding box results across frames for draws whose "
                "input-assembler vertex/index buffers are static (any vertex factory, including the bind-pose buffers "
@@ -292,10 +311,30 @@ namespace dxvk {
                "counters), so one entry serves every instance of a mesh and results can never go stale; the per-draw "
                "vertex-shader-constants hash component is recombined live so served hashes are bit-identical to a "
                "fresh compute.");
-    RTX_OPTION("rtx.d3d9", float, ue3VertexCaptureCameraCellSize, 2000.0f,
-               "UE3 compat: world-space camera cell size used to refresh camera-sensitive vertex captures. Smaller values recapture more often; 0 disables camera-cell hashing.");
-    RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, false,
-               "UE3 compat experimental: use input-assembler object-space positions directly for conservative static LocalVertexFactory draws instead of reconstructing positions from clip space.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ExactVertexCapture, true,
+               "UE3 compat: capture positions from the register the vertex shader multiplies by ViewProjectionMatrix "
+               "rather than by unprojecting its clip-space output. Unprojecting divides by a quantity built from the "
+               "difference of two numbers the size of view depth, so its error grows with the square of distance and "
+               "makes distant meshes shear and swim as the camera moves; reading back the untransformed value the "
+               "shader computed carries no such term. Requires the shader's oPos transform to be recognised and its "
+               "matrix register to match the CTAB ViewProjectionMatrix symbol, which together prove the register "
+               "holds a world position; draws failing either check fall back to unprojecting "
+               "(see rtx.d3d9.ue3RequireExactVertexCapture).");
+    RTX_OPTION("rtx.d3d9", bool, ue3RequireExactVertexCapture, false,
+               "UE3 compat: drop draws from the ray-traced scene when neither exact position source applies, rather "
+               "than falling back to clip-space reconstruction. This makes distance-dependent vertex distortion "
+               "impossible rather than merely rare, at the cost of losing any geometry the exact paths do not cover. "
+               "Enable rtx.d3d9.ue3LogCapturePrecision for a session first to enumerate which draws would be dropped.");
+    RTX_OPTION("rtx.d3d9", Ue3CapturePositionSourceOverride, ue3VertexCaptureSourceOverride, Ue3CapturePositionSourceOverride::Auto,
+               "UE3 compat diagnostics: force every vertex-capture draw onto one position source. 0 picks the most "
+               "accurate applicable source (default), 1 forces the shader's pre-projection register, 2 forces "
+               "input-assembler positions, 3 forces clip-space reconstruction. Toggling between 0 and 3 on a long "
+               "outdoor view is the direct A/B for distance-dependent distortion. Forcing a source a draw does not "
+               "qualify for falls back to reconstruction rather than producing wrong geometry.");
+    RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, true,
+               "UE3 compat: allow input-assembler object-space positions to be used directly for conservative static "
+               "LocalVertexFactory draws. This is the second-choice exact source, used for shaders whose oPos "
+               "transform rtx.d3d9.ue3ExactVertexCapture could not recognise.");
     RTX_OPTION("rtx.d3d9", bool, ue3RequireCtabCameraConstants, false,
                "UE3 compat: only allow a draw call to update the Main camera when its vertex shader CTAB explicitly "
                "names both ViewProjectionMatrix and CameraPosition constants. Engine utility shaders (shadow depth, "
@@ -361,7 +400,10 @@ namespace dxvk {
                "sample count, semantic/expression flags, final score, and the winning stages. Use this to diagnose draws "
                "where the wrong texture (e.g. a normal or specular map) is chosen as the ray-traced albedo.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
-               "UE3 compat: log camera-cell, hash, cache, and matrix diagnostics for vertex capture precision issues.");
+               "UE3 compat: log vertex capture precision diagnostics - the resolved position source per unique "
+               "(vertex shader, vertex factory) with the reason any draw fell back to clip-space reconstruction, "
+               "plus hash, cache and camera matrix details. The fallback lines are the list to work through before "
+               "enabling rtx.d3d9.ue3RequireExactVertexCapture.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogDrawStatusFlaps, false,
                "UE3 compat diagnostics: detect draws whose raytracing status (raytraced/rasterized/ignored) changes "
                "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
@@ -1116,7 +1158,7 @@ namespace dxvk {
     // Keyed purely on the IA identity (buffers, offsets, generations, draw range, decl,
     // texcoord selection), so one entry serves every instance of a mesh regardless of
     // transform. The entry holds the hash components computed from that identity; the
-    // per-draw VertexShader component (stable VS-constant hash, camera cell) is
+    // per-draw VertexShader component (stable VS-constant hash, position source) is
     // recombined live by the consumer, making served hashes bit-identical to a fresh
     // compute. Entries are heap-pinned via shared_ptr: a geometry worker publishes
     // results into the entry (release store on the ready flag) while the main thread
@@ -1140,33 +1182,27 @@ namespace dxvk {
                                              const DrawContext& drawContext,
                                              const RasterGeometry& geoData) const;
     // The geometry-hash VertexShader component for the current draw (stable VS-constant
-    // hash plus camera-cell/outlier folds); shared by computeHash and the memo hit path.
+    // hash plus position-source/outlier folds); shared by computeHash and the memo hit path.
     XXH64_hash_t computeLiveGeometryVertexShaderHashComponent();
 
-    struct Ue3CameraHashCell {
-      int32_t x = 0;
-      int32_t y = 0;
-      int32_t z = 0;
-    };
-    bool m_hasLoggedUe3CameraHashCell = false;
-    Ue3CameraHashCell m_lastLoggedUe3CameraHashCell = {};
+    // Position source resolved once per draw, before the vertex-capture cache key is built
+    // (the cache is only valid for exact sources) and before capture flags are uploaded.
+    Ue3CapturePositionSource m_activeCapturePositionSource = Ue3CapturePositionSource::ClipReconstruction;
 
-    // single-entry memo for computeUe3CameraHashCell, keyed on the exact inputs
-    // (worldToView content + cell size)
-    mutable Matrix4 m_ue3CameraCellMemoWorldToView;
-    mutable Ue3CameraHashCell m_ue3CameraCellMemoCell = {};
-    mutable float m_ue3CameraCellMemoCellSize = -1.0f;
-    mutable bool m_ue3CameraCellMemoResult = false;
-    mutable bool m_ue3CameraCellMemoValid = false;
-
-    bool shouldUseUe3CameraHashCell() const;
-    bool computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const;
-    static bool areUe3CameraHashCellsEqual(const Ue3CameraHashCell& a, const Ue3CameraHashCell& b);
-    void logUe3CameraHashCellIfChanged(const Ue3CameraHashCell& cell, const char* reason);
+    Ue3CapturePositionSource resolveUe3CapturePositionSource(const IndexContext& indexContext,
+                                                             const VertexContext vertexContext[caps::MaxStreams],
+                                                             const RasterGeometry& geoData,
+                                                             const char** outReason) const;
+    static bool isUe3ExactCapturePositionSource(Ue3CapturePositionSource source) {
+      return source != Ue3CapturePositionSource::ClipReconstruction;
+    }
+    static const char* describeUe3CapturePositionSource(Ue3CapturePositionSource source);
+    void logUe3CapturePositionSource(Ue3CapturePositionSource source, const char* reason) const;
 
     bool canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
+    bool canUseUe3PreProjectionVertexCapture(const char** outReason) const;
     bool canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
@@ -1177,7 +1213,6 @@ namespace dxvk {
     // vertex-capture cache key, so it is computed once per draw in internalPrepareDraw
     // instead of hashing up to 4KB of shader constants twice.
     XXH64_hash_t m_activeStableVsHash = 0;
-    bool m_activeStableVsHashUsedExclusions = false;
     XXH64_hash_t computeUe3StaticVertexCaptureCacheKey(const IndexContext& indexContext,
                                                        const VertexContext vertexContext[caps::MaxStreams],
                                                        const DrawContext& drawContext,
@@ -1198,7 +1233,7 @@ namespace dxvk {
     template<typename T>
     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
 
-    bool prepareVertexCapture(const int vertexIndexOffset, bool capturePositionFromInput = false);
+    bool prepareVertexCapture(const int vertexIndexOffset, Ue3CapturePositionSource positionSource);
 
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 
@@ -1391,7 +1426,9 @@ namespace dxvk {
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
       bool ue3StaticGeometryHashMemoization = false;
-      float ue3VertexCaptureCameraCellSize = 0.0f;
+      bool ue3ExactVertexCapture = false;
+      bool ue3RequireExactVertexCapture = false;
+      Ue3CapturePositionSourceOverride ue3VertexCaptureSourceOverride = Ue3CapturePositionSourceOverride::Auto;
       bool ue3NativeLocalMeshVertexCapture = false;
       bool ue3RequireCtabCameraConstants = false;
       bool ue3StableDiffuseSelection = false;
