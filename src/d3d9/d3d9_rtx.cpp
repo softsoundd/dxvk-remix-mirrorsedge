@@ -5776,11 +5776,11 @@ namespace dxvk {
     return true;
   }
 
-  // Resolved once per vertex shader. Camera registers are always excluded: hashing them would make
-  // every draw's identity move with the view. Stock UE3 reserves exactly two (VSR_ViewProjMatrix at
-  // c0, VSR_ViewOrigin at c4), which the fallbacks encode; CTAB overrides them where a game moved
-  // them. The second variant additionally drops the object transform and the shading-only
-  // constants, which describe where a mesh is and how it is lit rather than what its geometry is.
+  // Resolved once per vertex shader. The camera registers are always excluded: hashing them would
+  // make every draw's identity move with the view. Stock UE3 reserves two (VSR_ViewProjMatrix at c0,
+  // VSR_ViewOrigin at c4), which the defaults encode. The second variant additionally drops the
+  // object transform and the shading-only constants, which describe where a mesh is and how it is
+  // lit rather than what its geometry is.
   D3D9Rtx::Ue3VsHashExclusions D3D9Rtx::buildUe3VsHashExclusions(
       const Ue3VsShaderCtabInfo& ctabInfo,
       const std::vector<Ue3VsConstantSymbol>* symbols) {
@@ -5817,14 +5817,23 @@ namespace dxvk {
       }
     };
 
-    add(kUe3VsrViewProjMatrixRegister, 4);
-    add(kUe3VsrViewOriginRegister, 1);
-    if (ctabInfo.hasViewProjectionMatrix) {
-      add(ctabInfo.viewProjectionMatrixRegisterIndex, ctabInfo.viewProjectionMatrixRegisterCount);
+    // Where the CTAB names them, those locations replace the reserved defaults rather than adding
+    // to them. Excluding both would drop c0..c4 from the hash for a shader that keeps real
+    // per-draw state there, letting draws that differ collide on the same hash.
+    uint32_t viewProjReg = kUe3VsrViewProjMatrixRegister;
+    uint32_t viewProjRegCount = 4;
+    uint32_t viewOriginReg = kUe3VsrViewOriginRegister;
+    uint32_t viewOriginRegCount = 1;
+    if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
+      viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
+      viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
     }
-    if (ctabInfo.hasCameraPosition) {
-      add(ctabInfo.cameraPositionRegisterIndex, ctabInfo.cameraPositionRegisterCount);
+    if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
+      viewOriginReg = ctabInfo.cameraPositionRegisterIndex;
+      viewOriginRegCount = ctabInfo.cameraPositionRegisterCount;
     }
+    add(viewProjReg, viewProjRegCount);
+    add(viewOriginReg, viewOriginRegCount);
 
     Ue3VsHashExclusions result;
     std::array<Range, Ue3VsHashExclusions::kMaxRanges> cameraRaw = raw;
