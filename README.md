@@ -101,7 +101,25 @@ Diagnostics:
 - `rtx.d3d9.ue3RequireExactVertexCapture` drops draws that would unproject, so distance-dependent distortion cannot occur, at the cost of losing whatever the exact paths miss.
 - `rtx.d3d9.ue3VertexCaptureSourceOverride` forces one source for every draw. Toggling `0` (Auto) and `3` (Clip Reconstruction) on a long outdoor view is the A/B for the distortion.
 
-The static vertex-capture cache (`rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache`) covers factories whose world position is a function of the input assembler plus object and bone constants: local meshes, skinned meshes, decals and foliage. Exact-source captures are camera independent, so they stay valid across frames. It refuses reconstruction-sourced captures, which depend on where the camera was when they were taken; camera-facing factories (sprites, billboards, leaf cards) and morphing terrain, whose vertices move with the view; and terrain generally, since a cache hit suppresses the original draw the terrain baker needs to rasterize.
+The static vertex-capture cache (`rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache`) reuses captured vertex data from an earlier frame for local meshes, decals and foliage that are not moving. Exact-source captures do not depend on the camera, so they stay valid across frames. It refuses reconstruction-sourced captures (those depend on where the camera was), camera-facing factories (sprites, billboards, leaf cards), morphing terrain, terrain in general (a hit would suppress the draw the terrain baker needs), and skinned draws.
+
+The key includes the object transform and the shader constants other than camera registers, so only a draw that repeats both can hit. Skinned meshes put bone matrices in that hash and would mint a new key every frame, which is why they are refused; a moving prop does the same through its transform. A capture gets a device-local buffer only after its key has been seen on `rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames` distinct frames. Until then it is a few bytes of CPU bookkeeping. `rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB` caps retained bytes and evicts LRU first. `...RetentionFrames` is a staleness bound and `...MaxEntries` a backstop for many tiny captures. Expired entries are recaptured when the mesh returns to view, so a short window at a high frame rate will expire them during ordinary camera movement.
+
+Some titles recompute a draw's transform every frame even for still geometry, so keys never repeat. Below `rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheMinReusePercent` the cache releases its buffers and key records, then re-tests every `...ReuseProbeFrames` frames. Set the threshold to `0` to disable the guard.
+
+`rtx.d3d9.ue3LogStaticVertexCaptureCacheStats` reports entries, bytes, keys awaiting admission and reuse rate about once a second, including dormancy. Buffers appear under `RTXVertexCapture` in the memory profiler and HUD. If reuse is near zero, the keys are churning; raising the budget will not help.
+
+#### Diagnosing a cache that never hits
+
+`rtx.d3d9.ue3LogVertexConstantChurn` samples up to `rtx.d3d9.ue3VertexConstantChurnMaxTrackedDraws` meshes by input-assembler identity and reports what changed when a draw that should be static returns: whether the IA identity came back at all (buffer handles, draw range, or content-generation counters), whether the multiset of instance transforms matched between completed frames (same count but different placements means they moved; a count change is culling), and whether any other vertex constant moved, named by CTAB symbol. Camera and transform registers are skipped in that last check. Raw `LocalToWorld` is compared with the extracted matrices so an extraction bug is visible separately from the game. The tracker keys per mesh, not per placement, so ordinary instanced translations are not reported as churn. Changes only while the view moves point at a camera-derived constant; changes with the view still point at animation or time. `ue3ExcludePlacementFromVertexShaderHash` can address placement churn only.
+
+#### Placement constants and the geometry hash
+
+Stock UE3 excludes `ViewProjectionMatrix` (`c0`) and `CameraPosition` (`c4`) from the stable VS hash. Other stock camera-derived vertex constants belong to factories the cache already refuses (e.g. Mirror's Edge reuses about 98% of eligible draws).
+
+Other UE3 titles may upload a different `LocalToWorld` every frame for every draw when the view moves. Those registers sit in `HashComponents::VertexShader` and `rules::FullGeometryHash`, so `DrawCallCache::exactMatch` never matches across frames and a new `BlasEntry` is allocated per draw per frame. Asset and replacement hashes are unaffected (`rtx.geometryAssetHashRuleString` excludes `vertexshader` by default).
+
+`rtx.d3d9.ue3ExcludePlacementFromVertexShaderHash` leaves the transform and shading-only constants (`LightMapScale`, lightmap/shadow coordinate scale-bias) out of that hash. Bone registers stay in. It is off by default - enable it only when the churn log shows raw `LocalToWorld` registers differing on nearly every comparison.
 
 #### Mirror's Edge tonemapper and colour curves
 

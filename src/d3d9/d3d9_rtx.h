@@ -300,9 +300,74 @@ namespace dxvk {
                "UE3 compat: for static draws captured through an exact position source, reuse the vertex shader "
                "output captured on an earlier frame rather than preserving a new vertex-capture draw. Only exact "
                "sources qualify: a clip-space reconstruction depends on where the camera was when it was taken, so "
-               "reusing one across frames would freeze that frame's reconstruction error into the mesh.");
+               "reusing one across frames would freeze that frame's reconstruction error into the mesh. Cache keys "
+               "cover the object transform and the shader's non-camera constants, so only genuinely static draws "
+               "repeat a key; skinned draws and moving objects are refused outright or never admitted, and the "
+               "cache is bounded by rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
-               "UE3 compat: number of matching captures before a static draw can reuse cached vertex-capture output.");
+               "UE3 compat: number of distinct frames a static draw's cache key must be seen on before its captured "
+               "vertex data is retained for reuse. Until then the key is tracked by a few bytes of CPU-side "
+               "bookkeeping only, so a key that never repeats never retains a device-local capture buffer.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheBudgetMiB, 256,
+               "UE3 compat: upper bound in MiB on the device-local vertex-capture buffers retained by the static "
+               "vertex-capture cache. Least recently used entries are evicted once the budget is exceeded, so an "
+               "unexpectedly high key cardinality costs cache hit rate rather than VRAM. 0 disables the cache's "
+               "retention tier entirely.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheMaxEntries, 16384,
+               "UE3 compat: upper bound on the number of retained static vertex-capture entries, as a backstop "
+               "against many tiny captures exhausting the entry map before the byte budget is reached.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheRetentionFrames, 600,
+               "UE3 compat: number of frames a retained static vertex-capture entry survives without being reused "
+               "before it is dropped. This is a staleness bound, not the memory bound - "
+               "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB caps the bytes and evicts least recently used "
+               "entries, which is the mechanism that actually keeps VRAM in check. Keep this generous: a mesh that "
+               "leaves the view and comes back has to be recaptured once the entry expires, and at a high frame rate "
+               "a short window expires entries during ordinary camera movement.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheMinReusePercent, 10,
+               "UE3 compat: percentage of eligible draws that must be served from the static vertex-capture cache for "
+               "it to keep running. A title whose draws carry a camera-dependent vertex shader constant mints a fresh "
+               "cache key every frame the camera moves, so the cache can never hit and its bookkeeping is pure "
+               "overhead; below this rate it goes dormant, releasing its retained buffers and key records, and "
+               "re-tests itself every rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames frames in case a "
+               "later scene is cacheable. 0 disables the guard and lets the cache run unconditionally.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames, 1800,
+               "UE3 compat: number of frames the static vertex-capture cache stays dormant before briefly re-enabling "
+               "itself to re-measure its reuse rate. Lower values notice a newly cacheable scene sooner; higher values "
+               "spend less time re-measuring in a title where the cache can never hit.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ExcludePlacementFromVertexShaderHash, false,
+               "UE3 compat: leave the object transform (LocalToWorld/WorldToLocal) and the shading-only constants "
+               "(LightMapScale, lightmap/shadow coordinate scale-bias) out of the vertex-shader constant hash that "
+               "feeds HashComponents::VertexShader, and so rules::FullGeometryHash.\n"
+               "Enable it only for titles that recompute LocalToWorld every frame for geometry that is not moving. "
+               "There, the transform moves that hash every frame, DrawCallCache::exactMatch never matches across "
+               "frames, and a fresh BlasEntry is allocated for every draw of every frame; excluding the transform "
+               "restores cross-frame matching. Use rtx.d3d9.ue3LogVertexConstantChurn to identify such a title: its "
+               "level 2 reports the raw LocalToWorld registers differing on nearly every comparison.\n"
+               "It is off by default because it is a trade-off, not a pure win. That same hash is also what separates "
+               "one placement of a mesh from another, so excluding the transform collapses every instance of a mesh "
+               "into a single BlasEntry that must then disambiguate them internally. A title with stable transforms "
+               "and dense instancing is already in the good case and measurably loses throughput from the collapse - "
+               "Mirror's Edge loses roughly a tenth of its frame rate in a heavy scene.\n"
+               "Skinned meshes churn the hash through their bone registers either way, which stay included, so "
+               "genuine vertex changes are never lost. Asset and replacement hashes are unaffected regardless, "
+               "because rtx.geometryAssetHashRuleString excludes vertexshader.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogVertexConstantChurn, false,
+               "UE3 compat diagnostics: for draws that should be cacheable static geometry, report what actually "
+               "changes between consecutive frames, as three separately attributed levels - the input-assembler "
+               "identity, the set of instance transforms placed with the mesh, and any other vertex shader constant. "
+               "Constant changes are named by their CTAB symbol and correlated against whether the view moved. Use "
+               "this when the static vertex-capture cache reports a low reuse rate, to find which of the three is "
+               "responsible; only the third is beyond the reach of "
+               "rtx.d3d9.ue3ExcludePlacementFromVertexShaderHash.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3VertexConstantChurnMaxTrackedDraws, 256,
+               "UE3 compat diagnostics: how many distinct input-assembler identities the constant-churn diagnostic "
+               "samples. A sample is enough to characterise a title, and each tracked mesh retains a snapshot of the "
+               "shader's used float constants for comparison against the next frame.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogStaticVertexCaptureCacheStats, false,
+               "UE3 compat diagnostics: log the static vertex-capture cache's retained entry count, retained bytes "
+               "and per-frame reuse rate roughly once per second, plus a one-time warning when the byte budget or "
+               "entry cap first forces an eviction. Use this to confirm the cache is hitting rather than just "
+               "accumulating, and to size rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticGeometryHashMemoization, true,
                "UE3 CPU optimization: reuse geometry hash and bounding box results across frames for draws whose "
                "input-assembler vertex/index buffers are static (any vertex factory, including the bind-pose buffers "
@@ -950,9 +1015,50 @@ namespace dxvk {
       bool hasWindMatrices = false;
     };
 
+    // Full CTAB symbol table per vertex shader. Deliberately kept out of Ue3VsShaderCtabInfo,
+    // which is copied by value into m_currentUe3CtabInfo on every draw - putting strings in there
+    // would allocate per draw. Two consumers: naming registers for the constant-churn diagnostic,
+    // and resolving which registers are shading-only for the hash exclusions below. Filled
+    // unconditionally at parse time (once per unique shader) so enabling the diagnostic
+    // mid-session still names registers for shaders already seen.
+    struct Ue3VsConstantSymbol {
+      uint32_t registerIndex = 0;
+      uint32_t registerCount = 0;
+      std::string name;
+    };
+    fast_unordered_cache<std::vector<Ue3VsConstantSymbol>> m_ue3VsConstantSymbols;
+    // Names the register, e.g. "c12 (LocalToWorld[1])", falling back to the bare register.
+    std::string describeUe3VsConstantRegister(XXH64_hash_t vsBytecodeHash, uint32_t reg) const;
+
+    // Merged register ranges the stable VS hash skips, resolved once per vertex shader because
+    // they are a pure function of its CTAB. Both variants are precomputed so the per-draw path
+    // never builds, sorts or merges anything - it just hashes the gaps. Kept in a side map rather
+    // than in Ue3VsShaderCtabInfo, which is copied by value on every draw.
+    struct Ue3VsHashExclusions {
+      // Six come from fixed sources (two reserved camera registers, their CTAB overrides, and the
+      // two transform matrices); the rest are one per shading-only CTAB symbol. Overflowing only
+      // leaves a register in the hash that would have been excluded, so a generous cap is enough.
+      static constexpr uint32_t kMaxRanges = 16;
+      struct Range {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+      };
+      std::array<Range, kMaxRanges> cameraOnly = {};
+      uint32_t cameraOnlyCount = 0;
+      // Camera registers plus the object transform and shading-only constants.
+      std::array<Range, kMaxRanges> withPlacement = {};
+      uint32_t withPlacementCount = 0;
+    };
+
     // keyed by XXH3 hash of the vertex shader DXSO bytecode
     fast_unordered_cache<Ue3VsShaderCtabInfo> m_ue3VsShaderCtabCache;
     std::optional<Ue3VsShaderCtabInfo> m_currentUe3CtabInfo;
+
+    fast_unordered_cache<Ue3VsHashExclusions> m_ue3VsHashExclusionCache;
+    // Borrowed from the cache above for the duration of the draw; never owned.
+    const Ue3VsHashExclusions* m_currentUe3VsHashExclusions = nullptr;
+    static Ue3VsHashExclusions buildUe3VsHashExclusions(const Ue3VsShaderCtabInfo& ctabInfo,
+                                                        const std::vector<Ue3VsConstantSymbol>* symbols);
 
     struct Ue3CameraConstantsCache {
       XXH64_hash_t hash = 0;
@@ -1140,17 +1246,131 @@ namespace dxvk {
       bool canUseBuffer;
     };
 
+    // Retention tier of the static vertex-capture cache. An entry pins the whole
+    // device-local capture buffer that its four views alias, so keys only reach this tier
+    // once the admission tier below has proven they repeat across frames.
     struct Ue3VertexCaptureCacheEntry {
       RasterBuffer positionBuffer;
       RasterBuffer normalBuffer;
       RasterBuffer texcoordBuffer;
       RasterBuffer color0Buffer;
       uint32_t vertexCount = 0;
-      uint32_t captureCount = 0;
       uint32_t lastFrameTouched = 0;
+      VkDeviceSize byteSize = 0;
     };
 
     fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
+    // Sum of byteSize over the retention tier, maintained incrementally so the budget can be
+    // enforced without walking the map every frame.
+    VkDeviceSize m_ue3VertexCaptureCacheBytes = 0;
+
+    // Admission tier: a CPU-only sighting record that holds no GPU resources. A key has to
+    // be seen on this many distinct frames before the tier above starts holding its capture
+    // buffer, so a key that never repeats - an animating skinned pose, or any object whose
+    // transform moves, both of which change the key every frame - costs a few bytes of
+    // bookkeeping rather than a retained device-local buffer per draw per frame.
+    struct Ue3VertexCaptureAdmissionEntry {
+      uint32_t vertexCount = 0;
+      uint32_t sightings = 0;
+      uint32_t lastFrameSeen = 0;
+    };
+
+    fast_unordered_cache<Ue3VertexCaptureAdmissionEntry> m_ue3VertexCaptureAdmission;
+
+    // Cache effectiveness counters. The per-frame pair is folded at end of frame into the
+    // dormancy evaluation window (always) and the diagnostic interval (when logging is on).
+    uint32_t m_ue3VertexCaptureCacheFrameReuses = 0;
+    uint32_t m_ue3VertexCaptureCacheFrameCaptures = 0;
+    uint64_t m_ue3VertexCaptureCacheStatReuses = 0;
+    uint64_t m_ue3VertexCaptureCacheStatCaptures = 0;
+    uint32_t m_ue3VertexCaptureCacheStatFrames = 0;
+    uint32_t m_ue3VertexCaptureCacheStatFrameStamp = 0;
+    uint64_t m_ue3VertexCaptureCacheEvictions = 0;
+
+    // Dormancy guard. Some titles recompute a draw's object transform every frame even for
+    // geometry that is not moving, which mints a fresh cache key per draw per frame. The cache
+    // then cannot hit at all, and the admission tier alone accumulates a record per draw per
+    // frame for no benefit. Measuring the reuse rate over a window and standing the whole cache
+    // down when it is hopeless keeps the option safe to leave enabled in any UE3 title.
+    bool m_ue3VertexCaptureCacheDormant = false;
+    uint32_t m_ue3VertexCaptureCacheProbeCountdown = 0;
+    uint32_t m_ue3VertexCaptureWindowFrames = 0;
+    uint64_t m_ue3VertexCaptureWindowReuses = 0;
+    uint64_t m_ue3VertexCaptureWindowCaptures = 0;
+
+    // Constant-churn diagnostic (rtx.d3d9.ue3LogVertexConstantChurn). One entry per sampled
+    // *mesh*, keyed on input-assembler identity, holding the multiset of instance transforms seen
+    // for it each frame. Keying per mesh rather than per instance is what makes the three things
+    // that can break a cache key separable, because a key that folds them together cannot say
+    // which one moved:
+    //   1. the IA identity itself (buffer handles, draw range, content generation counters)
+    //   2. the set of instance transforms placed with that mesh
+    //   3. any other shader constant folded into the stable VS hash
+    // The transform registers are skipped in 3 precisely so it isolates the third cause; without
+    // that, 2 and 3 would both fire on the same underlying change and neither would be diagnostic.
+    struct Ue3ChurnMeshEntry {
+      uint32_t lastFrameSeen = 0;
+      // Frame the transform multiset below is accumulating for; rotated lazily on first touch of
+      // a new frame so meshes that stop being drawn simply age out.
+      uint32_t currentSetFrame = 0;
+      // Extracted objectToWorld per placement, and the raw LocalToWorld/WorldToLocal register
+      // block those were derived from. Tracking both is what separates a game that genuinely moves
+      // its transforms from an objectToWorld extraction that is not reproducible: identical raw
+      // registers with differing extracted matrices can only be the latter.
+      std::vector<XXH64_hash_t> transformsThisFrame;
+      std::vector<XXH64_hash_t> rawTransformsThisFrame;
+      // Hashes and size of the last *completed* frame's multisets, so two complete sets are
+      // compared rather than a complete set against a partially accumulated one.
+      uint32_t completedSetFrame = 0;
+      XXH64_hash_t completedSetHash = 0;
+      XXH64_hash_t completedRawSetHash = 0;
+      uint32_t completedSetSize = 0;
+      XXH64_hash_t vsBytecodeHash = 0;
+      Matrix4 worldToView;
+      std::vector<Vector4> floatConsts;
+      // Registers the level 3 diff skips: the camera registers because the stable VS hash already
+      // omits them, and the object transform because that is level 2's question and including it
+      // would make the result depend on which placement was drawn first each frame.
+      uint32_t viewProjReg = 0;
+      uint32_t viewProjRegCount = 0;
+      uint32_t cameraPosReg = 0;
+      uint32_t cameraPosRegCount = 0;
+      uint32_t localToWorldReg = 0;
+      uint32_t localToWorldRegCount = 0;
+      uint32_t worldToLocalReg = 0;
+      uint32_t worldToLocalRegCount = 0;
+    };
+    fast_unordered_cache<Ue3ChurnMeshEntry> m_ue3ConstantChurn;
+
+    // Aggregates over the report window. Ordered map so the per-register report comes out in
+    // register order. The shader hash is carried alongside the count purely so the report can
+    // resolve the register's CTAB name without searching for a shader that declares it.
+    struct Ue3ChurnRegisterTally {
+      uint64_t count = 0;
+      XXH64_hash_t vsBytecodeHash = 0;
+    };
+    std::map<uint32_t, Ue3ChurnRegisterTally> m_ue3ConstantChurnByRegister;
+    // Level 1: did the mesh's IA identity come back on the next frame at all?
+    uint64_t m_ue3ChurnMeshKeysCreated = 0;
+    uint64_t m_ue3ChurnMeshRevisited = 0;
+    // Level 2: for meshes that did come back, was the set of placements identical? Tracked for the
+    // extracted matrices and for the raw registers, so the two can be cross-tabulated.
+    uint64_t m_ue3ChurnTransformSetIdentical = 0;
+    uint64_t m_ue3ChurnTransformSetDiffered = 0;
+    uint64_t m_ue3ChurnTransformSetSizeChanged = 0;
+    uint64_t m_ue3ChurnRawTransformSetIdentical = 0;
+    // The diagnosis: extracted matrices moved while the registers they came from did not.
+    uint64_t m_ue3ChurnExtractionUnstable = 0;
+    // Level 3: did any constant move that is neither camera-derived nor part of the transform?
+    uint64_t m_ue3ConstantChurnComparisons = 0;
+    uint64_t m_ue3ChurnOtherConstantsChanged = 0;
+    uint64_t m_ue3ConstantChurnWhileViewMoved = 0;
+    uint64_t m_ue3ConstantChurnWhileViewStill = 0;
+    uint32_t m_ue3ConstantChurnDetailDumps = 0;
+    uint32_t m_ue3ConstantChurnReportFrameStamp = 0;
+
+    void trackUe3ConstantChurn(XXH64_hash_t iaKey, const RasterGeometry& geoData);
+    void reportUe3ConstantChurn();
 
     // Cross-frame memo of geometry hash + bounding box results for draws whose IA
     // vertex/index buffers are static (any vertex factory - a skinned mesh's bind-pose
@@ -1202,6 +1422,9 @@ namespace dxvk {
     bool canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
+    bool isUe3StaticVertexCaptureCacheEligible(const IndexContext& indexContext,
+                                               const VertexContext vertexContext[caps::MaxStreams],
+                                               const RasterGeometry& geoData) const;
     bool canUseUe3PreProjectionVertexCapture(const char** outReason) const;
     bool canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
@@ -1220,6 +1443,14 @@ namespace dxvk {
     bool tryReuseUe3StaticVertexCapture(XXH64_hash_t cacheKey, RasterGeometry& geoData);
     void updateUe3StaticVertexCaptureCache(XXH64_hash_t cacheKey, const RasterGeometry& geoData);
     void pruneUe3StaticVertexCaptureCache();
+    void enforceUe3StaticVertexCaptureCacheBudget();
+    void eraseUe3StaticVertexCaptureCacheEntry(XXH64_hash_t cacheKey);
+    void clearUe3StaticVertexCaptureCache();
+    // Called once per frame after pruning: folds the frame's reuse/capture counts into the
+    // dormancy window and the diagnostic interval, then runs both.
+    void updateUe3StaticVertexCaptureCacheState();
+    void evaluateUe3StaticVertexCaptureCacheDormancy();
+    void reportUe3StaticVertexCaptureCacheStats();
 
     static bool isPrimitiveSupported(const D3DPRIMITIVETYPE PrimitiveType) {
       return (PrimitiveType == D3DPT_TRIANGLELIST || PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_TRIANGLESTRIP);
@@ -1425,6 +1656,15 @@ namespace dxvk {
       bool conservativeOcclusionQueries = false;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheBudgetMiB = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheMaxEntries = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheRetentionFrames = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheMinReusePercent = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames = 0;
+      bool ue3LogStaticVertexCaptureCacheStats = false;
+      bool ue3ExcludePlacementFromVertexShaderHash = false;
+      bool ue3LogVertexConstantChurn = false;
+      uint32_t ue3VertexConstantChurnMaxTrackedDraws = 0;
       bool ue3StaticGeometryHashMemoization = false;
       bool ue3ExactVertexCapture = false;
       bool ue3RequireExactVertexCapture = false;

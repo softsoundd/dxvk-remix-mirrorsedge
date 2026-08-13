@@ -164,6 +164,7 @@ namespace dxvk {
     case dxvk::DxvkMemoryStats::RTXOpacityMicromap:     return "RTXOpacityMicromap";
     case dxvk::DxvkMemoryStats::RTXMaterialTexture:     return "RTXMaterialTexture";
     case dxvk::DxvkMemoryStats::RTXRenderTarget:        return "RTXRenderTarget";
+    case dxvk::DxvkMemoryStats::RTXVertexCapture:       return "RTXVertexCapture";
     default:                                          return "UnknownCategory";
     }
   }
