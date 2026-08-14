@@ -380,7 +380,8 @@ RtComponentPropertyValue propertyValueFromString(const std::string& str, const R
   } catch (const std::out_of_range& e) {
     Logger::err(str::format("propertyValueFromString: Out of range for type ", type, " conversion: '", str, "' - ", e.what()));
   }
-  assert(false && "Error parsing component property value in propertyValueFromString.");
+  // The string comes from authored USD, so a value that will not parse is bad input rather than
+  // a programmer error: it is reported above and the caller handles the invalid value.
   return kInvalidRtComponentPropertyValue;
 }
 

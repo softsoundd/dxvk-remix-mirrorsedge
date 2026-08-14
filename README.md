@@ -30,11 +30,11 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 
 1. Enable the bridge's redundant state filtering. Create (or edit) `.trex\bridge.conf` and add `eliminateRedundantSetterCalls = True`.
 > [!NOTE]
-> UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, roughly 9 state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
+> UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, multiple state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
 
-2. Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`) - this is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
-> [!IMPORTANT]
-> Disabling lightmaps is strongly recommended, both for compatibility and especially when authoring assets. When lightmaps are enabled, Remix scene exports generate different material hashes that are not compatible with non-lightmapped states. As a result, assets authored with lightmaps enabled may not match correctly once lightmaps are disabled. If you want to keep lightmaps enabled for before/after comparisons, that is fully supported. As long as assets were originally authored with lightmaps disabled, enabling lightmaps later for comparison will not affect material hash matching.
+2. *(Recommended)* Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`). This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
+> [!NOTE]
+> Lightmaps are not used as a surface's colour, whichever way this is set. Material identity is mostly independent of the setting, but not entirely - switching it can give a material a different hash. For this reason you should pick one setting before authoring and stay on it. `False` is the better option of the two. See [UE3 lightmaps are bypassed](documentation/UE3Compatibility.md#ue3-lightmaps-are-bypassed).
 
 3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```

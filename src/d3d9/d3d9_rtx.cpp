@@ -19,12 +19,15 @@
 #include "../dxvk/imgui/dxvk_imgui.h"
 
 #include <algorithm>
+#include <atomic>
+#include <bitset>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <shared_mutex>
 #include <sstream>
 #include <system_error>
 
@@ -1698,11 +1701,10 @@ namespace dxvk {
     // merged (start, count) register ranges of UniformVector_* / UniformScalar_* constants
     using Ue3MaterialConstRanges = std::vector<std::pair<uint32_t, uint32_t>>;
 
-    // Canonical shader signature serialization, shared by the CTAB parser and the
-    // lightmap-permutation bridge so their digests stay byte-identical. Entries carry
-    // names and register classes only: register indices shift with lightmap sampler
-    // counts and register counts are fxc's *used* element counts, which vary per
-    // permutation - neither may leak into the permutation-invariant signature.
+    // Canonical shader signature serialization. Entries carry names and register classes
+    // only: register indices shift with lightmap sampler counts and register counts are
+    // fxc's *used* element counts, which vary per permutation - neither may leak into the
+    // permutation-invariant signature.
     static std::string makeUe3SignatureEntry(const std::string& lowerName, const uint16_t registerSet) {
       return str::format(lowerName, "\x01", registerSet);
     }
@@ -1743,343 +1745,13 @@ namespace dxvk {
       // constants are permutation-dependent (fxc strips or trims whatever a permutation does
       // not reference) and deliberately excluded.
       XXH64_hash_t canonicalShaderSignature = kEmptyHash;
-      // shader references lightmap policy symbols (LightMapTextures/LightMapScale/
-      // LightMapResolution, BSplineTexture), so its bytecode identity varies with the
-      // DirectionalLightmaps / TdBicubicFiltering system settings
-      bool hasLightmapPermutationSymbols = false;
       bool hasCtab = false;
+
+      // Set only when a sampler was left out, for rtx.d3d9.ue3LogMaterialInstanceHash: comparing
+      // it between a DirectionalLightmaps=True and =False run is the direct way to see whether a
+      // material's two compiles agree on their identity inputs.
+      std::string identitySummary;
     };
-
-    static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(const std::vector<uint8_t>& bytecode) {
-      Ue3PsMaterialIdentityInfo info;
-      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
-        return info;
-
-      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
-      const uint32_t headerToken = tokens[0];
-      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
-      if (headerTypeMask != 0xffff0000u)
-        return info;
-
-      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
-      const uint32_t minorVersion = headerToken & 0xffu;
-      DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, minorVersion, majorVersion);
-
-      DxsoDecodeContext decoder(programInfo);
-      DxsoCodeIter iter(tokens + 1);
-      while (decoder.decodeInstruction(iter)) {
-        if (decoder.getCtabInfo().m_size != 0)
-          break;
-      }
-
-      const DxsoCtab& ctab = decoder.getCtabInfo();
-      if (ctab.m_size == 0 || ctab.m_constantData.empty())
-        return info;
-
-      info.hasCtab = true;
-
-      auto startsWith = [](const std::string& s, const char* prefix) {
-        return s.rfind(prefix, 0) == 0;
-      };
-
-      std::vector<std::pair<std::string, uint32_t>> uniformsByName;
-      std::vector<std::string> samplerSignatureEntries;
-      std::vector<std::string> uniformSignatureEntries;
-
-      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
-        const std::string name = toLowerAscii(c.name);
-
-        // lightmap policy symbols: LightMapTextures / LightMapScale / LightMapResolution and the
-        // Mirror's Edge bicubic B-spline weights LUT. Their presence marks the shader as a
-        // DirectionalLightmaps / TdBicubicFiltering permutation.
-        if (name.find("lightmap") != std::string::npos || name.find("bspline") != std::string::npos) {
-          info.hasLightmapPermutationSymbols = true;
-        }
-
-        if (c.registerSet == kD3dxRegisterSetSampler) {
-          // strict prefix rule: only the numbered sampler names emitted by the UE3 material
-          // translator count as material texture parameters; lightmaps/scene/shadow samplers
-          // use other names and must stay out of the material identity
-          if (c.registerCount != 0 &&
-              (startsWith(name, "texture2d_") || startsWith(name, "texturecube_") || startsWith(name, "texture3d_"))) {
-            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
-            for (uint32_t s = c.registerIndex; s < end; s++) {
-              info.materialSamplerMask |= (1u << s);
-              // arrays get per-register names so name keys stay unambiguous (material samplers
-              // are scalar in practice, this is defensive)
-              const std::string samplerName =
-                c.registerCount > 1u ? str::format(name, "[", s - c.registerIndex, "]") : name;
-              info.materialSamplersByNameOrder.emplace_back(
-                samplerName, XXH3_64bits(samplerName.data(), samplerName.size()), s);
-            }
-            samplerSignatureEntries.push_back(makeUe3SignatureEntry(name, c.registerSet));
-          }
-          continue;
-        }
-
-        const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
-        const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
-        if (!isUniformVector && !isUniformScalar)
-          continue;
-        if (c.registerSet > 2u || c.registerCount == 0)
-          continue;
-        if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
-          continue;
-        if (isUniformVector) {
-          info.uniformVectorRegisters.push_back(c.registerIndex);
-        }
-        uniformsByName.emplace_back(name, c.registerIndex);
-        uniformSignatureEntries.push_back(makeUe3SignatureEntry(name, c.registerSet));
-        info.constRanges.emplace_back(c.registerIndex, c.registerCount);
-      }
-
-      std::sort(info.uniformVectorRegisters.begin(), info.uniformVectorRegisters.end());
-
-      std::sort(uniformsByName.begin(), uniformsByName.end());
-      info.namedUniformFirstRegistersByNameOrder.reserve(uniformsByName.size());
-      for (const auto& [uniformName, uniformRegister] : uniformsByName) {
-        info.namedUniformFirstRegistersByNameOrder.emplace_back(
-          XXH3_64bits(uniformName.data(), uniformName.size()), uniformRegister);
-      }
-
-      // name order is deterministic and identical across permutations, and name keys keep the
-      // streamed identity aligned even if a permutation strips an unreferenced symbol
-      std::sort(info.materialSamplersByNameOrder.begin(), info.materialSamplersByNameOrder.end());
-
-      // canonical shader signature: name-sorted material sampler declarations. Engine symbols
-      // are excluded wholesale (the lightmap policy permutations reference different engine
-      // constants, e.g. AmbientColorAndSkyFactor only outside SIMPLE_LIGHTING), and Uniform*
-      // constants are avoided because fxc strips whichever uniforms a permutation does not
-      // reference (e.g. specular-only expressions in the simple-lightmap compile) - either
-      // would leak the permutation back into the identity. Constant-color materials have no
-      // material samplers, so their signature falls back to the uniform declarations
-      // (invariant whenever both permutations reference the same uniform set).
-      info.canonicalShaderSignature = hashUe3SignatureEntries(
-        !samplerSignatureEntries.empty() ? samplerSignatureEntries : uniformSignatureEntries);
-
-      if (info.constRanges.empty())
-        return info;
-
-      std::sort(info.constRanges.begin(), info.constRanges.end());
-      Ue3MaterialConstRanges merged;
-      for (const auto& r : info.constRanges) {
-        if (merged.empty() || r.first > merged.back().first + merged.back().second) {
-          merged.push_back(r);
-        } else {
-          const uint32_t end = std::max(merged.back().first + merged.back().second, r.first + r.second);
-          merged.back().second = end - merged.back().first;
-        }
-      }
-      info.constRanges = std::move(merged);
-      return info;
-    }
-
-    // Reused XXH3 streaming state: created once per thread instead of heap
-    // allocating/freeing a state per hash operation on the per-draw path. The state is
-    // fully reset before each use, so digests are identical to a fresh state.
-    static XXH3_state_t* getThreadLocalXxh3State() {
-      static thread_local XXH3_state_t* const state = XXH3_createState();
-      return state;
-    }
-
-    // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
-    // fallback would fold per-view/per-mesh constants into the hash.
-    static XXH64_hash_t hashUe3MaterialConstants(
-        const Vector4* fConsts,
-        const Ue3MaterialConstRanges& ranges) {
-      if (ranges.empty())
-        return kEmptyHash;
-
-      XXH3_state_t* const state = getThreadLocalXxh3State();
-      if (state == nullptr)
-        return kEmptyHash;
-      XXH3_64bits_reset(state);
-
-      bool anyRegisterHashed = false;
-      for (const auto& [start, count] : ranges) {
-        if (start + count > caps::MaxFloatConstantsPS)
-          continue;
-        XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
-        anyRegisterHashed = true;
-      }
-
-      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
-    }
-
-    // Permutation-invariant constants identity: streams (name key, leading element value) of
-    // each named Uniform* constant, in name order. fxc trims each uniform array to the
-    // elements the permutation actually references (the directional lightmap path can
-    // reference more expression elements than the simple path, e.g. an unreferenced specular
-    // expression), so higher elements are not comparable across lightmap policy permutations.
-    // The leading element is always within the reported range and the engine uploads the same
-    // expression value to it in every permutation. Name keys keep the stream aligned even if
-    // a permutation strips an entire unreferenced uniform.
-    static XXH64_hash_t hashUe3MaterialConstantsByNameOrder(
-        const Vector4* fConsts,
-        const std::vector<std::pair<XXH64_hash_t, uint32_t>>& namedUniformFirstRegistersByNameOrder) {
-      if (namedUniformFirstRegistersByNameOrder.empty())
-        return kEmptyHash;
-
-      XXH3_state_t* const state = getThreadLocalXxh3State();
-      if (state == nullptr)
-        return kEmptyHash;
-      XXH3_64bits_reset(state);
-
-      bool anyRegisterHashed = false;
-      for (const auto& [nameKey, reg] : namedUniformFirstRegistersByNameOrder) {
-        if (reg >= caps::MaxFloatConstantsPS)
-          continue;
-        XXH3_64bits_update(state, &nameKey, sizeof(nameKey));
-        XXH3_64bits_update(state, &fConsts[reg], sizeof(Vector4));
-        anyRegisterHashed = true;
-      }
-
-      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
-    }
-
-    static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
-
-    static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
-        const XXH64_hash_t psHash,
-        const std::vector<uint8_t>& bytecode) {
-      auto it = s_ue3PsMaterialIdentityCache.find(psHash);
-      if (it == s_ue3PsMaterialIdentityCache.end()) {
-        it = s_ue3PsMaterialIdentityCache.emplace(psHash, parseUe3PsMaterialIdentityFromCtab(bytecode)).first;
-      }
-      return it->second;
-    }
-
-    // UE3 lightmap-permutation bridge (rtx.d3d9.ue3LightmapPermutationBridgeLookup).
-    //
-    // The simple-lightmap compile strips material samplers and uniforms referenced only by
-    // specular/two-sided-lighting expressions, so such materials cannot share one identity
-    // across DirectionalLightmaps states: the simple-state draw computes its identity over a
-    // strict SUBSET of the directional-state draw's symbols. The bridge exploits the superset
-    // direction: from the richer draw, recompute the identity chain for small symbol-drop
-    // combinations - dropping exactly the stripped symbols reproduces the subset state's hash
-    // bit-for-bit (sampler names, streamed values, and the chain formula all match by
-    // construction). The replacement lookup then tries these alternates, so replacements
-    // authored under DirectionalLightmaps=False match under =True with no aliasing heuristics:
-    // an alternate either reconstructs a captured identity exactly or misses.
-    struct Ue3PresentMaterialSampler {
-      // points into the cached Ue3PsMaterialIdentityInfo entry; only consumed within the draw
-      const std::string* name = nullptr;
-      XXH64_hash_t nameKey = kEmptyHash;
-      XXH64_hash_t imageHash = kEmptyHash;
-    };
-
-    struct Ue3PresentMaterialUniform {
-      XXH64_hash_t nameKey = kEmptyHash;
-      Vector4 value;
-    };
-
-    // enumeration limits: strippable symbol counts are small in practice (a spec map and a
-    // couple of spec/two-sided uniforms); larger material graphs are not worth the combinatorics
-    constexpr uint32_t kUe3BridgeMaxSamplers = 8;
-    constexpr uint32_t kUe3BridgeMaxUniforms = 10;
-    constexpr uint32_t kUe3BridgeMaxSamplerDrops = 2;
-    constexpr uint32_t kUe3BridgeMaxUniformDrops = 2;
-    constexpr size_t kUe3BridgeMaxVariants = 64;
-
-    static std::shared_ptr<const std::vector<XXH64_hash_t>> buildUe3LightmapPermutationAlternateHashes(
-        const XXH64_hash_t fullMaterialHash,
-        const Ue3PresentMaterialSampler* samplers,
-        const uint32_t samplerCount,
-        const Ue3PresentMaterialUniform* uniforms,
-        const uint32_t uniformCount) {
-      if (samplerCount == 0 || samplerCount > kUe3BridgeMaxSamplers || uniformCount > kUe3BridgeMaxUniforms)
-        return nullptr;
-
-      XXH3_state_t* const state = getThreadLocalXxh3State();
-      if (state == nullptr)
-        return nullptr;
-
-      auto computeSignature = [&](const uint32_t samplerDropMask) {
-        std::vector<std::string> entries;
-        entries.reserve(samplerCount);
-        for (uint32_t i = 0; i < samplerCount; i++) {
-          if ((samplerDropMask & (1u << i)) == 0) {
-            entries.push_back(makeUe3SignatureEntry(*samplers[i].name, kD3dxRegisterSetSampler));
-          }
-        }
-        return hashUe3SignatureEntries(entries);
-      };
-
-      auto computeTextureSet = [&](const uint32_t samplerDropMask) {
-        XXH3_64bits_reset(state);
-        for (uint32_t i = 0; i < samplerCount; i++) {
-          if ((samplerDropMask & (1u << i)) == 0) {
-            XXH3_64bits_update(state, &samplers[i].nameKey, sizeof(samplers[i].nameKey));
-            XXH3_64bits_update(state, &samplers[i].imageHash, sizeof(samplers[i].imageHash));
-          }
-        }
-        return XXH3_64bits_digest(state);
-      };
-
-      // ~0u = drop all constants (matches the subset state having constants excluded or none left)
-      auto computeConstants = [&](const uint32_t uniformDropMask) -> XXH64_hash_t {
-        if (uniformDropMask == ~0u || uniformCount == 0)
-          return kEmptyHash;
-        XXH3_64bits_reset(state);
-        bool any = false;
-        for (uint32_t i = 0; i < uniformCount; i++) {
-          if ((uniformDropMask & (1u << i)) == 0) {
-            XXH3_64bits_update(state, &uniforms[i].nameKey, sizeof(uniforms[i].nameKey));
-            XXH3_64bits_update(state, &uniforms[i].value, sizeof(uniforms[i].value));
-            any = true;
-          }
-        }
-        return any ? XXH3_64bits_digest(state) : kEmptyHash;
-      };
-
-      std::vector<uint32_t> uniformDropMasks;
-      uniformDropMasks.push_back(0u);
-      for (uint32_t mask = 1; mask < (1u << uniformCount); mask++) {
-        if (bit::popcnt(mask) <= kUe3BridgeMaxUniformDrops) {
-          uniformDropMasks.push_back(mask);
-        }
-      }
-      uniformDropMasks.push_back(~0u);
-
-      auto result = std::make_shared<std::vector<XXH64_hash_t>>();
-      result->reserve(kUe3BridgeMaxVariants);
-
-      for (uint32_t samplerDropMask = 0; samplerDropMask < (1u << samplerCount); samplerDropMask++) {
-        const uint32_t drops = bit::popcnt(samplerDropMask);
-        if (drops > kUe3BridgeMaxSamplerDrops || drops >= samplerCount)
-          continue;
-
-        const XXH64_hash_t signature = computeSignature(samplerDropMask);
-        const XXH64_hash_t textureSetHash = computeTextureSet(samplerDropMask);
-        // replicates LegacyMaterialData::updateCachedHash's seed chain
-        const XXH64_hash_t tier2 = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), signature);
-
-        for (const uint32_t uniformDropMask : uniformDropMasks) {
-          if (samplerDropMask == 0 && uniformDropMask == 0)
-            continue; // identical to the draw's own identity (tier 1)
-
-          const XXH64_hash_t constantsHash = computeConstants(uniformDropMask);
-          const XXH64_hash_t variant = constantsHash != kEmptyHash
-            ? XXH3_64bits_withSeed(&constantsHash, sizeof(constantsHash), tier2)
-            : tier2;
-
-          if (variant != fullMaterialHash &&
-              std::find(result->begin(), result->end(), variant) == result->end()) {
-            result->push_back(variant);
-            if (result->size() >= kUe3BridgeMaxVariants) {
-              return result;
-            }
-          }
-        }
-      }
-
-      if (result->empty())
-        return nullptr;
-      return result;
-    }
-
-    // memoized per full material identity; pure function of the identity's inputs
-    static fast_unordered_cache<std::shared_ptr<const std::vector<XXH64_hash_t>>> s_ue3AlternateHashCache;
 
     // CTAB sampler register -> declared name, for diagnostics. Cached per shader hash.
     static const std::map<uint32_t, std::string>& getUe3PsSamplerNames(
@@ -2438,23 +2110,27 @@ namespace dxvk {
         usedCanonicalSeed ? " (canonical, lightmap-permutation invariant)" : " (bytecode)",
         std::hex,
         " textureSet=0x", textureSetHash,
-        " consts=0x", constantsHash, std::dec,
+        " consts=0x", constantsHash,
+        " group=0x", makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash), std::dec,
         " textures=[", textureList, "]",
         " constRanges=[", ranges, "]",
         constantsExcluded ? " constsExcluded=1" : "",
         " ctab=", identityInfo.hasCtab ? 1 : 0));
 
       static fast_unordered_cache<uint32_t> s_distinctHashCountPerGroup;
-      static fast_unordered_set s_churnWarnedShaders;
-      const XXH64_hash_t groupKey = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentitySeed);
+      static fast_unordered_set s_churnWarnedGroups;
+      const XXH64_hash_t groupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
       const uint32_t distinctCount = ++s_distinctHashCountPerGroup[groupKey];
-      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedShaders.insert(psHash).second) {
+      // Warn per group rather than per shader: one shader serves many material families, and
+      // warning once for the first to churn hides every other family behind it.
+      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedGroups.insert(groupKey).second) {
         Logger::warn(str::format(
           "[RTX-Compatibility][UE3-MIC] Pixel shader 0x", std::hex, psHash,
           " has minted ", std::dec, distinctCount, "+ distinct material hashes for a single texture set (0x",
           std::hex, textureSetHash, std::dec, ") - its constant registers are likely frame-varying ",
-          "(Time/panner/fade/sub-UV expressions). Add it to ",
-          "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to stabilize its material identity."));
+          "(Time/panner/fade/sub-UV expressions). If it is not excluded automatically, add group 0x",
+          std::hex, groupKey, std::dec, " to rtx.d3d9.ue3MicConstantIdentityExcludedGroups to stabilize "
+          "this material's identity without affecting others on the same shader."));
       }
     }
 
@@ -2544,7 +2220,10 @@ namespace dxvk {
         flags |= kPsSamplerSemanticEngineAuxiliary;
       }
 
-      if (contains("lightmap")) {
+      // UE3 lightmap machinery: the LightMapTextures[] coefficient array declared by every
+      // texture lightmap permutation, plus Mirror's Edge's BSplineTexture weight LUT, which
+      // exists only to filter those coefficients (TdBicubicFiltering).
+      if (contains("lightmap") || contains("bspline")) {
         flags |= kPsSamplerSemanticLightmap;
         flags |= kPsSamplerSemanticEngineAuxiliary;
       }
@@ -4077,6 +3756,308 @@ namespace dxvk {
       return result;
     }
 
+    // A material sampler the base pass only consumes as a lighting *input* rather than as
+    // colour. UE3's simple-lightmap compile does not reference those inputs, so fxc strips them
+    // and the two compiles declare different sampler sets for the same material; leaving them
+    // in identity is what makes a material's hash move with the DirectionalLightmaps setting.
+    //
+    // Excluding them makes the sets agree without knowing which compile is running: where the
+    // sampler is declared it is recognised and dropped, and where fxc already stripped it there
+    // is nothing to drop. The test is deliberately a property of the sampler's own use, so it
+    // cannot key off a symbol that exists in one compile and not the other.
+    static bool isUe3LightingInputSampler(const PsSamplerTexcoordInference& inferred) {
+      // Same signal albedo selection treats as decisive. Guards against the whole rule
+      // misfiring on a material's own base texture.
+      if ((inferred.expressionFlags & kPsSamplerExprDiffuseAnchor) != 0)
+        return false;
+      if ((inferred.expressionFlags & kPsSamplerExprNormalDecode) != 0)
+        return true;
+      if ((inferred.semanticFlags & kPsSamplerSemanticNonDiffuse) != 0)
+        return true;
+      // Sampled but never reaching oC0 as colour: specular and mask inputs collapse into dot
+      // products and comparisons, which is what separates them from a diffuse or emissive map.
+      if (inferred.sampleCount > 0 &&
+          (inferred.expressionFlags & kPsSamplerExprReachesOutputColor) == 0) {
+        return true;
+      }
+      return false;
+    }
+
+    static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(
+        const std::vector<uint8_t>& bytecode,
+        const D3D9CommonShader* pixelShader) {
+      Ue3PsMaterialIdentityInfo info;
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return info;
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      const uint32_t headerToken = tokens[0];
+      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
+      if (headerTypeMask != 0xffff0000u)
+        return info;
+
+      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
+      const uint32_t minorVersion = headerToken & 0xffu;
+      DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, minorVersion, majorVersion);
+
+      DxsoDecodeContext decoder(programInfo);
+      DxsoCodeIter iter(tokens + 1);
+      while (decoder.decodeInstruction(iter)) {
+        if (decoder.getCtabInfo().m_size != 0)
+          break;
+      }
+
+      const DxsoCtab& ctab = decoder.getCtabInfo();
+      if (ctab.m_size == 0 || ctab.m_constantData.empty())
+        return info;
+
+      info.hasCtab = true;
+
+      auto startsWith = [](const std::string& s, const char* prefix) {
+        return s.rfind(prefix, 0) == 0;
+      };
+
+      struct DeclaredSampler {
+        std::string name;
+        uint32_t registerIndex = 0;
+        uint32_t registerCount = 0;
+      };
+      struct DeclaredUniform {
+        std::string name;
+        uint16_t registerSet = 0;
+        uint32_t registerIndex = 0;
+        uint32_t registerCount = 0;
+      };
+
+      std::vector<DeclaredSampler> declaredSamplers;
+      std::vector<DeclaredUniform> declaredUniforms;
+
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        const std::string name = toLowerAscii(c.name);
+
+        if (c.registerSet == kD3dxRegisterSetSampler) {
+          // strict prefix rule: only the numbered sampler names emitted by the UE3 material
+          // translator count as material texture parameters; lightmaps/scene/shadow samplers
+          // use other names and must stay out of the material identity
+          if (c.registerCount != 0 &&
+              (startsWith(name, "texture2d_") || startsWith(name, "texturecube_") || startsWith(name, "texture3d_"))) {
+            declaredSamplers.push_back({ name, c.registerIndex, c.registerCount });
+          }
+          continue;
+        }
+
+        if (c.registerSet > 2u || c.registerCount == 0)
+          continue;
+        if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
+          continue;
+
+        const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
+        const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
+        if (!isUniformVector && !isUniformScalar)
+          continue;
+        // Constant-colour materials read their colour straight out of these, so the list has to
+        // stay complete even though only the vectors reach the identity hash.
+        if (isUniformVector) {
+          info.uniformVectorRegisters.push_back(c.registerIndex);
+        }
+        declaredUniforms.push_back({ name, c.registerSet, c.registerIndex, c.registerCount });
+      }
+
+      std::vector<std::pair<std::string, uint32_t>> uniformsByName;
+      std::vector<std::string> samplerSignatureEntries;
+      std::vector<std::string> uniformSignatureEntries;
+      std::vector<std::string> keptSamplerNames, excludedSamplerNames;
+
+      // Only needed to fall back on if every sampler classifies as a lighting input.
+      uint32_t allSamplerMask = 0;
+      std::vector<std::tuple<std::string, XXH64_hash_t, uint32_t>> allSamplersByNameOrder;
+      std::vector<std::string> allSamplerSignatureEntries;
+
+      for (const DeclaredSampler& sampler : declaredSamplers) {
+        const uint32_t end = std::min<uint32_t>(sampler.registerIndex + sampler.registerCount, caps::MaxTexturesPS);
+        bool anyKept = false;
+        for (uint32_t s = sampler.registerIndex; s < end; s++) {
+          // arrays get per-register names so name keys stay unambiguous (material samplers
+          // are scalar in practice, this is defensive)
+          const std::string samplerName =
+            sampler.registerCount > 1u ? str::format(sampler.name, "[", s - sampler.registerIndex, "]") : sampler.name;
+          const XXH64_hash_t samplerNameKey = XXH3_64bits(samplerName.data(), samplerName.size());
+          allSamplerMask |= (1u << s);
+          allSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
+
+          if (pixelShader != nullptr && isUe3LightingInputSampler(inferPixelShaderTexcoordForSampler(pixelShader, s))) {
+            excludedSamplerNames.push_back(samplerName);
+            continue;
+          }
+          keptSamplerNames.push_back(samplerName);
+          anyKept = true;
+          info.materialSamplerMask |= (1u << s);
+          info.materialSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
+        }
+        allSamplerSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
+        if (anyKept)
+          samplerSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
+      }
+
+      // A material that classified as nothing but lighting inputs has been misread; an empty set
+      // would collapse every such material onto one identity. Keep what was declared instead:
+      // that costs invariance for this shader but never merges distinct materials.
+      if (info.materialSamplerMask == 0 && allSamplerMask != 0) {
+        info.materialSamplerMask = allSamplerMask;
+        info.materialSamplersByNameOrder = std::move(allSamplersByNameOrder);
+        samplerSignatureEntries = std::move(allSamplerSignatureEntries);
+        keptSamplerNames.swap(excludedSamplerNames);
+        excludedSamplerNames.clear();
+      }
+
+      for (const DeclaredUniform& uniform : declaredUniforms) {
+        // Vectors only. Scalars are where the two lightmap compiles genuinely disagree:
+        // DiffusePower exponents the lightmap under SIMPLE_LIGHTING and a LightMapBasis-derived
+        // transfer coefficient otherwise, and SpecularPower is its structural twin present in
+        // only one compile - nothing in the bytecode separates them, so keeping either keeps
+        // both. The vectors carry the tint that tells UE3's colour variants apart.
+        if (uniform.name.find("uniformscalar_") != std::string::npos)
+          continue;
+
+        uniformsByName.emplace_back(uniform.name, uniform.registerIndex);
+        uniformSignatureEntries.push_back(makeUe3SignatureEntry(uniform.name, uniform.registerSet));
+        info.constRanges.emplace_back(uniform.registerIndex, uniform.registerCount);
+      }
+
+      if (!excludedSamplerNames.empty()) {
+        auto join = [](const std::vector<std::string>& names) {
+          std::string out;
+          for (const std::string& name : names) {
+            if (!out.empty())
+              out += ',';
+            out += name;
+          }
+          return out.empty() ? std::string("-") : out;
+        };
+        info.identitySummary = str::format(
+          "samplers kept=[", join(keptSamplerNames), "] excludedAsLightingInputs=[",
+          join(excludedSamplerNames), "]");
+      }
+
+      std::sort(info.uniformVectorRegisters.begin(), info.uniformVectorRegisters.end());
+
+      std::sort(uniformsByName.begin(), uniformsByName.end());
+      info.namedUniformFirstRegistersByNameOrder.reserve(uniformsByName.size());
+      for (const auto& [uniformName, uniformRegister] : uniformsByName) {
+        info.namedUniformFirstRegistersByNameOrder.emplace_back(
+          XXH3_64bits(uniformName.data(), uniformName.size()), uniformRegister);
+      }
+
+      // name order is deterministic and identical across permutations, and name keys keep the
+      // streamed identity aligned even if a permutation strips an unreferenced symbol
+      std::sort(info.materialSamplersByNameOrder.begin(), info.materialSamplersByNameOrder.end());
+
+      // canonical shader signature: name-sorted material sampler declarations, minus the
+      // lighting inputs the simple-lightmap compile would not have declared. Engine symbols are
+      // excluded wholesale (the lightmap policy permutations reference different engine
+      // constants, e.g. AmbientColorAndSkyFactor only outside SIMPLE_LIGHTING), and register
+      // indices and counts are excluded because both shift with the lightmap sampler count and
+      // with fxc's per-permutation element trimming. Constant-color materials have no material
+      // samplers, so their signature falls back to the uniform declarations.
+      info.canonicalShaderSignature = hashUe3SignatureEntries(
+        !samplerSignatureEntries.empty() ? samplerSignatureEntries : uniformSignatureEntries);
+
+      auto mergeConstRanges = [](Ue3MaterialConstRanges& ranges) {
+        if (ranges.empty())
+          return;
+        std::sort(ranges.begin(), ranges.end());
+        Ue3MaterialConstRanges merged;
+        for (const auto& r : ranges) {
+          if (merged.empty() || r.first > merged.back().first + merged.back().second) {
+            merged.push_back(r);
+          } else {
+            const uint32_t end = std::max(merged.back().first + merged.back().second, r.first + r.second);
+            merged.back().second = end - merged.back().first;
+          }
+        }
+        ranges = std::move(merged);
+      };
+      mergeConstRanges(info.constRanges);
+      return info;
+    }
+
+    // Reused XXH3 streaming state: created once per thread instead of heap
+    // allocating/freeing a state per hash operation on the per-draw path. The state is
+    // fully reset before each use, so digests are identical to a fresh state.
+    static XXH3_state_t* getThreadLocalXxh3State() {
+      static thread_local XXH3_state_t* const state = XXH3_createState();
+      return state;
+    }
+
+    // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
+    // fallback would fold per-view/per-mesh constants into the hash.
+    static XXH64_hash_t hashUe3MaterialConstants(
+        const Vector4* fConsts,
+        const Ue3MaterialConstRanges& ranges) {
+      if (ranges.empty())
+        return kEmptyHash;
+
+      XXH3_state_t* const state = getThreadLocalXxh3State();
+      if (state == nullptr)
+        return kEmptyHash;
+      XXH3_64bits_reset(state);
+
+      bool anyRegisterHashed = false;
+      for (const auto& [start, count] : ranges) {
+        if (start + count > caps::MaxFloatConstantsPS)
+          continue;
+        XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
+        anyRegisterHashed = true;
+      }
+
+      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
+    }
+
+    // Permutation-invariant constants identity: streams (name key, leading element value) of
+    // each named Uniform* constant, in name order. fxc trims each uniform array to the
+    // elements the permutation actually references (the directional lightmap path can
+    // reference more expression elements than the simple path, e.g. an unreferenced specular
+    // expression), so higher elements are not comparable across lightmap policy permutations.
+    // The leading element is always within the reported range and the engine uploads the same
+    // expression value to it in every permutation. Name keys keep the stream aligned even if
+    // a permutation strips an entire unreferenced uniform.
+    static XXH64_hash_t hashUe3MaterialConstantsByNameOrder(
+        const Vector4* fConsts,
+        const std::vector<std::pair<XXH64_hash_t, uint32_t>>& namedUniformFirstRegistersByNameOrder) {
+      if (namedUniformFirstRegistersByNameOrder.empty())
+        return kEmptyHash;
+
+      XXH3_state_t* const state = getThreadLocalXxh3State();
+      if (state == nullptr)
+        return kEmptyHash;
+      XXH3_64bits_reset(state);
+
+      bool anyRegisterHashed = false;
+      for (const auto& [nameKey, reg] : namedUniformFirstRegistersByNameOrder) {
+        if (reg >= caps::MaxFloatConstantsPS)
+          continue;
+        XXH3_64bits_update(state, &nameKey, sizeof(nameKey));
+        XXH3_64bits_update(state, &fConsts[reg], sizeof(Vector4));
+        anyRegisterHashed = true;
+      }
+
+      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
+    }
+
+    static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
+
+    static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
+        const XXH64_hash_t psHash,
+        const std::vector<uint8_t>& bytecode,
+        const D3D9CommonShader* pixelShader) {
+      auto it = s_ue3PsMaterialIdentityCache.find(psHash);
+      if (it == s_ue3PsMaterialIdentityCache.end()) {
+        it = s_ue3PsMaterialIdentityCache.emplace(
+          psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader)).first;
+      }
+      return it->second;
+    }
+
     bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
       const D3D9ShaderConstantsVSSoftware& vsConsts,
       const uint32_t viewProjRegisterBase,
@@ -5072,6 +5053,40 @@ namespace dxvk {
       " reason=", reason));
   }
 
+  namespace {
+    // Session registry of UE3 lightmap textures recognised from pixel shader CTAB sampler
+    // names. Append-only, and read from texture paths that run on other threads than the
+    // draw-call setup that discovers them.
+    std::shared_mutex g_autoLightmapTexturesMutex;
+    fast_unordered_set g_autoLightmapTextures;
+    // Fast negative for the common case of a title that never discovers any.
+    std::atomic<bool> g_autoLightmapTexturesPopulated { false };
+  }
+
+  bool D3D9Rtx::isAutoDetectedLightmapTexture(const XXH64_hash_t textureHash) {
+    if (textureHash == kEmptyHash || !g_autoLightmapTexturesPopulated.load(std::memory_order_acquire))
+      return false;
+
+    std::shared_lock lock(g_autoLightmapTexturesMutex);
+    return g_autoLightmapTextures.find(textureHash) != g_autoLightmapTextures.end();
+  }
+
+  void D3D9Rtx::registerAutoDetectedLightmapTexture(const XXH64_hash_t textureHash) {
+    if (textureHash == kEmptyHash)
+      return;
+
+    bool inserted = false;
+    {
+      std::unique_lock lock(g_autoLightmapTexturesMutex);
+      inserted = g_autoLightmapTextures.insert(textureHash).second;
+      if (inserted)
+        g_autoLightmapTexturesPopulated.store(true, std::memory_order_release);
+    }
+
+    if (inserted)
+      ImGUI::AddAutoTaggedLightmapTexture(textureHash);
+  }
+
   void D3D9Rtx::OnClear(DWORD flags) {
     if (!m_frameOptions.ue3EngineMode || !m_frameOptions.ue3ForegroundDpgIsViewModel) {
       return;
@@ -5225,8 +5240,7 @@ namespace dxvk {
     o.rasterizeFullscreenCompositeToPrimary = rasterizeFullscreenCompositeToPrimaryObject().get();
     o.shaderPathTexcoordIndexFromPixelShader = shaderPathTexcoordIndexFromPixelShaderObject().get();
     o.ue3MaterialInstanceConstantHash = ue3MaterialInstanceConstantHashObject().get();
-    o.ue3LightmapPermutationInvariantHash = ue3LightmapPermutationInvariantHashObject().get();
-    o.ue3LightmapPermutationBridgeLookup = ue3LightmapPermutationBridgeLookupObject().get();
+    o.ue3MicConstantIdentity = ue3MicConstantIdentityObject().get();
     o.ue3MicExcludeRenderTargetsFromIdentity = ue3MicExcludeRenderTargetsFromIdentityObject().get();
     o.ue3MicPersistAutoExcludedConstantGroups = ue3MicPersistAutoExcludedConstantGroupsObject().get();
     o.ue3LogMaterialInstanceHash = ue3LogMaterialInstanceHashObject().get();
@@ -5254,6 +5268,7 @@ namespace dxvk {
     o.ue3NativeLocalMeshVertexCapture = ue3NativeLocalMeshVertexCaptureObject().get();
     o.ue3RequireCtabCameraConstants = ue3RequireCtabCameraConstantsObject().get();
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
+    o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
     o.ue3MicAutoExcludeFrameVaryingConstants = ue3MicAutoExcludeFrameVaryingConstantsObject().get();
     o.ue3LogClassification = ue3LogClassificationObject().get();
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
@@ -5295,6 +5310,7 @@ namespace dxvk {
     o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
     o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
     o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
+    o.ue3MicConstantIdentityExcludedGroups = &ue3MicConstantIdentityExcludedGroupsObject().get();
     o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
     o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
 
@@ -5905,12 +5921,6 @@ namespace dxvk {
     const uint32_t cameraRawCount = rawCount;
     finalize(cameraRaw, cameraRawCount, result.cameraOnly, result.cameraOnlyCount);
 
-    if (ctabInfo.hasLocalToWorld) {
-      add(ctabInfo.localToWorldRegisterIndex, ctabInfo.localToWorldRegisterCount);
-    }
-    if (ctabInfo.hasWorldToLocal) {
-      add(ctabInfo.worldToLocalRegisterIndex, ctabInfo.worldToLocalRegisterCount);
-    }
     if (symbols != nullptr) {
       auto contains = [](const std::string& haystack, const char* needle) {
         return haystack.find(needle) != std::string::npos;
@@ -5927,6 +5937,17 @@ namespace dxvk {
           add(symbol.registerIndex, symbol.registerCount);
         }
       }
+    }
+
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> shadingRaw = raw;
+    const uint32_t shadingRawCount = rawCount;
+    finalize(shadingRaw, shadingRawCount, result.cameraAndShading, result.cameraAndShadingCount);
+
+    if (ctabInfo.hasLocalToWorld) {
+      add(ctabInfo.localToWorldRegisterIndex, ctabInfo.localToWorldRegisterCount);
+    }
+    if (ctabInfo.hasWorldToLocal) {
+      add(ctabInfo.worldToLocalRegisterIndex, ctabInfo.worldToLocalRegisterCount);
     }
     finalize(raw, rawCount, result.withPlacement, result.withPlacementCount);
 
@@ -5971,10 +5992,18 @@ namespace dxvk {
       const Ue3VsHashExclusions& exclusions =
         m_currentUe3VsHashExclusions != nullptr ? *m_currentUe3VsHashExclusions : s_reservedOnly;
       const bool excludePlacement = m_frameOptions.ue3ExcludePlacementFromVertexShaderHash;
-      const Ue3VsHashExclusions::Range* ranges =
-        excludePlacement ? exclusions.withPlacement.data() : exclusions.cameraOnly.data();
-      const uint32_t rangeCount =
-        excludePlacement ? exclusions.withPlacementCount : exclusions.cameraOnlyCount;
+      // Dropping the shading-only constants is free and keeps the hash off the lightmap policy,
+      // so UE3 mode takes it unconditionally; the placement registers stay opt-in for their cost.
+      const bool excludeShading = m_frameOptions.ue3EngineMode;
+      const Ue3VsHashExclusions::Range* ranges = exclusions.cameraOnly.data();
+      uint32_t rangeCount = exclusions.cameraOnlyCount;
+      if (excludePlacement) {
+        ranges = exclusions.withPlacement.data();
+        rangeCount = exclusions.withPlacementCount;
+      } else if (excludeShading) {
+        ranges = exclusions.cameraAndShading.data();
+        rangeCount = exclusions.cameraAndShadingCount;
+      }
 
       if (rangeCount > 0) {
         uint32_t cursor = 0;
@@ -7178,7 +7207,10 @@ namespace dxvk {
           targetBuffer = &geoData.normalBuffer;
         break;
       case D3DDECLUSAGE_TEXCOORD:
-        if (m_iaTexcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_iaTexcoordIndex)
+        // A D3DCOLOR-typed TEXCOORD under UE3 is a vertex lightmap coefficient stream, never a
+        // coordinate (see resolveIaTexcoordAvoidingVertexLightmaps).
+        if (m_iaTexcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_iaTexcoordIndex &&
+            !(m_frameOptions.ue3EngineMode && element.Type == D3DDECLTYPE_D3DCOLOR))
           targetBuffer = &geoData.texcoordBuffer;
         break;
       case D3DDECLUSAGE_COLOR:
@@ -7254,7 +7286,6 @@ namespace dxvk {
     m_activeDrawCallState.programmableVertexShaderBytecodeHash = 0;
     m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
     m_activeDrawCallState.isUe3ForegroundDpg = m_ue3ForegroundDpgActive;
-    m_activeDrawCallState.ue3LightmapPermutationAlternateHashes.reset();
 
     const bool isUe3Mode = m_frameOptions.ue3EngineMode;
     const bool effectiveUe3Camera = m_frameOptions.ue3CameraFromShaderConstants || isUe3Mode;
@@ -7354,14 +7385,6 @@ namespace dxvk {
 
           for (const DxsoCtab::Constant& c : ctab.m_constantData) {
             const std::string name = lower(c.name);
-
-            // Any lightmap policy symbol marks the shader pair as recompiled per lightmap
-            // permutation. Vertex-lightmap policies put LightMapScale in the VERTEX shader
-            // only (the lightmap reaches the pixel shader through interpolators), so this is
-            // the only signal for their pixel shader's material identity normalization.
-            if (!info.hasLightmapSymbols && contains(name, "lightmap")) {
-              info.hasLightmapSymbols = true;
-            }
 
             // ViewProjectionMatrix (4 registers)
             if (!info.hasViewProjectionMatrix && c.registerCount >= 4) {
@@ -9408,7 +9431,7 @@ namespace dxvk {
         "=hash:0x", std::hex, texture->GetImage()->getHash(),
         ",desc:0x", texture->GetImage()->getDescriptorHash(), std::dec,
         texture->IsRenderTarget() ? ",RT" : "",
-        lookupHash(RtxOptions::lightmapTextures(), texture->GetImage()->getHash()) ? ",lightmapTagged" : "",
+        isLightmapTexture(texture->GetImage()->getHash()) ? ",lightmap" : "",
         ",type:", uint32_t(texture->GetType()),
         ",samples:", inferredEntry != nullptr ? inferredEntry->samplerSampleCount[stage] : 0);
     }
@@ -9433,7 +9456,7 @@ namespace dxvk {
           }
         }
       }
-      const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode);
+      const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode, pixelShader);
       for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
         if (reg >= caps::MaxFloatConstantsPS) {
           continue;
@@ -10254,7 +10277,7 @@ namespace dxvk {
         const XXH64_hash_t texHash = texture->GetSampleView(true)->image()->getHash();
 
         // Currently we only support regular textures, skip lightmaps.
-        if (lookupHash(*m_frameOptions.lightmapTextures, texHash)) {
+        if (isLightmapTexture(texHash)) {
           continue;
         }
 
@@ -10434,6 +10457,8 @@ namespace dxvk {
           entry.samplerOffsetImmediateValid[s] = inferred.offsetImmediateValid ? 1u : 0u;
           entry.samplerOffsetImmediateU[s] = inferred.offsetImmediateU;
           entry.samplerOffsetImmediateV[s] = inferred.offsetImmediateV;
+          if ((inferred.semanticFlags & kPsSamplerSemanticLightmap) != 0)
+            entry.lightmapSamplerMask |= (1u << s);
         }
       }
 
@@ -10518,7 +10543,32 @@ namespace dxvk {
       int32_t strictCubemapFallbackScore = std::numeric_limits<int32_t>::min();
 
       const uint32_t usedSamplerMask = m_parent->m_psShaderMasks.samplerMask;
-      const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask;
+      // UE3 lightmaps are removed from the draw's texture set before anything reads it. A
+      // score penalty is not enough: DirectionalLightmaps=True binds three coefficient
+      // samplers where False binds one, so leaving them in changes the candidate pool, the
+      // selection cache key and its area sum, and the per-texture material spread - every
+      // one of which can flip the albedo pick between the two settings. Remix owns lighting,
+      // so the coefficients carry nothing a raytraced surface wants.
+      const uint32_t lightmapStageMask =
+        (m_frameOptions.ue3EngineMode && inferredPsEntry != nullptr) ? inferredPsEntry->lightmapSamplerMask : 0u;
+      const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask & ~lightmapStageMask;
+
+      // Publish what was bound at those samplers so the texture paths that cannot see a pixel
+      // shader - hash preservation on CPU writes, the terrain baker's stage filter, the texture
+      // picker - recognise the same images. First sight per hash only; the session set is
+      // append-only so the repeat check stays local.
+      if (m_frameOptions.ue3AutoDetectLightmapTextures) {
+        for (const uint32_t stage : bit::BitMask(lightmapStageMask & m_parent->m_activeTextures)) {
+          if (stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
+            continue;
+          D3D9CommonTexture* lightmap = GetCommonTexture(d3d9State().textures[stage]);
+          if (lightmap == nullptr || lightmap->GetImage() == nullptr)
+            continue;
+          const XXH64_hash_t lightmapHash = lightmap->GetImage()->getHash();
+          if (lightmapHash != kEmptyHash && m_ue3SeenLightmapTextures.insert(lightmapHash).second)
+            registerAutoDetectedLightmapTexture(lightmapHash);
+        }
+      }
 
       // Deterministic diffuse selection: the scoring below reads live shader constant
       // values (hasNonZeroInferredSamplerOffset), which UE3 rewrites per draw for
@@ -10688,7 +10738,7 @@ namespace dxvk {
           continue;
 
         const XXH64_hash_t texHash = texture->GetSampleView(false)->image()->getHash();
-        if (lookupHash(*m_frameOptions.lightmapTextures, texHash))
+        if (isLightmapTexture(texHash))
           continue;
         const bool isNeverAlbedo = lookupHash(*m_frameOptions.neverAlbedoTextures, texHash);
         const bool isPreferredAlbedo = lookupHash(*m_frameOptions.preferredAlbedoTextures, texHash);
@@ -11548,24 +11598,18 @@ namespace dxvk {
           const auto& bytecode = psCommonShader->GetBytecode();
           const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
           if (psHash != 0) {
-            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode);
+            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode, psCommonShader);
 
-            // Lightmap-bearing shaders are recompiled per lightmap policy permutation
-            // (DirectionalLightmaps 3-coefficient vs simple 1-coefficient, Mirror's Edge
-            // TdBicubicFiltering), so their bytecode hash - and everything seeded by it -
-            // varies with those system settings. Seed such shaders with the canonical CTAB
-            // material signature instead so material identity survives setting flips.
-            // Texture-lightmap permutations declare lightmap symbols in the pixel shader;
-            // vertex-lightmap permutations only in the vertex shader (the lightmap arrives
-            // through interpolators), so the draw's VS CTAB flag must be considered too.
-            // Shaders without lightmap symbols on either stage keep the bytecode hash and
-            // their existing material hashes.
-            const bool drawHasLightmapPermutationSymbols =
-              identityInfo.hasLightmapPermutationSymbols ||
-              (m_currentUe3CtabInfo.has_value() && m_currentUe3CtabInfo->hasLightmapSymbols);
+            // UE3 recompiles the same material's base pass per lightmap policy, so a bytecode
+            // hash - and everything seeded by it - varies with DirectionalLightmaps and
+            // TdBicubicFiltering. Seed every UE3 material with the canonical CTAB signature
+            // instead. This deliberately covers the permutations that carry no lightmap symbols
+            // at all: FNoLightMapPolicy compiles the same material for movable geometry,
+            // translucency and the unlit viewmode, and gating on lightmap symbols would have
+            // given those draws a bytecode-seeded identity that could never match their
+            // lightmapped selves.
             const bool useInvariantShaderIdentity =
-              (m_frameOptions.ue3LightmapPermutationInvariantHash || m_frameOptions.ue3EngineMode) &&
-              drawHasLightmapPermutationSymbols &&
+              m_frameOptions.ue3EngineMode &&
               identityInfo.canonicalShaderSignature != kEmptyHash;
             const XXH64_hash_t shaderIdentitySeed =
               useInvariantShaderIdentity ? identityInfo.canonicalShaderSignature : psHash;
@@ -11579,24 +11623,29 @@ namespace dxvk {
             // register: lightmap sampler counts shift register assignments between
             // permutations while the material's own sampler names stay fixed.
             const bool logMicHash = m_frameOptions.ue3LogMaterialInstanceHash;
-            const bool bridgeLookupEnabled =
-              useInvariantShaderIdentity &&
-              (m_frameOptions.ue3LightmapPermutationBridgeLookup || m_frameOptions.ue3EngineMode);
+            if (logMicHash && !identityInfo.identitySummary.empty()) {
+              static fast_unordered_set s_loggedIdentitySummaries;
+              if (s_loggedIdentitySummaries.insert(psHash).second) {
+                Logger::info(str::format(
+                  "[RTX-Ue3Identity] ps=0x", std::hex, psHash,
+                  " seed=0x", identityInfo.canonicalShaderSignature, std::dec,
+                  " ", identityInfo.identitySummary));
+              }
+            }
             std::string micTextureListLog;
-            std::array<Ue3PresentMaterialSampler, kUe3BridgeMaxSamplers> presentSamplers;
-            uint32_t presentSamplerCount = 0;
-            bool presentSamplersOverflowed = false;
             // Replacement identity drift diagnostics: record the (register, image hash, RT flag)
             // tuples that feed textureSetHash so tier drift can be attributed per sampler.
             Ue3MicIdentitySample::SamplerRecord micDiagSamplers[kMicDriftMaxTrackedSamplers];
             uint32_t micDiagSamplerCount = 0;
+            const BoundTextureSnapshot& identityBoundTextures = ensureBoundTextureSnapshot();
+
             XXH64_hash_t textureSetHash = kEmptyHash;
             if (identityInfo.materialSamplerMask != 0) {
               XXH3_state_t* const state = getThreadLocalXxh3State();
               if (state != nullptr) {
                 XXH3_64bits_reset(state);
                 bool anyTextureHashed = false;
-                const BoundTextureSnapshot& boundTextures = ensureBoundTextureSnapshot();
+                const BoundTextureSnapshot& boundTextures = identityBoundTextures;
                 auto hashMaterialSamplerTexture = [&](const void* samplerKey, const size_t samplerKeySize, const uint32_t samplerRegister, const char* samplerLogName) -> XXH64_hash_t {
                   if (samplerRegister >= SamplerCount || (boundTextures.mask & (1u << samplerRegister)) == 0)
                     return kEmptyHash;
@@ -11660,15 +11709,7 @@ namespace dxvk {
                   // name-keyed: register assignments shift between lightmap policy permutations
                   for (const auto& [samplerName, samplerNameKey, samplerRegister] : identityInfo.materialSamplersByNameOrder) {
                     if (samplerRegister < caps::MaxTexturesPS) {
-                      const XXH64_hash_t imageHash =
-                        hashMaterialSamplerTexture(&samplerNameKey, sizeof(samplerNameKey), samplerRegister, samplerName.c_str());
-                      if (bridgeLookupEnabled && imageHash != kEmptyHash) {
-                        if (presentSamplerCount < presentSamplers.size()) {
-                          presentSamplers[presentSamplerCount++] = Ue3PresentMaterialSampler { &samplerName, samplerNameKey, imageHash };
-                        } else {
-                          presentSamplersOverflowed = true;
-                        }
-                      }
+                      hashMaterialSamplerTexture(&samplerNameKey, sizeof(samplerNameKey), samplerRegister, samplerName.c_str());
                     }
                   }
                 } else {
@@ -11693,8 +11734,12 @@ namespace dxvk {
             // the one churning material family.
             const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
             bool constantsExcluded =
+              // The tier that cannot be made lightmap-policy independent; opt-in only.
+              !m_frameOptions.ue3MicConstantIdentity ||
               lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, psHash) ||
               (useInvariantShaderIdentity && lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, shaderIdentitySeed)) ||
+              // Same scope as the automatic exclusion, for families it never trips on.
+              lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedGroups, micChurnGroupKey) ||
               (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey, m_frameOptions.ue3MicPersistAutoExcludedConstantGroups));
             // Invariant-identity shaders hash constants by uniform name and leading register:
             // lightmap policy permutations shift uniform registers and trim per-permutation
@@ -11880,48 +11925,6 @@ namespace dxvk {
                     break;
                   }
                 }
-              }
-            }
-
-            // Lightmap-permutation bridge: publish the identity hashes this draw would produce
-            // under lightmap permutations that reference fewer material symbols (see
-            // buildUe3LightmapPermutationAlternateHashes). Memoized per material identity.
-            if (bridgeLookupEnabled && !presentSamplersOverflowed && presentSamplerCount > 0) {
-              m_activeDrawCallState.materialData.updateCachedHash();
-              const XXH64_hash_t fullMaterialHash = m_activeDrawCallState.materialData.getHash();
-              if (fullMaterialHash != kEmptyHash) {
-                auto it = s_ue3AlternateHashCache.find(fullMaterialHash);
-                if (it == s_ue3AlternateHashCache.end()) {
-                  std::array<Ue3PresentMaterialUniform, kUe3BridgeMaxUniforms> presentUniforms;
-                  uint32_t presentUniformCount = 0;
-                  bool presentUniformsOverflowed = false;
-                  // Excluded constants collapse every sibling onto one identity; baking the
-                  // first-seen sibling's live values into the memoized variants would make
-                  // bridge results depend on draw order. Structural (constants-free) variants
-                  // only for those.
-                  if (!constantsExcluded) {
-                    for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
-                      if (uniformRegister >= caps::MaxFloatConstantsPS)
-                        continue;
-                      if (presentUniformCount < presentUniforms.size()) {
-                        presentUniforms[presentUniformCount++] =
-                          Ue3PresentMaterialUniform { uniformNameKey, d3d9State().psConsts.fConsts[uniformRegister] };
-                      } else {
-                        presentUniformsOverflowed = true;
-                        break;
-                      }
-                    }
-                  }
-                  it = s_ue3AlternateHashCache.emplace(
-                    fullMaterialHash,
-                    presentUniformsOverflowed
-                      ? nullptr
-                      : buildUe3LightmapPermutationAlternateHashes(
-                          fullMaterialHash,
-                          presentSamplers.data(), presentSamplerCount,
-                          presentUniforms.data(), presentUniformCount)).first;
-                }
-                m_activeDrawCallState.ue3LightmapPermutationAlternateHashes = it->second;
               }
             }
 
@@ -12589,9 +12592,51 @@ namespace dxvk {
     }
 
     m_texcoordIndex = texcoordIdx;
-    m_iaTexcoordIndex = iaTexcoordIdx;
+    m_iaTexcoordIndex = resolveIaTexcoordAvoidingVertexLightmaps(iaTexcoordIdx);
 
     return true;
+  }
+
+  // UE3's vertex lightmap policies append a stream of packed lighting coefficients declared as
+  // TEXCOORD5 (simple) or TEXCOORD5/6/7 (directional), typed D3DCOLOR rather than a float pair.
+  // The element count therefore moves with the DirectionalLightmaps setting, and the data is
+  // baked lighting, not a coordinate. A D3DCOLOR-typed TEXCOORD is never a UV set in UE3, so
+  // that alone identifies them without consulting the vertex shader.
+  uint32_t D3D9Rtx::resolveIaTexcoordAvoidingVertexLightmaps(const uint32_t iaTexcoordIdx) const {
+    if (!m_frameOptions.ue3EngineMode || d3d9State().vertexDecl == nullptr)
+      return iaTexcoordIdx;
+
+    auto isVertexLightmapElement = [](const D3DVERTEXELEMENT9& element) {
+      return element.Usage == D3DDECLUSAGE_TEXCOORD &&
+             element.Type == D3DDECLTYPE_D3DCOLOR;
+    };
+
+    const auto& elements = d3d9State().vertexDecl->GetElements();
+    bool requestedIsLightmap = false;
+    for (const auto& element : elements) {
+      if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == iaTexcoordIdx) {
+        requestedIsLightmap = isVertexLightmapElement(element);
+        break;
+      }
+    }
+
+    if (!requestedIsLightmap)
+      return iaTexcoordIdx;
+
+    // Fall back to the mesh's lowest real UV set rather than leaving the surface with the
+    // lighting stream: an unresolvable index would drop the texcoord buffer entirely.
+    uint32_t fallback = iaTexcoordIdx;
+    bool found = false;
+    for (const auto& element : elements) {
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD || isVertexLightmapElement(element))
+        continue;
+      if (!found || element.UsageIndex < fallback) {
+        fallback = element.UsageIndex;
+        found = true;
+      }
+    }
+
+    return fallback;
   }
 
   PrepareDrawFlags D3D9Rtx::PrepareDrawGeometryForRT(const bool indexed, const DrawContext& context) {
@@ -13195,7 +13240,8 @@ namespace dxvk {
       m_ue3DiffuseSelectionLastSaveFrame = uint32_t(currentReflexFrameId);
       saveUe3DiffuseSelectionCache();
     }
-    
+
+
     // Flush any pending game and RTX work
     m_parent->Flush();
 

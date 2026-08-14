@@ -773,12 +773,6 @@ struct DrawCallState {
   // those registers that can reconstruct as a plausible camera.
   bool allowMainCameraUpdate = true;
 
-  // Material identity hashes this draw would have produced under lightmap policy permutations
-  // that reference fewer material symbols; tried against the replacement database when the
-  // draw's own identity tiers miss (see rtx.d3d9.ue3LightmapPermutationBridgeLookup). Shared
-  // immutable list, memoized per material identity; null when inapplicable.
-  std::shared_ptr<const std::vector<XXH64_hash_t>> ue3LightmapPermutationAlternateHashes;
-
   // UE3 pass classification for diagnostics (points to a static string)
   const char* ue3PassDescription = "Unknown";
 

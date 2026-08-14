@@ -4648,7 +4648,7 @@ namespace dxvk {
         const XXH64_hash_t imageHash = image->getHash();
         const bool keepConfiguredHash =
           lookupHash(RtxOptions::terrainTextures(), imageHash) ||
-          lookupHash(RtxOptions::lightmapTextures(), imageHash) ||
+          D3D9Rtx::isLightmapTexture(imageHash) ||
           lookupHash(RtxOptions::ignoreTextures(), imageHash) ||
           lookupHash(RtxOptions::ignoreBakedLightingTextures(), imageHash);
         if (imageHash != kEmptyHash && !keepConfiguredHash) {
@@ -7319,7 +7319,7 @@ namespace dxvk {
               if (isLastStage && numActiveStages > 1 && RtxOptions::ignoreLastTextureStage()) {
                 return true;
               }
-              if (lookupHash(RtxOptions::ignoreTextures(), texHash) || lookupHash(RtxOptions::lightmapTextures(), texHash)) {
+              if (lookupHash(RtxOptions::ignoreTextures(), texHash) || D3D9Rtx::isLightmapTexture(texHash)) {
                 return true;
               }
             }

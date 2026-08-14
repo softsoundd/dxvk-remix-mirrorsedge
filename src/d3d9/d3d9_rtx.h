@@ -148,45 +148,31 @@ namespace dxvk {
                "frame-varying expression values (Time, fades, sub-UV frames) must be listed in "
                "rtx.d3d9.ue3MicConstantIdentityExcludedShaders or their hashes churn every frame. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3LightmapPermutationInvariantHash, false,
-               "UE3 MaterialInstanceConstant support: make material identity invariant to the UE3 lightmap "
-               "shader permutations selected by system settings. UE3 recompiles every lightmapped base-pass "
-               "pixel shader per lightmap policy (DirectionalLightmaps=True: 3-coefficient TEXTURE_LIGHTMAP, "
-               "False: 1-coefficient SIMPLE_TEXTURE_LIGHTMAP; Mirror's Edge TdBicubicFiltering adds a bicubic "
-               "filtering permutation with LightMapResolution/BSplineTexture symbols), so the bytecode hash "
-               "seeding material identity - and with it every material hash used for tagging and replacements - "
-               "changes when those settings flip. With this option, draws whose shader CTAB declares lightmap "
-               "policy symbols - in the pixel shader (texture lightmaps: LightMapTextures et al) or only in the "
-               "vertex shader (vertex lightmaps: LightMapScale; their lightmap reaches the pixel shader through "
-               "interpolators) - use permutation-stable identity inputs instead: the seed is a canonical "
-               "signature of the material sampler declarations (Texture2D_*/TextureCube_*/Texture3D_* names), "
-               "and the texture set and Uniform* constants are keyed by symbol name rather than by register, "
-               "since register assignments and per-permutation unreferenced elements shift between permutations. "
-               "Shaders without lightmap symbols on either stage keep their bytecode-seeded hashes. Note: "
-               "enabling this changes the material hashes of lightmapped materials once (existing "
-               "material-hash-keyed work must be redone). Residual variance remains for materials with "
-               "parameters referenced by only one permutation: the simple-lightmap compile strips samplers and "
-               "uniforms used exclusively by specular/two-sided-lighting expressions, so such materials keep "
-               "one stable identity per lightmap policy state. rtx.d3d9.ue3LightmapPermutationBridgeLookup "
-               "bridges replacement lookups for them (author under DirectionalLightmaps=False); the "
-               "constants-free shader+textures identity tier also still matches across permutations unless a "
-               "sampler itself was stripped. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3LightmapPermutationBridgeLookup, false,
-               "UE3 MaterialInstanceConstant support: bridge replacement lookups across lightmap policy "
-               "permutations for materials that cannot share one identity. The simple-lightmap compile "
-               "(DirectionalLightmaps=False) strips material samplers and uniforms referenced only by "
-               "specular/two-sided-lighting expressions, so such materials genuinely bind different data per "
-               "state and rtx.d3d9.ue3LightmapPermutationInvariantHash alone cannot unify them. With this "
-               "option, draws running under the richer permutation also compute the identity hashes they "
-               "would have produced with small symbol subsets removed (up to 2 samplers and 2 uniforms, plus "
-               "a constants-free variant), and the replacement lookup tries those alternates after its normal "
-               "tiers. Dropping exactly the stripped symbols reproduces the simpler state's hash bit-for-bit, "
-               "so replacements authored/captured under DirectionalLightmaps=False apply under =True with no "
-               "aliasing heuristics - an alternate either reconstructs a captured identity exactly or misses. "
-               "The reverse direction is impossible (the simpler compile lacks the stripped data), so author "
-               "material replacements against the simple-lightmap state. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3AutoDetectLightmapTextures, true,
+               "UE3 compat: treat every texture bound to a lightmap sampler as if it had been listed in "
+               "rtx.lightmapTextures. UE3 declares its baked lighting under fixed CTAB sampler names "
+               "(LightMapTextures, and Mirror's Edge's BSplineTexture filtering LUT), so the runtime can "
+               "recognise them without the per-level hashes ever being tagged by hand. Discovered hashes are "
+               "held for the session only and are never written to a config. Remix supplies the lighting, so "
+               "these textures are excluded from albedo selection, material identity and the texture picker's "
+               "taggable set. Requires rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicConstantIdentity, true,
+               "UE3 MaterialInstanceConstant support: fold the material's Uniform* constants into its "
+               "identity, distinguishing instances that share a parent and its textures but differ in "
+               "VectorParameterValues/ScalarParameterValues. Mirror's Edge relies on this - its colour "
+               "variants (RooftopPropsClusters and its Blue/Orange/Yellow siblings, and many others) are "
+               "one texture set with a different tint parameter, and without this tier they collapse onto "
+               "a single anchor.\n"
+               "Only UniformVector_* parameters contribute. The scalars are where the two lightmap "
+               "compiles genuinely disagree - DiffusePower exponents the lightmap under SIMPLE_LIGHTING "
+               "and a LightMapBasis-derived transfer coefficient otherwise, and SpecularPower is its "
+               "structural twin present in only one compile - so the whole scalar class is left out "
+               "rather than trying to tell those two apart, which the bytecode does not allow. Material "
+               "instances separated only by a scalar parameter therefore share an anchor.\n"
+               "Turn it off for content whose material instances are told apart by their textures alone; "
+               "identity then becomes shader + material texture set, which is fully independent of the "
+               "lightmap policy. Either way, changing this re-mints the material hashes of every material "
+               "carrying constants, so anchors keyed on the old ones stop matching.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
                "UE3 MaterialInstanceConstant support: pixel shader bytecode hashes whose UniformVector_*/"
                "UniformScalar_* constants are excluded from material identity hashing. UE3 evaluates material "
@@ -195,10 +181,22 @@ namespace dxvk {
                "parameters; folding those into the hash would mint a new material identity every frame. "
                "Such shaders announce themselves as an endless stream of new materialHash lines when "
                "rtx.d3d9.ue3LogMaterialInstanceHash is enabled (a churn warning names the shader once a "
-               "threshold is crossed) - add the reported hash here. For lightmap-bearing shaders under "
-               "rtx.d3d9.ue3LightmapPermutationInvariantHash the reported value is the canonical shader "
-               "identity; both it and the raw bytecode hash are honoured. Excluded shaders fall back to "
-               "pixel shader + material texture set identity.");
+               "threshold is crossed) - add the reported hash here. Under rtx.d3d9.ue3EngineMode the reported "
+               "value is the canonical shader identity; both it and the raw bytecode hash are honoured. "
+               "Excluded shaders fall back to pixel shader + material texture set identity. Note that one "
+               "shader usually serves many materials - listing it here drops the constants tier for all of "
+               "them, which merges instances that differ only by a colour parameter. Prefer "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedGroups unless every material on the shader is "
+               "genuinely frame-varying.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedGroups, {},
+               "UE3 MaterialInstanceConstant support: churn group keys whose constants are excluded from "
+               "material identity hashing. A group is one (canonical shader identity, material texture set) "
+               "pair - a single material family - so this excludes exactly the material that churns and "
+               "leaves every other material on the same shader with its constants tier intact. This is the "
+               "same scope rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants applies automatically; list a key "
+               "here when a family churns without being detected, or to pin an exclusion so it survives "
+               "deleting rtx-remix/ue3MicAutoExcludedGroups.cache. Each material's key is reported as "
+               "'group=0x...' by rtx.d3d9.ue3LogMaterialInstanceHash.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogMaterialInstanceHash, false,
                "UE3 MaterialInstanceConstant support: log a one-shot per-material breakdown of the material "
                "identity hash (pixel shader hash, material texture set with per-sampler image hashes, constant "
@@ -336,9 +334,11 @@ namespace dxvk {
                "itself to re-measure its reuse rate. Lower values notice a newly cacheable scene sooner; higher values "
                "spend less time re-measuring in a title where the cache can never hit.");
     RTX_OPTION("rtx.d3d9", bool, ue3ExcludePlacementFromVertexShaderHash, false,
-               "UE3 compat: leave the object transform (LocalToWorld/WorldToLocal) and the shading-only constants "
-               "(LightMapScale, lightmap/shadow coordinate scale-bias) out of the vertex-shader constant hash that "
-               "feeds HashComponents::VertexShader, and so rules::FullGeometryHash.\n"
+               "UE3 compat: leave the object transform (LocalToWorld/WorldToLocal) out of the vertex-shader constant "
+               "hash that feeds HashComponents::VertexShader, and so rules::FullGeometryHash. The shading-only "
+               "constants (LightMapScale, lightmap/shadow coordinate scale-bias) are excluded by "
+               "rtx.d3d9.ue3EngineMode regardless of this option, since they never reach a vertex position and "
+               "LightMapScale otherwise moves the hash with the DirectionalLightmaps setting.\n"
                "Enable it only for titles that recompute LocalToWorld every frame for geometry that is not moving. "
                "There, the transform moves that hash every frame, DrawCallCache::exactMatch never matches across "
                "frames, and a fresh BlasEntry is allocated for every draw of every frame; excluding the transform "
@@ -726,7 +726,26 @@ namespace dxvk {
       return m_reflexFrameId;
     }
 
+    /**
+      * \brief: Whether a texture hash is a UE3 lightmap discovered this session from a pixel
+      * shader's CTAB sampler names (rtx.d3d9.ue3AutoDetectLightmapTextures). Process-wide and
+      * append-only, so the texture paths outside the draw-call setup - which have no D3D9Rtx
+      * to hand - can honour the discovery the same way they honour rtx.lightmapTextures.
+      */
+    static bool isAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
+
+    /**
+      * \brief: Whether a texture is baked lighting Remix must leave alone - either tagged in
+      * rtx.lightmapTextures or auto-detected this session.
+      */
+    static bool isLightmapTexture(XXH64_hash_t textureHash) {
+      return lookupHash(RtxOptions::lightmapTextures(), textureHash) ||
+             isAutoDetectedLightmapTexture(textureHash);
+    }
+
   private: 
+    static void registerAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
+
     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
     // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
     // Block objects and their `m_matrices` array storage stay pinned. The write cursor
@@ -887,6 +906,9 @@ namespace dxvk {
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
     static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
 
+    // Keeps UE3's vertex lightmap coefficient streams from being mistaken for the surface's UVs.
+    uint32_t resolveIaTexcoordAvoidingVertexLightmaps(uint32_t iaTexcoordIdx) const;
+
     // Half-or-larger in both dims (allows ScreenPercentage >50%) and aspect-matched to the
     // backbuffer so square SceneCapture RTs cannot pass as main-view-sized on widescreen.
     static bool ue3ViewportAspectMatchesBackbuffer(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
@@ -997,12 +1019,6 @@ namespace dxvk {
       uint32_t boneMatricesRegisterIndex = 0;
       uint32_t boneMatricesRegisterCount = 0;
 
-      // any CTAB name containing "lightmap" (LightMapScale, LightMapCoordinateScaleBias...):
-      // the shader pair is recompiled per UE3 lightmap policy permutation. Vertex-lightmap
-      // policies declare lightmap symbols only in the vertex shader, so this flag extends
-      // lightmap-permutation-invariant material identity to their pixel shaders.
-      bool hasLightmapSymbols = false;
-
       // vertex-factory style hints inferred from VS CTAB constant names
       // these are used to relax/adjust shader-path UV heuristics where packed UVs
       // and UV offsets are expected (decal/terrain/speedtree paths)
@@ -1046,6 +1062,13 @@ namespace dxvk {
       };
       std::array<Range, kMaxRanges> cameraOnly = {};
       uint32_t cameraOnlyCount = 0;
+      // Camera registers plus the shading-only constants (LightMapScale, lightmap/shadow
+      // coordinate scale-bias). LightMapScale holds a different element count and different
+      // values per lightmap policy, so leaving it in makes the geometry hash move with the
+      // DirectionalLightmaps setting. Unlike the object transform these registers cost nothing
+      // to drop - they never reach a vertex position - so UE3 mode always uses this variant.
+      std::array<Range, kMaxRanges> cameraAndShading = {};
+      uint32_t cameraAndShadingCount = 0;
       // Camera registers plus the object transform and shading-only constants.
       std::array<Range, kMaxRanges> withPlacement = {};
       uint32_t withPlacementCount = 0;
@@ -1121,9 +1144,18 @@ namespace dxvk {
       std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetImmediateValid;
       std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateU;
       std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateV;
+      // Sampler registers holding UE3 lightmap machinery (LightMapTextures[] coefficients and
+      // the bicubic B-spline weight LUT). Their count is a function of the DirectionalLightmaps
+      // setting - 3 coefficients vs 1 - so every draw-time decision that reads the bound texture
+      // set has to subtract them or it varies with a setting Remix does not care about.
+      uint32_t lightmapSamplerMask = 0;
     };
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedUvResolutions;
+
+    // Lightmap hashes this device has already published to the session registry, so the
+    // shared registry is only locked the first time each one is seen.
+    fast_unordered_set m_ue3SeenLightmapTextures;
 
     // rtx.d3d9.ue3LogUvAffineDetail state: per-shader one-shot sampler dump, per distinct
     // resolved transform dedup, and a per (shader, stage) cap so panner/frame-varying
@@ -1668,8 +1700,7 @@ namespace dxvk {
       bool rasterizeFullscreenCompositeToPrimary = false;
       bool shaderPathTexcoordIndexFromPixelShader = false;
       bool ue3MaterialInstanceConstantHash = false;
-      bool ue3LightmapPermutationInvariantHash = false;
-      bool ue3LightmapPermutationBridgeLookup = false;
+      bool ue3MicConstantIdentity = false;
       bool ue3MicExcludeRenderTargetsFromIdentity = true;
       bool ue3MicPersistAutoExcludedConstantGroups = true;
       bool ue3LogMaterialInstanceHash = false;
@@ -1697,6 +1728,7 @@ namespace dxvk {
       bool ue3NativeLocalMeshVertexCapture = false;
       bool ue3RequireCtabCameraConstants = false;
       bool ue3StableDiffuseSelection = false;
+      bool ue3AutoDetectLightmapTextures = false;
       bool ue3MicAutoExcludeFrameVaryingConstants = false;
       bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;
@@ -1746,6 +1778,7 @@ namespace dxvk {
       const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
       const fast_unordered_set* vsTexcoordCaptureOutlierTextures = nullptr;
       const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
+      const fast_unordered_set* ue3MicConstantIdentityExcludedGroups = nullptr;
       const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
       const fast_unordered_set* replacementDebugHashes = nullptr;
     };

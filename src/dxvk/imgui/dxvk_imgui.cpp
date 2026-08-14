@@ -167,6 +167,16 @@ namespace dxvk {
   XXH64_hash_t g_usedFogStateHash;
   std::mutex g_imguiFogMapMutex; // protects g_imguiFogMap
 
+  // Lightmaps the runtime recognised without user tagging; shown as belonging to the lightmap
+  // category so they neither clutter the uncategorized list nor look untagged.
+  fast_unordered_set g_autoTaggedLightmapTextures;
+  std::mutex g_autoTaggedLightmapTexturesMutex; // protects g_autoTaggedLightmapTextures
+
+  fast_unordered_set snapshotAutoTaggedLightmapTextures() {
+    const std::lock_guard<std::mutex> lock(g_autoTaggedLightmapTexturesMutex);
+    return g_autoTaggedLightmapTextures;
+  }
+
   struct RtxTextureOption {
     const char* uniqueId;
     const char* displayName;
@@ -681,6 +691,11 @@ namespace dxvk {
     
     // Note: Erase will do nothing if the hash does not exist in the map, and erase it if it is.
     g_imguiTextureMap.erase(hash);
+  }
+
+  void ImGUI::AddAutoTaggedLightmapTexture(const XXH64_hash_t hash) {
+    const std::lock_guard<std::mutex> lock(g_autoTaggedLightmapTexturesMutex);
+    g_autoTaggedLightmapTextures.insert(hash);
   }
 
   void ImGUI::SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash) {
@@ -2455,23 +2470,30 @@ namespace dxvk {
     auto foundTextureHash = std::optional<XXH64_hash_t> {};
     auto highlightColor = HighlightColor::World;
 
+    // Runtime-recognised lightmaps count as categorized even though no config lists them.
+    const bool isLightmapList = std::string_view { uniqueId } == "lightmaptextures";
+    const fast_unordered_set autoTaggedLightmaps = snapshotAutoTaggedLightmapTextures();
+
     for (auto& [texHash, texImgui] : g_imguiTextureMap) {
       bool textureHasSelection = false;
+      const bool autoTaggedLightmap = autoTaggedLightmaps.count(texHash) != 0;
 
       if (isListFiltered) {
         const auto& textureSet = listRtxOption.textureSetOption->get();
-        textureHasSelection = listRtxOption.textureSetOption->containsHash(texHash);
+        textureHasSelection = listRtxOption.textureSetOption->containsHash(texHash) ||
+                              (isLightmapList && autoTaggedLightmap);
 
         if ((listRtxOption.featureFlagMask & texImgui.textureFeatureFlags) != listRtxOption.featureFlagMask) {
           // If the list needs to be filtered by texture feature, skip it for this category.
           continue;
         }
       } else {
+        textureHasSelection = autoTaggedLightmap;
         for (const auto rtxOption : rtxTextureOptions) {
-          textureHasSelection = rtxOption.textureSetOption->containsHash(texHash);
           if (textureHasSelection) {
             break;
           }
+          textureHasSelection = rtxOption.textureSetOption->containsHash(texHash);
         }
       }
 

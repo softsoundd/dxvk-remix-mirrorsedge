@@ -1017,15 +1017,12 @@ namespace dxvk {
     // current draw (no session history), so the same surface always resolves to the same
     // replacement:
     //   1. materialHash          - exact child identity (PS + material texture set + constants)
-    //   2. lightmap-permutation alternates - exact identities this draw would have produced under
-    //                              lightmap policy permutations that reference fewer material
-    //                              symbols (see rtx.d3d9.ue3LightmapPermutationBridgeLookup)
-    //   3. textureSetShaderHash  - all MIC siblings sharing the shader and texture set (constants
+    //   2. textureSetShaderHash  - all MIC siblings sharing the shader and texture set (constants
     //                              ignored; stable even for shaders with frame-varying constants)
-    //   4. textureHash           - parent-level tag on the primary color texture
-    // Exact identities come before family/parent fallbacks so the same replacement wins
-    // regardless of which permutation is running. For non-UE3 games the tiers collapse into
-    // the legacy single texture-hash lookup.
+    //   3. textureHash           - parent-level tag on the primary color texture
+    // The exact identity comes before the family and parent fallbacks so a specifically
+    // authored replacement always wins over a broader one. For non-UE3 games the tiers
+    // collapse into the legacy single texture-hash lookup.
     const LegacyMaterialData& inputMaterial = input.getMaterialData();
     const XXH64_hash_t materialHash = inputMaterial.getHash();
     const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
@@ -1033,27 +1030,6 @@ namespace dxvk {
 
     const char* matchedTier = "material";
     MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(materialHash);
-
-    if (pReplacementMaterial == nullptr && input.ue3LightmapPermutationAlternateHashes != nullptr) {
-      for (const XXH64_hash_t alternateHash : *input.ue3LightmapPermutationAlternateHashes) {
-        if (alternateHash == kEmptyHash || alternateHash == materialHash ||
-            alternateHash == textureSetShaderHash || alternateHash == textureHash) {
-          continue;
-        }
-        pReplacementMaterial = m_pReplacer->getReplacementMaterial(alternateHash);
-        if (pReplacementMaterial != nullptr) {
-          matchedTier = "lightmap-permutation bridge";
-          static fast_unordered_set s_loggedBridgedMaterials;
-          if (s_loggedBridgedMaterials.insert(materialHash).second) {
-            Logger::info(str::format(
-              "[RTX-Compatibility][UE3-MIC] Lightmap-permutation bridge: materialHash=0x", std::hex, materialHash,
-              " matched replacement keyed 0x", alternateHash, std::dec,
-              " (authored under a simpler lightmap permutation)."));
-          }
-          break;
-        }
-      }
-    }
 
     if (pReplacementMaterial == nullptr &&
         textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {

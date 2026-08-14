@@ -96,6 +96,10 @@ namespace dxvk {
     
     static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
     static void ReleaseTexture(const XXH64_hash_t hash);
+    // Textures the runtime recognised as engine lightmaps on its own (see
+    // rtx.d3d9.ue3AutoDetectLightmapTextures). The picker shows them under the lightmap
+    // category so the detection is visible, without writing per-level hashes to a config.
+    static void AddAutoTaggedLightmapTexture(const XXH64_hash_t hash);
     static bool checkHotkeyState(const VirtualKeys& virtKeys, const bool allowContinuousPress = false);
     static void SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash);
 

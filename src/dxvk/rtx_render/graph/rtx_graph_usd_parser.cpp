@@ -407,7 +407,9 @@ std::vector<GraphUsdParser::DAGNode> GraphUsdParser::getDAGSortedNodes(const pxr
     }
   }
 
-  // Check that the DAG sort found all of the nodes.  Failure indicates there was a cycle of dependencies.
+  // Check that the DAG sort found all of the nodes.  Failure indicates there was a cycle of
+  // dependencies.  A cycle is authored data rather than a programmer error, and the nodes it
+  // covers are already dropped below, so this reports and degrades instead of asserting.
   if (sortedNodes.size() != nodes.size()) {
     Logger::err(str::format("Graph ", graphPrim.GetPath().GetString(), " has a cycle.  These nodes will not be loaded due to unresolvable dependencies:"));
     for (size_t nodeIndex = 0; nodeIndex < nodes.size(); nodeIndex++) {
@@ -415,7 +417,6 @@ std::vector<GraphUsdParser::DAGNode> GraphUsdParser::getDAGSortedNodes(const pxr
         Logger::err(str::format("  ", nodes[nodeIndex].path.GetString()));
       }
     }
-    assert(false && "Graph has a cycle.");
   }
 
   // Sorting was done on indices to avoid repeated copies.  Now that the sorting is done, copy the nodes into a new vector.

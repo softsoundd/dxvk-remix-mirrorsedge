@@ -612,7 +612,11 @@ namespace option_layer_export_test {
   
   void runAllTests() {
     std::cout << "\n=== Running Option Layer Export Tests ===" << std::endl;
-    
+
+    // Stand the option system up as the runtime does before any option is read.
+    RtxOptionLayer::initializeSystemLayers();
+    RtxOptionImpl::setInitialized(true);
+
     try {
       testExportAddedOptionsNewFile();
       testExportModifiedOptions();
