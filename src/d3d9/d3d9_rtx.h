@@ -111,6 +111,7 @@ namespace dxvk {
     friend class ImGUI; // <-- we want to modify these values directly.
 
     D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion = true);
+    ~D3D9Rtx();
 
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
     RTX_OPTION("rtx", bool, preTransformedVerticesIsUI, false, "When enabled, draw calls using pre-transformed (screen-space) vertices will be considered as UI. This is typical for D3D8/D3D9 games that render UI with RHW vertices.");
@@ -1142,8 +1143,26 @@ namespace dxvk {
       uint8_t chosenStages[2] = { 0xFF, 0xFF };
       uint8_t cubemapFallbackStage = 0xFF;
       uint64_t decisionAreaSum = 0;
+      // Runtime only, not serialised: only entries read from the cache file are worth auditing.
+      bool fromDisk = false;
     };
     fast_unordered_cache<Ue3DiffuseSelectionEntry> m_ue3DiffuseSelectionCache;
+    // Persisted to rtx-remix/ue3DiffuseSelection.cache. The pin survives a level reload in memory
+    // but not a relaunch, and a decision first made while a material's textures were still
+    // streamed down can differ from the settled one, so the file is what makes every session
+    // start from the same pick.
+    bool m_ue3DiffuseSelectionLoaded = false;
+    bool m_ue3DiffuseSelectionDirty = false;
+    bool m_ue3DiffuseSelectionSaveBlocked = false;
+    uint32_t m_ue3DiffuseSelectionLastSaveFrame = 0;
+    // A stored pick records a decision, not the inputs behind it, and is consulted whenever the
+    // bound texel area has not grown past the recorded peak - which after a settled run is
+    // essentially always. Changed scoring would therefore be invisible wherever a cache exists,
+    // so a bounded sample of loaded picks is re-scored and any disagreement reported once.
+    uint32_t m_ue3DiffuseSelectionAuditsRemaining = 0;
+    bool m_ue3DiffuseSelectionAuditWarned = false;
+    void loadUe3DiffuseSelectionCache();
+    void saveUe3DiffuseSelectionCache();
     // scoring reads the user-taggable lightmap/never-albedo/preferred-albedo texture sets; drop
     // cached decisions when those sets change so texture tagging in the UI takes effect live
     size_t m_ue3DiffuseSelectionLightmapSetSize = 0;
@@ -1158,15 +1177,21 @@ namespace dxvk {
 
     // per-texture spread over distinct pixel shaders: textures sampled by many unrelated
     // materials are shared detail/pattern/tint overlays rather than surface identity albedo.
-    // Persisted across sessions (rtx-remix/ue3TextureSpread.cache) so the spread penalty is
-    // deterministic from the first frame instead of converging anew each run.
+    // Persisted across sessions (rtx-remix/ue3TextureSpread.cache). `count` accumulates every
+    // shader seen, but scoring reads only `scoringCount` - the value loaded from disk - so the
+    // penalty is a fixed input for the whole session. Discoveries made now apply from the next
+    // session, which is what keeps a material's albedo pick from changing meaning mid-run.
     struct Ue3TextureMaterialSpread {
       std::array<XXH64_hash_t, 12> psHashes = {};
       uint8_t count = 0;
+      uint8_t scoringCount = 0;
     };
     fast_unordered_cache<Ue3TextureMaterialSpread> m_ue3TextureMaterialSpread;
     bool m_ue3TextureSpreadLoaded = false;
     bool m_ue3TextureSpreadDirty = false;
+    // Set when the cache file existed but could not be read in full. Saving rewrites the
+    // file from the map, so a partial load must never be allowed to publish itself.
+    bool m_ue3TextureSpreadSaveBlocked = false;
     uint32_t m_ue3TextureSpreadLastSaveFrame = 0;
     void loadUe3TextureSpreadCache();
     void saveUe3TextureSpreadCache();

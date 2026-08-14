@@ -22,9 +22,11 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <system_error>
 
 namespace dxvk {
   static const bool s_isDxvkResolutionEnvVarSet = (env::getEnvVar("DXVK_RESOLUTION_WIDTH") != "") || (env::getEnvVar("DXVK_RESOLUTION_HEIGHT") != "");
@@ -2196,33 +2198,79 @@ namespace dxvk {
     static fast_unordered_cache<Ue3MicConstantChurnEntry> s_ue3MicConstantChurnPerGroup;
     static fast_unordered_set s_ue3MicAutoExcludedGroups;
 
+    // Shared by the UE3 on-disk caches. Each rewrites its whole file from an in-memory
+    // container, so a save is only safe when that container holds everything the file held:
+    // a load that ends up with less must take the file out of reach for the session, or one
+    // unreadable read becomes permanent loss of data that took a playthrough to accumulate.
+    // Distinguishing "absent" from "unreadable" is what makes a first run still able to save.
+    bool ue3CacheFileExists(const char* path) {
+      std::error_code error;
+      return std::filesystem::exists(path, error);
+    }
+
+    // Publishes a fully written temp file over the real one, so a process that dies mid-write
+    // leaves the previous cache intact rather than a truncated file that the next load would
+    // read as a short but well-formed one.
+    bool ue3CommitCacheFile(const char* tempPath, const char* path) {
+      std::error_code error;
+      std::filesystem::rename(tempPath, path, error);
+      if (error) {
+        std::filesystem::remove(tempPath, error);
+        return false;
+      }
+      return true;
+    }
+
     // Cross-session persistence for the auto-exclusion set; rationale in the
     // rtx.d3d9.ue3MicPersistAutoExcludedConstantGroups option documentation.
     constexpr char kUe3MicAutoExcludedGroupsCachePath[] = "rtx-remix/ue3MicAutoExcludedGroups.cache";
+    constexpr char kUe3MicAutoExcludedGroupsCacheTempPath[] = "rtx-remix/ue3MicAutoExcludedGroups.cache.tmp";
     constexpr uint64_t kUe3MicAutoExcludedGroupsCacheMagic = 0x315843494D334555ull; // "UE3MICX1"
     constexpr uint32_t kUe3MicAutoExcludedGroupsCacheMaxEntries = 1u << 16;
 
     static bool s_ue3MicAutoExcludedGroupsLoaded = false;
+    // See the spread cache: a save rewrites the file from the set, so a load that could not
+    // read all of it must not be published. Losing entries here silently un-excludes a
+    // frame-varying group, which changes its material hash and breaks anchors authored
+    // against the excluded identity.
+    static bool s_ue3MicAutoExcludedGroupsSaveBlocked = false;
 
     static void loadUe3MicAutoExcludedGroupsCache() {
       s_ue3MicAutoExcludedGroupsLoaded = true;
 
+      auto refuseFutureSaves = [](const std::string& reason) {
+        s_ue3MicAutoExcludedGroupsSaveBlocked = true;
+        Logger::warn(str::format(
+          "[RTX-Compatibility][UE3-MIC] Constants auto-exclusion cache ", reason,
+          ". Leaving the file untouched for this session; groups re-derive their exclusions "
+          "from scratch. Delete ", kUe3MicAutoExcludedGroupsCachePath, " to start a fresh one."));
+      };
+
+      const bool fileExists = ue3CacheFileExists(kUe3MicAutoExcludedGroupsCachePath);
+
       std::ifstream file(kUe3MicAutoExcludedGroupsCachePath, std::ios::binary);
-      if (!file.is_open())
+      if (!file.is_open()) {
+        if (fileExists)
+          refuseFutureSaves("exists but could not be opened");
         return;
+      }
 
       uint64_t magic = 0;
       uint32_t entryCount = 0;
       file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
       file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
-      if (!file || magic != kUe3MicAutoExcludedGroupsCacheMagic || entryCount > kUe3MicAutoExcludedGroupsCacheMaxEntries)
+      if (!file || magic != kUe3MicAutoExcludedGroupsCacheMagic || entryCount > kUe3MicAutoExcludedGroupsCacheMaxEntries) {
+        refuseFutureSaves("header is unreadable or not recognised");
         return;
+      }
 
       for (uint32_t i = 0; i < entryCount; i++) {
         XXH64_hash_t groupKey = 0;
         file.read(reinterpret_cast<char*>(&groupKey), sizeof(groupKey));
-        if (!file)
+        if (!file) {
+          refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " groups readable"));
           return;
+        }
         s_ue3MicAutoExcludedGroups.insert(groupKey);
       }
 
@@ -2235,22 +2283,33 @@ namespace dxvk {
       if (!s_ue3MicAutoExcludedGroupsLoaded)
         loadUe3MicAutoExcludedGroupsCache();
 
-      std::ofstream file(kUe3MicAutoExcludedGroupsCachePath, std::ios::binary | std::ios::trunc);
-      if (!file.is_open())
+      if (s_ue3MicAutoExcludedGroupsSaveBlocked)
         return;
 
-      const uint32_t entryCount =
-        uint32_t(std::min<size_t>(s_ue3MicAutoExcludedGroups.size(), kUe3MicAutoExcludedGroupsCacheMaxEntries));
-      file.write(reinterpret_cast<const char*>(&kUe3MicAutoExcludedGroupsCacheMagic), sizeof(kUe3MicAutoExcludedGroupsCacheMagic));
-      file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+      {
+        std::ofstream file(kUe3MicAutoExcludedGroupsCacheTempPath, std::ios::binary | std::ios::trunc);
+        if (!file.is_open())
+          return;
 
-      uint32_t written = 0;
-      for (const XXH64_hash_t groupKey : s_ue3MicAutoExcludedGroups) {
-        if (written >= entryCount)
-          break;
-        file.write(reinterpret_cast<const char*>(&groupKey), sizeof(groupKey));
-        written++;
+        const uint32_t entryCount =
+          uint32_t(std::min<size_t>(s_ue3MicAutoExcludedGroups.size(), kUe3MicAutoExcludedGroupsCacheMaxEntries));
+        file.write(reinterpret_cast<const char*>(&kUe3MicAutoExcludedGroupsCacheMagic), sizeof(kUe3MicAutoExcludedGroupsCacheMagic));
+        file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+        uint32_t written = 0;
+        for (const XXH64_hash_t groupKey : s_ue3MicAutoExcludedGroups) {
+          if (written >= entryCount)
+            break;
+          file.write(reinterpret_cast<const char*>(&groupKey), sizeof(groupKey));
+          written++;
+        }
+
+        file.close();
+        if (!file)
+          return;
       }
+
+      ue3CommitCacheFile(kUe3MicAutoExcludedGroupsCacheTempPath, kUe3MicAutoExcludedGroupsCachePath);
     }
 
     // ===== Replacement identity drift diagnostics =====
@@ -5089,6 +5148,12 @@ namespace dxvk {
     , m_parent(d3d9Device)
     , m_enableDrawCallConversion(enableDrawCallConversion)
     , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
+  }
+
+  D3D9Rtx::~D3D9Rtx() {
+    // EndFrame saves on an interval, so the tail of a session would otherwise be lost.
+    saveUe3TextureSpreadCache();
+    saveUe3DiffuseSelectionCache();
   }
 
   void D3D9Rtx::SkinningMatrixPool::clear() {
@@ -10464,8 +10529,13 @@ namespace dxvk {
       bool selectionCacheUsable = false;
       bool selectionFromCache = false;
       uint64_t selectionBoundAreaSum = 0;
+      bool auditingPinnedSelection = false;
+      uint8_t auditedPinnedStages[2] = { kInvalidStage, kInvalidStage };
+      uint8_t auditedPinnedCubemapStage = kInvalidStage;
       if ((m_frameOptions.ue3StableDiffuseSelection || m_frameOptions.ue3EngineMode) &&
           inferredPsEntry != nullptr && inferredPsHash != kEmptyHash) {
+        if (!m_ue3DiffuseSelectionLoaded)
+          loadUe3DiffuseSelectionCache();
         // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
         // decisions when those sets change so texture tagging takes effect immediately
         const size_t lightmapSetSize = m_frameOptions.lightmapTextures->size();
@@ -10475,6 +10545,9 @@ namespace dxvk {
             neverAlbedoSetSize != m_ue3DiffuseSelectionNeverAlbedoSetSize ||
             preferredAlbedoSetSize != m_ue3DiffuseSelectionPreferredAlbedoSetSize) {
           m_ue3DiffuseSelectionCache.clear();
+          // Tagging invalidates every stored decision, so the persisted set has to shrink with
+          // the in-memory one rather than keep serving picks the tags have just overruled.
+          m_ue3DiffuseSelectionDirty = true;
           // re-log re-scored selections so tag effects are visible in ue3LogAlbedoSelection output
           m_loggedAlbedoSelections.clear();
           m_ue3DiffuseSelectionLightmapSetSize = lightmapSetSize;
@@ -10549,6 +10622,19 @@ namespace dxvk {
               selectionFromCache = false;
               m_ue3DiffuseSelectionCache.erase(cachedSelection);
               m_loggedAlbedoSelections.erase(selectionCacheKey);
+            } else if (cachedSelection->second.fromDisk && m_ue3DiffuseSelectionAuditsRemaining > 0) {
+              // Score this one anyway and compare. The pinned pick still wins - re-scoring at an
+              // arbitrary moment is exactly the transient the pin exists to avoid - so the audit
+              // only reports.
+              --m_ue3DiffuseSelectionAuditsRemaining;
+              auditingPinnedSelection = true;
+              auditedPinnedStages[0] = chosenStages[0];
+              auditedPinnedStages[1] = chosenStages[1];
+              auditedPinnedCubemapStage = strictCubemapFallbackStage;
+              chosenStages[0] = kInvalidStage;
+              chosenStages[1] = kInvalidStage;
+              strictCubemapFallbackStage = kInvalidStage;
+              selectionFromCache = false;
             }
           } else {
             // superseding re-score: let ue3LogAlbedoSelection dump the authoritative decision
@@ -10557,13 +10643,34 @@ namespace dxvk {
         }
       }
 
-      // per-stage score breakdown for rtx.d3d9.ue3LogAlbedoSelection, dumped once per selection key
+      // per-stage score breakdown for rtx.d3d9.ue3LogAlbedoSelection, dumped once per selection key.
+      // Audited draws are excluded: their scoring is discarded, so dumping it would report a
+      // decision the draw did not use.
       const bool logAlbedoSelection =
         m_frameOptions.ue3LogAlbedoSelection &&
         selectionCacheUsable &&
         !selectionFromCache &&
+        !auditingPinnedSelection &&
         m_loggedAlbedoSelections.find(selectionCacheKey) == m_loggedAlbedoSelections.end();
       std::string albedoSelectionLog;
+
+      // Size credit in mip steps: one doubling of texel area is worth a fixed amount, so a
+      // texture that has streamed one mip further gains a fixed, small advantage instead of
+      // one proportional to the texel count.
+      auto albedoAreaScore = [](const uint64_t area) -> int64_t {
+        constexpr int64_t kScorePerMipStep = 40'000;
+        constexpr int64_t kMaxMipSteps = 24;  // 4096x4096
+        int64_t steps = 0;
+        for (uint64_t remaining = area >> 1; remaining != 0 && steps < kMaxMipSteps; remaining >>= 1)
+          ++steps;
+        return steps * kScorePerMipStep;
+      };
+
+      // The unprovable-origin penalty only means something where the resolved UV transform is
+      // actually consumed; the gate mirrors the one guarding that resolution below.
+      const bool uvOriginPenaltyActive =
+        (m_frameOptions.shaderPathTexcoordIndexFromPixelShader || m_frameOptions.ue3EngineMode) &&
+        inferredPsEntry != nullptr;
 
       const uint32_t scoringTextureMask = selectionFromCache ? 0u : usedTextureMask;
       for (uint32_t stage : bit::BitMask(scoringTextureMask)) {
@@ -10588,7 +10695,11 @@ namespace dxvk {
 
         // material spread: distinct pixel shaders sampling this texture. Identity albedos stay
         // at 1-2 (material instances share their parent's bytecode); shared library assets -
-        // detail patterns, grunge/dirt overlays, tint ramps - appear across many unrelated shaders
+        // detail patterns, grunge/dirt overlays, tint ramps - appear across many unrelated shaders.
+        // Scoring reads the spread loaded from disk, never the live count: a statistic that grows
+        // as the level streams in would give the same material a different answer depending on
+        // when it was first drawn, and the pinned selections would have to be thrown away every
+        // time one texture crossed the threshold. This session's discoveries score from the next.
         uint32_t materialSpread = 0;
         if (inferredPsHash != kEmptyHash && texHash != kEmptyHash) {
           if (!m_ue3TextureSpreadLoaded)
@@ -10604,14 +10715,8 @@ namespace dxvk {
           if (!psKnown && spread.count < spread.psHashes.size()) {
             spread.psHashes[spread.count++] = inferredPsHash;
             m_ue3TextureSpreadDirty = true;
-            // crossing the penalty threshold changes scores of already-pinned selections;
-            // drop them so every material re-evaluates against the discovered spread
-            if (spread.count == 8) {
-              m_ue3DiffuseSelectionCache.clear();
-              m_loggedAlbedoSelections.clear();
-            }
           }
-          materialSpread = spread.count;
+          materialSpread = spread.scoringCount;
         }
 
         const bool srgb = (d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1) != 0;
@@ -10649,7 +10754,20 @@ namespace dxvk {
         bool inferredUsesXy = false;
         bool inferredUsesPackedSecondary = false;
         bool hasNonZeroInferredOffset = false;
+        // Whether this sampler's UV origin was proven back to a single interpolant. The
+        // surface's texture transform is derived from the winning stage alone, so a stage
+        // without a provable origin cannot carry one: winning the slot costs the surface
+        // its whole UV transform and leaves the texture at raw interpolant scale.
+        bool inferredSamplerUvOriginProvable = false;
+        bool inferredSamplerReadsPrimaryUvPair = false;
         if (inferredPsEntry != nullptr && stage < caps::MaxTexturesPS) {
+          const PsSamplerUvOrigin& stageUvOrigin = inferredPsEntry->samplerUvOrigin[stage];
+          inferredSamplerUvOriginProvable = stageUvOrigin.originValid;
+          // UE3 packs UV set 0 into an interpolant's .xy and set 1 into its .zw, so a proven
+          // origin on the .xy pair names the mesh's primary channel.
+          inferredSamplerReadsPrimaryUvPair =
+            stageUvOrigin.originValid && stageUvOrigin.sitesAgree &&
+            stageUvOrigin.compU == 0 && stageUvOrigin.compV == 1;
           sampleCount = inferredPsEntry->samplerSampleCount[stage];
           inferredTexcoordIdx = inferredPsEntry->samplerToTexcoord[stage];
           // GPUSkinMorphVF - TEXCOORD6/7 are morph delta streams, treat as noninferable UV
@@ -10814,6 +10932,15 @@ namespace dxvk {
           !inferredSamplerExprMaskControl &&
           !isNeverAlbedo &&
           (inferredSamplerLooksMaterialTexture || inferredSamplerSemanticFlags == 0);
+        // On a static mesh UV set 1 is the secondary/lightmap channel, so between two material
+        // samplers the one reading the primary .xy pair is the surface's own diffuse. Proven per
+        // sampler from bytecode and therefore decided on the first frame, which matters because
+        // the winner also fixes the surface's texcoord set: leaving equally-sized candidates to
+        // the near-tie tiebreaks below would let a second layer take the slot and drag the whole
+        // surface onto its UV set. The packed-UV block below expresses the same idea from
+        // statistical inference, so it cannot separate samplers whose inference came out equal;
+        // this term is additive to it.
+        score += (looksExpressionDrivenMaterial && inferredSamplerReadsPrimaryUvPair) ? 150'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTransform && hasResolvedTiling) ? 95'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvOffset) ? 52'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvAnimated) ? 115'000 : 0;
@@ -10830,14 +10957,22 @@ namespace dxvk {
         // sky/ambient lighting terms but can never be a surface albedo.
         score += (looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
                   inferredSamplerExprDiffuseAnchor) ? 2'500'000 : 0;
+        // A sampler whose UV origin is unprovable must not win on size: the transform is taken
+        // from the winner only, so promoting one drops the surface to raw interpolant UVs.
+        // Flat, so a shader where no sampler resolves is left unaffected.
+        score -= (uvOriginPenaltyActive && !inferredSamplerUvOriginProvable) ? 1'200'000 : 0;
         // normal maps get no size credit - resolution advantage must not offset the decode penalty.
         // Under UE3 the same applies to render targets that only survived the refusal above
         // through an explicit tag: their near-backbuffer area would dominate every other signal.
         const bool renderTargetSizeCreditDenied =
           m_frameOptions.ue3EngineMode && isRenderTarget && !isMovieTexture;
+        // Size counts in mip steps, not texels: streaming rewrites the bound dimensions as a
+        // level pages in, so raw area would let whichever candidate had paged in further win
+        // outright. One doubling is worth less than any single structural signal, which orders
+        // equally-classified candidates by size without letting residency overturn class.
         score += (normalDecodeActive || renderTargetSizeCreditDenied)
           ? 0
-          : int64_t(std::min<uint64_t>(effectiveArea, 16ull * 1024ull * 1024ull));
+          : int64_t(albedoAreaScore(effectiveArea));
         // near-exact ties among color-chain candidates (magnitudes stay below any real signal):
         // prefer a UV transform (the tiled base material - overlays sample raw UVs), then the
         // LATER sampler (the material translator assigns Texture2D_N slots in property compile
@@ -10948,6 +11083,8 @@ namespace dxvk {
           appendFlag(isNeverAlbedo, "TAG:NEVERALBEDO");
           appendFlag(isPreferredAlbedo, "TAG:PREFERALBEDO");
           appendFlag(isRenderTarget, "RT");
+          appendFlag(uvOriginPenaltyActive && !inferredSamplerUvOriginProvable, "NOUVORIGIN");
+          appendFlag(inferredSamplerReadsPrimaryUvPair, "UV0XY");
 
           albedoSelectionLog += str::format(
             "\n  s", stage,
@@ -11231,13 +11368,30 @@ namespace dxvk {
 
       // remember the final (post-fallback, post-promotion) decision for this material key,
       // overwriting any decision made against a smaller (streamed-down) texel area
-      if (selectionCacheUsable && !selectionFromCache) {
+      if (auditingPinnedSelection) {
+        if ((chosenStages[0] != auditedPinnedStages[0] || chosenStages[1] != auditedPinnedStages[1]) &&
+            !m_ue3DiffuseSelectionAuditWarned) {
+          m_ue3DiffuseSelectionAuditWarned = true;
+          Logger::warn(str::format(
+            "[RTX-Compatibility][UE3] Albedo selection cache disagrees with current scoring "
+            "(material key 0x", std::hex, selectionCacheKey, ": stored [s",
+            uint32_t(auditedPinnedStages[0]), ",s", uint32_t(auditedPinnedStages[1]),
+            "], scored [s", uint32_t(chosenStages[0]), ",s", uint32_t(chosenStages[1]), "])", std::dec,
+            ". Stored picks are being used, so a scoring change will not take effect: bump "
+            "kUe3DiffuseSelectionScoringVersion, or delete ", kUe3DiffuseSelectionCachePath, "."));
+        }
+        // The pin stands regardless - the audit reports, it does not re-decide.
+        chosenStages[0] = auditedPinnedStages[0];
+        chosenStages[1] = auditedPinnedStages[1];
+        strictCubemapFallbackStage = auditedPinnedCubemapStage;
+      } else if (selectionCacheUsable && !selectionFromCache) {
         Ue3DiffuseSelectionEntry cacheEntry;
         cacheEntry.chosenStages[0] = chosenStages[0];
         cacheEntry.chosenStages[1] = chosenStages[1];
         cacheEntry.cubemapFallbackStage = strictCubemapFallbackStage;
         cacheEntry.decisionAreaSum = selectionBoundAreaSum;
         m_ue3DiffuseSelectionCache[selectionCacheKey] = cacheEntry;
+        m_ue3DiffuseSelectionDirty = true;
       }
 
       if (logAlbedoSelection) {
@@ -12024,7 +12178,59 @@ namespace dxvk {
 
         if (entryPtr != nullptr && firstStage < caps::MaxTexturesPS) {
           const auto& entry = *entryPtr;
-          const PsSamplerUvOrigin& uvOrigin = entry.samplerUvOrigin[firstStage];
+
+          // A sampler whose own origin cannot be proven falls through to the fixed-function TSS
+          // texcoord index below. UE3 is fully programmable and never sets that meaningfully, so
+          // it is leftover device state, and a device reset restores it to the D3D9 default of
+          // "stage N reads texcoord N" - the surface's UV set would change for reasons unrelated
+          // to the material, presenting as the texture spontaneously rescaling.
+          //
+          // The shader's other material samplers shade the same surface, so where they
+          // unanimously name one interpolant that agreement is proven from bytecode. Only the
+          // origin is borrowed; a sibling's tiling is not this sampler's.
+          PsSamplerUvOrigin borrowedUvOrigin;
+          bool uvOriginBorrowed = false;
+          if (!entry.samplerUvOrigin[firstStage].originValid &&
+              (m_frameOptions.ue3EngineMode || m_frameOptions.shaderPathTexcoordIndexFromPixelShader)) {
+            bool haveCandidate = false;
+            bool candidatesConflict = false;
+            uint8_t sharedSemantic = 0;
+            uint8_t sharedCompU = 0;
+            uint8_t sharedCompV = 1;
+            for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+              if (s == firstStage || s >= SamplerCount || d3d9State().textures[s] == nullptr)
+                continue;
+              const PsSamplerUvOrigin& other = entry.samplerUvOrigin[s];
+              if (!other.originValid || !other.sitesAgree)
+                continue;
+              // Lightmap and engine buffers legitimately read their own UV set, so they must
+              // not vote on the material's.
+              const uint8_t semanticFlags = entry.samplerSemanticFlags[s];
+              if ((semanticFlags & (kPsSamplerSemanticLightmap | kPsSamplerSemanticEngineAuxiliary)) != 0)
+                continue;
+              if (!haveCandidate) {
+                haveCandidate = true;
+                sharedSemantic = other.semanticIndex;
+                sharedCompU = other.compU;
+                sharedCompV = other.compV;
+              } else if (other.semanticIndex != sharedSemantic ||
+                         other.compU != sharedCompU ||
+                         other.compV != sharedCompV) {
+                candidatesConflict = true;
+                break;
+              }
+            }
+            if (haveCandidate && !candidatesConflict) {
+              borrowedUvOrigin.originValid = true;
+              borrowedUvOrigin.semanticIndex = sharedSemantic;
+              borrowedUvOrigin.compU = sharedCompU;
+              borrowedUvOrigin.compV = sharedCompV;
+              uvOriginBorrowed = true;
+            }
+          }
+
+          const PsSamplerUvOrigin& uvOrigin =
+            uvOriginBorrowed ? borrowedUvOrigin : entry.samplerUvOrigin[firstStage];
 
           // rtx.d3d9.ue3LogUvAffineDetail: one-shot per-shader dump of every sampler's UV
           // origin and affine chain, with the textures bound on this draw
@@ -12369,6 +12575,7 @@ namespace dxvk {
                 ", sites=", uvOrigin.validSiteCount, " valid/", uvOrigin.invalidSiteCount, " invalid",
                 siteDisagreementNote,
                 uvOrigin.affineExact ? "" : " [affine-inexact]",
+                uvOriginBorrowed ? " [origin borrowed from sibling material samplers]" : "",
                 m_forceIaTexcoordForOutlier ? " [outlier-override]" : "");
               if (m_frameOptions.ue3LogUvResolution) {
                 Logger::info(msg);
@@ -12519,24 +12726,190 @@ namespace dxvk {
 
   namespace {
     constexpr char kUe3TextureSpreadCachePath[] = "rtx-remix/ue3TextureSpread.cache";
+    constexpr char kUe3TextureSpreadCacheTempPath[] = "rtx-remix/ue3TextureSpread.cache.tmp";
     constexpr uint64_t kUe3TextureSpreadCacheMagic = 0x3144525053334555ull; // "UE3SPRD1"
     constexpr uint32_t kUe3TextureSpreadCacheMaxEntries = 1u << 20;
-    constexpr uint32_t kUe3TextureSpreadSaveIntervalFrames = 600;
+    // Both learned caches are rewritten whole, so they are saved on an interval rather than on
+    // every change; the destructor flushes whatever the last interval missed.
+    constexpr uint32_t kUe3CacheSaveIntervalFrames = 600;
+
+    constexpr char kUe3DiffuseSelectionCachePath[] = "rtx-remix/ue3DiffuseSelection.cache";
+    constexpr char kUe3DiffuseSelectionCacheTempPath[] = "rtx-remix/ue3DiffuseSelection.cache.tmp";
+    constexpr uint64_t kUe3DiffuseSelectionCacheMagic = 0x324C455344334555ull; // "UE3DSEL2"
+    constexpr uint32_t kUe3DiffuseSelectionCacheMaxEntries = 1u << 20;
+    // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
+    // the albedo score changes, so a build with different scoring re-derives instead of serving
+    // decisions its own scoring would no longer make.
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 2;
+    // How many loaded picks to re-score and check against current scoring per session. A scoring
+    // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
+    constexpr uint32_t kUe3DiffuseSelectionAuditCount = 32;
+  }
+
+  void D3D9Rtx::loadUe3DiffuseSelectionCache() {
+    m_ue3DiffuseSelectionLoaded = true;
+
+    auto refuseFutureSaves = [this](const std::string& reason) {
+      m_ue3DiffuseSelectionSaveBlocked = true;
+      Logger::warn(str::format(
+        "[RTX-Compatibility][UE3] Albedo selection cache ", reason,
+        ". Leaving the file untouched for this session; albedo picks re-derive as materials are "
+        "first drawn. Delete ", kUe3DiffuseSelectionCachePath, " to start a fresh one."));
+    };
+
+    const bool fileExists = ue3CacheFileExists(kUe3DiffuseSelectionCachePath);
+
+    std::ifstream file(kUe3DiffuseSelectionCachePath, std::ios::binary);
+    if (!file.is_open()) {
+      if (fileExists)
+        refuseFutureSaves("exists but could not be opened");
+      return;
+    }
+
+    // Scoring reads the taggable texture sets, so a stored pick is only valid under the tags that
+    // produced it. Adopting the current sizes here is also what stops the tag-change check on the
+    // first scoring draw from comparing against zero and clearing everything just loaded.
+    const uint32_t currentLightmapSize = uint32_t(m_frameOptions.lightmapTextures->size());
+    const uint32_t currentNeverAlbedoSize = uint32_t(m_frameOptions.neverAlbedoTextures->size());
+    const uint32_t currentPreferredAlbedoSize = uint32_t(m_frameOptions.preferredAlbedoTextures->size());
+    m_ue3DiffuseSelectionLightmapSetSize = currentLightmapSize;
+    m_ue3DiffuseSelectionNeverAlbedoSetSize = currentNeverAlbedoSize;
+    m_ue3DiffuseSelectionPreferredAlbedoSetSize = currentPreferredAlbedoSize;
+
+    uint64_t magic = 0;
+    uint32_t scoringVersion = 0;
+    uint32_t lightmapSize = 0;
+    uint32_t neverAlbedoSize = 0;
+    uint32_t preferredAlbedoSize = 0;
+    uint32_t entryCount = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&scoringVersion), sizeof(scoringVersion));
+    file.read(reinterpret_cast<char*>(&lightmapSize), sizeof(lightmapSize));
+    file.read(reinterpret_cast<char*>(&neverAlbedoSize), sizeof(neverAlbedoSize));
+    file.read(reinterpret_cast<char*>(&preferredAlbedoSize), sizeof(preferredAlbedoSize));
+    file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
+    if (!file || magic != kUe3DiffuseSelectionCacheMagic || entryCount > kUe3DiffuseSelectionCacheMaxEntries) {
+      refuseFutureSaves("header is unreadable or not recognised");
+      return;
+    }
+    if (scoringVersion != kUe3DiffuseSelectionScoringVersion) {
+      // Our own file, written by different scoring: discard and rewrite rather than refuse.
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3] Albedo selection cache was written by scoring version ",
+        scoringVersion, " (this build is ", kUe3DiffuseSelectionScoringVersion,
+        "); re-deriving picks and rewriting it."));
+      m_ue3DiffuseSelectionDirty = true;
+      return;
+    }
+    if (lightmapSize != currentLightmapSize ||
+        neverAlbedoSize != currentNeverAlbedoSize ||
+        preferredAlbedoSize != currentPreferredAlbedoSize) {
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3] Albedo selection cache was written under different texture tags "
+        "(lightmap/never/preferred ", lightmapSize, "/", neverAlbedoSize, "/", preferredAlbedoSize,
+        ", now ", currentLightmapSize, "/", currentNeverAlbedoSize, "/", currentPreferredAlbedoSize,
+        "); re-deriving picks and rewriting it."));
+      m_ue3DiffuseSelectionDirty = true;
+      return;
+    }
+
+    for (uint32_t i = 0; i < entryCount; i++) {
+      XXH64_hash_t key = 0;
+      Ue3DiffuseSelectionEntry entry;
+      file.read(reinterpret_cast<char*>(&key), sizeof(key));
+      file.read(reinterpret_cast<char*>(&entry.chosenStages[0]), sizeof(entry.chosenStages[0]));
+      file.read(reinterpret_cast<char*>(&entry.chosenStages[1]), sizeof(entry.chosenStages[1]));
+      file.read(reinterpret_cast<char*>(&entry.cubemapFallbackStage), sizeof(entry.cubemapFallbackStage));
+      file.read(reinterpret_cast<char*>(&entry.decisionAreaSum), sizeof(entry.decisionAreaSum));
+      if (!file) {
+        refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " entries readable"));
+        return;
+      }
+      entry.fromDisk = true;
+      m_ue3DiffuseSelectionCache[key] = entry;
+    }
+
+    m_ue3DiffuseSelectionAuditsRemaining = kUe3DiffuseSelectionAuditCount;
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3] Loaded albedo selection cache: ", entryCount, " materials"));
+  }
+
+  void D3D9Rtx::saveUe3DiffuseSelectionCache() {
+    if (!m_ue3DiffuseSelectionDirty || m_ue3DiffuseSelectionSaveBlocked)
+      return;
+
+    {
+      std::ofstream file(kUe3DiffuseSelectionCacheTempPath, std::ios::binary | std::ios::trunc);
+      if (!file.is_open())
+        return;
+
+      const uint32_t entryCount =
+        uint32_t(std::min<size_t>(m_ue3DiffuseSelectionCache.size(), kUe3DiffuseSelectionCacheMaxEntries));
+      // The tracked sizes rather than the live sets: these are what the stored decisions were
+      // scored against, and they are readable from the destructor, where the frame options a
+      // draw would have populated may never have existed.
+      const uint32_t lightmapSize = uint32_t(m_ue3DiffuseSelectionLightmapSetSize);
+      const uint32_t neverAlbedoSize = uint32_t(m_ue3DiffuseSelectionNeverAlbedoSetSize);
+      const uint32_t preferredAlbedoSize = uint32_t(m_ue3DiffuseSelectionPreferredAlbedoSetSize);
+      file.write(reinterpret_cast<const char*>(&kUe3DiffuseSelectionCacheMagic), sizeof(kUe3DiffuseSelectionCacheMagic));
+      file.write(reinterpret_cast<const char*>(&kUe3DiffuseSelectionScoringVersion), sizeof(kUe3DiffuseSelectionScoringVersion));
+      file.write(reinterpret_cast<const char*>(&lightmapSize), sizeof(lightmapSize));
+      file.write(reinterpret_cast<const char*>(&neverAlbedoSize), sizeof(neverAlbedoSize));
+      file.write(reinterpret_cast<const char*>(&preferredAlbedoSize), sizeof(preferredAlbedoSize));
+      file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+      uint32_t written = 0;
+      for (const auto& entry : m_ue3DiffuseSelectionCache) {
+        if (written >= entryCount)
+          break;
+        file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+        file.write(reinterpret_cast<const char*>(&entry.second.chosenStages[0]), sizeof(entry.second.chosenStages[0]));
+        file.write(reinterpret_cast<const char*>(&entry.second.chosenStages[1]), sizeof(entry.second.chosenStages[1]));
+        file.write(reinterpret_cast<const char*>(&entry.second.cubemapFallbackStage), sizeof(entry.second.cubemapFallbackStage));
+        file.write(reinterpret_cast<const char*>(&entry.second.decisionAreaSum), sizeof(entry.second.decisionAreaSum));
+        written++;
+      }
+
+      file.close();
+      if (!file)
+        return;
+    }
+
+    if (ue3CommitCacheFile(kUe3DiffuseSelectionCacheTempPath, kUe3DiffuseSelectionCachePath))
+      m_ue3DiffuseSelectionDirty = false;
   }
 
   void D3D9Rtx::loadUe3TextureSpreadCache() {
     m_ue3TextureSpreadLoaded = true;
 
+    auto refuseFutureSaves = [this](const std::string& reason) {
+      m_ue3TextureSpreadSaveBlocked = true;
+      Logger::warn(str::format(
+        "[RTX-Compatibility][UE3] Texture material-spread cache ", reason,
+        ". Leaving the file untouched for this session so it is not overwritten with less "
+        "than it holds; albedo scoring falls back to no spread data. Delete ",
+        kUe3TextureSpreadCachePath, " to start a fresh one."));
+    };
+
+    const bool fileExists = ue3CacheFileExists(kUe3TextureSpreadCachePath);
+
     std::ifstream file(kUe3TextureSpreadCachePath, std::ios::binary);
-    if (!file.is_open())
+    if (!file.is_open()) {
+      // No file at all is an ordinary first run, and saving must stay available to create one.
+      if (fileExists)
+        refuseFutureSaves("exists but could not be opened");
       return;
+    }
 
     uint64_t magic = 0;
     uint32_t entryCount = 0;
     file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
-    if (!file || magic != kUe3TextureSpreadCacheMagic || entryCount > kUe3TextureSpreadCacheMaxEntries)
+    if (!file || magic != kUe3TextureSpreadCacheMagic || entryCount > kUe3TextureSpreadCacheMaxEntries) {
+      refuseFutureSaves("header is unreadable or not recognised");
       return;
+    }
 
     for (uint32_t i = 0; i < entryCount; i++) {
       XXH64_hash_t texHash = 0;
@@ -12544,13 +12917,18 @@ namespace dxvk {
       file.read(reinterpret_cast<char*>(&texHash), sizeof(texHash));
       file.read(reinterpret_cast<char*>(&count), sizeof(count));
       Ue3TextureMaterialSpread spread;
-      if (!file || count > spread.psHashes.size())
+      if (!file || count > spread.psHashes.size()) {
+        refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " entries readable"));
         return;
+      }
       for (uint8_t p = 0; p < count; p++)
         file.read(reinterpret_cast<char*>(&spread.psHashes[p]), sizeof(XXH64_hash_t));
-      if (!file)
+      if (!file) {
+        refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " entries readable"));
         return;
+      }
       spread.count = count;
+      spread.scoringCount = count;
       m_ue3TextureMaterialSpread[texHash] = spread;
     }
 
@@ -12559,29 +12937,38 @@ namespace dxvk {
   }
 
   void D3D9Rtx::saveUe3TextureSpreadCache() {
-    if (!m_ue3TextureSpreadDirty)
-      return;
-    m_ue3TextureSpreadDirty = false;
-
-    std::ofstream file(kUe3TextureSpreadCachePath, std::ios::binary | std::ios::trunc);
-    if (!file.is_open())
+    if (!m_ue3TextureSpreadDirty || m_ue3TextureSpreadSaveBlocked)
       return;
 
-    const uint32_t entryCount =
-      uint32_t(std::min<size_t>(m_ue3TextureMaterialSpread.size(), kUe3TextureSpreadCacheMaxEntries));
-    file.write(reinterpret_cast<const char*>(&kUe3TextureSpreadCacheMagic), sizeof(kUe3TextureSpreadCacheMagic));
-    file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+    {
+      std::ofstream file(kUe3TextureSpreadCacheTempPath, std::ios::binary | std::ios::trunc);
+      if (!file.is_open())
+        return;
 
-    uint32_t written = 0;
-    for (const auto& entry : m_ue3TextureMaterialSpread) {
-      if (written >= entryCount)
-        break;
-      file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
-      file.write(reinterpret_cast<const char*>(&entry.second.count), sizeof(entry.second.count));
-      for (uint8_t p = 0; p < entry.second.count; p++)
-        file.write(reinterpret_cast<const char*>(&entry.second.psHashes[p]), sizeof(XXH64_hash_t));
-      written++;
+      const uint32_t entryCount =
+        uint32_t(std::min<size_t>(m_ue3TextureMaterialSpread.size(), kUe3TextureSpreadCacheMaxEntries));
+      file.write(reinterpret_cast<const char*>(&kUe3TextureSpreadCacheMagic), sizeof(kUe3TextureSpreadCacheMagic));
+      file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+      uint32_t written = 0;
+      for (const auto& entry : m_ue3TextureMaterialSpread) {
+        if (written >= entryCount)
+          break;
+        file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+        file.write(reinterpret_cast<const char*>(&entry.second.count), sizeof(entry.second.count));
+        for (uint8_t p = 0; p < entry.second.count; p++)
+          file.write(reinterpret_cast<const char*>(&entry.second.psHashes[p]), sizeof(XXH64_hash_t));
+        written++;
+      }
+
+      file.close();
+      if (!file)
+        return;
     }
+
+    // Cleared only once the new file is in place, so a failed write is retried next interval.
+    if (ue3CommitCacheFile(kUe3TextureSpreadCacheTempPath, kUe3TextureSpreadCachePath))
+      m_ue3TextureSpreadDirty = false;
   }
 
   void D3D9Rtx::recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
@@ -12796,12 +13183,17 @@ namespace dxvk {
 
     const auto currentReflexFrameId = GetReflexFrameId();
 
-    // persist newly discovered texture material-spread so the next session scores
-    // deterministically from its first frame instead of re-converging
+    // persist what this session learned so the next one scores from it rather than re-converging
     if (m_ue3TextureSpreadDirty &&
-        currentReflexFrameId >= m_ue3TextureSpreadLastSaveFrame + kUe3TextureSpreadSaveIntervalFrames) {
+        currentReflexFrameId >= m_ue3TextureSpreadLastSaveFrame + kUe3CacheSaveIntervalFrames) {
       m_ue3TextureSpreadLastSaveFrame = uint32_t(currentReflexFrameId);
       saveUe3TextureSpreadCache();
+    }
+
+    if (m_ue3DiffuseSelectionDirty &&
+        currentReflexFrameId >= m_ue3DiffuseSelectionLastSaveFrame + kUe3CacheSaveIntervalFrames) {
+      m_ue3DiffuseSelectionLastSaveFrame = uint32_t(currentReflexFrameId);
+      saveUe3DiffuseSelectionCache();
     }
     
     // Flush any pending game and RTX work
