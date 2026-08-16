@@ -641,6 +641,15 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableDirectLighting, true, "Enables direct lighting (lighting directly from lights on to a surface) on surfaces when set to true, otherwise disables it.");
     RTX_OPTION("rtx", bool, enableSecondaryBounces, true, "Enables indirect lighting (lighting from diffuse/specular bounces to one or more other surfaces) on surfaces when set to true, otherwise disables it.");
       
+    RTX_OPTION("rtx", bool, logInstanceIdentityStats, false,
+               "Diagnostics: log roughly once a second where instance lookups land - exact-identity hits, "
+               "exact-transform hits, spatial nearest-neighbour hits, instances created - and how many candidates "
+               "the spatial search examined.\n"
+               "That candidate count is the one to watch: the search scans a cell neighbourhood sized from "
+               "rtx.uniqueObjectDistance, so a dense cluster of moving objects can land its whole batch in one cell "
+               "and turn the search quadratic in the batch's size. Instances whose identity does not depend on their "
+               "transform are reported separately, since they should be bypassing the search entirely.");
+
     // Needs to be > 0
     RTX_OPTION_ARGS("rtx", float, uniqueObjectDistance, 300.f, "The distance (in game units) that an object can move in a single frame before it is no longer considered the same object.\n"
                     "If this is too low, fast moving objects may flicker and have bad lighting.  If it's too high, repeated objects may flicker.\n"

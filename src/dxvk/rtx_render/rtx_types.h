@@ -139,6 +139,11 @@ struct ReplacementInstance {
     // equipment renders the same mesh both ways per frame with near-identical keys, and
     // cross-matching leaks view-model state onto the world shadow copy.
     bool isViewModelDraw = false;
+    // Set when identityHash deliberately leaves the transform out, because the draw carries its own
+    // stable per-instance identity (DrawCallState::decomposedInstanceId). An exact identity match
+    // then no longer proves the transform held, so the lookup has to report the drift and move the
+    // instance's spatial entry itself rather than relying on that invariant.
+    bool identityExcludesTransform = false;
   };
 
   ReplacementInstance() = delete;
@@ -502,6 +507,16 @@ struct RasterGeometry {
 };
 
 struct GeometryBufferData {
+  // Only float32 texcoord formats can be read as Vector2 on the CPU; anything else (games commonly
+  // pack UVs as half floats) is left absent below rather than mis-read, and is converted by the GPU
+  // interleaver instead. Callers that need texcoords on the CPU must consult this rather than
+  // RasterGeometry::texcoordBuffer.defined(), which would leave them reading through a null pointer.
+  static bool isCpuReadableTexcoordFormat(const VkFormat format) {
+    return format == VK_FORMAT_R32G32_SFLOAT
+        || format == VK_FORMAT_R32G32B32_SFLOAT
+        || format == VK_FORMAT_R32G32B32A32_SFLOAT;
+  }
+
   uint16_t* indexData;
   size_t indexStride;
 
@@ -538,16 +553,11 @@ struct GeometryBufferData {
 
     texcoordStride = 0;
     texcoordData = nullptr;
-    // Only float32 texcoord formats can be safely read as Vector2 on the CPU.
-    // R16G16_SFLOAT and other non-float32 formats are converted to R32G32_SFLOAT by the GPU interleaver;
-    // treat them as absent here to avoid mis-reading packed half-float data as float2.
-    if (geometryData.texcoordBuffer.defined()) {
-      const VkFormat texFmt = geometryData.texcoordBuffer.vertexFormat();
-      if (texFmt == VK_FORMAT_R32G32_SFLOAT || texFmt == VK_FORMAT_R32G32B32_SFLOAT || texFmt == VK_FORMAT_R32G32B32A32_SFLOAT) {
-        constexpr size_t texcoordSubElementSize = sizeof(float);
-        texcoordStride = geometryData.texcoordBuffer.stride() / texcoordSubElementSize;
-        texcoordData = (float*) geometryData.texcoordBuffer.mapPtr((size_t) geometryData.texcoordBuffer.offsetFromSlice());
-      }
+    if (geometryData.texcoordBuffer.defined() &&
+        isCpuReadableTexcoordFormat(geometryData.texcoordBuffer.vertexFormat())) {
+      constexpr size_t texcoordSubElementSize = sizeof(float);
+      texcoordStride = geometryData.texcoordBuffer.stride() / texcoordSubElementSize;
+      texcoordData = (float*) geometryData.texcoordBuffer.mapPtr((size_t) geometryData.texcoordBuffer.offsetFromSlice());
     }
 
     if (geometryData.normalBuffer.defined()) {
@@ -679,6 +689,13 @@ struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;
   DrawCallState& operator=(const DrawCallState& drawCallState) = default;
+
+  // Non-zero identifies one hardware instance of a draw that was decomposed into an instance per
+  // hardware instance (D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates). Such an instance stays
+  // the same object while its transform changes every frame, so DrawCallTracker::computeIdentityHash
+  // keys on this instead of the transform; otherwise it would miss the exact-identity lookup every
+  // frame and fall back to a spatial search costing O(batch size) per instance.
+  XXH64_hash_t decomposedInstanceId = kEmptyHash;
 
   // Note: This uses the original material for the hash, not the replaced material
   const XXH64_hash_t getHash(const HashRule& rule) const {

@@ -59,6 +59,7 @@ namespace dxvk {
       uint8_t normalType = 0;
       uint8_t normalStream = 0xFF;
       bool hasBinormal = false;
+      uint8_t binormalType = 0;
       bool hasBlendWeight = false;
       uint8_t blendWeightType = 0;
       bool hasBlendIndices = false;
@@ -97,6 +98,7 @@ namespace dxvk {
           break;
         case D3DDECLUSAGE_BINORMAL:
           sig.hasBinormal = true;
+          sig.binormalType = e.Type;
           break;
         case D3DDECLUSAGE_BLENDWEIGHT:
           sig.hasBlendWeight = true;
@@ -4377,6 +4379,24 @@ namespace dxvk {
       return Ue3VertexFactoryType::GPUSkin;
     }
 
+    // Instanced mesh particles share FoliageVertexFactory.usf and the instancing axes in
+    // TEXCOORD1..4, but their declaration has no NORMAL: FParticleInstancedMeshVertexFactory
+    // walks {VEU_Tangent, VEU_Binormal, VEU_Normal} while only filling components 0 and 1, so
+    // the mesh's TangentZ arrives under the BINORMAL semantic. (The stock game's shader still
+    // declares it as NORMAL and therefore never reads it - so UE3 renders these unlit.)
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_UBYTE4 &&
+        sig.hasBinormal && sig.binormalType == D3DDECLTYPE_UBYTE4 &&
+        !sig.hasNormal &&
+        !sig.hasBlendIndices && !sig.hasBlendWeight &&
+        sig.texcoordCount >= 5 &&
+        sig.texcoordTypes[1] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[2] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[3] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[4] == D3DDECLTYPE_FLOAT3) {
+      return Ue3VertexFactoryType::ParticleInstancedMesh;
+    }
+
     // local (static mesh) = POSITION(FLOAT3) + TANGENT(UBYTE4) + NORMAL(UBYTE4) + TEXCOORDs, no BLENDINDICES
     // foliage extends the local layout with instancing axes in TEXCOORD1..4.
     if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
@@ -4577,6 +4597,7 @@ namespace dxvk {
     case Ue3VertexFactoryType::TerrainMorph:
     case Ue3VertexFactoryType::SpeedTree:
     case Ue3VertexFactoryType::Foliage:
+    case Ue3VertexFactoryType::ParticleInstancedMesh:
     case Ue3VertexFactoryType::Particle:
     case Ue3VertexFactoryType::ParticleBeamTrail:
     case Ue3VertexFactoryType::LensFlare:
@@ -4584,6 +4605,409 @@ namespace dxvk {
     default:
       return false;
     }
+  }
+
+  // UE3 instances a mesh by leaving its placement out of the shader constants entirely: the mesh
+  // streams carry D3DSTREAMSOURCE_INDEXEDDATA | instanceCount, one further stream is tagged
+  // D3DSTREAMSOURCE_INSTANCEDATA, and the vertex factory reads InstanceOffset (TEXCOORD1) plus the
+  // three basis axes (TEXCOORD2..4) out of it. See FParticleInstancedMeshVertexFactory::InitRHI and
+  // FFoliageVertexFactory::InitRHI in the UE3 engine, and GetInstanceToWorld in
+  // FoliageVertexFactory.usf which both compile down to that layout.
+  D3D9Rtx::Ue3InstancingInfo D3D9Rtx::resolveUe3Instancing(
+      const D3D9VertexElements& elements,
+      const std::array<UINT, caps::MaxStreams>& streamFreq,
+      const uint32_t instanceCount) {
+    Ue3InstancingInfo info;
+
+    // D3D9 only honours a stream-0 instance count when some stream the declaration reads is
+    // tagged as instance data; GenerateDrawInfo gates the replayed draw the same way, so the
+    // scene has to agree or it would decompose a draw the hardware runs once.
+    uint32_t usedStreamMask = 0;
+    for (const auto& element : elements) {
+      if (element.Stream < caps::MaxStreams) {
+        usedStreamMask |= 1u << element.Stream;
+      }
+    }
+
+    for (const uint32_t s : bit::BitMask(usedStreamMask)) {
+      if ((streamFreq[s] & D3DSTREAMSOURCE_INSTANCEDATA) != 0) {
+        info.instanceDataStreamMask |= 1u << s;
+      }
+    }
+
+    if (info.instanceDataStreamMask == 0) {
+      return info;
+    }
+    info.instanceCount = std::max(instanceCount, 1u);
+
+    // A complete basis is all four elements, FLOAT3, on one and the same instance-data stream.
+    // Anything short of that is some other instancing scheme and must not be decomposed.
+    const D3DVERTEXELEMENT9* basis[4] = {};
+    for (const auto& element : elements) {
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD ||
+          element.UsageIndex < 1 || element.UsageIndex > 4 ||
+          element.Type != D3DDECLTYPE_FLOAT3 ||
+          element.Stream >= caps::MaxStreams ||
+          (info.instanceDataStreamMask & (1u << element.Stream)) == 0) {
+        continue;
+      }
+      basis[element.UsageIndex - 1] = &element;
+    }
+
+    if (basis[0] == nullptr || basis[1] == nullptr || basis[2] == nullptr || basis[3] == nullptr) {
+      return info;
+    }
+    if (basis[1]->Stream != basis[0]->Stream ||
+        basis[2]->Stream != basis[0]->Stream ||
+        basis[3]->Stream != basis[0]->Stream) {
+      return info;
+    }
+
+    info.hasInstanceTransform = true;
+    info.transformStream = basis[0]->Stream;
+    info.offsetByteOffset = basis[0]->Offset;
+    info.axisByteOffsets[0] = basis[1]->Offset;
+    info.axisByteOffsets[1] = basis[2]->Offset;
+    info.axisByteOffsets[2] = basis[3]->Offset;
+    return info;
+  }
+
+  bool D3D9Rtx::readUe3InstanceTransforms(const VertexContext vertexContext[caps::MaxStreams],
+                                          std::vector<Ue3DecomposedInstance>& instances,
+                                          const char** outReason) const {
+    instances.clear();
+
+    auto fail = [&](const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
+      return false;
+    };
+    if (outReason != nullptr) {
+      *outReason = "";
+    }
+
+    const Ue3InstancingInfo& info = m_currentUe3Instancing;
+    if (!info.hasInstanceTransform || info.instanceCount == 0) {
+      return fail("no per-instance transform basis in the declaration");
+    }
+
+    const VertexContext& ctx = vertexContext[info.transformStream];
+    if (ctx.stride == 0) {
+      return fail("instance stream has no stride");
+    }
+    if (ctx.mappedSlice.mapPtr == nullptr) {
+      return fail("instance stream is not host-visible");
+    }
+
+    // The four FLOAT3 reads have to stay inside the record, and the whole array inside the slice.
+    uint32_t maxByteOffset = info.offsetByteOffset;
+    for (const uint32_t axisOffset : info.axisByteOffsets) {
+      maxByteOffset = std::max(maxByteOffset, axisOffset);
+    }
+    if (maxByteOffset + sizeof(float) * 3 > ctx.stride) {
+      return fail("instance basis does not fit the instance stream's stride");
+    }
+
+    const size_t firstByte = size_t(ctx.offset);
+    const size_t requiredBytes = size_t(ctx.stride) * info.instanceCount;
+    if (firstByte + requiredBytes > ctx.mappedSlice.length) {
+      return fail("instance stream is shorter than the draw's instance count");
+    }
+
+    const uint8_t* records = static_cast<const uint8_t*>(ctx.mappedSlice.mapPtr) + firstByte;
+    auto readVector3 = [](const uint8_t* record, const uint32_t byteOffset) {
+      float v[3];
+      std::memcpy(v, record + byteOffset, sizeof(v));
+      return Vector3(v[0], v[1], v[2]);
+    };
+
+    instances.reserve(info.instanceCount);
+    for (uint32_t i = 0; i < info.instanceCount; i++) {
+      const uint8_t* record = records + size_t(ctx.stride) * i;
+      const Vector3 offset = readVector3(record, info.offsetByteOffset);
+      const Vector3 xAxis = readVector3(record, info.axisByteOffsets[0]);
+      const Vector3 yAxis = readVector3(record, info.axisByteOffsets[1]);
+      const Vector3 zAxis = readVector3(record, info.axisByteOffsets[2]);
+
+      // PhysX only writes the live prefix of an NxFluid emitter's instance buffer, so trailing
+      // records hold whatever the previous frame left - or nothing at all on a fresh allocation.
+      // A zero or non-finite basis is not a placement.
+      const bool finite =
+        std::isfinite(offset.x) && std::isfinite(offset.y) && std::isfinite(offset.z) &&
+        std::isfinite(xAxis.x) && std::isfinite(xAxis.y) && std::isfinite(xAxis.z) &&
+        std::isfinite(yAxis.x) && std::isfinite(yAxis.y) && std::isfinite(yAxis.z) &&
+        std::isfinite(zAxis.x) && std::isfinite(zAxis.y) && std::isfinite(zAxis.z);
+      if (!finite) {
+        continue;
+      }
+      if (std::abs(dot(xAxis, cross(yAxis, zAxis))) <= 1e-12f) {
+        continue;
+      }
+
+      // Row-vector layout to match Remix's Matrix4 (basis in rows 0..2, translation in row 3),
+      // identical to the FMatrix(XAxis, YAxis, ZAxis, Location) the engine's non-instanced
+      // NxFluid mesh path hands to FMeshElement::LocalToWorld.
+      Ue3DecomposedInstance instance;
+      instance.instanceToObject[0] = Vector4(xAxis.x, xAxis.y, xAxis.z, 0.0f);
+      instance.instanceToObject[1] = Vector4(yAxis.x, yAxis.y, yAxis.z, 0.0f);
+      instance.instanceToObject[2] = Vector4(zAxis.x, zAxis.y, zAxis.z, 0.0f);
+      instance.instanceToObject[3] = Vector4(offset.x, offset.y, offset.z, 1.0f);
+      // The buffer position, not the position in this vector: a degenerate record earlier in the
+      // buffer must not shift the identity of everything after it.
+      instance.sourceIndex = i;
+      instances.push_back(instance);
+    }
+
+    if (instances.empty()) {
+      return fail("every instance's basis was degenerate");
+    }
+    return true;
+  }
+
+  // Whatever these bounds drop, the kept set has to be the same set next frame: an instance that
+  // comes and goes as the camera moves flickers, and a selection that reorders the survivors also
+  // renames them (see Ue3DecomposedInstance::sourceIndex). Hence the count clamp keeps the lowest
+  // source indices rather than the nearest to the camera. Distance culling is view-dependent by
+  // definition and can pop at its boundary, which is why it is opt-in.
+  void D3D9Rtx::cullAndClampUe3InstanceTransforms(std::vector<Ue3DecomposedInstance>& instances,
+                                                  uint32_t& outCulledByDistance,
+                                                  uint32_t& outCulledByBudget) const {
+    outCulledByDistance = 0;
+    outCulledByBudget = 0;
+
+    const uint32_t budget = std::max(m_frameOptions.ue3MaxDecomposedInstances, 1u);
+    const float cullDistance = m_frameOptions.ue3DecomposedInstanceCullDistance;
+    if (cullDistance <= 0.0f && instances.size() <= budget) {
+      return;
+    }
+
+    if (cullDistance > 0.0f) {
+      const DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
+
+      // worldToView is affine, so its inverse's translation row is the view origin in world space.
+      // A camera that cannot be inverted leaves distances meaningless; skip to the count clamp.
+      const double det = determinant(transformData.worldToView);
+      if (std::isfinite(det) && std::abs(det) > 1e-24) {
+        const Matrix4 viewToWorld = inverseAffine(transformData.worldToView);
+        const Vector3 cameraPosition(viewToWorld[3].x, viewToWorld[3].y, viewToWorld[3].z);
+        if (std::isfinite(cameraPosition.x) && std::isfinite(cameraPosition.y) &&
+            std::isfinite(cameraPosition.z)) {
+          const float cullDistanceSq = cullDistance * cullDistance;
+          const size_t before = instances.size();
+          // Order-preserving, so the surviving instances keep their relative buffer order.
+          instances.erase(
+            std::remove_if(instances.begin(), instances.end(),
+                           [&](const Ue3DecomposedInstance& instance) {
+                             // Carried through the draw's object transform, which is identity for
+                             // UE3's instanced factories but composed anyway to stay general.
+                             const Vector4 world = transformData.objectToWorld *
+                               Vector4(instance.instanceToObject[3].x,
+                                       instance.instanceToObject[3].y,
+                                       instance.instanceToObject[3].z, 1.0f);
+                             const Vector3 delta = Vector3(world.x, world.y, world.z) - cameraPosition;
+                             return dot(delta, delta) > cullDistanceSq;
+                           }),
+            instances.end());
+          outCulledByDistance = uint32_t(before - instances.size());
+        }
+      }
+    }
+
+    if (instances.size() > budget) {
+      outCulledByBudget = uint32_t(instances.size() - budget);
+      instances.resize(budget);
+    }
+  }
+
+  // Names the batch an instanced draw belongs to, without involving any transform.
+  //
+  // The mesh streams say which mesh is being instanced but not which component is instancing it, and
+  // two piles of the same debris share them. The instance buffer would distinguish those but cannot
+  // serve as an identity - RenderNxFluidInstanced creates a fresh one per frame unless its pool hands
+  // one back - so batches are matched to the previous frame's by continuity of their own centroid,
+  // which holds because a batch as a whole barely moves even while its instances do.
+  XXH64_hash_t D3D9Rtx::resolveUe3InstancedBatchKey(const RasterGeometry& geoData,
+                                                    const std::vector<Ue3DecomposedInstance>& instances) {
+    if (instances.empty()) {
+      return kEmptyHash;
+    }
+
+    struct MeshKey {
+      const void* pVertexDecl;
+      const void* pVertexBuffer0;
+      const void* pIndexBuffer;
+      uint32_t vertexCount;
+      uint32_t indexCount;
+    };
+    const MeshKey meshKey = {
+      d3d9State().vertexDecl.ptr(),
+      d3d9State().vertexBuffers[0].vertexBuffer.ptr(),
+      d3d9State().indices.ptr(),
+      geoData.vertexCount,
+      geoData.indexCount,
+    };
+    const XXH64_hash_t meshHash = XXH3_64bits(&meshKey, sizeof(meshKey));
+
+    Vector3 centroid(0.f, 0.f, 0.f);
+    for (const Ue3DecomposedInstance& instance : instances) {
+      centroid += Vector3(instance.instanceToObject[3].x,
+                          instance.instanceToObject[3].y,
+                          instance.instanceToObject[3].z);
+    }
+    centroid *= 1.0f / float(instances.size());
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    std::vector<Ue3InstancedBatchRecord>& records = m_ue3InstancedBatches[meshHash];
+
+    // Retire batches that have not been drawn for a while so a level change cannot leave a stale
+    // record that a new batch of the same mesh would latch onto.
+    constexpr uint32_t kRetireAfterFrames = 120;
+    records.erase(
+      std::remove_if(records.begin(), records.end(),
+                     [&](const Ue3InstancedBatchRecord& record) {
+                       return currentFrame - record.lastFrame > kRetireAfterFrames;
+                     }),
+      records.end());
+
+    // A whole batch travelling this far in one frame is a different batch, not the same one moved.
+    constexpr float kMaxCentroidDriftSqr = 1000.f * 1000.f;
+    Ue3InstancedBatchRecord* nearest = nullptr;
+    float nearestDistSqr = kMaxCentroidDriftSqr;
+    for (Ue3InstancedBatchRecord& record : records) {
+      if (record.claimedFrame == currentFrame) {
+        continue; // another draw already matched this batch this frame
+      }
+      const Vector3 delta = record.centroid - centroid;
+      const float distSqr = dot(delta, delta);
+      if (distSqr < nearestDistSqr) {
+        nearestDistSqr = distSqr;
+        nearest = &record;
+      }
+    }
+
+    if (nearest == nullptr) {
+      Ue3InstancedBatchRecord record;
+      record.id = XXH3_64bits_withSeed(&m_ue3NextInstancedBatchId, sizeof(m_ue3NextInstancedBatchId), meshHash);
+      ++m_ue3NextInstancedBatchId;
+      records.push_back(record);
+      nearest = &records.back();
+    }
+
+    nearest->centroid = centroid;
+    nearest->lastFrame = currentFrame;
+    nearest->claimedFrame = currentFrame;
+    return nearest->id;
+  }
+
+  void D3D9Rtx::trackUe3InstanceOrderStability(const XXH64_hash_t batchKey,
+                                               const std::vector<Ue3DecomposedInstance>& instances) {
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+
+    // One entry per batch identity, each holding a translation per instance. Batch identities are
+    // minted afresh across a level change, so drop the lot rather than grow without bound.
+    constexpr size_t kMaxProbes = 64;
+    if (m_ue3InstanceOrderProbes.size() > kMaxProbes) {
+      m_ue3InstanceOrderProbes.clear();
+    }
+
+    Ue3InstanceOrderProbe& probe = m_ue3InstanceOrderProbes[batchKey];
+    const bool consecutiveFrames = probe.lastFrame != 0 && probe.lastFrame + 1 == currentFrame;
+
+    if (consecutiveFrames) {
+      if (probe.translations.size() != instances.size()) {
+        // A length change shifts every index past the first added or removed instance, so this
+        // batch cannot be index-paired at all this frame.
+        ++m_ue3InstancedStatOrderSizeChanges;
+      } else {
+        ++m_ue3InstancedStatOrderComparableBatches;
+        const float stableThreshold = RtxOptions::uniqueObjectDistance();
+        for (size_t i = 0; i < instances.size(); i++) {
+          const Matrix4& m = instances[i].instanceToObject;
+          const Vector3 current(m[3].x, m[3].y, m[3].z);
+          const Vector3 delta = current - probe.translations[i];
+          const float displacement = std::sqrt(dot(delta, delta));
+          ++m_ue3InstancedStatOrderPairs;
+          m_ue3InstancedStatOrderDisplacementSum += double(displacement);
+          m_ue3InstancedStatOrderDisplacementMax =
+            std::max(m_ue3InstancedStatOrderDisplacementMax, displacement);
+          if (displacement <= stableThreshold) {
+            ++m_ue3InstancedStatOrderStablePairs;
+          }
+        }
+      }
+    }
+
+    probe.lastFrame = currentFrame;
+    probe.translations.resize(instances.size());
+    for (size_t i = 0; i < instances.size(); i++) {
+      const Matrix4& m = instances[i].instanceToObject;
+      probe.translations[i] = Vector3(m[3].x, m[3].y, m[3].z);
+    }
+  }
+
+  void D3D9Rtx::reportUe3InstancedDrawStats() {
+    if (!m_frameOptions.ue3LogInstancedDrawStats) {
+      return;
+    }
+
+    ++m_ue3InstancedStatFrames;
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+
+    // roughly once a second at any plausible frame rate; this is a diagnostic, not a metric
+    constexpr uint32_t kStatIntervalFrames = 60;
+    if (currentFrame - m_ue3InstancedStatFrameStamp < kStatIntervalFrames) {
+      return;
+    }
+    m_ue3InstancedStatFrameStamp = currentFrame;
+
+    const uint32_t frames = std::max(m_ue3InstancedStatFrames, 1u);
+    const double perFrame = 1.0 / double(frames);
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Instanced] per frame over ", frames, " frames: ",
+      double(m_ue3InstancedStatDraws) * perFrame, " instanced draws, ",
+      double(m_ue3InstancedStatInstancesSeen) * perFrame, " hardware instances, ",
+      double(m_ue3InstancedStatInstancesSubmitted) * perFrame, " submitted, ",
+      double(m_ue3InstancedStatCulledDistance) * perFrame, " distance-culled, ",
+      double(m_ue3InstancedStatCulledBudget) * perFrame, " budget-culled; ",
+      double(m_ue3InstancedStatSubmitNs) * perFrame / 1.0e6, " ms/frame expanding them on the "
+      "submitting thread (the rest of an instance's cost lands on the consumer thread and the GPU)."));
+
+    // ue3StableDecomposedInstanceIdentity rests on the game keeping its instance order, so report how
+    // far index-paired instances actually moved rather than taking that on trust.
+    if (m_ue3InstancedStatOrderPairs > 0 || m_ue3InstancedStatOrderSizeChanges > 0) {
+      const double meanDisplacement = m_ue3InstancedStatOrderPairs > 0
+        ? m_ue3InstancedStatOrderDisplacementSum / double(m_ue3InstancedStatOrderPairs)
+        : 0.0;
+      const uint32_t stablePercent = m_ue3InstancedStatOrderPairs > 0
+        ? uint32_t((m_ue3InstancedStatOrderStablePairs * 100ull) / m_ue3InstancedStatOrderPairs)
+        : 0u;
+
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Instanced] instance order: ",
+        m_ue3InstancedStatOrderComparableBatches, " batch comparisons over ", frames, " frames (",
+        m_ue3InstancedStatOrderSizeChanges, " skipped on an instance count change), ",
+        m_ue3InstancedStatOrderPairs, " index-paired instances, mean displacement ",
+        meanDisplacement, " units, max ", m_ue3InstancedStatOrderDisplacementMax, ", ",
+        stablePercent, "% within rtx.uniqueObjectDistance. A mean on the scale of the batch's own "
+        "extent means the game reorders its instance buffer and index pairing is meaningless."));
+    }
+
+    m_ue3InstancedStatFrames = 0;
+    m_ue3InstancedStatDraws = 0;
+    m_ue3InstancedStatInstancesSeen = 0;
+    m_ue3InstancedStatInstancesSubmitted = 0;
+    m_ue3InstancedStatCulledDistance = 0;
+    m_ue3InstancedStatCulledBudget = 0;
+    m_ue3InstancedStatSubmitNs = 0;
+    m_ue3InstancedStatOrderPairs = 0;
+    m_ue3InstancedStatOrderStablePairs = 0;
+    m_ue3InstancedStatOrderSizeChanges = 0;
+    m_ue3InstancedStatOrderComparableBatches = 0;
+    m_ue3InstancedStatOrderDisplacementSum = 0.0;
+    m_ue3InstancedStatOrderDisplacementMax = 0.f;
   }
 
   bool D3D9Rtx::ue3ViewportAspectMatchesBackbuffer(
@@ -4759,7 +5183,8 @@ namespace dxvk {
         m_currentUe3VertexFactory == Ue3VertexFactoryType::Terrain ||
         m_currentUe3VertexFactory == Ue3VertexFactoryType::TerrainMorph ||
         m_currentUe3VertexFactory == Ue3VertexFactoryType::SpeedTree ||
-        m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage) {
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleInstancedMesh) {
       return Ue3PassType::Material;
     }
 
@@ -4778,6 +5203,7 @@ namespace dxvk {
     case Ue3VertexFactoryType::ParticleBeamTrail: return "ParticleBeamTrail";
     case Ue3VertexFactoryType::SpeedTree: return "SpeedTree";
     case Ue3VertexFactoryType::Foliage: return "Foliage";
+    case Ue3VertexFactoryType::ParticleInstancedMesh: return "ParticleInstancedMesh";
     case Ue3VertexFactoryType::LocalDecal: return "LocalDecal";
     case Ue3VertexFactoryType::LensFlare: return "LensFlare";
     case Ue3VertexFactoryType::PositionOnly: return "PositionOnly";
@@ -5266,6 +5692,11 @@ namespace dxvk {
     o.ue3RequireExactVertexCapture = ue3RequireExactVertexCaptureObject().get();
     o.ue3VertexCaptureSourceOverride = ue3VertexCaptureSourceOverrideObject().get();
     o.ue3NativeLocalMeshVertexCapture = ue3NativeLocalMeshVertexCaptureObject().get();
+    o.ue3DecomposeInstancedDraws = ue3DecomposeInstancedDrawsObject().get();
+    o.ue3MaxDecomposedInstances = ue3MaxDecomposedInstancesObject().get();
+    o.ue3DecomposedInstanceCullDistance = ue3DecomposedInstanceCullDistanceObject().get();
+    o.ue3StableDecomposedInstanceIdentity = ue3StableDecomposedInstanceIdentityObject().get();
+    o.ue3LogInstancedDrawStats = ue3LogInstancedDrawStatsObject().get();
     o.ue3RequireCtabCameraConstants = ue3RequireCtabCameraConstantsObject().get();
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
     o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
@@ -5275,6 +5706,7 @@ namespace dxvk {
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
     o.ue3LogAlbedoSelection = ue3LogAlbedoSelectionObject().get();
     o.ue3LogCapturePrecision = ue3LogCapturePrecisionObject().get();
+    o.ue3LogInstancedDraws = ue3LogInstancedDrawsObject().get();
     o.ue3LogDrawStatusFlaps = ue3LogDrawStatusFlapsObject().get();
     o.ue3LogOcclusionQueries = ue3LogOcclusionQueriesObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
@@ -5312,6 +5744,7 @@ namespace dxvk {
     o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
     o.ue3MicConstantIdentityExcludedGroups = &ue3MicConstantIdentityExcludedGroupsObject().get();
     o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
+    o.ue3TraceDrawTextureHashes = &ue3TraceDrawTextureHashesObject().get();
     o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
 
     o.valid = true;
@@ -5384,6 +5817,19 @@ namespace dxvk {
       }
       return source;
     };
+
+    // Vertex capture cannot describe a hardware-instanced draw at all: its output buffer is
+    // indexed by vertex, so every instance writes the same slots and the survivors are an
+    // arbitrary mix of placements. The input assembler holds one object-space copy of the mesh,
+    // which is the only self-consistent answer, and the placements come from the instance stream
+    // instead (see readUe3InstanceTransforms). Overrides are deliberately not honoured here.
+    if (m_currentUe3Instancing.instanceCount > 1) {
+      const char* instancedReason = "";
+      if (canUseUe3InstancedMeshVertexPositions(geoData, &instancedReason)) {
+        return pick(Ue3CapturePositionSource::InputAssembler, "hardware-instanced draw");
+      }
+      return pick(Ue3CapturePositionSource::ClipReconstruction, instancedReason);
+    }
 
     switch (m_frameOptions.ue3VertexCaptureSourceOverride) {
     case Ue3CapturePositionSourceOverride::ForcePreProjection:
@@ -5526,6 +5972,11 @@ namespace dxvk {
     if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
       return false;
     }
+    // Instanced draws never capture in the first place; caching one would only pin a buffer that
+    // is never consulted again.
+    if (m_currentUe3Instancing.instanceCount > 1) {
+      return false;
+    }
     if (!m_currentUe3CtabInfo.has_value()) {
       return false;
     }
@@ -5598,6 +6049,12 @@ namespace dxvk {
         return false;
       }
 
+      // Instance-data streams are dynamic by nature and contribute nothing to the geometry the
+      // memo describes; computeUe3IaGeometryMemoKey leaves them out of the key for the same reason.
+      if ((m_currentUe3Instancing.instanceDataStreamMask & (1u << element.Stream)) != 0) {
+        continue;
+      }
+
       const VertexContext& ctx = vertexContext[element.Stream];
       if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticD3D9Buffer(ctx.pVBO)) {
         return false;
@@ -5640,10 +6097,15 @@ namespace dxvk {
       return record;
     }
 
+    // excludeStreamMask drops streams whose contents are not part of the identity being keyed.
+    // Instance-data streams are the case that matters: they are reallocated and rewritten every
+    // frame, so including them would mint a key that can never repeat, while none of their
+    // contents reaches the geometry the key describes.
     template<typename ElementsT, typename VertexContextT>
     XXH64_hash_t hashUe3KeyStreamRecords(const ElementsT& elements,
                                          const VertexContextT* vertexContext,
-                                         XXH64_hash_t seed) {
+                                         XXH64_hash_t seed,
+                                         const uint32_t excludeStreamMask = 0) {
       // decl layout itself (semantics, formats, offsets, stream assignment)
       XXH64_hash_t hash = XXH3_64bits_withSeed(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9), seed);
 
@@ -5653,6 +6115,9 @@ namespace dxvk {
       for (const auto& element : elements) {
         // stream bounds are pre-validated by the canUse/canMemoize eligibility gates
         assert(element.Stream < caps::MaxStreams);
+        if ((excludeStreamMask & (1u << element.Stream)) != 0) {
+          continue;
+        }
         records[recordCount++] = makeUe3KeyStreamRecord(vertexContext[element.Stream]);
         if (recordCount == records.size()) {
           hash = XXH3_64bits_withSeed(records.data(), recordCount * sizeof(Ue3KeyStreamRecord), hash);
@@ -5739,7 +6204,8 @@ namespace dxvk {
         uint32_t(m_uvResolutionMode), m_forceIaTexcoordForOutlier);
 
     const XXH64_hash_t headerHash = XXH3_64bits_withSeed(&header, sizeof(header), kSeed);
-    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash);
+    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash,
+                                   m_currentUe3Instancing.instanceDataStreamMask);
   }
 
   namespace {
@@ -5779,7 +6245,8 @@ namespace dxvk {
     header.objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
 
     const XXH64_hash_t headerHash = XXH3_64bits_withSeed(&header, sizeof(header), kSeed);
-    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash);
+    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash,
+                                   m_currentUe3Instancing.instanceDataStreamMask);
   }
 
   // Second-choice exact source, for shaders whose oPos transform was not recognised. Only
@@ -5854,6 +6321,49 @@ namespace dxvk {
       }
     }
 
+    return true;
+  }
+
+  // An instanced mesh factory's world position is GetInstanceToWorld(Input) * Input.Position
+  // (FoliageVertexFactory.usf, shared by FFoliageVertexFactory and
+  // FParticleInstancedMeshVertexFactory), so the declaration's POSITION is object space by
+  // construction - there is no shader constant involved and nothing to prove about the transform.
+  // That makes the conservatism canUseUe3NativeLocalVertexCapture applies to Local draws, where
+  // reading the input assembler is a guess about what the shader does, unnecessary here.
+  bool D3D9Rtx::canUseUe3InstancedMeshVertexPositions(const RasterGeometry& geoData,
+                                                     const char** outReason) const {
+    auto fail = [&](const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
+      return false;
+    };
+
+    if (!m_frameOptions.ue3EngineMode) {
+      return fail("UE3 engine mode disabled");
+    }
+    if (!m_currentUe3Instancing.hasInstanceTransform) {
+      return fail("no per-instance transform basis in the declaration");
+    }
+    if (m_currentUe3VertexFactory != Ue3VertexFactoryType::Foliage &&
+        m_currentUe3VertexFactory != Ue3VertexFactoryType::ParticleInstancedMesh) {
+      return fail("not a recognised instanced mesh vertex factory");
+    }
+    // Object-space positions are only meaningful alongside the transforms that place them.
+    if (m_ue3InstanceTransformReadFailure != nullptr) {
+      return fail(m_ue3InstanceTransformReadFailure);
+    }
+    if (!geoData.positionBuffer.defined()) {
+      return fail("no input-assembler position buffer");
+    }
+    // Skinning would move the vertices after the input assembler; instanced factories never skin.
+    if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
+      return fail("draw carries skinning data");
+    }
+
+    if (outReason != nullptr) {
+      *outReason = "";
+    }
     return true;
   }
 
@@ -7168,12 +7678,24 @@ namespace dxvk {
     ScopedCpuProfileZoneN("Process Vertices");
     DxvkBufferSlice streamCopies[caps::MaxStreams] {};
 
+    // FParticleInstancedMeshVertexFactory hands the mesh's TangentZ to the BINORMAL semantic
+    // rather than NORMAL (see classifyUe3VertexFactory), so this is the one factory whose surface
+    // normal has to be read from there.
+    const bool normalFromBinormal =
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleInstancedMesh;
+
     // Process vertex buffers from CPU
     for (const auto& element : d3d9State().vertexDecl->GetElements()) {
       // Get vertex context
       const VertexContext& ctx = vertexContext[element.Stream];
 
       if (ctx.mappedSlice.handle == VK_NULL_HANDLE)
+        continue;
+
+      // An instance-data stream advances once per instance, so indexing it by vertex reads an
+      // unrelated instance's record (and walks off the end of a short instance buffer).
+      if (element.Stream < caps::MaxStreams &&
+          (m_currentUe3Instancing.instanceDataStreamMask & (1u << element.Stream)) != 0)
         continue;
 
       const int32_t vertexOffset = ctx.offset + ctx.stride * vertexIndexOffset;
@@ -7203,12 +7725,16 @@ namespace dxvk {
           targetBuffer = &geoData.blendIndicesBuffer;
         break;
       case D3DDECLUSAGE_NORMAL:
-        if (element.UsageIndex == 0)
+        if (element.UsageIndex == 0 && !normalFromBinormal)
+          targetBuffer = &geoData.normalBuffer;
+        break;
+      case D3DDECLUSAGE_BINORMAL:
+        if (element.UsageIndex == 0 && normalFromBinormal)
           targetBuffer = &geoData.normalBuffer;
         break;
       case D3DDECLUSAGE_TEXCOORD:
         // A D3DCOLOR-typed TEXCOORD under UE3 is a vertex lightmap coefficient stream, never a
-        // coordinate (see resolveIaTexcoordAvoidingVertexLightmaps).
+        // coordinate (see resolveIaTexcoordAvoidingNonUvElements).
         if (m_iaTexcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_iaTexcoordIndex &&
             !(m_frameOptions.ue3EngineMode && element.Type == D3DDECLTYPE_D3DCOLOR))
           targetBuffer = &geoData.texcoordBuffer;
@@ -7267,7 +7793,7 @@ namespace dxvk {
 
         // UE3 packed normals use D3DDECLTYPE_UBYTE4 (not normalised) so for remix purposes we want a decoded
         // [-1, 1] normal and the interleaver supports VK_FORMAT_R8G8B8A8_UNORM for this
-        if (element.Usage == D3DDECLUSAGE_NORMAL && fmt == VK_FORMAT_R8G8B8A8_USCALED) {
+        if (targetBuffer == &geoData.normalBuffer && fmt == VK_FORMAT_R8G8B8A8_USCALED) {
           fmt = VK_FORMAT_R8G8B8A8_UNORM;
         }
         *targetBuffer = RasterBuffer(streamCopies[element.Stream], elementOffset, ctx.stride, fmt);
@@ -9561,6 +10087,304 @@ namespace dxvk {
       constantAlbedoLog));
   }
 
+  namespace {
+    const char* ue3DeclUsageName(const BYTE usage) {
+      switch (usage) {
+      case D3DDECLUSAGE_POSITION:     return "POSITION";
+      case D3DDECLUSAGE_BLENDWEIGHT:  return "BLENDWEIGHT";
+      case D3DDECLUSAGE_BLENDINDICES: return "BLENDINDICES";
+      case D3DDECLUSAGE_NORMAL:       return "NORMAL";
+      case D3DDECLUSAGE_PSIZE:        return "PSIZE";
+      case D3DDECLUSAGE_TEXCOORD:     return "TEXCOORD";
+      case D3DDECLUSAGE_TANGENT:      return "TANGENT";
+      case D3DDECLUSAGE_BINORMAL:     return "BINORMAL";
+      case D3DDECLUSAGE_TESSFACTOR:   return "TESSFACTOR";
+      case D3DDECLUSAGE_POSITIONT:    return "POSITIONT";
+      case D3DDECLUSAGE_COLOR:        return "COLOR";
+      case D3DDECLUSAGE_FOG:          return "FOG";
+      case D3DDECLUSAGE_DEPTH:        return "DEPTH";
+      case D3DDECLUSAGE_SAMPLE:       return "SAMPLE";
+      default:                        return "?";
+      }
+    }
+
+    const char* ue3DeclTypeName(const BYTE type) {
+      switch (type) {
+      case D3DDECLTYPE_FLOAT1:    return "FLOAT1";
+      case D3DDECLTYPE_FLOAT2:    return "FLOAT2";
+      case D3DDECLTYPE_FLOAT3:    return "FLOAT3";
+      case D3DDECLTYPE_FLOAT4:    return "FLOAT4";
+      case D3DDECLTYPE_D3DCOLOR:  return "D3DCOLOR";
+      case D3DDECLTYPE_UBYTE4:    return "UBYTE4";
+      case D3DDECLTYPE_SHORT2:    return "SHORT2";
+      case D3DDECLTYPE_SHORT4:    return "SHORT4";
+      case D3DDECLTYPE_UBYTE4N:   return "UBYTE4N";
+      case D3DDECLTYPE_SHORT2N:   return "SHORT2N";
+      case D3DDECLTYPE_SHORT4N:   return "SHORT4N";
+      case D3DDECLTYPE_USHORT2N:  return "USHORT2N";
+      case D3DDECLTYPE_USHORT4N:  return "USHORT4N";
+      case D3DDECLTYPE_UDEC3:     return "UDEC3";
+      case D3DDECLTYPE_DEC3N:     return "DEC3N";
+      case D3DDECLTYPE_FLOAT16_2: return "FLOAT16_2";
+      case D3DDECLTYPE_FLOAT16_4: return "FLOAT16_4";
+      case D3DDECLTYPE_UNUSED:    return "UNUSED";
+      default:                    return "?";
+      }
+    }
+
+    std::string formatMatrixRows(const Matrix4& m) {
+      std::string out;
+      for (uint32_t row = 0; row < 4; row++) {
+        out += str::format(row == 0 ? "[" : " [",
+                           m[row].x, ",", m[row].y, ",", m[row].z, ",", m[row].w, "]");
+      }
+      return out;
+    }
+  }
+
+  // Shader, material and bound-texture hashes for a draw, so a warning about one names something
+  // that can be looked up in the texture picker or fed to rtx.d3d9.ue3TraceDrawTextureHashes.
+  std::string D3D9Rtx::describeUe3DrawIdentity() const {
+    XXH64_hash_t vsHash = kEmptyHash;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+    }
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    std::string textures;
+    for (uint32_t stage = 0; stage < LegacyMaterialData::kMaxSupportedTextures; stage++) {
+      const XXH64_hash_t imageHash = m_activeDrawCallState.materialData.colorTextures[stage].getImageHash();
+      if (imageHash == kEmptyHash) {
+        continue;
+      }
+      textures += str::format(textures.empty() ? "" : " ", "s", stage, ":0x", std::hex, imageHash, std::dec);
+    }
+
+    return str::format(
+      "vs=0x", std::hex, vsHash,
+      " ps=0x", psHash,
+      " materialHash=0x", m_activeDrawCallState.materialData.getHash(), std::dec,
+      " textures=[", textures.empty() ? "none" : textures, "]");
+  }
+
+  std::string D3D9Rtx::describeUe3VertexDeclaration() const {
+    if (d3d9State().vertexDecl == nullptr) {
+      return "none";
+    }
+
+    std::string out;
+    for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+      out += str::format(out.empty() ? "" : " | ",
+                         "s", uint32_t(element.Stream), ":",
+                         ue3DeclUsageName(element.Usage), uint32_t(element.UsageIndex),
+                         " ", ue3DeclTypeName(element.Type),
+                         " @", uint32_t(element.Offset));
+    }
+    return out.empty() ? "empty" : out;
+  }
+
+  std::string D3D9Rtx::describeUe3DrawInstancing(const VertexContext vertexContext[caps::MaxStreams]) const {
+    const Ue3InstancingInfo& info = m_currentUe3Instancing;
+
+    std::string streams;
+    for (uint32_t s = 0; s < caps::MaxStreams; s++) {
+      const VertexContext& ctx = vertexContext[s];
+      if (ctx.mappedSlice.mapPtr == nullptr && d3d9State().streamFreq[s] == 1) {
+        continue;
+      }
+      const bool dynamic =
+        ctx.pVBO != nullptr && ctx.pVBO->Desc() != nullptr &&
+        (ctx.pVBO->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
+      streams += str::format(streams.empty() ? "" : " | ",
+                             "s", s,
+                             " freq=0x", std::hex, uint32_t(d3d9State().streamFreq[s]), std::dec,
+                             " stride=", ctx.stride,
+                             " dynamic=", dynamic ? 1 : 0);
+    }
+
+    std::string transform = "none";
+    if (info.hasInstanceTransform) {
+      transform = str::format("stream=", info.transformStream,
+                              " offset@", info.offsetByteOffset,
+                              " axes@", info.axisByteOffsets[0],
+                              "/", info.axisByteOffsets[1],
+                              "/", info.axisByteOffsets[2]);
+    }
+
+    return str::format("instances=", info.instanceCount,
+                       " instanceDataStreams=0x", std::hex, info.instanceDataStreamMask, std::dec,
+                       " instanceTransform=[", transform, "]",
+                       " decomposed=", uint32_t(m_ue3DecomposedInstances.size()),
+                       " streams=[", streams.empty() ? "none" : streams, "]");
+  }
+
+  void D3D9Rtx::logUe3InstancedDrawOnce(const DrawContext& drawContext,
+                                        const VertexContext vertexContext[caps::MaxStreams],
+                                        const RasterGeometry& geoData) {
+    if (!m_frameOptions.ue3LogInstancedDraws || !m_currentUe3Instancing.isInstanced()) {
+      return;
+    }
+
+    XXH64_hash_t vsHash = kEmptyHash;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+    }
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    // The instance count varies with the particle population, so it is deliberately left out of
+    // the key: one line per (shader, declaration, factory) is the point.
+    struct Key {
+      XXH64_hash_t vsHash;
+      XXH64_hash_t psHash;
+      const void* pVertexDecl;
+      uint32_t vertexFactory;
+      uint32_t passType;
+      uint32_t positionSource;
+      uint32_t hasInstanceTransform;
+    };
+    const Key key = {
+      vsHash,
+      psHash,
+      d3d9State().vertexDecl.ptr(),
+      uint32_t(m_currentUe3VertexFactory),
+      uint32_t(m_currentUe3PassType),
+      uint32_t(m_activeCapturePositionSource),
+      m_currentUe3Instancing.hasInstanceTransform ? 1u : 0u,
+    };
+    if (!m_loggedUe3InstancedDraws.insert(XXH3_64bits(&key, sizeof(key))).second) {
+      return;
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Instanced] vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      " pass=", describeUe3PassType(m_currentUe3PassType),
+      " posSource=", describeUe3CapturePositionSource(m_activeCapturePositionSource),
+      " ", describeUe3DrawInstancing(vertexContext),
+      " prims=", drawContext.PrimitiveCount,
+      " verts=", geoData.vertexCount,
+      " indices=", geoData.indexCount,
+      " ", describeUe3DrawIdentity(),
+      " decl=[", describeUe3VertexDeclaration(), "]"));
+  }
+
+  void D3D9Rtx::logUe3TracedDrawOnce(const DrawContext& drawContext,
+                                     const VertexContext vertexContext[caps::MaxStreams],
+                                     RasterGeometry& geoData) {
+    if (m_frameOptions.ue3TraceDrawTextureHashes == nullptr ||
+        m_frameOptions.ue3TraceDrawTextureHashes->empty()) {
+      return;
+    }
+
+    // Any bound colour texture matching the list arms the dossier, not just the chosen albedo:
+    // the point is to find a draw from a hash read off the texture picker.
+    bool matched = false;
+    for (const auto& texture : m_activeDrawCallState.materialData.colorTextures) {
+      const XXH64_hash_t imageHash = texture.getImageHash();
+      if (imageHash != kEmptyHash && lookupHash(*m_frameOptions.ue3TraceDrawTextureHashes, imageHash)) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return;
+    }
+
+    XXH64_hash_t vsHash = kEmptyHash;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+    }
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+
+    struct Key {
+      XXH64_hash_t vsHash;
+      XXH64_hash_t psHash;
+      XXH64_hash_t materialHash;
+      const void* pVertexDecl;
+      uint32_t vertexFactory;
+      uint32_t passType;
+      uint32_t positionSource;
+      uint32_t reserved;
+    };
+    const Key key = {
+      vsHash,
+      psHash,
+      materialHash,
+      d3d9State().vertexDecl.ptr(),
+      uint32_t(m_currentUe3VertexFactory),
+      uint32_t(m_currentUe3PassType),
+      uint32_t(m_activeCapturePositionSource),
+      0u,
+    };
+    if (!m_loggedUe3TracedDraws.insert(XXH3_64bits(&key, sizeof(key))).second) {
+      return;
+    }
+
+    // Geometry hashing normally completes on a worker and is collected on the CS thread. Sync it
+    // here so the dossier can report the value replacements anchor on; finalizeGeometryHashes
+    // accepts an already-resolved RasterGeometry, so consuming the future is safe.
+    if (geoData.futureGeometryHashes.valid()) {
+      geoData.hashes = geoData.futureGeometryHashes.get();
+    }
+    const XXH64_hash_t assetGeometryHash = geoData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    const XXH64_hash_t fullGeometryHash = geoData.getHashForRule<rules::FullGeometryHash>();
+
+    std::string textures;
+    for (uint32_t stage = 0; stage < LegacyMaterialData::kMaxSupportedTextures; stage++) {
+      const XXH64_hash_t imageHash = m_activeDrawCallState.materialData.colorTextures[stage].getImageHash();
+      if (imageHash == kEmptyHash) {
+        continue;
+      }
+      textures += str::format(textures.empty() ? "" : " ", "s", stage, ":0x", std::hex, imageHash, std::dec);
+    }
+
+    std::string instanceTransforms;
+    {
+      constexpr size_t kMaxLoggedTransforms = 4;
+      const size_t count = std::min(kMaxLoggedTransforms, m_ue3DecomposedInstances.size());
+      for (size_t i = 0; i < count; i++) {
+        const Ue3DecomposedInstance& instance = m_ue3DecomposedInstances[i];
+        instanceTransforms += str::format("\n    instance[", instance.sourceIndex, "]=",
+                                          formatMatrixRows(instance.instanceToObject));
+      }
+      if (m_ue3DecomposedInstances.size() > count) {
+        instanceTransforms += str::format("\n    ... ",
+                                          uint32_t(m_ue3DecomposedInstances.size() - count),
+                                          " more");
+      }
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-DrawTrace] vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      " pass=", describeUe3PassType(m_currentUe3PassType),
+      " posSource=", describeUe3CapturePositionSource(m_activeCapturePositionSource),
+      " vs=0x", std::hex, vsHash,
+      " ps=0x", psHash,
+      " materialHash=0x", materialHash,
+      " assetGeometryHash=0x", assetGeometryHash,
+      " fullGeometryHash=0x", fullGeometryHash, std::dec,
+      "\n    prims=", drawContext.PrimitiveCount,
+      " verts=", geoData.vertexCount,
+      " indices=", geoData.indexCount,
+      " topology=", uint32_t(geoData.topology),
+      " cull=", uint32_t(geoData.cullMode),
+      " textures=[", textures.empty() ? "none" : textures, "]",
+      "\n    ", describeUe3DrawInstancing(vertexContext),
+      "\n    decl=[", describeUe3VertexDeclaration(), "]",
+      "\n    objectToWorld=", formatMatrixRows(m_activeDrawCallState.transformData.objectToWorld),
+      instanceTransforms));
+  }
+
   bool D3D9Rtx::isUe3RenderTargetRefusedAsAlbedo(D3D9CommonTexture* texture,
                                                  const uint32_t stage,
                                                  const PsSamplerTexcoordEntry* inferredEntry) const {
@@ -9649,6 +10473,26 @@ namespace dxvk {
         m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
         m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
       }
+    }
+
+    // Hardware instancing state is needed before the capture source is resolved: a per-vertex
+    // capture buffer cannot represent a draw that runs its vertices once per instance. Kept behind
+    // ue3EngineMode with the rest of the UE3 behaviour - recovering placements from a stream relies
+    // on knowing the engine's instance layout, and without that there is nothing better to do with
+    // an instanced draw than what Remix already did.
+    // Leaving this at its default (no instancing seen) is what makes ue3DecomposeInstancedDraws a
+    // true bypass: every decision downstream keys off instanceCount, so with the option off an
+    // instanced draw is handled exactly as it was before decomposition existed.
+    m_currentUe3Instancing = Ue3InstancingInfo();
+    m_ue3DecomposedInstances.clear();
+    m_ue3DecomposedBatchKey = kEmptyHash;
+    // m_activeDrawCallState is reused across draws, so a previous draw's per-instance identity must
+    // not leak into an ordinary one and detach it from the transform its identity depends on.
+    m_activeDrawCallState.decomposedInstanceId = kEmptyHash;
+    if (m_frameOptions.ue3EngineMode && m_frameOptions.ue3DecomposeInstancedDraws &&
+        d3d9State().vertexDecl != nullptr) {
+      m_currentUe3Instancing = resolveUe3Instancing(
+        d3d9State().vertexDecl->GetElements(), d3d9State().streamFreq, m_parent->GetInstanceCount());
     }
 
     const auto [status, triggerRtxInjection, deferUntilInjection] = makeDrawCallType(drawContext);
@@ -9777,6 +10621,51 @@ namespace dxvk {
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
 
+    // Recover the placements UE3 hid in the instance-data stream. Done before the capture source is
+    // resolved so that path can prefer input-assembler positions once the placements are in hand:
+    // object-space positions are only usable if there is a transform to place them with.
+    m_ue3InstanceTransformReadFailure = nullptr;
+    if (m_currentUe3Instancing.instanceCount > 1) {
+      const char* readReason = "";
+      if (readUe3InstanceTransforms(vertexContext, m_ue3DecomposedInstances, &readReason)) {
+        const size_t instancesRead = m_ue3DecomposedInstances.size();
+
+        // Both of these read the batch as the game wrote it, before any culling: the batch key's
+        // centroid has to stay view-independent, and the order probe measures the game's order.
+        m_ue3DecomposedBatchKey = resolveUe3InstancedBatchKey(geoData, m_ue3DecomposedInstances);
+        if (m_frameOptions.ue3LogInstancedDrawStats) {
+          trackUe3InstanceOrderStability(m_ue3DecomposedBatchKey, m_ue3DecomposedInstances);
+        }
+
+        uint32_t culledByDistance = 0;
+        uint32_t culledByBudget = 0;
+        cullAndClampUe3InstanceTransforms(m_ue3DecomposedInstances, culledByDistance, culledByBudget);
+
+        if (culledByBudget > 0) {
+          ONCE(Logger::warn(str::format(
+            "[RTX-Compatibility] UE3 instanced draw expands to ", instancesRead,
+            " instances, above rtx.d3d9.ue3MaxDecomposedInstances (",
+            std::max(m_frameOptions.ue3MaxDecomposedInstances, 1u), "); keeping a fixed ",
+            m_ue3DecomposedInstances.size(), " of them and dropping ", culledByBudget,
+            ". The kept subset is deliberately the same every frame - a view-dependent one flickers. ",
+            describeUe3DrawIdentity(),
+            " verts=", geoData.vertexCount, " prims=", drawContext.PrimitiveCount)));
+        }
+
+        if (m_frameOptions.ue3LogInstancedDrawStats) {
+          ++m_ue3InstancedStatDraws;
+          m_ue3InstancedStatInstancesSeen += instancesRead;
+          m_ue3InstancedStatInstancesSubmitted += m_ue3DecomposedInstances.size();
+          m_ue3InstancedStatCulledDistance += culledByDistance;
+          m_ue3InstancedStatCulledBudget += culledByBudget;
+        }
+      } else {
+        // Without placements, input-assembler positions would put the mesh at the world origin, so
+        // the draw is refused below rather than rendered somewhere it does not belong.
+        m_ue3InstanceTransformReadFailure = readReason;
+      }
+    }
+
     // UE3 vertex shader skinned (GPUSkin) draws share one bind-pose vertex buffer and bounding box
     // across every instance of a skeletal mesh, so the BLAS cache cannot tell simultaneous instances
     // apart on geometry alone. The first bone's translation separates them, and its bone hash gives
@@ -9835,6 +10724,24 @@ namespace dxvk {
           !isUe3ExactCapturePositionSource(m_activeCapturePositionSource)) {
         m_ue3LastDrawDecision = "no exact vertex capture position source";
         ONCE(Logger::info("[RTX-Compatibility-Info] Ignoring draw without an exact vertex capture position source (rtx.d3d9.ue3RequireExactVertexCapture)."));
+        return finishPrepare(prepareFlagsForIgnoredDraws);
+      }
+
+      // An instanced draw that did not land on input-assembler positions has no correct answer
+      // left: capture would have every hardware instance overwrite one another's slots, producing
+      // a cloud of triangles built from mixed placements that changes every time it is captured.
+      // Dropping the draw is the honest outcome.
+      if (m_currentUe3Instancing.instanceCount > 1 &&
+          m_activeCapturePositionSource != Ue3CapturePositionSource::InputAssembler) {
+        m_ue3LastDrawDecision = "hardware-instanced draw without input-assembler positions";
+        ONCE(Logger::warn(str::format(
+          "[RTX-Compatibility] Ignoring hardware-instanced draw: its positions would have to come from "
+          "vertex capture, which is indexed per vertex and so cannot separate instances (vf=",
+          describeUe3VertexFactory(m_currentUe3VertexFactory),
+          ", reason='", positionSourceReason, "') ",
+          describeUe3DrawIdentity(), " ",
+          describeUe3DrawInstancing(vertexContext),
+          " decl=[", describeUe3VertexDeclaration(), "]")));
         return finishPrepare(prepareFlagsForIgnoredDraws);
       }
     }
@@ -9948,11 +10855,17 @@ namespace dxvk {
       }
     }
 
+    // Every captured member is written at data[vertexId - baseVertex], so a draw whose vertices run
+    // once per hardware instance has all of its instances aliasing one another. The declaration
+    // already supplied this draw's positions, normals and UVs in object space.
+    const bool instancedDrawSuppressesCapture = m_currentUe3Instancing.instanceCount > 1;
+
     // For shader based drawcalls we also want to capture the vertex shader output
     bool needVertexCapture =
       m_parent->UseProgrammableVS() &&
       m_frameOptions.useVertexCapture &&
-      !reusedCachedVertexCapture;
+      !reusedCachedVertexCapture &&
+      !instancedDrawSuppressesCapture;
     if (needVertexCapture) {
       needVertexCapture = prepareVertexCapture(vertexIndexOffset, m_activeCapturePositionSource);
     }
@@ -9995,6 +10908,9 @@ namespace dxvk {
 
     assert(status == RtxGeometryStatus::RayTraced);
 
+    logUe3InstancedDrawOnce(drawContext, vertexContext, geoData);
+    logUe3TracedDrawOnce(drawContext, vertexContext, geoData);
+
     const bool preserveOriginalDraw = needVertexCapture;
 
     return finishPrepare(
@@ -10028,6 +10944,25 @@ namespace dxvk {
       params.vertexCount = drawInfo.vertexCount;
     }
 
+    if (!m_ue3DecomposedInstances.empty()) {
+      // UE3 only instances through programmable vertex shaders, for which processSkinning returns
+      // nothing. Were skinning data pending, duplicating the draw state would hand several copies
+      // the same one-shot task, and finalizeSkinningData would recompute objectToWorld from the
+      // camera and discard the per-instance placement anyway - so leave such a draw undecomposed.
+      if (m_activeDrawCallState.futureSkinningData.valid()) {
+        ONCE(Logger::warn("[RTX-Compatibility] Not decomposing a hardware-instanced draw with pending "
+                          "skinning data; the batch will be placed as a single instance."));
+      } else {
+        // One ray-traced instance per hardware instance, each carrying the placement read out of the
+        // instance stream. The geometry is a single object-space copy of the mesh, so this reproduces
+        // what UE3's non-instanced NxFluid mesh path submits: one draw per particle with
+        // LocalToWorld = FMatrix(XAxis, YAxis, ZAxis, Location).
+        params.instanceCount = 1;
+        submitUe3DecomposedInstanceDrawCallStates(params);
+        return;
+      }
+    }
+
     submitActiveDrawCallState();
 
     m_parent->EmitCs([params, this](DxvkContext* ctx) {
@@ -10037,6 +10972,79 @@ namespace dxvk {
         static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, drawCallState);
       }
     });
+  }
+
+  void D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates(const DrawParameters& params) {
+    ScopedCpuProfileZone();
+
+    const bool timeSubmission = m_frameOptions.ue3LogInstancedDrawStats;
+    const auto submitStart = timeSubmission ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point();
+
+    // Every copy of the draw state shares the pending futures' task pointers, and a task result is
+    // a one-shot: the first consumer disposes it and the rest would wait on a result that is never
+    // set again. Resolve them here so all copies carry finished data. Steady state usually costs
+    // nothing, because the geometry hash memo serves these draws without scheduling a future at all.
+    // (The caller guarantees there is no pending skinning future.)
+    RasterGeometry& geoData = m_activeDrawCallState.geometryData;
+    if (geoData.futureGeometryHashes.valid()) {
+      geoData.hashes = geoData.futureGeometryHashes.get();
+    }
+    if (geoData.futureBoundingBox.valid()) {
+      geoData.boundingBox = geoData.futureBoundingBox.get();
+    }
+
+    const Matrix4 objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
+    const Matrix4 worldToView = m_activeDrawCallState.transformData.worldToView;
+    const size_t instanceCount = m_ue3DecomposedInstances.size();
+
+    const bool stableIdentity =
+      m_frameOptions.ue3StableDecomposedInstanceIdentity && m_ue3DecomposedBatchKey != kEmptyHash;
+
+    for (size_t i = 0; i < instanceCount; i++) {
+      const Ue3DecomposedInstance& instance = m_ue3DecomposedInstances[i];
+
+      DrawCallTransforms& transforms = m_activeDrawCallState.transformData;
+      transforms.objectToWorld = objectToWorld * instance.instanceToObject;
+      transforms.objectToView = worldToView * transforms.objectToWorld;
+      transforms.sanitize();
+
+      if (stableIdentity) {
+        // Keyed on the instance's position in the game's buffer, not in this vector: culling changes
+        // how many instances precede it, and renaming an instance costs it its history.
+        const uint64_t sourceIndex = uint64_t(instance.sourceIndex);
+        XXH64_hash_t instanceId =
+          XXH3_64bits_withSeed(&sourceIndex, sizeof(sourceIndex), m_ue3DecomposedBatchKey);
+        if (instanceId == kEmptyHash) {
+          instanceId = 1; // kEmptyHash means "not a decomposed instance"
+        }
+        m_activeDrawCallState.decomposedInstanceId = instanceId;
+      }
+
+      if (i + 1 < instanceCount) {
+        // push() leaves its argument untouched when the queue is full, so retrying with the same
+        // copy is safe.
+        DrawCallState instanceDrawCallState = m_activeDrawCallState;
+        while (!m_drawCallStateQueue.push(std::move(instanceDrawCallState))) {
+          Sleep(0);
+        }
+      } else {
+        submitActiveDrawCallState();
+      }
+
+      m_parent->EmitCs([params, this](DxvkContext* ctx) {
+        assert(dynamic_cast<RtxContext*>(ctx));
+        DrawCallState drawCallState;
+        if (m_drawCallStateQueue.pop(drawCallState)) {
+          static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, drawCallState);
+        }
+      });
+    }
+
+    if (timeSubmission) {
+      m_ue3InstancedStatSubmitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - submitStart).count());
+    }
   }
 
   void D3D9Rtx::submitActiveDrawCallState() {
@@ -10320,7 +11328,11 @@ namespace dxvk {
       vfType == Ue3VertexFactoryType::Particle ||
       vfType == Ue3VertexFactoryType::ParticleBeamTrail ||
       vfType == Ue3VertexFactoryType::LensFlare;
-    const bool isUe3FoliageVF = vfType == Ue3VertexFactoryType::Foliage;
+    // Instanced mesh particles compile the same FoliageVertexFactory.usf and pack their UVs the
+    // same way, so they follow foliage rather than the camera-facing particle factories.
+    const bool isUe3FoliageVF =
+      vfType == Ue3VertexFactoryType::Foliage ||
+      vfType == Ue3VertexFactoryType::ParticleInstancedMesh;
     const bool isUe3SpeedTreeVF = vfType == Ue3VertexFactoryType::SpeedTree;
     const bool isUe3LocalDecalVF = vfType == Ue3VertexFactoryType::LocalDecal;
     const bool isUe3MorphVF = vfType == Ue3VertexFactoryType::GPUSkinMorph;
@@ -12592,35 +13604,42 @@ namespace dxvk {
     }
 
     m_texcoordIndex = texcoordIdx;
-    m_iaTexcoordIndex = resolveIaTexcoordAvoidingVertexLightmaps(iaTexcoordIdx);
+    m_iaTexcoordIndex = resolveIaTexcoordAvoidingNonUvElements(iaTexcoordIdx);
 
     return true;
   }
 
-  // UE3's vertex lightmap policies append a stream of packed lighting coefficients declared as
-  // TEXCOORD5 (simple) or TEXCOORD5/6/7 (directional), typed D3DCOLOR rather than a float pair.
-  // The element count therefore moves with the DirectionalLightmaps setting, and the data is
-  // baked lighting, not a coordinate. A D3DCOLOR-typed TEXCOORD is never a UV set in UE3, so
-  // that alone identifies them without consulting the vertex shader.
-  uint32_t D3D9Rtx::resolveIaTexcoordAvoidingVertexLightmaps(const uint32_t iaTexcoordIdx) const {
+  // Two kinds of UE3 TEXCOORD element are not coordinates at all:
+  //  - vertex lightmap policies append packed lighting coefficients as TEXCOORD5 (simple) or
+  //    TEXCOORD5/6/7 (directional), typed D3DCOLOR rather than a float pair. The element count
+  //    moves with the DirectionalLightmaps setting, and a D3DCOLOR-typed TEXCOORD is never a UV
+  //    set in UE3, so the type alone identifies them without consulting the vertex shader.
+  //  - instanced vertex factories put the per-instance basis in TEXCOORD1..4 on an instance-data
+  //    stream. Those advance once per instance, so they carry no per-vertex meaning.
+  uint32_t D3D9Rtx::resolveIaTexcoordAvoidingNonUvElements(const uint32_t iaTexcoordIdx) const {
     if (!m_frameOptions.ue3EngineMode || d3d9State().vertexDecl == nullptr)
       return iaTexcoordIdx;
 
-    auto isVertexLightmapElement = [](const D3DVERTEXELEMENT9& element) {
-      return element.Usage == D3DDECLUSAGE_TEXCOORD &&
-             element.Type == D3DDECLTYPE_D3DCOLOR;
+    const uint32_t instanceDataStreamMask = m_currentUe3Instancing.instanceDataStreamMask;
+    auto isNonUvElement = [instanceDataStreamMask](const D3DVERTEXELEMENT9& element) {
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD)
+        return false;
+      if (element.Type == D3DDECLTYPE_D3DCOLOR)
+        return true;
+      return element.Stream < caps::MaxStreams &&
+             (instanceDataStreamMask & (1u << element.Stream)) != 0;
     };
 
     const auto& elements = d3d9State().vertexDecl->GetElements();
-    bool requestedIsLightmap = false;
+    bool requestedIsNonUv = false;
     for (const auto& element : elements) {
       if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == iaTexcoordIdx) {
-        requestedIsLightmap = isVertexLightmapElement(element);
+        requestedIsNonUv = isNonUvElement(element);
         break;
       }
     }
 
-    if (!requestedIsLightmap)
+    if (!requestedIsNonUv)
       return iaTexcoordIdx;
 
     // Fall back to the mesh's lowest real UV set rather than leaving the surface with the
@@ -12628,7 +13647,7 @@ namespace dxvk {
     uint32_t fallback = iaTexcoordIdx;
     bool found = false;
     for (const auto& element : elements) {
-      if (element.Usage != D3DDECLUSAGE_TEXCOORD || isVertexLightmapElement(element))
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD || isNonUvElement(element))
         continue;
       if (!found || element.UsageIndex < fallback) {
         fallback = element.UsageIndex;
@@ -13271,6 +14290,8 @@ namespace dxvk {
     pruneUe3StaticVertexCaptureCache();
     pruneUe3GeometryMemoCache();
     updateUe3StaticVertexCaptureCacheState();
+    // Independent of the capture cache, whose state update returns early when it is disabled.
+    reportUe3InstancedDrawStats();
     reportUe3ConstantChurn();
 
     DrawCallState::refreshCategoryLookupTable();

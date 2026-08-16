@@ -401,6 +401,65 @@ namespace dxvk {
                "UE3 compat: allow input-assembler object-space positions to be used directly for conservative static "
                "LocalVertexFactory draws. This is the second-choice exact source, used for shaders whose oPos "
                "transform rtx.d3d9.ue3ExactVertexCapture could not recognise.");
+    RTX_OPTION("rtx.d3d9", bool, ue3DecomposeInstancedDraws, true,
+               "UE3 compat: split a D3D9 hardware-instanced draw into one ray-traced instance per hardware instance, "
+               "reading each placement out of the instance-data stream (UE3's InstanceOffset/InstanceXAxis/"
+               "InstanceYAxis/InstanceZAxis) rather than from a vertex shader constant.\n"
+               "UE3 places foliage and PhysX/NxFluid mesh particles this way: one draw call, one identity LocalToWorld, "
+               "and every placement in a dynamic vertex stream. Without this the batch collapses onto that single "
+               "identity transform, and because vertex capture indexes its output buffer by vertex alone every hardware "
+               "instance writes the same slots - the surviving positions are an arbitrary mix of placements, so the mesh "
+               "renders as an exploded cluster of stretched triangles that reshuffles on every capture.\n"
+               "Enabled, such draws take their object-space positions from the input assembler (no capture, nothing to "
+               "race) and each instance is submitted with its own object-to-world transform, matching what the engine's "
+               "non-instanced fallback path produces. A draw whose placements cannot be recovered is dropped, with the "
+               "reason logged, rather than rendered at the world origin.\n"
+               "Disabling it is a complete bypass, racing included, so it is a direct A/B. See "
+               "rtx.d3d9.ue3LogInstancedDraws.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3MaxDecomposedInstances, 4096,
+               "UE3 compat: upper bound on the hardware instances rtx.d3d9.ue3DecomposeInstancedDraws expands from one "
+               "draw. Each instance becomes its own ray-traced submission, so a pathological batch would otherwise cost "
+               "unbounded CPU time; the excess is dropped with a one-shot warning naming the draw. The default clears "
+               "Mirror's Edge's densest debris scatters with headroom and stays well inside the draw call state queue's "
+               "capacity.\n"
+               "Cost is linear in instances, so lowering this is the reliable way to trade density for frame time. What "
+               "it keeps is a fixed subset - the instances the game lists first, which is spawn order, so a batch thins "
+               "out roughly evenly rather than losing one side of itself. Deliberately not the instances nearest the "
+               "camera: that set changes as the view moves, so instances would appear and disappear, and since each is "
+               "named by its position in the game's buffer a view-dependent selection also renames them and costs them "
+               "their history.");
+    RTX_OPTION_ARGS("rtx.d3d9", float, ue3DecomposedInstanceCullDistance, 0.f,
+               "UE3 compat: drop decomposed hardware instances farther than this many world units from the camera, "
+               "or 0 to keep every instance the game submitted.\n"
+               "Each instance costs a ray-traced submission and a TLAS entry, and the game's own culling only removes "
+               "what leaves the frustum, so this bounds what a far-off scatter costs while it is still on screen.\n"
+               "It cannot help with a cluster you are standing in, where every instance is at much the same distance "
+               "and the bound becomes all-or-nothing; use rtx.d3d9.ue3MaxDecomposedInstances for that. Being "
+               "view-dependent it can also pop at its boundary, so keep the distance far enough out that the popping "
+               "is not what you are looking at.",
+               args.minValue = 0.f);
+    RTX_OPTION("rtx.d3d9", bool, ue3StableDecomposedInstanceIdentity, true,
+               "UE3 compat: give each instance produced by rtx.d3d9.ue3DecomposeInstancedDraws an identity that "
+               "survives it moving, so Remix recognises it frame to frame by a hash lookup.\n"
+               "Instance identity normally includes the object transform, which is ideal for the static geometry that "
+               "dominates a scene but means anything moving misses the exact-identity lookup every frame and falls "
+               "through to a spatial nearest-neighbour search. That search scans a cell neighbourhood sized from "
+               "rtx.uniqueObjectDistance, so a dense cluster of moving objects lands its whole batch in one cell and "
+               "the search becomes quadratic in the batch's size.\n"
+               "Decomposed instances are the one case with a better answer available: they arrive in a stable order in "
+               "the game's instance stream, so instance N of a batch can be named directly. Pairing is then exact "
+               "rather than a proximity guess, which also makes their motion vectors correct. Lowering "
+               "rtx.uniqueObjectDistance is not a substitute - it is global, and dropping it far enough to subdivide "
+               "a cluster also stops camera-attached geometry matching during fast turns.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogInstancedDrawStats, false,
+               "UE3 compat diagnostics: log roughly once a second what hardware-instanced draws are costing - "
+               "instanced draws and hardware instances per frame, how many were submitted, how many each bound "
+               "dropped, and the wall time the submitting thread spent expanding them - which separates submission "
+               "cost from the per-instance work the consumer thread and the GPU do.\n"
+               "Also reports the instance-order stability rtx.d3d9.ue3StableDecomposedInstanceIdentity depends on: how "
+               "far index-paired instances moved between frames, and how often a batch could not be compared because "
+               "its instance count changed. A mean displacement on the scale of a batch's own extent would mean the "
+               "game reorders its instance buffer, making that option unsound.");
     RTX_OPTION("rtx.d3d9", bool, ue3RequireCtabCameraConstants, false,
                "UE3 compat: only allow a draw call to update the Main camera when its vertex shader CTAB explicitly "
                "names both ViewProjectionMatrix and CameraPosition constants. Engine utility shaders (shadow depth, "
@@ -470,6 +529,22 @@ namespace dxvk {
                "(vertex shader, vertex factory) with the reason any draw fell back to clip-space reconstruction, "
                "plus hash, cache and camera matrix details. The fallback lines are the list to work through before "
                "enabling rtx.d3d9.ue3RequireExactVertexCapture.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogInstancedDraws, false,
+               "UE3 compat diagnostics: log a one-shot [UE3-Instanced] line per draw identity for every draw that "
+               "uses D3D9 hardware instancing (a stream frequency above one, or a D3DSTREAMSOURCE_INSTANCEDATA "
+               "stream): instance count, per-stream frequency/stride/dynamic usage, the vertex declaration, the "
+               "classified vertex factory and pass, the resolved capture position source, whether a per-instance "
+               "transform was recovered, the vertex/index counts, and the draw's shader/material/texture hashes. Use "
+               "it to confirm which geometry a title places through hardware instancing - under UE3 that is foliage "
+               "and PhysX/NxFluid mesh particles - and that rtx.d3d9.ue3DecomposeInstancedDraws is handling it.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3TraceDrawTextureHashes, {},
+               "UE3 compat diagnostics: texture image hashes whose draws are dumped as a full [UE3-DrawTrace] "
+               "dossier - shader hashes, vertex factory, pass, capture position source, hardware instancing state with "
+               "the first recovered instance transforms, the vertex declaration, per-stream buffer identity, the "
+               "object-to-world transform, and the asset and full geometry hashes alongside the material hash. The "
+               "asset geometry hash is what replacements anchor on, so this is also how to confirm a mesh's hash is "
+               "stable across sessions. Logged once per draw identity, but resolving the geometry hash synchronously "
+               "costs a worker sync - leave the list empty in normal use.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogDrawStatusFlaps, false,
                "UE3 compat diagnostics: detect draws whose raytracing status (raytraced/rasterized/ignored) changes "
                "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
@@ -873,6 +948,9 @@ namespace dxvk {
       ParticleBeamTrail,
       SpeedTree,
       Foliage,
+      // FParticleInstancedMeshVertexFactory: hardware-instanced static meshes used by mesh
+      // particle emitters, including the PhysX/NxFluid debris ones.
+      ParticleInstancedMesh,
       LocalDecal,
       LensFlare,
       PositionOnly,
@@ -906,8 +984,102 @@ namespace dxvk {
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
     static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
 
-    // Keeps UE3's vertex lightmap coefficient streams from being mistaken for the surface's UVs.
-    uint32_t resolveIaTexcoordAvoidingVertexLightmaps(uint32_t iaTexcoordIdx) const;
+    // D3D9 hardware instancing state of the current draw. UE3 places foliage and NxFluid mesh
+    // particles with one instanced draw whose per-instance transform lives in a vertex stream
+    // (InstanceOffset + InstanceXAxis/YAxis/ZAxis as TEXCOORD1..4), not in a shader constant, so
+    // both the placement and the capture-safety decisions have to come from the declaration.
+    struct Ue3InstancingInfo {
+      uint32_t instanceCount = 1;
+      // Streams marked D3DSTREAMSOURCE_INSTANCEDATA: advanced per instance rather than per vertex,
+      // so nothing in them may ever be read as a per-vertex attribute.
+      uint32_t instanceDataStreamMask = 0;
+      // Set when TEXCOORD1..4 form a complete FLOAT3 instance basis on one instance-data stream.
+      bool hasInstanceTransform = false;
+      uint32_t transformStream = 0;
+      uint32_t offsetByteOffset = 0;
+      uint32_t axisByteOffsets[3] = {};
+
+      bool isInstanced() const { return instanceCount > 1 || instanceDataStreamMask != 0; }
+    };
+
+    static Ue3InstancingInfo resolveUe3Instancing(const D3D9VertexElements& elements,
+                                                  const std::array<UINT, caps::MaxStreams>& streamFreq,
+                                                  uint32_t instanceCount);
+
+    Ue3InstancingInfo m_currentUe3Instancing;
+
+    // One placement recovered from the instance-data stream. sourceIndex is the instance's position
+    // in the game's buffer, which is what names it across frames - not its position in this vector,
+    // which culling shifts.
+    struct Ue3DecomposedInstance {
+      Matrix4 instanceToObject;
+      uint32_t sourceIndex = 0;
+    };
+
+    // Placements for the current draw, filled in internalPrepareDraw and consumed by
+    // CommitGeometryToRT. Empty for ordinary draws.
+    std::vector<Ue3DecomposedInstance> m_ue3DecomposedInstances;
+
+    // Why the placements could not be recovered for an instanced draw, or null when they were.
+    // Refuses the draw rather than placing its object-space geometry at the world origin.
+    const char* m_ue3InstanceTransformReadFailure = nullptr;
+
+    void cullAndClampUe3InstanceTransforms(std::vector<Ue3DecomposedInstance>& instances,
+                                           uint32_t& outCulledByDistance,
+                                           uint32_t& outCulledByBudget) const;
+
+    // Instance-order stability probe for rtx.d3d9.ue3StableDecomposedInstanceIdentity, whose pairing
+    // of instance i with instance i of the previous frame is only sound while the game keeps its
+    // instance buffer in a stable order. Measures how far index-paired instances moved between
+    // consecutive frames: small means the order held, displacements on the scale of the batch's own
+    // extent mean the pairing is meaningless.
+    struct Ue3InstanceOrderProbe {
+      std::vector<Vector3> translations;
+      uint32_t lastFrame = 0;
+    };
+    fast_unordered_cache<Ue3InstanceOrderProbe> m_ue3InstanceOrderProbes;
+    void trackUe3InstanceOrderStability(XXH64_hash_t batchKey,
+                                        const std::vector<Ue3DecomposedInstance>& instances);
+
+    // Transform-free identity of the instanced batch the current draw belongs to, combined with an
+    // instance's index to name it across frames. kEmptyHash outside a decomposed draw.
+    //
+    // Deliberately not derived from the instance buffer: UE3 hands out a fresh or pooled instance
+    // buffer per frame, so its handle is not an identity. The mesh streams are stable, so a batch is
+    // identified by its mesh plus continuity of its own centroid - there are only a handful of
+    // instanced batches per frame, so matching them is trivially cheap.
+    struct Ue3InstancedBatchRecord {
+      XXH64_hash_t id = kEmptyHash;
+      Vector3 centroid = Vector3(0.f, 0.f, 0.f);
+      uint32_t lastFrame = 0;
+      uint32_t claimedFrame = 0;
+    };
+    std::unordered_map<XXH64_hash_t, std::vector<Ue3InstancedBatchRecord>> m_ue3InstancedBatches;
+    uint64_t m_ue3NextInstancedBatchId = 1;
+    XXH64_hash_t resolveUe3InstancedBatchKey(const RasterGeometry& geoData,
+                                             const std::vector<Ue3DecomposedInstance>& instances);
+    XXH64_hash_t m_ue3DecomposedBatchKey = kEmptyHash;
+
+    // rtx.d3d9.ue3LogInstancedDrawStats accumulators, reported and reset about once a second.
+    void reportUe3InstancedDrawStats();
+    uint32_t m_ue3InstancedStatFrames = 0;
+    uint32_t m_ue3InstancedStatFrameStamp = 0;
+    uint64_t m_ue3InstancedStatDraws = 0;
+    uint64_t m_ue3InstancedStatInstancesSeen = 0;
+    uint64_t m_ue3InstancedStatInstancesSubmitted = 0;
+    uint64_t m_ue3InstancedStatCulledDistance = 0;
+    uint64_t m_ue3InstancedStatCulledBudget = 0;
+    uint64_t m_ue3InstancedStatSubmitNs = 0;
+    uint64_t m_ue3InstancedStatOrderPairs = 0;
+    uint64_t m_ue3InstancedStatOrderStablePairs = 0;
+    uint64_t m_ue3InstancedStatOrderSizeChanges = 0;
+    uint64_t m_ue3InstancedStatOrderComparableBatches = 0;
+    double m_ue3InstancedStatOrderDisplacementSum = 0.0;
+    float m_ue3InstancedStatOrderDisplacementMax = 0.f;
+
+    // Keeps UE3's vertex lightmap coefficient streams and per-instance transform streams from
+    // being mistaken for the surface's UVs.
+    uint32_t resolveIaTexcoordAvoidingNonUvElements(uint32_t iaTexcoordIdx) const;
 
     // Half-or-larger in both dims (allows ScreenPercentage >50%) and aspect-matched to the
     // backbuffer so square SceneCapture RTs cannot pass as main-view-sized on widescreen.
@@ -1486,6 +1658,29 @@ namespace dxvk {
     bool canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
+    bool canUseUe3InstancedMeshVertexPositions(const RasterGeometry& geoData,
+                                               const char** outReason = nullptr) const;
+
+    // Reads m_currentUe3Instancing's per-instance basis out of the instance-data stream. Degenerate
+    // placements are dropped: PhysX leaves unused slots in the emitter's instance buffer untouched.
+    bool readUe3InstanceTransforms(const VertexContext vertexContext[caps::MaxStreams],
+                                   std::vector<Ue3DecomposedInstance>& instances,
+                                   const char** outReason = nullptr) const;
+
+    // Diagnostics: rtx.d3d9.ue3LogInstancedDraws / rtx.d3d9.ue3TraceDrawTextureHashes.
+    std::string describeUe3DrawInstancing(const VertexContext vertexContext[caps::MaxStreams]) const;
+    std::string describeUe3VertexDeclaration() const;
+    std::string describeUe3DrawIdentity() const;
+    void logUe3InstancedDrawOnce(const DrawContext& drawContext,
+                                 const VertexContext vertexContext[caps::MaxStreams],
+                                 const RasterGeometry& geoData);
+    void logUe3TracedDrawOnce(const DrawContext& drawContext,
+                              const VertexContext vertexContext[caps::MaxStreams],
+                              RasterGeometry& geoData);
+
+    // draw identities already dumped by the instancing / texture-hash draw probes
+    fast_unordered_set m_loggedUe3InstancedDraws;
+    fast_unordered_set m_loggedUe3TracedDraws;
     XXH64_hash_t computeUe3StableVertexShaderHash(bool* outHashedFloatConstsWithExclusions = nullptr) const;
 
     // Per-draw memo of computeUe3StableVertexShaderHash (VS bytecode + camera-excluded
@@ -1726,6 +1921,11 @@ namespace dxvk {
       bool ue3RequireExactVertexCapture = false;
       Ue3CapturePositionSourceOverride ue3VertexCaptureSourceOverride = Ue3CapturePositionSourceOverride::Auto;
       bool ue3NativeLocalMeshVertexCapture = false;
+      bool ue3DecomposeInstancedDraws = false;
+      uint32_t ue3MaxDecomposedInstances = 0;
+      float ue3DecomposedInstanceCullDistance = 0.f;
+      bool ue3StableDecomposedInstanceIdentity = false;
+      bool ue3LogInstancedDrawStats = false;
       bool ue3RequireCtabCameraConstants = false;
       bool ue3StableDiffuseSelection = false;
       bool ue3AutoDetectLightmapTextures = false;
@@ -1735,6 +1935,7 @@ namespace dxvk {
       bool ue3LogUvAffineDetail = false;
       bool ue3LogAlbedoSelection = false;
       bool ue3LogCapturePrecision = false;
+      bool ue3LogInstancedDraws = false;
       bool ue3LogDrawStatusFlaps = false;
       bool ue3LogOcclusionQueries = false;
       bool deferredUiReplay = false;
@@ -1780,6 +1981,7 @@ namespace dxvk {
       const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
       const fast_unordered_set* ue3MicConstantIdentityExcludedGroups = nullptr;
       const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
+      const fast_unordered_set* ue3TraceDrawTextureHashes = nullptr;
       const fast_unordered_set* replacementDebugHashes = nullptr;
     };
     FrameOptionCache m_frameOptions;
@@ -1805,5 +2007,9 @@ namespace dxvk {
                                        const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {});
 
     void submitActiveDrawCallState();
+
+    // Expands m_ue3DecomposedInstances into one ray-traced submission per hardware instance, each
+    // with its own object-to-world transform.
+    void submitUe3DecomposedInstanceDrawCallStates(const DrawParameters& params);
   };
 }

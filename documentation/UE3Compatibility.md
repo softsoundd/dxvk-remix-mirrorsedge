@@ -21,6 +21,8 @@ A draw uses this path (`rtx.d3d9.ue3ExactVertexCapture`) only when the transform
 
 If the transform is not recognised, conservative static `LocalVertexFactory` meshes use their input-assembler object-space positions (`rtx.d3d9.ue3NativeLocalMeshVertexCapture`), which is equally exact. Anything else unprojects.
 
+Hardware-instanced draws are the one case that never captures at all, whether or not the transform is recognised, because the capture buffer is indexed per vertex and cannot separate instances - see [Hardware-instanced mesh particles and foliage](#hardware-instanced-mesh-particles-and-foliage).
+
 Diagnostics:
 
 - `rtx.d3d9.ue3LogCapturePrecision` logs the resolved source per unique (vertex shader, vertex factory). On fallback it also dumps the instructions that produced each `oPos` component.
@@ -34,6 +36,72 @@ The key includes the object transform and the shader constants other than camera
 Some titles recompute a draw's transform every frame even for still geometry, so keys never repeat. Below `rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheMinReusePercent` the cache releases its buffers and key records, then re-tests every `...ReuseProbeFrames` frames. Set the threshold to `0` to disable the guard.
 
 `rtx.d3d9.ue3LogStaticVertexCaptureCacheStats` reports entries, bytes, keys awaiting admission and reuse rate about once a second, including dormancy. Buffers appear under `RTXVertexCapture` in the memory profiler and HUD. If reuse is near zero, the keys are churning; raising the budget will not help.
+
+## Hardware-instanced mesh particles and foliage
+
+Vertex capture cannot describe a hardware-instanced draw. The injected code writes each member at `data[gl_VertexIndex - baseVertex]`, and D3D9 instancing replays the same vertex indices once per instance, so every instance writes the same slots with no ordering between them. The surviving positions are an arbitrary mix of placements: individual triangles end up with corners from different instances, which reads on screen as an exploded cluster of stretched geometry that lands somewhere different every time it is captured.
+
+UE3 reaches this in two places, both of which put the placement in a vertex stream rather than a shader constant:
+
+- Foliage (`FFoliageVertexFactory`, `FoliageComponent` / `UnTerrainFoliage`).
+- Mesh particles (`FParticleInstancedMeshVertexFactory`), including the PhysX/NxFluid debris emitters (`ParticleModuleTypeDataMeshNxFluid`), which is what Mirror's Edge uses for simulated trash, paper and rubble. `FDynamicMeshEmitterData::RenderNxFluidInstanced` issues one `DrawMesh` for the whole cluster with `LocalToWorld = FMatrix::Identity`, and `FD3D9DynamicRHI::SetStreamSource` turns that into `SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | N)` on the mesh streams plus `D3DSTREAMSOURCE_INSTANCEDATA | 1` on the instance stream.
+
+Both compile `FoliageVertexFactory.usf`, whose world position is
+
+```hlsl
+float4x4 GetInstanceToWorld(FVertexFactoryInput Input) { /* InstanceXAxis/YAxis/ZAxis + InstanceOffset */ }
+float4 CalcWorldPosition(FVertexFactoryInput Input) { return mul(GetInstanceToWorld(Input), Input.Position); }
+```
+
+so the mesh streams still hold one plain object-space copy of the mesh, and `InstanceOffset` plus the three basis axes arrive as `TEXCOORD1..4` (`FLOAT3`) on the instance-data stream.
+
+`rtx.d3d9.ue3DecomposeInstancedDraws` (on by default) uses exactly that. Positions come from the input assembler rather than from capture, and one ray-traced instance is submitted per hardware instance with `objectToWorld = LocalToWorld * FMatrix(XAxis, YAxis, ZAxis, Location)`, byte for byte the transform the engine's own non-instanced fallback (`RenderNxFluidNonInstanced`) would have handed to `FMeshElement::LocalToWorld`. Nothing from the instance stream reaches the geometry, so a mesh's asset hash is the base mesh's and stays stable as particles move, spawn and die.
+
+Because each instance becomes a real `RtInstance`, replacements, categories, anti-culling and motion vectors all work per particle. Instances whose basis is degenerate are dropped, since PhysX only writes the live prefix of an emitter's instance buffer and leaves the rest holding whatever was there before. This is also why decomposition submits a real draw call state per instance rather than filling `DrawCallTransforms::instancesToObject`: the GPU point-instancer path shares one `prevObjectToWorld` across a batch, which would give moving debris wrong motion vectors.
+
+Because an instanced factory's world position is the instance transform times `Input.Position`, the declaration's `POSITION` is object space by construction. No shader constant is involved and there is nothing to prove about the transform. Decomposed draws therefore skip the conservatism `rtx.d3d9.ue3NativeLocalMeshVertexCapture` applies to `Local` draws, where reading the input assembler is a guess about what the shader does. What they need is a complete `TEXCOORD1..4` `FLOAT3` basis on an instance-data stream, a bound position buffer, and no skinning. A draw whose placements cannot be recovered is dropped with the reason logged, rather than rendered at the world origin. With no `LocalToWorld` constant in the shader, object-space positions without their placements would land nowhere useful.
+
+These are also the only UE3 draws that skip vertex capture entirely, which makes them the first to reach the geometry interleaver's CPU path (taken below 1024 vertices when every input buffer is host-visible; a capture buffer is device-local, so a capturing draw always interleaves on the GPU). That path reads through `GeometryBufferData`, which reports a texcoord buffer as absent unless it is float32 because packed half floats cannot be read as `float2`, and UE3 packs its UVs as `FLOAT16_2`. `RtxGeometryUtils::interleaveGeometry` forces the GPU path for any texcoord format the CPU path cannot read, via `GeometryBufferData::isCpuReadableTexcoordFormat`. Without that, it hands the interleaver a null pointer.
+
+### Dense clusters and instance identity
+
+A dense cluster of *moving* instances is expensive, and not because of submission cost. `rtx.d3d9.ue3LogInstancedDrawStats` reports that separately and it is a small fraction of the total.
+
+`DrawCallTracker::computeIdentityHash` includes the object transform. That is ideal for the static geometry which dominates a scene: a still object hits the exact-identity lookup every frame, but anything moving misses it and falls through to a spatial nearest-neighbour search. That search scans an eight-cell neighbourhood sized from `rtx.uniqueObjectDistance` (cells are twice it, so 600 units by default), so a pile a few metres across sits inside a single cell and every instance in it scans the whole pile. The cost is quadratic in the batch's size, which is why it appears abruptly as a batch grows rather than scaling with it.
+
+`rtx.d3d9.ue3StableDecomposedInstanceIdentity` (on by default) removes that. Decomposed instances arrive in a stable order in the game's instance stream, so instance N of a batch can be named directly: `DrawCallState::decomposedInstanceId` (batch identity plus index) stands in for the transform in the identity hash, the exact-identity lookup hits every frame, and the spatial search never runs. Pairing is then exact rather than a proximity guess, which also makes the instances' motion vectors correct. `rtx.d3d9.ue3LogInstancedDrawStats` reports the order stability this rests on, and `rtx.logInstanceIdentityStats` reports the hit rate and the number of spatial candidates examined.
+
+One invariant has to be restored by hand. An exact-identity hit normally proves the transform did not change, and `SceneManager`'s preserve path relies on that: it reuses surface state, transform included, whenever the dirty flags come back clear. For these keys `ReplacementInstance::LookupKey::identityExcludesTransform` is set, and the lookup then runs the dirty-flag comparison and moves the instance's spatial entry itself. This is inert for every other caller, whose transform genuinely is unchanged on such a hit. If it were ever broken the symptom would be unmistakable: instances frozen in place while everything else moves.
+
+Naming the batch is the subtle half, and the instance buffer cannot do it: `RenderNxFluidInstanced` calls `RHICreateVertexBuffer` for a fresh one every frame unless its two-entry pool happens to hand one back, so its handle is not an identity. Batches are matched to the previous frame's by continuity of their own centroid, which holds because a batch as a whole barely moves even while its instances do. Records are claimed once per frame so two piles of the same mesh cannot collide, and retire after 120 unseen frames so a level change cannot leave one for a new batch to latch onto.
+
+Lowering `rtx.uniqueObjectDistance` is not a substitute. It does shrink the scan, but it is global: dropping it far enough to subdivide a pile also stops camera-attached geometry (the view model, a force-shown player model) matching during fast turns, which then loses its temporal history every frame and forces fresh BLAS and instance work.
+
+### Bounding a scatter that is simply too large
+
+Cost is linear in instances once the above is in place, so the instance count is the remaining lever.
+
+- `rtx.d3d9.ue3MaxDecomposedInstances` is a hard ceiling and the bound that behaves for a dense cluster. It keeps a fixed subset: the instances the game lists first, which is spawn order, so a batch thins out roughly evenly rather than losing one side of itself.
+- `rtx.d3d9.ue3DecomposedInstanceCullDistance` (0, disabled) drops instances beyond a distance from the camera. It bounds what a far-off scatter costs while still on screen, but cannot help with a cluster you are standing in, where every instance is at much the same distance.
+
+Both must keep the *same* set frame to frame, which is why the ceiling is not "the instances nearest the camera" even though that sounds kinder. A view-dependent subset changes as you move, so instances appear and disappear. Worse, since each is named by its position in the game's buffer, a selection that also reorders the survivors renames every one and costs it its history. `Ue3DecomposedInstance::sourceIndex` carries the buffer position through culling for exactly that reason.
+
+### The two factories are not reliably distinguishable
+
+"Foliage" in UE3 is not plants. `UFoliageComponent` is an instanced-static-mesh scattering system: one `InstanceStaticMesh` and `Material` plus an array of per-instance `Location`/`XAxis`/`YAxis`/`ZAxis`. Level artists use it for any small repeated prop. Its declaration is very close to the mesh particle one, including the `COLOR` element aliased onto `TEXCOORD0` that foliage emits when a mesh has no shadow-map coordinate.
+
+The reference UE3 source does distinguish them by one element: `FFoliageVertexFactory::InitRHI` walks `{VEU_Tangent, VEU_Normal}`, so it emits `NORMAL`, while `FParticleInstancedMeshVertexFactory::InitRHI` walks `{VEU_Tangent, VEU_Binormal, VEU_Normal}` and `InitInstancedResources` fills only components 0 and 1. On that source the mesh particle declaration carries `TANGENT` + `BINORMAL` and no `NORMAL`, with the mesh's `TangentZ` arriving under `BINORMAL`. `ParticleInstancedMesh` matches that layout and reads the surface normal from `BINORMAL`; the stock game cannot, because its shader still declares `TangentZ : NORMAL`, so UE3 would render such particles with no normal at all.
+
+Mirror's Edge's shipped build emits a real `NORMAL` (`s1:NORMAL0 UBYTE4 @4`) for its instanced mesh particles, so they are declaration-identical to foliage and classify as `Foliage`. `ParticleInstancedMesh` has not been observed to match in this title. Both types take identical position and placement paths, so the type only decides which element supplies the normal.
+
+Do not use the classified factory type to tell foliage from particles; use the material. Every instanced batch observed in Mirror's Edge is dynamic PhysX debris whose placements change every frame: trash and paper scraps that spawn above a rooftop and fall into place on level load, and pebble scatters that can be pushed around.
+
+### Diagnostics
+
+- `rtx.d3d9.ue3LogInstancedDraws`: one line per instanced draw identity: instance count, per-stream frequency and dynamic usage, the declaration, the classified factory and pass, the resolved capture source, and whether a per-instance transform was recovered. For a decomposed draw the source reads `InputAssembler` and `instanceTransform` names the stream and byte offsets.
+- `rtx.d3d9.ue3LogInstancedDrawStats`: per-frame instance counts, what each bound dropped, the wall time spent expanding them, and the instance-order stability `ue3StableDecomposedInstanceIdentity` rests on. A mean index-paired displacement on the scale of a batch's own extent would mean the game reorders its buffer, making that option unsound.
+- `rtx.logInstanceIdentityStats`: where instance lookups land and how many spatial candidates they examine. This is what shows the quadratic scan appearing or disappearing.
+- `rtx.d3d9.ue3TraceDrawTextureHashes`: a full `[UE3-DrawTrace]` dossier for draws binding a listed texture, including the object-to-world transform, the first few recovered instance transforms, and the asset and full geometry hashes. The asset hash is what replacements anchor on, so this is also how to confirm a mesh's hash is identical across two sessions.
 
 ## Diagnosing a cache that never hits
 
