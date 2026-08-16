@@ -377,10 +377,12 @@ void integratePathVertex(
 #ifdef ATMOSPHERE_AVAILABLE
     else if (cb.skyMode == 1)
     {
-      // Physical atmosphere mode
+      // Physical atmosphere mode. Note: no sun disc here. The sun is an RtDistantLight sampled by
+      // NEE at the previous path vertex, so adding the disc would double count it.
       skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
         ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, pathState.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(pathState.direction, cb.atmosphereArgs, cb.isZUp != 0);
+        : evalSkyRadiance(pathState.direction, cb.atmosphereArgs,
+                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, cb.isZUp != 0);
     }
 #endif
     else

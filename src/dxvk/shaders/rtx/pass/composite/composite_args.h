@@ -24,6 +24,7 @@
 #include "rtx/utility/shader_types.h"
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/raytrace_args.h"
+#include "rtx/pass/atmosphere/atmosphere_args.h"
 #include "rtx/algorithm/accumulate.h"
 
 #define DENOISER_MODE_OFF 0
@@ -37,6 +38,8 @@ struct CompositeArgs {
   VolumeArgs volumeArgs;
   AccumulationArgs accumulationArgs;
   SparseRenderingArgs sparseRenderingArgs;
+  // Needed for the aerial perspective volume's frustum basis and depth range.
+  AtmosphereArgs atmosphereArgs;
 
   // -- Struct objects should go above this line to preserve alignment --
 

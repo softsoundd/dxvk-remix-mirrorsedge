@@ -20,8 +20,20 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// Multiscattering LUT computation for Hillaire atmospheric scattering
-// Approximates multiple scattering contributions
+// Multiple scattering LUT, the central contribution of Hillaire's EGSR 2020 paper (Section 5.5).
+//
+// For each (sun zenith angle, altitude) entry this integrates, over 64 uniformly distributed
+// directions around the sample point:
+//   - L_2ndOrder (Equations 5-6): second order in-scattered luminance for a unit illuminance light,
+//     including the diffuse response of the planet's ground.
+//   - f_ms (Equations 7-8): a unitless [0, 1] transfer factor describing how much energy the
+//     surrounding medium returns toward the sample point.
+// The infinite series of further scattering orders then collapses analytically to
+// F_ms = 1 / (1 - f_ms) (Equation 9), giving Psi_ms = L_2ndOrder * F_ms (Equation 10).
+//
+// Psi_ms has units of sr^-1: multiplying it by a directional light's illuminance and the local
+// sigma_s yields that light's complete multiple scattering contribution (Equation 11). Neither the
+// illuminance nor sigma_s is baked in here, so callers must apply each exactly once.
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 
@@ -31,157 +43,162 @@ ConstantBuffer<AtmosphereArgs> atmosphereArgs;
 layout(binding = 1)
 Texture2D<float4> transmittanceLutInput;
 
-layout(binding = 2)
-SamplerState transmittanceSampler;
-
-layout(binding = 3, rgba16f)
+layout(binding = 2, rgba16f)
 RWTexture2D<float4> multiscatteringLutOutput;
 
-// Ground albedo for reflected light (Blender uses 0.3)
-static const vec3 GROUND_ALBEDO = vec3(0.3f, 0.3f, 0.3f);
-static const float PHASE_ISOTROPIC = 1.0f / (4.0f * kPi);
+// 8x8 directions over the sphere, matching the paper's 64 direction budget.
+static const uint kSqrtDirectionCount = 8;
+static const uint kDirectionCount = kSqrtDirectionCount * kSqrtDirectionCount;
+// Ray march step count per direction. The paper reports 20 as sufficient.
+static const int kMarchStepCount = 20;
 
-// Compute ground reflection contribution (from Blender's sky_multiple_scattering.cpp)
-// This is crucial for realistic sunset colors - light bouncing off the ground
-vec3 computeGroundReflection(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
-  // Distance from sample point to planet center
-  float d = args.planetRadius + altitude;
-  
-  // Solid angle subtended by the planet from a point at d distance from center
-  // omega = 2π(1 - sqrt(1 - (R/d)²))
-  float ratio = args.planetRadius / d;
-  float omega = 2.0f * kPi * (1.0f - sqrt(max(0.0f, 1.0f - ratio * ratio)));
-  
-  // Get transmittance from ground to sun (sun zenith at ground level)
-  vec3 T_to_ground = sampleTransmittanceLut(transmittanceLutInput, transmittanceSampler,
-                                             0.0f, sunZenithCosAngle, args);
-  
-  // Get transmittance ratio: T(ground,sample) = T(ground,sun) / T(sample,sun)
-  vec3 T_ground_to_sun = sampleTransmittanceLut(transmittanceLutInput, transmittanceSampler,
-                                                 0.0f, 1.0f, args);  // Zenith at ground
-  vec3 T_sample_to_sun = sampleTransmittanceLut(transmittanceLutInput, transmittanceSampler,
-                                                 altitude, max(sunZenithCosAngle, 0.01f), args);
-  vec3 T_ground_to_sample = T_ground_to_sun / max(T_sample_to_sun, vec3(1e-6f));
-  
-  // 2nd order scattering from the ground (Lambertian reflection)
-  // L_ground = (1/4π) * omega * (albedo/π) * T_to_ground * T_ground_to_sample * cos_theta
-  float cosTheta = max(sunZenithCosAngle, 0.0f);
-  vec3 L_ground = PHASE_ISOTROPIC * omega * (GROUND_ALBEDO / kPi) * T_to_ground * T_ground_to_sample * cosTheta;
-  
-  return L_ground;
-}
+struct MultiscatterIntegral {
+  vec3 secondOrderLuminance;  // L_2ndOrder for E_I = 1
+  vec3 transferFactor;        // f_ms
+};
 
-// Analytical fit for higher-order atmospheric scattering (from Blender)
-// This approximation is wavelength-dependent for accurate color
-vec3 computeAnalyticalMultiscattering(float sunZenithCosAngle) {
-  // Blender's fitted coefficients - but toned down to avoid excessive purple at sunset
-  // Original Blender values were too strong for our RGB approximation
-  // Using more neutral colors to prevent purple tint when combined with orange sunset
-  vec3 L_ms_color = vec3(0.35f, 0.38f, 0.45f);  // More neutral, less blue-heavy
-  
-  // Analytical fit: color * (1 / (1 + 5 * exp(-17.92 * cos_theta)))
-  // This models how multiple scattering increases as sun gets higher
-  // Reduced overall strength to 0.01 (from 0.02) to prevent purple cast
-  float fitTerm = 1.0f / (1.0f + 5.0f * exp(-17.92f * sunZenithCosAngle));
-  
-  return 0.01f * L_ms_color * fitTerm;
-}
+// Integrates Equations 6 and 8 along a single direction leaving the sample point.
+MultiscatterIntegral integrateDirection(
+  vec3 samplePos, vec3 rayDir, vec3 sunDir, AtmosphereArgs args)
+{
+  MultiscatterIntegral result;
+  result.secondOrderLuminance = vec3(0.0f);
+  result.transferFactor = vec3(0.0f);
 
-// Compute multiscattering contribution at given altitude and sun zenith angle
-vec3 computeMultiscattering(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
-  vec3 planetCenter = vec3(0.0f, -args.planetRadius, 0.0f);
-  vec3 rayOrigin = vec3(0.0f, altitude, 0.0f);
-  
-  // Integrate over hemisphere for volumetric scattering
-  const int numDirSamples = 64;
-  const int numDistanceSamples = 20;
-  
-  vec3 multiScatter = vec3(0.0f);
-  
-  for (int i = 0; i < numDirSamples; ++i) {
-    float zenithAngle = kPi * (float(i) + 0.5f) / float(numDirSamples);
-    float cosZenith = cos(zenithAngle);
-    float sinZenith = sin(zenithAngle);
-    
-    vec3 rayDir = vec3(sinZenith, cosZenith, 0.0f);
-    
-    // Intersect with atmosphere
-    float t0, t1;
-    if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
+  const vec3 planetCenter = getPlanetCenter(args);
+
+  float tTop0, tTop1;
+  if (!intersectSphere(samplePos, rayDir, planetCenter, args.atmosphereRadius, tTop0, tTop1)) {
+    return result;
+  }
+
+  // The sample point is inside the atmosphere, so the far root is the exit distance.
+  float tEnd = max(tTop1, 0.0f);
+
+  // Stop at the ground when the direction points into the planet.
+  const float tGround = intersectSphereNearest(samplePos, rayDir, planetCenter, args.planetRadius);
+  const bool hitsGround = tGround >= 0.0f;
+  if (hitsGround) {
+    tEnd = tGround;
+  }
+
+  if (tEnd <= 0.0f) {
+    return result;
+  }
+
+  const float invSteps = 1.0f / float(kMarchStepCount);
+  vec3 throughput = vec3(1.0f);
+  float segmentStart = 0.0f;
+
+  for (int i = 0; i < kMarchStepCount; ++i) {
+    const float segmentEnd = atmosphereStepFraction(float(i + 1) * invSteps);
+    const float dt = (segmentEnd - segmentStart) * tEnd;
+    const float t = (segmentStart + (segmentEnd - segmentStart) * 0.5f) * tEnd;
+    segmentStart = segmentEnd;
+
+    if (dt <= 0.0f) {
       continue;
     }
-    
-    t0 = max(0.0f, t0);
-    
-    // Check planet intersection
-    float tPlanet0, tPlanet1;
-    bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
-    if (hitsPlanet && tPlanet0 > 0.0f) {
-      t1 = tPlanet0;
-    }
-    
-    float dt = (t1 - t0) / float(numDistanceSamples);
-    
-    // March along ray
-    for (int j = 0; j < numDistanceSamples; ++j) {
-      float t = t0 + (float(j) + 0.5f) * dt;
-      vec3 samplePos = rayOrigin + rayDir * t;
-      float sampleAltitude = length(samplePos - planetCenter) - args.planetRadius;
-      
-      float densityR = rayleighDensity(sampleAltitude, args);
-      float densityM = mieDensity(sampleAltitude, args);
-      float densityO3 = ozoneDensity(sampleAltitude, args);
-      
-      vec3 scatteringR = args.rayleighScattering * densityR;
-      vec3 scatteringM = args.mieScattering * densityM;
-      vec3 scattering = scatteringR + scatteringM;
-      
-      // Note: Ozone only absorbs, doesn't scatter, so it's not added to scattering
-      // but it does affect the sun transmittance sampled from the LUT
-      
-      // Sample transmittance to sun
-      vec3 toSun = vec3(0.0f, sunZenithCosAngle, sqrt(max(0.0f, 1.0f - sunZenithCosAngle * sunZenithCosAngle)));
-      float sunZenithCos = dot(normalize(samplePos - planetCenter), toSun);
-      vec3 sunTransmittance = sampleTransmittanceLut(transmittanceLutInput, transmittanceSampler, 
-                                                      sampleAltitude, sunZenithCos, args);
-      
-      multiScatter += scattering * sunTransmittance * dt * sinZenith;
+
+    const vec3 marchPos = samplePos + rayDir * t;
+    const float altitude = clamp(
+      length(marchPos - planetCenter) - args.planetRadius, 0.0f, args.atmosphereThickness);
+
+    const AtmosphereMedium medium = sampleAtmosphereMedium(altitude, args);
+    const vec3 sampleTransmittance = clamp(exp(-medium.extinction * dt), vec3(0.0f), vec3(1.0f));
+    const vec3 clampedExtinction = max(medium.extinction, vec3(1e-7f));
+
+    // Equation 6: single scattering with the isotropic phase and a unit illuminance.
+    const vec3 sunShadowing = evalSunShadowing(marchPos, sunDir, transmittanceLutInput, args);
+    const vec3 inScatter = medium.scattering * kIsotropicPhase * sunShadowing;
+
+    // Equation 8: the same integral without shadowing or phase, which normalises f_ms into [0, 1].
+    const vec3 transferIntegrand = medium.scattering;
+
+    // Energy conserving analytical integration (Equation 17).
+    result.secondOrderLuminance += throughput * ((inScatter - inScatter * sampleTransmittance) / clampedExtinction);
+    result.transferFactor += throughput * ((transferIntegrand - transferIntegrand * sampleTransmittance) / clampedExtinction);
+
+    throughput *= sampleTransmittance;
+  }
+
+  // Diffuse response of the ground, the L_o term of Equation 6.
+  if (hitsGround) {
+    const vec3 groundPos = samplePos + rayDir * tEnd;
+    const vec3 groundNormal = normalize(groundPos - planetCenter);
+    const float NdotL = dot(groundNormal, sunDir);
+
+    if (NdotL > 0.0f) {
+      const vec3 sunShadowing = evalSunShadowing(groundPos, sunDir, transmittanceLutInput, args);
+      result.secondOrderLuminance += throughput * sunShadowing * NdotL * (kGroundAlbedo / kPi);
     }
   }
-  
-  // Normalize by hemisphere solid angle
-  multiScatter *= 2.0f * kPi / float(numDirSamples);
-  
-  // Add ground reflection contribution (key for sunset colors!)
-  vec3 groundReflection = computeGroundReflection(altitude, sunZenithCosAngle, args);
-  
-  // Add analytical fit for higher-order scattering (wavelength-dependent)
-  vec3 analyticalMS = computeAnalyticalMultiscattering(sunZenithCosAngle);
-  
-  return multiScatter + groundReflection + analyticalMS;
+
+  return result;
+}
+
+vec3 computeMultiscattering(float sunZenithCosAngle, float altitude, AtmosphereArgs args) {
+  const vec3 samplePos = vec3(0.0f, clamp(altitude, 0.0f, args.atmosphereThickness), 0.0f);
+
+  const float sunZenithSinAngle = sqrt(max(0.0f, 1.0f - sunZenithCosAngle * sunZenithCosAngle));
+  const vec3 sunDir = normalize(vec3(sunZenithSinAngle, sunZenithCosAngle, 0.0f));
+
+  vec3 secondOrderLuminance = vec3(0.0f);
+  vec3 transferFactor = vec3(0.0f);
+
+  // Uniform directions over the sphere, so the Monte Carlo estimator of Equations 5 and 7 carries a
+  // 4pi/N weight. Those equations also apply p_u to the whole per-direction integral, on top of the
+  // p_u that Equation 6 already applies to its own single scattering term.
+  for (uint i = 0; i < kSqrtDirectionCount; ++i) {
+    for (uint j = 0; j < kSqrtDirectionCount; ++j) {
+      const float u = (float(i) + 0.5f) / float(kSqrtDirectionCount);
+      const float v = (float(j) + 0.5f) / float(kSqrtDirectionCount);
+
+      const float theta = 2.0f * kPi * u;
+      const float cosPhi = 1.0f - 2.0f * v;
+      const float sinPhi = sqrt(max(0.0f, 1.0f - cosPhi * cosPhi));
+      const vec3 rayDir = vec3(sinPhi * cos(theta), cosPhi, sinPhi * sin(theta));
+
+      const MultiscatterIntegral integral = integrateDirection(samplePos, rayDir, sunDir, args);
+
+      secondOrderLuminance += integral.secondOrderLuminance;
+      transferFactor += integral.transferFactor;
+    }
+  }
+
+  // The sphere solid angle and the outer p_u cancel exactly, leaving the mean over directions.
+  const float directionWeight = (4.0f * kPi) * kIsotropicPhase / float(kDirectionCount);
+  secondOrderLuminance *= directionWeight;
+  transferFactor *= directionWeight;
+
+  // Equations 9 and 10. f_ms is normalised into [0, 1) so the series always converges, but clamp
+  // anyway so a pathological atmosphere setup cannot produce a negative or infinite denominator.
+  const vec3 clampedTransfer = clamp(transferFactor, vec3(0.0f), vec3(0.999f));
+  const vec3 multiScatteringSum = vec3(1.0f) / (vec3(1.0f) - clampedTransfer);
+
+  vec3 psiMs = secondOrderLuminance * multiScatteringSum;
+  psiMs = max(psiMs, vec3(0.0f));
+  if (any(isnan(psiMs)) || any(isinf(psiMs))) {
+    psiMs = vec3(0.0f);
+  }
+
+  return psiMs;
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 threadId : SV_DispatchThreadID) {
   AtmosphereArgs args = atmosphereArgs;
-  
-  // Check bounds
+
   if (threadId.x >= args.multiscatteringLutSize || threadId.y >= args.multiscatteringLutSize) {
     return;
   }
-  
-  // Convert pixel to parameters
-  // X axis: sun zenith angle cos
-  // Y axis: altitude
-  vec2 uv = (vec2(threadId) + 0.5f) / float(args.multiscatteringLutSize);
-  
-  float sunZenithCosAngle = uv.x * 2.0f - 1.0f;  // [-1, 1]
-  float altitude = uv.y * args.atmosphereThickness;  // [0, atmosphereThickness]
-  
-  // Compute multiscattering
-  vec3 multiScatter = computeMultiscattering(altitude, sunZenithCosAngle, args);
-  
-  // Write result
-  multiscatteringLutOutput[threadId] = float4(multiScatter, 1.0f);
+
+  const vec2 uv = (vec2(threadId) + 0.5f) / vec2(args.multiscatteringLutSize, args.multiscatteringLutSize);
+
+  // Parameterization from Section 5.5.2, matching sampleMultiscatteringLut().
+  const float sunZenithCosAngle = textureCoordToUnitRange(uv.x, args.multiscatteringLutSize) * 2.0f - 1.0f;
+  const float altitude = textureCoordToUnitRange(uv.y, args.multiscatteringLutSize) * args.atmosphereThickness;
+
+  multiscatteringLutOutput[threadId] = float4(computeMultiscattering(sunZenithCosAngle, altitude, args), 1.0f);
 }

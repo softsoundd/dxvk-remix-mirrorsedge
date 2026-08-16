@@ -38,6 +38,7 @@
 
 #include "rtx/algorithm/volume_composite_helpers.slangh"
 #include "rtx/algorithm/accumulate.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
@@ -618,8 +619,9 @@ void applySkyContribution(
     return;
   }
 
-  // Physical Atmosphere sky is already in SharedRadiance — skip SkyMatte/SkyLight.
-  if (cb.volumeArgs.physicalAtmosphereEnabled != 0)
+  // Physical Atmosphere sky is already in SharedRadiance — skip SkyMatte/SkyLight. An external
+  // dome light still takes priority over the atmosphere, and is composited from here as usual.
+  if (cb.volumeArgs.physicalAtmosphereEnabled != 0 && !cb.domeLightArgs.active)
   {
     return;
   }
@@ -642,6 +644,42 @@ void applySkyContribution(
   }
 
   radianceOutput += skyContribution;
+}
+
+// Aerial perspective (paper Section 5.4): atmospheric extinction and in-scatter between the camera
+// and the shaded surface, which is what makes distant geometry hazy and desaturated.
+//
+// Skipped on primary misses because the sky-view LUT already integrates the whole atmospheric column
+// for those directions. PSR pixels use their camera-to-mirror distance, so a reflection is correctly
+// attenuated by the air in front of the mirror.
+//
+// The volume covers only the segment past the global volumetrics froxel grid, so its in-scatter is
+// attenuated by that grid's transmittance. Strictly the near in-scatter already in radianceOutput
+// should not pick up the far transmittance in turn, but the froxel grid spans tens of metres against
+// this volume's kilometres, so its transmittance is near one wherever the far term matters.
+void applyAerialPerspective(
+  uint2 pixelCoordinate,
+  bool primaryMiss,
+  float hitDistance,
+  vec3 volumeAttenuation,
+  inout vec3 radianceOutput)
+{
+  if (cb.volumeArgs.physicalAtmosphereEnabled == 0 ||
+      cb.atmosphereArgs.aerialPerspectiveLutSize == 0 ||
+      cb.domeLightArgs.active ||
+      primaryMiss ||
+      hitDistance <= 0.0f)
+  {
+    return;
+  }
+
+  const vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
+  const vec3 uvw = aerialPerspectiveScreenUvToUvw(screenUV, hitDistance, cb.atmosphereArgs);
+  const vec4 aerialPerspective = sampleAerialPerspectiveLut(AtmosphereAerialPerspectiveLut, uvw, cb.atmosphereArgs);
+
+  const vec3 inScatter = max(aerialPerspective.rgb, vec3(0.0f)) * volumeAttenuation;
+
+  radianceOutput = radianceOutput * saturate(aerialPerspective.a) + inScatter;
 }
 
 void applyFog(
@@ -847,7 +885,12 @@ vec4 compositeResult(
   const bool psrReflectionSkyMiss = geometryFlags.performPSRR
     && !geometryFlags.secondarySurfaceMask
     && psrReflectionSegmentSigned < 0.0f;
-  const bool attenuateSharedAsSky = primaryMiss || psrReflectionSkyMiss;
+  // Primary misses only carry sky in SharedRadiance when the atmosphere supplied it; skybox and
+  // dome light misses are composited later from the sky matte and must stay pre-attenuated.
+  const bool primarySkyMiss = primaryMiss
+    && cb.volumeArgs.physicalAtmosphereEnabled != 0
+    && !cb.domeLightArgs.active;
+  const bool attenuateSharedAsSky = primarySkyMiss || psrReflectionSkyMiss;
   vec3 skyVolumeAttenuation = volumeAttenuation;
   if (attenuateSharedAsSky && cb.volumeArgs.physicalAtmosphereEnabled != 0)
   {
@@ -859,6 +902,9 @@ vec4 compositeResult(
     skyVolumeAttenuation = pow(T, skyPower);
   }
   radianceOutput += attenuateSharedAsSky ? (sharedRadiance * skyVolumeAttenuation) : sharedRadiance;
+
+  // Applied before the sky so it only affects geometry; the sky already carries its full column.
+  applyAerialPerspective(pixelCoordinate, primaryMiss, volumeHitDistance, volumeAttenuation, radianceOutput);
 
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 

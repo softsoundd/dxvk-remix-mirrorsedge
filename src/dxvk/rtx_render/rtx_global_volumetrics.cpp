@@ -129,12 +129,13 @@ namespace dxvk {
 
   static const std::array<RtxGlobalVolumetrics::Preset, RtxGlobalVolumetrics::PresetCount> Presets = {
       // transmittance, measDist, albedo, aniso, skyAmb, sunGain, msRes, skyPow, ground
+      // Note: skyAmb is a gain on an unbiased hemisphere integral, so 1 is the physical value.
       RtxGlobalVolumetrics::Preset( // Default
           Vector3(0.999f, 0.999f, 0.999f),
           200.0f,
           Vector3(0.999f, 0.999f, 0.999f),
           0.0f,
-          0.75f, 1.2f, 0.04f, 0.65f, 0.15f
+          1.0f, 1.2f, 0.04f, 0.65f, 0.15f
       ),
       RtxGlobalVolumetrics::Preset( // HeavyFog
           // Dense, high-albedo medium: extinction from short measurement distance;
@@ -144,42 +145,42 @@ namespace dxvk {
           8.0f,
           Vector3(0.99f, 0.99f, 0.99f),
           0.3f,
-          0.9f, 1.35f, 0.08f, 0.55f, 0.28f
+          1.2f, 1.35f, 0.08f, 0.55f, 0.28f
       ),
       RtxGlobalVolumetrics::Preset( // LightFog
           Vector3(0.96f, 0.96f, 0.96f),
           20.0f,
           Vector3(0.99f, 0.99f, 0.99f),
           0.2f,
-          0.8f, 1.25f, 0.06f, 0.65f, 0.22f
+          1.05f, 1.25f, 0.06f, 0.65f, 0.22f
       ),
       RtxGlobalVolumetrics::Preset( // Mist
           Vector3(0.96f, 0.96f, 0.96f),
           50.0f,
           Vector3(0.98f, 0.98f, 0.98f),
           0.1f,
-          0.7f, 1.15f, 0.05f, 0.7f, 0.18f
+          0.95f, 1.15f, 0.05f, 0.7f, 0.18f
       ),
       RtxGlobalVolumetrics::Preset( // Haze
           Vector3(0.9f, 0.85f, 0.75f),
           70.0f,
           Vector3(0.8f, 0.8f, 0.8f),
           0.2f,
-          0.65f, 1.2f, 0.05f, 0.75f, 0.15f
+          0.85f, 1.2f, 0.05f, 0.75f, 0.15f
       ),
       RtxGlobalVolumetrics::Preset( // Dust
           Vector3(0.87f, 0.73f, 0.5f),
           60.0f,
           Vector3(0.85f, 0.75f, 0.65f),
           0.4f,
-          0.7f, 1.3f, 0.06f, 0.6f, 0.2f
+          0.95f, 1.3f, 0.06f, 0.6f, 0.2f
       ),
       RtxGlobalVolumetrics::Preset( // Smoke
           Vector3(0.87f, 0.73f, 0.5f),
           20.0f,
           Vector3(0.85f, 0.75f, 0.65f),
           0.6f,
-          0.55f, 1.15f, 0.04f, 0.7f, 0.12f
+          0.75f, 1.15f, 0.04f, 0.7f, 0.12f
       )
   };
 
@@ -351,7 +352,16 @@ namespace dxvk {
           RemixGui::DragFloat("Anisotropy", &anisotropyObject(), 0.01f, -.99f, .99f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Sky Ambient Strength", &atmosphereVolumeAmbientScaleObject(), 0.01f, 0.0f, 4.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::SetTooltipToLastWidgetOnHover(
-            "Physical Atmosphere only. Strength of sky-view LUT hemisphere injected into froxel SH.");
+            "Physical Atmosphere only. Gain on the sky-view LUT hemisphere injected into froxel SH.\n"
+            "1 = physical (unbiased hemisphere integral).");
+          RemixGui::Checkbox("Sky Ambient Visibility", &skyAmbientVisibilityObject());
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Trace a visibility ray per sky ambient sample so interiors do not inherit outdoor sky radiance.\n"
+            "Disabling it leaves the estimate unoccluded, which tints indoor glass with sky colour.");
+          RemixGui::DragInt("Sky Visibility Samples", &skyVisibilitySampleCountObject(), 1.0f, 1, 8, "%d", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "Sky ambient samples (and visibility rays) per froxel per frame. Raise if fast camera motion\n"
+            "leaves noise in freshly disoccluded fog.");
           RemixGui::DragFloat("Fog Density Scale Height (m)", &fogDensityScaleHeightMetersObject(), 0.25f, 0.0f, 200.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::SetTooltipToLastWidgetOnHover(
             "Exponential height falloff; 0 = homogeneous shell. Typical ground fog 10-20 m.");
@@ -666,6 +676,8 @@ namespace dxvk {
     volumeArgs.worldUnitsPerMeter = RtxOptions::getMeterToWorldUnitScale();
     volumeArgs.multiScatterResidualScale =
       RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? multiScatterResidualScale() : 0.0f;
+    volumeArgs.skyVisibilitySampleCount = std::max(skyVisibilitySampleCount(), 1u);
+    volumeArgs.skyAmbientVisibility = skyAmbientVisibility() ? 1u : 0u;
 
     Vector3 sunsetTint(1.0f, 1.0f, 1.0f);
     float sunsetBlend = 0.0f;
@@ -676,7 +688,6 @@ namespace dxvk {
     }
     volumeArgs.fogSunsetColorBlend = sunsetBlend;
     volumeArgs.fogSunsetWarmTint = sunsetTint;
-    volumeArgs.pad1 = 0.0f;
 
     volumeArgs.enableNoiseFieldDensity = enableHeterogeneousFog();
     volumeArgs.noiseFieldSubStepSize = noiseFieldSubStepSizeMeters() * RtxOptions::getMeterToWorldUnitScale();

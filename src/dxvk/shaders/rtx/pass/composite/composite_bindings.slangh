@@ -105,6 +105,9 @@ Sampler3D<float4> ValueNoiseSampler;
 layout(binding = COMPOSITE_SKY_LIGHT_TEXTURE)
 Sampler2D<float3> SkyLight;
 
+layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
+Texture3D AtmosphereAerialPerspectiveLut;
+
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;
 

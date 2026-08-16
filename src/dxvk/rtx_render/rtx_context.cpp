@@ -323,6 +323,16 @@ namespace dxvk {
     return m_common->metaRayReconstruction().useRayReconstruction();
   }
 
+  Rc<DxvkImageView> RtxContext::getAerialPerspectiveLutView() const {
+    if (!m_atmosphere || RtxOptions::skyMode() != SkyMode::PhysicalAtmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getAerialPerspectiveLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
   RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
     if (shouldUseDLSS() && m_common->metaDLSS().isActive()) {
       return InternalUpscaler::DLSS;
@@ -1444,8 +1454,13 @@ namespace dxvk {
       }
 
       m_atmosphere->initialize(this);
-      m_atmosphere->computeLuts(this);
-      constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
+
+      constants.atmosphereArgs = RtxAtmosphere::buildAtmosphereArgsFromOptions();
+      // The aerial perspective volume is fitted to the camera, so its basis has to be supplied
+      // before the LUTs are baked.
+      RtxAtmosphere::fillAerialPerspectiveArgs(constants.atmosphereArgs, cameraManager.getMainCamera());
+
+      m_atmosphere->computeLuts(this, constants.atmosphereArgs);
       m_atmosphere->syncDistantSunLight(*this, constants.atmosphereArgs);
     }
 

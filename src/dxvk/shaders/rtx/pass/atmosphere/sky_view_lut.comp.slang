@@ -34,45 +34,36 @@ Texture2D<float4> transmittanceLutInput;
 layout(binding = 2)
 Texture2D<float4> multiscatteringLutInput;
 
-layout(binding = 3)
-SamplerState lutSampler;
-
-layout(binding = 4, rgba16f)
+layout(binding = 3, rgba16f)
 RWTexture2D<float4> skyViewLutOutput;
 
 // Compute sky color for a given view direction
 vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
-  // Assume camera at ground level
-  float cameraAltitude = 0.0f;
-  vec3 cameraPos = vec3(0.0f, cameraAltitude, 0.0f);
-  
-  // Convert UV to spherical coordinates
-  // uv.x: azimuth [0, 2π]
-  // uv.y: elevation [-π/2, π/2] mapped from [0, 1]
-  float azimuth = uv.x * 2.0f * kPi;
-  float elevation = (uv.y - 0.5f) * kPi;
-  
-  // Construct view direction
-  float cosElevation = cos(elevation);
-  float sinElevation = sin(elevation);
-  vec3 viewDir = vec3(
+  // Camera on the local vertical at the configured altitude, matching evalSkyRadiance().
+  const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, 0.0f), 0.0f);
+
+  // uv.x maps linearly to azimuth; uv.y uses the paper's Section 5.3 latitude compression, which
+  // concentrates texels near the horizon where the sky has its highest visual frequency.
+  const float azimuth = uv.x * 2.0f * kPi;
+  const float elevation = skyViewLutVToElevation(uv.y);
+
+  const float cosElevation = cos(elevation);
+  const float sinElevation = sin(elevation);
+  const vec3 viewDir = normalize(vec3(
     cosElevation * cos(azimuth),
     sinElevation,
     cosElevation * sin(azimuth)
-  );
-  viewDir = normalize(viewDir);
-  
-  // Compute atmosphere radiance along this ray
-  vec3 sunDir = args.sunDirection;
-  vec3 radiance = evalAtmosphereRadiance(
+  ));
+
+  return evalAtmosphereRadiance(
     cameraPos,
     viewDir,
-    sunDir,
+    args.sunDirection,
     args,
+    transmittanceLutInput,
+    multiscatteringLutInput,
     32  // numSamples
   );
-  
-  return radiance;
 }
 
 [shader("compute")]

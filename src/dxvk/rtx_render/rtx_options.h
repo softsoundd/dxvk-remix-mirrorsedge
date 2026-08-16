@@ -1416,8 +1416,28 @@ namespace dxvk {
                "Sample the precomputed sky-view LUT for sky radiance on ray misses instead of ray marching the atmosphere per ray. "
                "The LUT is generated with the same scattering evaluation, so the result is visually identical at a fraction of the GPU cost. "
                "Disable only to A/B compare against the reference inline evaluation.");
-    RTX_OPTION("rtx.atmosphere", bool, sunDisc, true, "Include the sun itself in the output.");
-    RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");
+    RTX_OPTION("rtx.atmosphere", bool, aerialPerspective, true,
+               "Apply the atmosphere's in-scatter and extinction to scene geometry through a camera fitted froxel "
+               "volume (paper Section 5.4). This is what gives distant buildings and terrain their haze and "
+               "desaturation. Where global volumetrics are enabled, the march starts past the froxel grid's range so "
+               "the two do not double count.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveDepthRangeMeters, 32000.0f,
+               "Depth in meters covered by the aerial perspective volume. Bring this closer to the camera for denser "
+               "atmospheres to spend the 32 slices over a shorter, more accurate range.",
+               args.minValue = 100.0f);
+    RTX_OPTION("rtx.atmosphere", bool, sunDisc, true,
+               "Draw the sun disc into the environment on camera and mirror (PSR) rays, which cannot reach the sun "
+               "through next event estimation. Rough surfaces get the sun from the distant light instead, so the disc "
+               "is deliberately not added on indirect bounces where that would double count.");
+    RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f,
+               "Angular diameter of the sun disc in degrees. Earth's sun is 0.545. This also sets the sun's size and "
+               "peak intensity in glossy reflections, so keep it physical and use sunShadowSoftening for softer shadows.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, sunShadowSoftening, 0.0f,
+               "Extra half-angle in degrees added to the sun light's cone purely to widen shadow penumbrae.\n"
+               "This trades reflection fidelity for softer shadows: the cone also determines how large and how bright "
+               "the sun appears in glossy reflections, so any non-zero value makes the reflected sun wider and dimmer. "
+               "0 keeps the geometrically correct disc.",
+               args.minValue = 0.0f, args.maxValue = 12.0f);
     RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");
     RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f, "Sun angle from horizon in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f, "Rotation of sun around zenith in degrees.");
@@ -1429,14 +1449,20 @@ namespace dxvk {
     // Advanced/Internal Atmosphere Parameters
     RTX_OPTION("rtx.atmosphere", float, planetRadius, 6371.0f, "Planet radius in kilometers.");
     RTX_OPTION("rtx.atmosphere", float, atmosphereThickness, 100.0f, "Atmosphere thickness in kilometers.");
-    RTX_OPTION("rtx.atmosphere", float, mieAnisotropy, 0.97f, "Mie phase function anisotropy (g parameter, -1 to 1).");
+    RTX_OPTION("rtx.atmosphere", float, mieAnisotropy, 0.8f,
+               "Mie phase function anisotropy (g parameter, -1 to 1). 0.8 is the paper's default for Earth's aerosols; "
+               "values approaching 1 concentrate nearly all aerosol scattering into a tight forward halo.");
 
     // Base coefficients (can be used for non-Earth atmospheres, scaled by density sliders)
-    RTX_OPTION("rtx.atmosphere", Vector3, rayleighScattering, Vector3(5.8e-3f, 13.5e-3f, 33.1e-3f), "Base Rayleigh scattering coefficients (km^-1).");
+    // Note: defaults follow Table 1 of Hillaire's EGSR 2020 paper, converted from m^-1 to km^-1.
+    RTX_OPTION("rtx.atmosphere", Vector3, rayleighScattering, Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f), "Base Rayleigh scattering coefficients (km^-1).");
     RTX_OPTION("rtx.atmosphere", Vector3, mieScattering, Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f), "Base Mie scattering coefficients (km^-1).");
-    RTX_OPTION("rtx.atmosphere", Vector3, ozoneAbsorption, Vector3(2.04e-3f, 4.97e-3f, 2.14e-4f), "Base Ozone absorption coefficients (km^-1).");
-    RTX_OPTION("rtx.atmosphere", float, ozoneLayerAltitude, 25.0f, "Altitude of ozone layer peak in kilometers.");
-    RTX_OPTION("rtx.atmosphere", float, ozoneLayerWidth, 15.0f, "Width of the ozone layer in kilometers.");
+    RTX_OPTION("rtx.atmosphere", Vector3, mieAbsorption, Vector3(4.4e-3f, 4.4e-3f, 4.4e-3f),
+               "Base Mie absorption coefficients (km^-1). Aerosols absorb as well as scatter; raising this relative to "
+               "mieScattering darkens the haze, and making it chromatic tints it.");
+    RTX_OPTION("rtx.atmosphere", Vector3, ozoneAbsorption, Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f), "Base Ozone absorption coefficients (km^-1).");
+    RTX_OPTION("rtx.atmosphere", float, ozoneLayerAltitude, 25.0f, "Altitude of the ozone layer's tent profile peak in kilometers.");
+    RTX_OPTION("rtx.atmosphere", float, ozoneLayerWidth, 15.0f, "Half-width of the ozone layer's tent profile in kilometers (the paper uses a 30 km wide tent, so 15).");
     RTX_OPTION("rtx.atmosphere", Vector3, sunIlluminance, Vector3(20.0f, 20.0f, 20.0f), "Base Sun illuminance color/intensity.");
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash

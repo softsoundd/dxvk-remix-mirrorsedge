@@ -129,6 +129,7 @@ namespace dxvk {
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
+        TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -403,6 +404,9 @@ namespace dxvk {
     } else {
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, ctx->getResourceManager().getSkyMatte(ctx).view, nullptr);
     }
+    // Null outside of Physical Atmosphere, where the shader also skips sampling it.
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT,
+      ctx->getAerialPerspectiveLutView(), nullptr);
 
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;
@@ -441,6 +445,7 @@ namespace dxvk {
     compositeArgs.enableReSTIRGI = RtxOptions::useReSTIRGI();
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
+    compositeArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();

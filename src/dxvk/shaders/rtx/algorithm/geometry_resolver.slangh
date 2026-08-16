@@ -1936,28 +1936,23 @@ void geometryResolverVertex(
   // Output a miss
   if (!rayInteractionHasHit(rayInteraction))
   {
-    // Get sky radiance to blend with
-    vec3 skyRadiance;
-    if (cb.domeLightArgs.active)
-    {
-      skyRadiance = cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, ray.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform);
-    }
+    // Physical Atmosphere only. Skybox rasterization and dome lights are composited from the
+    // full resolution sky matte in applySkyContribution() instead, so adding them here as well
+    // would double count the sky on primary misses.
 #ifdef ATMOSPHERE_AVAILABLE
-    else if (cb.skyMode == 1)
+    if (cb.skyMode == 1 && !cb.domeLightArgs.active)
     {
-      // Physical atmosphere mode
-      skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
+      vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
         ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+        : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, cb.isZUp != 0);
+
+      // The camera ray never runs NEE, so the sun disc has to come from the environment here.
+      skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
+
+      geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
     }
 #endif
-    else
-    {
-      // Skybox rasterization mode
-      skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
-    }
-
-    geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
 
     updateNrcOnGBufferMiss(geometryResolverState.pixelCoordinate);
 
@@ -2634,7 +2629,13 @@ void geometryPSRResolverVertex(
       // Physical atmosphere mode.
       vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
         ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
+        : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, cb.isZUp != 0);
+
+      // Mirror-like PSR paths never run NEE either, so without this a mirror reflecting the sky
+      // shows no sun.
+      skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
+
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }
 #endif

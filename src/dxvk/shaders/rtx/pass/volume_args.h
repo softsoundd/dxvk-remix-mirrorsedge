@@ -121,7 +121,15 @@ struct VolumeArgs {
   float fogSunsetColorBlend;
 
   vec3 fogSunsetWarmTint;
-  float pad1;
+  // Sky ambient samples, and therefore visibility rays, per froxel per frame.
+  uint skyVisibilitySampleCount;
+
+  // 0 leaves the sky ambient estimate unoccluded, which leaks sky radiance into interiors.
+  uint16_t skyAmbientVisibility;
+  uint16_t pad0;
+  uint pad1;
+  uint pad2;
+  uint pad3;
 };
 
 #ifdef __cplusplus

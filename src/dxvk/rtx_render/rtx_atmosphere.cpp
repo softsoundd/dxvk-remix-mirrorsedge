@@ -24,25 +24,47 @@
 #include "dxvk_context.h"
 #include "rtx_options.h"
 #include "rtx_context.h"
+#include "rtx_camera.h"
 #include "rtx_scene_manager.h"
 #include "rtx_light_manager.h"
 #include "rtx_lights.h"
 #include "rtx_global_volumetrics.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "../../util/util_color.h"
+#include <rtx_shaders/transmittance_lut.h>
+#include <rtx_shaders/multiscattering_lut.h>
 #include <rtx_shaders/sky_view_lut.h>
+#include <rtx_shaders/aerial_perspective_lut.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 
 namespace dxvk {
-  // Shader definitions for atmosphere LUT generation
-  // Note: the transmittance and multiscattering LUT passes are no longer dispatched -
-  // sky-view LUT generation and all runtime paths use the analytical transmittance and
-  // multiscattering approximations in atmosphere_common.slangh, so those two LUTs were
-  // computed but never read. Their images are still created because the runtime binding
-  // layout (common_bindings.slangh) declares them.
+  // Shader definitions for atmosphere LUT generation. The transmittance and multiscattering LUTs
+  // depend only on the atmosphere parameters, the sky-view LUT additionally on the sun, and the
+  // aerial perspective volume on the camera frustum, so they are baked in that order.
   namespace {
+    class TransmittanceLutShader : public ManagedShader {
+      SHADER_SOURCE(TransmittanceLutShader, VK_SHADER_STAGE_COMPUTE_BIT, transmittance_lut)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        RW_TEXTURE2D(1)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(TransmittanceLutShader);
+
+    class MultiscatteringLutShader : public ManagedShader {
+      SHADER_SOURCE(MultiscatteringLutShader, VK_SHADER_STAGE_COMPUTE_BIT, multiscattering_lut)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        RW_TEXTURE2D(2)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(MultiscatteringLutShader);
+
     class SkyViewLutShader : public ManagedShader {
       SHADER_SOURCE(SkyViewLutShader, VK_SHADER_STAGE_COMPUTE_BIT, sky_view_lut)
       
@@ -50,11 +72,22 @@ namespace dxvk {
         CONSTANT_BUFFER(0)
         TEXTURE2D(1)
         TEXTURE2D(2)
-        SAMPLER(3)
-        RW_TEXTURE2D(4)
+        RW_TEXTURE2D(3)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(SkyViewLutShader);
+
+    class AerialPerspectiveLutShader : public ManagedShader {
+      SHADER_SOURCE(AerialPerspectiveLutShader, VK_SHADER_STAGE_COMPUTE_BIT, aerial_perspective_lut)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        TEXTURE2D(2)
+        RW_TEXTURE3D(3)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
 
     constexpr float kAtmPi = 3.14159265358979323846f;
 
@@ -69,36 +102,94 @@ namespace dxvk {
       return Vector3(a.x * b.x, a.y * b.y, a.z * b.z);
     }
 
-    // CPU port of getAtmosphericTransmittanceForDir / getTransmittanceToSunAtAltitude.
-    // dirYUp must be normalized, Y-up. Ozone density at the layer altitude is 1.
-    // altitudeKm scales remaining optical depth by exp(-h/H).
+    float atmOzoneDensity(const AtmosphereArgs& a, float altitudeKm) {
+      const float halfWidth = std::max(a.ozoneLayerWidth, 1e-3f);
+      return std::max(0.0f, 1.0f - std::abs(altitudeKm - a.ozoneLayerAltitude) / halfWidth);
+    }
+
+    // Ray-sphere roots for a unit length direction, sorted. Returns false when the ray misses.
+    bool atmIntersectSphere(
+      const Vector3& origin, const Vector3& direction, const Vector3& center, float radius,
+      float& outNear, float& outFar) {
+      const Vector3 oc = origin - center;
+      const float b = 2.0f * dot(oc, direction);
+      const float c = dot(oc, oc) - radius * radius;
+      const float discriminant = b * b - 4.0f * c;
+
+      if (discriminant < 0.0f) {
+        return false;
+      }
+
+      const float sqrtDiscriminant = std::sqrt(discriminant);
+      outNear = (-b - sqrtDiscriminant) * 0.5f;
+      outFar = (-b + sqrtDiscriminant) * 0.5f;
+
+      return true;
+    }
+
+    // CPU counterpart of evalSunShadowing(). Ray marches the optical depth from an altitude toward
+    // the sun through the spherical atmosphere, the same integral the transmittance LUT bakes, so the
+    // CPU-side sun light and the GPU sky agree. Returns zero once the planet occludes the sun.
+    // dirYUp must be unit length.
     Vector3 atmTransmittanceYUp(const AtmosphereArgs& a, const Vector3& dirYUp, float altitudeKm = 0.0f) {
-      const float H = a.rayleighScaleHeight;
-      const float zc = dirYUp.y;
-      float airMass;
-      if (zc > 0.01f) {
-        const float zenithRad = std::acos(std::min(std::max(zc, -1.0f), 1.0f));
-        const float zenithDeg = zenithRad * (180.0f / kAtmPi);
-        airMass = 1.0f / (zc + 0.15f * std::pow(93.885f - zenithDeg, -1.253f));
-      } else {
-        airMass = 40.0f * std::exp(-zc * 10.0f);
+      const Vector3 planetCenter(0.0f, -a.planetRadius, 0.0f);
+      const Vector3 origin(0.0f, std::max(altitudeKm, 0.0f), 0.0f);
+
+      float tNear, tFar;
+
+      // Any intersection ahead of the origin means the sun is below the local horizon. The radius is
+      // nudged inward so a sample sitting exactly on the ground is not self shadowed.
+      if (atmIntersectSphere(origin, dirYUp, planetCenter, a.planetRadius * (1.0f - 1e-5f), tNear, tFar)
+          && tFar >= 0.0f) {
+        return Vector3(0.0f, 0.0f, 0.0f);
       }
-      airMass = std::min(airMass, 200.0f);
-      const float h = std::max(altitudeKm, 0.0f);
-      const float rayleighDensity = std::exp(-h / std::max(H, 1e-3f));
-      const float mieDensity = std::exp(-h / std::max(a.mieScaleHeight, 1e-3f));
-      const float rayleighOD = H * airMass * rayleighDensity;
-      const float mieOD = a.mieScaleHeight * airMass * mieDensity;
-      const float ozonePath = airMass * rayleighDensity;
-      Vector3 t(
-        std::exp(-(a.rayleighScattering.x * rayleighOD + a.mieScattering.x * mieOD + a.ozoneAbsorption.x * ozonePath * 0.15f)),
-        std::exp(-(a.rayleighScattering.y * rayleighOD + a.mieScattering.y * mieOD + a.ozoneAbsorption.y * ozonePath * 0.15f)),
-        std::exp(-(a.rayleighScattering.z * rayleighOD + a.mieScattering.z * mieOD + a.ozoneAbsorption.z * ozonePath * 0.15f)));
-      if (zc < 0.0f) {
-        const float f = std::exp(-(-zc) * 15.0f);
-        t = Vector3(t.x * f, t.y * f, t.z * f);
+
+      // March to the top of the atmosphere along the sun direction.
+      if (!atmIntersectSphere(origin, dirYUp, planetCenter, a.atmosphereRadius, tNear, tFar) || tFar <= 0.0f) {
+        return Vector3(1.0f, 1.0f, 1.0f);
       }
-      return t;
+
+      const float tEnd = tFar;
+
+      // Matches the shader's power distributed steps: short near the origin where the air is densest.
+      constexpr int kSteps = 40;
+      constexpr float kStepExponent = 2.0f;
+      Vector3 opticalDepth(0.0f, 0.0f, 0.0f);
+      float segmentStart = 0.0f;
+
+      for (int i = 0; i < kSteps; ++i) {
+        const float segmentEnd = std::pow(float(i + 1) / float(kSteps), kStepExponent);
+        const float dt = (segmentEnd - segmentStart) * tEnd;
+        const float t = (segmentStart + (segmentEnd - segmentStart) * 0.5f) * tEnd;
+        segmentStart = segmentEnd;
+
+        if (dt <= 0.0f) {
+          continue;
+        }
+
+        const Vector3 samplePos = origin + dirYUp * t;
+        const float h = std::min(
+          std::max(length(samplePos - planetCenter) - a.planetRadius, 0.0f), a.atmosphereThickness);
+
+        const float densityR = std::exp(-h / std::max(a.rayleighScaleHeight, 1e-3f));
+        const float densityM = std::exp(-h / std::max(a.mieScaleHeight, 1e-3f));
+        const float densityO3 = atmOzoneDensity(a, h);
+
+        opticalDepth.x += (a.rayleighScattering.x * densityR
+                        + (a.mieScattering.x + a.mieAbsorption.x) * densityM
+                        + a.ozoneAbsorption.x * densityO3) * dt;
+        opticalDepth.y += (a.rayleighScattering.y * densityR
+                        + (a.mieScattering.y + a.mieAbsorption.y) * densityM
+                        + a.ozoneAbsorption.y * densityO3) * dt;
+        opticalDepth.z += (a.rayleighScattering.z * densityR
+                        + (a.mieScattering.z + a.mieAbsorption.z) * densityM
+                        + a.ozoneAbsorption.z * densityO3) * dt;
+      }
+
+      return Vector3(
+        std::exp(-std::min(opticalDepth.x, 1e3f)),
+        std::exp(-std::min(opticalDepth.y, 1e3f)),
+        std::exp(-std::min(opticalDepth.z, 1e3f)));
     }
   }
 
@@ -156,6 +247,9 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   float aerosolDensity = RtxOptions::aerosolDensity();
   args.mieScattering = RtxOptions::mieScattering() * aerosolDensity;
   
+  // Aerosols both scatter and absorb, so Mie extinction needs the absorption term too.
+  args.mieAbsorption = RtxOptions::mieAbsorption() * aerosolDensity;
+
   args.mieAnisotropy = RtxOptions::mieAnisotropy();
   
   // Sun Angular Radius (from Sun Size in degrees)
@@ -165,6 +259,8 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   
   // Brightness multiplier
   args.sunRayBrightness = 1.0f; 
+
+  args.sunDiscEnabled = RtxOptions::sunDisc() ? 1u : 0u;
 
   // Ozone absorption (Base * Density Multiplier)
   float ozoneDensity = RtxOptions::ozoneDensity();
@@ -191,19 +287,42 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   args.rayleighScaleHeight = kRayleighScaleHeight;
   args.mieScaleHeight = kMieScaleHeight;
 
+  // Aerial perspective. The camera basis is filled in per frame by fillAerialPerspectiveArgs().
+  const float worldUnitsPerMeter = RtxOptions::getMeterToWorldUnitScale();
+  args.aerialPerspectiveLutSize = RtxOptions::aerialPerspective() ? kAerialPerspectiveLutSize : 0u;
+  args.aerialPerspectiveDepthRange =
+    RtxOptions::aerialPerspectiveDepthRangeMeters() * worldUnitsPerMeter;
+  args.worldUnitsPerKilometer = worldUnitsPerMeter * 1000.0f;
+  args.isZUp = RtxOptions::zUp() ? 1u : 0u;
+
+  // Hand off to the global volumetrics froxel grid: everything nearer than its range is already
+  // integrated there, so double counting is avoided by starting the atmospheric march past it.
+  args.aerialPerspectiveStartDistance = RtxGlobalVolumetrics::enable()
+    ? RtxGlobalVolumetrics::froxelMaxDistanceMeters() * worldUnitsPerMeter
+    : 0.0f;
+
   return args;
 }
 
-bool RtxAtmosphere::needsLutRecompute() const {
+void RtxAtmosphere::fillAerialPerspectiveArgs(AtmosphereArgs& args, const RtCamera& camera) {
+  // Frustum half extents at unit forward distance, so the shader's ray direction always has a
+  // forward component of exactly one and the slice index maps linearly to forward distance.
+  const float tanHalfFovY = std::tan(camera.getFov() * 0.5f);
+  const float tanHalfFovX = tanHalfFovY * camera.getAspectRatio();
+
+  args.cameraPosition = camera.getPosition();
+  args.cameraForward = camera.getDirection();
+  args.cameraRight = camera.getRight() * tanHalfFovX;
+  args.cameraUp = camera.getUp() * tanHalfFovY;
+}
+
+bool RtxAtmosphere::needsLutRecompute(const AtmosphereArgs& args) const {
   if (!m_initialized || m_lutsNeedRecompute) {
     return true;
   }
 
-  // Check if any parameters have changed
-  AtmosphereArgs currentArgs = getAtmosphereArgs();
-  
-  // Compare with cached args (simple memcmp would work for POD types)
-  return memcmp(&currentArgs, &m_cachedArgs, sizeof(AtmosphereArgs)) != 0;
+  // Only the camera independent prefix matters here; see kBakeInvariantArgsSize.
+  return memcmp(&args, &m_cachedArgs, kBakeInvariantArgsSize) != 0;
 }
 
 void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
@@ -254,56 +373,100 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     VkClearColorValue{}, // clearValue
     1 // mipLevels
   );
+
+  // Create aerial perspective volume (in-scatter in RGB, mean transmittance in A)
+  VkExtent3D aerialPerspectiveExtent = {
+    kAerialPerspectiveLutSize, kAerialPerspectiveLutSize, kAerialPerspectiveLutSize };
+  m_aerialPerspectiveLut = Resources::createImageResource(
+    ctx,
+    "Atmosphere Aerial Perspective LUT",
+    aerialPerspectiveExtent,
+    VK_FORMAT_R16G16B16A16_SFLOAT,
+    1, // numLayers
+    VK_IMAGE_TYPE_3D,
+    VK_IMAGE_VIEW_TYPE_3D,
+    0, // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
+    VkClearColorValue{}, // clearValue
+    1 // mipLevels
+  );
 }
 
-void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx) {
-  if (!needsLutRecompute()) {
-    return;
+void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args) {
+  // One upload serves every pass below.
+  ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+
+  if (needsLutRecompute(args)) {
+    m_cachedArgs = args;
+
+    // Transmittance first: the multiscattering and sky-view bakes both sample it.
+    dispatchTransmittanceLut(ctx);
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    dispatchMultiscatteringLut(ctx);
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    dispatchSkyViewLut(ctx);
+
+    m_lutsNeedRecompute = false;
   }
 
-  // Update cached args
-  m_cachedArgs = getAtmosphereArgs();
+  // Camera fitted, so this rebuilds every frame regardless of whether the bakes above ran. The
+  // barrier covers the transmittance and multiscattering LUTs it samples.
+  if (args.aerialPerspectiveLutSize > 0) {
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-  dispatchSkyViewLut(ctx);
-  
-  // Final barrier: Ensure the LUT is written before use in ray tracing
+    dispatchAerialPerspectiveLut(ctx);
+  }
+
+  // Final barrier: Ensure the LUTs are written before use in ray tracing
   ctx->emitMemoryBarrier(0,
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_ACCESS_SHADER_WRITE_BIT,
     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     VK_ACCESS_SHADER_READ_BIT);
+}
 
-  m_lutsNeedRecompute = false;
+void RtxAtmosphere::dispatchTransmittanceLut(Rc<DxvkContext> ctx) {
+  ScopedGpuProfileZone(ctx, "Atmosphere Transmittance LUT");
+
+  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+  ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
+
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_transmittanceLut.image);
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, TransmittanceLutShader::getShader());
+  ctx->dispatch((kTransmittanceLutWidth + 15) / 16, (kTransmittanceLutHeight + 15) / 16, 1);
+}
+
+void RtxAtmosphere::dispatchMultiscatteringLut(Rc<DxvkContext> ctx) {
+  ScopedGpuProfileZone(ctx, "Atmosphere Multiscattering LUT");
+
+  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+  ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
+  ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
+
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_multiscatteringLut.image);
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, MultiscatteringLutShader::getShader());
+  ctx->dispatch((kMultiscatteringLutSize + 7) / 8, (kMultiscatteringLutSize + 7) / 8, 1);
 }
 
 void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ScopedGpuProfileZone(ctx, "Atmosphere Sky View LUT");
-  
-  // Update atmosphere args buffer
-  AtmosphereArgs args = getAtmosphereArgs();
-  ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
-  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
-  
-  // Bind resources
-  // Note: the transmittance/multiscattering LUT inputs are still declared by the shader
-  // interface but the generation code evaluates both analytically and never samples them.
+
   ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
   ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
   ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
-  
-  if (m_lutSampler == nullptr) {
-    DxvkSamplerCreateInfo samplerInfo = {};
-    samplerInfo.magFilter = VK_FILTER_LINEAR;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    m_lutSampler = m_device->createSampler(samplerInfo);
-  }
-  ctx->bindResourceSampler(3, m_lutSampler);
-  
-  ctx->bindResourceView(4, m_skyViewLut.view, nullptr);
+  ctx->bindResourceView(3, m_skyViewLut.view, nullptr);
   
   // Track resources
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
@@ -319,9 +482,22 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ctx->dispatch(groupsX, groupsY, 1);
 }
 
-void RtxAtmosphere::bindResources(Rc<DxvkContext> ctx, VkPipelineBindPoint pipelineBindPoint) {
-  // TODO: Bind atmosphere LUT resources to the pipeline
-  // This will be called from RtxContext to make the LUTs available to shaders
+void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
+  ScopedGpuProfileZone(ctx, "Atmosphere Aerial Perspective LUT");
+
+  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+  ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
+  ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
+  ctx->bindResourceView(3, m_aerialPerspectiveLut.view, nullptr);
+
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_aerialPerspectiveLut.image);
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AerialPerspectiveLutShader::getShader());
+
+  const uint32_t groups = (kAerialPerspectiveLutSize + 3) / 4;
+  ctx->dispatch(groups, groups, groups);
 }
 
 void RtxAtmosphere::dropDistantSunLight() {
@@ -381,76 +557,43 @@ void RtxAtmosphere::estimateVolumeSunsetWarmTint(const AtmosphereArgs& args, Vec
 
 void RtxAtmosphere::syncDistantSunLight(RtxContext& ctx, const AtmosphereArgs& args) {
   // Sole Physical Atmosphere sun for surface NEE + Volume ReSTIR.
-  // Radiance matches sampleAtmosphereSunLight / pi (distant-light solid-angle concentration).
   LightManager& lm = ctx.getSceneManager().getLightManager();
   const bool isZUp = RtxOptions::zUp();
   constexpr float kMinHalfAngle = 0.0005f;
-  constexpr float kTwilightLo = -0.259f; // -15 deg
-  constexpr float kTwilightHi = 0.05f;
 
   const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
-  const float elevFade = atmSmoothstep(kTwilightLo, kTwilightHi, sunDirYUp.y);
+  const bool sunAboveHorizon = sunDirYUp.y > 0.0f;
 
+  // RtDistantLight stores illuminance / pi, since distantLightSampleArea() recovers the sample
+  // radiance as that divided by sin^2(halfAngle). This keeps the delivered illuminance independent
+  // of the cone width, so widening the cone only softens shadows and dims the reflected disc.
+  //
+  // The horizon needs no artificial fade: atmTransmittanceYUp() reddens and then extinguishes the
+  // sun as it descends, and returns zero once the planet occludes it. Twilight is then the sky's own
+  // multiple scattering rather than direct sunlight leaking below the horizon.
   Vector3 radiance(0.0f, 0.0f, 0.0f);
-  Vector3 T(1.0f, 1.0f, 1.0f);
-  if (elevFade > 0.0f) {
-    const float mieModulation = 0.3f + 1.7f * args.mieAnisotropy;
-    const float sunVisibility = 0.05f + 0.95f * atmSmoothstep(0.0f, 0.8f, args.mieAnisotropy);
-    Vector3 dirForT = sunDirYUp;
-    if (dirForT.y < 0.02f) {
-      dirForT.y = 0.02f;
-      const float len = std::sqrt(dirForT.x * dirForT.x + dirForT.y * dirForT.y + dirForT.z * dirForT.z);
-      dirForT = Vector3(dirForT.x / len, dirForT.y / len, dirForT.z / len);
-    }
-    T = atmTransmittanceYUp(args, dirForT, args.viewAltitude);
+  if (sunAboveHorizon) {
+    const Vector3 T = atmTransmittanceYUp(args, sunDirYUp, args.viewAltitude);
     const Vector3 sunIll(args.sunIlluminance.x, args.sunIlluminance.y, args.sunIlluminance.z);
-    const Vector3 sample = atmMul(sunIll, T) * (mieModulation * sunVisibility * args.sunRayBrightness * 0.5f * elevFade);
-    radiance = sample * (1.0f / kAtmPi);
+    const Vector3 illuminance = atmMul(sunIll, T) * args.sunRayBrightness;
+    radiance = illuminance * (1.0f / kAtmPi);
   }
 
   const Vector3 toSun = isZUp
     ? Vector3(sunDirYUp.x, sunDirYUp.z, sunDirYUp.y)
     : sunDirYUp;
   // Propagation toward the ground (= -toBody).
-  const Vector3 propDir = (elevFade > 0.0f)
+  const Vector3 propDir = sunAboveHorizon
     ? Vector3(-toSun.x, -toSun.y, -toSun.z)
     : Vector3(0.0f, -1.0f, 0.0f);
 
-  // Soft shadows = distant-light cone half-angle. Widen with atmosphere/fog OD.
-  // Do not rescale radiance by sin²θ: GPU samples use radiance/sin²θ while ReSTIR
-  // weights use raw radiance, so energy-preserving scales over-select the sun.
-  const float baseHalfAngle = std::max(args.sunAngularRadius, kMinHalfAngle);
-  float extraHalfAngle = 0.0f;
-  if (elevFade > 0.0f) {
-    const float avgT = std::max((T.x + T.y + T.z) * (1.0f / 3.0f), 1e-4f);
-    const float atmOd = -std::log(avgT);
-    extraHalfAngle += std::min(atmOd * 0.035f, 6.0f * (kAtmPi / 180.0f));
-
-    if (RtxGlobalVolumetrics::enable()) {
-      const Vector3 tcLin = sRGBGammaToLinear(RtxGlobalVolumetrics::transmittanceColor());
-      const float tLum = std::min(std::max(sRGBLuminance(tcLin), 1e-4f), 0.999f);
-      const float meas = std::max(
-        RtxGlobalVolumetrics::transmittanceMeasurementDistanceMeters() * RtxOptions::getMeterToWorldUnitScale(),
-        1e-3f);
-      const float sigma = -std::log(tLum) / meas;
-      const Vector3 alb = RtxGlobalVolumetrics::singleScatteringAlbedo();
-      const float aLum = std::min(std::max(sRGBLuminance(alb), 0.0f), 1.0f);
-      const float scenicMeters = std::max(
-        RtxGlobalVolumetrics::froxelMaxDistanceMeters() * 3.0f,
-        120.0f);
-      const float scenicPath = scenicMeters * RtxOptions::getMeterToWorldUnitScale();
-      const float extOd = sigma * scenicPath;
-      const float absorbOd = sigma * (1.0f - aLum) * scenicPath;
-      const float fogOd = std::min(extOd + 1.5f * absorbOd, 8.0f);
-      // Thin media stay near the geometric disk; dense fog ramps to full widen.
-      constexpr float kFogOdSoftStart = 0.35f;
-      constexpr float kFogOdSoftFull = 2.0f;
-      const float fogSoft = atmSmoothstep(kFogOdSoftStart, kFogOdSoftFull, fogOd);
-      extraHalfAngle += fogSoft * (10.0f * (kAtmPi / 180.0f));
-    }
-  }
+  // The cone half-angle doubles as the sun's apparent size in every glossy reflection, so widening it
+  // to soften shadows also makes the reflected sun larger and dimmer. sunShadowSoftening keeps that
+  // trade-off opt-in rather than deriving a widening from atmospheric or fog optical depth.
   constexpr float kMaxHalfAngle = 12.0f * (kAtmPi / 180.0f);
-  const float halfAngle = std::min(baseHalfAngle + extraHalfAngle, kMaxHalfAngle);
+  const float softening = RtxOptions::sunShadowSoftening() * (kAtmPi / 180.0f);
+  const float halfAngle = std::min(
+    std::max(args.sunAngularRadius, kMinHalfAngle) + std::max(softening, 0.0f), kMaxHalfAngle);
 
   const Vector3 clamped(
     std::max(radiance.x, 0.0f),

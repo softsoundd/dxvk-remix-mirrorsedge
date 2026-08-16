@@ -264,10 +264,19 @@ namespace dxvk {
                "This scaling factor is applied to the fixed function fog's color and becomes a multiscattering approximation in the volumetrics system.\n"
                "Sometimes useful but this multiscattering approximation is very basic (just a simple ambient term for now essentially) and may not look very good depending on various conditions.",
                args.minValue = 0.0f);
-    RTX_OPTION_ARGS("rtx.volumetrics", float, atmosphereVolumeAmbientScale, 0.75f,
-               "Physical Atmosphere only. Strength of the directional sky-view LUT hemisphere injected into froxel SH.\n"
-               "0 disables sky→froxel lighting. Typical range 0.5–1.5.",
+    RTX_OPTION_ARGS("rtx.volumetrics", float, atmosphereVolumeAmbientScale, 1.0f,
+               "Physical Atmosphere only. Gain on the sky-view LUT hemisphere injected into froxel SH.\n"
+               "0 disables sky→froxel lighting, 1 = physical (unbiased hemisphere integral). Typical range 0.5–1.5.",
                args.minValue = 0.0f, args.maxValue = 4.0f);
+    RTX_OPTION("rtx.volumetrics", bool, skyAmbientVisibility, true,
+               "Physical Atmosphere only. Trace a visibility ray per sky ambient sample so interiors do not inherit\n"
+               "outdoor sky radiance. Disabling it leaves the estimate unoccluded, which tints indoor translucent\n"
+               "surfaces with sky colour since their diffuse layer reads the froxel cache directly.");
+    RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, skyVisibilitySampleCount, 2,
+               "Physical Atmosphere only. Sky ambient samples (and therefore visibility rays) per froxel per frame.\n"
+               "Variance is absorbed by the froxel history, so low counts are usually fine; raise if fast camera\n"
+               "motion leaves visible noise in freshly disoccluded fog.",
+               args.minValue = 1u, args.maxValue = 8u);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogSunVisibilityGain, 1.2f,
                "Artistic gain on directional froxel in-scatter (sun shafts / anisotropic lobe excess over isotropic sky fill).\n"
                "Does not scale the isotropic sky floor or multiScatteringEstimate — raise for stronger shafts without washing ambient fog.\n"

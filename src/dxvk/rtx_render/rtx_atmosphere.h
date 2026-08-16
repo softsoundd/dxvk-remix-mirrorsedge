@@ -50,20 +50,17 @@ public:
 
   /**
    * \brief Compute atmospheric LUTs if needed
-   * 
-   * Checks if parameters have changed and recomputes LUTs if necessary.
+   *
+   * The transmittance, multiscattering and sky-view LUTs only depend on the atmosphere parameters,
+   * so they are rebaked when those change. The aerial perspective volume is fitted to the camera
+   * frustum and is therefore rebuilt every frame.
    */
-  void computeLuts(Rc<DxvkContext> ctx);
+  void computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
 
   /**
-   * \brief Bind atmosphere resources to pipeline
+   * \brief Check if the parameter-driven LUTs need recomputation
    */
-  void bindResources(Rc<DxvkContext> ctx, VkPipelineBindPoint pipelineBindPoint);
-
-  /**
-   * \brief Check if LUTs need recomputation
-   */
-  bool needsLutRecompute() const;
+  bool needsLutRecompute(const AtmosphereArgs& args) const;
 
   /**
    * \brief Get transmittance LUT resource
@@ -81,9 +78,22 @@ public:
   Resources::Resource getSkyViewLut() const { return m_skyViewLut; }
 
   /**
+   * \brief Get aerial perspective LUT resource
+   */
+  Resources::Resource getAerialPerspectiveLut() const { return m_aerialPerspectiveLut; }
+
+  /**
    * \brief Build atmosphere parameters from current RtxOptions (no GPU state).
+   *
+   * The aerial perspective camera fields are left zeroed; fillAerialPerspectiveArgs supplies them
+   * once a camera is available.
    */
   static AtmosphereArgs buildAtmosphereArgsFromOptions();
+
+  /**
+   * \brief Fill in the per-frame camera frustum basis used by the aerial perspective volume.
+   */
+  static void fillAerialPerspectiveArgs(AtmosphereArgs& args, const class RtCamera& camera);
 
   /**
    * \brief Get current atmosphere parameters
@@ -117,7 +127,10 @@ public:
 
 private:
   void createLutResources(Rc<DxvkContext> ctx);
+  void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
+  void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
+  void dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx);
 
   // LUT dimensions
   static constexpr uint32_t kTransmittanceLutWidth = 512;   // Increased from 256 for better precision
@@ -125,17 +138,23 @@ private:
   static constexpr uint32_t kMultiscatteringLutSize = 32;
   static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
   static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
+  // Paper Section 5.4 uses 32^3 over the frustum, which is enough for such a low frequency effect.
+  static constexpr uint32_t kAerialPerspectiveLutSize = 32;
 
   // Scale heights for exponential density profiles (in km)
   static constexpr float kRayleighScaleHeight = 8.0f;
   static constexpr float kMieScaleHeight = 1.2f;
 
+  // Only the leading, camera independent portion of AtmosphereArgs invalidates the baked LUTs. The
+  // aerial perspective fields that follow change every frame and have their own dispatch.
+  static constexpr size_t kBakeInvariantArgsSize = offsetof(AtmosphereArgs, aerialPerspectiveLutSize);
+
   Resources::Resource m_transmittanceLut;
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
-  
+  Resources::Resource m_aerialPerspectiveLut;
+
   Rc<DxvkBuffer> m_constantsBuffer;
-  Rc<DxvkSampler> m_lutSampler;
 
   AtmosphereArgs m_cachedArgs;
   bool m_initialized = false;

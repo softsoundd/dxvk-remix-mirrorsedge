@@ -3078,10 +3078,12 @@ namespace dxvk {
             RtxOptions::sunIlluminanceObject().setImmediately(Vector3(20.0f, 20.0f, 20.0f));
             RtxOptions::planetRadiusObject().setImmediately(6371.0f);
             RtxOptions::atmosphereThicknessObject().setImmediately(100.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(5.8e-3f, 13.5e-3f, 33.1e-3f));
+            // Table 1 of the paper, converted from m^-1 to km^-1.
+            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f));
             RtxOptions::mieScatteringObject().setImmediately(Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f));
+            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(4.4e-3f, 4.4e-3f, 4.4e-3f));
             RtxOptions::mieAnisotropyObject().setImmediately(0.8f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(2.04e-3f, 4.97e-3f, 2.14e-4f));
+            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
             RtxOptions::ozoneLayerAltitudeObject().setImmediately(25.0f);
             RtxOptions::ozoneLayerWidthObject().setImmediately(15.0f);
           }
@@ -3094,6 +3096,9 @@ namespace dxvk {
             RtxOptions::atmosphereThicknessObject().setImmediately(50.0f);
             RtxOptions::rayleighScatteringObject().setImmediately(Vector3(8.0e-3f, 10.0e-3f, 12.0e-3f));
             RtxOptions::mieScatteringObject().setImmediately(Vector3(8.0e-3f, 8.0e-3f, 8.0e-3f));
+            // Iron rich dust absorbs strongly toward the blue end, which is what inverts the sky
+            // and sunset colours relative to Earth.
+            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(4.0e-3f, 6.0e-3f, 10.0e-3f));
             RtxOptions::mieAnisotropyObject().setImmediately(0.7f);
             RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.0f, 0.0f, 0.0f));
             RtxOptions::ozoneLayerAltitudeObject().setImmediately(0.0f);
@@ -3108,8 +3113,9 @@ namespace dxvk {
             RtxOptions::atmosphereThicknessObject().setImmediately(80.0f);
             RtxOptions::rayleighScatteringObject().setImmediately(Vector3(4.0e-3f, 9.0e-3f, 22.0e-3f));
             RtxOptions::mieScatteringObject().setImmediately(Vector3(1.0e-3f, 1.0e-3f, 1.0e-3f));
+            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(1.1e-3f, 1.1e-3f, 1.1e-3f));
             RtxOptions::mieAnisotropyObject().setImmediately(0.9f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(2.04e-3f, 4.97e-3f, 2.14e-4f));
+            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
             RtxOptions::ozoneLayerAltitudeObject().setImmediately(25.0f);
             RtxOptions::ozoneLayerWidthObject().setImmediately(15.0f);
           }
@@ -3119,10 +3125,12 @@ namespace dxvk {
             RtxOptions::sunIlluminanceObject().setImmediately(Vector3(18.0f, 18.0f, 18.0f));
             RtxOptions::planetRadiusObject().setImmediately(6371.0f);
             RtxOptions::atmosphereThicknessObject().setImmediately(100.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(5.8e-3f, 13.5e-3f, 33.1e-3f));
+            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f));
             RtxOptions::mieScatteringObject().setImmediately(Vector3(12.0e-3f, 12.0e-3f, 12.0e-3f));
+            // Pollution is soot heavy, so absorption dominates scattering here.
+            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(18.0e-3f, 18.0e-3f, 18.0e-3f));
             RtxOptions::mieAnisotropyObject().setImmediately(0.65f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(2.04e-3f, 4.97e-3f, 2.14e-4f));
+            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
             RtxOptions::ozoneLayerAltitudeObject().setImmediately(25.0f);
             RtxOptions::ozoneLayerWidthObject().setImmediately(15.0f);
           }
@@ -3135,6 +3143,7 @@ namespace dxvk {
             RtxOptions::atmosphereThicknessObject().setImmediately(120.0f);
             RtxOptions::rayleighScatteringObject().setImmediately(Vector3(4.0e-3f, 18.0e-3f, 10.0e-3f));
             RtxOptions::mieScatteringObject().setImmediately(Vector3(5.0e-3f, 5.0e-3f, 5.0e-3f));
+            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(5.5e-3f, 5.5e-3f, 5.5e-3f));
             RtxOptions::mieAnisotropyObject().setImmediately(0.75f);
             RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(1.0e-3f, 0.5e-3f, 3.0e-3f));
             RtxOptions::ozoneLayerAltitudeObject().setImmediately(30.0f);
@@ -3149,6 +3158,7 @@ namespace dxvk {
             RtxOptions::atmosphereThicknessObject().setImmediately(90.0f);
             RtxOptions::rayleighScatteringObject().setImmediately(Vector3(7.0e-3f, 11.0e-3f, 18.0e-3f));
             RtxOptions::mieScatteringObject().setImmediately(Vector3(15.0e-3f, 12.0e-3f, 8.0e-3f));
+            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(8.0e-3f, 10.0e-3f, 16.0e-3f));
             RtxOptions::mieAnisotropyObject().setImmediately(0.6f);
             RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.5e-3f, 1.0e-3f, 0.1e-3f));
             RtxOptions::ozoneLayerAltitudeObject().setImmediately(20.0f);
@@ -3161,9 +3171,23 @@ namespace dxvk {
           RemixGui::Checkbox("Use Sky View LUT", &RtxOptions::useSkyViewLutObject());
           RemixGui::SetTooltipToLastWidgetOnHover("Sample the precomputed sky-view LUT on ray misses instead of ray marching the atmosphere per ray.\nVisually identical at a fraction of the GPU cost; disable only to A/B compare against the reference inline evaluation.");
 
+          RemixGui::Checkbox("Aerial Perspective", &RtxOptions::aerialPerspectiveObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Apply the atmosphere's in-scatter and extinction to scene geometry, which is what gives distant\nbuildings and terrain their haze and desaturation. Hands off to the global volumetrics froxel grid\nat its range so the two do not double count.");
+
+          if (RtxOptions::aerialPerspective()) {
+            RemixGui::DragFloat("Aerial Perspective Range", &RtxOptions::aerialPerspectiveDepthRangeMetersObject(), 100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Depth covered by the 32 slice aerial perspective volume. Reduce for denser atmospheres to spend\nthe slices over a shorter, more accurate range.");
+          }
+
           if (ImGui::TreeNode("Atmosphere Parameters")) {
+            RemixGui::Checkbox("Sun Disc", &RtxOptions::sunDiscObject());
+            RemixGui::SetTooltipToLastWidgetOnHover("Draw the sun disc into the environment on camera and mirror rays, which cannot reach the sun\nthrough next event estimation. Without it, a mirror reflecting the sky shows no sun at all.");
+
             RemixGui::DragFloat("Sun Size", &RtxOptions::sunSizeObject(), 0.01f, 0.0f, 10.0f, "%.3f deg", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Size of sun disc in degrees");
+            RemixGui::SetTooltipToLastWidgetOnHover("Angular diameter of the sun disc in degrees; Earth's sun is 0.545.\nAlso sets the sun's size and peak intensity in glossy reflections, so keep it physical and use\nSun Shadow Softening if you want softer shadows.");
+
+            RemixGui::DragFloat("Sun Shadow Softening", &RtxOptions::sunShadowSofteningObject(), 0.01f, 0.0f, 12.0f, "%.2f deg", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Extra half-angle added to the sun's cone purely to widen shadow penumbrae.\nThis trades reflection fidelity for softer shadows: the cone also sets how large and how bright the\nsun looks in reflections, so any non-zero value makes the reflected sun wider and dimmer.");
 
             RemixGui::DragFloat("Sun Intensity", &RtxOptions::sunIntensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
             RemixGui::SetTooltipToLastWidgetOnHover("Strength of Sun");
@@ -3190,13 +3214,17 @@ namespace dxvk {
               RemixGui::DragFloat("Planet Radius", &RtxOptions::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
               RemixGui::DragFloat("Atmosphere Thickness", &RtxOptions::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
               RemixGui::DragFloat("Mie Anisotropy", &RtxOptions::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Aerosol phase asymmetry. 0.8 is the paper's Earth default; approaching 1 concentrates nearly all\naerosol scattering into a tight forward halo around the sun.");
 
               RemixGui::DragFloat3("Base Sun Illuminance", &RtxOptions::sunIlluminanceObject(), 0.1f, 0.0f, 100.0f, "%.1f", sliderFlags);
               RemixGui::DragFloat3("Base Rayleigh", &RtxOptions::rayleighScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
-              RemixGui::DragFloat3("Base Mie", &RtxOptions::mieScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
+              RemixGui::DragFloat3("Base Mie Scattering", &RtxOptions::mieScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
+              RemixGui::DragFloat3("Base Mie Absorption", &RtxOptions::mieAbsorptionObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Aerosols absorb as well as scatter. Raising this relative to Mie scattering darkens the haze and\ncan tint it, which is how a Mars-like sky and its blue sunsets come about.");
               RemixGui::DragFloat3("Base Ozone", &RtxOptions::ozoneAbsorptionObject(), 0.0001f, 0.0f, 0.01f, "%.6f", sliderFlags);
               RemixGui::DragFloat("Ozone Layer Altitude", &RtxOptions::ozoneLayerAltitudeObject(), 0.5f, 0.0f, 50.0f, "%.1f km", sliderFlags);
               RemixGui::DragFloat("Ozone Layer Width", &RtxOptions::ozoneLayerWidthObject(), 0.5f, 1.0f, 30.0f, "%.1f km", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Half-width of the ozone tent profile; the paper uses a 30 km wide tent, so 15.");
 
               ImGui::TreePop();
             }
