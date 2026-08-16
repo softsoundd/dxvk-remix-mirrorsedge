@@ -403,6 +403,7 @@ struct RaytraceArgs {
   uint sssTransmissionBsdfSampleCount;
   uint sssTransmissionSingleScatteringSampleCount;
   uint enableTransmissionDiffusionProfileCorrection;
+  float metersToWorldUnitScale;
   float totalMipBias;
   float hairCardMipBias;
   float hairCardRoughnessScale;
