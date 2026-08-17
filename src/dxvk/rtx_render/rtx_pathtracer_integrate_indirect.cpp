@@ -184,6 +184,7 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(INTEGRATE_INDIRECT_BINDING_NRC_COUNTERS_INPUT_OUTPUT)
 
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT)
+        RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT)
         RW_STRUCTURED_BUFFER(INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RESERVOIR_OUTPUT)
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RADIANCE_OUTPUT)
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_RESTIR_GI_HIT_GEOMETRY_OUTPUT)
@@ -402,6 +403,18 @@ namespace dxvk {
 
     logIntegrateIndirectMode();
 
+    // Written sparsely below, so without this pixels the paths do not reach retain the previous frame's
+    // length.
+    {
+      const VkClearColorValue clearValue = { 0.f, 0.f, 0.f, 0.f };
+      VkImageSubresourceRange subRange = {};
+      subRange.layerCount = 1;
+      subRange.levelCount = 1;
+      subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+      ctx->clearColorImage(rtOutput.m_indirectReflectionSegment.image, clearValue, subRange);
+    }
+
     // Bind resources
 
     // Note: Clamp to edge used to avoid interpolation to black on the edges of the view.
@@ -481,6 +494,7 @@ namespace dxvk {
     reSTIRGI.bindIntegrateIndirectPathTracingResources(*ctx);
 
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Write), nullptr);
+    ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT, rtOutput.m_indirectReflectionSegment.view, nullptr);
     
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(INTEGRATE_INSTRUMENTATION, debugView.getInstrumentation(), nullptr);

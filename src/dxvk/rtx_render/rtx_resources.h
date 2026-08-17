@@ -283,6 +283,8 @@ namespace dxvk
       Resource m_secondaryVirtualWorldShadingNormalPerceptualRoughness;
       Resource m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising;
       Resource m_secondaryHitDistance;
+      // Signed length of the indirect integrator's first bounce; negative means it reached the sky.
+      Resource m_indirectReflectionSegment;
       AliasedResource m_secondaryViewDirection;
       AliasedResource m_secondaryConeRadius;
       AliasedResource m_secondaryWorldPositionWorldTriangleNormal;

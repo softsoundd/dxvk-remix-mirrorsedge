@@ -166,6 +166,10 @@ RWTexture2D<float4> RestirGIHitGeometry;
 layout(rgba16f, binding = INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT)
 RWTexture2D<float4> IndirectRadianceHitDistance;        
 
+// Signed length of the first bounce; negative means that bounce reached the sky.
+layout(r32f, binding = INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT)
+RWTexture2D<float> ReflectionSegment;
+
 layout(binding = INTEGRATE_INDIRECT_BINDING_NEE_CACHE)
 ByteAddressBuffer NeeCache;
 

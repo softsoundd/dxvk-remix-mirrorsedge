@@ -70,6 +70,8 @@
 #define COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT                  58
 #define COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT                59
 #define COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT               60
+// Signed first-bounce length from the indirect integrator, for reflections PSR declined.
+#define COMPOSITE_INDIRECT_REFLECTION_SEGMENT_INPUT                 61
 
 // Inputs/Outputs
 

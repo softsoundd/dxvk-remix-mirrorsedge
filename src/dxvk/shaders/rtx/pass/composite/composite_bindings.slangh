@@ -54,6 +54,8 @@ layout(binding = COMPOSITE_PSR_REFLECTION_SEGMENT_INPUT)
 Texture2D<float> PsrReflectionSegmentLength;
 layout(binding = COMPOSITE_PSR_REFLECTION_DIRECTION_INPUT)
 Texture2D<float2> PsrReflectionDirection;
+layout(binding = COMPOSITE_INDIRECT_REFLECTION_SEGMENT_INPUT)
+Texture2D<float> IndirectReflectionSegment;
 
 layout(binding = COMPOSITE_SECONDARY_ATTENUATION_INPUT)
 RWTexture2D<uint> SecondaryAttenuation;

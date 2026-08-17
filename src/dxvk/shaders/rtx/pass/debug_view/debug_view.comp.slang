@@ -472,10 +472,11 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
     vec3 volumetricPreintegratedRadiance = vec3(0.0f, 0.0f, 0.0f);
     vec3 volumeAttenuation = vec3(1.0f, 1.0f, 1.0f);
     float volumetricIntegrationOffset = 0.f;
+    vec3 unusedMeanInScatter = vec3(0.0f, 0.0f, 0.0f);
     integrateVolumetricNEE(
       randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
       volumeArgs, cb.animationTimeSec * 1000, threadId.xy, screenUV, false, cameraGetWorldPosition(camera), volumeArgs.froxelMaxDistance, primaryRayDirections.worldDirection,
-      volumetricPreintegratedRadiance, volumeAttenuation);
+      volumetricPreintegratedRadiance, volumeAttenuation, unusedMeanInScatter);
     value.xyz = volumetricPreintegratedRadiance;
     break;
   }

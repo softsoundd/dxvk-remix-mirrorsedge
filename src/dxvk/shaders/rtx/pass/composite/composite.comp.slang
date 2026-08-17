@@ -404,10 +404,18 @@ void applyVolumetricLighting(
   float volumetricRadianceScale,
   vec3 remodulatedTotalSecondaryRadiance,
   vec3 sharedRadiance,
-  // PSR one-bounce fog: firstHit > 0 enables dual froxel integrate.
+  // Reflection one-bounce fog: firstHit > 0 enables the dual froxel integrate, whether PSR replaced the
+  // surface or the indirect integrator produced the reflection and stashed its segment.
   float psrFirstHitDistance,
   float psrReflectionSegmentSigned,
   float3 psrReflectionDirection,
+  // Reflectance the fog beyond the surface is seen through. PSR content already carries it; an indirect
+  // reflection is remodulated by specular albedo after denoising, so its haze must be scaled to match.
+  vec3 segmentAttenuation,
+  // PSR content takes the segment's extinction from here. An indirect reflection already had it applied in
+  // the path by RESOLVER_USE_VOLUMETRIC_ATTENUATION, and that radiance buffer also holds the surface's own
+  // direct lighting, which the segment must not attenuate.
+  bool segmentIsPsr,
   out vec3 volumetricPreintegratedRadiance,
   out vec3 volumeAttenuation,
   out vec3 alphaBlendOutput,
@@ -424,6 +432,8 @@ void applyVolumetricLighting(
   volumeAttenuation = vec3(1);
   alphaBlendOutput = vec3(0);
   backgroundAlpha = 1.0f;
+
+  vec3 ignoredMeanInScatter = vec3(0.0f);
 
   // Note: This is only evaluated when volumetrics are enabled, no external check is needed.
   // Todo: Using Primary linear view Z for now, not the best option as this does not work with PSR (among other effects like
@@ -446,37 +456,40 @@ void applyVolumetricLighting(
 
     if (psrReflectionFog)
     {
-      // Camera→mirror, then along the reflection ray. Froxels are camera-frustum grids
-      // (samples outside the frustum are approximate). T = T0*T1; S = S0 + T0*S1.
+      // Camera→mirror, then along the reflection ray. T = T0*T1; S = S0 + T0*S1.
       const float3 cameraPos = cameraGetWorldPosition(cb.camera);
       float3 t0 = vec3(1.0f);
       float3 s0 = vec3(0.0f);
+      float3 cameraRayMeanInScatter = vec3(0.0f);
       integrateVolumetricNEE(
         randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
         cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, false,
         cameraPos, psrFirstHitDistance, primaryRayDirections.worldDirection,
-        s0, t0);
+        s0, t0, cameraRayMeanInScatter);
 
       const float3 mirrorPos = cameraPos + primaryRayDirections.worldDirection * psrFirstHitDistance;
       const bool reflMiss = psrReflectionSegmentSigned < 0.0f;
       const float reflSeg = abs(psrReflectionSegmentSigned);
       float3 t1 = vec3(1.0f);
       float3 s1 = vec3(0.0f);
+      // One value for the whole segment: the fraction of it inside the camera's frustum varies with viewing
+      // angle, and the cache holds nothing outside. Taken from the camera ray's cache mean, which carries
+      // the cache's magnitude and the scene's occlusion.
       integrateVolumetricNEE(
         randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
         cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, reflMiss,
         mirrorPos, reflSeg, psrReflectionDirection,
-        s1, t1);
+        s1, t1, ignoredMeanInScatter, true, cameraRayMeanInScatter);
 
-      volumeAttenuation = t0 * t1;
-      volumetricPreintegratedRadiance = s0 + t0 * s1;
+      volumeAttenuation = segmentIsPsr ? (t0 * t1) : t0;
+      volumetricPreintegratedRadiance = s0 + t0 * s1 * segmentAttenuation;
     }
     else
     {
       integrateVolumetricNEE(
         randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
         cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, primaryMiss, cameraGetWorldPosition(cb.camera), viewDistance, primaryRayDirections.worldDirection,
-        volumetricPreintegratedRadiance, volumeAttenuation);
+        volumetricPreintegratedRadiance, volumeAttenuation, ignoredMeanInScatter);
     }
   }
 
@@ -551,7 +564,7 @@ void applyVolumetricLighting(
         integrateVolumetricNEE(
           randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
           cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, false, cameraGetWorldPosition(cb.camera), surface.hitT, primaryRayDirections.worldDirection,
-          alphaVolumetricPreintegratedRadiance, alphaVolumetricAttenuation);
+          alphaVolumetricPreintegratedRadiance, alphaVolumetricAttenuation, ignoredMeanInScatter);
 
         alphaBlendOutput *= alphaVolumetricAttenuation * (1 - backgroundAlpha);
         alphaBlendOutput += alphaVolumetricPreintegratedRadiance * (1 - backgroundAlpha);
@@ -788,7 +801,8 @@ vec4 compositeResult(
   float psrFirstHitDistance = -1.0f;
   float psrReflectionSegmentSigned = 0.0f;
   float3 psrReflectionDirection = float3(0.0f, 0.0f, 0.0f);
-  if (geometryFlags.performedAnyPSR() && !geometryFlags.secondarySurfaceMask)
+  const bool performedPsr = geometryFlags.performedAnyPSR() && !geometryFlags.secondarySurfaceMask;
+  if (performedPsr)
   {
     const float firstHit = PsrFirstHitDistance[pixelCoordinate];
     if (firstHit > 0.0f)
@@ -802,6 +816,22 @@ vec4 compositeResult(
         psrReflectionSegmentSigned = PsrReflectionSegmentLength[pixelCoordinate];
         psrReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[pixelCoordinate]);
       }
+    }
+  }
+  else if (pixelIsActive && isIndirectActive && !primaryMiss)
+  {
+    // A reflection PSR declined arrives through the indirect integrator, which stashed its first bounce
+    // length. Only the length is stashed; since the segment is lit by a single value its direction enters
+    // only through the density field, so the mirror direction serves a rough lobe.
+    const float indirectSegment = IndirectReflectionSegment[pixelCoordinate];
+    if (indirectSegment != 0.0f)
+    {
+      const float3 shadingNormal =
+        PrimaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].xyz * 2.0f - 1.0f;
+
+      psrFirstHitDistance = viewDistance;
+      psrReflectionSegmentSigned = indirectSegment;
+      psrReflectionDirection = reflect(primaryRayDirections.worldDirection, normalize(shadingNormal));
     }
   }
 
@@ -870,6 +900,7 @@ vec4 compositeResult(
     pixelCoordinate, randomState, primaryRayDirections, pixelIsActive, primaryMiss, volumeHitDistance,
     radianceScale, volumetricRadianceScale, remodulatedTotalSecondaryRadiance, sharedRadiance,
     psrFirstHitDistance, psrReflectionSegmentSigned, psrReflectionDirection,
+    performedPsr ? vec3(1.0f, 1.0f, 1.0f) : primarySpecularAlbedo, performedPsr,
     volumetricPreintegratedRadiance, volumeAttenuation, alphaBlendOutput, backgroundAlpha,
     radianceOutput, particleLayerOutput);
 
