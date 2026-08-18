@@ -156,6 +156,16 @@ namespace dxvk {
                "held for the session only and are never written to a config. Remix supplies the lighting, so "
                "these textures are excluded from albedo selection, material identity and the texture picker's "
                "taggable set. Requires rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", float, ue3ConstantAlbedoTintGain, 8.0f,
+               "UE3 compat: how strongly a textureless material's UniformVector_* colour pulls its albedo away "
+               "from rtx.legacyMaterial.albedoConstant. UE3 keeps such a material's tint in a colour register and "
+               "relies on the baked lightmap for brightness, so the raw value is far too dark to use as an albedo "
+               "once Remix has removed the lightmap and relit the surface. The register's brightest channel times "
+               "this gain, clamped to 1, is the weight blending from the legacy albedo constant to the register's "
+               "fully saturated hue, so a register at zero leaves the surface at the legacy constant and a tint "
+               "ramping up fades smoothly to its colour rather than stepping to it. The default reaches full "
+               "saturation at 0.125, the peak Mirror's Edge's menu highlight reaches. Set to 0 to use the register "
+               "value directly instead, which is faithful to the constant but renders these surfaces very dark.");
     RTX_OPTION("rtx.d3d9", bool, ue3MicConstantIdentity, true,
                "UE3 MaterialInstanceConstant support: fold the material's Uniform* constants into its "
                "identity, distinguishing instances that share a parent and its textures but differ in "
@@ -1929,6 +1939,7 @@ namespace dxvk {
       bool ue3RequireCtabCameraConstants = false;
       bool ue3StableDiffuseSelection = false;
       bool ue3AutoDetectLightmapTextures = false;
+      float ue3ConstantAlbedoTintGain = 0.f;
       bool ue3MicAutoExcludeFrameVaryingConstants = false;
       bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;

@@ -2091,6 +2091,7 @@ namespace dxvk {
         const XXH64_hash_t psHash,
         const XXH64_hash_t shaderIdentitySeed,
         const XXH64_hash_t textureSetHash,
+        const XXH64_hash_t churnGroupKey,
         const XXH64_hash_t constantsHash,
         const Ue3PsMaterialIdentityInfo& identityInfo,
         const bool constantsExcluded,
@@ -2113,7 +2114,7 @@ namespace dxvk {
         std::hex,
         " textureSet=0x", textureSetHash,
         " consts=0x", constantsHash,
-        " group=0x", makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash), std::dec,
+        " group=0x", churnGroupKey, std::dec,
         " textures=[", textureList, "]",
         " constRanges=[", ranges, "]",
         constantsExcluded ? " constsExcluded=1" : "",
@@ -2121,17 +2122,16 @@ namespace dxvk {
 
       static fast_unordered_cache<uint32_t> s_distinctHashCountPerGroup;
       static fast_unordered_set s_churnWarnedGroups;
-      const XXH64_hash_t groupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
-      const uint32_t distinctCount = ++s_distinctHashCountPerGroup[groupKey];
+      const uint32_t distinctCount = ++s_distinctHashCountPerGroup[churnGroupKey];
       // Warn per group rather than per shader: one shader serves many material families, and
       // warning once for the first to churn hides every other family behind it.
-      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedGroups.insert(groupKey).second) {
+      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedGroups.insert(churnGroupKey).second) {
         Logger::warn(str::format(
           "[RTX-Compatibility][UE3-MIC] Pixel shader 0x", std::hex, psHash,
           " has minted ", std::dec, distinctCount, "+ distinct material hashes for a single texture set (0x",
           std::hex, textureSetHash, std::dec, ") - its constant registers are likely frame-varying ",
           "(Time/panner/fade/sub-UV expressions). If it is not excluded automatically, add group 0x",
-          std::hex, groupKey, std::dec, " to rtx.d3d9.ue3MicConstantIdentityExcludedGroups to stabilize "
+          std::hex, churnGroupKey, std::dec, " to rtx.d3d9.ue3MicConstantIdentityExcludedGroups to stabilize "
           "this material's identity without affecting others on the same shader."));
       }
     }
@@ -3867,7 +3867,6 @@ namespace dxvk {
 
       std::vector<std::pair<std::string, uint32_t>> uniformsByName;
       std::vector<std::string> samplerSignatureEntries;
-      std::vector<std::string> uniformSignatureEntries;
       std::vector<std::string> keptSamplerNames, excludedSamplerNames;
 
       // Only needed to fall back on if every sampler classifies as a lighting input.
@@ -3922,7 +3921,6 @@ namespace dxvk {
           continue;
 
         uniformsByName.emplace_back(uniform.name, uniform.registerIndex);
-        uniformSignatureEntries.push_back(makeUe3SignatureEntry(uniform.name, uniform.registerSet));
         info.constRanges.emplace_back(uniform.registerIndex, uniform.registerCount);
       }
 
@@ -3959,10 +3957,16 @@ namespace dxvk {
       // excluded wholesale (the lightmap policy permutations reference different engine
       // constants, e.g. AmbientColorAndSkyFactor only outside SIMPLE_LIGHTING), and register
       // indices and counts are excluded because both shift with the lightmap sampler count and
-      // with fxc's per-permutation element trimming. Constant-color materials have no material
-      // samplers, so their signature falls back to the uniform declarations.
-      info.canonicalShaderSignature = hashUe3SignatureEntries(
-        !samplerSignatureEntries.empty() ? samplerSignatureEntries : uniformSignatureEntries);
+      // with fxc's per-permutation element trimming.
+      //
+      // A shader declaring no material samplers gets no signature and falls back to the bytecode
+      // hash. Seeding it from the uniform declarations instead would identify no material:
+      // UniformVector_0 alone describes a large share of the textureless ones, and with an empty
+      // texture set to pair it with they all collapse onto one textureSet+shader anchor. Bytecode
+      // costs lightmap-policy invariance for these shaders only, the same trade the
+      // all-lighting-inputs guard above makes.
+      info.canonicalShaderSignature =
+        !samplerSignatureEntries.empty() ? hashUe3SignatureEntries(samplerSignatureEntries) : kEmptyHash;
 
       auto mergeConstRanges = [](Ue3MaterialConstRanges& ranges) {
         if (ranges.empty())
@@ -5700,6 +5704,7 @@ namespace dxvk {
     o.ue3RequireCtabCameraConstants = ue3RequireCtabCameraConstantsObject().get();
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
     o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
+    o.ue3ConstantAlbedoTintGain = ue3ConstantAlbedoTintGainObject().get();
     o.ue3MicAutoExcludeFrameVaryingConstants = ue3MicAutoExcludeFrameVaryingConstantsObject().get();
     o.ue3LogClassification = ue3LogClassificationObject().get();
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
@@ -12744,7 +12749,15 @@ namespace dxvk {
             // identity seed; auto-exclusion is scoped to the (seed, texture set) group, which
             // is permutation-consistent for invariant-identity shaders yet never wider than
             // the one churning material family.
-            const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
+            // Keyed on the texture set the identity uses, primary-colour fallback included. Keying it
+            // on the raw material texture set puts every material whose CTAB declares no material
+            // samplers into one group however different the images they bind, so an exclusion
+            // measured on one strips the constants tier - all that separates them - from all of them.
+            const XXH64_hash_t identityTextureSetHash =
+              (textureSetHash != kEmptyHash)
+                ? textureSetHash
+                : m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+            const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, identityTextureSetHash);
             bool constantsExcluded =
               // The tier that cannot be made lightmap-policy independent; opt-in only.
               !m_frameOptions.ue3MicConstantIdentity ||
@@ -12772,8 +12785,7 @@ namespace dxvk {
               // The exclusion changes this group's material identity mid-session; log both
               // sides so anchor mismatches around the flip are attributable.
               const XXH64_hash_t primaryTexHashForFlipLog = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
-              const XXH64_hash_t effectiveTextureSet = (textureSetHash != kEmptyHash) ? textureSetHash : primaryTexHashForFlipLog;
-              const XXH64_hash_t identityWithoutConstants = XXH3_64bits_withSeed(&effectiveTextureSet, sizeof(effectiveTextureSet), shaderIdentitySeed);
+              const XXH64_hash_t identityWithoutConstants = XXH3_64bits_withSeed(&identityTextureSetHash, sizeof(identityTextureSetHash), shaderIdentitySeed);
               const XXH64_hash_t identityWithConstants = XXH3_64bits_withSeed(&psConstsHash, sizeof(psConstsHash), identityWithoutConstants);
               Logger::warn(str::format(
                 "[RTX-MicDrift] Constants auto-exclusion changed material identity mid-session for group seed=0x",
@@ -12947,6 +12959,7 @@ namespace dxvk {
             if (identityInfo.materialSamplerMask == 0 &&
                 !identityInfo.uniformVectorRegisters.empty() &&
                 !m_activeDrawCallState.materialData.colorTextures[0].isValid()) {
+              const float tintGain = m_frameOptions.ue3ConstantAlbedoTintGain;
               for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
                 if (reg >= caps::MaxFloatConstantsPS)
                   continue;
@@ -12956,10 +12969,25 @@ namespace dxvk {
                   continue;
                 const float maxComp = std::max({ uniformColor.x, uniformColor.y, uniformColor.z });
                 const float minComp = std::min({ uniformColor.x, uniformColor.y, uniformColor.z });
-                // reject blacks/negatives (not visible albedo) and HDR-scale values (intensities)
+                // reject blacks/negatives (not visible albedo) and HDR-scale values (intensities).
+                // Rejecting black also lets a register holding the material's switched-off colour
+                // fall through to whichever one holds its real tint.
                 if (minComp < 0.0f || maxComp <= 0.01f || maxComp > 8.0f)
                   continue;
-                m_activeDrawCallState.materialData.ue3ConstantAlbedo = uniformColor;
+
+                Vector4 albedo = uniformColor;
+                if (tintGain > 0.0f) {
+                  // The register holds a tint UE3 multiplied against baked lighting for brightness,
+                  // so raw it is near-black once the lightmap is gone. Blend the legacy constant
+                  // towards the fully saturated hue by the register's own strength, which keeps a
+                  // ramping tint continuous instead of stepping away from the unlit surface.
+                  const Vector3 base = LegacyMaterialDefaults::albedoConstant();
+                  const float weight = std::min(maxComp * tintGain, 1.0f);
+                  albedo.x = base.x + (uniformColor.x / maxComp - base.x) * weight;
+                  albedo.y = base.y + (uniformColor.y / maxComp - base.y) * weight;
+                  albedo.z = base.z + (uniformColor.z / maxComp - base.z) * weight;
+                }
+                m_activeDrawCallState.materialData.ue3ConstantAlbedo = albedo;
                 m_activeDrawCallState.materialData.hasUe3ConstantAlbedo = true;
                 break;
               }
@@ -12968,8 +12996,8 @@ namespace dxvk {
             if (logMicHash) {
               m_activeDrawCallState.materialData.updateCachedHash();
               logUe3MaterialInstanceHashBreakdownOnce(
-                m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash, psConstsHash,
-                identityInfo, constantsExcluded, micTextureListLog);
+                m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash,
+                micChurnGroupKey, psConstsHash, identityInfo, constantsExcluded, micTextureListLog);
             }
           }
         }
