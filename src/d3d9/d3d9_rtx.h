@@ -144,9 +144,9 @@ namespace dxvk {
                "(CTAB names Texture2D_*/TextureCube_*), and the shader's material constants (CTAB UniformVector_*/"
                "UniformScalar_* registers). Distinguishes material instances by their TextureParameterValues, "
                "StaticSwitchParameters and VectorParameterValues/ScalarParameterValues, enabling tagging at the "
-               "child level instead of broadly at the parent level. Shaders whose constant registers carry "
-               "frame-varying expression values (Time, fades, sub-UV frames) must be listed in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders or their hashes churn every frame. "
+               "child level instead of broadly at the parent level. Constant registers carrying frame-varying "
+               "expression values (Time, panners, fades, sub-UV frames) are recognised from shader dataflow and "
+               "left out of the identity - see rtx.d3d9.ue3MicVolatileConstantDetection. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3AutoDetectLightmapTextures, true,
                "UE3 compat: treat every texture bound to a lightmap sampler as if it had been listed in "
@@ -183,36 +183,48 @@ namespace dxvk {
                "identity then becomes shader + material texture set, which is fully independent of the "
                "lightmap policy. Either way, changing this re-mints the material hashes of every material "
                "carrying constants, so anchors keyed on the old ones stop matching.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicVolatileConstantDetection, true,
+               "UE3 MaterialInstanceConstant support: leave a material's frame-varying UniformVector_* "
+               "registers out of its identity, recognised from the shader's own dataflow rather than learned "
+               "at runtime. UE3 re-evaluates every material uniform expression on the CPU per draw and writes "
+               "the result into the same registers that carry authored VectorParameterValues, so a panner, "
+               "flipbook/sub-UV frame, rotator or time-driven fade re-mints the material hash as it animates "
+               "and the replacements anchored on it match only on the frames the value comes back around. "
+               "A register is treated as volatile when the shader's dataflow shows a sampler's coordinate "
+               "depending on it, whatever shape the expression takes - a scale, an offset, a rotator's 2x2 "
+               "matrix across a register pair, or any chain of those through temporaries. Tint registers "
+               "reach the output colour instead and are kept, so UE3's colour variants "
+               "(RooftopPropsClusters and its Blue/Orange/Yellow siblings) still get one anchor each.\n"
+               "Because the classification is a property of the shader, identity is decided before the first "
+               "draw is ever hashed and never changes within or between sessions - no learning, no cache, no "
+               "mid-session flip. Materials separated only by a volatile register share an anchor, which is "
+               "unavoidable: their identity was not reproducible in the first place.\n"
+               "Turning this off restores raw all-UniformVector_* identity and re-mints the hashes of every "
+               "material carrying a volatile register.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
-               "UE3 MaterialInstanceConstant support: pixel shader bytecode hashes whose UniformVector_*/"
-               "UniformScalar_* constants are excluded from material identity hashing. UE3 evaluates material "
-               "uniform expressions on the CPU every draw, so shaders using Time/panner/fade/sub-UV expressions "
-               "receive frame-varying values in the same constant registers as stable material instance "
-               "parameters; folding those into the hash would mint a new material identity every frame. "
-               "Such shaders announce themselves as an endless stream of new materialHash lines when "
-               "rtx.d3d9.ue3LogMaterialInstanceHash is enabled (a churn warning names the shader once a "
-               "threshold is crossed) - add the reported hash here. Under rtx.d3d9.ue3EngineMode the reported "
-               "value is the canonical shader identity; both it and the raw bytecode hash are honoured. "
-               "Excluded shaders fall back to pixel shader + material texture set identity. Note that one "
-               "shader usually serves many materials - listing it here drops the constants tier for all of "
-               "them, which merges instances that differ only by a colour parameter. Prefer "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedGroups unless every material on the shader is "
-               "genuinely frame-varying.");
-    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedGroups, {},
-               "UE3 MaterialInstanceConstant support: churn group keys whose constants are excluded from "
-               "material identity hashing. A group is one (canonical shader identity, material texture set) "
-               "pair - a single material family - so this excludes exactly the material that churns and "
-               "leaves every other material on the same shader with its constants tier intact. This is the "
-               "same scope rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants applies automatically; list a key "
-               "here when a family churns without being detected, or to pin an exclusion so it survives "
-               "deleting rtx-remix/ue3MicAutoExcludedGroups.cache. Each material's key is reported as "
-               "'group=0x...' by rtx.d3d9.ue3LogMaterialInstanceHash.");
+               "UE3 MaterialInstanceConstant support: pixel shader hashes whose UniformVector_* constants are "
+               "excluded from material identity hashing wholesale. Reach for this only when every material on "
+               "a shader is frame-varying in a way rtx.d3d9.ue3MicVolatileConstantDetection cannot see: one "
+               "UE3 base-pass shader commonly serves dozens of material families, and listing it drops the "
+               "constants tier for all of them, merging instances that differ only by a colour parameter. "
+               "Under rtx.d3d9.ue3EngineMode both the canonical shader identity and the raw bytecode hash are "
+               "honoured. Prefer rtx.d3d9.ue3MicConstantIdentityExcludedMaterials, which is scoped to a single "
+               "material family.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedMaterials, {},
+               "UE3 MaterialInstanceConstant support: textureSet+shader hashes whose constants are excluded "
+               "from material identity hashing. That hash names one material family - a shader together with "
+               "the exact set of images its material samplers bind - so this excludes precisely the family that "
+               "churns and leaves every other material on the same shader with its constants tier intact. It is "
+               "also the second replacement lookup tier, so the same value can anchor the family's override.\n"
+               "List a hash here when [RTX-MicChurn] reports a family still minting more than one identity, "
+               "which happens when a frame-varying register reaches the output colour rather than a UV "
+               "coordinate and so cannot be told from an authored tint. The warning prints the value ready to "
+               "paste; it is also reported as 'textureSetShader=0x...' by rtx.d3d9.ue3LogMaterialInstanceHash.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogMaterialInstanceHash, false,
                "UE3 MaterialInstanceConstant support: log a one-shot per-material breakdown of the material "
-               "identity hash (pixel shader hash, material texture set with per-sampler image hashes, constant "
-               "ranges and hash, and the final hash), plus a churn warning naming any shader that mints an "
-               "abnormal number of distinct hashes (a sign its constants are frame-varying and it belongs in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders).");
+               "identity hash (pixel shader hash, material texture set with per-sampler image hashes, which "
+               "UniformVector_* registers were kept versus dropped as volatile, the constants hash, and the "
+               "final hash).");
     RTX_OPTION("rtx.d3d9", bool, ue3MicExcludeRenderTargetsFromIdentity, true,
                "UE3 MaterialInstanceConstant support: exclude render-target-backed textures from the material "
                "texture-set identity hash. Render targets bound as material samplers (scene captures, "
@@ -234,21 +246,17 @@ namespace dxvk {
                "texture's *descriptor* hash is stable across recreations: find it in the "
                "rtx.d3d9.ue3LogMaterialInstanceHash breakdown (textures=[sN:0x<image>(desc:0x<descriptor>)]) "
                "or in [RTX-MicDrift] sampler diffs, add it here, then re-anchor the affected material once - "
-               "its identity is stable from then on. Note descriptor hashes derive from texture properties "
-               "(dimensions/format/usage), so identically-shaped textures share one and the exclusion "
-               "applies to all of them - usually desirable for the engine-composited textures this option "
-               "targets. UE3-streamed textures recreate at a different size per resident mip level and so "
-               "carry one descriptor hash per size; the composited/dynamic textures this option is meant "
-               "for are fixed-size.");
-    RTX_OPTION("rtx.d3d9", bool, ue3MicPersistAutoExcludedConstantGroups, true,
-               "UE3 MaterialInstanceConstant support: persist the constants-churn auto-exclusion set "
-               "(see rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants) across sessions in "
-               "rtx-remix/ue3MicAutoExcludedGroups.cache. Without persistence a churning material group is "
-               "only excluded after it re-mints enough distinct hashes within the session, so its material "
-               "identity flips mid-session at an unpredictable point - replacements anchored on either side "
-               "of the flip only match part of the time. With persistence the exclusion applies from the "
-               "first frame of every later session, making such identities deterministic. Delete the cache "
-               "file to reset learned exclusions.");
+               "its identity is stable from then on. The sampler is identified by that descriptor hash rather "
+               "than dropped from the texture set: a texture whose contents are not reproducible still has a "
+               "reproducible shape, and dropping it would achieve nothing on a material whose only sampler it "
+               "is, since an empty texture set falls back to the primary colour texture's image hash - the "
+               "value being excluded.\n"
+               "Note descriptor hashes derive from texture properties (dimensions/format/usage), so "
+               "identically-shaped textures share one and the exclusion applies to all of them; materials "
+               "distinguished only by which of those they bind will merge. That is usually acceptable for the "
+               "engine-composited textures this option targets. UE3-streamed textures recreate at a different "
+               "size per resident mip level and so carry one descriptor hash per size; the composited/dynamic "
+               "textures this option is meant for are fixed-size.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, vsTexcoordCaptureOutlierTextures, {},
                "Texture hashes for which VS-captured texcoords should be overridden with IA (input assembler) texcoords. "
                "Useful as a compatibility fallback when certain textures appear stretched due to incorrect VS texcoord capture.");
@@ -496,17 +504,32 @@ namespace dxvk {
                "Note: the two schemes produce different hashes, so texture tags and replacements only match under the "
                "setting they were authored with. "
                "Only active when rtx.d3d9.ue3EngineMode is enabled.");
-    RTX_OPTION("rtx.d3d9", bool, ue3MicAutoExcludeFrameVaryingConstants, true,
-               "UE3 MaterialInstanceConstant support: automatically detect materials whose UniformVector_*/"
-               "UniformScalar_* constant registers are frame-varying (Time/panner/fade/sub-UV expressions) and "
-               "exclude their constants from material identity hashing at runtime, as if they were listed in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders. Without this, such materials mint a new material "
-               "hash every frame, churning instance identity (visible as temporal instability/flicker and per-frame "
-               "BLAS rebuilds) until each is excluded manually. Detection and exclusion are scoped to a single "
-               "(identity seed, texture set) group - one churning material family never widens to other materials "
-               "sharing its shader or signature - and re-seen sibling hashes decay the churn count, so legitimate "
-               "constant-differentiated sibling sets of any size do not trip it. Only active when material "
-               "instance hashing is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogTextureHashProvenance, false,
+               "UE3 compat: log how each Remix image hash was derived - the mip 0 content hash on its "
+               "own, the mip count, whether the streaming-stable mip tail or the top mip produced the "
+               "value, how many tail mips were hashed, the D3D9 usage and pool, and which subresources "
+               "still had a pending upload when the hash was latched. One line per (texture shape, image "
+               "hash) pair, so a texture whose hash moves between runs shows every value it took rather "
+               "than only the first.\n"
+               "The mip 0 hash is what makes this diagnostic worth reading. A hash is latched once and "
+               "never recomputed, so when a material's descriptor hash is constant while its image hash "
+               "changes per level load, comparing mip 0 separates the two possible causes: repeating "
+               "while the full-chain hash moves means the picture is the same and the instability is in "
+               "the smaller mips, which identity has no reason to depend on; moving as well means the "
+               "material is genuinely binding a different texture.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ReportMicIdentityChurn, true,
+               "UE3 MaterialInstanceConstant support: warn once per material family that mints enough "
+               "distinct identity hashes to make an animating register the only plausible explanation, "
+               "naming the UniformVector_* registers whose values moved and printing the "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedMaterials entry that pins it. The threshold sits well "
+               "above the size of a genuine colour-variant sibling set, which a frame-varying register "
+               "passes within a second, so the two do not have to be told apart by hand.\n"
+               "Identity is never altered as a result. The report exists so a family whose frame-varying "
+               "register could not be recognised from dataflow - a fade or tint the bytecode cannot "
+               "distinguish from an authored parameter - announces itself instead of quietly breaking the "
+               "replacements anchored on it. It costs nothing until a family actually churns, so unlike "
+               "rtx.logReplacementResolution it is on by default. Only active when material instance hashing "
+               "is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
                "UE3 compat: log pass/vertex-factory classification decisions for draw routing. "
                "Also emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
@@ -1907,7 +1930,8 @@ namespace dxvk {
       bool ue3MaterialInstanceConstantHash = false;
       bool ue3MicConstantIdentity = false;
       bool ue3MicExcludeRenderTargetsFromIdentity = true;
-      bool ue3MicPersistAutoExcludedConstantGroups = true;
+      bool ue3MicVolatileConstantDetection = true;
+      bool ue3ReportMicIdentityChurn = true;
       bool ue3LogMaterialInstanceHash = false;
       bool ue3SkipDepthPrepass = false;
       bool ue3SkipShadowDepthPasses = false;
@@ -1940,7 +1964,6 @@ namespace dxvk {
       bool ue3StableDiffuseSelection = false;
       bool ue3AutoDetectLightmapTextures = false;
       float ue3ConstantAlbedoTintGain = 0.f;
-      bool ue3MicAutoExcludeFrameVaryingConstants = false;
       bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;
       bool ue3LogUvAffineDetail = false;
@@ -1990,7 +2013,7 @@ namespace dxvk {
       const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
       const fast_unordered_set* vsTexcoordCaptureOutlierTextures = nullptr;
       const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
-      const fast_unordered_set* ue3MicConstantIdentityExcludedGroups = nullptr;
+      const fast_unordered_set* ue3MicConstantIdentityExcludedMaterials = nullptr;
       const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
       const fast_unordered_set* ue3TraceDrawTextureHashes = nullptr;
       const fast_unordered_set* replacementDebugHashes = nullptr;

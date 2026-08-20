@@ -666,6 +666,8 @@ namespace dxvk {
     }
   }
 
+  constexpr uint32_t kUe3TailMaxDimension = 64;
+
   // UE3 streaming-stable texture identity: UE3's texture streamer creates a new D3D9 texture
   // object per mip-count change, so a top-mip hash differs per streamed variant of one logical
   // texture and everything keyed on texture hashes (replacements, categories, tags, material
@@ -680,7 +682,12 @@ namespace dxvk {
     if (m_desc.MipLevels <= 1 || IsRenderTarget())
       return kEmptyHash;
 
-    constexpr uint32_t kTailMaxDimension = 64;
+    // The whole chain is the tail for a texture at or below the tail size, which also makes it the
+    // state every larger texture passes through while streaming in: UE3's minimum resident mip
+    // count puts that variant at this size, and it must hash equal to the fully resident one or a
+    // replacement cannot bind until streaming finishes. Identifying such a texture by its top mip
+    // alone breaks that equality, so a texture whose smaller mips are not yet written has to be
+    // handled by tagging it in rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes instead.
     XXH64_hash_t tailHash = kEmptyHash;
     uint32_t tailMipCount = 0;
     // chain from the smallest mip upward so the value is independent of how many
@@ -688,7 +695,7 @@ namespace dxvk {
     for (int32_t mip = int32_t(m_desc.MipLevels) - 1; mip >= 0; mip--) {
       const uint32_t mipWidth = std::max(1u, m_desc.Width >> mip);
       const uint32_t mipHeight = std::max(1u, m_desc.Height >> mip);
-      if (std::max(mipWidth, mipHeight) > kTailMaxDimension)
+      if (std::max(mipWidth, mipHeight) > kUe3TailMaxDimension)
         break;
 
       const auto& mipBuffer = source->m_buffers[mip];
@@ -714,6 +721,67 @@ namespace dxvk {
       m_desc.Height / aspectGcd,
     };
     return XXH3_64bits_withSeed(&seed, sizeof(seed), tailHash);
+  }
+
+  // Keyed on (descriptor, image) rather than descriptor alone: identically shaped textures share a
+  // descriptor, so a texture whose content hash moves between runs would otherwise be hidden
+  // behind the first value seen. See ue3LogTextureHashProvenance.
+  void D3D9CommonTexture::LogUe3TextureHashProvenance(
+      const D3D9CommonTexture* source, const XXH64_hash_t imageHash, const bool is2DTexture) const {
+    if (source == nullptr)
+      return;
+
+    const XXH64_hash_t descriptorHash = m_desc.CalculateHash();
+
+    static dxvk::mutex s_mutex;
+    static std::unordered_set<XXH64_hash_t> s_logged;
+    {
+      const XXH64_hash_t logKey = XXH3_64bits_withSeed(&imageHash, sizeof(imageHash), descriptorHash);
+      std::lock_guard<dxvk::mutex> lock(s_mutex);
+      if (!s_logged.insert(logKey).second)
+        return;
+    }
+
+    const bool tailEligible = D3D9Rtx::ue3StreamingStableTextureHashing() && D3D9Rtx::ue3EngineMode() &&
+                              is2DTexture && m_desc.MipLevels > 1 && !IsRenderTarget();
+
+    // needsUpload is set for every subresource at creation, so it does not distinguish "written by
+    // the game" from "allocated and untouched" - it is reported as state, not as evidence that a
+    // buffer holds content.
+    std::string tailState;
+    uint32_t tailMipCount = 0;
+    for (int32_t mip = tailEligible ? int32_t(m_desc.MipLevels) - 1 : -1; mip >= 0; mip--) {
+      const uint32_t mipWidth = std::max(1u, m_desc.Width >> mip);
+      const uint32_t mipHeight = std::max(1u, m_desc.Height >> mip);
+      if (std::max(mipWidth, mipHeight) > kUe3TailMaxDimension)
+        break;
+      tailMipCount++;
+      tailState += str::format(
+        tailState.empty() ? "" : ",", "mip", mip,
+        source->m_buffers[mip].ptr() == nullptr ? "=noBuffer" : (source->NeedsUpload(mip) ? "=needsUpload" : "=uploaded"));
+    }
+
+    // Mip 0 on its own is what makes this diagnostic decisive: repeating across level loads while
+    // the image hash does not means the picture is stable and only the smaller mips moved.
+    const auto& topBuffer = source->m_buffers[0];
+    const std::string mip0 = topBuffer.ptr() != nullptr
+      ? str::format("0x", std::hex, XXH3_64bits(topBuffer->mapPtr(0), topBuffer->info().size), std::dec,
+                    "(", topBuffer->info().size, "B)")
+      : std::string("unavailable");
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-TexHash] desc=0x", std::hex, descriptorHash,
+      " image=0x", imageHash, std::dec,
+      " mip0=", mip0,
+      " ", m_desc.Width, "x", m_desc.Height,
+      " mips=", m_desc.MipLevels,
+      " fmt=", uint32_t(m_desc.Format),
+      " usage=0x", std::hex, m_desc.Usage, std::dec,
+      " pool=", uint32_t(m_desc.Pool),
+      " rt=", IsRenderTarget() ? 1 : 0,
+      " path=", tailEligible ? "tail" : "topMip",
+      " tailMips=", tailMipCount,
+      " [", tailState.empty() ? "-" : tailState, "]"));
   }
 
   void D3D9CommonTexture::SetupForRtxFrom(const D3D9CommonTexture* source) {
@@ -759,23 +827,34 @@ namespace dxvk {
       }
     } else {
       // resolve cubemap albedo materials
-      bool hasAnyData = false;
+      //
+      // Every face has to be present before an identity is latched. The hash is set once and
+      // this function returns early forever after, so hashing whichever faces happened to have
+      // CPU data first makes the value depend on upload order - a cube map that identifies a
+      // material one session identifies nothing the next, and the material's identity moves with
+      // it. Waiting costs at most a rebind: a face without data cannot be sampled yet.
+      //
+      // The streaming-stable mip tail deliberately does not apply here. UE3's texture streamer
+      // iterates UTexture2D only and a cube map's faces skip UpdateResource entirely, so a cube
+      // map never presents itself as a series of mip-count variants the way a 2D texture does.
+      // Routing it through the tail would buy no stability and would re-mint the identity of
+      // every material binding one.
       for (uint32_t face = 0; face < 6; face++) {
         const auto& buffer = source->m_buffers[CalcSubresource(face, 0)];
         if (buffer.ptr() == nullptr)
-          continue;
+          return;
 
-        hasAnyData = true;
         const XXH64_hash_t subHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
         imageHash = XXH3_64bits_withSeed(&subHash, sizeof(subHash), imageHash);
       }
 
-      if (!hasAnyData)
-        return;
-
       texturePickerView = CreateView(0, 0, VK_IMAGE_USAGE_SAMPLED_BIT, false);
       if (texturePickerView == nullptr)
         texturePickerView = m_sampleView.Color;
+    }
+
+    if (D3D9Rtx::ue3LogTextureHashProvenance()) {
+      LogUe3TextureHashProvenance(source, imageHash, is2DTexture);
     }
 
     // save hash to dxvkImage

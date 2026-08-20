@@ -1740,6 +1740,10 @@ namespace dxvk {
       // leading-register-only streaming keeps the constants identity aligned across lightmap
       // policy permutations, which shift uniform registers.
       std::vector<std::pair<XXH64_hash_t, uint32_t>> namedUniformFirstRegistersByNameOrder;
+      // Registers the shader's own dataflow proves carry a frame-varying expression value
+      // rather than an authored parameter, in ascending order. Diagnostics only; the identity
+      // streams above already exclude them.
+      std::vector<uint32_t> volatileUniformRegisters;
       // XXH3 over the name-sorted material sampler declarations (names and register class
       // only): a shader identity that is stable across the UE3 lightmap policy permutations
       // (directional vs simple texture lightmaps, Mirror's Edge bicubic lightmap filtering)
@@ -1749,9 +1753,10 @@ namespace dxvk {
       XXH64_hash_t canonicalShaderSignature = kEmptyHash;
       bool hasCtab = false;
 
-      // Set only when a sampler was left out, for rtx.d3d9.ue3LogMaterialInstanceHash: comparing
-      // it between a DirectionalLightmaps=True and =False run is the direct way to see whether a
-      // material's two compiles agree on their identity inputs.
+      // Set only when a sampler or uniform was left out, for
+      // rtx.d3d9.ue3LogMaterialInstanceHash: comparing it between a DirectionalLightmaps=True
+      // and =False run is the direct way to see whether a material's two compiles agree on
+      // their identity inputs.
       std::string identitySummary;
     };
 
@@ -1842,36 +1847,6 @@ namespace dxvk {
       return s_ue3PsFloatConstantNameCache.emplace(psHash, std::move(names)).first->second;
     }
 
-    // Churn threshold for warning about frame-varying constant registers: genuine
-    // constant-differentiated material instance siblings form small groups (measured 2-8 per
-    // shader+texture set), while frame-varying values sweep unbounded hashes within a single
-    // group. A widely reused shader legitimately produces many hashes spread across many
-    // texture sets, so the count must be per group, not per shader.
-    constexpr uint32_t kUe3MicChurnWarnThreshold = 32;
-
-    // Runtime auto-exclusion of frame-varying constants from material identity
-    // (rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants): per (identity seed, texture set)
-    // group, remember the most recent distinct constants hashes in a bounded ring. Re-seeing
-    // a sibling's hash is a ring hit and DECAYS the distinct count: stable siblings redraw
-    // every frame, so legitimate constant-differentiated families - however many siblings
-    // accumulate across levels - hit far more than they miss and never trip. Frame-varying
-    // constants (Time/panner/fade/sub-UV expressions) mint a new hash every draw, never hit
-    // the ring, and cross the threshold within a second - after which the GROUP's constants
-    // are dropped from identity for the session. Exclusion is keyed per group, never per
-    // seed: the canonical seed is only a sampler-name signature shared by many unrelated
-    // materials, and excluding it wholesale would collapse the identity - and break the
-    // replacement matching - of every material that shares it.
-    constexpr uint32_t kUe3MicConstantHashRingSize = kUe3MicChurnWarnThreshold;
-
-    struct Ue3MicConstantChurnEntry {
-      std::array<XXH64_hash_t, kUe3MicConstantHashRingSize> recentHashes = {};
-      uint32_t ringCursor = 0;
-      uint32_t distinctCount = 0;
-    };
-
-    static fast_unordered_cache<Ue3MicConstantChurnEntry> s_ue3MicConstantChurnPerGroup;
-    static fast_unordered_set s_ue3MicAutoExcludedGroups;
-
     // Shared by the UE3 on-disk caches. Each rewrites its whole file from an in-memory
     // container, so a save is only safe when that container holds everything the file held:
     // a load that ends up with less must take the file out of reach for the session, or one
@@ -1895,97 +1870,6 @@ namespace dxvk {
       return true;
     }
 
-    // Cross-session persistence for the auto-exclusion set; rationale in the
-    // rtx.d3d9.ue3MicPersistAutoExcludedConstantGroups option documentation.
-    constexpr char kUe3MicAutoExcludedGroupsCachePath[] = "rtx-remix/ue3MicAutoExcludedGroups.cache";
-    constexpr char kUe3MicAutoExcludedGroupsCacheTempPath[] = "rtx-remix/ue3MicAutoExcludedGroups.cache.tmp";
-    constexpr uint64_t kUe3MicAutoExcludedGroupsCacheMagic = 0x315843494D334555ull; // "UE3MICX1"
-    constexpr uint32_t kUe3MicAutoExcludedGroupsCacheMaxEntries = 1u << 16;
-
-    static bool s_ue3MicAutoExcludedGroupsLoaded = false;
-    // See the spread cache: a save rewrites the file from the set, so a load that could not
-    // read all of it must not be published. Losing entries here silently un-excludes a
-    // frame-varying group, which changes its material hash and breaks anchors authored
-    // against the excluded identity.
-    static bool s_ue3MicAutoExcludedGroupsSaveBlocked = false;
-
-    static void loadUe3MicAutoExcludedGroupsCache() {
-      s_ue3MicAutoExcludedGroupsLoaded = true;
-
-      auto refuseFutureSaves = [](const std::string& reason) {
-        s_ue3MicAutoExcludedGroupsSaveBlocked = true;
-        Logger::warn(str::format(
-          "[RTX-Compatibility][UE3-MIC] Constants auto-exclusion cache ", reason,
-          ". Leaving the file untouched for this session; groups re-derive their exclusions "
-          "from scratch. Delete ", kUe3MicAutoExcludedGroupsCachePath, " to start a fresh one."));
-      };
-
-      const bool fileExists = ue3CacheFileExists(kUe3MicAutoExcludedGroupsCachePath);
-
-      std::ifstream file(kUe3MicAutoExcludedGroupsCachePath, std::ios::binary);
-      if (!file.is_open()) {
-        if (fileExists)
-          refuseFutureSaves("exists but could not be opened");
-        return;
-      }
-
-      uint64_t magic = 0;
-      uint32_t entryCount = 0;
-      file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-      file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
-      if (!file || magic != kUe3MicAutoExcludedGroupsCacheMagic || entryCount > kUe3MicAutoExcludedGroupsCacheMaxEntries) {
-        refuseFutureSaves("header is unreadable or not recognised");
-        return;
-      }
-
-      for (uint32_t i = 0; i < entryCount; i++) {
-        XXH64_hash_t groupKey = 0;
-        file.read(reinterpret_cast<char*>(&groupKey), sizeof(groupKey));
-        if (!file) {
-          refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " groups readable"));
-          return;
-        }
-        s_ue3MicAutoExcludedGroups.insert(groupKey);
-      }
-
-      Logger::info(str::format(
-        "[RTX-Compatibility][UE3-MIC] Loaded constants auto-exclusion cache: ", entryCount, " material groups"));
-    }
-
-    static void saveUe3MicAutoExcludedGroupsCache() {
-      // Merge any not-yet-loaded persisted entries first so a save never drops them.
-      if (!s_ue3MicAutoExcludedGroupsLoaded)
-        loadUe3MicAutoExcludedGroupsCache();
-
-      if (s_ue3MicAutoExcludedGroupsSaveBlocked)
-        return;
-
-      {
-        std::ofstream file(kUe3MicAutoExcludedGroupsCacheTempPath, std::ios::binary | std::ios::trunc);
-        if (!file.is_open())
-          return;
-
-        const uint32_t entryCount =
-          uint32_t(std::min<size_t>(s_ue3MicAutoExcludedGroups.size(), kUe3MicAutoExcludedGroupsCacheMaxEntries));
-        file.write(reinterpret_cast<const char*>(&kUe3MicAutoExcludedGroupsCacheMagic), sizeof(kUe3MicAutoExcludedGroupsCacheMagic));
-        file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
-
-        uint32_t written = 0;
-        for (const XXH64_hash_t groupKey : s_ue3MicAutoExcludedGroups) {
-          if (written >= entryCount)
-            break;
-          file.write(reinterpret_cast<const char*>(&groupKey), sizeof(groupKey));
-          written++;
-        }
-
-        file.close();
-        if (!file)
-          return;
-      }
-
-      ue3CommitCacheFile(kUe3MicAutoExcludedGroupsCacheTempPath, kUe3MicAutoExcludedGroupsCachePath);
-    }
-
     // ===== Replacement identity drift diagnostics =====
     // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
     //
@@ -1996,8 +1880,8 @@ namespace dxvk {
     // minted hashes themselves.
     constexpr uint32_t kMicDriftMaxTrackedSamplers = 16;  // caps::MaxTexturesPS
     constexpr uint32_t kMicDriftMaxTrackedConstants = 16;
-    // Per-family log caps: without them an A/B-oscillating constants hash (which the churn
-    // ring buffer intentionally does not auto-exclude) would emit a drift warning per draw.
+    // Per-family log caps: a family whose constants animate in a way volatile-register
+    // classification cannot see would otherwise emit a drift warning per draw.
     constexpr uint32_t kMicDriftMaxLogsPerFamily = 16;
     constexpr uint32_t kMicDriftMaxLogsPerTrackedFamily = 64;
 
@@ -2029,61 +1913,165 @@ namespace dxvk {
     static fast_unordered_cache<Ue3MicIdentitySample> s_ue3MicIdentityByFamily;
     static fast_unordered_set s_ue3MicRtPoisonWarnedFamilies;
 
-    static XXH64_hash_t makeUe3MicChurnGroupKey(const XXH64_hash_t shaderIdentitySeed,
-                                                const XXH64_hash_t textureSetHash) {
-      return XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentitySeed);
-    }
+    // ===== Residual identity churn reporting =====
+    // (rtx.d3d9.ue3ReportMicIdentityChurn)
+    //
+    // Volatile-register classification is a property of the shader, so a material's identity is
+    // decided before its first draw is hashed and cannot move afterwards. What the bytecode
+    // cannot see is a frame-varying expression that reaches the output colour rather than a
+    // coordinate - a time-driven fade or tint is indistinguishable from an authored
+    // VectorParameterValue there. Those families still mint more than one identity, so they are
+    // reported rather than left to break their anchors quietly. Nothing is excluded as a result:
+    // an identity that changes mid-session is exactly what this whole design exists to avoid,
+    // and the fix belongs in a config the next session starts from.
+    //
+    // Keyed on textureSetShaderHash, which already folds in the identity seed and is both the
+    // authoring handle (rtx.d3d9.ue3MicConstantIdentityExcludedMaterials) and the second
+    // replacement lookup tier.
+    //
+    // A second identity on one texture set is also what a colour variant looks like the first time
+    // its sibling is drawn, so reporting at two would bury the families that matter under benign
+    // ones. Measured constant-differentiated sibling sets run to about eight; a frame-varying
+    // register passes any bound within a second, so a threshold well clear of the former separates
+    // them without needing to understand the values.
+    constexpr uint32_t kUe3MicChurnReportThreshold = 16;
 
-    static bool isUe3MicGroupAutoExcluded(const XXH64_hash_t churnGroupKey, const bool persistAcrossSessions) {
-      if (persistAcrossSessions && !s_ue3MicAutoExcludedGroupsLoaded)
-        loadUe3MicAutoExcludedGroupsCache();
-      return s_ue3MicAutoExcludedGroups.find(churnGroupKey) != s_ue3MicAutoExcludedGroups.end();
-    }
+    struct Ue3MicChurnReport {
+      XXH64_hash_t firstConstantsHash = kEmptyHash;
+      std::vector<Ue3MicIdentitySample::ConstantRecord> firstConstants;
+      fast_unordered_set seenConstantsHashes;
+      bool warned = false;
+    };
 
-    // Returns true when the group was newly auto-excluded on this call.
-    static bool trackUe3MicConstantChurn(const XXH64_hash_t churnGroupKey,
-                                         const XXH64_hash_t psHash,
-                                         const XXH64_hash_t shaderIdentitySeed,
-                                         const XXH64_hash_t textureSetHash,
-                                         const XXH64_hash_t constantsHash,
-                                         const bool persistAcrossSessions) {
-      Ue3MicConstantChurnEntry& entry = s_ue3MicConstantChurnPerGroup[churnGroupKey];
+    static fast_unordered_cache<Ue3MicChurnReport> s_ue3MicChurnByMaterialFamily;
 
-      for (const XXH64_hash_t seenHash : entry.recentHashes) {
-        if (seenHash == constantsHash) {
-          if (entry.distinctCount > 0) {
-            --entry.distinctCount;
-          }
-          return false;
+    // Walks the registers in the order the constants hash streams them, so a report can name the
+    // ones whose values moved. `emit` returns false to stop early, which is how the fixed-size
+    // drift snapshot applies its bound.
+    template <typename EmitFn>
+    static void forEachUe3MicIdentityConstant(
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream,
+        EmitFn&& emit) {
+      if (useNameOrderStream) {
+        for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
+          if (uniformRegister < caps::MaxFloatConstantsPS && !emit(uniformRegister))
+            return;
         }
+        return;
       }
 
-      entry.recentHashes[entry.ringCursor] = constantsHash;
-      entry.ringCursor = (entry.ringCursor + 1u) % kUe3MicConstantHashRingSize;
-      ++entry.distinctCount;
-
-      if (entry.distinctCount >= kUe3MicChurnWarnThreshold &&
-          s_ue3MicAutoExcludedGroups.insert(churnGroupKey).second) {
-        if (persistAcrossSessions) {
-          saveUe3MicAutoExcludedGroupsCache();
+      for (const auto& [rangeStart, rangeCount] : identityInfo.constRanges) {
+        for (uint32_t r = rangeStart; r < rangeStart + rangeCount; r++) {
+          if (r < caps::MaxFloatConstantsPS && !emit(r))
+            return;
         }
-        Logger::warn(str::format(
-          "[RTX-Compatibility][UE3-MIC] Material group (seed=0x", std::hex, shaderIdentitySeed,
-          ", ps=0x", psHash,
-          ", textureSet=0x", textureSetHash, std::dec,
-          ") minted ", kUe3MicChurnWarnThreshold,
-          "+ distinct constant hashes - its constant registers are frame-varying "
-          "(Time/panner/fade/sub-UV expressions). Excluding this group's constants from "
-          "material identity",
-          persistAcrossSessions
-            ? " and persisting the exclusion to rtx-remix/ue3MicAutoExcludedGroups.cache (applies "
-              "from the start of future sessions; delete the file to reset)."
-            : " for this session; add the shader hash or seed to "
-              "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to exclude it permanently."));
+      }
+    }
+
+    // Bounded, for the per-family drift sample that is retained for every family while replacement
+    // diagnostics are on.
+    static uint32_t snapshotUe3MicIdentityConstants(
+        const Vector4* fConsts,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream,
+        Ue3MicIdentitySample::ConstantRecord* out,
+        const uint32_t outCapacity) {
+      uint32_t count = 0;
+      forEachUe3MicIdentityConstant(identityInfo, useNameOrderStream, [&](const uint32_t reg) {
+        out[count++] = Ue3MicIdentitySample::ConstantRecord { uint16_t(reg), fConsts[reg] };
+        return count < outCapacity;
+      });
+      return count;
+    }
+
+    // Unbounded: each family takes at most two, and a cap would silently drop the register that
+    // moved on any shader declaring more uniforms than the cap - leaving a report that says a
+    // family churned but not which value did, which is the only part worth reading.
+    static std::vector<Ue3MicIdentitySample::ConstantRecord> snapshotUe3MicIdentityConstants(
+        const Vector4* fConsts,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream) {
+      std::vector<Ue3MicIdentitySample::ConstantRecord> records;
+      forEachUe3MicIdentityConstant(identityInfo, useNameOrderStream, [&](const uint32_t reg) {
+        records.push_back({ uint16_t(reg), fConsts[reg] });
         return true;
+      });
+      return records;
+    }
+
+    static void reportUe3MicIdentityChurnOnce(
+        const XXH64_hash_t textureSetShaderHash,
+        const XXH64_hash_t psHash,
+        const XXH64_hash_t shaderIdentitySeed,
+        const XXH64_hash_t primaryTextureHash,
+        const XXH64_hash_t constantsHash,
+        const Vector4* fConsts,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream,
+        const std::vector<uint8_t>& bytecode) {
+      if (textureSetShaderHash == kEmptyHash || constantsHash == kEmptyHash)
+        return;
+
+      Ue3MicChurnReport& report = s_ue3MicChurnByMaterialFamily[textureSetShaderHash];
+      if (report.warned)
+        return;
+
+      if (report.firstConstantsHash == kEmptyHash) {
+        report.firstConstantsHash = constantsHash;
+        report.firstConstants = snapshotUe3MicIdentityConstants(fConsts, identityInfo, useNameOrderStream);
+        report.seenConstantsHashes.insert(constantsHash);
+        return;
       }
 
-      return false;
+      if (!report.seenConstantsHashes.insert(constantsHash).second ||
+          report.seenConstantsHashes.size() < kUe3MicChurnReportThreshold) {
+        return;
+      }
+
+      report.warned = true;
+      report.seenConstantsHashes.clear();
+
+      const std::vector<Ue3MicIdentitySample::ConstantRecord> current =
+        snapshotUe3MicIdentityConstants(fConsts, identityInfo, useNameOrderStream);
+
+      const std::map<uint32_t, std::string>& constantNames = getUe3PsFloatConstantNames(psHash, bytecode);
+      std::string detail;
+      for (const Ue3MicIdentitySample::ConstantRecord& now : current) {
+        for (const Ue3MicIdentitySample::ConstantRecord& first : report.firstConstants) {
+          if (first.reg != now.reg)
+            continue;
+          if (first.value.x != now.value.x || first.value.y != now.value.y ||
+              first.value.z != now.value.z || first.value.w != now.value.w) {
+            const auto nameIt = constantNames.find(uint32_t(now.reg));
+            detail += str::format(
+              "\n    c", uint32_t(now.reg),
+              nameIt != constantNames.end() ? str::format(" (", nameIt->second, ")") : std::string(),
+              ": (", first.value.x, ",", first.value.y, ",", first.value.z, ",", first.value.w,
+              ") -> (", now.value.x, ",", now.value.y, ",", now.value.z, ",", now.value.w, ")");
+          }
+          break;
+        }
+      }
+
+      Logger::warn(str::format(
+        "[RTX-MicChurn] Material family textureSetShader=0x", std::hex, textureSetShaderHash,
+        " (ps=0x", psHash, " seed=0x", shaderIdentitySeed, " tex=0x", primaryTextureHash, std::dec,
+        ") has minted ", kUe3MicChurnReportThreshold,
+        " identities from its constants tier, so a register is very likely animating:",
+        // No register differing while the hash did means the two mints saw different register
+        // *sets*, which for a fixed shader only happens when a permutation trimmed a uniform.
+        detail.empty()
+          ? str::format("\n    (constants hash 0x", std::hex, report.firstConstantsHash, " -> 0x", constantsHash,
+                        std::dec, " with no differing register among the ", current.size(), " compared)")
+          : detail,
+        "\n  Every material hash it mints is unanchorable. Pin it with:"
+        "\n    rtx.d3d9.ue3MicConstantIdentityExcludedMaterials = 0x", std::hex, textureSetShaderHash, std::dec,
+        "\n  then re-anchor the material once. Identity is unchanged for this session."));
+
+      // Nothing reads these once the family has reported; the record stays only for `warned`.
+      report.firstConstants.clear();
+      report.firstConstants.shrink_to_fit();
     }
 
     static void logUe3MaterialInstanceHashBreakdownOnce(
@@ -2091,7 +2079,7 @@ namespace dxvk {
         const XXH64_hash_t psHash,
         const XXH64_hash_t shaderIdentitySeed,
         const XXH64_hash_t textureSetHash,
-        const XXH64_hash_t churnGroupKey,
+        const XXH64_hash_t textureSetShaderHash,
         const XXH64_hash_t constantsHash,
         const Ue3PsMaterialIdentityInfo& identityInfo,
         const bool constantsExcluded,
@@ -2105,6 +2093,11 @@ namespace dxvk {
         ranges += str::format(ranges.empty() ? "c" : ",c", start, "+", count);
       }
 
+      std::string volatileRegisters;
+      for (const uint32_t reg : identityInfo.volatileUniformRegisters) {
+        volatileRegisters += str::format(volatileRegisters.empty() ? "c" : ",c", reg);
+      }
+
       const bool usedCanonicalSeed = shaderIdentitySeed != psHash;
       Logger::info(str::format(
         "[RTX-Compatibility][UE3-MIC] materialHash=0x", std::hex, materialHash,
@@ -2113,27 +2106,13 @@ namespace dxvk {
         usedCanonicalSeed ? " (canonical, lightmap-permutation invariant)" : " (bytecode)",
         std::hex,
         " textureSet=0x", textureSetHash,
-        " consts=0x", constantsHash,
-        " group=0x", churnGroupKey, std::dec,
+        " textureSetShader=0x", textureSetShaderHash,
+        " consts=0x", constantsHash, std::dec,
         " textures=[", textureList, "]",
         " constRanges=[", ranges, "]",
+        volatileRegisters.empty() ? std::string() : str::format(" volatileRegs=[", volatileRegisters, "]"),
         constantsExcluded ? " constsExcluded=1" : "",
         " ctab=", identityInfo.hasCtab ? 1 : 0));
-
-      static fast_unordered_cache<uint32_t> s_distinctHashCountPerGroup;
-      static fast_unordered_set s_churnWarnedGroups;
-      const uint32_t distinctCount = ++s_distinctHashCountPerGroup[churnGroupKey];
-      // Warn per group rather than per shader: one shader serves many material families, and
-      // warning once for the first to churn hides every other family behind it.
-      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedGroups.insert(churnGroupKey).second) {
-        Logger::warn(str::format(
-          "[RTX-Compatibility][UE3-MIC] Pixel shader 0x", std::hex, psHash,
-          " has minted ", std::dec, distinctCount, "+ distinct material hashes for a single texture set (0x",
-          std::hex, textureSetHash, std::dec, ") - its constant registers are likely frame-varying ",
-          "(Time/panner/fade/sub-UV expressions). If it is not excluded automatically, add group 0x",
-          std::hex, churnGroupKey, std::dec, " to rtx.d3d9.ue3MicConstantIdentityExcludedGroups to stabilize "
-          "this material's identity without affecting others on the same shader."));
-      }
     }
 
     constexpr uint8_t kPsSamplerSemanticEngineAuxiliary = 1u << 0;
@@ -2142,6 +2121,83 @@ namespace dxvk {
     constexpr uint8_t kPsSamplerSemanticNonDiffuse      = 1u << 3;
     constexpr uint8_t kPsSamplerSemanticVideo           = 1u << 4;
     constexpr uint8_t kPsSamplerSemanticMovieTexture    = 1u << 5;
+
+    // How many of DxsoInstructionContext::src an opcode actually reads. The decoder overwrites
+    // that array in order and leaves the rest holding whatever the previous instruction put
+    // there, so anything reading a slot the opcode does not use gets a stale register. The
+    // existing coordinate heuristics tolerate that (an extra provenance bit only nudges
+    // scoring); constant-dependency tracking cannot, because a stale constant would be dropped
+    // from material identity and merge materials that a tint tells apart.
+    //
+    // Unknown opcodes report 0 so the tracking fails closed: a missed dependency leaves an
+    // identity that churns and says so through [RTX-MicChurn], whereas an invented one silently
+    // collapses two anchors into one.
+    static uint32_t getDxsoSourceOperandCount(const DxsoOpcode op) {
+      switch (op) {
+      case DxsoOpcode::Mov:
+      case DxsoOpcode::Rcp:
+      case DxsoOpcode::Rsq:
+      case DxsoOpcode::Exp:
+      case DxsoOpcode::Log:
+      case DxsoOpcode::ExpP:
+      case DxsoOpcode::LogP:
+      case DxsoOpcode::Frc:
+      case DxsoOpcode::Abs:
+      case DxsoOpcode::Nrm:
+      case DxsoOpcode::Sgn:
+      case DxsoOpcode::Lit:
+      case DxsoOpcode::Mova:
+      case DxsoOpcode::DsX:
+      case DxsoOpcode::DsY:
+      case DxsoOpcode::SinCos:  // ps_3_0 folds away the two constant operands ps_2_0 required
+        return 1;
+      case DxsoOpcode::Add:
+      case DxsoOpcode::Sub:
+      case DxsoOpcode::Mul:
+      case DxsoOpcode::Dp3:
+      case DxsoOpcode::Dp4:
+      case DxsoOpcode::Min:
+      case DxsoOpcode::Max:
+      case DxsoOpcode::Slt:
+      case DxsoOpcode::Sge:
+      case DxsoOpcode::Dst:
+      case DxsoOpcode::Pow:
+      case DxsoOpcode::Crs:
+      case DxsoOpcode::M4x4:
+      case DxsoOpcode::M4x3:
+      case DxsoOpcode::M3x4:
+      case DxsoOpcode::M3x3:
+      case DxsoOpcode::M3x2:
+      case DxsoOpcode::Bem:
+        return 2;
+      case DxsoOpcode::Mad:
+      case DxsoOpcode::Lrp:
+      case DxsoOpcode::Cmp:
+      case DxsoOpcode::Cnd:
+      case DxsoOpcode::Dp2Add:
+        return 3;
+      // Sampling ops report none. Their destination holds a sampled value, whose dependency on the
+      // coordinate's constants matters only for a dependent texture read, and their operand layout
+      // varies by shader model (ps_1_x carries the coordinate in the destination). Under-reporting
+      // costs a dependent read's taint and is caught by [RTX-MicChurn]; guessing wrong would taint
+      // from a stale slot and merge two anchors.
+      default:
+        return 0;
+      }
+    }
+
+    // Matrix multiplies name only the first row's constant register; the rest of the matrix
+    // occupies the registers immediately after it. Returns 0 for everything else.
+    static uint32_t getDxsoMatrixRowCount(const DxsoOpcode op) {
+      switch (op) {
+      case DxsoOpcode::M4x4: return 4;
+      case DxsoOpcode::M4x3:
+      case DxsoOpcode::M3x4:
+      case DxsoOpcode::M3x3: return 3;
+      case DxsoOpcode::M3x2: return 2;
+      default:               return 0;
+      }
+    }
 
     // expression-level hints inferred from shader opcode/dataflow around a sampler's UV path
     constexpr uint16_t kPsSamplerExprUvTransform = 1u << 0;
@@ -2328,6 +2384,12 @@ namespace dxvk {
       bool offsetImmediateValid = false;
       float offsetImmediateU = 0.0f;
       float offsetImmediateV = 0.0f;
+      // Every float constant register this sampler's coordinate depends on, ascending. Unlike
+      // scaleConstReg/offsetConstReg - which are outputs of the affine resolver and so only
+      // exist for the shapes it can express - this is the transitive dataflow, so it also
+      // covers a rotator's 2x2 matrix, a matrix multiply, and any chain through temps. Excludes
+      // `def` literals, which are bytecode rather than draw state.
+      std::vector<uint32_t> coordConstRegs;
     };
 
     struct PsTexcoordScaleHint {
@@ -2418,6 +2480,13 @@ namespace dxvk {
       defFloatConstValid.fill(0);
       std::array<Vector4, caps::MaxFloatConstantsPS> defFloatConsts = {};
 
+      // Which float constant registers each temp's value transitively depends on, as a bitset.
+      // Read at a sample to learn what a coordinate is built from, which is what tells a texture
+      // transform apart from an authored parameter no matter what shape the expression takes.
+      constexpr uint32_t kConstDepWords = (caps::MaxFloatConstantsPS + 63u) / 64u;
+      using ConstDepSet = std::array<uint64_t, kConstDepWords>;
+      std::array<ConstDepSet, 64> tempConstDeps = {};
+
       auto getTexcoordFromRegister = [&](const DxsoRegister& r) -> int32_t {
         auto mapPsInputRegToTexcoordUsage = [&](const uint32_t regNum) -> int32_t {
           if (regNum < inputRegToTexcoord.size()) {
@@ -2459,6 +2528,30 @@ namespace dxvk {
             : 0u;
         default:
           return 0u;
+        }
+      };
+
+      // A `def` literal is baked into the bytecode, so it is already part of the shader identity
+      // seed and can never vary between draws.
+      auto markConstDep = [&](const int32_t reg, ConstDepSet& inOut) {
+        if (reg >= 0 && reg < int32_t(caps::MaxFloatConstantsPS) && !defFloatConstValid[reg])
+          inOut[uint32_t(reg) / 64u] |= 1ull << (uint32_t(reg) % 64u);
+      };
+
+      auto orConstDepsFromRegister = [&](const DxsoRegister& r, ConstDepSet& inOut) {
+        switch (r.id.type) {
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          if (r.id.num < tempConstDeps.size()) {
+            const ConstDepSet& deps = tempConstDeps[r.id.num];
+            for (uint32_t w = 0; w < kConstDepWords; w++)
+              inOut[w] |= deps[w];
+          }
+          break;
+        default:
+          if (isFloatConstantRegisterType(r.id.type) && !r.hasRelative)
+            markConstDep(getFloatConstantRegisterIndex(r), inOut);
+          break;
         }
       };
 
@@ -2719,6 +2812,7 @@ namespace dxvk {
       uint32_t texcoordDerivedSampleCount = 0;
       uint32_t nonTexcoordDerivedSampleCount = 0;
       uint16_t sampledCoordExpressionFlags = 0;
+      ConstDepSet sampledCoordConstDeps = {};  // -> result.coordConstRegs
       bool normalDecodeDetected = false;   // -> kPsSamplerExprNormalDecode
       bool reachesOutputColor = false;     // -> kPsSamplerExprReachesOutputColor
       bool diffuseAnchorDetected = false;  // -> kPsSamplerExprDiffuseAnchor
@@ -2781,6 +2875,30 @@ namespace dxvk {
           const uint8_t anchorB = getAnchorBitsFromRegister(ctx.src[1]);
           if ((roleA && anchorB != 0) || (roleB && anchorA != 0))
             diffuseAnchorDetected = true;
+        }
+
+        // Constant dependency propagation, for every temp write rather than only the ones the
+        // coordinate tracking recognises: a rotator reaches its coordinate through intermediate
+        // temps that are not themselves coordinates. Sources are read before the destination is
+        // assigned, so an in-place update (dst == src) sees its own prior dependencies. Only the
+        // set belonging to a register actually sampled from is ever read back.
+        if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
+            ctx.dst.id.num < tempConstDeps.size() &&
+            op != DxsoOpcode::Def && op != DxsoOpcode::DefI && op != DxsoOpcode::DefB) {
+          ConstDepSet deps = {};
+          const uint32_t srcCount = std::min<uint32_t>(getDxsoSourceOperandCount(op), uint32_t(ctx.src.size()));
+          for (uint32_t s = 0; s < srcCount; s++)
+            orConstDepsFromRegister(ctx.src[s], deps);
+
+          const uint32_t matrixRows = getDxsoMatrixRowCount(op);
+          if (matrixRows > 1u && srcCount >= 2u &&
+              isFloatConstantRegisterType(ctx.src[1].id.type) && !ctx.src[1].hasRelative) {
+            const int32_t base = getFloatConstantRegisterIndex(ctx.src[1]);
+            for (uint32_t row = 1; row < matrixRows; row++)
+              markConstDep(base + int32_t(row), deps);
+          }
+
+          tempConstDeps[ctx.dst.id.num] = deps;
         }
 
         if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
@@ -3447,6 +3565,10 @@ namespace dxvk {
             ? uint16_t(result.sampleCount + 1u)
             : std::numeric_limits<uint16_t>::max();
 
+          // Accumulated across every sample of this sampler, since a material can read the same
+          // texture through more than one coordinate (a sub-UV blend reads two atlas frames).
+          orConstDepsFromRegister(*coordReg, sampledCoordConstDeps);
+
           if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
               ctx.dst.id.num < tempSamplerValueRole.size()) {
             uint8_t sampleRole = kSamplerValueRoleColor;
@@ -3626,6 +3748,11 @@ namespace dxvk {
         }
       }
 
+      for (uint32_t reg = 0; reg < caps::MaxFloatConstantsPS; reg++) {
+        if ((sampledCoordConstDeps[reg / 64u] >> (reg % 64u)) & 1ull)
+          result.coordConstRegs.push_back(reg);
+      }
+
       result.expressionFlags = sampledCoordExpressionFlags;
       if (result.scaleConstReg >= 0 || result.scaleImmediateValid)
         result.expressionFlags |= kPsSamplerExprUvTransform;
@@ -3787,7 +3914,8 @@ namespace dxvk {
 
     static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(
         const std::vector<uint8_t>& bytecode,
-        const D3D9CommonShader* pixelShader) {
+        const D3D9CommonShader* pixelShader,
+        const bool detectVolatileConstants) {
       Ue3PsMaterialIdentityInfo info;
       if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
         return info;
@@ -3833,11 +3961,20 @@ namespace dxvk {
 
       std::vector<DeclaredSampler> declaredSamplers;
       std::vector<DeclaredUniform> declaredUniforms;
+      // Every sampler register the CTAB declares, material or engine. A frame-varying uniform
+      // can drive the UV of any of them, and the register has to leave the identity wherever it
+      // is used - an engine sampler sharing a material's panner offset is still that panner.
+      std::vector<uint32_t> allDeclaredSamplerRegisters;
 
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
         const std::string name = toLowerAscii(c.name);
 
         if (c.registerSet == kD3dxRegisterSetSampler) {
+          if (c.registerCount != 0) {
+            const uint32_t declaredEnd = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
+            for (uint32_t s = c.registerIndex; s < declaredEnd; s++)
+              allDeclaredSamplerRegisters.push_back(s);
+          }
           // strict prefix rule: only the numbered sampler names emitted by the UE3 material
           // translator count as material texture parameters; lightmaps/scene/shadow samplers
           // use other names and must stay out of the material identity
@@ -3869,6 +4006,49 @@ namespace dxvk {
       std::vector<std::string> samplerSignatureEntries;
       std::vector<std::string> keptSamplerNames, excludedSamplerNames;
 
+      // One bytecode walk per declared sampler, shared by the lighting-input test below and the
+      // volatile-register harvest. This whole parse is memoised per shader hash, so the cost is
+      // paid once per pixel shader rather than per draw.
+      std::map<uint32_t, PsSamplerTexcoordInference> samplerInference;
+      if (pixelShader != nullptr) {
+        for (const uint32_t samplerRegister : allDeclaredSamplerRegisters)
+          samplerInference.emplace(samplerRegister, inferPixelShaderTexcoordForSampler(pixelShader, samplerRegister));
+      }
+
+      // Registers the shader itself proves drive a sampler's coordinate: a texture transform
+      // rather than an authored parameter, wherever the value happens to come from. UE3
+      // re-evaluates every material uniform expression on the CPU per draw and
+      // writes the result into the same registers that carry VectorParameterValues, so a
+      // panner, rotator, flipbook/sub-UV frame or distance blend arrives in one of these and
+      // moves while the material stays the same one. An identity that folds them in is not
+      // reproducible: it re-mints as the material animates, and the replacements anchored on it
+      // match only on the frames the value happens to come back around. The tints UE3's colour
+      // variants are told apart by reach the output colour instead, never a coordinate, so they
+      // are untouched by this.
+      //
+      // Nothing about the material's appearance is lost. The UV path reads these same registers
+      // live and still resolves the transform per draw (samplerScaleConstReg /
+      // samplerOffsetConstReg); it is only the identity hash that declines to include them.
+      std::vector<uint32_t> volatileRegisters;
+      if (detectVolatileConstants) {
+        auto markVolatile = [&](const int32_t reg) {
+          if (reg < 0 || uint32_t(reg) >= caps::MaxFloatConstantsPS)
+            return;
+          const uint32_t value = uint32_t(reg);
+          if (std::find(volatileRegisters.begin(), volatileRegisters.end(), value) == volatileRegisters.end())
+            volatileRegisters.push_back(value);
+        };
+        for (const auto& [samplerRegister, inferred] : samplerInference) {
+          // The transitive dependency set, not the affine resolver's scale/offset slots. Those
+          // only exist for a transform the resolver can express as `uv * cA + cB`, and Mirror's
+          // Edge's animated materials mostly do not take that shape: a Rotator arrives as a 2x2
+          // matrix across a register pair - visible in the values as (cos,-sin)/(sin,cos) - which
+          // fits neither slot, so the resolver leaves both empty and nothing would be excluded.
+          for (const uint32_t reg : inferred.coordConstRegs)
+            markVolatile(int32_t(reg));
+        }
+      }
+
       // Only needed to fall back on if every sampler classifies as a lighting input.
       uint32_t allSamplerMask = 0;
       std::vector<std::tuple<std::string, XXH64_hash_t, uint32_t>> allSamplersByNameOrder;
@@ -3886,7 +4066,8 @@ namespace dxvk {
           allSamplerMask |= (1u << s);
           allSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
 
-          if (pixelShader != nullptr && isUe3LightingInputSampler(inferPixelShaderTexcoordForSampler(pixelShader, s))) {
+          const auto inferenceIt = samplerInference.find(s);
+          if (inferenceIt != samplerInference.end() && isUe3LightingInputSampler(inferenceIt->second)) {
             excludedSamplerNames.push_back(samplerName);
             continue;
           }
@@ -3911,6 +4092,27 @@ namespace dxvk {
         excludedSamplerNames.clear();
       }
 
+      std::vector<std::string> keptUniformNames, volatileUniformNames;
+      std::vector<uint32_t> droppedUniformRegisters;
+
+      // Constants are the only thing telling a textureless material apart, so one keeps every
+      // register even where the dataflow marks it volatile. Merging those collapses unrelated
+      // materials onto a single anchor, which is a worse outcome than an identity that moves -
+      // the same trade the all-lighting-inputs guard above makes.
+      const bool keepEveryUniform = info.materialSamplerMask == 0;
+
+      // A uniform is dropped when *any* register in its declared range is volatile, not only
+      // its leading one. The hash streams the leading element, but fxc is free to place the
+      // animated component anywhere inside the range it reported.
+      auto uniformRangeIsVolatile = [&](const DeclaredUniform& uniform) {
+        const uint32_t end = uniform.registerIndex + uniform.registerCount;
+        for (uint32_t r = uniform.registerIndex; r < end; r++) {
+          if (std::find(volatileRegisters.begin(), volatileRegisters.end(), r) != volatileRegisters.end())
+            return true;
+        }
+        return false;
+      };
+
       for (const DeclaredUniform& uniform : declaredUniforms) {
         // Vectors only. Scalars are where the two lightmap compiles genuinely disagree:
         // DiffusePower exponents the lightmap under SIMPLE_LIGHTING and a LightMapBasis-derived
@@ -3920,11 +4122,21 @@ namespace dxvk {
         if (uniform.name.find("uniformscalar_") != std::string::npos)
           continue;
 
+        if (!keepEveryUniform && uniformRangeIsVolatile(uniform)) {
+          volatileUniformNames.push_back(uniform.name);
+          // Report the registers that actually left the identity, not every register the
+          // analysis flagged: a UV transform driven by an engine constant marks a register no
+          // material uniform ever covered, and claiming it was excluded would be a lie.
+          droppedUniformRegisters.push_back(uniform.registerIndex);
+          continue;
+        }
+
+        keptUniformNames.push_back(uniform.name);
         uniformsByName.emplace_back(uniform.name, uniform.registerIndex);
         info.constRanges.emplace_back(uniform.registerIndex, uniform.registerCount);
       }
 
-      if (!excludedSamplerNames.empty()) {
+      if (!excludedSamplerNames.empty() || !volatileUniformNames.empty()) {
         auto join = [](const std::vector<std::string>& names) {
           std::string out;
           for (const std::string& name : names) {
@@ -3936,8 +4148,12 @@ namespace dxvk {
         };
         info.identitySummary = str::format(
           "samplers kept=[", join(keptSamplerNames), "] excludedAsLightingInputs=[",
-          join(excludedSamplerNames), "]");
+          join(excludedSamplerNames), "] uniforms kept=[", join(keptUniformNames),
+          "] excludedAsVolatile=[", join(volatileUniformNames), "]");
       }
+
+      std::sort(droppedUniformRegisters.begin(), droppedUniformRegisters.end());
+      info.volatileUniformRegisters = std::move(droppedUniformRegisters);
 
       std::sort(info.uniformVectorRegisters.begin(), info.uniformVectorRegisters.end());
 
@@ -4051,15 +4267,25 @@ namespace dxvk {
     }
 
     static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
+    // The parse bakes in whether volatile registers were filtered, so a mid-session toggle of
+    // rtx.d3d9.ue3MicVolatileConstantDetection has to invalidate it rather than serve entries
+    // classified under the other setting.
+    static bool s_ue3PsMaterialIdentityCacheDetectedVolatile = true;
 
     static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
         const XXH64_hash_t psHash,
         const std::vector<uint8_t>& bytecode,
-        const D3D9CommonShader* pixelShader) {
+        const D3D9CommonShader* pixelShader,
+        const bool detectVolatileConstants) {
+      if (s_ue3PsMaterialIdentityCacheDetectedVolatile != detectVolatileConstants) {
+        s_ue3PsMaterialIdentityCacheDetectedVolatile = detectVolatileConstants;
+        s_ue3PsMaterialIdentityCache.clear();
+      }
+
       auto it = s_ue3PsMaterialIdentityCache.find(psHash);
       if (it == s_ue3PsMaterialIdentityCache.end()) {
         it = s_ue3PsMaterialIdentityCache.emplace(
-          psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader)).first;
+          psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader, detectVolatileConstants)).first;
       }
       return it->second;
     }
@@ -5672,7 +5898,8 @@ namespace dxvk {
     o.ue3MaterialInstanceConstantHash = ue3MaterialInstanceConstantHashObject().get();
     o.ue3MicConstantIdentity = ue3MicConstantIdentityObject().get();
     o.ue3MicExcludeRenderTargetsFromIdentity = ue3MicExcludeRenderTargetsFromIdentityObject().get();
-    o.ue3MicPersistAutoExcludedConstantGroups = ue3MicPersistAutoExcludedConstantGroupsObject().get();
+    o.ue3MicVolatileConstantDetection = ue3MicVolatileConstantDetectionObject().get();
+    o.ue3ReportMicIdentityChurn = ue3ReportMicIdentityChurnObject().get();
     o.ue3LogMaterialInstanceHash = ue3LogMaterialInstanceHashObject().get();
     o.ue3SkipDepthPrepass = ue3SkipDepthPrepassObject().get();
     o.ue3SkipShadowDepthPasses = ue3SkipShadowDepthPassesObject().get();
@@ -5705,7 +5932,6 @@ namespace dxvk {
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
     o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
     o.ue3ConstantAlbedoTintGain = ue3ConstantAlbedoTintGainObject().get();
-    o.ue3MicAutoExcludeFrameVaryingConstants = ue3MicAutoExcludeFrameVaryingConstantsObject().get();
     o.ue3LogClassification = ue3LogClassificationObject().get();
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
@@ -5747,7 +5973,7 @@ namespace dxvk {
     o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
     o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
     o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
-    o.ue3MicConstantIdentityExcludedGroups = &ue3MicConstantIdentityExcludedGroupsObject().get();
+    o.ue3MicConstantIdentityExcludedMaterials = &ue3MicConstantIdentityExcludedMaterialsObject().get();
     o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
     o.ue3TraceDrawTextureHashes = &ue3TraceDrawTextureHashesObject().get();
     o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
@@ -9987,7 +10213,8 @@ namespace dxvk {
           }
         }
       }
-      const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode, pixelShader);
+      const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
+        psHash, bytecode, pixelShader, m_frameOptions.ue3MicVolatileConstantDetection);
       for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
         if (reg >= caps::MaxFloatConstantsPS) {
           continue;
@@ -12615,7 +12842,8 @@ namespace dxvk {
           const auto& bytecode = psCommonShader->GetBytecode();
           const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
           if (psHash != 0) {
-            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode, psCommonShader);
+            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
+              psHash, bytecode, psCommonShader, m_frameOptions.ue3MicVolatileConstantDetection);
 
             // UE3 recompiles the same material's base pass per lightmap policy, so a bytecode
             // hash - and everything seeded by it - varies with DirectionalLightmaps and
@@ -12691,19 +12919,36 @@ namespace dxvk {
                   }
                   if (!m_frameOptions.ue3MicIdentityExcludedTextureDescHashes->empty() &&
                       lookupHash(*m_frameOptions.ue3MicIdentityExcludedTextureDescHashes, entry.descriptorHash)) {
-                    // User-tagged session-unstable texture (engine-composited contents give it a
-                    // new image hash every session): keep it out of the identity so anchors hold.
+                    // A texture whose contents are not reproducible (engine-composited, or
+                    // re-uploaded with a different animation frame every level load) still has a
+                    // reproducible *shape*, so the sampler is identified by its descriptor hash
+                    // rather than dropped. Dropping it would be self-defeating on a material
+                    // whose only sampler this is: an empty texture set falls back to the primary
+                    // colour texture's image hash, which is the very value being excluded.
                     if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
                       static fast_unordered_set s_loggedDescIdentityExclusions;
                       const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
                       if (s_loggedDescIdentityExclusions.insert(exclusionLogKey).second) {
                         Logger::info(str::format(
-                          "[RTX-Compatibility][UE3-MIC] Excluded texture image 0x", std::hex, imageHash,
-                          " (descriptor hash 0x", entry.descriptorHash,
-                          ") at material sampler s", std::dec, samplerRegister,
-                          " of pixel shader 0x", std::hex, psHash, std::dec,
-                          " from material identity (rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes)."));
+                          "[RTX-Compatibility][UE3-MIC] Identifying material sampler s", std::dec, samplerRegister,
+                          " of pixel shader 0x", std::hex, psHash,
+                          " by its descriptor hash 0x", entry.descriptorHash,
+                          " instead of its image hash 0x", imageHash, std::dec,
+                          " (rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes)."));
                       }
+                    }
+                    XXH3_64bits_update(state, samplerKey, samplerKeySize);
+                    XXH3_64bits_update(state, &entry.descriptorHash, sizeof(entry.descriptorHash));
+                    anyTextureHashed = true;
+                    if (micDiagSamplerCount < kMicDriftMaxTrackedSamplers) {
+                      micDiagSamplers[micDiagSamplerCount++] = Ue3MicIdentitySample::SamplerRecord {
+                        uint8_t(samplerRegister), entry.isRenderTarget, entry.descriptorHash, entry.descriptorHash };
+                    }
+                    if (logMicHash) {
+                      micTextureListLog += str::format(
+                        micTextureListLog.empty() ? "s" : ",s", samplerRegister,
+                        samplerLogName != nullptr ? str::format("(", samplerLogName, ")") : std::string(),
+                        ":desc0x", std::hex, entry.descriptorHash, std::dec);
                     }
                     return kEmptyHash;
                   }
@@ -12744,28 +12989,26 @@ namespace dxvk {
             }
             m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
 
-            const bool autoExcludeEnabled = m_frameOptions.ue3MicAutoExcludeFrameVaryingConstants;
-            // Manual exclusion honours both the raw bytecode hash (existing configs) and the
-            // identity seed; auto-exclusion is scoped to the (seed, texture set) group, which
-            // is permutation-consistent for invariant-identity shaders yet never wider than
-            // the one churning material family.
-            // Keyed on the texture set the identity uses, primary-colour fallback included. Keying it
-            // on the raw material texture set puts every material whose CTAB declares no material
-            // samplers into one group however different the images they bind, so an exclusion
-            // measured on one strips the constants tier - all that separates them - from all of them.
+            // Constants tier. Frame-varying registers are already gone by this point: the parse
+            // left them out of identityInfo (rtx.d3d9.ue3MicVolatileConstantDetection), so what
+            // remains is hashed unconditionally and the result cannot change mid-session.
+            //
+            // Both manual escape hatches are keyed on values that outlive a session. The shader
+            // one honours the raw bytecode hash (for existing configs) as well as the identity
+            // seed. The per-material one is keyed on textureSetShaderHash, the same value the
+            // second replacement lookup tier uses, so an exclusion and an anchor are named alike.
             const XXH64_hash_t identityTextureSetHash =
               (textureSetHash != kEmptyHash)
                 ? textureSetHash
                 : m_activeDrawCallState.materialData.getColorTexture().getImageHash();
-            const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, identityTextureSetHash);
-            bool constantsExcluded =
+            const XXH64_hash_t textureSetShaderHash =
+              XXH3_64bits_withSeed(&identityTextureSetHash, sizeof(identityTextureSetHash), shaderIdentitySeed);
+            const bool constantsExcluded =
               // The tier that cannot be made lightmap-policy independent; opt-in only.
               !m_frameOptions.ue3MicConstantIdentity ||
               lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, psHash) ||
               (useInvariantShaderIdentity && lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, shaderIdentitySeed)) ||
-              // Same scope as the automatic exclusion, for families it never trips on.
-              lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedGroups, micChurnGroupKey) ||
-              (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey, m_frameOptions.ue3MicPersistAutoExcludedConstantGroups));
+              lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedMaterials, textureSetShaderHash);
             // Invariant-identity shaders hash constants by uniform name and leading register:
             // lightmap policy permutations shift uniform registers and trim per-permutation
             // unreferenced elements, so the raw register-range stream is not comparable
@@ -12777,26 +13020,17 @@ namespace dxvk {
                 ? hashUe3MaterialConstantsByNameOrder(d3d9State().psConsts.fConsts, identityInfo.namedUniformFirstRegistersByNameOrder)
                 : hashUe3MaterialConstants(d3d9State().psConsts.fConsts, identityInfo.constRanges);
             }
-            // frame-varying constant registers would mint a new material identity every
-            // draw; detect that here and drop constants-based identity for the group
-            if (!constantsExcluded && psConstsHash != kEmptyHash && autoExcludeEnabled &&
-                trackUe3MicConstantChurn(micChurnGroupKey, psHash, shaderIdentitySeed, textureSetHash, psConstsHash,
-                                         m_frameOptions.ue3MicPersistAutoExcludedConstantGroups)) {
-              // The exclusion changes this group's material identity mid-session; log both
-              // sides so anchor mismatches around the flip are attributable.
-              const XXH64_hash_t primaryTexHashForFlipLog = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
-              const XXH64_hash_t identityWithoutConstants = XXH3_64bits_withSeed(&identityTextureSetHash, sizeof(identityTextureSetHash), shaderIdentitySeed);
-              const XXH64_hash_t identityWithConstants = XXH3_64bits_withSeed(&psConstsHash, sizeof(psConstsHash), identityWithoutConstants);
-              Logger::warn(str::format(
-                "[RTX-MicDrift] Constants auto-exclusion changed material identity mid-session for group seed=0x",
-                std::hex, shaderIdentitySeed, " textureSet=0x", textureSetHash, " tex=0x", primaryTexHashForFlipLog,
-                ": last constants-bearing materialHash 0x", identityWithConstants,
-                " -> constants-free materialHash 0x", identityWithoutConstants, std::dec,
-                ". Replacements anchored on one side of this flip stop matching on the other."));
-              constantsExcluded = true;
-              psConstsHash = kEmptyHash;
-            }
             m_activeDrawCallState.materialData.setPixelShaderConstantsHashForMaterialInstance(psConstsHash);
+
+            // Report - never act on - a family that still mints more than one identity, so a
+            // frame-varying register the bytecode could not see announces itself instead of
+            // quietly breaking the replacements anchored on it.
+            if (m_frameOptions.ue3ReportMicIdentityChurn && !constantsExcluded && psConstsHash != kEmptyHash) {
+              reportUe3MicIdentityChurnOnce(
+                textureSetShaderHash, psHash, shaderIdentitySeed,
+                m_activeDrawCallState.materialData.getColorTexture().getImageHash(),
+                psConstsHash, d3d9State().psConsts.fConsts, identityInfo, useInvariantShaderIdentity, bytecode);
+            }
 
             // Replacement identity drift diagnostics: attribute a changed material hash
             // to the tier that moved and flag RT-poisoned identities.
@@ -12806,7 +13040,6 @@ namespace dxvk {
             if (replacementDiagActive) {
               m_activeDrawCallState.materialData.updateCachedHash();
               const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
-              const XXH64_hash_t textureSetShaderHash = m_activeDrawCallState.materialData.getTextureSetAndShaderHash();
               const XXH64_hash_t primaryTexHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
 
               bool tracked = false;
@@ -12826,27 +13059,9 @@ namespace dxvk {
                 Ue3MicIdentitySample::ConstantRecord curConstants[kMicDriftMaxTrackedConstants];
                 uint32_t curConstantCount = 0;
                 if (!constantsExcluded && psConstsHash != kEmptyHash) {
-                  if (useInvariantShaderIdentity) {
-                    for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
-                      if (curConstantCount >= kMicDriftMaxTrackedConstants)
-                        break;
-                      if (uniformRegister >= caps::MaxFloatConstantsPS)
-                        continue;
-                      curConstants[curConstantCount++] = Ue3MicIdentitySample::ConstantRecord {
-                        uint16_t(uniformRegister), d3d9State().psConsts.fConsts[uniformRegister] };
-                    }
-                  } else {
-                    for (const auto& [rangeStart, rangeCount] : identityInfo.constRanges) {
-                      for (uint32_t r = rangeStart; r < rangeStart + rangeCount; r++) {
-                        if (curConstantCount >= kMicDriftMaxTrackedConstants || r >= caps::MaxFloatConstantsPS)
-                          break;
-                        curConstants[curConstantCount++] = Ue3MicIdentitySample::ConstantRecord {
-                          uint16_t(r), d3d9State().psConsts.fConsts[r] };
-                      }
-                      if (curConstantCount >= kMicDriftMaxTrackedConstants)
-                        break;
-                    }
-                  }
+                  curConstantCount = snapshotUe3MicIdentityConstants(
+                    d3d9State().psConsts.fConsts, identityInfo, useInvariantShaderIdentity,
+                    curConstants, kMicDriftMaxTrackedConstants);
                 }
 
                 Ue3MicIdentitySample& prev = s_ue3MicIdentityByFamily[familyKey];
@@ -12997,7 +13212,7 @@ namespace dxvk {
               m_activeDrawCallState.materialData.updateCachedHash();
               logUe3MaterialInstanceHashBreakdownOnce(
                 m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash,
-                micChurnGroupKey, psConstsHash, identityInfo, constantsExcluded, micTextureListLog);
+                textureSetShaderHash, psConstsHash, identityInfo, constantsExcluded, micTextureListLog);
             }
           }
         }

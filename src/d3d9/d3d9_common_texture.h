@@ -486,6 +486,7 @@ namespace dxvk {
 
     // NV-DXVK start: UE3 streaming-stable texture hashing
     XXH64_hash_t ComputeUe3StreamingStableHash(const D3D9CommonTexture* source) const;
+    void LogUe3TextureHashProvenance(const D3D9CommonTexture* source, XXH64_hash_t imageHash, bool is2DTexture) const;
     // NV-DXVK end
 
     // NV-DXVK start: resolution-agnostic render target tagging

@@ -157,7 +157,7 @@ Do not use the `LightMapBasis` literals instead, however tempting they are as a 
 
 ### Constants tier
 
-Only `UniformVector_*` parameters contribute (`rtx.d3d9.ue3MicConstantIdentity`, on by default). The `UniformScalar_*` class is excluded wholesale rather than analysed, because that is where the two compiles genuinely disagree: `DiffusePower` exponents the lightmap under `SIMPLE_LIGHTING` and a basis-derived transfer coefficient otherwise, while `SpecularPower` is structurally identical yet present in only one compile. Nothing in the bytecode separates them, so keeping either keeps both. The vectors are taken as declared, because they carry the tint UE3's colour variants are told apart by. `T_RooftopPropsClusters_DA` and its Blue/Orange/Yellow siblings are one texture set differing only in that parameter, and anything that drops it merges them.
+Only `UniformVector_*` parameters contribute (`rtx.d3d9.ue3MicConstantIdentity`, on by default). The `UniformScalar_*` class is excluded wholesale rather than analysed, because that is where the two compiles genuinely disagree: `DiffusePower` exponents the lightmap under `SIMPLE_LIGHTING` and a basis-derived transfer coefficient otherwise, while `SpecularPower` is structurally identical yet present in only one compile. Nothing in the bytecode separates them, so keeping either keeps both. The vectors carry the tint UE3's colour variants are told apart by - `T_RooftopPropsClusters_DA` and its Blue/Orange/Yellow siblings are one texture set differing only in that parameter, and anything that drops it merges them - but they are not taken wholly as declared; see below.
 
 ### Coverage
 
@@ -167,7 +167,7 @@ If you change any of this, measure it by matching materials between a `True` and
 
 Turning `rtx.d3d9.ue3MicConstantIdentity` off makes identity shader + texture set alone, which is fully lightmap-independent, at the cost of merging every instance that shares a texture set onto one anchor. Mirror's Edge tints many of its variants from one set, so this collapses a substantial fraction of them.
 
-Any change to what feeds identity re-mints the affected material hashes, and `mat_<hash>` prims authored against the old ones stop matching. There is no automatic migration: re-anchor the affected materials, using `rtx.d3d9.ue3LogMaterialInstanceHash` to read the new hash for a material you can identify by its albedo texture.
+Any change to what feeds identity re-mints the affected material hashes, and `mat_<hash>` prims authored against the old ones stop matching. See [Re-anchoring after an identity change](#re-anchoring-after-an-identity-change).
 
 ## Albedo selection and the texture spread cache
 
@@ -199,15 +199,56 @@ No scoring threshold resolves this - it is one UV set for two demands. `rtx.d3d9
 
 ## Material identity and replacement anchor stability
 
-With `rtx.d3d9.ue3EngineMode`, a material's identity hash (the `mat_*` anchor that captures, texture tags, and asset replacements key off) is a chain: pixel shader identity → material texture set (image hash of every CTAB `Texture2D_*`/`TextureCube_*` sampler) → material constants (`UniformVector_*`/`UniformScalar_*`). Every tier is a pure function of the draw, so the same material instance always gets the same hash when the inputs themselves are stable. UE3 games expose three unstable input classes, so the runtime deals with each:
+With `rtx.d3d9.ue3EngineMode`, a material's identity hash (the `mat_*` anchor that captures, texture tags, and asset replacements key off) is a chain: pixel shader identity → material texture set (image hash of every CTAB `Texture2D_*`/`TextureCube_*` sampler) → material constants (`UniformVector_*`). Every tier is a pure function of the draw *and of the shader*, decided before the first draw is hashed and never revised, so a material's hash is reproducible from the first frame of any session with no learned state behind it.
 
-- Render targets bound as material samplers (scene captures, reflection buffers). An RT's image hash embeds a creation counter and changes every respawn, checkpoint, or level load. RTs are excluded from identity by default (`rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity`). Anchors that still key off RT-bearing identities need re-anchoring once.
-- Frame-varying constants (time/panner/fade/sub-UV expressions). Churn auto-exclusion drops such a group's constants from identity once it has minted enough distinct hashes. That exclusion is written to `rtx-remix/ue3MicAutoExcludedGroups.cache` (`rtx.d3d9.ue3MicPersistAutoExcludedConstantGroups`), so the group's identity is deterministic from the first frame of every later session instead of flipping mid-session at an unpredictable point.
+Getting there means each of the inputs UE3 offers that is not itself reproducible has to be recognised and left out:
 
-  Deleting that cache is not free: detection does not always fire a second time. On Mirror's Edge, four material families minting thousands of distinct constant hashes each went undetected for a whole session after the file was removed, while two others were caught within 32 draws. Anchors authored against a settled exclusion break when this happens, so treat the file as authoring state rather than a scratch cache. Where a family churns without being caught, pin it with `rtx.d3d9.ue3MicConstantIdentityExcludedGroups`, which takes the `group=0x...` key printed by `rtx.d3d9.ue3LogMaterialInstanceHash` and covers exactly one (shader, texture set) family. The group is keyed on the same texture set the identity is, primary-colour-texture fallback included, so it stays as narrow as the family it was measured on; keying it on the raw material texture set put every material whose CTAB declares no material samplers into one group, and an exclusion measured on one of them dropped the constants tier - the only thing telling them apart - from all of them.
+- **Frame-varying constants** (panners, rotators, flipbook/sub-UV frames, time-driven fades, distance blends). UE3 re-evaluates every material uniform expression on the CPU per draw and writes the result into the same registers that carry authored `VectorParameterValues`, so at the D3D9 level an animation and a tint are the same kind of value. What separates them is where the value *goes*: a texture transform reaches a sampler's coordinate, a tint reaches the output colour. `rtx.d3d9.ue3MicVolatileConstantDetection` (on by default) takes the transitive set of constant registers a sampler's coordinate depends on and drops those from the constants tier, keeping everything else. `rtx.d3d9.ue3LogMaterialInstanceHash` reports the split per shader as `volatileRegs=[...]` and `uniforms kept=[...] excludedAsVolatile=[...]`.
 
-  Reach for `rtx.d3d9.ue3MicConstantIdentityExcludedShaders` only when every material on a shader is frame-varying. It is keyed on the shader, and one UE3 base-pass shader commonly serves dozens of material families - excluding one seed on this content stripped the constants tier from 64 of them and merged six authored anchors that differed only by tint.
-- Session-composited textures (engine-generated textures reuploaded with different contents every session). Their content hash is session-unique, so any identity containing them cannot be anchored from a capture. Tag the texture's descriptor hash (stable across recreations; shown as `desc:0x...` in the `rtx.d3d9.ue3LogMaterialInstanceHash` breakdown and `[RTX-MicDrift]` sampler diffs) in `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes`, then re-anchor the material once. Alternatively, anchor the override at the raw texture hash (`mat_<textureHash>`): replacement lookup runs tiers material → textureSet+shader → texture, so a texture-tier anchor catches every material variant that selects that image as its albedo, while more specific anchors still win where present.
+  It has to be the dependency set rather than the affine resolver's scale and offset registers, which only exist for a transform expressible as `uv * cA + cB`. Mirror's Edge's animated materials mostly are not that shape: a Rotator arrives as a 2x2 matrix spread across a register pair, recognisable in the logged values as `(cos,-sin)` and `(sin,cos)`, which fits neither slot. Keying on the resolver's output left those materials with nothing excluded.
+
+  The tracking follows only the operands an opcode actually reads, and reports none where the layout is not certain, so it errs towards leaving a register in identity. That direction matters: an identity that still churns says so through `[RTX-MicChurn]`, whereas one built from a stale operand would merge two anchors silently.
+
+  Nothing about the material's appearance changes: the UV path reads those same registers live and still resolves the transform per draw. Only the identity declines to include them.
+
+  The cost is that two materials separated *only* by such a register share one anchor. Neither had a reproducible identity to anchor beforehand, so little is lost, but note that a static UV tiling parameter is no longer a discriminator: a material whose only distinguishing feature is its tiling now shares its sibling's `mat_<hash>`.
+
+- **Render targets bound as material samplers** (scene captures, reflection buffers). An RT's image hash embeds a creation counter and changes every respawn, checkpoint, or level load. RTs are excluded from identity by default (`rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity`).
+
+- **Session-composited textures** (engine-generated textures reuploaded with different contents every session). Their content hash is session-unique, so any identity containing them cannot be anchored from a capture. Tag the texture's descriptor hash (stable across recreations; shown as `desc:0x...` in the `rtx.d3d9.ue3LogMaterialInstanceHash` breakdown and `[RTX-MicDrift]` sampler diffs) in `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes`, then re-anchor the material once. The sampler is then identified by that descriptor hash rather than dropped from the texture set: a texture whose contents are not reproducible still has a reproducible shape, and dropping it would be self-defeating on a material whose only sampler it is, since an empty texture set falls back to the primary colour texture's image hash - the value being excluded. Note that identically shaped textures share a descriptor, so the exclusion covers all of them and materials distinguished only by which of those they bind will merge.
+
+  Alternatively, anchor the override at the raw texture hash (`mat_<textureHash>`): replacement lookup runs tiers material → textureSet+shader → texture, so a texture-tier anchor catches every material variant that selects that image as its albedo, while more specific anchors still win where present.
+
+- **Mipped textures at or below the streaming-stable tail size**, where the whole chain is the tail. Identity is latched while mip 0 is being flushed, so a smaller mip the game has not written yet is an allocated buffer holding recycled memory, and that becomes permanent identity - visible as an image hash that changes on every level load while the descriptor hash stays put. Use `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes` on the affected descriptor; `rtx.d3d9.ue3LogTextureHashProvenance` reports the mip 0 hash separately from the full-chain one, which is what distinguishes this from a texture whose contents genuinely differ.
+
+  Identifying such a texture by its top mip alone looks like the obvious fix and is not one. That size is also the state every larger texture passes through while streaming in, because UE3's minimum resident mip count lands there, and the whole point of the tail scheme is that the reduced variant hashes equal to the fully resident one. Break that equality and a replacement cannot bind until streaming finishes, which presents as an asset appearing unenhanced for a moment on every level load - the regression the tail scheme was introduced to remove.
+
+- **Cube maps assembled face by face.** A cube map's hash is latched the first time it is set up for RTX and never recomputed, so hashing whichever faces happened to have CPU data at that moment makes the value depend on upload order - identifying a material one session and nothing the next. All six faces must be present before an identity is latched; waiting costs at most a rebind, since a face without data cannot be sampled yet. For a fully resident cube map the value is unchanged, so nothing anchored on one needs re-anchoring.
+
+  The streaming-stable mip tail deliberately does not extend to cube maps. UE3's texture streamer iterates `UTexture2D` only and a cube map's faces skip `UpdateResource`, so a cube map never appears as a series of mip-count variants the way a 2D texture does - the tail would buy no stability while re-minting the identity of every material binding one.
+
+### What the runtime cannot recognise, and how it tells you
+
+A frame-varying expression that reaches the *output colour* rather than a coordinate - a time-driven fade or a pulsing tint - is genuinely indistinguishable from an authored `VectorParameterValue` in the bytecode, and no rule over dataflow separates them. Such a family still mints more than one identity.
+
+`rtx.d3d9.ue3ReportMicIdentityChurn` (on by default, and free until a family actually churns) warns once per family, naming the registers whose values moved and printing the config line that pins it:
+
+```
+[RTX-MicChurn] Material family textureSetShader=0x... (ps=0x... seed=0x... tex=0x...) has minted 16 identities from its constants tier, so a register is very likely animating:
+    c12 (UniformVector_3): (1,1,1,1) -> (1,1,1,0.42)
+  Every material hash it mints is unanchorable. Pin it with:
+    rtx.d3d9.ue3MicConstantIdentityExcludedMaterials = 0x...
+```
+
+It reports on a count rather than on the first disagreement, because a *second* identity on one texture set is also what a colour variant looks like the first time its sibling is drawn. Measured sibling sets run to about eight while an animating register passes any bound within a second, so a threshold clear of the former keeps the report to the families that actually cannot be anchored.
+
+Identity is never altered as a consequence of the report. An exclusion that takes effect part-way through a session is the exact failure this design exists to remove - it splits the material's anchors either side of an unpredictable moment - so the fix belongs in a config the next session starts from. `rtx.d3d9.ue3MicConstantIdentityExcludedMaterials` is keyed on `textureSetShaderHash`, which is both the second replacement lookup tier and one material family, so the same value that pins the exclusion can anchor the override. Reach for `rtx.d3d9.ue3MicConstantIdentityExcludedShaders` only when every material on a shader is frame-varying: it is keyed on the shader, and one UE3 base-pass shader commonly serves dozens of families - excluding one seed on this content stripped the constants tier from 64 of them and merged six authored anchors that differed only by tint.
+
+### Re-anchoring after an identity change
+
+Any change to what feeds identity re-mints the affected material hashes, and `mat_<hash>` prims authored against the old ones stop matching. There is nothing to alias them to: for a material that was animating there were many old hashes, one per frame, which is why its anchor was unreliable to begin with, and where the change is to the texture set the old value was a function of data that is no longer reproduced at all.
+
+So re-anchoring reads the new value rather than mapping the old one. `rtx.d3d9.ue3LogMaterialInstanceHash` prints one breakdown per material, and its `textures=[...]` field identifies which material is which by the images its samplers bind - match on the albedo texture and take the `materialHash`. A fresh capture works too, and is the better option when many materials moved at once.
 
 ## Replacement anchor diagnostics
 
@@ -215,7 +256,7 @@ When an authored enhancement does not appear (or appears intermittently), enable
 
 - `[RTX-ReplacementResolve]`: how each material/mesh resolved against the mod's anchors (which lookup tier matched, or `NO MATCH`), plus a per-mod anchor dump at load.
 - `[RTX-ReplacementFlap]`: a material family that previously matched stopped matching (or vice versa) mid-session, with old/new hashes for every tier.
-- `[RTX-MicDrift]`: a material family minted a new identity, attributed to the tier that moved: per-sampler image hash diffs (with `desc:0x...` and RT flags) or changed constant registers with old/new values.
+- `[RTX-MicDrift]`: a material family minted a new identity, attributed to the tier that moved: per-sampler image hash diffs (with `desc:0x...` and RT flags) or changed constant registers with old/new values. This is the full-detail form of `[RTX-MicChurn]`, which is on by default and covers the constants tier only.
 - `[RTX-MicRtPoisoning]`: a material identity still embeds a render-target image hash (only possible with RT exclusion disabled).
 - `[RTX-MeshAnchorDrift]`: a mesh replacement key moved, attributed to its geometry part (unstable vertex data, e.g. CPU-morphed skinned meshes) vs its material part (mesh keys are `geometryHash XOR materialHash`).
 
