@@ -33,6 +33,7 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_debug_view.h"
 #include "rtx_sparse_rendering.h"
+#include "rtx_atmosphere.h"
 
 #include "../util/util_global_time.h"
 
@@ -131,6 +132,7 @@ namespace dxvk {
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
         TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
+        TEXTURE2D(COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -410,6 +412,9 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT,
       ctx->getAerialPerspectiveLutView(), nullptr);
 
+    ctx->bindResourceView(COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT,
+      ctx->getSkyHemisphereMeanView(), nullptr);
+
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;
 
@@ -448,6 +453,16 @@ namespace dxvk {
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
     compositeArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
+
+    Vector3 unoccludedSunRadiance(0.0f, 0.0f, 0.0f);
+    Vector3 unoccludedSunDirection(0.0f, 0.0f, 0.0f);
+    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+      RtxAtmosphere::estimateUnoccludedVolumeLighting(
+        compositeArgs.atmosphereArgs, RtxOptions::zUp(),
+        unoccludedSunRadiance, unoccludedSunDirection);
+    }
+    compositeArgs.unoccludedSunRadiance = unoccludedSunRadiance;
+    compositeArgs.unoccludedSunDirection = unoccludedSunDirection;
     compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
     compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
     compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();

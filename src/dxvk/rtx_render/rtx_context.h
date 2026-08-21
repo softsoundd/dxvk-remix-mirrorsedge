@@ -158,6 +158,9 @@ namespace dxvk {
     /** Aerial perspective volume view, or nullptr when Physical Atmosphere is not active. */
     Rc<DxvkImageView> getAerialPerspectiveLutView() const;
 
+    /** 1x1 sky-view LUT hemisphere mean, or nullptr before atmosphere init. */
+    Rc<DxvkImageView> getSkyHemisphereMeanView() const;
+
 #ifdef REMIX_DEVELOPMENT
     /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */
     bool handleCrashHotkeys();

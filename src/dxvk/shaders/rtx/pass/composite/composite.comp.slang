@@ -393,6 +393,19 @@ void loadInputRadiance(
   }
 }
 
+// LUT hemisphere mean * 0.5 * strength matches froxel SH evaluateHG(*, 0) (2π / 4π).
+float3 evalReflectionSkyFloor()
+{
+  if (cb.volumeArgs.physicalAtmosphereEnabled == 0 ||
+      cb.volumeArgs.skyAmbientStrength <= 0.0f)
+  {
+    return cb.volumeArgs.multiScatteringEstimate;
+  }
+
+  const float3 lutMean = SkyHemisphereMean.Load(int3(0, 0, 0)).rgb;
+  return lutMean * (cb.volumeArgs.skyAmbientStrength * 0.5f);
+}
+
 void applyVolumetricLighting(
   uint2 pixelCoordinate,
   inout RNG randomState,
@@ -460,26 +473,25 @@ void applyVolumetricLighting(
       const float3 cameraPos = cameraGetWorldPosition(cb.camera);
       float3 t0 = vec3(1.0f);
       float3 s0 = vec3(0.0f);
-      float3 cameraRayMeanInScatter = vec3(0.0f);
       integrateVolumetricNEE(
         randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
         cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, false,
         cameraPos, psrFirstHitDistance, primaryRayDirections.worldDirection,
-        s0, t0, cameraRayMeanInScatter);
+        s0, t0, ignoredMeanInScatter);
 
       const float3 mirrorPos = cameraPos + primaryRayDirections.worldDirection * psrFirstHitDistance;
       const bool reflMiss = psrReflectionSegmentSigned < 0.0f;
       const float reflSeg = abs(psrReflectionSegmentSigned);
       float3 t1 = vec3(1.0f);
       float3 s1 = vec3(0.0f);
-      // One value for the whole segment: the fraction of it inside the camera's frustum varies with viewing
-      // angle, and the cache holds nothing outside. Taken from the camera ray's cache mean, which carries
-      // the cache's magnitude and the scene's occlusion.
+      const float3 reflectionInScatter = evalUnoccludedReflectionInScatter(
+        cb.volumeArgs, psrReflectionDirection, evalReflectionSkyFloor(), mirrorPos,
+        cb.unoccludedSunRadiance, cb.unoccludedSunDirection);
       integrateVolumetricNEE(
         randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
         cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, reflMiss,
         mirrorPos, reflSeg, psrReflectionDirection,
-        s1, t1, ignoredMeanInScatter, true, cameraRayMeanInScatter);
+        s1, t1, ignoredMeanInScatter, false, reflectionInScatter, true);
 
       volumeAttenuation = segmentIsPsr ? (t0 * t1) : t0;
       volumetricPreintegratedRadiance = s0 + t0 * s1 * segmentAttenuation;

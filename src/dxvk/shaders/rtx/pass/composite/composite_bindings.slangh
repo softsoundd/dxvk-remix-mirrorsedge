@@ -109,6 +109,8 @@ Sampler2D<float3> SkyLight;
 
 layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
 Texture3D AtmosphereAerialPerspectiveLut;
+layout(binding = COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT)
+Texture2D SkyHemisphereMean;
 
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;

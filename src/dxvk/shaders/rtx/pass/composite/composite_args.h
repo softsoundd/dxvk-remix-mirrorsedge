@@ -114,4 +114,14 @@ struct CompositeArgs {
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
   float pad1;
+
+  // Unoccluded distant-sun illuminance and world direction for reflection-segment fog.
+  vec3 unoccludedSunRadiance;
+  float padUnoccludedSun;
+  vec3 unoccludedSunDirection;
+  float padUnoccludedDir;
 };
+
+#ifdef __cplusplus
+static_assert((sizeof(CompositeArgs) & 15) == 0);
+#endif

@@ -333,6 +333,16 @@ namespace dxvk {
     return lut.isValid() ? lut.view : nullptr;
   }
 
+  Rc<DxvkImageView> RtxContext::getSkyHemisphereMeanView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource mean = m_atmosphere->getSkyHemisphereMean();
+
+    return mean.isValid() ? mean.view : nullptr;
+  }
+
   RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
     if (shouldUseDLSS() && m_common->metaDLSS().isActive()) {
       return InternalUpscaler::DLSS;

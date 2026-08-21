@@ -52,8 +52,9 @@ public:
    * \brief Compute atmospheric LUTs if needed
    *
    * The transmittance, multiscattering and sky-view LUTs only depend on the atmosphere parameters,
-   * so they are rebaked when those change. The aerial perspective volume is fitted to the camera
-   * frustum and is therefore rebuilt every frame.
+   * so they are rebaked when those change. The sky-view hemisphere mean is derived from the sky-view
+   * LUT at the same time. The aerial perspective volume is fitted to the camera frustum and is
+   * therefore rebuilt every frame.
    */
   void computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
 
@@ -76,6 +77,11 @@ public:
    * \brief Get sky view LUT resource
    */
   Resources::Resource getSkyViewLut() const { return m_skyViewLut; }
+
+  /**
+   * \brief 1x1 isotropic hemisphere mean of the sky-view LUT.
+   */
+  Resources::Resource getSkyHemisphereMean() const { return m_skyHemisphereMean; }
 
   /**
    * \brief Get aerial perspective LUT resource
@@ -109,6 +115,16 @@ public:
   static Vector3 estimateVolumeAmbientRadiance(const AtmosphereArgs& args);
 
   /**
+   * \brief Unoccluded ground-reaching sun illuminance and world-space direction.
+   * Composite applies medium transmittance, firefly filtering, and SH HG.
+   */
+  static void estimateUnoccludedVolumeLighting(
+    const AtmosphereArgs& args,
+    bool isZUp,
+    Vector3& outSunRadiance,
+    Vector3& outSunDirectionWorld);
+
+  /**
    * \brief Low-sun warm tint for froxel composite (σ_s desaturation + mild warm bias).
    *
    * outBlend is 0 at high sun and rises toward the horizon. Keeps artistic medium colour
@@ -130,6 +146,7 @@ private:
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
+  void dispatchSkyHemisphereMean(Rc<DxvkContext> ctx);
   void dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx);
 
   // LUT dimensions
@@ -152,6 +169,7 @@ private:
   Resources::Resource m_transmittanceLut;
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
+  Resources::Resource m_skyHemisphereMean;
   Resources::Resource m_aerialPerspectiveLut;
 
   Rc<DxvkBuffer> m_constantsBuffer;

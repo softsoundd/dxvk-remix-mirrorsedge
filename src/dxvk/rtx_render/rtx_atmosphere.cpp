@@ -34,6 +34,7 @@
 #include <rtx_shaders/transmittance_lut.h>
 #include <rtx_shaders/multiscattering_lut.h>
 #include <rtx_shaders/sky_view_lut.h>
+#include <rtx_shaders/sky_view_hemisphere_mean.h>
 #include <rtx_shaders/aerial_perspective_lut.h>
 #include <algorithm>
 #include <cmath>
@@ -76,6 +77,17 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(SkyViewLutShader);
+
+    class SkyViewHemisphereMeanShader : public ManagedShader {
+      SHADER_SOURCE(SkyViewHemisphereMeanShader, VK_SHADER_STAGE_COMPUTE_BIT, sky_view_hemisphere_mean)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        TEXTURE2D(1)
+        RW_TEXTURE2D(2)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(SkyViewHemisphereMeanShader);
 
     class AerialPerspectiveLutShader : public ManagedShader {
       SHADER_SOURCE(AerialPerspectiveLutShader, VK_SHADER_STAGE_COMPUTE_BIT, aerial_perspective_lut)
@@ -374,6 +386,22 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     1 // mipLevels
   );
 
+  // Isotropic hemisphere mean of the sky-view LUT.
+  VkExtent3D skyHemisphereExtent = { 1, 1, 1 };
+  m_skyHemisphereMean = Resources::createImageResource(
+    ctx,
+    "Atmosphere Sky Hemisphere Mean",
+    skyHemisphereExtent,
+    VK_FORMAT_R16G16B16A16_SFLOAT,
+    1, // numLayers
+    VK_IMAGE_TYPE_2D,
+    VK_IMAGE_VIEW_TYPE_2D,
+    0, // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
+    VkClearColorValue{}, // clearValue
+    1 // mipLevels
+  );
+
   // Create aerial perspective volume (in-scatter in RGB, mean transmittance in A)
   VkExtent3D aerialPerspectiveExtent = {
     kAerialPerspectiveLutSize, kAerialPerspectiveLutSize, kAerialPerspectiveLutSize };
@@ -412,6 +440,10 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args)
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
     dispatchSkyViewLut(ctx);
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    dispatchSkyHemisphereMean(ctx);
 
     m_lutsNeedRecompute = false;
   }
@@ -426,11 +458,11 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args)
     dispatchAerialPerspectiveLut(ctx);
   }
 
-  // Final barrier: Ensure the LUTs are written before use in ray tracing
+  // LUT writes before ray tracing and composite.
   ctx->emitMemoryBarrier(0,
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_ACCESS_SHADER_WRITE_BIT,
-    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
     VK_ACCESS_SHADER_READ_BIT);
 }
 
@@ -482,6 +514,20 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ctx->dispatch(groupsX, groupsY, 1);
 }
 
+void RtxAtmosphere::dispatchSkyHemisphereMean(Rc<DxvkContext> ctx) {
+  ScopedGpuProfileZone(ctx, "Atmosphere Sky Hemisphere Mean");
+
+  ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+  ctx->bindResourceView(1, m_skyViewLut.view, nullptr);
+  ctx->bindResourceView(2, m_skyHemisphereMean.view, nullptr);
+
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_skyViewLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_skyHemisphereMean.image);
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SkyViewHemisphereMeanShader::getShader());
+  ctx->dispatch(1, 1, 1);
+}
+
 void RtxAtmosphere::dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx) {
   ScopedGpuProfileZone(ctx, "Atmosphere Aerial Perspective LUT");
 
@@ -525,6 +571,24 @@ Vector3 RtxAtmosphere::estimateVolumeAmbientRadiance(const AtmosphereArgs& args)
   // /pi: multiScatteringEstimate is radiance beside froxel SH; sunIll*T is irradiance-like.
   const Vector3 skyTint(0.65f, 0.78f, 1.0f);
   return atmMul(groundIlluminance, skyTint) * (elevFade / kAtmPi);
+}
+
+void RtxAtmosphere::estimateUnoccludedVolumeLighting(
+  const AtmosphereArgs& args,
+  bool isZUp,
+  Vector3& outSunRadiance,
+  Vector3& outSunDirectionWorld) {
+  const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
+  outSunRadiance = Vector3(0.0f, 0.0f, 0.0f);
+  outSunDirectionWorld = Vector3(0.0f, 0.0f, 0.0f);
+  if (sunDirYUp.y > 0.0f) {
+    outSunDirectionWorld = isZUp
+      ? Vector3(sunDirYUp.x, sunDirYUp.z, sunDirYUp.y)
+      : sunDirYUp;
+    const Vector3 T = atmTransmittanceYUp(args, sunDirYUp, args.viewAltitude);
+    const Vector3 sunIll(args.sunIlluminance.x, args.sunIlluminance.y, args.sunIlluminance.z);
+    outSunRadiance = atmMul(sunIll, T) * args.sunRayBrightness;
+  }
 }
 
 void RtxAtmosphere::estimateVolumeSunsetWarmTint(const AtmosphereArgs& args, Vector3& outTint, float& outBlend) {
