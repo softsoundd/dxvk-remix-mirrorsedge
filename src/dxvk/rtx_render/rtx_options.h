@@ -254,6 +254,15 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, viewModelGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) for first-person view-model draw calls.\n"
                   "Preferred when Mesh1p shares materials with Mesh3p.");
+    RTX_OPTION_ARGS("rtx", fast_unordered_set, cullBackfacesInShadowTextures, {},
+                  "Textures / material hashes for wrapping world-shell meshes whose inward backfaces should be ignored on shadow and NEE visibility rays.\n"
+                  "Use for one-sided building exteriors around BSP interiors with window openings. Primary and GI rays already cull those faces; visibility rays do not by default, so the shell blocks the sun. Front faces still cast outdoor shadows.\n"
+                  "Prefer rtx.cullBackfacesInShadowGeometries when the material is shared. Do not enable rtx.enableCullingInSecondaryRays for this.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION_ARGS("rtx", fast_unordered_set, cullBackfacesInShadowGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for wrapping world-shell meshes whose inward backfaces should be ignored on shadow and NEE visibility rays.\n"
+                  "Preferred when the shell shares materials with other meshes. See rtx.cullBackfacesInShadowTextures.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION("rtx", fast_unordered_set, lightConverter, {},
                   "Textures on draw calls that should spawn Remix effect lights.\n"
                   "An effect light is a dynamic sphere light placed at the tagged draw call's geometry centroid; radius, intensity, color, and plasma-ball animation are controlled in the Runtime UI's Lighting > Effect Light section.");
@@ -1062,7 +1071,9 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableAlphaBlend, true, "Enable rendering alpha blended geometry, used for partial opacity and other blending effects on various surfaces in many games.");
     RTX_OPTION("rtx", bool, enableAlphaTest, true, "Enable rendering alpha tested geometry, used for cutout style opacity in some games.");
     RTX_OPTION("rtx", bool, enableCulling, true, "Enable front/backface culling for opaque objects. Objects with alpha blend or alpha test are not culled.");
-    RTX_OPTION("rtx", bool, enableCullingInSecondaryRays, false, "Enable front/backface culling for opaque objects. Objects with alpha blend or alpha test are not culled.  Only applies in secondary rays, defaults to off.  Generally helps with light bleeding from objects that aren't watertight.");
+    RTX_OPTION("rtx", bool, enableCullingInSecondaryRays, false,
+               "Enable front/backface culling for opaque objects. Objects with alpha blend or alpha test are not culled.  Only applies in secondary rays, defaults to off.  Generally helps with light bleeding from objects that aren't watertight.\n"
+               "For wrapping building shells, tag with rtx.cullBackfacesInShadowTextures / rtx.cullBackfacesInShadowGeometries instead; this global override also weakens object shadows.");
     RTX_OPTION_ARGS("rtx", bool, enableEmissiveBlendModeTranslation, true, "Treat incoming semi/additive D3D blend modes as emissive.",
                     args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION_ARGS("rtx", bool, enableEmissiveBlendEmissiveOverride, true, "Override typical material emissive information on draw calls with any emissive blending modes to emulate their original look more accurately.",

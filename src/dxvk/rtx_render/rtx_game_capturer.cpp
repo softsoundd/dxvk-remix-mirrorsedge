@@ -650,9 +650,9 @@ namespace dxvk {
         const InstanceCategories flag = (InstanceCategories) i;
         const bool isSet = flags.test(flag);
 
-        // Keep Hair Cards absent from captured categoryFlags when false instead of authoring an explicit false value.
-        // This preserves existing captures while true hair-card instances still store the category explicitly.
-        if (flag == InstanceCategories::HairCards && !isSet) {
+        // Don't author an explicit false for these; true instances still store the category.
+        if (!isSet && (flag == InstanceCategories::HairCards ||
+                       flag == InstanceCategories::CullBackfacesInShadows)) {
           continue;
         }
 

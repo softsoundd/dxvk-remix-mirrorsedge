@@ -1467,6 +1467,7 @@ namespace dxvk {
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
+    constants.enableShadowBackfaceSkip = getSceneManager().getAccelManager().hasShadowBackfaceSkipInstances();
 
     constants.domeLightArgs = getSceneManager().getLightManager().getDomeLightArgs();
 

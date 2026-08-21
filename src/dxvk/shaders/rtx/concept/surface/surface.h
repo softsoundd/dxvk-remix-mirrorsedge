@@ -317,6 +317,12 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
   }
 
+  property bool cullBackfacesInShadows
+  {
+    get { return packedFlagGet(data0b.z, 1 << 3); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 3) : packedFlagUnset(data0b.z, 1 << 3); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }

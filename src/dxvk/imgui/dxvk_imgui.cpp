@@ -208,6 +208,7 @@ namespace dxvk {
     {"playermodeltextures", "Player Model Texture (optional)", &RtxOptions::playerModelTexturesObject()},
     {"playermodelbodytextures", "Player Model Body Texture (optional)", &RtxOptions::playerModelBodyTexturesObject()},
     {"viewmodeltextures", "View Model Texture (optional)", &RtxOptions::viewModelTexturesObject()},
+    {"cullbackfacesinshadowtextures", "Cull Backfaces in Shadows (optional)", &RtxOptions::cullBackfacesInShadowTexturesObject()},
     {"opacitymicromapignoretextures", "Opacity Micromap Ignore Texture (optional)", &RtxOptions::opacityMicromapIgnoreTexturesObject()},
     {"ignorebakedlightingtextures","Ignore Baked Lighting Textures (optional)", &RtxOptions::ignoreBakedLightingTexturesObject()},
     {"ignorealphaontextures","Ignore Alpha Channel of Textures (optional)", &RtxOptions::ignoreAlphaOnTexturesObject()},
@@ -224,6 +225,7 @@ namespace dxvk {
     {"viewmodelgeometries", "View Model Geometry (optional)", &RtxOptions::viewModelGeometriesObject()},
     {"playermodelgeometries", "Player Model Geometry (optional)", &RtxOptions::playerModelGeometriesObject()},
     {"playermodelbodygeometries", "Player Model Body Geometry (optional)", &RtxOptions::playerModelBodyGeometriesObject()},
+    {"cullbackfacesinshadowgeometries", "Cull Backfaces in Shadows Geometry (optional)", &RtxOptions::cullBackfacesInShadowGeometriesObject()},
   };
 
   RemixGui::ComboWithKey<RenderPassGBufferRaytraceMode> renderPassGBufferRaytraceModeCombo {
@@ -4382,6 +4384,11 @@ namespace dxvk {
 
       RemixGui::Checkbox("Enable Triangle Culling (Globally)", &RtxOptions::enableCullingObject());
       RemixGui::Checkbox("Enable Triangle Culling (Override Secondary Rays)", &RtxOptions::enableCullingInSecondaryRaysObject());
+      RemixGui::Checkbox("UE3 Auto Cull Enclosing Mesh Shadow Backfaces", &D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfacesObject());
+      if (D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfaces()) {
+        RemixGui::DragFloat("UE3 Auto Cull Min Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMinExtentMetersObject(), 0.1f, 0.0f, 1000.0f, "%.2f");
+        RemixGui::DragFloat("UE3 Auto Cull Max Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMaxExtentMetersObject(), 1.0f, 1.0f, 10000.0f, "%.1f");
+      }
       RemixGui::Separator();
       RemixGui::DragInt("Min Prims in Dynamic BLAS", &RtxOptions::minPrimsInDynamicBLASObject(), 1.f, 100, 0);
       RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);

@@ -36,6 +36,8 @@
 
 #include "dxvk_scoped_annotation.h"
 #include "rtx_options.h"
+#include "rtx_camera.h"
+#include "../../d3d9/d3d9_rtx.h"
 
 #include "rtx/pass/instance_definitions.h"
 #include "rtx/concept/billboard.h"
@@ -1620,8 +1622,75 @@ namespace dxvk {
     std::swap(currIndex, prevIndex);
   }
 
+  namespace {
+
+  bool isAutoEnclosureShadowCandidate(const RtInstance& instance) {
+    if (!instance.surface.alphaState.isFullyOpaque) {
+      return false;
+    }
+    if ((instance.getVkInstance().flags & VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) != 0) {
+      return false;
+    }
+    if (instance.testCategoryFlags(
+          InstanceCategories::ViewModel,
+          InstanceCategories::Particle,
+          InstanceCategories::HairCards,
+          InstanceCategories::Sky,
+          InstanceCategories::Hidden,
+          InstanceCategories::Ignore,
+          InstanceCategories::Terrain,
+          InstanceCategories::ThirdPersonPlayerModel,
+          InstanceCategories::ThirdPersonPlayerBody,
+          DECAL_CATEGORY_FLAGS)) {
+      return false;
+    }
+    const BlasEntry* blas = instance.getBlas();
+    if (blas == nullptr) {
+      return false;
+    }
+    if (blas->input.getCullMode() == VK_CULL_MODE_NONE) {
+      return false;
+    }
+    return true;
+  }
+
+  bool cameraIsInsideEnclosingMesh(
+      const RtInstance& instance,
+      const Vector3& cameraPos,
+      const float minExtentWorld,
+      const float maxExtentWorld) {
+    const BlasEntry* blas = instance.getBlas();
+    if (blas == nullptr) {
+      return false;
+    }
+    const AxisAlignedBoundingBox& aabb = blas->input.getGeometryData().boundingBox;
+    if (!aabb.isValid()) {
+      return false;
+    }
+
+    const Matrix4& objectToWorld = instance.surface.objectToWorld;
+    const Vector3 localExtent = aabb.maxPos - aabb.minPos;
+    const Vector3 worldExtent(
+      std::abs(localExtent.x) * length(objectToWorld[0].xyz()),
+      std::abs(localExtent.y) * length(objectToWorld[1].xyz()),
+      std::abs(localExtent.z) * length(objectToWorld[2].xyz()));
+    const float minExtent = std::min(worldExtent.x, std::min(worldExtent.y, worldExtent.z));
+    const float maxExtent = std::max(worldExtent.x, std::max(worldExtent.y, worldExtent.z));
+    if (minExtent < minExtentWorld || maxExtent > maxExtentWorld) {
+      return false;
+    }
+
+    const Vector3 localCamera = (inverse(objectToWorld) * Vector4(cameraPos, 1.0f)).xyz();
+    return localCamera.x >= aabb.minPos.x && localCamera.x <= aabb.maxPos.x &&
+           localCamera.y >= aabb.minPos.y && localCamera.y <= aabb.maxPos.y &&
+           localCamera.z >= aabb.minPos.z && localCamera.z <= aabb.maxPos.z;
+  }
+
+  }  // namespace
+
   void AccelManager::uploadSurfaceData(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
+    m_hasShadowBackfaceSkipInstances = false;
     if (m_reorderedSurfaces.empty()) {
       return;
     }
@@ -1652,9 +1721,25 @@ namespace dxvk {
     std::size_t dataOffset = 0;
     surfacesGPUData.resize(surfacesGPUSize);
 
+    const bool autoEnclosingShells =
+      D3D9Rtx::ue3EngineMode() && D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfaces();
+    const float metersToWorld = RtxOptions::getMeterToWorldUnitScale();
+    const float minExtentWorld = D3D9Rtx::ue3AutoCullEnclosingMeshMinExtentMeters() * metersToWorld;
+    const float maxExtentWorld = D3D9Rtx::ue3AutoCullEnclosingMeshMaxExtentMeters() * metersToWorld;
+    const RtCamera& camera = ctx->getCommonObjects()->getSceneManager().getCamera();
+    const bool cameraValid = camera.isValid(m_device->getCurrentFrameId());
+    const Vector3 cameraPos = cameraValid ? camera.getPosition() : Vector3();
+
     for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
-      const auto& currentInstance = *m_reorderedSurfaces[i];
-      RtSurface& currentSurface = m_reorderedSurfaces[i]->surface;
+      RtInstance& currentInstance = *m_reorderedSurfaces[i];
+      RtSurface& currentSurface = currentInstance.surface;
+
+      const bool tagged = currentInstance.testCategoryFlags(InstanceCategories::CullBackfacesInShadows);
+      const bool autoFlag = autoEnclosingShells && cameraValid &&
+        isAutoEnclosureShadowCandidate(currentInstance) &&
+        cameraIsInsideEnclosingMesh(currentInstance, cameraPos, minExtentWorld, maxExtentWorld);
+      currentSurface.cullBackfacesInShadows = tagged || autoFlag;
+      m_hasShadowBackfaceSkipInstances = m_hasShadowBackfaceSkipInstances || currentSurface.cullBackfacesInShadows;
 
       // For PointInstancer entries beyond the first, do nothing.  The GPU culling shader will 
       // patch per-instance transforms and set per-instance customInstanceIndex later.

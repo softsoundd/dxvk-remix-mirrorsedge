@@ -46,6 +46,7 @@ namespace dxvk {
     { InstanceCategories::SmoothNormals,           "remix_category:smooth_normals",           "Smooth Normals",            "rtx.smoothNormalsTextures" },
     { InstanceCategories::HairCards,               "remix_category:hair_cards",               "Hair Cards",                "rtx.hairCardTextures" },
     { InstanceCategories::ViewModel,               "remix_category:view_model",               "View Model",                "rtx.viewModelTextures" },
+    { InstanceCategories::CullBackfacesInShadows,  "remix_category:cull_backfaces_in_shadows","Cull Backfaces in Shadows", "rtx.cullBackfacesInShadowTextures" },
   };
 
   // Table must have one entry per enum value.

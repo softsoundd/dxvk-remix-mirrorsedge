@@ -119,6 +119,7 @@ struct RtSurface {
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
     flags0 |= colorTextureIsSrgb ? (1 << 2) : 0;
+    flags0 |= cullBackfacesInShadows ? (1 << 3) : 0;
 
     writeGPUHelper(data, offset, flags0);
 
@@ -341,6 +342,7 @@ struct RtSurface {
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
   bool ignoreTransparencyLayer = false;
+  bool cullBackfacesInShadows = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
   RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
@@ -409,7 +411,8 @@ struct RtSurface {
       "  isTextureFactorBlend: ", isTextureFactorBlend, "\n",
       "  isMotionBlurMaskOut: ", isMotionBlurMaskOut, "\n",
       "  skipSurfaceInteractionSpritesheetAdjustment: ", skipSurfaceInteractionSpritesheetAdjustment, "\n",
-      "  ignoreTransparencyLayer: ", ignoreTransparencyLayer));
+      "  ignoreTransparencyLayer: ", ignoreTransparencyLayer, "\n",
+      "  cullBackfacesInShadows: ", cullBackfacesInShadows));
     
     // Print alpha state
     Logger::warn("=== Alpha State ===");

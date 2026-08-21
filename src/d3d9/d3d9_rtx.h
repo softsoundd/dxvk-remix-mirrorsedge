@@ -268,6 +268,15 @@ namespace dxvk {
                "UE3 multi-pass compat: skip draw calls targeting small square render targets (typical of shadow depth maps). "
                "Prevents shadow-pass geometry from being incorrectly captured as scene geometry. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3AutoCullEnclosingMeshShadowBackfaces, false,
+               "UE3 compat: on shadow/NEE visibility rays, ignore inward backfaces of one-sided opaque meshes whose object AABB contains the camera.\n"
+               "For wrapping building shells around BSP interiors. Gated by rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters / MaxExtentMeters. Requires rtx.d3d9.ue3EngineMode. Off by default; geometry tagging is more precise.");
+    RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMinExtentMeters, 2.0f,
+               "Minimum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
+               "Keeps thin floor slabs and billboard cards from being treated as enclosing shells.");
+    RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMaxExtentMeters, 150.0f,
+               "Maximum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
+               "Keeps whole-level BSP models from being treated as enclosing shells.");
     RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthTestDisabledTranslucency, false,
                "UE3 translucency compat: skip alpha-blended draw calls that have depth test and depth write both disabled. "
                "These are typically UE3 NeedsDepthTestDisabled materials (e.g. fullscreen overlays, fog volume composites) "

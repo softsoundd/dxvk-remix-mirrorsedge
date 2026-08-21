@@ -308,7 +308,8 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
   result.hasOpaqueHit = false;
   result.hasPOMHit = false;
 
-  uint rayFlags = (VisibilityMode & visibilityModeAccurateHitDistance)
+  // Closest-hit required when skipping flagged backfaces: a first-hit far shell must not hide a closer occluder.
+  uint rayFlags = ((VisibilityMode & visibilityModeAccurateHitDistance) || cb.enableShadowBackfaceSkip)
     ? RAY_FLAG_NONE
     : RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
 
@@ -319,6 +320,10 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
       ? 0
       : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
   }
+
+  uint shadowBackfaceSkipCount = 0;
+  const uint maxShadowBackfaceSkips = 8;
+  float skippedShadowBackfaceT = 0.0f;
 
   while (true)
   {
@@ -349,6 +354,15 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
         RayHitInfo rayHitInfo;
         RAY_HIT_INFO_CREATE_RAY_QUERY_CANDIDATE(rayHitInfo, rayQuery)
 
+        if (cb.enableShadowBackfaceSkip && !rayHitInfo.frontHit)
+        {
+          const Surface skipSurface = surfaces[calculateSurfaceIndex(rayHitInfo)];
+          if (skipSurface.cullBackfacesInShadows)
+          {
+            continue;
+          }
+        }
+
         vec3 surfaceAttenuation = handleVisibilityVertex<VisibilityMode>(visibilityRay, rayHitInfo, usePreviousTLAS);
 
         vec3 prevAttenuation = result.attenuation;
@@ -370,11 +384,36 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 
     if (rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
+      if (cb.enableShadowBackfaceSkip && !rayQuery.CommittedTriangleFrontFace() &&
+          shadowBackfaceSkipCount < maxShadowBackfaceSkips)
+      {
+        RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(skipHitInfo, rayQuery)
+        const Surface skipSurface = surfaces[calculateSurfaceIndex(skipHitInfo)];
+        if (skipSurface.cullBackfacesInShadows)
+        {
+          const float t = rayQuery.CommittedRayT();
+          const vec3 hitP = visibilityRay.origin + visibilityRay.direction * t;
+          const float error = max(calculatePositionError(hitP), calculatePositionError(visibilityRay.origin));
+          const float offsetDistance = max(length(calculateRayOffset(error, visibilityRay.direction)), 1.0e-3f);
+          visibilityRay.origin = hitP + visibilityRay.direction * offsetDistance;
+          visibilityRay.tMax = max(visibilityRay.tMax - t - offsetDistance, 0.0f);
+          visibilityRay.coneRadius += visibilityRay.spreadAngle * t;
+          skippedShadowBackfaceT += t + offsetDistance;
+          ++shadowBackfaceSkipCount;
+          if (visibilityRay.tMax > 0.0f)
+          {
+            continue;
+          }
+
+          break;
+        }
+      }
+
       if (clearOpaqueHitAttenuation)
       {
         result.attenuation = vec3(0.0f);
       }
-      result.hitDistance = rayQuery.CommittedRayT();
+      result.hitDistance = rayQuery.CommittedRayT() + skippedShadowBackfaceT;
       result.hasOpaqueHit = true;
 
       // If we already went through a portal, add the path segment before the portal
@@ -403,6 +442,7 @@ VisibilityResult traceVisibilityRay<let VisibilityMode : uint>(
 
       // We only support going through one portal, so don't iterate after the next ray
       expectedRayPortalIndex = invalidRayPortalIndex;
+      skippedShadowBackfaceT = 0.0f;
     }
     else
     {

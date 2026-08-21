@@ -158,4 +158,9 @@ class "RemixInstanceCategoryAPI" (
         displayGroup = "Remix Categories"
         displayName = "View Model"
     )
+    bool remix_category:cull_backfaces_in_shadows = 0 (
+        doc = "Textures / material hashes for wrapping world-shell meshes whose inward backfaces should be ignored on shadow and NEE visibility rays.\nUse for one-sided building exteriors around BSP interiors with window openings. Primary and GI rays already cull those faces; visibility rays do not by default, so the shell blocks the sun. Front faces still cast outdoor shadows.\nPrefer rtx.cullBackfacesInShadowGeometries when the material is shared. Do not enable rtx.enableCullingInSecondaryRays for this."
+        displayGroup = "Remix Categories"
+        displayName = "Cull Backfaces in Shadows"
+    )
 }

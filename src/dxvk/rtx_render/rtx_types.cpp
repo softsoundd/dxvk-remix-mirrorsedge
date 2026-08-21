@@ -449,6 +449,7 @@ namespace dxvk {
       { InstanceCategories::ParticleEmitter, &RtxOptions::particleEmitterTextures() },
       { InstanceCategories::HairCards, &RtxOptions::hairCardTextures() },
       { InstanceCategories::ViewModel, &RtxOptions::viewModelTextures() },
+      { InstanceCategories::CullBackfacesInShadows, &RtxOptions::cullBackfacesInShadowTextures() },
     };
 
     // Position-weighted size fingerprint: any single-set tagging change (add/remove via
@@ -527,6 +528,7 @@ namespace dxvk {
     setCategory(InstanceCategories::ParticleEmitter, matched(InstanceCategories::ParticleEmitter));
     setCategory(InstanceCategories::HairCards, matched(InstanceCategories::HairCards));
     setCategory(InstanceCategories::ViewModel, matched(InstanceCategories::ViewModel));
+    setCategory(InstanceCategories::CullBackfacesInShadows, matched(InstanceCategories::CullBackfacesInShadows));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {
@@ -547,6 +549,10 @@ namespace dxvk {
       removeCategory(InstanceCategories::ViewModel);
     } else if (lookupHash(RtxOptions::viewModelGeometries(), topologyHash)) {
       setCategory(InstanceCategories::ViewModel, true);
+    }
+
+    if (lookupHash(RtxOptions::cullBackfacesInShadowGeometries(), topologyHash)) {
+      setCategory(InstanceCategories::CullBackfacesInShadows, true);
     }
   }
 

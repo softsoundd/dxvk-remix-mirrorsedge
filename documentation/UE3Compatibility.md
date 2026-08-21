@@ -261,3 +261,11 @@ When an authored enhancement does not appear (or appears intermittently), enable
 - `[RTX-MeshAnchorDrift]`: a mesh replacement key moved, attributed to its geometry part (unstable vertex data, e.g. CPU-morphed skinned meshes) vs its material part (mesh keys are `geometryHash XOR materialHash`).
 
 `rtx.replacementDebugHashes` tracks specific hashes in detail (matched against texture, material, textureSet+shader, geometry, and mesh-key hashes) without the full-scene log volume. Toggling enhanced assets on/off in the UI intentionally shows up as synchronised matched/`NO MATCH` flaps with unchanged hashes.
+
+## Direct sun through wrapping-mesh windows
+
+UE3 interiors are often a one-sided exterior static-mesh shell around BSP rooms with window openings. Rasterisation, primary rays, and GI already cull the shell's inward backfaces, so you see sky. Shadow/NEE visibility rays do not (`rtx.enableCullingInSecondaryRays` is off), so the same shell blocks the sun.
+
+The Triangle Culling (Override Secondary Rays) option could mitigate this, but that also globally culls backfaces on every opaque mesh and weakens prop/foliage/character shadows which is not desireable. Instead, tag the wrapping shell as **Cull Backfaces in Shadows** (`rtx.cullBackfacesInShadowTextures` / `rtx.cullBackfacesInShadowGeometries`; geometry hashes when materials are shared).
+
+Optionally enable `rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces` to flag one-sided opaque meshes whose object AABB contains the camera and whose world-space extents fall between `rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters` (2 m) and `rtx.d3d9.ue3AutoCullEnclosingMeshMaxExtentMeters` (150 m). Tagging is more precise if auto misses a hangar or flags the wrong mesh. Do not tag thin floors or whole-level BSP, or rooms below can leak sun.
