@@ -778,7 +778,7 @@ vec4 compositeResult(
       }
     }
   }
-  else if (pixelIsActive && isIndirectActive && !primaryMiss)
+  else if (pixelIsActive && !primaryMiss)
   {
     // A reflection PSR declined arrives through the indirect integrator, which stashed its first bounce
     // length. Only the length is stashed; since the segment is lit by a single value its direction enters
