@@ -17,14 +17,14 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` toggle which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
 
 - Camera and object transforms are read from UE3's reserved shader constants (CTAB parsing).
-- Vertex positions are captured from the register the game's vertex shader multiplies by ViewProjectionMatrix, not from unprojecting its clip-space output, so accuracy does not depend on view distance. See [Exact vertex position capture](documentation/UE3Compatibility.md#exact-vertex-position-capture).
+- Vertex positions are captured from the register the game's vertex shader multiplies by ViewProjectionMatrix. See [Exact vertex position capture](documentation/UE3Compatibility.md#exact-vertex-position-capture).
 - Depth prepass, shadow depth, SceneCapture, depth-test-disabled translucency, and fullscreen postprocess are skipped so only real base-pass geometry gets ray traced.
-- Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level: tags, categories and asset replacements survive texture streaming, settings changes, and restarts.
-- Sampler UVs (tiling, panning, atlas tiles) are resolved, including UE3's distance fade based anti-tiling materials.
+- Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level.
+- Sampler UVs (tiling, panning, rotation, atlas tiles, etc.) are resolved.
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
 - Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
 - First person geometry (arms, held weapon) is detected via UE3's `SDPG_Foreground` boundary (mid-scene depth-only clear) and classified as ViewModel, overriding player-model tags (`rtx.d3d9.ue3ForegroundDpgIsViewModel`).
-- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`) reproduces the game's native tonemapping/colour curve display transform - exposure, per-channel highlights/shadows/midtones grade, display gamma 2.0 and the per-map 16-segment colour curves - on Remix's path-traced output, with hue-preserving modernisations as toggles. Per-map curves and grade constants are captured live from the game's (skipped) tonemap pass. See [Mirror's Edge tonemapper and colour curves](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves).
+- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`) reproduces the game's native tonemapping/colour curve display transform - exposure, per-channel highlights/shadows/midtones grade, display gamma 2.0 and the per-map 16-segment colour curves - on Remix's path-traced output, with [hue-preserving modernisations](https://softsoundd.github.io/posts/faithful-luma-overview/) as toggles. Per-map curves and grade constants are captured live from the game's (skipped) tonemap pass. See [Mirror's Edge tonemapper and colour curves](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves).
 
 ### 2) Mirror's Edge/UE3 setup:
 
@@ -34,7 +34,7 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 
 2. *(Recommended)* Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`). This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
 > [!NOTE]
-> Lightmaps are not used as a surface's colour, whichever way this is set. Material identity is mostly independent of the setting, but not entirely - switching it can give a material a different hash. For this reason you should pick one setting before authoring and stay on it. `False` is the better option of the two. See [UE3 lightmaps are bypassed](documentation/UE3Compatibility.md#ue3-lightmaps-are-bypassed).
+> Lightmaps are not used as a surface's colour, whichever way this is set. Material identity is *mostly* independent of the setting, but not entirely - switching it can give a material a different hash. For this reason you should pick one setting before Toolkit authoring and stay on it. `False` is the better option of the two. See [UE3 lightmaps are bypassed](documentation/UE3Compatibility.md#ue3-lightmaps-are-bypassed).
 
 3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```
@@ -76,7 +76,7 @@ show fog
 
 ### 3) Extra fork notes/debugging
 
-Implementation notes and debugging guidance for the UE3-specific behaviour - vertex capture, the tonemapper, albedo and UV selection, material identity and replacement anchors - live in [documentation/UE3Compatibility.md](documentation/UE3Compatibility.md).
+Implementation notes and debugging guidance for the UE3-specific behaviour live in [documentation/UE3Compatibility.md](documentation/UE3Compatibility.md).
 
 ### 4) Acknowledgements
 - sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).

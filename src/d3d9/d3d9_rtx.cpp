@@ -206,9 +206,9 @@ namespace dxvk {
     //
     // The tracer proves, per register component, which interpolant (PS) or IA texcoord
     // input (VS) component a value originates from, and accumulates the affine chain
-    // (scale/offset from draw-time constants or def'd immediates) applied along the way.
-    // Math outside the affine model keeps the origin but marks the affine inexact;
-    // genuinely ambiguous origins are invalidated.
+    // (scale/cross/offset from draw-time constants or def'd immediates) applied along the
+    // way - see UvComponentAffine for the term model. Math outside that model keeps the
+    // origin but marks the affine inexact; genuinely ambiguous origins are invalidated.
     // ---------------------------------------------------------------------------
 
     static bool uvAffineTermPresent(const UvAffineTerm& t) {
@@ -229,14 +229,26 @@ namespace dxvk {
     }
 
     static bool uvComponentAffinesEqual(const UvComponentAffine& a, const UvComponentAffine& b) {
-      return uvAffineTermsEqual(a.scale, b.scale) && uvAffineTermsEqual(a.offset, b.offset);
+      if (a.hasCross != b.hasCross)
+        return false;
+      if (!uvAffineTermsEqual(a.scale, b.scale) || !uvAffineTermsEqual(a.offset, b.offset))
+        return false;
+      if (!a.hasCross)
+        return true;
+      return a.scaleComponent == b.scaleComponent &&
+             a.crossComponent == b.crossComponent &&
+             uvAffineTermsEqual(a.cross, b.cross);
     }
 
     static bool uvComponentAffineExact(const UvComponentAffine& a) {
-      return !a.scale.inexact && !a.offset.inexact;
+      if (a.scale.inexact || a.offset.inexact)
+        return false;
+      return !a.hasCross || !a.cross.inexact;
     }
 
     static bool uvComponentAffineIsIdentity(const UvComponentAffine& a) {
+      if (a.hasCross)
+        return false;
       return uvComponentAffineExact(a) &&
              (!uvAffineTermPresent(a.scale) ||
               (a.scale.immValid && a.scale.imm == 1.0f && a.scale.constReg < 0)) &&
@@ -261,6 +273,9 @@ namespace dxvk {
         return !term.inexact && term.constReg < 0;
       };
 
+      if (affU.hasCross || affV.hasCross)
+        return false;
+
       if (!compileTimeOffset(affU.offset) || !compileTimeOffset(affV.offset))
         return false;
 
@@ -276,116 +291,144 @@ namespace dxvk {
     static void uvAffineMarkInexact(UvComponentAffine& a) {
       a.scale.inexact = true;
       a.offset.inexact = true;
+      if (a.hasCross)
+        a.cross.inexact = true;
     }
 
-    // value' = value * m for a compile-time immediate m
-    static void uvAffineMulImmediate(UvComponentAffine& a, const float value) {
-      if (a.scale.constReg >= 0) {
-        a.scale.factor *= value;
-      } else if (a.scale.immValid) {
-        a.scale.imm *= value;
+    static void uvAffineTermScaleMulImmediate(UvAffineTerm& t, const float value) {
+      if (t.constReg >= 0) {
+        t.factor *= value;
+      } else if (t.immValid) {
+        t.imm *= value;
       } else {
-        a.scale.immValid = true;
-        a.scale.imm = value;
+        t.immValid = true;
+        t.imm = value;
+      }
+    }
+
+    // An offset term is a sum, so multiplying it distributes over every part.
+    static void uvAffineTermOffsetMulImmediate(UvAffineTerm& t, const float value) {
+      if (t.immValid) {
+        t.imm *= value;
+      }
+      if (t.constReg >= 0) {
+        t.factor *= value;
+      }
+      if (t.constReg2 >= 0) {
+        t.factor2 *= value;
+      }
+    }
+
+    static void uvAffineTermScaleMulConstant(UvAffineTerm& t, const int16_t reg, const uint8_t comp, const float factor) {
+      if (t.constReg >= 0) {
+        // the term would become a product of two draw-time constants - not representable
+        t.inexact = true;
+      } else if (t.immValid) {
+        const float staticScale = t.imm;
+        t.immValid = false;
+        t.imm = 0.0f;
+        t.constReg = reg;
+        t.constComp = comp;
+        t.factor = staticScale * factor;
+      } else {
+        t.constReg = reg;
+        t.constComp = comp;
+        t.factor = factor;
+      }
+    }
+
+    static void uvAffineTermOffsetMulConstant(UvAffineTerm& t, const int16_t reg, const uint8_t comp, const float factor) {
+      if (t.constReg >= 0) {
+        // any existing constant part times a new draw-time constant is a product of two
+        // draw-time constants - not representable
+        t.inexact = true;
+      } else if (t.immValid) {
+        if (t.imm != 0.0f) {
+          const float staticOffset = t.imm;
+          t.immValid = false;
+          t.imm = 0.0f;
+          t.constReg = reg;
+          t.constComp = comp;
+          t.factor = staticOffset * factor;
+        } else {
+          t.immValid = false;
+        }
+      }
+    }
+
+    static void uvAffineTermAddImmediate(UvAffineTerm& t, const float value) {
+      if (value == 0.0f)
+        return;
+      t.immValid = true;
+      t.imm += value;
+    }
+
+    static void uvAffineTermAddConstant(UvAffineTerm& t, const int16_t reg, const uint8_t comp, const float factor) {
+      if (t.immValid && t.imm == 0.0f)
+        t.immValid = false;
+
+      if (t.constReg >= 0 && t.constComp == comp && t.constReg == reg) {
+        // same component referenced twice: fold into the first part's factor
+        t.factor += factor;
+        if (t.factor == 0.0f) {
+          // cancelled out: promote the second part into the first slot to keep the
+          // "constReg2 only set when constReg is" invariant
+          t.constReg = t.constReg2;
+          t.constComp = t.constComp2;
+          t.factor = t.factor2;
+          t.constReg2 = -1;
+          t.constComp2 = 0;
+          t.factor2 = 1.0f;
+        }
+        return;
+      }
+      if (t.constReg2 >= 0 && t.constComp2 == comp && t.constReg2 == reg) {
+        t.factor2 += factor;
+        if (t.factor2 == 0.0f) {
+          t.constReg2 = -1;
+          t.constComp2 = 0;
+          t.factor2 = 1.0f;
+        }
+        return;
       }
 
-      // the offset is a sum: multiplying by an immediate distributes over every part
-      if (a.offset.immValid) {
-        a.offset.imm *= value;
+      if (t.constReg < 0) {
+        t.constReg = reg;
+        t.constComp = comp;
+        t.factor = factor;
+      } else if (t.constReg2 < 0) {
+        t.constReg2 = reg;
+        t.constComp2 = comp;
+        t.factor2 = factor;
+      } else {
+        // more than two distinct constant parts - not representable
+        t.inexact = true;
       }
-      if (a.offset.constReg >= 0) {
-        a.offset.factor *= value;
-      }
-      if (a.offset.constReg2 >= 0) {
-        a.offset.factor2 *= value;
-      }
+    }
+
+    // value' = value * m for a compile-time immediate m. `cross` scales like `scale` does:
+    // both multiply an interpolant component, so both take the coefficient.
+    static void uvAffineMulImmediate(UvComponentAffine& a, const float value) {
+      uvAffineTermScaleMulImmediate(a.scale, value);
+      uvAffineTermOffsetMulImmediate(a.offset, value);
+      if (a.hasCross)
+        uvAffineTermScaleMulImmediate(a.cross, value);
     }
 
     // value' = value * consts[reg][comp] * factor
     static void uvAffineMulConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
-      if (a.scale.constReg >= 0) {
-        // scale would become a product of two draw-time constants - not representable
-        a.scale.inexact = true;
-      } else if (a.scale.immValid) {
-        const float staticScale = a.scale.imm;
-        a.scale.immValid = false;
-        a.scale.imm = 0.0f;
-        a.scale.constReg = reg;
-        a.scale.constComp = comp;
-        a.scale.factor = staticScale * factor;
-      } else {
-        a.scale.constReg = reg;
-        a.scale.constComp = comp;
-        a.scale.factor = factor;
-      }
-
-      if (a.offset.constReg >= 0) {
-        // any existing constant part times a new draw-time constant is a product of two
-        // draw-time constants - not representable
-        a.offset.inexact = true;
-      } else if (a.offset.immValid) {
-        if (a.offset.imm != 0.0f) {
-          const float staticOffset = a.offset.imm;
-          a.offset.immValid = false;
-          a.offset.imm = 0.0f;
-          a.offset.constReg = reg;
-          a.offset.constComp = comp;
-          a.offset.factor = staticOffset * factor;
-        } else {
-          a.offset.immValid = false;
-        }
-      }
+      uvAffineTermScaleMulConstant(a.scale, reg, comp, factor);
+      uvAffineTermOffsetMulConstant(a.offset, reg, comp, factor);
+      if (a.hasCross)
+        uvAffineTermScaleMulConstant(a.cross, reg, comp, factor);
     }
 
     static void uvAffineAddImmediate(UvComponentAffine& a, const float value) {
-      if (value == 0.0f)
-        return;
-
-      a.offset.immValid = true;
-      a.offset.imm += value;
+      uvAffineTermAddImmediate(a.offset, value);
     }
 
     static void uvAffineAddConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
-      if (a.offset.immValid && a.offset.imm == 0.0f)
-        a.offset.immValid = false;
-
-      if (a.offset.constReg >= 0 && a.offset.constComp == comp && a.offset.constReg == reg) {
-        // same component referenced twice: fold into the first part's factor
-        a.offset.factor += factor;
-        if (a.offset.factor == 0.0f) {
-          // cancelled out: promote the second part into the first slot to keep the
-          // "constReg2 only set when constReg is" invariant
-          a.offset.constReg = a.offset.constReg2;
-          a.offset.constComp = a.offset.constComp2;
-          a.offset.factor = a.offset.factor2;
-          a.offset.constReg2 = -1;
-          a.offset.constComp2 = 0;
-          a.offset.factor2 = 1.0f;
-        }
-        return;
-      }
-      if (a.offset.constReg2 >= 0 && a.offset.constComp2 == comp && a.offset.constReg2 == reg) {
-        a.offset.factor2 += factor;
-        if (a.offset.factor2 == 0.0f) {
-          a.offset.constReg2 = -1;
-          a.offset.constComp2 = 0;
-          a.offset.factor2 = 1.0f;
-        }
-        return;
-      }
-
-      if (a.offset.constReg < 0) {
-        a.offset.constReg = reg;
-        a.offset.constComp = comp;
-        a.offset.factor = factor;
-      } else if (a.offset.constReg2 < 0) {
-        a.offset.constReg2 = reg;
-        a.offset.constComp2 = comp;
-        a.offset.factor2 = factor;
-      } else {
-        // more than two distinct constant parts - not representable
-        a.offset.inexact = true;
-      }
+      uvAffineTermAddConstant(a.offset, reg, comp, factor);
     }
 
     // Applies a DXSO source modifier to the affine chain; returns false when not representable.
@@ -442,6 +485,78 @@ namespace dxvk {
       return a.valid && b.valid && a.reg == b.reg;
     }
 
+    static bool uvAffineScaleNonIdentity(const UvComponentAffine& a) {
+      return uvAffineTermPresent(a.scale) &&
+             !(a.scale.immValid && a.scale.imm == 1.0f && a.scale.constReg < 0);
+    }
+
+    static void uvAffineTermAddTerm(UvAffineTerm& dest, const UvAffineTerm& src) {
+      if (src.inexact) {
+        dest.inexact = true;
+        return;
+      }
+      if (src.immValid)
+        uvAffineTermAddImmediate(dest, src.imm);
+      if (src.constReg >= 0)
+        uvAffineTermAddConstant(dest, src.constReg, src.constComp, src.factor);
+      if (src.constReg2 >= 0)
+        uvAffineTermAddConstant(dest, src.constReg2, src.constComp2, src.factor2);
+    }
+
+    // Fold sibling into dest as the cross coefficient: dest = dest + sibling, with dest.scale
+    // multiplying dest.component and dest.cross multiplying sibling.component. Fails (and
+    // leaves dest unchanged) when the result would leave the scale/cross/offset model.
+    static bool uvAffineTryAttachCross(UvExactComponentOrigin& dest, const UvExactComponentOrigin& sibling) {
+      if (!uvOriginSameRegister(dest, sibling))
+        return false;
+      if (dest.affine.hasCross || sibling.affine.hasCross)
+        return false;
+      if (!uvComponentAffineExact(dest.affine) || !uvComponentAffineExact(sibling.affine))
+        return false;
+      if (!uvIsSingleComponentMask(dest.componentMask) || !uvIsSingleComponentMask(sibling.componentMask))
+        return false;
+      if (dest.component == sibling.component)
+        return false;
+
+      UvComponentAffine combined = dest.affine;
+      combined.hasCross = true;
+      combined.scaleComponent = dest.component;
+      combined.crossComponent = sibling.component;
+      if (uvAffineTermPresent(sibling.affine.scale)) {
+        combined.cross = sibling.affine.scale;
+      } else {
+        combined.cross.immValid = true;
+        combined.cross.imm = 1.0f;
+      }
+      uvAffineTermAddTerm(combined.offset, sibling.affine.offset);
+      if (!uvComponentAffineExact(combined))
+        return false;
+
+      dest.componentMask = uint8_t(dest.componentMask | sibling.componentMask);
+      dest.affine = combined;
+      return true;
+    }
+
+    static bool uvAffineMixUsesPair(const UvComponentAffine& a, const uint8_t compU, const uint8_t compV) {
+      if (!a.hasCross)
+        return true;
+      const auto isPair = [&](const uint8_t c) {
+        return c == compU || c == compV;
+      };
+      return isPair(a.scaleComponent) && isPair(a.crossComponent);
+    }
+
+    static bool uvAffineIsExactLinearPair(const UvComponentAffine& u,
+                                          const UvComponentAffine& v,
+                                          const uint8_t compU,
+                                          const uint8_t compV) {
+      if (!u.hasCross && !v.hasCross)
+        return false;
+      return uvComponentAffineExact(u) && uvComponentAffineExact(v) &&
+             uvAffineMixUsesPair(u, compU, compV) &&
+             uvAffineMixUsesPair(v, compU, compV);
+    }
+
     // Merges two value origins that both contribute to one result component (blend endpoints,
     // clamps, dot products, etc.). Keeping the origin with an inexact affine when one contributor
     // is unknown deliberately models "base UV plus per-pixel detail" patterns (bump offset,
@@ -493,6 +608,28 @@ namespace dxvk {
         uvAffineAddConstant(a, ref.constReg, ref.constComp, sign * ref.factor);
     }
 
+    static void uvAffineTermCollectConstRegs(const UvAffineTerm& term,
+                                             int32_t* regs,
+                                             uint32_t& count,
+                                             const uint32_t cap) {
+      auto push = [&](const int16_t r) {
+        if (r >= 0 && count < cap)
+          regs[count++] = int32_t(r);
+      };
+      push(term.constReg);
+      push(term.constReg2);
+    }
+
+    static void uvComponentAffineCollectConstRegs(const UvComponentAffine& a,
+                                                  int32_t* regs,
+                                                  uint32_t& count,
+                                                  const uint32_t cap) {
+      uvAffineTermCollectConstRegs(a.scale, regs, count, cap);
+      uvAffineTermCollectConstRegs(a.offset, regs, count, cap);
+      if (a.hasCross)
+        uvAffineTermCollectConstRegs(a.cross, regs, count, cap);
+    }
+
     // -------------------------------------------------------------------------
     // Formatting helpers for rtx.d3d9.ue3LogUvAffineDetail / ue3UvTraceShaderHashes
     // -------------------------------------------------------------------------
@@ -530,7 +667,13 @@ namespace dxvk {
     }
 
     static std::string formatUvComponentAffine(const UvComponentAffine& affine) {
-      return str::format("uv*", formatUvAffineTerm(affine.scale, "1"), "+", formatUvAffineTerm(affine.offset, "0"));
+      if (!affine.hasCross) {
+        return str::format("uv*", formatUvAffineTerm(affine.scale, "1"), "+", formatUvAffineTerm(affine.offset, "0"));
+      }
+      return str::format(
+        "uv.", "xyzw"[affine.scaleComponent & 0x3u], "*", formatUvAffineTerm(affine.scale, "1"),
+        "+uv.", "xyzw"[affine.crossComponent & 0x3u], "*", formatUvAffineTerm(affine.cross, "0"),
+        "+", formatUvAffineTerm(affine.offset, "0"));
     }
 
     static std::string formatUvConstExpr(const UvConstComponentRef& ref) {
@@ -970,6 +1113,15 @@ namespace dxvk {
               uvAffineMulImmediate(origin.affine, 2.0f);
               return origin;
             }
+            // UV matrix / rotator in the form fxc emits when it expands a dot into mul/mad:
+            // a sum of two interpolant components, at least one already carrying a
+            // non-identity scale. Requiring that scale is what keeps a bare U+V - which is
+            // not a coordinate transform - out of the model.
+            if (uvAffineScaleNonIdentity(o0.affine) || uvAffineScaleNonIdentity(o1.affine)) {
+              UvExactComponentOrigin combined = o0;
+              if (uvAffineTryAttachCross(combined, o1))
+                return combined;
+            }
             UvExactComponentOrigin merged = uvMergeOrigins(o0, o1);
             if (merged.valid)
               uvAffineMarkInexact(merged.affine); // sum of two interpolant terms
@@ -1016,6 +1168,11 @@ namespace dxvk {
               return product;
             }
             if (o2.valid) {
+              if (uvAffineScaleNonIdentity(product.affine) || uvAffineScaleNonIdentity(o2.affine)) {
+                UvExactComponentOrigin combined = product;
+                if (uvAffineTryAttachCross(combined, o2))
+                  return combined;
+              }
               UvExactComponentOrigin merged = uvMergeOrigins(product, o2);
               if (merged.valid)
                 uvAffineMarkInexact(merged.affine);
@@ -1100,13 +1257,61 @@ namespace dxvk {
         }
 
         // dot products consume multiple components of their sources: union the origins so
-        // register provenance (and the packed-UV half being read) survives. This is what keeps
-        // UV rotators / matrix transforms (dp2add pairs, m3x2..m4x4) attributable.
+        // register provenance (and the packed-UV half being read) survives. UV rotators /
+        // matrix transforms (dp2add of a UV pair against a constant row) stay exact as
+        // scale+cross+offset; other dots (m3x2..m4x4, lighting) keep origin but mark
+        // the affine inexact.
         case DxsoOpcode::Dp2Add: {
+          const UvExactComponentOrigin o0x = readOrigin(ctx.src[0], 0);
+          const UvExactComponentOrigin o0y = readOrigin(ctx.src[0], 1);
+          const UvExactComponentOrigin o1x = readOrigin(ctx.src[1], 0);
+          const UvExactComponentOrigin o1y = readOrigin(ctx.src[1], 1);
+          const UvConstComponentRef k0x = readConst(ctx.src[0], 0);
+          const UvConstComponentRef k0y = readConst(ctx.src[0], 1);
+          const UvConstComponentRef k1x = readConst(ctx.src[1], 0);
+          const UvConstComponentRef k1y = readConst(ctx.src[1], 1);
+          const UvConstComponentRef k2 = readConst(ctx.src[2], c);
+          const UvExactComponentOrigin o2 = readOrigin(ctx.src[2], c);
+
+          // dest = src0.xy · src1.xy + src2, with the UV pair in either operand and the matrix
+          // row constants in the other. Folds into scale + cross + offset by multiplying each
+          // UV component by its row coefficient and attaching the sibling as `cross`. src2 is
+          // the translation (Center, or Origin - R·Origin); an absent addend contributes 0.
+          auto tryDp2AddRow = [&](const UvExactComponentOrigin& uvx,
+                                  const UvExactComponentOrigin& uvy,
+                                  const UvConstComponentRef& kx,
+                                  const UvConstComponentRef& ky,
+                                  const UvConstComponentRef& addend) -> UvExactComponentOrigin {
+            if (!kx.valid || !ky.valid)
+              return UvExactComponentOrigin{};
+            UvExactComponentOrigin primary = uvx;
+            uvAffineMulConstRef(primary.affine, kx);
+            UvExactComponentOrigin sibling = uvy;
+            uvAffineMulConstRef(sibling.affine, ky);
+            if (!uvAffineTryAttachCross(primary, sibling))
+              return UvExactComponentOrigin{};
+            if (addend.valid)
+              uvAffineAddConstRef(primary.affine, addend, 1.0f);
+            if (!uvComponentAffineExact(primary.affine))
+              return UvExactComponentOrigin{};
+            return primary;
+          };
+
+          if (!o1x.valid && !o1y.valid && !o2.valid) {
+            const UvExactComponentOrigin row = tryDp2AddRow(o0x, o0y, k1x, k1y, k2);
+            if (row.valid)
+              return row;
+          }
+          if (!o0x.valid && !o0y.valid && !o2.valid) {
+            const UvExactComponentOrigin row = tryDp2AddRow(o1x, o1y, k0x, k0y, k2);
+            if (row.valid)
+              return row;
+          }
+
           UvExactComponentOrigin merged = uvMergeOrigins(
             readOriginUnion(ctx.src[0], 2u),
             readOriginUnion(ctx.src[1], 2u));
-          merged = uvMergeOrigins(merged, readOrigin(ctx.src[2], c));
+          merged = uvMergeOrigins(merged, o2);
           if (merged.valid)
             uvAffineMarkInexact(merged.affine);
           return merged;
@@ -1416,8 +1621,8 @@ namespace dxvk {
                 site.compU = uOrigin.component;
                 site.compV = vOrigin.component;
               } else {
-                // component-mixing math (rotators, UV matrices): the register is proven but the
-                // exact pair is not - attribute the packed interpolant half being consumed
+                // component-mixing math (rotators, UV matrices): the exact source pair is not
+                // recoverable, so attribute the packed interpolant half being consumed
                 const uint8_t unionMask = uint8_t(uOrigin.componentMask | vOrigin.componentMask);
                 const bool onlySecondaryHalf =
                   (unionMask & 0b0011u) == 0u && (unionMask & 0b1100u) != 0u;
@@ -1427,10 +1632,11 @@ namespace dxvk {
               site.affineU = uOrigin.affine;
               site.affineV = vOrigin.affine;
               site.affineExact =
-                cleanComponents &&
                 !projected &&
                 uvComponentAffineExact(uOrigin.affine) &&
-                uvComponentAffineExact(vOrigin.affine);
+                uvComponentAffineExact(vOrigin.affine) &&
+                (cleanComponents ||
+                 uvAffineIsExactLinearPair(uOrigin.affine, vOrigin.affine, site.compU, site.compV));
             }
           }
 
@@ -4027,8 +4233,8 @@ namespace dxvk {
       // are untouched by this.
       //
       // Nothing about the material's appearance is lost. The UV path reads these same registers
-      // live and still resolves the transform per draw (samplerScaleConstReg /
-      // samplerOffsetConstReg); it is only the identity hash that declines to include them.
+      // live and resolves the transform per draw; it is only the identity hash that declines to
+      // include them.
       std::vector<uint32_t> volatileRegisters;
       if (detectVolatileConstants) {
         auto markVolatile = [&](const int32_t reg) {
@@ -4039,11 +4245,11 @@ namespace dxvk {
             volatileRegisters.push_back(value);
         };
         for (const auto& [samplerRegister, inferred] : samplerInference) {
-          // The transitive dependency set, not the affine resolver's scale/offset slots. Those
-          // only exist for a transform the resolver can express as `uv * cA + cB`, and Mirror's
-          // Edge's animated materials mostly do not take that shape: a Rotator arrives as a 2x2
-          // matrix across a register pair - visible in the values as (cos,-sin)/(sin,cos) - which
-          // fits neither slot, so the resolver leaves both empty and nothing would be excluded.
+          // The transitive dependency set, not the affine resolver's term slots, which only name
+          // the registers a *resolved* transform reads. A register driving a coordinate through
+          // math the resolver cannot express - a Rotator whose row is a product of two live
+          // constants, a matrix multiply, any chain through temporaries - would otherwise be left
+          // in the identity and animate it.
           for (const uint32_t reg : inferred.coordConstRegs)
             markVolatile(int32_t(reg));
         }
@@ -11711,6 +11917,9 @@ namespace dxvk {
 
     if constexpr (!FixedFunction) {
       if ((m_frameOptions.shaderPathTexcoordIndexFromPixelShader || m_frameOptions.ue3EngineMode) && d3d9State().pixelShader.ptr() != nullptr) {
+        // Measures the bytecode analysis a shader's first sighting pays; the result is cached,
+        // so the zone is near-empty on every later draw.
+        ScopedCpuProfileZoneN("UE3 PS sampler analysis");
         inferredPs = d3d9State().pixelShader->GetCommonShader();
         inferredPsEntry = getOrInitPsSamplerTexcoordEntry(inferredPs, inferredPsHash);
       }
@@ -11828,6 +12037,7 @@ namespace dxvk {
       uint8_t auditedPinnedCubemapStage = kInvalidStage;
       if ((m_frameOptions.ue3StableDiffuseSelection || m_frameOptions.ue3EngineMode) &&
           inferredPsEntry != nullptr && inferredPsHash != kEmptyHash) {
+        ScopedCpuProfileZoneN("UE3 diffuse selection lookup");
         if (!m_ue3DiffuseSelectionLoaded)
           loadUe3DiffuseSelectionCache();
         // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
@@ -12838,6 +13048,7 @@ namespace dxvk {
       // must run before setupCategoriesForTexture so category lookups use the full material hash
       if constexpr (!FixedFunction) {
         if ((m_frameOptions.ue3MaterialInstanceConstantHash || m_frameOptions.ue3EngineMode) && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+          ScopedCpuProfileZoneN("UE3 material identity");
           const D3D9CommonShader* psCommonShader = d3d9State().pixelShader->GetCommonShader();
           const auto& bytecode = psCommonShader->GetBytecode();
           const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
@@ -13426,6 +13637,7 @@ namespace dxvk {
 
       if ((m_frameOptions.shaderPathTexcoordIndexFromPixelShader || m_frameOptions.ue3EngineMode) &&
           d3d9State().pixelShader.ptr() != nullptr) {
+        ScopedCpuProfileZoneN("UE3 UV resolution");
         const D3D9CommonShader* ps = inferredPs != nullptr
           ? inferredPs
           : d3d9State().pixelShader->GetCommonShader();
@@ -13609,53 +13821,138 @@ namespace dxvk {
             }
 
             // exact UV transform: sampledUv = psAffine(interpolant),
-            // interpolant = vsAffine(iaUv) when the IA path is used
-            float psScaleU = 1.0f;
-            float psScaleV = 1.0f;
-            float psOffsetU = 0.0f;
-            float psOffsetV = 0.0f;
-            const bool psAffineResolved =
-              uvOrigin.affineExact &&
-              resolvePsAffineTermValue(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
-              resolvePsAffineTermValue(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
-              resolvePsAffineTermValue(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
-              resolvePsAffineTermValue(uvOrigin.affineV.offset, 0.0f, psOffsetV);
-            if (!psAffineResolved) {
-              // non-affine or unresolvable PS math: keep the proven base UV, apply no transform
-              psScaleU = 1.0f;
-              psScaleV = 1.0f;
-              psOffsetU = 0.0f;
-              psOffsetV = 0.0f;
+            // interpolant = vsAffine(iaUv) when the IA path is used. Resolves to
+            // U' = aU + bV + tx, V' = cU + dV + ty, where an axis-aligned transform
+            // (tiling, panner) leaves the cross terms b and c at zero.
+            float psA = 1.0f;
+            float psB = 0.0f;
+            float psC = 0.0f;
+            float psD = 1.0f;
+            float psTx = 0.0f;
+            float psTy = 0.0f;
+            const bool hasCross =
+              uvOrigin.affineU.hasCross || uvOrigin.affineV.hasCross;
+            bool psAffineResolved = false;
+
+            if (!hasCross) {
+              float psScaleU = 1.0f;
+              float psScaleV = 1.0f;
+              float psOffsetU = 0.0f;
+              float psOffsetV = 0.0f;
+              psAffineResolved =
+                uvOrigin.affineExact &&
+                resolvePsAffineTermValue(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
+                resolvePsAffineTermValue(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
+                resolvePsAffineTermValue(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
+                resolvePsAffineTermValue(uvOrigin.affineV.offset, 0.0f, psOffsetV);
+              if (!psAffineResolved) {
+                psScaleU = 1.0f;
+                psScaleV = 1.0f;
+                psOffsetU = 0.0f;
+                psOffsetV = 0.0f;
+              }
+              psA = psScaleU;
+              psD = psScaleV;
+              psTx = psOffsetU;
+              psTy = psOffsetV;
+            } else {
+              auto resolveCrossRow = [&](const UvComponentAffine& aff,
+                                         const bool scaleAppliesToU,
+                                         float& outCoeffU, float& outCoeffV, float& outTrans) -> bool {
+                if (!uvComponentAffineExact(aff))
+                  return false;
+                if (!aff.hasCross) {
+                  float scale = 1.0f;
+                  float offset = 0.0f;
+                  if (!resolvePsAffineTermValue(aff.scale, 1.0f, scale) ||
+                      !resolvePsAffineTermValue(aff.offset, 0.0f, offset))
+                    return false;
+                  outCoeffU = scaleAppliesToU ? scale : 0.0f;
+                  outCoeffV = scaleAppliesToU ? 0.0f : scale;
+                  outTrans = offset;
+                  return true;
+                }
+                float scale = 1.0f;
+                float cross = 0.0f;
+                float offset = 0.0f;
+                if (!resolvePsAffineTermValue(aff.scale, 1.0f, scale) ||
+                    !resolvePsAffineTermValue(aff.cross, 0.0f, cross) ||
+                    !resolvePsAffineTermValue(aff.offset, 0.0f, offset))
+                  return false;
+                outCoeffU = 0.0f;
+                outCoeffV = 0.0f;
+                auto accumulate = [&](const uint8_t comp, const float coeff) -> bool {
+                  if (comp == m_texcoordCompU) {
+                    outCoeffU += coeff;
+                    return true;
+                  }
+                  if (comp == m_texcoordCompV) {
+                    outCoeffV += coeff;
+                    return true;
+                  }
+                  return false;
+                };
+                if (!accumulate(aff.scaleComponent, scale) ||
+                    !accumulate(aff.crossComponent, cross))
+                  return false;
+                outTrans = offset;
+                return std::isfinite(outCoeffU) && std::isfinite(outCoeffV) && std::isfinite(outTrans);
+              };
+
+              psAffineResolved =
+                uvOrigin.affineExact &&
+                resolveCrossRow(uvOrigin.affineU, true, psA, psB, psTx) &&
+                resolveCrossRow(uvOrigin.affineV, false, psC, psD, psTy);
+              if (!psAffineResolved) {
+                psA = 1.0f;
+                psB = 0.0f;
+                psC = 0.0f;
+                psD = 1.0f;
+                psTx = 0.0f;
+                psTy = 0.0f;
+              }
             }
 
-            float finalScaleU = psScaleU;
-            float finalScaleV = psScaleV;
-            float finalOffsetU = psOffsetU;
-            float finalOffsetV = psOffsetV;
+            float finalA = psA;
+            float finalB = psB;
+            float finalC = psC;
+            float finalD = psD;
+            float finalTx = psTx;
+            float finalTy = psTy;
             if (m_uvResolutionMode == UvResolutionMode::ProvenIa && vsAffineFold) {
-              // ps(vs(uv)) = (psScale * vsScale) * uv + (psScale * vsOffset + psOffset)
-              finalScaleU = psScaleU * vsScaleU;
-              finalScaleV = psScaleV * vsScaleV;
-              finalOffsetU = psScaleU * vsOffsetU + psOffsetU;
-              finalOffsetV = psScaleV * vsOffsetV + psOffsetV;
+              finalA = psA * vsScaleU;
+              finalB = psB * vsScaleV;
+              finalC = psC * vsScaleU;
+              finalD = psD * vsScaleV;
+              finalTx = psA * vsOffsetU + psB * vsOffsetV + psTx;
+              finalTy = psC * vsOffsetU + psD * vsOffsetV + psTy;
             }
 
             constexpr float kMinAbsScale = 1e-6f;
+            constexpr float kMinAbsDeterminant = 1e-12f;  // a product of two scales, so squared
             const bool transformIsIdentity =
-              finalScaleU == 1.0f && finalScaleV == 1.0f &&
-              finalOffsetU == 0.0f && finalOffsetV == 0.0f;
+              finalA == 1.0f && finalB == 0.0f &&
+              finalC == 0.0f && finalD == 1.0f &&
+              finalTx == 0.0f && finalTy == 0.0f;
+            // A rotation puts zeroes on the diagonal every quarter turn, so a mixed transform
+            // is judged degenerate by its determinant rather than by its diagonal terms.
             const bool transformIsUsable =
-              std::isfinite(finalScaleU) && std::isfinite(finalScaleV) &&
-              std::isfinite(finalOffsetU) && std::isfinite(finalOffsetV) &&
-              std::abs(finalScaleU) > kMinAbsScale && std::abs(finalScaleV) > kMinAbsScale;
+              std::isfinite(finalA) && std::isfinite(finalB) &&
+              std::isfinite(finalC) && std::isfinite(finalD) &&
+              std::isfinite(finalTx) && std::isfinite(finalTy) &&
+              (hasCross
+                 ? std::abs(finalA * finalD - finalB * finalC) > kMinAbsDeterminant
+                 : (std::abs(finalA) > kMinAbsScale && std::abs(finalD) > kMinAbsScale));
 
             if (!transformIsIdentity && transformIsUsable) {
               Matrix4& texXform = m_activeDrawCallState.transformData.textureTransform;
               texXform = Matrix4();
-              texXform[0].x = finalScaleU;
-              texXform[1].y = finalScaleV;
-              texXform[3].x = finalOffsetU;
-              texXform[3].y = finalOffsetV;
+              texXform[0].x = finalA;
+              texXform[1].x = finalB;
+              texXform[3].x = finalTx;
+              texXform[0].y = finalC;
+              texXform[1].y = finalD;
+              texXform[3].y = finalTy;
             }
 
             // rtx.d3d9.ue3LogUvAffineDetail: per-draw affine resolution outcome, logged once
@@ -13672,10 +13969,12 @@ namespace dxvk {
               };
               mixDetail(firstStage);
               mixDetail(uint64_t(m_uvResolutionMode));
-              mixDetail(quantize(finalScaleU));
-              mixDetail(quantize(finalScaleV));
-              mixDetail(quantize(finalOffsetU));
-              mixDetail(quantize(finalOffsetV));
+              mixDetail(quantize(finalA));
+              mixDetail(quantize(finalB));
+              mixDetail(quantize(finalC));
+              mixDetail(quantize(finalD));
+              mixDetail(quantize(finalTx));
+              mixDetail(quantize(finalTy));
               mixDetail(uint64_t(psAffineResolved ? 1 : 0) | (uint64_t(applied ? 1 : 0) << 1));
 
               XXH64_hash_t capKey = psHash;
@@ -13692,14 +13991,14 @@ namespace dxvk {
                 std::string ctabLog;
                 if (ps != nullptr && psHash != 0) {
                   const auto& constNames = getUe3PsFloatConstantNames(psHash, ps->GetBytecode());
-                  std::array<int32_t, 8> referencedRegs = {
-                    uvOrigin.affineU.scale.constReg, uvOrigin.affineU.offset.constReg,
-                    uvOrigin.affineV.scale.constReg, uvOrigin.affineV.offset.constReg,
-                    uvOrigin.affineU.scale.constReg2, uvOrigin.affineU.offset.constReg2,
-                    uvOrigin.affineV.scale.constReg2, uvOrigin.affineV.offset.constReg2 };
-                  std::sort(referencedRegs.begin(), referencedRegs.end());
+                  std::array<int32_t, 32> referencedRegs = {};
+                  uint32_t referencedCount = 0;
+                  uvComponentAffineCollectConstRegs(uvOrigin.affineU, referencedRegs.data(), referencedCount, uint32_t(referencedRegs.size()));
+                  uvComponentAffineCollectConstRegs(uvOrigin.affineV, referencedRegs.data(), referencedCount, uint32_t(referencedRegs.size()));
+                  std::sort(referencedRegs.begin(), referencedRegs.begin() + referencedCount);
                   int32_t lastLogged = -1;
-                  for (const int32_t reg : referencedRegs) {
+                  for (uint32_t i = 0; i < referencedCount; i++) {
+                    const int32_t reg = referencedRegs[i];
                     if (reg < 0 || reg == lastLogged || uint32_t(reg) >= caps::MaxFloatConstantsPS)
                       continue;
                     lastLogged = reg;
@@ -13748,9 +14047,9 @@ namespace dxvk {
                   " | U:[", formatUvComponentAffine(uvOrigin.affineU),
                   "] V:[", formatUvComponentAffine(uvOrigin.affineV),
                   "] | psResolved=", psAffineResolved ? 1 : 0,
-                  " ps=(", psScaleU, ",", psScaleV, ",", psOffsetU, ",", psOffsetV, ")",
+                  " ps=(", psA, ",", psB, ",", psC, ",", psD, ",", psTx, ",", psTy, ")",
                   " vsFold=", vsAffineFold ? 1 : 0, vsLog,
-                  " final=(", finalScaleU, ",", finalScaleV, ",", finalOffsetU, ",", finalOffsetV, ")",
+                  " final=(", finalA, ",", finalB, ",", finalC, ",", finalD, ",", finalTx, ",", finalTy, ")",
                   " identity=", transformIsIdentity ? 1 : 0,
                   " usable=", transformIsUsable ? 1 : 0,
                   " applied=", applied ? 1 : 0,
@@ -14538,6 +14837,10 @@ namespace dxvk {
     reportUe3ConstantChurn();
 
     DrawCallState::refreshCategoryLookupTable();
+
+    // The per-draw profile zones in this file are only meaningful against the draw count, which
+    // a UE3 title moves by an order of magnitude depending on its occlusion and frustum culling.
+    ProfilerPlotValue("D3D9 Draw Calls", int64_t(m_drawCallID));
 
     // Reset for the next frame
     m_rtxInjectTriggered = false;

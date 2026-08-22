@@ -58,9 +58,20 @@ namespace dxvk {
     bool inexact = false;
   };
 
+  // One coordinate component as `value * scale + offset`, or - for a UV matrix such as UE3's
+  // Rotator - as a combination of two components of the same interpolant:
+  //   value' = scale * uv[scaleComponent] + cross * uv[crossComponent] + offset
+  // Center biases fold into `offset` as an immediate alongside the two matrix-row constants,
+  // which is what the two constant slots of an offset term are for. A coefficient that would
+  // become the product of two draw-time constants (a Panner feeding a Rotator) is not
+  // representable and marks the term inexact.
   struct UvComponentAffine {
     UvAffineTerm scale;   // absent => 1.0
     UvAffineTerm offset;  // absent => 0.0
+    UvAffineTerm cross;   // absent => 0.0, so an unmixed component is unaffected by it
+    bool hasCross = false;
+    uint8_t scaleComponent = 0;  // interpolant component `scale` multiplies when hasCross
+    uint8_t crossComponent = 0;  // interpolant component `cross` multiplies when hasCross
   };
 
   // Deterministic resolution of the coordinate a pixel shader feeds into a sampler:
@@ -555,12 +566,13 @@ namespace dxvk {
                "resolves inexactly.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvAffineDetail, false,
                "UE3 compat diagnostics: log the full UV affine chain behind the deterministic UV resolution of "
-               "shader-path draws: per-component scale/offset terms (immediate or constant-register component with "
-               "factor, and inexactness), the live resolved scale/offset values, the gates that allowed or rejected "
-               "writing the texture transform, and the pixel shader CTAB names/values of referenced constant "
-               "registers. On the first sighting of a pixel shader it also dumps every sampler's UV origin and "
-               "affine chain with the currently bound textures. Logs once per distinct resolved transform, capped "
-               "per shader+stage. Use this to diagnose texture-atlas materials whose tile offset is not applied.");
+               "shader-path draws: per-component scale, cross and offset terms (immediate or constant-register "
+               "component with factor, and inexactness), the live resolved 2x2 plus translation, the gates that "
+               "allowed or rejected writing the texture transform, and the pixel shader CTAB names/values of "
+               "referenced constant registers. On the first sighting of a pixel shader it also dumps every "
+               "sampler's UV origin and affine chain with the currently bound textures. Logs once per distinct "
+               "resolved transform, capped per shader+stage. Use this to diagnose texture-atlas materials whose "
+               "tile offset is not applied, or a UV matrix (UE3 Rotator) that resolves inexactly.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogAlbedoSelection, false,
                "UE3 compat diagnostics: log a per-sampler score breakdown of the shader-path albedo selection once per "
                "(pixel shader, bound texture set, sRGB states, vertex factory) key: texture hash, dimensions, sRGB state, "

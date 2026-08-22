@@ -56,6 +56,9 @@ namespace dxvk {
         ri->texgenMode != key.texgenMode) {
       ri->dirtyFlags.set(ReplacementInstance::DirtyFlag::Other);
     }
+    // The tracked set above does not cover every input a submission can change - a skinned
+    // mesh's bone hash is in the identity but has no dirty bit - so an unattributed difference
+    // has to fall back to the dynamic path rather than be treated as no change.
     if ((ri->dirtyFlags & ReplacementInstance::kLookupDriftMask).isClear()) {
       ri->dirtyFlags.set(ReplacementInstance::DirtyFlag::Other);
     }
