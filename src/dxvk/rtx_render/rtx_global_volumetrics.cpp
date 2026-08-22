@@ -250,9 +250,9 @@ namespace dxvk {
       RemixGui::Checkbox("Show Advanced Options", &showAdvanced);
 
       if (showAdvanced) {
-        RemixGui::DragInt("Froxel Grid Resolution Scale", &froxelGridResolutionScaleObject(), 0.1f, 1);
-        RemixGui::DragInt("Froxel Depth Slices", &froxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
-        RemixGui::DragInt("Max Accumulation Frames", &maxAccumulationFramesObject(), 0.1f, 1, UINT8_MAX);
+        RemixGui::DragInt("Froxel Grid Resolution Scale", &froxelGridResolutionScaleObject(), 0.1f, 1, INT_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragInt("Froxel Depth Slices", &froxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragInt("Max Accumulation Frames", &maxAccumulationFramesObject(), 0.1f, 1, UINT8_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Depth Slice Distribution Exponent", &froxelDepthSliceDistributionExponentObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Max Distance", &froxelMaxDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Firefly Filtering Luminance Threshold", &froxelFireflyFilteringLuminanceThresholdObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
@@ -264,11 +264,11 @@ namespace dxvk {
 
         ImGui::BeginDisabled(enableReferenceMode());
 
-        RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1);
-        RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
+        RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1, INT_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Restir Guard Band Scale Factor", &restirGridGuardBandFactorObject(), 0.1f, 1.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 
-        RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX);
+        RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::Checkbox("Enable Initial Visibility", &enableInitialVisibilityObject());
         ImGui::BeginDisabled(!enableInitialVisibility());
         RemixGui::Checkbox("Enable Visibility Reuse", &visibilityReuseObject());
@@ -276,14 +276,14 @@ namespace dxvk {
 
         RemixGui::Checkbox("Enable Temporal Resampling", &enableTemporalResamplingObject());
         ImGui::BeginDisabled(!enableTemporalResampling());
-        RemixGui::DragInt("Temporal Resampling Max Sample Count", &temporalReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
+        RemixGui::DragInt("Temporal Resampling Max Sample Count", &temporalReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         ImGui::EndDisabled();
 
         RemixGui::Separator();
 
         RemixGui::Checkbox("Enable Spatial Resampling", &enableSpatialResamplingObject());
         ImGui::BeginDisabled(!enableSpatialResampling());
-        RemixGui::DragInt("Spatial Resampling Max Sample Count", &spatialReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
+        RemixGui::DragInt("Spatial Resampling Max Sample Count", &spatialReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Clamped Spatial Resampling Search Radius", &spatialReuseSamplingRadiusObject(), 0.01f, 0.0f, 10.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         ImGui::EndDisabled();
 
@@ -335,7 +335,7 @@ namespace dxvk {
 
         if (showAdvanced) {
           RemixGui::Checkbox("Enable Translucent Shadows", &enableTranslucentShadowsObject());
-          RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f");
+          RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::SetTooltipToLastWidgetOnHover(
             "Chromatic extinction (not fog paint alone). Darker = higher extinction.\n"
             "With Inherit Atmosphere Lighting Color, low sun reduces scatter chroma while keeping this density control.");
@@ -345,7 +345,7 @@ namespace dxvk {
             "so cool media respond realistically to warm sunlight. High sun keeps artistic colour.");
           RemixGui::DragFloat("Transmittance Measurement Distance", &transmittanceMeasurementDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::SetTooltipToLastWidgetOnHover("Lower distance = denser medium (same transmittance color implies more extinction per meter).");
-          RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f");
+          RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::SetTooltipToLastWidgetOnHover(
             "Scatter / extinction ratio. Near 1 = bright lit fog; lower = more absorption, less in-scatter.\n"
             "Lit fog colour comes from the sun/lights in the froxel cache, not from this as a tint.");
@@ -380,7 +380,7 @@ namespace dxvk {
 
           ImGui::BeginDisabled(!enableHeterogeneousFog());
           RemixGui::DragFloat("Noise Field Substep Size", &noiseFieldSubStepSizeMetersObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragInt("Noise Field Number of Octaves", &noiseFieldOctavesObject(), 0.05f, 1, 8);
+          RemixGui::DragInt("Noise Field Number of Octaves", &noiseFieldOctavesObject(), 0.05f, 1, 8, "%d", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Time Scale", &noiseFieldTimeScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Density Scale", &noiseFieldDensityScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Density Exponent", &noiseFieldDensityExponentObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -396,8 +396,8 @@ namespace dxvk {
         ImGui::Indent();
         ImGui::BeginDisabled(!enableAtmosphere());
         {
-          RemixGui::DragFloat("Planet Radius", &atmospherePlanetRadiusMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragFloat("Height", &atmosphereHeightMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Planet Radius", &atmospherePlanetRadiusMetersObject(), 0.1f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Height", &atmosphereHeightMetersObject(), 0.1f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::Checkbox("Inverted", &atmosphereInvertedObject());
           ImGui::EndDisabled();
         }
