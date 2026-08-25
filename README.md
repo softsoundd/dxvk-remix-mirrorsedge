@@ -1,6 +1,6 @@
 # dxvk-remix
 
-[![Build Status](https://github.com/NVIDIAGameWorks/dxvk-remix/actions/workflows/build.yml/badge.svg)](https://github.com/NVIDIAGameWorks/dxvk-remix/actions/workflows/build.yml)
+[![Build Status](https://github.com/softsoundd/dxvk-remix-mirrorsedge/actions/workflows/build.yml/badge.svg?branch=mirrors-edge)](https://github.com/softsoundd/dxvk-remix-mirrorsedge/actions/workflows/build.yml)
 
 dxvk-remix is a fork of the [DXVK](https://github.com/doitsujin/dxvk) project, which overhauls the fixed-function graphics pipeline implementation in order to remaster games with path tracing.
 
