@@ -1091,6 +1091,7 @@ namespace dxvk {
     m_raytracingOutput.m_secondaryWorldShadingNormal = createImageResource(ctx, "secondary world shading normal", m_downscaledExtent, VK_FORMAT_R32_UINT);
     m_raytracingOutput.m_secondaryPerceptualRoughness = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R8_UNORM, "Secondary Perceptual Roughness", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_secondaryLinearViewZ = createImageResource(ctx, "secondary linear view z", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
+    m_raytracingOutput.m_indirectReflectionSegment = createImageResource(ctx, "indirect reflection segment", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     m_raytracingOutput.m_secondaryAlbedo = createImageResource(ctx, "secondary albedo", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     m_raytracingOutput.m_secondaryBaseReflectivity = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "Secondary Base Reflectivity");
     m_raytracingOutput.m_secondarySpecularAlbedo = AliasedResource(
@@ -1104,7 +1105,6 @@ namespace dxvk {
     m_raytracingOutput.m_secondaryPositionError = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32_SFLOAT, "Secondary Position Error", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_alphaBlendGBuffer = createImageResource(ctx, "alpha blend gbuffer", m_downscaledExtent, VK_FORMAT_R32G32B32A32_UINT);
     m_raytracingOutput.m_alphaBlendRadiance = AliasedResource(m_raytracingOutput.m_secondaryVirtualMotionVector, ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Alpha Blend Radiance");
-    m_raytracingOutput.m_rayReconstructionParticleBuffer = createImageResource(ctx, "DLSS-RR particle buffer", m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
 
     // Denoiser input and output (Primary/Secondary Surfaces with Direct/Indirect or Combined Radiance)
     // Note: A single texture is aliased for both the noisy output from the integration pass and the denoised result from NRD.

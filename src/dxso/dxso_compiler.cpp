@@ -1,4 +1,4 @@
-#include "dxso_compiler.h"
+﻿#include "dxso_compiler.h"
 
 #include "dxso_analysis.h"
 
@@ -93,6 +93,10 @@ namespace dxvk {
       if (coissue.instructionIdx == ctx.instructionIdx + 1)
         processInstruction(coissue, coissue.instructionIdx);
     }
+
+    // NV-DXVK start: exact vertex capture
+    this->emitPreProjectionPositionSnapshot(ctx);
+    // NV-DXVK end
 
     switch (opcode) {
     case DxsoOpcode::Nop:
@@ -632,6 +636,33 @@ namespace dxvk {
       // Cache the struct type so we can access members later
       m_vs.capturedVertexStructType = capturedVertexType;
     }
+
+    if (m_analysis->preProjPosition.valid) {
+      m_vs.preProjPosition = m_module.newVarInit(
+        m_module.defPointerType(vec4Type, spv::StorageClassPrivate),
+        spv::StorageClassPrivate,
+        m_module.constvec4f32(0.0f, 0.0f, 0.0f, 1.0f));
+      m_module.setDebugName(m_vs.preProjPosition, "preProjPosition");
+    }
+  }
+  // NV-DXVK end
+
+  // NV-DXVK start: exact vertex capture
+  void DxsoCompiler::emitPreProjectionPositionSnapshot(const DxsoInstructionContext& ctx) {
+    const DxsoPreProjectionPositionInfo& info = m_analysis->preProjPosition;
+
+    if (m_vs.preProjPosition == 0
+     || !info.valid
+     || ctx.instructionIdx != info.snapshotInstructionIdx)
+      return;
+
+    // Emitted before the transform runs, so the register still holds the untransformed
+    // position regardless of whether the transform writes over it.
+    DxsoRegister source;
+    source.id = info.sourceReg;
+
+    const DxsoRegisterValue value = this->emitRegisterLoad(source, IdentityWriteMask);
+    m_module.opStore(m_vs.preProjPosition, value.id);
   }
   // NV-DXVK end
 
@@ -3837,12 +3868,57 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     const uint32_t objH = m_module.opVectorTimesMatrix(vec4TypeId, world4, worldToObject);
     const uint32_t obj3 = m_module.opVectorShuffle(vec3TypeId, objH, objH, 3, lit012);
 
+    // Pre-1.4 SPIR-V requires a vector condition when selecting between vectors.
+    auto conditionVec3 = [&](uint32_t cond) {
+      const uint32_t bvec3TypeId = m_module.defVectorType(m_module.defBoolType(), 3);
+      const std::array<uint32_t, 3> conds = { cond, cond, cond };
+      return m_module.opCompositeConstruct(bvec3TypeId, conds.size(), conds.data());
+    };
+
     uint32_t capturedPosition = obj3;
     if (m_vs.iPosition0.id > 0) {
       const uint32_t inputPosition4 = m_module.opLoad(vec4TypeId, m_vs.iPosition0.id);
       const uint32_t inputPosition3 = m_module.opVectorShuffle(vec3TypeId, inputPosition4, inputPosition4, 3, lit012);
-      capturedPosition = m_module.opSelect(vec3TypeId, hasPositionFromInputFlagId, inputPosition3, capturedPosition);
+      capturedPosition = m_module.opSelect(vec3TypeId, conditionVec3(hasPositionFromInputFlagId), inputPosition3, capturedPosition);
     }
+
+    // NV-DXVK start: exact vertex capture
+    // The shader's own pre-projection position, taken straight to object space with no
+    // projective inverse. See DxsoPreProjectionPositionInfo.
+    if (m_vs.preProjPosition != 0) {
+      const uint32_t boolTypeId = m_module.defBoolType();
+      const uint32_t zeroF = m_module.constf32(0.0f);
+
+      const uint32_t hasPositionFromPreProjectionFlagId = m_module.opINotEqual(
+        boolTypeId,
+        m_module.opBitwiseAnd(uintType, flagsId, m_module.constu32(kVertexCaptureFlag_PositionFromPreProjection)),
+        m_module.constu32(0));
+
+      const uint32_t preProj4 = m_module.opLoad(vec4TypeId, m_vs.preProjPosition);
+      const uint32_t preProjW = m_module.opCompositeExtract(floatType, preProj4, 1, &lit3);
+
+      // Affine world transforms leave w at 1, where dividing is exact and free; guarding
+      // against 0 keeps a shader that produced a direction from writing infinities.
+      const uint32_t preProjWIsZero = m_module.opFOrdEqual(boolTypeId, preProjW, zeroF);
+      const uint32_t preProjSafeW = m_module.opSelect(floatType, preProjWIsZero, oneF, preProjW);
+      const uint32_t preProjInvW = m_module.opFDiv(floatType, oneF, preProjSafeW);
+
+      uint32_t preProjWorld3 = m_module.opVectorShuffle(vec3TypeId, preProj4, preProj4, 3, lit012);
+      preProjWorld3 = m_module.opVectorTimesScalar(vec3TypeId, preProjWorld3, preProjInvW);
+
+      const uint32_t px = m_module.opCompositeExtract(floatType, preProjWorld3, 1, &lit0);
+      const uint32_t py = m_module.opCompositeExtract(floatType, preProjWorld3, 1, &lit1);
+      const uint32_t pz = m_module.opCompositeExtract(floatType, preProjWorld3, 1, &lit2);
+      uint32_t preProjWorld4Comps[4] = { px, py, pz, oneF };
+      const uint32_t preProjWorld4 = m_module.opCompositeConstruct(vec4TypeId, 4, preProjWorld4Comps);
+
+      const uint32_t preProjObjH = m_module.opVectorTimesMatrix(vec4TypeId, preProjWorld4, worldToObject);
+      const uint32_t preProjObj3 = m_module.opVectorShuffle(vec3TypeId, preProjObjH, preProjObjH, 3, lit012);
+
+      capturedPosition = m_module.opSelect(vec3TypeId, conditionVec3(hasPositionFromPreProjectionFlagId), preProjObj3, capturedPosition);
+    }
+    // NV-DXVK end
+
     const uint32_t ox = m_module.opCompositeExtract(floatType, capturedPosition, 1, &lit0);
     const uint32_t oy = m_module.opCompositeExtract(floatType, capturedPosition, 1, &lit1);
     const uint32_t oz = m_module.opCompositeExtract(floatType, capturedPosition, 1, &lit2);

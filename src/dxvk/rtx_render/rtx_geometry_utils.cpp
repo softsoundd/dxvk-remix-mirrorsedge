@@ -884,6 +884,9 @@ namespace dxvk {
     args.hasTexcoord = input.texcoordBuffer.defined();
     if (args.hasTexcoord) {
       mustUseGPU |= input.texcoordBuffer.isPendingGpuWrite() || input.texcoordBuffer.mapPtr() == nullptr;
+      // The CPU path reads through GeometryBufferData, which supplies no pointer for a texcoord
+      // format it cannot read as float32, so those have to interleave on the GPU where they convert.
+      mustUseGPU |= !GeometryBufferData::isCpuReadableTexcoordFormat(input.texcoordBuffer.vertexFormat());
       assert(input.texcoordBuffer.offsetFromSlice() % 4 == 0);
       args.texcoordOffset = input.texcoordBuffer.offsetFromSlice() / 4;
       args.texcoordStride = input.texcoordBuffer.stride() / 4;

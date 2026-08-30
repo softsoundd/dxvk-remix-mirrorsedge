@@ -290,8 +290,6 @@ void integratePathVertex(
   bool pomOpaqueSurfaceEncountered = false;
   bool isStochasticAlphaBlend = false; // note: not used here
   uint8_t firstRayPortal = invalidRayPortalIndex;
-  // Indirect rays have no transparency layer; merge any ring emissive back into emissiveRadiance below.
-  vec3 transparencyLayerEmissive = vec3(0.0f);
 
   resolveVertex<PathState>(
     resolveMode,
@@ -300,14 +298,11 @@ void integratePathVertex(
     surface, surfaceInteraction,
     polymorphicSurfaceMaterialInteraction,
     radianceAttenuation, emissiveRadiance,
-    transparencyLayerEmissive,
     decalMemory, decalEmissiveRadiance, 
     pathState.coneSpreadAngle,
     isStochasticAlphaBlend, firstRayPortal,
     pomOpaqueSurfaceEncountered,
     isRaytracedRenderTarget);
-
-  emissiveRadiance += transparencyLayerEmissive;
 
   // We can encounter a POM surface during resolving (as it's a shared function).  But if POM is disabled in indirect cases
   //  we must also handle that case and ensure nothing tries to use POM elsewhere.
@@ -352,6 +347,36 @@ void integratePathVertex(
     }
   }
 #endif  
+
+  // Composite fogs a non-PSR reflection along this length. firstBounceHitDistance cannot serve instead: it
+  // is a float16_t, the copy reaching composite has been normalised by the denoiser and cannot express a
+  // ray leaving the scene, and it travels in m_indirectRadianceHitDistance, whose memory is reused before
+  // composite runs. Skipped where PSR ran, since the G-buffer wrote that pixel's segment.
+  bool stashReflectionSegment = pathState.bounceIteration == 1;
+
+#if ENABLE_NRC
+  // For update paths pathState.pixelCoordinate indexes the update domain rather than the screen.
+  stashReflectionSegment = stashReflectionSegment && !pathState.isNrcUpdate;
+#endif
+
+  if (stashReflectionSegment)
+  {
+    const GeometryFlags primaryGeometryFlags =
+      geometryFlagsReadFromGBuffer(pathState.pixelCoordinate, SharedFlags);
+
+    if (!primaryGeometryFlags.performedAnyPSR() && !primaryGeometryFlags.secondarySurfaceMask)
+    {
+      if (rayInteractionHasHit(rayInteraction))
+      {
+        ReflectionSegment[pathState.pixelCoordinate] = max(pathState.segmentHitDistance, 0.0f);
+      }
+      else if (!pathState.continueResolving)
+      {
+        // Negative requests composite's unbounded tail; the magnitude is unused.
+        ReflectionSegment[pathState.pixelCoordinate] = -1.0f;
+      }
+    }
+  }
 
   if (rayInteractionHasHit(rayInteraction))
   {

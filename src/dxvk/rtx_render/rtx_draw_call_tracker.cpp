@@ -35,7 +35,9 @@ namespace dxvk {
   static void computeDirtyFlags(
       ReplacementInstance* ri, const ReplacementInstance::LookupKey& key) {
     ri->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
-    // This function is only called when the full identity hash doesn't match, so something must have changed.
+    // Usually called because the full identity hash did not match, so something must have changed.
+    // The exception is a key whose identity excludes the transform, where an identity match says
+    // nothing about whether the transform moved and this comparison is the only thing that does.
     if (std::memcmp(&ri->objectToWorld, &key.transform, sizeof(Matrix4)) != 0) {
       ri->dirtyFlags.set(ReplacementInstance::DirtyFlag::Transform);
     }
@@ -54,6 +56,9 @@ namespace dxvk {
         ri->texgenMode != key.texgenMode) {
       ri->dirtyFlags.set(ReplacementInstance::DirtyFlag::Other);
     }
+    // The tracked set above does not cover every input a submission can change - a skinned
+    // mesh's bone hash is in the identity but has no dirty bit - so an unattributed difference
+    // has to fall back to the dynamic path rather than be treated as no change.
     if ((ri->dirtyFlags & ReplacementInstance::kLookupDriftMask).isClear()) {
       ri->dirtyFlags.set(ReplacementInstance::DirtyFlag::Other);
     }
@@ -86,6 +91,7 @@ namespace dxvk {
       XXH64_hash_t matHash;
       XXH64_hash_t boneHash;
       XXH64_hash_t overrideMaterialHash;
+      XXH64_hash_t decomposedInstanceId;
       Matrix4 xform;
       Matrix4 textureTransform;
       uint32_t cameraType;
@@ -102,7 +108,12 @@ namespace dxvk {
     data.overrideMaterialHash = overrideMaterialData != nullptr
         ? overrideMaterialData->getHash()
         : kEmptyHash;
-    data.xform = drawCallState.getTransformData().objectToWorld;
+    // A decomposed hardware instance is the same object frame to frame even though it moves, so its
+    // own identifier stands in for the transform. Everything else keys on the transform as before.
+    data.decomposedInstanceId = drawCallState.decomposedInstanceId;
+    if (drawCallState.decomposedInstanceId == kEmptyHash) {
+      data.xform = drawCallState.getTransformData().objectToWorld;
+    }
     data.categories = drawCallState.getCategoryFlags().raw();
     data.boneHash = drawCallState.getSkinningState().boneHash;
     data.cameraType = static_cast<uint32_t>(drawCallState.cameraType);
@@ -114,6 +125,7 @@ namespace dxvk {
         &IdentityHashData::matHash,
         &IdentityHashData::boneHash,
         &IdentityHashData::overrideMaterialHash,
+        &IdentityHashData::decomposedInstanceId,
         &IdentityHashData::xform,
         &IdentityHashData::textureTransform,
         &IdentityHashData::cameraType,
@@ -145,6 +157,7 @@ namespace dxvk {
     match->vertexPositionHash = key.vertexPositionHash;
     match->materialHash = key.materialHash;
     match->centroid = key.worldPos;
+    match->isViewModelDraw = key.isViewModelDraw;
 
     if (moveInAssetMap) {
       match->spatialCacheTransformHash = moveInAssetMap->move(
@@ -178,19 +191,45 @@ namespace dxvk {
     // the same ReplacementInstance even if already seen this frame. This handles two-pass rendering where
     // the game draws the same mesh twice (e.g., base pass + overlay). The second pass
     // merges into the same instance via mergeInstanceHeuristics in updateInstance.
+    if (key.identityExcludesTransform) {
+      ++m_identityStats.stableIdentityLookups;
+    }
+
     auto exactMatchIter = m_identityHashMap.find(key.identityHash);
     if (exactMatchIter != m_identityHashMap.end()) {
-      // identityHash includes transform/material/vertex hashes, so all key fields
-      // match this RI's cached values by construction. Nothing changed since last
-      // submission of this identity.
+      ++m_identityStats.l1Hits;
+      if (key.identityExcludesTransform) {
+        ++m_identityStats.stableIdentityL1Hits;
+      }
+      // Unless the key excludes it, identityHash includes the transform along with the material and
+      // vertex hashes, so all key fields match this RI's cached values by construction: nothing
+      // changed since the last submission of this identity.
       //
-      // Only clear lookup-drift bits on the first lookup of a new frame. A second lookup
+      // Only touch lookup-drift bits on the first lookup of a new frame. A second lookup
       // within the same frame (two-pass rendering) must not clobber flags the L2
       // path set when first matching this RI for the current frame. Dynamic-feature
       // bits persist until the dynamic path runs.
       ReplacementInstance* match = exactMatchIter->second;
       if (match->frameLastSeen != currentFrameId) {
-        match->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
+        if (key.identityExcludesTransform) {
+          // A hit on such a key proves the object is the same one, not that it stayed put, so the
+          // two things the invariant above would have given for free have to be done by hand:
+          // report the drift, because the preserve path reuses surface state (transform included)
+          // whenever the dirty flags come back clear, and move the instance's spatial entry so the
+          // nearest-neighbour search still finds it where it now is. computeDirtyFlags does its own
+          // comparison, so an instance that genuinely did not move still sets no bits.
+          computeDirtyFlags(match, key);
+          match->vertexPositionHash = key.vertexPositionHash;
+          match->materialHash = key.materialHash;
+          match->centroid = key.worldPos;
+          auto spatialMapIter = m_assetSpatialMaps.find(key.spatialMapHash);
+          if (spatialMapIter != m_assetSpatialMaps.end()) {
+            match->spatialCacheTransformHash = spatialMapIter->second.move(
+                match->spatialCacheTransformHash, key.worldPos, key.transform, match);
+          }
+        } else {
+          match->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
+        }
       }
       return match;
     }
@@ -199,9 +238,12 @@ namespace dxvk {
     const float uniqueObjectDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
     const float spatialMapCellSize = RtxOptions::uniqueObjectDistance() * 2.f;
 
+    // Runs once per candidate the search examines, so counting here measures the scan exactly.
     auto l2Filter = [&](const ReplacementInstance* candidate) {
+      ++m_identityStats.candidatesExamined;
       return candidate->frameLastSeen != currentFrameId &&
-             candidate->materialHash == key.materialHash;
+             candidate->materialHash == key.materialHash &&
+             candidate->isViewModelDraw == key.isViewModelDraw;
     };
 
     auto spatialMapIter = m_assetSpatialMaps.find(key.spatialMapHash);
@@ -216,6 +258,7 @@ namespace dxvk {
         return false;
       });
       if (exactTransformMatch != nullptr) {
+        ++m_identityStats.l2ExactTransformHits;
         // Compute diff before reassociation. Transform/vertex/spatialMap match
         // by construction here; only material can diverge (l2Filter requires
         // material match, so usually nothing differs at this point).
@@ -232,6 +275,7 @@ namespace dxvk {
         key.worldPos, uniqueObjectDistanceSqr, nearestDistSqr, l2Filter);
 
       if (nearestMatch != nullptr) {
+        ++m_identityStats.l2SpatialHits;
         // Compute diff before reassociation overwrites the cached fields. The
         // transform differs (otherwise we would have hit the exact-transform
         // branch above); other fields may also have changed.
@@ -242,6 +286,7 @@ namespace dxvk {
     }
 
     // Level 3: no match — create a new ReplacementInstance.
+    ++m_identityStats.creates;
     auto newReplacementInstance = std::make_unique<ReplacementInstance>(
         key, m_nextReplacementInstanceId++, currentFrameId);
     ReplacementInstance* replacementInstance = newReplacementInstance.get();
@@ -276,7 +321,9 @@ namespace dxvk {
       drawCallState.getGeometryData().boundingBox.getTransformedCentroid(objectToWorld),
       objectToWorld,
       drawCallState.getTransformData().textureTransform,
-      drawCallState.getTransformData().texgenMode
+      drawCallState.getTransformData().texgenMode,
+      drawCallState.cameraType == CameraType::ViewModel,
+      drawCallState.decomposedInstanceId != kEmptyHash
     };
 
     ReplacementInstance* result = findOrCreateReplacementInstance(key);
@@ -315,7 +362,8 @@ namespace dxvk {
     auto portalFilter = [&](const ReplacementInstance* candidate) {
       return candidate != newInstance &&
              candidate->frameLastSeen != currentFrameId &&
-             candidate->materialHash == key.materialHash;
+             candidate->materialHash == key.materialHash &&
+             candidate->isViewModelDraw == key.isViewModelDraw;
     };
 
     for (auto& rayPortalPair : rayPortalManager.getRayPortalPairInfos()) {
@@ -364,9 +412,51 @@ namespace dxvk {
     replacementInstance->clear();
   }
 
+  void DrawCallTracker::reportIdentityStats() {
+    if (!RtxOptions::logInstanceIdentityStats()) {
+      return;
+    }
+
+    ++m_identityStats.frames;
+
+    const uint32_t currentFrame = m_device->getCurrentFrameId();
+    constexpr uint32_t kStatIntervalFrames = 60;
+    if (currentFrame - m_identityStats.frameStamp < kStatIntervalFrames) {
+      return;
+    }
+    m_identityStats.frameStamp = currentFrame;
+
+    const uint32_t frames = std::max(m_identityStats.frames, 1u);
+    const double perFrame = 1.0 / double(frames);
+    const uint32_t stablePercent = m_identityStats.stableIdentityLookups > 0
+      ? uint32_t((m_identityStats.stableIdentityL1Hits * 100ull) / m_identityStats.stableIdentityLookups)
+      : 0u;
+
+    Logger::info(str::format(
+      "[RTX-InstanceIdentity] per frame over ", frames, " frames: ",
+      double(m_identityStats.l1Hits) * perFrame, " exact-identity hits, ",
+      double(m_identityStats.l2ExactTransformHits) * perFrame, " exact-transform hits, ",
+      double(m_identityStats.l2SpatialHits) * perFrame, " spatial hits, ",
+      double(m_identityStats.creates) * perFrame, " created; ",
+      double(m_identityStats.candidatesExamined) * perFrame, " spatial candidates examined. ",
+      "Transform-independent identities: ", double(m_identityStats.stableIdentityLookups) * perFrame,
+      " lookups, ", stablePercent, "% hit exact identity."));
+
+    m_identityStats.l1Hits = 0;
+    m_identityStats.l2ExactTransformHits = 0;
+    m_identityStats.l2SpatialHits = 0;
+    m_identityStats.creates = 0;
+    m_identityStats.candidatesExamined = 0;
+    m_identityStats.stableIdentityLookups = 0;
+    m_identityStats.stableIdentityL1Hits = 0;
+    m_identityStats.frames = 0;
+  }
+
   void DrawCallTracker::garbageCollectReplacementInstances(
       RtCamera& camera,
       bool isAntiCullingSupported) {
+
+    reportIdentityStats();
 
     const uint32_t currentFrame = m_device->getCurrentFrameId();
     const uint32_t numFramesToKeepObjects = RtxOptions::numFramesToKeepInstances();

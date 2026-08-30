@@ -42,12 +42,9 @@
 #include "../../util/util_math.h"
 #include "../../util/util_vector.h"
 #include "../../util/util_string.h"
+#include "../../util/util_sentry.h"
 
 #include "../../d3d9/d3d9_swapchain.h"
-
-#include "../../lssusd/usd_include_begin.h"
-#include <src/usd-plugins/RemixParticleSystem/ParticleSystemAPI.h>
-#include "../../lssusd/usd_include_end.h"
 
 #include <windows.h>
 
@@ -667,12 +664,13 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL){ result.set(InstanceCategories::ThirdPersonPlayerModel); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY ){ result.set(InstanceCategories::ThirdPersonPlayerBody ); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING    ){ result.set(InstanceCategories::IgnoreBakedLighting   ); }
-      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER){ result.set(InstanceCategories::IgnoreTransparencyLayer); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS)                { result.set(InstanceCategories::HairCards); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL)                { result.set(InstanceCategories::ViewModel); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_CULL_BACKFACES_IN_SHADOWS) { result.set(InstanceCategories::CullBackfacesInShadows); }
       
-      static_assert((int)InstanceCategories::Count == 26, "Instance categories changed, please update Remix SDK");
+      static_assert((int)InstanceCategories::Count == 27, "Instance categories changed, please update Remix SDK");
       return result;
     }
 
@@ -779,9 +777,6 @@ namespace {
       desc.restrictVelocityX = static_cast<uint8_t>(info.restrictVelocityX);
       desc.restrictVelocityY = static_cast<uint8_t>(info.restrictVelocityY);
       desc.restrictVelocityZ = static_cast<uint8_t>(info.restrictVelocityZ);
-
-      // If this assert fails a new particle system parameter added, please update here.
-      assert(pxr::RemixParticleSystemAPI::GetSchemaAttributeNames(false).size() == 46);
 
       return desc;
     }
@@ -1286,7 +1281,7 @@ namespace {
       dxvk::Vector2i{ pixelRegion->left, pixelRegion->top },
       dxvk::Vector2i{ pixelRegion->right, pixelRegion->bottom },
       // invoke user's callback on result
-      [callback, callbackUserData](std::vector<dxvk::ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t>) {
+      [callback, callbackUserData](std::vector<dxvk::ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t>, std::optional<XXH64_hash_t>) {
         callback(objectPickingValues.data(), uint32_t(objectPickingValues.size()), callbackUserData);
       }
     );
@@ -1398,6 +1393,7 @@ namespace {
     }
     s_dxvkD3D9 = dxvkD3d9Ex;
     s_dxvkDevice = dxvkDevice;
+    dxvk::g_dxvkDeviceNative = dxvkDevice->GetDXVKDevice().ptr();
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1656,6 +1652,7 @@ namespace {
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
     if (s_dxvkDevice) {
+      dxvk::g_dxvkDeviceNative = nullptr;
       while (true) {
         ULONG left = s_dxvkDevice->Release();
         if (left == 0) {
@@ -1673,6 +1670,10 @@ namespace {
       }
       s_dxvkD3D9 = nullptr;
     }
+
+    // Make sure Sentry doesn't keep the process alive when it should be shutting down.
+    dxvk::sentry::shutdown();
+
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1790,4 +1791,5 @@ extern "C"
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
+
 }

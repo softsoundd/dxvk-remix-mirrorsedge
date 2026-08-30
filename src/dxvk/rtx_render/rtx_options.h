@@ -131,7 +131,8 @@ namespace dxvk {
 
   enum class TonemappingMode : int {
     Global = 0,
-    Local
+    Local,
+    MirrorsEdge
   };
 
   enum class UIType : int {
@@ -208,7 +209,11 @@ namespace dxvk {
                   "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
                   "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
                   "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
-                  "For render-target textures the stable descriptor hash matches in addition to the (recreation-dependent) image hash, and rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
+                  "Non-RT textures match by image hash. Render targets match either descriptor hash the texture picker "
+                  "registers for them: the resolution-agnostic one (aspect ratio in place of Width/Height) survives "
+                  "resolution changes, while the absolute one pins a single target when several share an aspect ratio "
+                  "(e.g. a scene colour buffer and its half-resolution post-process chain). "
+                  "rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
                   "Tagging is not absolute: depth-writing draws, world geometry (anything beyond trivial depth-test-off overlay quads), and engine post-process shaders are refused deferral and classified normally, so shared textures cannot pull scene geometry out of the ray-traced world.\n"
                   "See rtx.d3d9.deferredUiReplay and rtx.d3d9.deferredUiRefreshSceneColor for the replay behavior.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
@@ -228,6 +233,31 @@ namespace dxvk {
     RTX_OPTION("rtx", fast_unordered_set, playerModelBodyTextures, {},
                   "Textures on draw calls that identify the player model body/root position.\n"
                   "Remix uses the tagged body instance as the anchor for filtering nearby player-model parts and for creating or positioning virtual player-model instances through portals.");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for third-person player model draw calls.\n"
+                  "Use when Mesh3p shares materials with the first-person mesh.");
+    RTX_OPTION("rtx", fast_unordered_set, playerModelBodyGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) identifying the player model body/root position.\n"
+                  "Geometry-based equivalent of rtx.playerModelBodyTextures; implies the player-model category.\n"
+                  "The tagged body instance anchors the player-model distance filter (rtx.playerModel.horizontal/verticalDetectionDistance):\n"
+                  "player-model-tagged instances beyond that capsule revert to regular world geometry each frame.\n"
+                  "Optional - held weapons are classified automatically (rtx.playerModel.autoDetectHeldEquipment) and need no tagging.");
+    RTX_OPTION("rtx", fast_unordered_set, viewModelTextures, {},
+                  "Textures / material hashes for first-person view-model draw calls (e.g. Mesh1p arms, FP weapon).\n"
+                  "Forces CameraType::ViewModel when rtx.viewModel.enable is true.\n"
+                  "Prefer rtx.viewModelGeometries when the same material is also used on the third-person body.");
+    RTX_OPTION("rtx", fast_unordered_set, viewModelGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for first-person view-model draw calls.\n"
+                  "Preferred when Mesh1p shares materials with Mesh3p.");
+    RTX_OPTION_ARGS("rtx", fast_unordered_set, cullBackfacesInShadowTextures, {},
+                  "Textures / material hashes for wrapping world-shell meshes whose inward backfaces should be ignored on shadow and NEE visibility rays.\n"
+                  "Use for one-sided building exteriors around BSP interiors with window openings. Primary and GI rays already cull those faces; visibility rays do not by default, so the shell blocks the sun. Front faces still cast outdoor shadows.\n"
+                  "Prefer rtx.cullBackfacesInShadowGeometries when the material is shared. Do not enable rtx.enableCullingInSecondaryRays for this.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION_ARGS("rtx", fast_unordered_set, cullBackfacesInShadowGeometries, {},
+                  "Topology-stable geometry hashes (indices + geometry descriptor) for wrapping world-shell meshes whose inward backfaces should be ignored on shadow and NEE visibility rays.\n"
+                  "Preferred when the shell shares materials with other meshes. See rtx.cullBackfacesInShadowTextures.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION("rtx", fast_unordered_set, lightConverter, {},
                   "Textures on draw calls that should spawn Remix effect lights.\n"
                   "An effect light is a dynamic sphere light placed at the tagged draw call's geometry centroid; radius, intensity, color, and plasma-ball animation are controlled in the Runtime UI's Lighting > Effect Light section.");
@@ -248,10 +278,6 @@ namespace dxvk {
                   "Typically objects marked as particles or objects using emissive blending will be rendered with a special method which allows re-orientation of the billboard geometry assumed to make up the draw call in indirect rays (reflections for example).\n"
                   "This method works fine for typical particles, but some (e.g. a laser beam) may not be well-represented with the typical billboard assumption of simply needing to rotate around its centroid to face the view direction.\n"
                   "To handle such cases a different beam mode is used to treat objects as more of a cylindrical beam and re-orient around its main spanning axis, allowing for better rendering of these beam-like effect objects.");
-    RTX_OPTION("rtx", fast_unordered_set, ignoreTransparencyLayerTextures, {},
-                  "Textures on draw calls that should not be stored in the transparency layer, when DLSS-RR is on.\n"
-                  "The transparency layer stores noise-free transparent objects which bypasses DLSS-RR denoising, but it has lower anti-aliasing quality.\n"
-                  "Transparent objects that have aliasing/flickering issues, like laser beams, can be added to this list to achieve better anti-aliasing quality.");
     RTX_OPTION("rtx", fast_unordered_set, decalTextures, {},
                   "Textures on draw calls used for static geometric decals or decals with complex topology.\n"
                   "These materials will be blended over the materials underneath them when decal material blending is enabled.\n"
@@ -320,7 +346,10 @@ namespace dxvk {
                   args.onChangeCallback = &geometryAssetHashRuleStringOnChange,
                   args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION_ARGS("rtx", fast_unordered_set, raytracedRenderTargetTextures, {},
-                    "DescriptorHashes for Render Targets. (Screens that should display the output of another camera).",
+                    "Descriptor hashes for render targets that should display the output of another camera (screens, "
+                    "monitors). Either hash the texture picker registers for a render target matches: the "
+                    "resolution-agnostic one (aspect ratio in place of Width/Height) survives resolution changes, "
+                    "while the absolute one pins a single target when several share an aspect ratio.",
                     args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION("rtx", fast_unordered_set, particleEmitterTextures, {}, "Objects rendered with these textures will emit particles that inherit the material of the object itself.");
     RTX_OPTION("rtx", fast_unordered_set, smoothNormalsTextures, {},
@@ -450,19 +479,83 @@ namespace dxvk {
       RTX_OPTION("rtx.viewModel", bool, enableVirtualInstances, true, "If true, virtual instances are created to render the view models behind a portal.");
       RTX_OPTION("rtx.viewModel", bool, perspectiveCorrection, true, "If true, apply correction to view models (e.g. different FOV is used for view models).");
       RTX_OPTION("rtx.viewModel", float, maxZThreshold, 0.0f, "If a draw call's viewport has max depth less than or equal to this threshold, then assume that it's a view model.");
+      RTX_OPTION("rtx.viewModel", float, maxNearPlane, 0.f,
+                 "Hide view-model instances while the game's near clipping plane exceeds this value (world units). 0 disables.\n"
+                 "Games hide the first-person view model by pushing the raster near plane past it during scoped zoom;\n"
+                 "ray tracing ignores raster clipping, so this mirrors that intent.\n"
+                 "Set between the game's normal and pushed-out near plane values. Unreliable when mods rewrite the\n"
+                 "near plane per frame - prefer hideBelowFovDegrees in that case.");
+      RTX_OPTION("rtx.viewModel", float, hideBelowFovDegrees, 0.f,
+                 "Hide view-model instances while the view-model camera's vertical FOV is below this many degrees. 0 disables.\n"
+                 "Scoped zoom shrinks the FOV drastically (e.g. Mirror's Edge sniper zoom: ~59 down to ~7 degrees), and games\n"
+                 "hide the first-person view model while zoomed via raster tricks ray tracing ignores. The FOV itself is the\n"
+                 "most robust zoom signal: it works regardless of how the game or mods manage clipping planes.\n"
+                 "Set it well below the narrowest FOV the game uses for anything else. Cinematics pull the FOV in too\n"
+                 "(Mirror's Edge scripted sequences reach ~43 degrees), and a threshold above that hides the first-person\n"
+                 "overlay for the length of the cutscene. Only the depth of the zoom separates the two cases.");
     } viewModel;
 
     struct PlayerModel {
       friend class ImGUI;
       RTX_OPTION("rtx.playerModel", bool, enableVirtualInstances, true, "");
-      RTX_OPTION("rtx.playerModel", bool, enableInPrimarySpace, false, "");
+      RTX_OPTION("rtx.playerModel", bool, enableInPrimarySpace, false,
+                 "Show third-person player-model instances on primary camera rays.\n"
+                 "Also hides the view model while enabled; prefer autoEnableInPrimarySpaceWhenNoViewModel for cutscenes.");
+      RTX_OPTION("rtx.playerModel", bool, autoEnableInPrimarySpaceWhenNoViewModel, false,
+                 "Show player-model instances on primary rays in frames with no ViewModel camera\n"
+                 "(cutscenes / flyovers that do not draw Mesh1p). Does not override enableInPrimarySpace.");
+      RTX_OPTION("rtx.playerModel", float, autoEnableInPrimarySpaceBodyDistance, 0.f,
+                 "Show player-model instances on primary rays when the main camera is farther than this\n"
+                 "many world units from the player (external / third-person / cutscene cameras). Catches\n"
+                 "cameras that detach while the game still draws first-person overlay geometry, which\n"
+                 "defeats the no-ViewModel heuristic. 0 disables.\n"
+                 "The player position is the minimum camera distance across this frame's player-model\n"
+                 "instances (anything tagged via rtx.playerModelTextures / rtx.playerModelGeometries).\n"
+                 "Check the distance a game actually reports before setting this. Where the pawn is parked\n"
+                 "away from the camera during scripted sequences, or extra copies of the player mesh share\n"
+                 "its tags, the measured distance leaves the first-person range during ordinary play and any\n"
+                 "threshold inside that spread flickers the body in and out.");
+      RTX_OPTION("rtx.playerModel", float, firstPersonMaxDistance, 0.f,
+                 "While the camera is the first-person view, drop player-model instances farther than this\n"
+                 "many world units from it entirely - no primary rays, no shadows, no reflections. 0 disables.\n"
+                 "Primary shadows exist so the player casts a shadow of their own body. A player model parked\n"
+                 "far from the camera is not that: scripted sequences move the pawn to where it needs to be and\n"
+                 "fly the camera in separately, and a game modified to always draw its third-person mesh leaves\n"
+                 "that copy standing in the scene casting a shadow nobody is there to cast. The instance\n"
+                 "returns to normal once the camera reaches it.");
+      RTX_OPTION("rtx.playerModel", uint32_t, autoEnableInPrimarySpaceDelayFrames, 0,
+                 "Consecutive frames the automatic rules must agree before the player model moves onto\n"
+                 "primary rays. Leaving the external-camera state is always immediate, so returning to\n"
+                 "first person never leaves the body standing in the camera.\n"
+                 "Guards against momentary signal dropouts - a camera cut that costs one frame of overlay\n"
+                 "geometry, a frame where the player's own draws leave the tagged set - flipping the body\n"
+                 "into view. Does not apply to enableInPrimarySpace.");
+      RTX_OPTION_FLAG("rtx.playerModel", bool, logCameraRegime, false, RtxOptionFlags::NoSave,
+                      "Log the external-camera regime decision whenever its inputs change, and every\n"
+                      "player-model instance's pose and world anchor once a second. Use when the player model\n"
+                      "or its shadow appears on primary rays at the wrong time, or when a character renders\n"
+                      "in bind pose (which means its instance is not being told apart from another copy).");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
+      RTX_OPTION("rtx.playerModel", bool, autoDetectHeldEquipment, true,
+                 "Automatically treat the world-space copy of view-model-drawn meshes as player-model geometry.\n"
+                 "Held equipment (e.g. weapons) often renders twice: a view-model copy for the point of view and\n"
+                 "a world-space copy kept as shadow caster. When a mesh is drawn both ways in one frame, the world\n"
+                 "instance closest to the camera is classified as player model: hidden from primary rays, still\n"
+                 "casting shadows and appearing in reflections. Instances without a view-model twin that frame\n"
+                 "(dropped or NPC-held duplicates of the same mesh) remain regular world geometry.\n"
+                 "Such meshes need no texture or geometry tagging at all.");
+      RTX_OPTION("rtx.playerModel", float, heldEquipmentMaxDistance, 200.f,
+                 "Maximum distance (world units) from the camera for autoDetectHeldEquipment candidates.\n"
+                 "Guards against classifying a distant duplicate when the real held copy is absent (e.g. culled).");
       RTX_OPTION("rtx.playerModel", float, backwardOffset, 0.f, "");
       RTX_OPTION("rtx.playerModel", float, horizontalDetectionDistance, 34.f, "");
       RTX_OPTION("rtx.playerModel", float, verticalDetectionDistance, 64.f, "");
       RTX_OPTION("rtx.playerModel", float, eyeHeight, 64.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleRadius, 24.f, "");
       RTX_OPTION("rtx.playerModel", float, intersectionCapsuleHeight, 68.f, "");
+
+      // The effective per-frame decision (external-camera regime) is computed once in
+      // SceneManager::prepareSceneData; consumers read it from the InstanceManager.
     } playerModel;
 
     struct Displacement {
@@ -552,6 +645,15 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableDirectLighting, true, "Enables direct lighting (lighting directly from lights on to a surface) on surfaces when set to true, otherwise disables it.");
     RTX_OPTION("rtx", bool, enableSecondaryBounces, true, "Enables indirect lighting (lighting from diffuse/specular bounces to one or more other surfaces) on surfaces when set to true, otherwise disables it.");
       
+    RTX_OPTION("rtx", bool, logInstanceIdentityStats, false,
+               "Diagnostics: log roughly once a second where instance lookups land - exact-identity hits, "
+               "exact-transform hits, spatial nearest-neighbour hits, instances created - and how many candidates "
+               "the spatial search examined.\n"
+               "That candidate count is the one to watch: the search scans a cell neighbourhood sized from "
+               "rtx.uniqueObjectDistance, so a dense cluster of moving objects can land its whole batch in one cell "
+               "and turn the search quadratic in the batch's size. Instances whose identity does not depend on their "
+               "transform are reported separately, since they should be bypassing the search entirely.");
+
     // Needs to be > 0
     RTX_OPTION_ARGS("rtx", float, uniqueObjectDistance, 300.f, "The distance (in game units) that an object can move in a single frame before it is no longer considered the same object.\n"
                     "If this is too low, fast moving objects may flicker and have bad lighting.  If it's too high, repeated objects may flicker.\n"
@@ -772,6 +874,15 @@ namespace dxvk {
                "A threshold value to indicate that the denoiser's alternate disocclusion threshold should be used when normal map \"detail\" on a transmission PSR surface exceeds a desired amount.\n"
                "Normal detail is defined as 1-dot(tangent_normal, vec3(0, 0, 1)), or in other words it is 0 when no normal mapping is used, and 1 when the normal mapped normal is perpendicular to the underlying normal.\n"
                "This is typically used to reduce flickering artifacts resulting from refraction on surfaces like glass leveraging normal maps as often the denoiser is too aggressive with disocclusion checks frame to frame when DLSS or other camera jittering is in use.");
+    RTX_OPTION_ARGS("rtx", float, psrMaxDistanceMeters, 0.0f,
+               "Maximum accumulated hit distance in meters for PSR (Primary Surface Replacement).\n"
+               "Beyond this distance PSR is disabled and the current surface remains in the G-Buffer.\n"
+               "0 disables the limit. See also psrMaxDistanceFadeMeters.",
+               args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx", float, psrMaxDistanceFadeMeters, 0.0f,
+               "Fade span in meters ending at psrMaxDistanceMeters. PSR probability decreases from 1 to 0 across this span.\n"
+               "0 is a hard cutoff at psrMaxDistanceMeters.",
+               args.minValue = 0.0f);
 
     // Shader Execution Reordering Options
     RTX_OPTION_ENV("rtx", bool, isShaderExecutionReorderingSupported, true, "DXVK_IS_SHADER_EXECUTION_REORDERING_SUPPORTED", "Enables Shader Execution Reordering (SER) if it is supported by the target HW and SW."); 
@@ -955,7 +1066,9 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableAlphaBlend, true, "Enable rendering alpha blended geometry, used for partial opacity and other blending effects on various surfaces in many games.");
     RTX_OPTION("rtx", bool, enableAlphaTest, true, "Enable rendering alpha tested geometry, used for cutout style opacity in some games.");
     RTX_OPTION("rtx", bool, enableCulling, true, "Enable front/backface culling for opaque objects. Objects with alpha blend or alpha test are not culled.");
-    RTX_OPTION("rtx", bool, enableCullingInSecondaryRays, false, "Enable front/backface culling for opaque objects. Objects with alpha blend or alpha test are not culled.  Only applies in secondary rays, defaults to off.  Generally helps with light bleeding from objects that aren't watertight.");
+    RTX_OPTION("rtx", bool, enableCullingInSecondaryRays, false,
+               "Enable front/backface culling for opaque objects. Objects with alpha blend or alpha test are not culled.  Only applies in secondary rays, defaults to off.  Generally helps with light bleeding from objects that aren't watertight.\n"
+               "For wrapping building shells, tag with rtx.cullBackfacesInShadowTextures / rtx.cullBackfacesInShadowGeometries instead; this global override also weakens object shadows.");
     RTX_OPTION_ARGS("rtx", bool, enableEmissiveBlendModeTranslation, true, "Treat incoming semi/additive D3D blend modes as emissive.",
                     args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION_ARGS("rtx", bool, enableEmissiveBlendEmissiveOverride, true, "Override typical material emissive information on draw calls with any emissive blending modes to emulate their original look more accurately.",
@@ -1196,7 +1309,10 @@ namespace dxvk {
                       args.maxValue = 1024 * 32);
       RTX_OPTION_ENV("rtx.texturemanager", bool, samplerFeedbackEnable, true, "DXVK_TEXTURES_SAMPLER_FEEDBACK_ENABLE",
                  "Enable texture sampler feedback. If true, a texture prioritization logic considers the amount of mip-levels that was sampled by a GPU while rendering a scene."
-                 "(For example, if a texture is in the distance, it will have a lower priority compared to a texture rendered just in front of the camera).");
+                 "(For example, if a texture is in the distance, it will have a lower priority compared to a texture rendered just in front of the camera).\n"
+                 "If false, texture streaming is disabled altogether and every replacement texture is loaded at its full resolution, ignoring the texture budget. "
+                 "Useful to rule out streaming when diagnosing blurry replacements, at the cost of higher VRAM usage.\n"
+                 "Note that disabling this at runtime is one-way: textures pinned to full resolution stay pinned until the game is restarted.");
       RTX_OPTION_FLAG_ENV("rtx.texturemanager", bool, neverDowngradeTextures, false, RtxOptionFlags::NoSave, "DXVK_TEXTURES_NEVER_DOWNGRADE", 
                  "Debug option to forcibly prevent uploading lower resolution data, if the texture already has been promoted to a high resolution.");
       RTX_OPTION("rtx.texturemanager", int, stagingBufferSizeMiB, 96,
@@ -1217,10 +1333,11 @@ namespace dxvk {
                "Should only be set to false for debugging purposes if the partial DDS loader's logic is suspected to be incorrect to compare against GLI's implementation.");
 
     RTX_OPTION("rtx", TonemappingMode, tonemappingMode, TonemappingMode::Local,
-               "The tonemapping type to use, 0 for Global, 1 for Local (Default).\n"
+               "The tonemapping type to use, 0 for Global, 1 for Local (Default), 2 for Mirror's Edge (UE3).\n"
                "Global tonemapping tonemaps the image with respect to global parameters, usually based on statistics about the rendered image as a whole.\n"
                "Local tonemapping on the other hand uses more spatially-local parameters determined by regions of the rendered image rather than the whole image.\n"
-               "Local tonemapping can result in better preservation of highlights and shadows in scenes with high amounts of dynamic range whereas global tonemapping may have to comprimise between over or underexposure.");
+               "Local tonemapping can result in better preservation of highlights and shadows in scenes with high amounts of dynamic range whereas global tonemapping may have to comprimise between over or underexposure.\n"
+               "Mirror's Edge (UE3) reproduces the game's native TdToneMapping display transform (exposure, per-channel grade, display gamma 2.0 and per-map 16-segment colour curves) with optional hue-preserving modernizations; see the rtx.tonemap.ue3.* options.");
     RTX_OPTION("rtx", bool, useLegacyACES, true,
                "Use a luminance-only approximation of ACES that over-saturates the highlights. If false, use a refined ACES transform that converts between color spaces with more precision.");
     RTX_OPTION("rtx", bool, showLegacyACESOption, false,
@@ -1299,6 +1416,23 @@ namespace dxvk {
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");
+
+    RTX_OPTION("rtx", bool, logReplacementResolution, false,
+               "Replacement anchor diagnostics: log how every draw resolves against authored replacement "
+               "anchors (material replacements through the tiered material identity lookup, mesh/light "
+               "replacements through the geometry-asset-hash XOR material-hash key), and warn whenever the "
+               "same material family or mesh resolves differently than it did earlier in the session - the "
+               "signature of hash drift breaking authored anchors. Also enables the UE3 material-identity "
+               "drift attribution in the D3D9 layer, which names the identity tier (texture set, constants, "
+               "render-target-backed sampler) responsible for a changed material hash. Verbose; intended for "
+               "debugging sessions only.");
+    RTX_OPTION("rtx", fast_unordered_set, replacementDebugHashes, {},
+               "Replacement anchor diagnostics: hashes to track in detail even when "
+               "rtx.logReplacementResolution is disabled. A draw is tracked when any of its identity hashes "
+               "match an entry: the primary color texture hash, the full material hash, the "
+               "textureSet+shader tier hash, the geometry asset hash, the combined mesh replacement key, or "
+               "any material sampler's image hash. Tracked draws produce the same resolution and drift logs "
+               "as rtx.logReplacementResolution without the full-scene log volume.");
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 
@@ -1411,6 +1545,17 @@ namespace dxvk {
 
       // Need to set this to true after conf files are parsed, but before any options are accessed.
       RtxOptionImpl::setInitialized(true);
+
+      // Unreal Engine 3 is a Z-up engine, so its compatibility mode implies rtx.zUp. Only applied
+      // when no config file states an opinion, which leaves user.conf free to override it and
+      // saves every UE3 game profile from having to repeat it.
+      {
+        const Config& mergedConfig = RtxOptionLayer::getMergedConfig();
+        if (mergedConfig.getOption<bool>("rtx.d3d9.ue3EngineMode", false) &&
+            !mergedConfig.findOption("rtx.zUp")) {
+          zUp.setDeferred(true);
+        }
+      }
 
       // Replacement options
       if (env::getEnvVar("DXVK_DISABLE_ASSET_REPLACEMENT") == "1") {

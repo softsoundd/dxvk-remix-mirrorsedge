@@ -53,6 +53,9 @@ function SetupBuild {
 
 	If ( $BuildArch -eq "x64" ) {
 		$Arch = "x64"
+	} ElseIf ( $BuildArch -eq "arm64" -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64" ) {
+		# Native arm64 host: use the arm64 toolchain rather than the emulated x64 cross-compiler.
+		$Arch = "arm64"
 	} Else {
 		$Arch = "amd64_arm64"
 	}
@@ -107,7 +110,9 @@ function PerformBuild {
 
 		[bool]$ConfigureOnly = $false,
 
-		[bool]$ShadersOnly = $false
+		[bool]$ShadersOnly = $false,
+
+		[bool]$SkipApics = $false
 	)
 
 	if ( [string]::IsNullOrEmpty("$BuildArch") ) {
@@ -126,10 +131,9 @@ function PerformBuild {
 		if ( $env:BUILD_SENTRY_ENVIRONMENT ) {
 			$mesonArgs += "-Dremix_sentry_environment=$env:BUILD_SENTRY_ENVIRONMENT"
 		}
-		if ( $ShadersOnly ) {
+		if ( $ShadersOnly -or $SkipApics ) {
 			$mesonArgs += "-Ddownload_apics=False"
 		}
-
 		If ( $BuildArch -eq "arm64ec" ) {
 			$mesonArgs += @("--cross-file", "build-wina64ec.txt")
 		} Else { If ( $BuildArch -eq "arm64" ) {

@@ -49,6 +49,8 @@ namespace dxvk {
     // Variables needed for optimization
     std::atomic_uint16_t  m_idToTexture_count{ 0 };
     uint8_t*              m_cachedAssetMipcount{};
+    // Per texture, the mip count that a GPU-reported feedback index counts down from.
+    uint8_t*              m_cachedReferenceMipcount{};
     uint32_t              m_cachedAssetMipcount_length{ 0 };
     uint32_t*             m_cachedGpubuf{ 0 };
 
@@ -74,6 +76,14 @@ namespace dxvk {
       */
     const std::vector<TextureRef>& getTextureTable() const {
       return m_textureCache.getObjectTable();
+    }
+
+    /**
+      * \return Count of replacement ManagedTextures currently retained by at least one live
+      *         instance.  Updated at 0->1 and 1->0 ref-count transitions so this is O(1).
+      */
+    uint32_t getActiveReplacementTextures() const {
+      return m_retainedCount.load(std::memory_order_relaxed);
     }
 
     /**
@@ -122,10 +132,10 @@ namespace dxvk {
     
     /**
       * \brief Manages texture VRAM budget by demoting textures when over budget.
-      * 
-      * Demotes textures that were previously rendered (m_frameLastUsed != UINT32_MAX).
-      * Newly loaded textures (m_frameLastUsed == UINT32_MAX) are preserved since they
-      * haven't been rendered yet and are needed for the incoming scene.
+      *
+      * Demotes textures with m_refCount > 0 (active in the scene).
+      * Newly loaded textures (m_refCount == 0) are preserved since they
+      * haven't been bound to any instance yet and are needed for the incoming scene.
       */
     void manageBudgetWithPriority();
 
@@ -139,16 +149,15 @@ namespace dxvk {
       return showProgress();
     }
 
-    void updateSamplerFeedback(const Rc<ManagedTexture>& tex, uint16_t associatedFeedbackStamp);
+    // Ref counting for texture lifetime: increment when a surface material is bound to an instance,
+    // decrement when the instance is destroyed or its material changes. GC evicts textures at zero.
+    void retainTexture(uint32_t textureIndex);
+    void releaseTexture(uint32_t textureIndex);
 
-    /**
-     * Preserve path: re-run addTexture for the bindless slot so this frame's texture table
-     * matches the dynamic path (track + frame usage). \p leaderSamplerFeedbackStamp may be
-     * SAMPLER_FEEDBACK_INVALID; addTexture still must run for correct bindless registration.
-     * \p async controls whether the texture may be loaded asynchronously; when false, all
-     * mips are scheduled immediately on this thread and the texture is marked non-demotable.
-     */
-    void preserveTexture(uint32_t textureIndex, uint16_t leaderSamplerFeedbackStamp, bool async = true);
+    // Called from SceneManager::clear() after all instances have been destroyed. Asserts that
+    // every ManagedTexture ref count is zero, meaning instance lifecycle drove all retains
+    // to release. A non-zero count means a retain/release is mismatched somewhere.
+    void assertAllRefCountsZero();
 
     // Do not use. This is here temporarily for WAR for REMIX-1557
     void releaseTexture(TextureRef& textureRef) {
@@ -160,6 +169,7 @@ namespace dxvk {
 
   private:
     void scheduleTextureLoad(const Rc<ManagedTexture>& texture, bool async, bool forceUnload = false);
+    void updateSamplerFeedback(const Rc<ManagedTexture>& tex, uint16_t associatedFeedbackStamp);
 
   private:
     struct TextureHashFn {
@@ -174,6 +184,7 @@ namespace dxvk {
     };
     SparseUniqueCache<TextureRef, TextureHashFn, TextureEquality> m_textureCache;
     uint32_t m_textureCacheGeneration = 0;
+    std::atomic<uint32_t> m_retainedCount { 0 }; // replacement textures (ManagedTexture) with m_refCount > 0
 
     AsyncRunner*       m_asyncThread;
     AsyncRunner_RTXIO* m_asyncThread_rtxio;

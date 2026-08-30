@@ -349,6 +349,8 @@ dxvk_src = files([
   'rtx_render/rtx_tone_mapping.h',
   'rtx_render/rtx_types.cpp',
   'rtx_render/rtx_types.h',
+  'rtx_render/rtx_ue3_tone_mapping.cpp',
+  'rtx_render/rtx_ue3_tone_mapping.h',
   'rtx_render/rtx_utils.h',
   'rtx_render/rtx_xess.cpp',
   'rtx_render/rtx_xess.h',
@@ -447,7 +449,7 @@ nrd_dep = declare_dependency(
   include_directories : nrd_include_dir
 )
 
-target_dlss_lib_path = 'lib/Windows_x86_64/x86_64'
+target_dlss_lib_path = 'lib/Windows_x86_64/x64'
 if dxvk_is_woa
   target_dlss_lib_path = 'lib/Windows_arm64/arm64'
 endif

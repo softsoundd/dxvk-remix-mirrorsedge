@@ -66,6 +66,14 @@
 #define SAMPLER_FEEDBACK_INVALID           uint16_t(0xFFFF)
 #define SAMPLER_FEEDBACK_MAX_TEXTURE_COUNT uint16_t(0xFFFF)
 
+// Sampler feedback measures the accessed mip against a fixed square reference texture rather than
+// against the texture actually bound, so that differently sized assets report a comparable value.
+// A reported index N means the surface needs (SAMPLER_FEEDBACK_REFERENCE_MIP_COUNT - N) mips counted
+// from the finest mip: how many mips a surface needs follows from its UV gradient, not from the
+// resolution of the texture it happens to sample.
+#define SAMPLER_FEEDBACK_REFERENCE_TEXTURE_SIZE 4096
+#define SAMPLER_FEEDBACK_REFERENCE_MIP_COUNT    13
+
 // Note: Light array may only be up to a size of 2^16-1, allowing the last index to be
 // used for an invalid index similar to the max binding index for materials.
 #define LIGHT_INDEX_INVALID (0xFFFF)

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -100,8 +100,13 @@ public:
   // Leave it false before relative transforms, such as portal teleports.
   void updateFromReference(const RtInstance& src, bool preserveTransforms = true);
 
-  // Bind a BLAS object to this instance
+  // Bind a BLAS object to this instance and sync buffer indices/strides from its geometry data.
   void setBlas(BlasEntry& blas);
+
+  // Syncs surface buffer indices and strides from the currently bound BLAS.
+  // Called by setBlas() on initial bind or re-link, and by updateBufferCache()
+  // when geometry buffer slots change mid-scene.
+  void syncBufferIndicesFromBlas();
 
   // Sets current and previous transforms explicitly
   bool teleport(const Matrix4& objectToWorld);
@@ -357,9 +362,6 @@ public:
   // Binds a raytracing material to the specified instance.
   void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material);
 
-  // Copies buffer indices from the BlasEntry's geometry data to the instance's surface.
-  void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
-
   // Per-frame finalization shared by the dynamic and preserve paths:
   // re-registers the player-model / view-model candidate lists (cleared every onFrameEnd) and
   // dispatches onInstanceUpdated to listeners.
@@ -400,6 +402,38 @@ public:
 
   void createPlayerModelVirtualInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
+  // Classifies the world-space shadow copies of held equipment as player-model instances:
+  // per topology hash drawn through the view-model camera this frame, the world instance
+  // closest to the camera. Copies without a view-model twin (dropped / NPC-held duplicates
+  // of the same mesh) keep their regular world classification.
+  void detectHeldEquipmentInstances(const fast_unordered_set& viewModelTopologyHashes, const CameraManager& cameraManager);
+
+  // Caches this frame's main-camera distance to the player (minimum over player-model
+  // instances); negative when none exist. Drives the external-camera auto primary-space
+  // rule (rtx.playerModel.autoEnableInPrimarySpaceBodyDistance).
+  void updatePlayerModelBodyCameraDistance(const CameraManager& cameraManager);
+  float getPlayerModelBodyCameraDistance() const { return m_playerModelBodyCameraDistance; }
+
+  // Player-model instances drawn this frame. Zero means nothing carried a player-model tag,
+  // so the camera regime cannot affect the body at all - it is plain world geometry.
+  size_t getPlayerModelInstanceCount() const { return m_playerModelInstances.size(); }
+
+  // Drops player-model instances too far from a first-person camera to be its own body
+  // (rtx.playerModel.firstPersonMaxDistance). Runs after the camera regime is decided.
+  void hideDistantPlayerModelInstances(const CameraManager& cameraManager);
+
+  // This frame's camera regime, computed once by SceneManager::prepareSceneData: true when
+  // the main camera is not the first-person view (player model shown on primary rays,
+  // view-model copies hidden, held-equipment classification suspended).
+  void setExternalCameraRegime(bool external) { m_externalCameraRegime = external; }
+  bool isExternalCameraRegime() const { return m_externalCameraRegime; }
+
+  // True while the view model is force-hidden (e.g. scoped zoom: FOV below
+  // rtx.viewModel.hideBelowFovDegrees or near plane past rtx.viewModel.maxNearPlane).
+  // Computed by SceneManager::prepareSceneData alongside the camera regime.
+  void setViewModelHidden(bool hidden) { m_viewModelHidden = hidden; }
+  bool isViewModelHidden() const { return m_viewModelHidden; }
+
   void findPortalForVirtualInstances(const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
   int getVirtualInstancePortalIndex() const { return m_virtualInstancePortalIndex; }
@@ -421,6 +455,29 @@ private:
   uint64_t m_sceneGeneration = 0;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
+
+  // Held-equipment transition logging (see detectHeldEquipmentInstances)
+  size_t m_heldEquipmentLastWinnerCount = SIZE_MAX;
+
+  // Previous frame's view-model FOV, for detecting in-progress zoom transitions.
+  float m_heldEquipmentPrevFovDegrees = -1.f;
+
+  // Negative when no player-model instance was drawn this frame.
+  float m_playerModelBodyCameraDistance = -1.f;
+  bool m_externalCameraRegime = false;
+  bool m_viewModelHidden = false;
+
+  // Reports each player-model instance's pose and world anchor (rtx.playerModel.logCameraRegime).
+  // Shows whether instances of a shared skeletal mesh are being told apart, and where each one
+  // actually sits relative to the camera.
+  void logPlayerModelInstances(const Vector3& cameraPosition);
+  uint32_t m_lastLoggedPlayerModelInstancesFrame = 0;
+
+  // World instances currently classified as held equipment, mapped to the frame their
+  // view-model twin last confirmed them. Classification outlives twin loss through a short
+  // jitter grace and through zoom transitions (see detectHeldEquipmentInstances).
+  // Pruned in removeInstance.
+  std::unordered_map<RtInstance*, uint32_t> m_heldEquipmentInstances;
   std::vector<RtInstance*> m_playerModelInstances;
   uint32_t m_playerModelInstancesFrameId = kInvalidFrameIndex;
   std::vector<IntersectionBillboard> m_billboards;

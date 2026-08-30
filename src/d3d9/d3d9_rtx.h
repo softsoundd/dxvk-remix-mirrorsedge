@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 #include <optional>
+#include <unordered_map>
 
 namespace dxvk {
   struct D3D9BufferSlice;
@@ -57,9 +58,20 @@ namespace dxvk {
     bool inexact = false;
   };
 
+  // One coordinate component as `value * scale + offset`, or - for a UV matrix such as UE3's
+  // Rotator - as a combination of two components of the same interpolant:
+  //   value' = scale * uv[scaleComponent] + cross * uv[crossComponent] + offset
+  // Center biases fold into `offset` as an immediate alongside the two matrix-row constants,
+  // which is what the two constant slots of an offset term are for. A coefficient that would
+  // become the product of two draw-time constants (a Panner feeding a Rotator) is not
+  // representable and marks the term inexact.
   struct UvComponentAffine {
     UvAffineTerm scale;   // absent => 1.0
     UvAffineTerm offset;  // absent => 0.0
+    UvAffineTerm cross;   // absent => 0.0, so an unmixed component is unaffected by it
+    bool hasCross = false;
+    uint8_t scaleComponent = 0;  // interpolant component `scale` multiplies when hasCross
+    uint8_t crossComponent = 0;  // interpolant component `cross` multiplies when hasCross
   };
 
   // Deterministic resolution of the coordinate a pixel shader feeds into a sampler:
@@ -89,6 +101,22 @@ namespace dxvk {
     OriginOnly,      // origin proven but the VS math is not representable as an affine transform
   };
 
+  // Where vertex capture reads a draw's positions from. Both exact sources are independent
+  // of view depth; ClipReconstruction inverts the projection, whose error grows with the
+  // square of view depth over the near plane and shears distant geometry.
+  enum class Ue3CapturePositionSource : uint8_t {
+    ClipReconstruction = 0, // unproject the vertex shader's clip-space output (inexact)
+    InputAssembler,         // IA object-space positions, for meshes the shader only moves rigidly
+    PreProjectionRegister,  // the world position the shader itself computed, read back directly
+  };
+
+  enum class Ue3CapturePositionSourceOverride : int {
+    Auto = 0,
+    ForcePreProjection,
+    ForceInputAssembler,
+    ForceReconstruction,
+  };
+
   //This class handles all of the RTX operations that are required from the D3D9 side.
   struct D3D9Rtx {
     friend class ImGUI; // <-- we want to modify these values directly.
@@ -104,7 +132,8 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useVertexCapturedTexcoords, false, "When enabled, vertex shader output texcoords always override input texcoords from the vertex declaration. Enable for games where the vertex shader applies meaningful UV transformations that should be used for ray tracing (e.g. animated UVs via shader constants).");
     RTX_OPTION("rtx", bool, useWorldMatricesForShaders, true, "When enabled, Remix will utilize the world matrices being passed from the game via D3D9 fixed function API, even when running with shaders.  Sometimes games pass these matrices and they are useful, however for some games they are very unreliable, and should be filtered out.  If you're seeing precision related issues with shader vertex capture, try disabling this setting.");
     RTX_OPTION("rtx.d3d9", bool, ue3EngineMode, false,
-               "Master toggle for Unreal Engine 3 D3D9 compatibility.");
+               "Master toggle for Unreal Engine 3 D3D9 compatibility. Also defaults rtx.zUp to True, UE3 being a "
+               "Z-up engine, unless a config file sets it explicitly.");
     RTX_OPTION("rtx.d3d9", bool, ue3CameraFromShaderConstants, false,
                "UE3 compat: derive World/View and View/Projection matrices from UE3 reserved shader constants. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
@@ -126,67 +155,119 @@ namespace dxvk {
                "(CTAB names Texture2D_*/TextureCube_*), and the shader's material constants (CTAB UniformVector_*/"
                "UniformScalar_* registers). Distinguishes material instances by their TextureParameterValues, "
                "StaticSwitchParameters and VectorParameterValues/ScalarParameterValues, enabling tagging at the "
-               "child level instead of broadly at the parent level. Shaders whose constant registers carry "
-               "frame-varying expression values (Time, fades, sub-UV frames) must be listed in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders or their hashes churn every frame. "
+               "child level instead of broadly at the parent level. Constant registers carrying frame-varying "
+               "expression values (Time, panners, fades, sub-UV frames) are recognised from shader dataflow and "
+               "left out of the identity - see rtx.d3d9.ue3MicVolatileConstantDetection. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3LightmapPermutationInvariantHash, false,
-               "UE3 MaterialInstanceConstant support: make material identity invariant to the UE3 lightmap "
-               "shader permutations selected by system settings. UE3 recompiles every lightmapped base-pass "
-               "pixel shader per lightmap policy (DirectionalLightmaps=True: 3-coefficient TEXTURE_LIGHTMAP, "
-               "False: 1-coefficient SIMPLE_TEXTURE_LIGHTMAP; Mirror's Edge TdBicubicFiltering adds a bicubic "
-               "filtering permutation with LightMapResolution/BSplineTexture symbols), so the bytecode hash "
-               "seeding material identity - and with it every material hash used for tagging and replacements - "
-               "changes when those settings flip. With this option, draws whose shader CTAB declares lightmap "
-               "policy symbols - in the pixel shader (texture lightmaps: LightMapTextures et al) or only in the "
-               "vertex shader (vertex lightmaps: LightMapScale; their lightmap reaches the pixel shader through "
-               "interpolators) - use permutation-stable identity inputs instead: the seed is a canonical "
-               "signature of the material sampler declarations (Texture2D_*/TextureCube_*/Texture3D_* names), "
-               "and the texture set and Uniform* constants are keyed by symbol name rather than by register, "
-               "since register assignments and per-permutation unreferenced elements shift between permutations. "
-               "Shaders without lightmap symbols on either stage keep their bytecode-seeded hashes. Note: "
-               "enabling this changes the material hashes of lightmapped materials once (existing "
-               "material-hash-keyed work must be redone). Residual variance remains for materials with "
-               "parameters referenced by only one permutation: the simple-lightmap compile strips samplers and "
-               "uniforms used exclusively by specular/two-sided-lighting expressions, so such materials keep "
-               "one stable identity per lightmap policy state. rtx.d3d9.ue3LightmapPermutationBridgeLookup "
-               "bridges replacement lookups for them (author under DirectionalLightmaps=False); the "
-               "constants-free shader+textures identity tier also still matches across permutations unless a "
-               "sampler itself was stripped. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3LightmapPermutationBridgeLookup, false,
-               "UE3 MaterialInstanceConstant support: bridge replacement lookups across lightmap policy "
-               "permutations for materials that cannot share one identity. The simple-lightmap compile "
-               "(DirectionalLightmaps=False) strips material samplers and uniforms referenced only by "
-               "specular/two-sided-lighting expressions, so such materials genuinely bind different data per "
-               "state and rtx.d3d9.ue3LightmapPermutationInvariantHash alone cannot unify them. With this "
-               "option, draws running under the richer permutation also compute the identity hashes they "
-               "would have produced with small symbol subsets removed (up to 2 samplers and 2 uniforms, plus "
-               "a constants-free variant), and the replacement lookup tries those alternates after its normal "
-               "tiers. Dropping exactly the stripped symbols reproduces the simpler state's hash bit-for-bit, "
-               "so replacements authored/captured under DirectionalLightmaps=False apply under =True with no "
-               "aliasing heuristics - an alternate either reconstructs a captured identity exactly or misses. "
-               "The reverse direction is impossible (the simpler compile lacks the stripped data), so author "
-               "material replacements against the simple-lightmap state. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3AutoDetectLightmapTextures, true,
+               "UE3 compat: treat every texture bound to a lightmap sampler as if it had been listed in "
+               "rtx.lightmapTextures. UE3 declares its baked lighting under fixed CTAB sampler names "
+               "(LightMapTextures, and Mirror's Edge's BSplineTexture filtering LUT), so the runtime can "
+               "recognise them without the per-level hashes ever being tagged by hand. Discovered hashes are "
+               "held for the session only and are never written to a config. Remix supplies the lighting, so "
+               "these textures are excluded from albedo selection, material identity and the texture picker's "
+               "taggable set. Requires rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", float, ue3ConstantAlbedoTintGain, 8.0f,
+               "UE3 compat: how strongly a textureless material's UniformVector_* colour pulls its albedo away "
+               "from rtx.legacyMaterial.albedoConstant. UE3 keeps such a material's tint in a colour register and "
+               "relies on the baked lightmap for brightness, so the raw value is far too dark to use as an albedo "
+               "once Remix has removed the lightmap and relit the surface. The register's brightest channel times "
+               "this gain, clamped to 1, is the weight blending from the legacy albedo constant to the register's "
+               "fully saturated hue, so a register at zero leaves the surface at the legacy constant and a tint "
+               "ramping up fades smoothly to its colour rather than stepping to it. The default reaches full "
+               "saturation at 0.125, the peak Mirror's Edge's menu highlight reaches. Set to 0 to use the register "
+               "value directly instead, which is faithful to the constant but renders these surfaces very dark.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicConstantIdentity, true,
+               "UE3 MaterialInstanceConstant support: fold the material's Uniform* constants into its "
+               "identity, distinguishing instances that share a parent and its textures but differ in "
+               "VectorParameterValues/ScalarParameterValues. Mirror's Edge relies on this - its colour "
+               "variants (RooftopPropsClusters and its Blue/Orange/Yellow siblings, and many others) are "
+               "one texture set with a different tint parameter, and without this tier they collapse onto "
+               "a single anchor.\n"
+               "Only UniformVector_* parameters contribute. The scalars are where the two lightmap "
+               "compiles genuinely disagree - DiffusePower exponents the lightmap under SIMPLE_LIGHTING "
+               "and a LightMapBasis-derived transfer coefficient otherwise, and SpecularPower is its "
+               "structural twin present in only one compile - so the whole scalar class is left out "
+               "rather than trying to tell those two apart, which the bytecode does not allow. Material "
+               "instances separated only by a scalar parameter therefore share an anchor.\n"
+               "Turn it off for content whose material instances are told apart by their textures alone; "
+               "identity then becomes shader + material texture set, which is fully independent of the "
+               "lightmap policy. Either way, changing this re-mints the material hashes of every material "
+               "carrying constants, so anchors keyed on the old ones stop matching.");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicVolatileConstantDetection, true,
+               "UE3 MaterialInstanceConstant support: leave a material's frame-varying UniformVector_* "
+               "registers out of its identity, recognised from the shader's own dataflow rather than learned "
+               "at runtime. UE3 re-evaluates every material uniform expression on the CPU per draw and writes "
+               "the result into the same registers that carry authored VectorParameterValues, so a panner, "
+               "flipbook/sub-UV frame, rotator or time-driven fade re-mints the material hash as it animates "
+               "and the replacements anchored on it match only on the frames the value comes back around. "
+               "A register is treated as volatile when the shader's dataflow shows a sampler's coordinate "
+               "depending on it, whatever shape the expression takes - a scale, an offset, a rotator's 2x2 "
+               "matrix across a register pair, or any chain of those through temporaries. Tint registers "
+               "reach the output colour instead and are kept, so UE3's colour variants "
+               "(RooftopPropsClusters and its Blue/Orange/Yellow siblings) still get one anchor each.\n"
+               "Because the classification is a property of the shader, identity is decided before the first "
+               "draw is ever hashed and never changes within or between sessions - no learning, no cache, no "
+               "mid-session flip. Materials separated only by a volatile register share an anchor, which is "
+               "unavoidable: their identity was not reproducible in the first place.\n"
+               "Turning this off restores raw all-UniformVector_* identity and re-mints the hashes of every "
+               "material carrying a volatile register.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
-               "UE3 MaterialInstanceConstant support: pixel shader bytecode hashes whose UniformVector_*/"
-               "UniformScalar_* constants are excluded from material identity hashing. UE3 evaluates material "
-               "uniform expressions on the CPU every draw, so shaders using Time/panner/fade/sub-UV expressions "
-               "receive frame-varying values in the same constant registers as stable material instance "
-               "parameters; folding those into the hash would mint a new material identity every frame. "
-               "Such shaders announce themselves as an endless stream of new materialHash lines when "
-               "rtx.d3d9.ue3LogMaterialInstanceHash is enabled (a churn warning names the shader once a "
-               "threshold is crossed) - add the reported hash here. For lightmap-bearing shaders under "
-               "rtx.d3d9.ue3LightmapPermutationInvariantHash the reported value is the canonical shader "
-               "identity; both it and the raw bytecode hash are honoured. Excluded shaders fall back to "
-               "pixel shader + material texture set identity.");
+               "UE3 MaterialInstanceConstant support: pixel shader hashes whose UniformVector_* constants are "
+               "excluded from material identity hashing wholesale. Reach for this only when every material on "
+               "a shader is frame-varying in a way rtx.d3d9.ue3MicVolatileConstantDetection cannot see: one "
+               "UE3 base-pass shader commonly serves dozens of material families, and listing it drops the "
+               "constants tier for all of them, merging instances that differ only by a colour parameter. "
+               "Under rtx.d3d9.ue3EngineMode both the canonical shader identity and the raw bytecode hash are "
+               "honoured. Prefer rtx.d3d9.ue3MicConstantIdentityExcludedMaterials, which is scoped to a single "
+               "material family.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedMaterials, {},
+               "UE3 MaterialInstanceConstant support: textureSet+shader hashes whose constants are excluded "
+               "from material identity hashing. That hash names one material family - a shader together with "
+               "the exact set of images its material samplers bind - so this excludes precisely the family that "
+               "churns and leaves every other material on the same shader with its constants tier intact. It is "
+               "also the second replacement lookup tier, so the same value can anchor the family's override.\n"
+               "List a hash here when [RTX-MicChurn] reports a family still minting more than one identity, "
+               "which happens when a frame-varying register reaches the output colour rather than a UV "
+               "coordinate and so cannot be told from an authored tint. The warning prints the value ready to "
+               "paste; it is also reported as 'textureSetShader=0x...' by rtx.d3d9.ue3LogMaterialInstanceHash.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogMaterialInstanceHash, false,
                "UE3 MaterialInstanceConstant support: log a one-shot per-material breakdown of the material "
-               "identity hash (pixel shader hash, material texture set with per-sampler image hashes, constant "
-               "ranges and hash, and the final hash), plus a churn warning naming any shader that mints an "
-               "abnormal number of distinct hashes (a sign its constants are frame-varying and it belongs in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders).");
+               "identity hash (pixel shader hash, material texture set with per-sampler image hashes, which "
+               "UniformVector_* registers were kept versus dropped as volatile, the constants hash, and the "
+               "final hash).");
+    RTX_OPTION("rtx.d3d9", bool, ue3MicExcludeRenderTargetsFromIdentity, true,
+               "UE3 MaterialInstanceConstant support: exclude render-target-backed textures from the material "
+               "texture-set identity hash. Render targets bound as material samplers (scene captures, "
+               "reflection buffers - e.g. the capture Mirror's Edge routes into the first-person body "
+               "materials) receive a new image hash every time the game recreates them (respawn, checkpoint "
+               "reload, level load). Folding that hash into material identity re-mints the material hash on "
+               "every recreation, silently breaking texture tags and asset replacements anchored on the "
+               "identity: they only match again when the render target happens to reproduce its capture-time "
+               "hash. Excluding render targets (treating them like hashless textures, which were always "
+               "skipped) keeps material identity stable across recreations. Note: identities that previously "
+               "included a render-target hash change once when this option turns on - re-anchor affected "
+               "replacements (rtx.logReplacementResolution logs the new hashes).");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicIdentityExcludedTextureDescHashes, {},
+               "UE3 MaterialInstanceConstant support: descriptor hashes of textures to exclude from the "
+               "material texture-set identity hash. Some engine-composited textures are re-uploaded with "
+               "different contents every session, so their content-based image hash is session-unique and "
+               "any material identity that includes them changes across sessions - replacements anchored on "
+               "such identities silently stop matching (they were authored against one session's hash). A "
+               "texture's *descriptor* hash is stable across recreations: find it in the "
+               "rtx.d3d9.ue3LogMaterialInstanceHash breakdown (textures=[sN:0x<image>(desc:0x<descriptor>)]) "
+               "or in [RTX-MicDrift] sampler diffs, add it here, then re-anchor the affected material once - "
+               "its identity is stable from then on. The sampler is identified by that descriptor hash rather "
+               "than dropped from the texture set: a texture whose contents are not reproducible still has a "
+               "reproducible shape, and dropping it would achieve nothing on a material whose only sampler it "
+               "is, since an empty texture set falls back to the primary colour texture's image hash - the "
+               "value being excluded.\n"
+               "Note descriptor hashes derive from texture properties (dimensions/format/usage), so "
+               "identically-shaped textures share one and the exclusion applies to all of them; materials "
+               "distinguished only by which of those they bind will merge. That is usually acceptable for the "
+               "engine-composited textures this option targets. UE3-streamed textures recreate at a different "
+               "size per resident mip level and so carry one descriptor hash per size; the composited/dynamic "
+               "textures this option is meant for are fixed-size.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, vsTexcoordCaptureOutlierTextures, {},
                "Texture hashes for which VS-captured texcoords should be overridden with IA (input assembler) texcoords. "
                "Useful as a compatibility fallback when certain textures appear stretched due to incorrect VS texcoord capture.");
@@ -198,6 +279,15 @@ namespace dxvk {
                "UE3 multi-pass compat: skip draw calls targeting small square render targets (typical of shadow depth maps). "
                "Prevents shadow-pass geometry from being incorrectly captured as scene geometry. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3AutoCullEnclosingMeshShadowBackfaces, false,
+               "UE3 compat: on shadow/NEE visibility rays, ignore inward backfaces of one-sided opaque meshes whose object AABB contains the camera.\n"
+               "For wrapping building shells around BSP interiors. Gated by rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters / MaxExtentMeters. Requires rtx.d3d9.ue3EngineMode. Off by default; geometry tagging is more precise.");
+    RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMinExtentMeters, 2.0f,
+               "Minimum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
+               "Keeps thin floor slabs and billboard cards from being treated as enclosing shells.");
+    RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMaxExtentMeters, 150.0f,
+               "Maximum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
+               "Keeps whole-level BSP models from being treated as enclosing shells.");
     RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthTestDisabledTranslucency, false,
                "UE3 translucency compat: skip alpha-blended draw calls that have depth test and depth write both disabled. "
                "These are typically UE3 NeedsDepthTestDisabled materials (e.g. fullscreen overlays, fog volume composites) "
@@ -211,12 +301,23 @@ namespace dxvk {
                "geometry is ingested into the ray-traced scene through mirrored or oblique-clipped views, "
                "corrupting it. World-geometry draws are dropped when any capture signal matches: viewport "
                "strictly smaller than half the backbuffer in both dimensions (probe-sized targets; exact-half "
-               "splitscreen viewports are never matched), a mirrored view-projection (negative 3x3 determinant, "
-               "reflect probes' FMirrorMatrix), or a CTAB-declared camera that fails plausibility extraction "
-               "(reflect/portal probes' oblique FClipProjectionMatrix near-plane clip; the main view always "
-               "extracts). Skipped draws are removed entirely while ray tracing, so probe target textures show "
+               "splitscreen viewports are never matched), a sub-full viewport whose aspect does not match the "
+               "backbuffer (e.g. square probe RTs on widescreen), a mirrored view-projection (negative 3x3 "
+               "determinant, reflect probes' FMirrorMatrix), or a CTAB-declared camera that fails plausibility "
+               "extraction (reflect/portal probes' oblique FClipProjectionMatrix near-plane clip; the main "
+               "view always extracts). Sub-main-view-sized world draws also cannot update the Main camera. "
+               "Skipped draws are removed entirely while ray tracing, so probe target textures show "
                "their last resolved content - visually equivalent to running with 'show scenecapture' toggled "
                "off. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ForegroundDpgIsViewModel, true,
+               "UE3 compat: classify SDPG_Foreground draws as view-model (first-person overlay) geometry. "
+               "UE3 renders the foreground depth priority group (first-person arms, held weapon, muzzle flash) "
+               "after the world DPG behind a mid-scene depth-only clear so foreground meshes never depth-clash "
+               "with the world. Draws after that boundary receive the ViewModel category and override any "
+               "player-model tag, so a weapon mesh shared between first- and third-person components can be "
+               "tagged as Player Model Geometry to control the third-person copy while the first-person copy "
+               "stays a view model. Only active in rtx.d3d9.ue3EngineMode; promotion to the ViewModel camera "
+               "additionally requires rtx.viewModel.enable.");
     RTX_OPTION("rtx.d3d9", bool, conservativeOcclusionQueries, false,
                "Answer hardware occlusion queries with conservative results suited to path tracing instead "
                "of GPU-measured raster visibility: readbacks return immediately with full-backbuffer "
@@ -233,9 +334,79 @@ namespace dxvk {
                "pixel-count consumers (e.g. UE3 lens flare fading) see fully-visible. Only active while ray "
                "tracing is enabled. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
-               "UE3 compat: for stable static LocalVertexFactory draws, reuse previously captured vertex shader output instead of preserving a new vertex-capture draw.");
+               "UE3 compat: for static draws captured through an exact position source, reuse the vertex shader "
+               "output captured on an earlier frame rather than preserving a new vertex-capture draw. Only exact "
+               "sources qualify: a clip-space reconstruction depends on where the camera was when it was taken, so "
+               "reusing one across frames would freeze that frame's reconstruction error into the mesh. Cache keys "
+               "cover the object transform and the shader's non-camera constants, so only genuinely static draws "
+               "repeat a key; skinned draws and moving objects are refused outright or never admitted, and the "
+               "cache is bounded by rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheWarmupFrames, 2,
-               "UE3 compat: number of matching captures before a static LocalVertexFactory draw can reuse cached vertex-capture output.");
+               "UE3 compat: number of distinct frames a static draw's cache key must be seen on before its captured "
+               "vertex data is retained for reuse. Until then the key is tracked by a few bytes of CPU-side "
+               "bookkeeping only, so a key that never repeats never retains a device-local capture buffer.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheBudgetMiB, 256,
+               "UE3 compat: upper bound in MiB on the device-local vertex-capture buffers retained by the static "
+               "vertex-capture cache. Least recently used entries are evicted once the budget is exceeded, so an "
+               "unexpectedly high key cardinality costs cache hit rate rather than VRAM. 0 disables the cache's "
+               "retention tier entirely.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheMaxEntries, 16384,
+               "UE3 compat: upper bound on the number of retained static vertex-capture entries, as a backstop "
+               "against many tiny captures exhausting the entry map before the byte budget is reached.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheRetentionFrames, 600,
+               "UE3 compat: number of frames a retained static vertex-capture entry survives without being reused "
+               "before it is dropped. This is a staleness bound, not the memory bound - "
+               "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB caps the bytes and evicts least recently used "
+               "entries, which is the mechanism that actually keeps VRAM in check. Keep this generous: a mesh that "
+               "leaves the view and comes back has to be recaptured once the entry expires, and at a high frame rate "
+               "a short window expires entries during ordinary camera movement.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheMinReusePercent, 10,
+               "UE3 compat: percentage of eligible draws that must be served from the static vertex-capture cache for "
+               "it to keep running. A title whose draws carry a camera-dependent vertex shader constant mints a fresh "
+               "cache key every frame the camera moves, so the cache can never hit and its bookkeeping is pure "
+               "overhead; below this rate it goes dormant, releasing its retained buffers and key records, and "
+               "re-tests itself every rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames frames in case a "
+               "later scene is cacheable. 0 disables the guard and lets the cache run unconditionally.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames, 1800,
+               "UE3 compat: number of frames the static vertex-capture cache stays dormant before briefly re-enabling "
+               "itself to re-measure its reuse rate. Lower values notice a newly cacheable scene sooner; higher values "
+               "spend less time re-measuring in a title where the cache can never hit.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ExcludePlacementFromVertexShaderHash, false,
+               "UE3 compat: leave the object transform (LocalToWorld/WorldToLocal) out of the vertex-shader constant "
+               "hash that feeds HashComponents::VertexShader, and so rules::FullGeometryHash. The shading-only "
+               "constants (LightMapScale, lightmap/shadow coordinate scale-bias) are excluded by "
+               "rtx.d3d9.ue3EngineMode regardless of this option, since they never reach a vertex position and "
+               "LightMapScale otherwise moves the hash with the DirectionalLightmaps setting.\n"
+               "Enable it only for titles that recompute LocalToWorld every frame for geometry that is not moving. "
+               "There, the transform moves that hash every frame, DrawCallCache::exactMatch never matches across "
+               "frames, and a fresh BlasEntry is allocated for every draw of every frame; excluding the transform "
+               "restores cross-frame matching. Use rtx.d3d9.ue3LogVertexConstantChurn to identify such a title: its "
+               "level 2 reports the raw LocalToWorld registers differing on nearly every comparison.\n"
+               "It is off by default because it is a trade-off, not a pure win. That same hash is also what separates "
+               "one placement of a mesh from another, so excluding the transform collapses every instance of a mesh "
+               "into a single BlasEntry that must then disambiguate them internally. A title with stable transforms "
+               "and dense instancing is already in the good case and measurably loses throughput from the collapse - "
+               "Mirror's Edge loses roughly a tenth of its frame rate in a heavy scene.\n"
+               "Skinned meshes churn the hash through their bone registers either way, which stay included, so "
+               "genuine vertex changes are never lost. Asset and replacement hashes are unaffected regardless, "
+               "because rtx.geometryAssetHashRuleString excludes vertexshader.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogVertexConstantChurn, false,
+               "UE3 compat diagnostics: for draws that should be cacheable static geometry, report what actually "
+               "changes between consecutive frames, as three separately attributed levels - the input-assembler "
+               "identity, the set of instance transforms placed with the mesh, and any other vertex shader constant. "
+               "Constant changes are named by their CTAB symbol and correlated against whether the view moved. Use "
+               "this when the static vertex-capture cache reports a low reuse rate, to find which of the three is "
+               "responsible; only the third is beyond the reach of "
+               "rtx.d3d9.ue3ExcludePlacementFromVertexShaderHash.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3VertexConstantChurnMaxTrackedDraws, 256,
+               "UE3 compat diagnostics: how many distinct input-assembler identities the constant-churn diagnostic "
+               "samples. A sample is enough to characterise a title, and each tracked mesh retains a snapshot of the "
+               "shader's used float constants for comparison against the next frame.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogStaticVertexCaptureCacheStats, false,
+               "UE3 compat diagnostics: log the static vertex-capture cache's retained entry count, retained bytes "
+               "and per-frame reuse rate roughly once per second, plus a one-time warning when the byte budget or "
+               "entry cap first forces an eviction. Use this to confirm the cache is hitting rather than just "
+               "accumulating, and to size rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB.");
     RTX_OPTION("rtx.d3d9", bool, ue3StaticGeometryHashMemoization, true,
                "UE3 CPU optimization: reuse geometry hash and bounding box results across frames for draws whose "
                "input-assembler vertex/index buffers are static (any vertex factory, including the bind-pose buffers "
@@ -244,10 +415,89 @@ namespace dxvk {
                "counters), so one entry serves every instance of a mesh and results can never go stale; the per-draw "
                "vertex-shader-constants hash component is recombined live so served hashes are bit-identical to a "
                "fresh compute.");
-    RTX_OPTION("rtx.d3d9", float, ue3VertexCaptureCameraCellSize, 2000.0f,
-               "UE3 compat: world-space camera cell size used to refresh camera-sensitive vertex captures. Smaller values recapture more often; 0 disables camera-cell hashing.");
-    RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, false,
-               "UE3 compat experimental: use input-assembler object-space positions directly for conservative static LocalVertexFactory draws instead of reconstructing positions from clip space.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ExactVertexCapture, true,
+               "UE3 compat: capture positions from the register the vertex shader multiplies by ViewProjectionMatrix "
+               "rather than by unprojecting its clip-space output. Unprojecting divides by a quantity built from the "
+               "difference of two numbers the size of view depth, so its error grows with the square of distance and "
+               "makes distant meshes shear and swim as the camera moves; reading back the untransformed value the "
+               "shader computed carries no such term. Requires the shader's oPos transform to be recognised and its "
+               "matrix register to match the CTAB ViewProjectionMatrix symbol, which together prove the register "
+               "holds a world position; draws failing either check fall back to unprojecting "
+               "(see rtx.d3d9.ue3RequireExactVertexCapture).");
+    RTX_OPTION("rtx.d3d9", bool, ue3RequireExactVertexCapture, false,
+               "UE3 compat: drop draws from the ray-traced scene when neither exact position source applies, rather "
+               "than falling back to clip-space reconstruction. This makes distance-dependent vertex distortion "
+               "impossible rather than merely rare, at the cost of losing any geometry the exact paths do not cover. "
+               "Enable rtx.d3d9.ue3LogCapturePrecision for a session first to enumerate which draws would be dropped.");
+    RTX_OPTION("rtx.d3d9", Ue3CapturePositionSourceOverride, ue3VertexCaptureSourceOverride, Ue3CapturePositionSourceOverride::Auto,
+               "UE3 compat diagnostics: force every vertex-capture draw onto one position source. 0 picks the most "
+               "accurate applicable source (default), 1 forces the shader's pre-projection register, 2 forces "
+               "input-assembler positions, 3 forces clip-space reconstruction. Toggling between 0 and 3 on a long "
+               "outdoor view is the direct A/B for distance-dependent distortion. Forcing a source a draw does not "
+               "qualify for falls back to reconstruction rather than producing wrong geometry.");
+    RTX_OPTION("rtx.d3d9", bool, ue3NativeLocalMeshVertexCapture, true,
+               "UE3 compat: allow input-assembler object-space positions to be used directly for conservative static "
+               "LocalVertexFactory draws. This is the second-choice exact source, used for shaders whose oPos "
+               "transform rtx.d3d9.ue3ExactVertexCapture could not recognise.");
+    RTX_OPTION("rtx.d3d9", bool, ue3DecomposeInstancedDraws, true,
+               "UE3 compat: split a D3D9 hardware-instanced draw into one ray-traced instance per hardware instance, "
+               "reading each placement out of the instance-data stream (UE3's InstanceOffset/InstanceXAxis/"
+               "InstanceYAxis/InstanceZAxis) rather than from a vertex shader constant.\n"
+               "UE3 places foliage and PhysX/NxFluid mesh particles this way: one draw call, one identity LocalToWorld, "
+               "and every placement in a dynamic vertex stream. Without this the batch collapses onto that single "
+               "identity transform, and because vertex capture indexes its output buffer by vertex alone every hardware "
+               "instance writes the same slots - the surviving positions are an arbitrary mix of placements, so the mesh "
+               "renders as an exploded cluster of stretched triangles that reshuffles on every capture.\n"
+               "Enabled, such draws take their object-space positions from the input assembler (no capture, nothing to "
+               "race) and each instance is submitted with its own object-to-world transform, matching what the engine's "
+               "non-instanced fallback path produces. A draw whose placements cannot be recovered is dropped, with the "
+               "reason logged, rather than rendered at the world origin.\n"
+               "Disabling it is a complete bypass, racing included, so it is a direct A/B. See "
+               "rtx.d3d9.ue3LogInstancedDraws.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3MaxDecomposedInstances, 4096,
+               "UE3 compat: upper bound on the hardware instances rtx.d3d9.ue3DecomposeInstancedDraws expands from one "
+               "draw. Each instance becomes its own ray-traced submission, so a pathological batch would otherwise cost "
+               "unbounded CPU time; the excess is dropped with a one-shot warning naming the draw. The default clears "
+               "Mirror's Edge's densest debris scatters with headroom and stays well inside the draw call state queue's "
+               "capacity.\n"
+               "Cost is linear in instances, so lowering this is the reliable way to trade density for frame time. What "
+               "it keeps is a fixed subset - the instances the game lists first, which is spawn order, so a batch thins "
+               "out roughly evenly rather than losing one side of itself. Deliberately not the instances nearest the "
+               "camera: that set changes as the view moves, so instances would appear and disappear, and since each is "
+               "named by its position in the game's buffer a view-dependent selection also renames them and costs them "
+               "their history.");
+    RTX_OPTION_ARGS("rtx.d3d9", float, ue3DecomposedInstanceCullDistance, 0.f,
+               "UE3 compat: drop decomposed hardware instances farther than this many world units from the camera, "
+               "or 0 to keep every instance the game submitted.\n"
+               "Each instance costs a ray-traced submission and a TLAS entry, and the game's own culling only removes "
+               "what leaves the frustum, so this bounds what a far-off scatter costs while it is still on screen.\n"
+               "It cannot help with a cluster you are standing in, where every instance is at much the same distance "
+               "and the bound becomes all-or-nothing; use rtx.d3d9.ue3MaxDecomposedInstances for that. Being "
+               "view-dependent it can also pop at its boundary, so keep the distance far enough out that the popping "
+               "is not what you are looking at.",
+               args.minValue = 0.f);
+    RTX_OPTION("rtx.d3d9", bool, ue3StableDecomposedInstanceIdentity, true,
+               "UE3 compat: give each instance produced by rtx.d3d9.ue3DecomposeInstancedDraws an identity that "
+               "survives it moving, so Remix recognises it frame to frame by a hash lookup.\n"
+               "Instance identity normally includes the object transform, which is ideal for the static geometry that "
+               "dominates a scene but means anything moving misses the exact-identity lookup every frame and falls "
+               "through to a spatial nearest-neighbour search. That search scans a cell neighbourhood sized from "
+               "rtx.uniqueObjectDistance, so a dense cluster of moving objects lands its whole batch in one cell and "
+               "the search becomes quadratic in the batch's size.\n"
+               "Decomposed instances are the one case with a better answer available: they arrive in a stable order in "
+               "the game's instance stream, so instance N of a batch can be named directly. Pairing is then exact "
+               "rather than a proximity guess, which also makes their motion vectors correct. Lowering "
+               "rtx.uniqueObjectDistance is not a substitute - it is global, and dropping it far enough to subdivide "
+               "a cluster also stops camera-attached geometry matching during fast turns.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogInstancedDrawStats, false,
+               "UE3 compat diagnostics: log roughly once a second what hardware-instanced draws are costing - "
+               "instanced draws and hardware instances per frame, how many were submitted, how many each bound "
+               "dropped, and the wall time the submitting thread spent expanding them - which separates submission "
+               "cost from the per-instance work the consumer thread and the GPU do.\n"
+               "Also reports the instance-order stability rtx.d3d9.ue3StableDecomposedInstanceIdentity depends on: how "
+               "far index-paired instances moved between frames, and how often a batch could not be compared because "
+               "its instance count changed. A mean displacement on the scale of a batch's own extent would mean the "
+               "game reorders its instance buffer, making that option unsound.");
     RTX_OPTION("rtx.d3d9", bool, ue3RequireCtabCameraConstants, false,
                "UE3 compat: only allow a draw call to update the Main camera when its vertex shader CTAB explicitly "
                "names both ViewProjectionMatrix and CameraPosition constants. Engine utility shaders (shadow depth, "
@@ -274,19 +524,36 @@ namespace dxvk {
                "Note: the two schemes produce different hashes, so texture tags and replacements only match under the "
                "setting they were authored with. "
                "Only active when rtx.d3d9.ue3EngineMode is enabled.");
-    RTX_OPTION("rtx.d3d9", bool, ue3MicAutoExcludeFrameVaryingConstants, true,
-               "UE3 MaterialInstanceConstant support: automatically detect materials whose UniformVector_*/"
-               "UniformScalar_* constant registers are frame-varying (Time/panner/fade/sub-UV expressions) and "
-               "exclude their constants from material identity hashing at runtime, as if they were listed in "
-               "rtx.d3d9.ue3MicConstantIdentityExcludedShaders. Without this, such materials mint a new material "
-               "hash every frame, churning instance identity (visible as temporal instability/flicker and per-frame "
-               "BLAS rebuilds) until each is excluded manually. Detection and exclusion are scoped to a single "
-               "(identity seed, texture set) group - one churning material family never widens to other materials "
-               "sharing its shader or signature - and re-seen sibling hashes decay the churn count, so legitimate "
-               "constant-differentiated sibling sets of any size do not trip it. Only active when material "
-               "instance hashing is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogTextureHashProvenance, false,
+               "UE3 compat: log how each Remix image hash was derived - the mip 0 content hash on its "
+               "own, the mip count, whether the streaming-stable mip tail or the top mip produced the "
+               "value, how many tail mips were hashed, the D3D9 usage and pool, and which subresources "
+               "still had a pending upload when the hash was latched. One line per (texture shape, image "
+               "hash) pair, so a texture whose hash moves between runs shows every value it took rather "
+               "than only the first.\n"
+               "The mip 0 hash is what makes this diagnostic worth reading. A hash is latched once and "
+               "never recomputed, so when a material's descriptor hash is constant while its image hash "
+               "changes per level load, comparing mip 0 separates the two possible causes: repeating "
+               "while the full-chain hash moves means the picture is the same and the instability is in "
+               "the smaller mips, which identity has no reason to depend on; moving as well means the "
+               "material is genuinely binding a different texture.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ReportMicIdentityChurn, true,
+               "UE3 MaterialInstanceConstant support: warn once per material family that mints enough "
+               "distinct identity hashes to make an animating register the only plausible explanation, "
+               "naming the UniformVector_* registers whose values moved and printing the "
+               "rtx.d3d9.ue3MicConstantIdentityExcludedMaterials entry that pins it. The threshold sits well "
+               "above the size of a genuine colour-variant sibling set, which a frame-varying register "
+               "passes within a second, so the two do not have to be told apart by hand.\n"
+               "Identity is never altered as a result. The report exists so a family whose frame-varying "
+               "register could not be recognised from dataflow - a fade or tint the bytecode cannot "
+               "distinguish from an authored parameter - announces itself instead of quietly breaking the "
+               "replacements anchored on it. It costs nothing until a family actually churns, so unlike "
+               "rtx.logReplacementResolution it is on by default. Only active when material instance hashing "
+               "is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
-               "UE3 compat: log explicit pass and vertex factory classification decisions for draw-call routing diagnostics.");
+               "UE3 compat: log pass/vertex-factory classification decisions for draw routing. "
+               "Also emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
+               "for Particle / ParticleBeamTrail / LensFlare draws.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
@@ -299,19 +566,39 @@ namespace dxvk {
                "resolves inexactly.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvAffineDetail, false,
                "UE3 compat diagnostics: log the full UV affine chain behind the deterministic UV resolution of "
-               "shader-path draws: per-component scale/offset terms (immediate or constant-register component with "
-               "factor, and inexactness), the live resolved scale/offset values, the gates that allowed or rejected "
-               "writing the texture transform, and the pixel shader CTAB names/values of referenced constant "
-               "registers. On the first sighting of a pixel shader it also dumps every sampler's UV origin and "
-               "affine chain with the currently bound textures. Logs once per distinct resolved transform, capped "
-               "per shader+stage. Use this to diagnose texture-atlas materials whose tile offset is not applied.");
+               "shader-path draws: per-component scale, cross and offset terms (immediate or constant-register "
+               "component with factor, and inexactness), the live resolved 2x2 plus translation, the gates that "
+               "allowed or rejected writing the texture transform, and the pixel shader CTAB names/values of "
+               "referenced constant registers. On the first sighting of a pixel shader it also dumps every "
+               "sampler's UV origin and affine chain with the currently bound textures. Logs once per distinct "
+               "resolved transform, capped per shader+stage. Use this to diagnose texture-atlas materials whose "
+               "tile offset is not applied, or a UV matrix (UE3 Rotator) that resolves inexactly.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogAlbedoSelection, false,
                "UE3 compat diagnostics: log a per-sampler score breakdown of the shader-path albedo selection once per "
                "(pixel shader, bound texture set, sRGB states, vertex factory) key: texture hash, dimensions, sRGB state, "
                "sample count, semantic/expression flags, final score, and the winning stages. Use this to diagnose draws "
                "where the wrong texture (e.g. a normal or specular map) is chosen as the ray-traced albedo.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
-               "UE3 compat: log camera-cell, hash, cache, and matrix diagnostics for vertex capture precision issues.");
+               "UE3 compat: log vertex capture precision diagnostics - the resolved position source per unique "
+               "(vertex shader, vertex factory) with the reason any draw fell back to clip-space reconstruction, "
+               "plus hash, cache and camera matrix details. The fallback lines are the list to work through before "
+               "enabling rtx.d3d9.ue3RequireExactVertexCapture.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogInstancedDraws, false,
+               "UE3 compat diagnostics: log a one-shot [UE3-Instanced] line per draw identity for every draw that "
+               "uses D3D9 hardware instancing (a stream frequency above one, or a D3DSTREAMSOURCE_INSTANCEDATA "
+               "stream): instance count, per-stream frequency/stride/dynamic usage, the vertex declaration, the "
+               "classified vertex factory and pass, the resolved capture position source, whether a per-instance "
+               "transform was recovered, the vertex/index counts, and the draw's shader/material/texture hashes. Use "
+               "it to confirm which geometry a title places through hardware instancing - under UE3 that is foliage "
+               "and PhysX/NxFluid mesh particles - and that rtx.d3d9.ue3DecomposeInstancedDraws is handling it.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3TraceDrawTextureHashes, {},
+               "UE3 compat diagnostics: texture image hashes whose draws are dumped as a full [UE3-DrawTrace] "
+               "dossier - shader hashes, vertex factory, pass, capture position source, hardware instancing state with "
+               "the first recovered instance transforms, the vertex declaration, per-stream buffer identity, the "
+               "object-to-world transform, and the asset and full geometry hashes alongside the material hash. The "
+               "asset geometry hash is what replacements anchor on, so this is also how to confirm a mesh's hash is "
+               "stable across sessions. Logged once per draw identity, but resolving the geometry hash synchronously "
+               "costs a worker sync - leave the list empty in normal use.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogDrawStatusFlaps, false,
                "UE3 compat diagnostics: detect draws whose raytracing status (raytraced/rasterized/ignored) changes "
                "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
@@ -335,12 +622,14 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", fast_unordered_set, deferredUiPixelShaders, {},
                "Pixel shader bytecode hashes whose draws are treated as deferred UI overlays (see rtx.deferredUiTextures).\n"
                "Prefer this over texture tagging when the overlay samples a render target (e.g. UE3's scene color copy): "
-               "render-target texture hashes change every time the game recreates the target (respawn/level load), while "
-               "the overlay material's pixel shader hash is stable across respawns, level loads and sessions. Whenever a "
+               "RT image hashes change on recreation. Prefer a pixel shader tag, or one of the RT descriptor hashes the "
+               "texture picker offers via rtx.deferredUiTextures. Whenever a "
                "tagged texture matches a draw, the runtime logs that draw's pixel shader hash ([RTX-DeferredUI] log lines) "
                "so the tag can be moved into this option.\n"
                "A pixel shader tag is treated as explicit intent: unlike texture tags it is not subject to the engine "
-               "post-process shader exclusion (the world-geometry and depth-write guards still apply).");
+               "post-process shader exclusion, and it alone outranks the UE3 fullscreen post-process / fog-distortion "
+               "classification, so an overlay whose shader looks like a screen-space contribution pass is still "
+               "deferred rather than dropped (the world-geometry and depth-write guards still apply).");
     RTX_OPTION("rtx.d3d9", bool, deferredUiRefreshSceneColor, true,
                "When replaying deferred UI overlay draws, first copy the ray-traced output into any scene-color "
                "render-target texture the overlay samples (e.g. UE3's resolved SceneColorTexture). Overlay materials "
@@ -529,6 +818,22 @@ namespace dxvk {
     void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
 
     /**
+      * \brief: Signal a device Clear call. Used to detect the UE3 foreground DPG boundary
+      * (mid-scene depth-only clear before first-person arms/weapon draws).
+      */
+    void OnClear(DWORD flags);
+
+    /**
+      * \brief: Called from texture upload/unlock paths with the sysmem source
+      * of the data; stashes 16x1 float RGBA payloads (the game's baked tonemap
+      * colour curve LUTs) for the Mirror's Edge tonemapping mode's live
+      * capture. Partial-rect updates are merged; offsets/counts are in texels.
+      */
+    void onUe3CurveTextureUpload(const D3D9CommonTexture* dstTexture, D3D9CommonTexture* srcTexture, uint32_t srcSubresource,
+                                 uint32_t srcTexelOffsetX, uint32_t dstTexelOffsetX,
+                                 uint32_t texelWidth, uint32_t texelHeight);
+
+    /**
       * \brief: Signal that we're about to present the image.
       */
     void OnPresent(const Rc<DxvkImage>& targetImage);
@@ -602,7 +907,26 @@ namespace dxvk {
       */
     void bootstrapNgxPassthroughUpscaler(uint32_t displayWidth, uint32_t displayHeight);
 
+    /**
+      * \brief: Whether a texture hash is a UE3 lightmap discovered this session from a pixel
+      * shader's CTAB sampler names (rtx.d3d9.ue3AutoDetectLightmapTextures). Process-wide and
+      * append-only, so the texture paths outside the draw-call setup - which have no D3D9Rtx
+      * to hand - can honour the discovery the same way they honour rtx.lightmapTextures.
+      */
+    static bool isAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
+
+    /**
+      * \brief: Whether a texture is baked lighting Remix must leave alone - either tagged in
+      * rtx.lightmapTextures or auto-detected this session.
+      */
+    static bool isLightmapTexture(XXH64_hash_t textureHash) {
+      return lookupHash(RtxOptions::lightmapTextures(), textureHash) ||
+             isAutoDetectedLightmapTexture(textureHash);
+    }
+
   private: 
+    static void registerAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
+
     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
     // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
     // Block objects and their `m_matrices` array storage stay pinned. The write cursor
@@ -730,6 +1054,9 @@ namespace dxvk {
       ParticleBeamTrail,
       SpeedTree,
       Foliage,
+      // FParticleInstancedMeshVertexFactory: hardware-instanced static meshes used by mesh
+      // particle emitters, including the PhysX/NxFluid debris ones.
+      ParticleInstancedMesh,
       LocalDecal,
       LensFlare,
       PositionOnly,
@@ -755,8 +1082,115 @@ namespace dxvk {
     Ue3PassType m_currentUe3PassType = Ue3PassType::Unknown;
     fast_unordered_cache<Ue3VertexFactoryType> m_ue3VertexFactoryCache;
 
+    // UE3 SDPG_Foreground tracking: the foreground DPG (first-person arms/weapon) renders
+    // after the world DPG behind a mid-scene depth-only clear. Both reset in EndFrame.
+    bool m_ue3SeenMainViewWorldDraw = false;
+    bool m_ue3ForegroundDpgActive = false;
+
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
     static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
+
+    // D3D9 hardware instancing state of the current draw. UE3 places foliage and NxFluid mesh
+    // particles with one instanced draw whose per-instance transform lives in a vertex stream
+    // (InstanceOffset + InstanceXAxis/YAxis/ZAxis as TEXCOORD1..4), not in a shader constant, so
+    // both the placement and the capture-safety decisions have to come from the declaration.
+    struct Ue3InstancingInfo {
+      uint32_t instanceCount = 1;
+      // Streams marked D3DSTREAMSOURCE_INSTANCEDATA: advanced per instance rather than per vertex,
+      // so nothing in them may ever be read as a per-vertex attribute.
+      uint32_t instanceDataStreamMask = 0;
+      // Set when TEXCOORD1..4 form a complete FLOAT3 instance basis on one instance-data stream.
+      bool hasInstanceTransform = false;
+      uint32_t transformStream = 0;
+      uint32_t offsetByteOffset = 0;
+      uint32_t axisByteOffsets[3] = {};
+
+      bool isInstanced() const { return instanceCount > 1 || instanceDataStreamMask != 0; }
+    };
+
+    static Ue3InstancingInfo resolveUe3Instancing(const D3D9VertexElements& elements,
+                                                  const std::array<UINT, caps::MaxStreams>& streamFreq,
+                                                  uint32_t instanceCount);
+
+    Ue3InstancingInfo m_currentUe3Instancing;
+
+    // One placement recovered from the instance-data stream. sourceIndex is the instance's position
+    // in the game's buffer, which is what names it across frames - not its position in this vector,
+    // which culling shifts.
+    struct Ue3DecomposedInstance {
+      Matrix4 instanceToObject;
+      uint32_t sourceIndex = 0;
+    };
+
+    // Placements for the current draw, filled in internalPrepareDraw and consumed by
+    // CommitGeometryToRT. Empty for ordinary draws.
+    std::vector<Ue3DecomposedInstance> m_ue3DecomposedInstances;
+
+    // Why the placements could not be recovered for an instanced draw, or null when they were.
+    // Refuses the draw rather than placing its object-space geometry at the world origin.
+    const char* m_ue3InstanceTransformReadFailure = nullptr;
+
+    void cullAndClampUe3InstanceTransforms(std::vector<Ue3DecomposedInstance>& instances,
+                                           uint32_t& outCulledByDistance,
+                                           uint32_t& outCulledByBudget) const;
+
+    // Instance-order stability probe for rtx.d3d9.ue3StableDecomposedInstanceIdentity, whose pairing
+    // of instance i with instance i of the previous frame is only sound while the game keeps its
+    // instance buffer in a stable order. Measures how far index-paired instances moved between
+    // consecutive frames: small means the order held, displacements on the scale of the batch's own
+    // extent mean the pairing is meaningless.
+    struct Ue3InstanceOrderProbe {
+      std::vector<Vector3> translations;
+      uint32_t lastFrame = 0;
+    };
+    fast_unordered_cache<Ue3InstanceOrderProbe> m_ue3InstanceOrderProbes;
+    void trackUe3InstanceOrderStability(XXH64_hash_t batchKey,
+                                        const std::vector<Ue3DecomposedInstance>& instances);
+
+    // Transform-free identity of the instanced batch the current draw belongs to, combined with an
+    // instance's index to name it across frames. kEmptyHash outside a decomposed draw.
+    //
+    // Deliberately not derived from the instance buffer: UE3 hands out a fresh or pooled instance
+    // buffer per frame, so its handle is not an identity. The mesh streams are stable, so a batch is
+    // identified by its mesh plus continuity of its own centroid - there are only a handful of
+    // instanced batches per frame, so matching them is trivially cheap.
+    struct Ue3InstancedBatchRecord {
+      XXH64_hash_t id = kEmptyHash;
+      Vector3 centroid = Vector3(0.f, 0.f, 0.f);
+      uint32_t lastFrame = 0;
+      uint32_t claimedFrame = 0;
+    };
+    std::unordered_map<XXH64_hash_t, std::vector<Ue3InstancedBatchRecord>> m_ue3InstancedBatches;
+    uint64_t m_ue3NextInstancedBatchId = 1;
+    XXH64_hash_t resolveUe3InstancedBatchKey(const RasterGeometry& geoData,
+                                             const std::vector<Ue3DecomposedInstance>& instances);
+    XXH64_hash_t m_ue3DecomposedBatchKey = kEmptyHash;
+
+    // rtx.d3d9.ue3LogInstancedDrawStats accumulators, reported and reset about once a second.
+    void reportUe3InstancedDrawStats();
+    uint32_t m_ue3InstancedStatFrames = 0;
+    uint32_t m_ue3InstancedStatFrameStamp = 0;
+    uint64_t m_ue3InstancedStatDraws = 0;
+    uint64_t m_ue3InstancedStatInstancesSeen = 0;
+    uint64_t m_ue3InstancedStatInstancesSubmitted = 0;
+    uint64_t m_ue3InstancedStatCulledDistance = 0;
+    uint64_t m_ue3InstancedStatCulledBudget = 0;
+    uint64_t m_ue3InstancedStatSubmitNs = 0;
+    uint64_t m_ue3InstancedStatOrderPairs = 0;
+    uint64_t m_ue3InstancedStatOrderStablePairs = 0;
+    uint64_t m_ue3InstancedStatOrderSizeChanges = 0;
+    uint64_t m_ue3InstancedStatOrderComparableBatches = 0;
+    double m_ue3InstancedStatOrderDisplacementSum = 0.0;
+    float m_ue3InstancedStatOrderDisplacementMax = 0.f;
+
+    // Keeps UE3's vertex lightmap coefficient streams and per-instance transform streams from
+    // being mistaken for the surface's UVs.
+    uint32_t resolveIaTexcoordAvoidingNonUvElements(uint32_t iaTexcoordIdx) const;
+
+    // Half-or-larger in both dims (allows ScreenPercentage >50%) and aspect-matched to the
+    // backbuffer so square SceneCapture RTs cannot pass as main-view-sized on widescreen.
+    static bool ue3ViewportAspectMatchesBackbuffer(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
+    static bool ue3ViewportIsMainViewSized(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
 
     struct Ue3ShaderFeatureInfo {
       bool initialized = false;
@@ -768,6 +1202,8 @@ namespace dxvk {
       bool hasShadowSampler = false;
       bool hasVelocitySampler = false;
       bool hasExposureOrToneSampler = false;
+      bool hasBlurredImageSampler = false;
+      bool hasFilterTextureSampler = false;
       bool hasUiSampler = false;
       bool hasDistortionSampler = false;
       bool hasVideoSampler = false;
@@ -792,6 +1228,28 @@ namespace dxvk {
       uint32_t gammaInverseReg = kNgxNoRegister;
       uint32_t gammaColorScaleReg = kNgxNoRegister;
       uint32_t gammaOverlayColorReg = kNgxNoRegister;
+      // DOFAndBloom / UberPostProcess CTAB tokens (DepthOfFieldCommon / FilterPixelShader).
+      bool hasDofPackedParameters = false;
+      bool hasDofMinMaxBlurClamp = false;
+      bool hasFilterSampleWeights = false;
+
+      bool looksLikeDofAndBloomPostProcess() const {
+        return hasBlurredImageSampler ||
+               (hasDofPackedParameters && hasDofMinMaxBlurClamp) ||
+               (hasFilterTextureSampler && hasFilterSampleWeights);
+      }
+
+      // TdToneMapping capture support: sampler indices of the baked colour
+      // curve LUT textures and float register indices of the grade constants
+      // (-1 / 0xFF when not present in the shader's CTAB).
+      uint8_t colorCurvesKSamplerIndex = 0xFF;
+      uint8_t colorCurvesMSamplerIndex = 0xFF;
+      int16_t toneMapSceneShadowsReg = -1;         // SceneShadowsAndDesaturation
+      int16_t toneMapInverseHighLightsReg = -1;    // SceneInverseHighLights
+      int16_t toneMapMidTonesReg = -1;             // SceneMidTones
+      int16_t toneMapScaledLumaWeightsReg = -1;    // SceneScaledLuminanceWeights
+      int16_t toneMapGammaColorScaleReg = -1;      // GammaColorScaleAndInverse
+      int16_t toneMapGammaOverlayReg = -1;         // GammaOverlayColor
     };
 
     fast_unordered_cache<Ue3ShaderFeatureInfo> m_ue3ShaderFeatureCache;
@@ -806,6 +1264,23 @@ namespace dxvk {
                               const char* reason);
     bool trackUe3MovieTextureRenderTarget(const char* reason);
     bool isUe3MovieTextureDescHash(XXH64_hash_t descHash) const;
+
+    // TdToneMapping capture: the game uploads its baked/blended colour curves
+    // as two 16x1 float textures (ColorCurvesK/ColorCurvesM) each frame; the
+    // texel payloads are snooped at upload/unlock time (keyed by destination
+    // texture) and joined with the tonemap pass's pixel shader constants when
+    // the fullscreen tonemap draw is classified.
+    static constexpr uint32_t kUe3CurveTexelCount = 16;
+    struct Ue3CurveTexels {
+      std::array<Vector4, kUe3CurveTexelCount> texels = {};
+    };
+    std::unordered_map<const D3D9CommonTexture*, Ue3CurveTexels> m_ue3CurveTexelCache;
+    bool m_ue3ToneMapCapturedThisFrame = false;
+
+    // Captures the TdToneMapping grade constants + curve texels once per
+    // frame at the (not raytraced) tonemap draw and forwards them to the
+    // renderer.
+    void maybeCaptureUe3ToneMapState();
 
     struct Ue3VsShaderCtabInfo {
       bool initialized = false;
@@ -829,12 +1304,6 @@ namespace dxvk {
       uint32_t boneMatricesRegisterIndex = 0;
       uint32_t boneMatricesRegisterCount = 0;
 
-      // any CTAB name containing "lightmap" (LightMapScale, LightMapCoordinateScaleBias...):
-      // the shader pair is recompiled per UE3 lightmap policy permutation. Vertex-lightmap
-      // policies declare lightmap symbols only in the vertex shader, so this flag extends
-      // lightmap-permutation-invariant material identity to their pixel shaders.
-      bool hasLightmapSymbols = false;
-
       // vertex-factory style hints inferred from VS CTAB constant names
       // these are used to relax/adjust shader-path UV heuristics where packed UVs
       // and UV offsets are expected (decal/terrain/speedtree paths)
@@ -846,6 +1315,48 @@ namespace dxvk {
       bool hasShadowCoordinateScaleBias = false;
       bool hasViewToLocal = false;
       bool hasWindMatrices = false;
+    };
+
+    // Full CTAB symbol table per vertex shader. Deliberately kept out of Ue3VsShaderCtabInfo,
+    // which is copied by value into m_currentUe3CtabInfo on every draw - putting strings in there
+    // would allocate per draw. Two consumers: naming registers for the constant-churn diagnostic,
+    // and resolving which registers are shading-only for the hash exclusions below. Filled
+    // unconditionally at parse time (once per unique shader) so enabling the diagnostic
+    // mid-session still names registers for shaders already seen.
+    struct Ue3VsConstantSymbol {
+      uint32_t registerIndex = 0;
+      uint32_t registerCount = 0;
+      std::string name;
+    };
+    fast_unordered_cache<std::vector<Ue3VsConstantSymbol>> m_ue3VsConstantSymbols;
+    // Names the register, e.g. "c12 (LocalToWorld[1])", falling back to the bare register.
+    std::string describeUe3VsConstantRegister(XXH64_hash_t vsBytecodeHash, uint32_t reg) const;
+
+    // Merged register ranges the stable VS hash skips, resolved once per vertex shader because
+    // they are a pure function of its CTAB. Both variants are precomputed so the per-draw path
+    // never builds, sorts or merges anything - it just hashes the gaps. Kept in a side map rather
+    // than in Ue3VsShaderCtabInfo, which is copied by value on every draw.
+    struct Ue3VsHashExclusions {
+      // Six come from fixed sources (two reserved camera registers, their CTAB overrides, and the
+      // two transform matrices); the rest are one per shading-only CTAB symbol. Overflowing only
+      // leaves a register in the hash that would have been excluded, so a generous cap is enough.
+      static constexpr uint32_t kMaxRanges = 16;
+      struct Range {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+      };
+      std::array<Range, kMaxRanges> cameraOnly = {};
+      uint32_t cameraOnlyCount = 0;
+      // Camera registers plus the shading-only constants (LightMapScale, lightmap/shadow
+      // coordinate scale-bias). LightMapScale holds a different element count and different
+      // values per lightmap policy, so leaving it in makes the geometry hash move with the
+      // DirectionalLightmaps setting. Unlike the object transform these registers cost nothing
+      // to drop - they never reach a vertex position - so UE3 mode always uses this variant.
+      std::array<Range, kMaxRanges> cameraAndShading = {};
+      uint32_t cameraAndShadingCount = 0;
+      // Camera registers plus the object transform and shading-only constants.
+      std::array<Range, kMaxRanges> withPlacement = {};
+      uint32_t withPlacementCount = 0;
     };
 
     // keyed by XXH3 hash of the vertex shader DXSO bytecode
@@ -1195,6 +1706,11 @@ namespace dxvk {
                                             bool& outUsedTranspose,
                                             float& outReconstructionError,
                                             XXH64_hash_t* outConstantsHash = nullptr);
+    fast_unordered_cache<Ue3VsHashExclusions> m_ue3VsHashExclusionCache;
+    // Borrowed from the cache above for the duration of the draw; never owned.
+    const Ue3VsHashExclusions* m_currentUe3VsHashExclusions = nullptr;
+    static Ue3VsHashExclusions buildUe3VsHashExclusions(const Ue3VsShaderCtabInfo& ctabInfo,
+                                                        const std::vector<Ue3VsConstantSymbol>* symbols);
 
     struct Ue3CameraConstantsCache {
       XXH64_hash_t hash = 0;
@@ -1256,9 +1772,18 @@ namespace dxvk {
       std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetImmediateValid;
       std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateU;
       std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateV;
+      // Sampler registers holding UE3 lightmap machinery (LightMapTextures[] coefficients and
+      // the bicubic B-spline weight LUT). Their count is a function of the DirectionalLightmaps
+      // setting - 3 coefficients vs 1 - so every draw-time decision that reads the bound texture
+      // set has to subtract them or it varies with a setting Remix does not care about.
+      uint32_t lightmapSamplerMask = 0;
     };
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedUvResolutions;
+
+    // Lightmap hashes this device has already published to the session registry, so the
+    // shared registry is only locked the first time each one is seen.
+    fast_unordered_set m_ue3SeenLightmapTextures;
 
     // rtx.d3d9.ue3LogUvAffineDetail state: per-shader one-shot sampler dump, per distinct
     // resolved transform dedup, and a per (shader, stage) cap so panner/frame-varying
@@ -1278,8 +1803,26 @@ namespace dxvk {
       uint8_t chosenStages[2] = { 0xFF, 0xFF };
       uint8_t cubemapFallbackStage = 0xFF;
       uint64_t decisionAreaSum = 0;
+      // Runtime only, not serialised: only entries read from the cache file are worth auditing.
+      bool fromDisk = false;
     };
     fast_unordered_cache<Ue3DiffuseSelectionEntry> m_ue3DiffuseSelectionCache;
+    // Persisted to rtx-remix/ue3DiffuseSelection.cache. The pin survives a level reload in memory
+    // but not a relaunch, and a decision first made while a material's textures were still
+    // streamed down can differ from the settled one, so the file is what makes every session
+    // start from the same pick.
+    bool m_ue3DiffuseSelectionLoaded = false;
+    bool m_ue3DiffuseSelectionDirty = false;
+    bool m_ue3DiffuseSelectionSaveBlocked = false;
+    uint32_t m_ue3DiffuseSelectionLastSaveFrame = 0;
+    // A stored pick records a decision, not the inputs behind it, and is consulted whenever the
+    // bound texel area has not grown past the recorded peak - which after a settled run is
+    // essentially always. Changed scoring would therefore be invisible wherever a cache exists,
+    // so a bounded sample of loaded picks is re-scored and any disagreement reported once.
+    uint32_t m_ue3DiffuseSelectionAuditsRemaining = 0;
+    bool m_ue3DiffuseSelectionAuditWarned = false;
+    void loadUe3DiffuseSelectionCache();
+    void saveUe3DiffuseSelectionCache();
     // scoring reads the user-taggable lightmap/never-albedo/preferred-albedo texture sets; drop
     // cached decisions when those sets change so texture tagging in the UI takes effect live
     size_t m_ue3DiffuseSelectionLightmapSetSize = 0;
@@ -1289,17 +1832,26 @@ namespace dxvk {
     // selection cache keys already dumped by rtx.d3d9.ue3LogAlbedoSelection
     fast_unordered_set m_loggedAlbedoSelections;
 
+    // draw identities already dumped as [UE3-Particle] by rtx.d3d9.ue3LogClassification
+    fast_unordered_set m_loggedUe3ParticleDraws;
+
     // per-texture spread over distinct pixel shaders: textures sampled by many unrelated
     // materials are shared detail/pattern/tint overlays rather than surface identity albedo.
-    // Persisted across sessions (rtx-remix/ue3TextureSpread.cache) so the spread penalty is
-    // deterministic from the first frame instead of converging anew each run.
+    // Persisted across sessions (rtx-remix/ue3TextureSpread.cache). `count` accumulates every
+    // shader seen, but scoring reads only `scoringCount` - the value loaded from disk - so the
+    // penalty is a fixed input for the whole session. Discoveries made now apply from the next
+    // session, which is what keeps a material's albedo pick from changing meaning mid-run.
     struct Ue3TextureMaterialSpread {
       std::array<XXH64_hash_t, 12> psHashes = {};
       uint8_t count = 0;
+      uint8_t scoringCount = 0;
     };
     fast_unordered_cache<Ue3TextureMaterialSpread> m_ue3TextureMaterialSpread;
     bool m_ue3TextureSpreadLoaded = false;
     bool m_ue3TextureSpreadDirty = false;
+    // Set when the cache file existed but could not be read in full. Saving rewrites the
+    // file from the map, so a partial load must never be allowed to publish itself.
+    bool m_ue3TextureSpreadSaveBlocked = false;
     uint32_t m_ue3TextureSpreadLastSaveFrame = 0;
     void loadUe3TextureSpreadCache();
     void saveUe3TextureSpreadCache();
@@ -1324,6 +1876,15 @@ namespace dxvk {
                                  uint32_t usedSamplerMask,
                                  uint32_t usedTextureMask,
                                  const PsSamplerTexcoordEntry* inferredEntry);
+    void logUe3ParticleDrawOnce();
+
+    // UE3 albedo selection refuses render targets: soft-particle and scene-colour buffers carry a
+    // content hash and near-backbuffer area, so at high resolutions they outscore the real material
+    // texture. Movie surfaces and explicitly tagged targets stay eligible. Only meaningful under
+    // rtx.d3d9.ue3EngineMode, which callers gate on.
+    bool isUe3RenderTargetRefusedAsAlbedo(D3D9CommonTexture* texture,
+                                          uint32_t stage,
+                                          const PsSamplerTexcoordEntry* inferredEntry) const;
 
     struct Ue3VsTexcoordTraceEntry {
       bool initialized = false;
@@ -1336,6 +1897,18 @@ namespace dxvk {
     fast_unordered_cache<Ue3VsTexcoordTraceEntry> m_ue3VsTexcoordTraceCache;
     fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
     fast_unordered_set m_ue3MovieTextureDescHashes;
+
+    // True if the image is tagged in rtx.raytracedRenderTargetTextures (and optionally
+    // present in the auto-detected set).
+    bool isTaggedRaytracedRenderTarget(const Rc<DxvkImage>& image, bool includeAutoDetected) const;
+
+    // Authored render-target tags accept the aspect-normalized descriptor hash (registered by
+    // the texture picker, stable across resolution changes) or the absolute one. Returns the
+    // hash that matched, so diagnostics can name the identity the author actually tagged.
+    static XXH64_hash_t matchAuthoredRenderTargetTag(const fast_unordered_set& tags,
+                                                     XXH64_hash_t descriptorHash,
+                                                     XXH64_hash_t resolutionAgnosticDescriptorHash);
+    bool isBackBufferSizedImage(const Rc<DxvkImage>& image) const;
 
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,
@@ -1358,17 +1931,131 @@ namespace dxvk {
       bool canUseBuffer;
     };
 
+    // Retention tier of the static vertex-capture cache. An entry pins the whole
+    // device-local capture buffer that its four views alias, so keys only reach this tier
+    // once the admission tier below has proven they repeat across frames.
     struct Ue3VertexCaptureCacheEntry {
       RasterBuffer positionBuffer;
       RasterBuffer normalBuffer;
       RasterBuffer texcoordBuffer;
       RasterBuffer color0Buffer;
       uint32_t vertexCount = 0;
-      uint32_t captureCount = 0;
       uint32_t lastFrameTouched = 0;
+      VkDeviceSize byteSize = 0;
     };
 
     fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
+    // Sum of byteSize over the retention tier, maintained incrementally so the budget can be
+    // enforced without walking the map every frame.
+    VkDeviceSize m_ue3VertexCaptureCacheBytes = 0;
+
+    // Admission tier: a CPU-only sighting record that holds no GPU resources. A key has to
+    // be seen on this many distinct frames before the tier above starts holding its capture
+    // buffer, so a key that never repeats - an animating skinned pose, or any object whose
+    // transform moves, both of which change the key every frame - costs a few bytes of
+    // bookkeeping rather than a retained device-local buffer per draw per frame.
+    struct Ue3VertexCaptureAdmissionEntry {
+      uint32_t vertexCount = 0;
+      uint32_t sightings = 0;
+      uint32_t lastFrameSeen = 0;
+    };
+
+    fast_unordered_cache<Ue3VertexCaptureAdmissionEntry> m_ue3VertexCaptureAdmission;
+
+    // Cache effectiveness counters. The per-frame pair is folded at end of frame into the
+    // dormancy evaluation window (always) and the diagnostic interval (when logging is on).
+    uint32_t m_ue3VertexCaptureCacheFrameReuses = 0;
+    uint32_t m_ue3VertexCaptureCacheFrameCaptures = 0;
+    uint64_t m_ue3VertexCaptureCacheStatReuses = 0;
+    uint64_t m_ue3VertexCaptureCacheStatCaptures = 0;
+    uint32_t m_ue3VertexCaptureCacheStatFrames = 0;
+    uint32_t m_ue3VertexCaptureCacheStatFrameStamp = 0;
+    uint64_t m_ue3VertexCaptureCacheEvictions = 0;
+
+    // Dormancy guard. Some titles recompute a draw's object transform every frame even for
+    // geometry that is not moving, which mints a fresh cache key per draw per frame. The cache
+    // then cannot hit at all, and the admission tier alone accumulates a record per draw per
+    // frame for no benefit. Measuring the reuse rate over a window and standing the whole cache
+    // down when it is hopeless keeps the option safe to leave enabled in any UE3 title.
+    bool m_ue3VertexCaptureCacheDormant = false;
+    uint32_t m_ue3VertexCaptureCacheProbeCountdown = 0;
+    uint32_t m_ue3VertexCaptureWindowFrames = 0;
+    uint64_t m_ue3VertexCaptureWindowReuses = 0;
+    uint64_t m_ue3VertexCaptureWindowCaptures = 0;
+
+    // Constant-churn diagnostic (rtx.d3d9.ue3LogVertexConstantChurn). One entry per sampled
+    // *mesh*, keyed on input-assembler identity, holding the multiset of instance transforms seen
+    // for it each frame. Keying per mesh rather than per instance is what makes the three things
+    // that can break a cache key separable, because a key that folds them together cannot say
+    // which one moved:
+    //   1. the IA identity itself (buffer handles, draw range, content generation counters)
+    //   2. the set of instance transforms placed with that mesh
+    //   3. any other shader constant folded into the stable VS hash
+    // The transform registers are skipped in 3 precisely so it isolates the third cause; without
+    // that, 2 and 3 would both fire on the same underlying change and neither would be diagnostic.
+    struct Ue3ChurnMeshEntry {
+      uint32_t lastFrameSeen = 0;
+      // Frame the transform multiset below is accumulating for; rotated lazily on first touch of
+      // a new frame so meshes that stop being drawn simply age out.
+      uint32_t currentSetFrame = 0;
+      // Extracted objectToWorld per placement, and the raw LocalToWorld/WorldToLocal register
+      // block those were derived from. Tracking both is what separates a game that genuinely moves
+      // its transforms from an objectToWorld extraction that is not reproducible: identical raw
+      // registers with differing extracted matrices can only be the latter.
+      std::vector<XXH64_hash_t> transformsThisFrame;
+      std::vector<XXH64_hash_t> rawTransformsThisFrame;
+      // Hashes and size of the last *completed* frame's multisets, so two complete sets are
+      // compared rather than a complete set against a partially accumulated one.
+      uint32_t completedSetFrame = 0;
+      XXH64_hash_t completedSetHash = 0;
+      XXH64_hash_t completedRawSetHash = 0;
+      uint32_t completedSetSize = 0;
+      XXH64_hash_t vsBytecodeHash = 0;
+      Matrix4 worldToView;
+      std::vector<Vector4> floatConsts;
+      // Registers the level 3 diff skips: the camera registers because the stable VS hash already
+      // omits them, and the object transform because that is level 2's question and including it
+      // would make the result depend on which placement was drawn first each frame.
+      uint32_t viewProjReg = 0;
+      uint32_t viewProjRegCount = 0;
+      uint32_t cameraPosReg = 0;
+      uint32_t cameraPosRegCount = 0;
+      uint32_t localToWorldReg = 0;
+      uint32_t localToWorldRegCount = 0;
+      uint32_t worldToLocalReg = 0;
+      uint32_t worldToLocalRegCount = 0;
+    };
+    fast_unordered_cache<Ue3ChurnMeshEntry> m_ue3ConstantChurn;
+
+    // Aggregates over the report window. Ordered map so the per-register report comes out in
+    // register order. The shader hash is carried alongside the count purely so the report can
+    // resolve the register's CTAB name without searching for a shader that declares it.
+    struct Ue3ChurnRegisterTally {
+      uint64_t count = 0;
+      XXH64_hash_t vsBytecodeHash = 0;
+    };
+    std::map<uint32_t, Ue3ChurnRegisterTally> m_ue3ConstantChurnByRegister;
+    // Level 1: did the mesh's IA identity come back on the next frame at all?
+    uint64_t m_ue3ChurnMeshKeysCreated = 0;
+    uint64_t m_ue3ChurnMeshRevisited = 0;
+    // Level 2: for meshes that did come back, was the set of placements identical? Tracked for the
+    // extracted matrices and for the raw registers, so the two can be cross-tabulated.
+    uint64_t m_ue3ChurnTransformSetIdentical = 0;
+    uint64_t m_ue3ChurnTransformSetDiffered = 0;
+    uint64_t m_ue3ChurnTransformSetSizeChanged = 0;
+    uint64_t m_ue3ChurnRawTransformSetIdentical = 0;
+    // The diagnosis: extracted matrices moved while the registers they came from did not.
+    uint64_t m_ue3ChurnExtractionUnstable = 0;
+    // Level 3: did any constant move that is neither camera-derived nor part of the transform?
+    uint64_t m_ue3ConstantChurnComparisons = 0;
+    uint64_t m_ue3ChurnOtherConstantsChanged = 0;
+    uint64_t m_ue3ConstantChurnWhileViewMoved = 0;
+    uint64_t m_ue3ConstantChurnWhileViewStill = 0;
+    uint32_t m_ue3ConstantChurnDetailDumps = 0;
+    uint32_t m_ue3ConstantChurnReportFrameStamp = 0;
+
+    void trackUe3ConstantChurn(XXH64_hash_t iaKey, const RasterGeometry& geoData);
+    void reportUe3ConstantChurn();
 
     // Cross-frame memo of geometry hash + bounding box results for draws whose IA
     // vertex/index buffers are static (any vertex factory - a skinned mesh's bind-pose
@@ -1376,7 +2063,7 @@ namespace dxvk {
     // Keyed purely on the IA identity (buffers, offsets, generations, draw range, decl,
     // texcoord selection), so one entry serves every instance of a mesh regardless of
     // transform. The entry holds the hash components computed from that identity; the
-    // per-draw VertexShader component (stable VS-constant hash, camera cell) is
+    // per-draw VertexShader component (stable VS-constant hash, position source) is
     // recombined live by the consumer, making served hashes bit-identical to a fresh
     // compute. Entries are heap-pinned via shared_ptr: a geometry worker publishes
     // results into the entry (release store on the ready flag) while the main thread
@@ -1400,36 +2087,56 @@ namespace dxvk {
                                              const DrawContext& drawContext,
                                              const RasterGeometry& geoData) const;
     // The geometry-hash VertexShader component for the current draw (stable VS-constant
-    // hash plus camera-cell/outlier folds); shared by computeHash and the memo hit path.
+    // hash plus position-source/outlier folds); shared by computeHash and the memo hit path.
     XXH64_hash_t computeLiveGeometryVertexShaderHashComponent();
 
-    struct Ue3CameraHashCell {
-      int32_t x = 0;
-      int32_t y = 0;
-      int32_t z = 0;
-    };
-    bool m_hasLoggedUe3CameraHashCell = false;
-    Ue3CameraHashCell m_lastLoggedUe3CameraHashCell = {};
+    // Position source resolved once per draw, before the vertex-capture cache key is built
+    // (the cache is only valid for exact sources) and before capture flags are uploaded.
+    Ue3CapturePositionSource m_activeCapturePositionSource = Ue3CapturePositionSource::ClipReconstruction;
 
-    // single-entry memo for computeUe3CameraHashCell, keyed on the exact inputs
-    // (worldToView content + cell size)
-    mutable Matrix4 m_ue3CameraCellMemoWorldToView;
-    mutable Ue3CameraHashCell m_ue3CameraCellMemoCell = {};
-    mutable float m_ue3CameraCellMemoCellSize = -1.0f;
-    mutable bool m_ue3CameraCellMemoResult = false;
-    mutable bool m_ue3CameraCellMemoValid = false;
-
-    bool shouldUseUe3CameraHashCell() const;
-    bool computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const;
-    static bool areUe3CameraHashCellsEqual(const Ue3CameraHashCell& a, const Ue3CameraHashCell& b);
-    void logUe3CameraHashCellIfChanged(const Ue3CameraHashCell& cell, const char* reason);
+    Ue3CapturePositionSource resolveUe3CapturePositionSource(const IndexContext& indexContext,
+                                                             const VertexContext vertexContext[caps::MaxStreams],
+                                                             const RasterGeometry& geoData,
+                                                             const char** outReason) const;
+    static bool isUe3ExactCapturePositionSource(Ue3CapturePositionSource source) {
+      return source != Ue3CapturePositionSource::ClipReconstruction;
+    }
+    static const char* describeUe3CapturePositionSource(Ue3CapturePositionSource source);
+    void logUe3CapturePositionSource(Ue3CapturePositionSource source, const char* reason) const;
 
     bool canUseUe3StaticVertexCaptureCache(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
+    bool isUe3StaticVertexCaptureCacheEligible(const IndexContext& indexContext,
+                                               const VertexContext vertexContext[caps::MaxStreams],
+                                               const RasterGeometry& geoData) const;
+    bool canUseUe3PreProjectionVertexCapture(const char** outReason) const;
     bool canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                            const VertexContext vertexContext[caps::MaxStreams],
                                            const RasterGeometry& geoData) const;
+    bool canUseUe3InstancedMeshVertexPositions(const RasterGeometry& geoData,
+                                               const char** outReason = nullptr) const;
+
+    // Reads m_currentUe3Instancing's per-instance basis out of the instance-data stream. Degenerate
+    // placements are dropped: PhysX leaves unused slots in the emitter's instance buffer untouched.
+    bool readUe3InstanceTransforms(const VertexContext vertexContext[caps::MaxStreams],
+                                   std::vector<Ue3DecomposedInstance>& instances,
+                                   const char** outReason = nullptr) const;
+
+    // Diagnostics: rtx.d3d9.ue3LogInstancedDraws / rtx.d3d9.ue3TraceDrawTextureHashes.
+    std::string describeUe3DrawInstancing(const VertexContext vertexContext[caps::MaxStreams]) const;
+    std::string describeUe3VertexDeclaration() const;
+    std::string describeUe3DrawIdentity() const;
+    void logUe3InstancedDrawOnce(const DrawContext& drawContext,
+                                 const VertexContext vertexContext[caps::MaxStreams],
+                                 const RasterGeometry& geoData);
+    void logUe3TracedDrawOnce(const DrawContext& drawContext,
+                              const VertexContext vertexContext[caps::MaxStreams],
+                              RasterGeometry& geoData);
+
+    // draw identities already dumped by the instancing / texture-hash draw probes
+    fast_unordered_set m_loggedUe3InstancedDraws;
+    fast_unordered_set m_loggedUe3TracedDraws;
     XXH64_hash_t computeUe3StableVertexShaderHash(bool* outHashedFloatConstsWithExclusions = nullptr) const;
 
     // Per-draw memo of computeUe3StableVertexShaderHash (VS bytecode + camera-excluded
@@ -1437,7 +2144,6 @@ namespace dxvk {
     // vertex-capture cache key, so it is computed once per draw in internalPrepareDraw
     // instead of hashing up to 4KB of shader constants twice.
     XXH64_hash_t m_activeStableVsHash = 0;
-    bool m_activeStableVsHashUsedExclusions = false;
     XXH64_hash_t computeUe3StaticVertexCaptureCacheKey(const IndexContext& indexContext,
                                                        const VertexContext vertexContext[caps::MaxStreams],
                                                        const DrawContext& drawContext,
@@ -1445,6 +2151,14 @@ namespace dxvk {
     bool tryReuseUe3StaticVertexCapture(XXH64_hash_t cacheKey, RasterGeometry& geoData);
     void updateUe3StaticVertexCaptureCache(XXH64_hash_t cacheKey, const RasterGeometry& geoData);
     void pruneUe3StaticVertexCaptureCache();
+    void enforceUe3StaticVertexCaptureCacheBudget();
+    void eraseUe3StaticVertexCaptureCacheEntry(XXH64_hash_t cacheKey);
+    void clearUe3StaticVertexCaptureCache();
+    // Called once per frame after pruning: folds the frame's reuse/capture counts into the
+    // dormancy window and the diagnostic interval, then runs both.
+    void updateUe3StaticVertexCaptureCacheState();
+    void evaluateUe3StaticVertexCaptureCacheDormancy();
+    void reportUe3StaticVertexCaptureCacheStats();
 
     static bool isPrimitiveSupported(const D3DPRIMITIVETYPE PrimitiveType) {
       return (PrimitiveType == D3DPT_TRIANGLELIST || PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_TRIANGLESTRIP);
@@ -1458,7 +2172,7 @@ namespace dxvk {
     template<typename T>
     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
 
-    bool prepareVertexCapture(const int vertexIndexOffset, bool capturePositionFromInput = false);
+    bool prepareVertexCapture(const int vertexIndexOffset, Ue3CapturePositionSource positionSource);
 
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 
@@ -1554,11 +2268,9 @@ namespace dxvk {
     // [RTX-DeferredUI] tag diagnostics
     fast_unordered_set m_deferredUiLoggedDecisions;
 
-    // Checks whether the draw matches rtx.deferredUiTextures (by texture image hash, or by the
-    // stable descriptor hash for render-target textures) or rtx.d3d9.deferredUiPixelShaders.
-    bool isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash = nullptr,
-                                bool* pMatchedTextureIsRenderTarget = nullptr,
-                                XXH64_hash_t* pMatchedRtDescriptorHash = nullptr) const;
+    // Checks whether the draw matches rtx.deferredUiTextures (image hash for non-RTs, or
+    // resolution-agnostic RT descriptor hash) or rtx.d3d9.deferredUiPixelShaders.
+    bool isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash = nullptr) const;
 
     bool captureDeferredUiDraw(const IndexContext& indexContext,
                                const VertexContext vertexContext[caps::MaxStreams],
@@ -1709,7 +2421,14 @@ namespace dxvk {
     struct BoundTextureSnapshotEntry {
       D3D9CommonTexture* texture = nullptr;
       XXH64_hash_t imageHash = kEmptyHash;
+      // RT-only absolute descriptor hash (includes Width/Height); also copied into
+      // descriptorHash below for MIC / identity paths that need a size-dependent key.
       XXH64_hash_t rtDescriptorHash = 0;
+      // RT-only aspect-normalized descriptor hash used by deferred-UI / raytraced-RT tagging.
+      XXH64_hash_t rtResolutionAgnosticDescriptorHash = 0;
+      // Descriptor hash of every image (stable across recreation, unlike imageHash for
+      // GPU-written or session-composited textures).
+      XXH64_hash_t descriptorHash = 0;
       bool hasImage = false;
       bool hasSampleView = false;
       bool isRenderTarget = false;
@@ -1750,27 +2469,48 @@ namespace dxvk {
       bool rasterizeFullscreenCompositeToPrimary = false;
       bool shaderPathTexcoordIndexFromPixelShader = false;
       bool ue3MaterialInstanceConstantHash = false;
-      bool ue3LightmapPermutationInvariantHash = false;
-      bool ue3LightmapPermutationBridgeLookup = false;
+      bool ue3MicConstantIdentity = false;
+      bool ue3MicExcludeRenderTargetsFromIdentity = true;
+      bool ue3MicVolatileConstantDetection = true;
+      bool ue3ReportMicIdentityChurn = true;
       bool ue3LogMaterialInstanceHash = false;
       bool ue3SkipDepthPrepass = false;
       bool ue3SkipShadowDepthPasses = false;
       bool ue3SkipDepthTestDisabledTranslucency = false;
       bool ue3SkipSceneCapturePasses = false;
+      bool ue3ForegroundDpgIsViewModel = false;
       bool conservativeOcclusionQueries = false;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheBudgetMiB = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheMaxEntries = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheRetentionFrames = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheMinReusePercent = 0;
+      uint32_t ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames = 0;
+      bool ue3LogStaticVertexCaptureCacheStats = false;
+      bool ue3ExcludePlacementFromVertexShaderHash = false;
+      bool ue3LogVertexConstantChurn = false;
+      uint32_t ue3VertexConstantChurnMaxTrackedDraws = 0;
       bool ue3StaticGeometryHashMemoization = false;
-      float ue3VertexCaptureCameraCellSize = 0.0f;
+      bool ue3ExactVertexCapture = false;
+      bool ue3RequireExactVertexCapture = false;
+      Ue3CapturePositionSourceOverride ue3VertexCaptureSourceOverride = Ue3CapturePositionSourceOverride::Auto;
       bool ue3NativeLocalMeshVertexCapture = false;
+      bool ue3DecomposeInstancedDraws = false;
+      uint32_t ue3MaxDecomposedInstances = 0;
+      float ue3DecomposedInstanceCullDistance = 0.f;
+      bool ue3StableDecomposedInstanceIdentity = false;
+      bool ue3LogInstancedDrawStats = false;
       bool ue3RequireCtabCameraConstants = false;
       bool ue3StableDiffuseSelection = false;
-      bool ue3MicAutoExcludeFrameVaryingConstants = false;
+      bool ue3AutoDetectLightmapTextures = false;
+      float ue3ConstantAlbedoTintGain = 0.f;
       bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;
       bool ue3LogUvAffineDetail = false;
       bool ue3LogAlbedoSelection = false;
       bool ue3LogCapturePrecision = false;
+      bool ue3LogInstancedDraws = false;
       bool ue3LogDrawStatusFlaps = false;
       bool ue3LogOcclusionQueries = false;
       bool deferredUiReplay = false;
@@ -1801,6 +2541,7 @@ namespace dxvk {
       bool enableMultiStageTextureFactorBlending = false;
       bool ignoreAllVertexColorBakedLighting = false;
       bool vertexColorIsBakedLighting = false;
+      bool logReplacementResolution = false;
       Vector2i drawCallRange = Vector2i(0, 0);
 
       // Set-typed options, cached as pointers: each option's resolved hash set is
@@ -1819,6 +2560,10 @@ namespace dxvk {
       const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
       const fast_unordered_set* vsTexcoordCaptureOutlierTextures = nullptr;
       const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
+      const fast_unordered_set* ue3MicConstantIdentityExcludedMaterials = nullptr;
+      const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
+      const fast_unordered_set* ue3TraceDrawTextureHashes = nullptr;
+      const fast_unordered_set* replacementDebugHashes = nullptr;
     };
     FrameOptionCache m_frameOptions;
     void refreshFrameOptionCache();
@@ -1843,5 +2588,9 @@ namespace dxvk {
                                        const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {});
 
     void submitActiveDrawCallState();
+
+    // Expands m_ue3DecomposedInstances into one ray-traced submission per hardware instance, each
+    // with its own object-to-world transform.
+    void submitUe3DecomposedInstanceDrawCallStates(const DrawParameters& params);
   };
 }

@@ -179,9 +179,6 @@ namespace dxvk::vk {
 
   
   VkResult Presenter::recreateSwapChain(const PresenterDesc& desc) {
-    if (m_swapchain)
-      destroySwapchain();
-
     // Query surface capabilities. Some properties might
     // have changed, including the size limits and supported
     // present modes, so we'll just query everything again.
@@ -205,6 +202,17 @@ namespace dxvk::vk {
       if (status != VK_SUCCESS)
         return status;
     }
+
+    // Keep the existing swapchain when the surface is 0x0 (minimized); destroy-first
+    // would force a recreate on restore.
+    {
+      const VkExtent2D peekExtent = pickImageExtent(caps, desc.imageExtent);
+      if ((!peekExtent.width || !peekExtent.height) && m_swapchain)
+        return VK_SUCCESS;
+    }
+
+    if (m_swapchain)
+      destroySwapchain();
 
     if ((status = getSupportedFormats(formats, desc)) != VK_SUCCESS)
       return status;

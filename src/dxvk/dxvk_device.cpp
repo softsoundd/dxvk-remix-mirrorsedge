@@ -35,6 +35,10 @@
 #include "rtx_render/rtx_sparse_rendering.h"
 
 namespace dxvk {
+
+  // NV-DXVK start: Remix native device access
+  DxvkDevice* g_dxvkDeviceNative = nullptr;
+  // NV-DXVK end
   
   DxvkDevice::DxvkDevice(
     const Rc<vk::InstanceFn>&       vki,
@@ -559,6 +563,7 @@ namespace dxvk {
     m_autoExposure(device),
     m_toneMapping(device),
     m_localToneMapping(device),
+    m_ue3ToneMapping(device),
     m_bloom(device),
     m_geometryUtils(device),
     m_imageUtils(device),

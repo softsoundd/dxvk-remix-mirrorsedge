@@ -55,6 +55,11 @@ namespace dxvk {
 
       return XXH3_64bits(this, sizeof(D3D9_COMMON_TEXTURE_DESC));
     }
+
+    // Like CalculateHash, but Width/Height are replaced with the reduced aspect ratio
+    // (W/gcd, H/gcd) so RT identity survives resolution changes while still distinguishing
+    // format, usage, MSAA, and aspect.
+    XXH64_hash_t CalculateResolutionAgnosticHash() const;
     // NV-DXVK end
   };
 
@@ -481,6 +486,11 @@ namespace dxvk {
 
     // NV-DXVK start: UE3 streaming-stable texture hashing
     XXH64_hash_t ComputeUe3StreamingStableHash(const D3D9CommonTexture* source) const;
+    void LogUe3TextureHashProvenance(const D3D9CommonTexture* source, XXH64_hash_t imageHash, bool is2DTexture) const;
+    // NV-DXVK end
+
+    // NV-DXVK start: resolution-agnostic render target tagging
+    void RegisterRenderTargetDescriptorHashes(const Rc<DxvkImageView>& pickerView);
     // NV-DXVK end
 
     D3D9DeviceEx*                 m_device;

@@ -309,6 +309,8 @@ namespace dxvk
       Resource m_secondaryVirtualWorldShadingNormalPerceptualRoughness;
       Resource m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising;
       Resource m_secondaryHitDistance;
+      // Signed length of the indirect integrator's first bounce; negative means it reached the sky.
+      Resource m_indirectReflectionSegment;
       AliasedResource m_secondaryViewDirection;
       AliasedResource m_secondaryConeRadius;
       AliasedResource m_secondaryWorldPositionWorldTriangleNormal;
@@ -319,15 +321,9 @@ namespace dxvk
       // Resource containing 1spp radiance from indirect pass - with each pixel containing {diffuse | specular} for a {primary | secondary} surface
       AliasedResource m_indirectRadianceHitDistance;
       AliasedResource m_rayReconstructionHitDistance;
-      Resource m_rayReconstructionParticleBuffer;
-      Resource m_sparseRenderingDirectActivePixelMask;
-      Resource m_sparseRenderingIndirectActivePixelMask;
-      Resource m_sparseRenderingUnionActivePixelMask;
-      Resource m_sparseRenderingDirectPixelSamplingRate;
-      Resource m_sparseRenderingIndirectPixelSamplingRate;
-      Resource m_sparseRenderingDirectActiveLocalPixelCoords;
-      Resource m_sparseRenderingIndirectActiveLocalPixelCoords;
-      Resource m_sparseRenderingUnionActiveLocalPixelCoords;
+      Resource m_sparseRenderingActivePixelMask;
+      Resource m_sparseRenderingPixelSamplingRate;
+      Resource m_sparseRenderingActiveLocalPixelCoords;
 
       AliasedResource m_primaryDirectDiffuseRadiance;
       AliasedResource m_primaryDirectSpecularRadiance;

@@ -218,6 +218,10 @@ namespace dxvk {
 
     RTX_OPTION("rtx.postfx", bool,  enableMotionBlurNoiseSample, true, "Enable random distance sampling for every step along the motion vector. The random pattern is generated with interleaved gradient noise.");
     RTX_OPTION("rtx.postfx", bool,  enableMotionBlurEmissive, true, "Enable Motion Blur for Emissive surfaces. Disable this when the motion blur on emissive surfaces cause severe artifacts.");
+    RTX_OPTION("rtx.postfx", bool,  enableMotionBlurViewModel, false,
+               "Enable Motion Blur for view-model (first-person) surfaces.\n"
+               "Excluded by default: a held item that tracks the camera has near-zero real screen motion and blur on it usually looks wrong.\n"
+               "Games with strongly animated first-person meshes (e.g. sprinting arms) benefit from enabling this; use rtx.postfx.motionBlurMaskOutTextures to opt out specific materials.");
     RTX_OPTION("rtx.postfx", uint,  motionBlurSampleCount, 4, "The number of samples along the motion vector. More samples could help to reduce motion blur noise.");
     RTX_OPTION("rtx.postfx", float, exposureFraction, 0.4f, "Simulate the camera exposure, the longer exposure will cause stronger motion blur.");
     RTX_OPTION("rtx.postfx", float, blurDiameterFraction, 0.02f, "The diameter of the circle that motion blur samplings occur. Motion vectors beyond this circle will be clamped.");

@@ -204,7 +204,7 @@ struct RaytraceArgs {
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
   float secondarySpecularFireflyFilteringThreshold;
-  uint  outputParticleLayer;
+  uint secondarySignalPadding;
 
   // Note: Packed as float16, uses uint16_t due to being shared on C++ side
   uint16_t emissiveBlendOverrideEmissiveIntensity;
@@ -315,6 +315,9 @@ struct RaytraceArgs {
   uint enablePSTRSecondaryIncidentSplitApproximation;
   float psrrNormalDetailThreshold;
   float pstrNormalDetailThreshold;
+  // World units (converted from meters). 0 = unlimited / no fade.
+  float psrMaxDistance;
+  float psrMaxDistanceFade;
 
   uint enableEnhanceBSDFDetail;
   uint enhanceBSDFIndirectMode;
@@ -380,6 +383,7 @@ struct RaytraceArgs {
   uint isLastCompositeOutputValid;
   uint isZUp; // Note: Indicates if the Z axis is the "up" axis in world space if true, otherwise the Y axis if false.
   uint enableCullingSecondaryRays;
+  uint enableShadowBackfaceSkip;
 
   u16vec2 gpuPrintThreadIndex;
   uint gpuPrintElementIndex;
@@ -397,6 +401,7 @@ struct RaytraceArgs {
   uint sssTransmissionBsdfSampleCount;
   uint sssTransmissionSingleScatteringSampleCount;
   uint enableTransmissionDiffusionProfileCorrection;
+  float metersToWorldUnitScale;
   float totalMipBias;
   float hairCardMipBias;
   float hairCardRoughnessScale;

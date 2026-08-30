@@ -447,20 +447,20 @@ namespace dxvk
                                   bool depthInverted,
                                   bool autoExposure,
                                   bool sharpening,
-                                  NVSDK_NGX_PerfQuality_Value perfQuality,
-                                  NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset) {
+                                  NVSDK_NGX_DLSS_Hint_Render_Preset dlssPreset,
+                                  NVSDK_NGX_PerfQuality_Value perfQuality) {
     ScopedCpuProfileZone();
 
     // Render preset hint (model selection) - set for every quality slot so the choice
     // follows whatever perf quality the feature is created with. Written unconditionally:
     // the parameter block outlives feature recreation, so a previously set preset must be
     // explicitly overwritten with Default (0) to actually revert to the snippet's choice.
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, renderPreset);
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, renderPreset);
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, renderPreset);
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, renderPreset);
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, renderPreset);
-    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, renderPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, dlssPreset);
 
     const unsigned int CreationNodeMask = 1;
     const unsigned int VisibilityNodeMask = 1;
@@ -486,6 +486,12 @@ namespace dxvk
     createParams.InFeatureCreateFlags = createFlags;
 
     VkCommandBuffer vkCommandBuffer = renderContext->getCommandList()->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer);
+
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, dlssPreset);
+    m_parameters->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, dlssPreset);
 
     // Release video memory when DLSS is disabled.
     m_parameters->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
@@ -722,7 +728,6 @@ namespace dxvk
     NVSDK_NGX_Resource_VK exposureResource = TextureToResourceVK(buffers.pExposure, false);
     NVSDK_NGX_Resource_VK biasCurrentColorMaskResource = TextureToResourceVK(buffers.pBiasCurrentColorMask, false);
     NVSDK_NGX_Resource_VK hitDistanceResource = TextureToResourceVK(buffers.pHitDistance, false);
-    NVSDK_NGX_Resource_VK inTransparencyLayerResource = TextureToResourceVK(buffers.pInTransparencyLayer, false);
 
     NVSDK_NGX_VK_DLSS_Eval_Params evalParams = {};
     evalParams.Feature.pInColor = &unresolvedColorResource;
@@ -762,8 +767,6 @@ namespace dxvk
     evalParams_DLDN.pInExposureTexture = nullptr;
     evalParams_DLDN.pInMotionVectors = &motionVectorsResource;
     evalParams_DLDN.pInBiasCurrentColorMask = nullptr;
-    evalParams_DLDN.pInTransparencyLayer = buffers.pInTransparencyLayer ? &inTransparencyLayerResource : nullptr;
-    evalParams_DLDN.pInTransparencyLayerOpacity = nullptr;
     evalParams_DLDN.InJitterOffsetX = settings.jitterOffset[0];
     evalParams_DLDN.InJitterOffsetY = settings.jitterOffset[1];
     evalParams_DLDN.InPreExposure = settings.preExposure;
@@ -946,11 +949,19 @@ namespace dxvk
     consts.motionVectorsInvalidValue = 0.0; // xxxnsubtil: is this correct?
     consts.motionVectorsDilated = false;
 
+#ifdef _M_X64
+    // The x64 SDK helper sources these values from consts, overriding direct parameter writes.
+    consts.multiFrameCount = interpolatedFrameCount;
+    consts.multiFrameIndex = interpolatedFrameIndex + 1;
+#else
+    // The older ARM64 SDK requires setting these parameters directly.
+    m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, interpolatedFrameCount);
+    m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, interpolatedFrameIndex + 1);
+#endif
+
     m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_CmdQueue, m_device->queues().__DLFG_QUEUE.queueHandle);
     m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_EnableInterp, 1);
     m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_IsRecording, 1);
-    m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, interpolatedFrameCount);
-    m_parameters->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, interpolatedFrameIndex + 1);
 
     NVSDK_NGX_Result result;
     result = NGX_VK_EVALUATE_DLSSG(clientCommandList, m_feature, m_parameters, &evalParams, &consts);

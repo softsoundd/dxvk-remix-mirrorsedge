@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -36,6 +36,7 @@
 #include "../util/util_hashtable.h"
 
 #include "rtx_globals.h"
+#include "rtx_retained_buffer_table.h"
 #include "rtx_types.h"
 #include "rtx_common_object.h"
 #include "rtx_camera_manager.h"
@@ -69,8 +70,7 @@ public:
   const RtSurfaceMaterial& get(const uint32_t index) const { return m_surfaceMaterialCache.getObjectTable()[index]; }
 
 protected:
-  BufferRefTable<RaytraceBuffer> m_bufferCache;
-  BufferRefTable<Rc<DxvkSampler>> m_materialSamplerCache;
+  RetainedBufferTable<RaytraceBuffer> m_bufferCache;
 
   struct SurfaceMaterialHashFn {
     size_t operator() (const RtSurfaceMaterial& mat) const {
@@ -222,10 +222,11 @@ public:
                     uint32_t& textureIndex,
                     bool hasTexcoords,
                     bool async = true,
-                    uint16_t samplerFeedbackStamp = SAMPLER_FEEDBACK_INVALID);
+                    uint16_t* inout_samplerFeedbackStamp = nullptr);
   [[nodiscard]] SamplerIndex trackSampler(Rc<DxvkSampler> sampler);
 
   std::optional<XXH64_hash_t> findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue);
+  std::optional<XXH64_hash_t> findGeometryHashByObjectPickingValue(uint32_t objectPickingValue);
   std::vector<ObjectPickingValue> gatherObjectPickingValuesByTextureHash(XXH64_hash_t texHash);
 
   // Replacement material hash tracking
@@ -250,8 +251,8 @@ public:
   void requestVramCompaction();
   void manageTextureVram();
 
-  bool isThinOpaqueMaterialExist() const { return m_thinOpaqueMaterialExist; }
-  bool isSssMaterialExist() const { return m_sssMaterialExist; }
+  bool isThinOpaqueMaterialExist() const { return m_thinOpaqueCount > 0; }
+  bool isSssMaterialExist() const { return m_sssCount > 0; }
 
   bool isAntiCullingSupported() const { return m_isAntiCullingSupported; }
 
@@ -265,7 +266,7 @@ private:
   };
   // Handles conversion of geometry data coming from a draw call, to the data used by the raytracing backend
   template<bool isNew>
-  ObjectCacheState processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, RaytraceGeometry& modifiedGeometryData);
+  ObjectCacheState processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
 
   // Consumes a draw call state and updates the scene state accordingly
   RtInstance* processDrawCallState(const Rc<DxvkContext>& ctx, 
@@ -279,20 +280,31 @@ private:
                                                  const DrawCallState& drawCallState,
                                                  uint32_t* out_indexInCache = nullptr);
 
-  // Update per-frame scene-wide aggregates derived from a finalized opaque surface
-  // material (POM count, SSS / thin-opaque existence). These are reset each frame
-  // in onFrameEnd; both the dynamic path (createSurfaceMaterial) and the
-  // preserve path (preserveInstance) must call this so the classification of
-  // SSS-vs-thin-opaque lives in exactly one place.
-  void accumulateOpaqueMaterialAggregates(const RtOpaqueSurfaceMaterial& opaqueMat);
+  // Retain / release all resources associated with the surface material at the given cache index:
+  // texture ref counts (via RtxTextureManager) and scene-wide feature counts (POM, SSS, thin-opaque).
+  // Called when an instance's bound material changes or the instance is destroyed.
+  void retainSurfaceMaterial(uint32_t matIdx);
+  void releaseSurfaceMaterial(uint32_t matIdx);
 
   RtTranslucentSurfaceMaterial createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
                                                                 uint32_t samplerIndex,
                                                                 bool hasTexcoords);
   Rc<DxvkSampler> getOrCreateExternalSampler();
 
-  // Updates ref counts for new buffers
-  void updateBufferCache(RaytraceGeometry& newGeoData);
+  // Acquire/update stable buffer-cache slots for all geometry buffers in geo.
+  // Called on the dynamic path (KBuildBVH / kUpdateBVH / kUpdateInstance) only.
+  void updateBufferCache(BlasEntry* pBlas);
+
+  // Propagate the BLAS's current geometry buffer indices/strides/formats to all
+  // currently-linked instances.
+  void syncLinkedInstances(BlasEntry* pBlas);
+
+  // Release all buffer-cache slots held by geo. Called when a BlasEntry is GC'd.
+  void unregisterGeometryBuffers(RaytraceGeometry& geo);
+
+  // Release every BlasEntry's buffer slots and assert the active count reaches zero.
+  // Called from clear() to detect registration/release imbalances before wiping the table.
+  void verifyAndReleaseBufferCache();
 
   // Called whenever a new BLAS scene object is added to the cache
   ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
@@ -316,8 +328,7 @@ private:
       const DrawCallState& input,
       const AssetReplacement& replacement);
 
-  // Minimal per-frame work: refresh buffer-cache indices and touch textures so the instance
-  // still renders after m_bufferCache is cleared (see preserve path for unchanged / anti-culled draws).
+  // Minimal per-frame work for the preserve path (unchanged / anti-culled draws).
   // When pInput is set (preserve replacement draw path), also runs the ray-portal refresh
   // via processRayPortalData on the cached RtSurfaceMaterial.
   void preserveInstance(
@@ -346,6 +357,11 @@ private:
 
   void createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance);
 
+  // Logs the external-camera regime decision when its inputs change (rtx.playerModel.logCameraRegime).
+  void logCameraRegimeChange(bool externalCameraRegime, bool viewModelCameraValid, bool demotedForeground,
+                             bool distanceExternal, bool noViewModelExternal, float playerDistance,
+                             bool viewModelHidden, float viewModelFovDegrees);
+
   // Print all RtInstances for debugging
   void printAllRtInstances();
   
@@ -355,6 +371,15 @@ private:
   uint32_t m_beginUsdExportFrameNum = -1;
   bool m_enqueueDelayedClear = false;
   bool m_previousFrameSceneAvailable = false;
+
+  // Last camera-regime state logged and when, so logCameraRegimeChange reports transitions
+  // plus a periodic repeat rather than every frame.
+  uint32_t m_lastLoggedCameraRegime = UINT32_MAX;
+  uint32_t m_lastLoggedCameraRegimeFrame = 0;
+
+  // Consecutive frames the automatic external-camera rules have agreed
+  // (rtx.playerModel.autoEnableInPrimarySpaceDelayFrames).
+  uint32_t m_autoExternalCameraFrames = 0;
 
   RtxGlobals m_globals;
 
@@ -377,6 +402,11 @@ private:
 
   FogState m_fog;
   fast_unordered_cache<FogState> m_fogStates;
+
+  // Topology hashes of meshes drawn through the view-model camera, accumulated between RTX
+  // injections (view-model draws often happen after injection and belong to the next scene).
+  // Consumed and cleared by the detectHeldEquipmentInstances call during scene preparation.
+  fast_unordered_set m_viewModelTopologyHashes;
   std::mutex m_startInMediumMaterialMutex;
   std::optional<MaterialData> m_pendingStartInMediumMaterial;
   bool m_pendingClearStartInMediumMaterial = false;
@@ -400,6 +430,8 @@ private:
   struct DrawCallMetaInfo {
     XXH64_hash_t legacyTextureHash { kEmptyHash };
     XXH64_hash_t legacyTextureHash2 { kEmptyHash };
+    // Topology-stable geometry hash used for geometry category tagging in the UI.
+    XXH64_hash_t geometryHash { kEmptyHash };
   };
   struct DrawCallMeta {
     constexpr static inline uint8_t MaxTicks = 2;
@@ -415,8 +447,8 @@ private:
   std::atomic_bool m_forceFreeTextureMemory = false;
   std::atomic_bool m_forceFreeUnusedDxvkAllocatorChunks = false;
 
-  bool m_thinOpaqueMaterialExist = false;
-  bool m_sssMaterialExist = false;
+  uint32_t m_thinOpaqueCount = 0;
+  uint32_t m_sssCount = 0;
 
   bool m_isAntiCullingSupported = true;
 

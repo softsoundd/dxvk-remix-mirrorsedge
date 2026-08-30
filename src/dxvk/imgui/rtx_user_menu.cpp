@@ -46,6 +46,7 @@ namespace dxvk {
 
   // Combo boxes shared with dxvk_imgui.cpp
   extern RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo;
+  extern RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset> dlssRenderPresetCombo;
   extern RemixGui::ComboWithKey<XeSSPreset> xessPresetCombo;
 
   // Combo boxes used only by the user menu
@@ -334,6 +335,11 @@ namespace dxvk {
             common->metaNgxPassthrough().showImguiStatusLine(false);
             ImGui::BeginDisabled(disableNonPresetSettings);
             break;
+          }
+          // Preset is shown before the mode. Ray Reconstruction has its own preset selector
+          // (rendered by showRayReconstructionEnable above), so only show the SR preset here.
+          if (!RtxOptions::enableRayReconstruction()) {
+            dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
           }
 
           dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());

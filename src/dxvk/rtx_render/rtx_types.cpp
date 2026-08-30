@@ -148,7 +148,8 @@ namespace dxvk {
       , centroid(key.worldPos)
       , frameCreated(frameId)
       , textureTransform(key.textureTransform)
-      , texgenMode(key.texgenMode) {
+      , texgenMode(key.texgenMode)
+      , isViewModelDraw(key.isViewModelDraw) {
     // No prior data to diff against; every field is effectively new. Set all
     // dirty bits so downstream update logic that gates individual steps on
     // specific bits runs the full update on the RI's first submission.
@@ -294,6 +295,20 @@ namespace dxvk {
       // Update any categories that require geometry hash
       setupCategoriesForGeometry();
 
+      // UE3 SDPG_Foreground draws are first-person overlay geometry. Runs after texture and
+      // geometry tagging so it wins (FP/TP weapon components share one mesh, so player-model
+      // tags must only bind the world-DPG copy). On external cameras the override is
+      // suspended and the overlay renders as world geometry.
+      if (isUe3ForegroundDpg) {
+        if (!g_ue3ForegroundDemoteToWorld) {
+          setCategory(InstanceCategories::ViewModel, true);
+          removeCategory(InstanceCategories::ThirdPersonPlayerModel);
+          removeCategory(InstanceCategories::ThirdPersonPlayerBody);
+        } else {
+          ++g_ue3ForegroundDemotedDrawCount;
+        }
+      }
+
       return true;
     }
 
@@ -366,6 +381,9 @@ namespace dxvk {
     }
   }
 
+  bool g_ue3ForegroundDemoteToWorld = false;
+  uint32_t g_ue3ForegroundDemotedDrawCount = 0;
+
   void DrawCallState::setCategory(InstanceCategories category, bool doSet) {
     if (doSet) {
       categories.set(category);
@@ -418,7 +436,6 @@ namespace dxvk {
       { InstanceCategories::Hidden, &RtxOptions::hideInstanceTextures() },
       { InstanceCategories::Particle, &RtxOptions::particleTextures() },
       { InstanceCategories::Beam, &RtxOptions::beamTextures() },
-      { InstanceCategories::IgnoreTransparencyLayer, &RtxOptions::ignoreTransparencyLayerTextures() },
       { InstanceCategories::DecalStatic, &RtxOptions::decalTextures() },
       { InstanceCategories::DecalDynamic, &RtxOptions::dynamicDecalTextures() },
       { InstanceCategories::DecalSingleOffset, &RtxOptions::singleOffsetDecalTextures() },
@@ -430,6 +447,8 @@ namespace dxvk {
       { InstanceCategories::Sky, &RtxOptions::skyBoxTextures() },
       { InstanceCategories::ParticleEmitter, &RtxOptions::particleEmitterTextures() },
       { InstanceCategories::HairCards, &RtxOptions::hairCardTextures() },
+      { InstanceCategories::ViewModel, &RtxOptions::viewModelTextures() },
+      { InstanceCategories::CullBackfacesInShadows, &RtxOptions::cullBackfacesInShadowTextures() },
     };
 
     // Position-weighted size fingerprint: any single-set tagging change (add/remove via
@@ -490,7 +509,6 @@ namespace dxvk {
 
     setCategory(InstanceCategories::Particle, matched(InstanceCategories::Particle));
     setCategory(InstanceCategories::Beam, matched(InstanceCategories::Beam));
-    setCategory(InstanceCategories::IgnoreTransparencyLayer, matched(InstanceCategories::IgnoreTransparencyLayer));
 
     setCategory(InstanceCategories::DecalStatic, matched(InstanceCategories::DecalStatic));
     setCategory(InstanceCategories::DecalDynamic, matched(InstanceCategories::DecalDynamic));
@@ -505,13 +523,35 @@ namespace dxvk {
     setCategory(InstanceCategories::Terrain, matched(InstanceCategories::Terrain));
     setCategory(InstanceCategories::Sky, matched(InstanceCategories::Sky));
 
-    setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
-    setCategory(InstanceCategories::HairCards, lookupHash(RtxOptions::hairCardTextures(), textureHash));
+    setCategory(InstanceCategories::ParticleEmitter, matched(InstanceCategories::ParticleEmitter));
+    setCategory(InstanceCategories::HairCards, matched(InstanceCategories::HairCards));
+    setCategory(InstanceCategories::ViewModel, matched(InstanceCategories::ViewModel));
+    setCategory(InstanceCategories::CullBackfacesInShadows, matched(InstanceCategories::CullBackfacesInShadows));
   }
 
   void DrawCallState::setupCategoriesForGeometry() {
     const XXH64_hash_t assetReplacementHash = getHash(RtxOptions::geometryAssetHashRule());
     setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxGeometries(), assetReplacementHash));
+
+    // Topology-stable (indices + descriptor) so CPU-skinned meshes keep a stable tag across poses.
+    const XXH64_hash_t topologyHash =
+      getGeometryData().getHashForRule(HashRule(rules::TopologicalHash));
+
+    // Geometry tags OR with texture categories. Player-model geometry clears ViewModel so a
+    // shared material in viewModelTextures cannot pull Mesh3p onto the view-model camera.
+    // Body geometry implies player-model: the body-anchor lookup only scans player-model instances.
+    const bool playerModelBodyGeometry = lookupHash(RtxOptions::playerModelBodyGeometries(), topologyHash);
+    if (playerModelBodyGeometry || lookupHash(RtxOptions::playerModelGeometries(), topologyHash)) {
+      setCategory(InstanceCategories::ThirdPersonPlayerModel, true);
+      setCategory(InstanceCategories::ThirdPersonPlayerBody, playerModelBodyGeometry);
+      removeCategory(InstanceCategories::ViewModel);
+    } else if (lookupHash(RtxOptions::viewModelGeometries(), topologyHash)) {
+      setCategory(InstanceCategories::ViewModel, true);
+    }
+
+    if (lookupHash(RtxOptions::cullBackfacesInShadowGeometries(), topologyHash)) {
+      setCategory(InstanceCategories::CullBackfacesInShadows, true);
+    }
   }
 
   static std::optional<Vector3> makeCameraPosition(const Matrix4& worldToView,

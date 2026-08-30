@@ -166,6 +166,8 @@ public:
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
+  bool hasShadowBackfaceSkipInstances() const { return m_hasShadowBackfaceSkipInstances; }
+
   // Returns true if the last mergeInstancesIntoBlas call took the fast-skip
   // path (scene generation unchanged).  When true, m_reorderedSurfaces and
   // all BLAS/surface data are identical to the previous frame, so callers
@@ -238,6 +240,7 @@ private:
   // Scene generation from InstanceManager when the BLAS was last built.
   uint64_t m_lastProcessedGeneration = UINT64_MAX;
   bool m_sceneUnchangedThisFrame = false;
+  bool m_hasShadowBackfaceSkipInstances = false;
   // Set when newly built OMMs need to be bound to BLASes.  Forces all buckets
   // dirty on the next incremental rebuild so tryBindOpacityMicromap runs.
   bool m_ommBindPending = false;

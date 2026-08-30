@@ -39,6 +39,7 @@ DxvkMemoryStats& DxvkMemoryStats::operator=(const DxvkMemoryStats& other)
   rtxMaterialTextures = other.rtxMaterialTextures.load();
   rtxRenderTargets = other.rtxRenderTargets.load();
   rtxReplacementGeometry = other.rtxReplacementGeometry.load();
+  rtxVertexCapture = other.rtxVertexCapture.load();
 
   return *this;
 }
@@ -69,6 +70,9 @@ void DxvkMemoryStats::trackMemoryAssigned(Category category, VkDeviceSize size)
     break;
   case Category::RTXReplacementGeometry:
     rtxReplacementGeometry += size;
+    break;
+  case Category::RTXVertexCapture:
+    rtxVertexCapture += size;
     break;
         
   default:
@@ -105,6 +109,9 @@ void DxvkMemoryStats::trackMemoryReleased(Category category, VkDeviceSize size)
     break;
   case Category::RTXReplacementGeometry:
     rtxReplacementGeometry -= size;
+    break;
+  case Category::RTXVertexCapture:
+    rtxVertexCapture -= size;
     break;
 
   default:
@@ -154,6 +161,8 @@ VkDeviceSize DxvkMemoryStats::usedByCategory(Category category) const
     return rtxRenderTargets;
   case Category::RTXReplacementGeometry:
     return rtxReplacementGeometry;
+  case Category::RTXVertexCapture:
+    return rtxVertexCapture;
   default:
     assert(!"unimplemented");
     return 0;
@@ -169,6 +178,7 @@ static const std::map<DxvkMemoryStats::Category, const char *> categoryStringMap
   { DxvkMemoryStats::Category::RTXMaterialTexture, "RTXMaterialTexture" },
   { DxvkMemoryStats::Category::RTXRenderTarget, "RTXRenderTarget" },
   { DxvkMemoryStats::Category::RTXReplacementGeometry, "RTXReplacementGeometry" },
+  { DxvkMemoryStats::Category::RTXVertexCapture, "RTXVertexCapture" },
 };
 
 const char* DxvkMemoryStats::categoryToString(Category category) {

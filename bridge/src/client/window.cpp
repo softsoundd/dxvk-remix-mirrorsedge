@@ -167,11 +167,9 @@ void windowMsg(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         D3DDEVICE_CREATION_PARAMETERS create_parms = data.createParam;
         if (!(create_parms.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES) && !g_suppressWindowManagement) {
           if (wParam && !g_bActivateProcessed) {
-            RECT rect;
-            GetMonitorRect(GetDefaultMonitor(), &rect);
-            SetWindowPos(hWnd, HWND_TOP, rect.left, rect.top, presParams.BackBufferWidth, presParams.BackBufferHeight,
-              SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS);
-            Logger::info(format_string("Window's position is reset. Left: %d, Top: %d, Width: %d, Height: %d", rect.left, rect.top, presParams.BackBufferWidth, presParams.BackBufferHeight));
+            // Avoid SetWindowPos here: SIZE/POS churn races the Remix server mid-draw.
+            if (IsIconic(hWnd))
+              ShowWindowAsync(hWnd, SW_RESTORE);
             g_bActivateProcessed = true;
           } else if (!wParam) {
             if (IsWindowVisible(hWnd))
@@ -179,13 +177,8 @@ void windowMsg(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_bActivateProcessed = false;
           }
         }
-      } else if (msg == WM_SIZE) {
-        D3DDEVICE_CREATION_PARAMETERS create_parms = data.createParam;
-
-        if (!(create_parms.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES) && !IsIconic(hWnd) && !g_suppressWindowManagement) {
-          PostMessageW(hWnd, WM_ACTIVATEAPP, 1, GetCurrentThreadId());
-        }
       }
+      // No WM_SIZE -> WM_ACTIVATEAPP - that re-entry races Present under Bridge.
     }
   }
 }

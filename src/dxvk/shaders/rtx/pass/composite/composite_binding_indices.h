@@ -61,10 +61,7 @@
 #define COMPOSITE_SKY_LIGHT_TEXTURE                                 26
 #define COMPOSITE_ACTIVE_PIXEL_MASK_INPUT                           27
 #define COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT                   28
-#define COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT                    33
-#define COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT                  34
-#define COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT                  58
-#define COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT                59
+#define COMPOSITE_PIXEL_SAMPLING_RATE_INPUT                         58
 
 // Inputs/Outputs
 
@@ -77,6 +74,5 @@
 #define COMPOSITE_LAST_FINAL_OUTPUT                                 52
 #define COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT                       53
 
-#define COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT         54
-#define COMPOSITE_DEBUG_VIEW_OUTPUT                                 55
-#define COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT            57
+#define COMPOSITE_DEBUG_VIEW_OUTPUT                                 54
+#define COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT            55

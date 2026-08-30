@@ -135,6 +135,15 @@ struct ReplacementInstance {
     // so they don't churn dirty flags.
     Matrix4 textureTransform = Matrix4();
     TexGenMode texgenMode = TexGenMode::None;
+    // View-model draws must never spatially match world instances (and vice versa): held
+    // equipment renders the same mesh both ways per frame with near-identical keys, and
+    // cross-matching leaks view-model state onto the world shadow copy.
+    bool isViewModelDraw = false;
+    // Set when identityHash deliberately leaves the transform out, because the draw carries its own
+    // stable per-instance identity (DrawCallState::decomposedInstanceId). An exact identity match
+    // then no longer proves the transform held, so the lookup has to report the drift and move the
+    // instance's spatial entry itself rather than relying on that invariant.
+    bool identityExcludesTransform = false;
   };
 
   ReplacementInstance() = delete;
@@ -213,6 +222,9 @@ struct ReplacementInstance {
   // Stored as raw bits because CategoryFlags is defined later in this file.
   uint32_t categoryFlags = 0;
   bool isSkinned = false;
+
+  // See LookupKey::isViewModelDraw; spatial matching filters on this affinity.
+  bool isViewModelDraw = false;
 
   // When true, the aggregate object-space bounding boxes (geometryBoundingBox,
   // lightBoundingBox) will be recomputed from the replacement mesh/light data
@@ -495,6 +507,16 @@ struct RasterGeometry {
 };
 
 struct GeometryBufferData {
+  // Only float32 texcoord formats can be read as Vector2 on the CPU; anything else (games commonly
+  // pack UVs as half floats) is left absent below rather than mis-read, and is converted by the GPU
+  // interleaver instead. Callers that need texcoords on the CPU must consult this rather than
+  // RasterGeometry::texcoordBuffer.defined(), which would leave them reading through a null pointer.
+  static bool isCpuReadableTexcoordFormat(const VkFormat format) {
+    return format == VK_FORMAT_R32G32_SFLOAT
+        || format == VK_FORMAT_R32G32B32_SFLOAT
+        || format == VK_FORMAT_R32G32B32A32_SFLOAT;
+  }
+
   uint16_t* indexData;
   size_t indexStride;
 
@@ -531,16 +553,11 @@ struct GeometryBufferData {
 
     texcoordStride = 0;
     texcoordData = nullptr;
-    // Only float32 texcoord formats can be safely read as Vector2 on the CPU.
-    // R16G16_SFLOAT and other non-float32 formats are converted to R32G32_SFLOAT by the GPU interleaver;
-    // treat them as absent here to avoid mis-reading packed half-float data as float2.
-    if (geometryData.texcoordBuffer.defined()) {
-      const VkFormat texFmt = geometryData.texcoordBuffer.vertexFormat();
-      if (texFmt == VK_FORMAT_R32G32_SFLOAT || texFmt == VK_FORMAT_R32G32B32_SFLOAT || texFmt == VK_FORMAT_R32G32B32A32_SFLOAT) {
-        constexpr size_t texcoordSubElementSize = sizeof(float);
-        texcoordStride = geometryData.texcoordBuffer.stride() / texcoordSubElementSize;
-        texcoordData = (float*) geometryData.texcoordBuffer.mapPtr((size_t) geometryData.texcoordBuffer.offsetFromSlice());
-      }
+    if (geometryData.texcoordBuffer.defined() &&
+        isCpuReadableTexcoordFormat(geometryData.texcoordBuffer.vertexFormat())) {
+      constexpr size_t texcoordSubElementSize = sizeof(float);
+      texcoordStride = geometryData.texcoordBuffer.stride() / texcoordSubElementSize;
+      texcoordData = (float*) geometryData.texcoordBuffer.mapPtr((size_t) geometryData.texcoordBuffer.offsetFromSlice());
     }
 
     if (geometryData.normalBuffer.defined()) {
@@ -645,15 +662,26 @@ enum class InstanceCategories : uint32_t {
   ThirdPersonPlayerModel,
   ThirdPersonPlayerBody,
   IgnoreBakedLighting,
-  IgnoreTransparencyLayer,
   ParticleEmitter,
   SmoothNormals,
   HairCards,
+  ViewModel,
+  CullBackfacesInShadows,
 
   Count,
 };
 
 using CategoryFlags = Flags<InstanceCategories>;
+
+// External-camera regime flag written by SceneManager::prepareSceneData: while true, UE3
+// foreground-DPG draws skip the ViewModel category override and render as world geometry
+// (first-person overlay meshes like the held weapon show normally on external cameras).
+extern bool g_ue3ForegroundDemoteToWorld;
+
+// Number of foreground draws demoted since the last scene preparation; sampled and reset
+// there. Distinguishes self-inflicted ViewModel-camera absence (we demoted the overlay)
+// from genuine absence (the game drew no first-person overlay at all).
+extern uint32_t g_ue3ForegroundDemotedDrawCount;
 
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
@@ -661,6 +689,13 @@ struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;
   DrawCallState& operator=(const DrawCallState& drawCallState) = default;
+
+  // Non-zero identifies one hardware instance of a draw that was decomposed into an instance per
+  // hardware instance (D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates). Such an instance stays
+  // the same object while its transform changes every frame, so DrawCallTracker::computeIdentityHash
+  // keys on this instead of the transform; otherwise it would miss the exact-identity lookup every
+  // frame and fall back to a spatial search costing O(batch size) per instance.
+  XXH64_hash_t decomposedInstanceId = kEmptyHash;
 
   // Note: This uses the original material for the hash, not the replaced material
   const XXH64_hash_t getHash(const HashRule& rule) const {
@@ -755,14 +790,13 @@ struct DrawCallState {
   // those registers that can reconstruct as a plausible camera.
   bool allowMainCameraUpdate = true;
 
-  // Material identity hashes this draw would have produced under lightmap policy permutations
-  // that reference fewer material symbols; tried against the replacement database when the
-  // draw's own identity tiers miss (see rtx.d3d9.ue3LightmapPermutationBridgeLookup). Shared
-  // immutable list, memoized per material identity; null when inapplicable.
-  std::shared_ptr<const std::vector<XXH64_hash_t>> ue3LightmapPermutationAlternateHashes;
-
   // UE3 pass classification for diagnostics (points to a static string)
   const char* ue3PassDescription = "Unknown";
+
+  // Draw happened in UE3's SDPG_Foreground segment (after the mid-scene depth-only clear):
+  // first-person overlay geometry such as arms, held weapon, muzzle flash.
+  // See rtx.d3d9.ue3ForegroundDpgIsViewModel.
+  bool isUe3ForegroundDpg = false;
 
   float minZ = 0.0f;
   float maxZ = 1.0f;

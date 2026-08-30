@@ -101,6 +101,25 @@ private:
   // the entry from m_replacementInstances -- callers must handle that separately.
   void destroyReplacementInstance(ReplacementInstance* replacementInstance);
 
+  // rtx.logInstanceIdentityStats. candidatesExamined is the figure of interest: the spatial search
+  // scans a cell neighbourhood sized from rtx.uniqueObjectDistance, so a dense cluster of moving
+  // objects can land its whole batch in one cell and turn the search quadratic in the batch's size.
+  struct IdentityStats {
+    uint64_t l1Hits = 0;
+    uint64_t l2ExactTransformHits = 0;
+    uint64_t l2SpatialHits = 0;
+    uint64_t creates = 0;
+    uint64_t candidatesExamined = 0;
+    // Keys carrying their own transform-independent identity (LookupKey::identityExcludesTransform),
+    // which should be bypassing the search entirely.
+    uint64_t stableIdentityLookups = 0;
+    uint64_t stableIdentityL1Hits = 0;
+    uint32_t frames = 0;
+    uint32_t frameStamp = 0;
+  };
+  IdentityStats m_identityStats;
+  void reportIdentityStats();
+
   DxvkDevice* m_device;
 
   std::unordered_map<XXH64_hash_t, ReplacementInstance*> m_identityHashMap;

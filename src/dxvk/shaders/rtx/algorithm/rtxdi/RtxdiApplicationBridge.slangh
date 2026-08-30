@@ -470,8 +470,13 @@ float RAB_GetLightSampleTargetPdfForVolume(RAB_LightSample lightSample, RAB_Volu
   // Note: The target PDF is not normalized so it can be any sort of weight heuristic (rather than something that integrates to 1). This math is
   // based on the volume NEE math and should match reasonably well for minimizing noise in volumetric light selection.
 
-  // Todo: Factor in the HG phase function when we add anisotropy support.
-  const float phaseWeight = 1.0f;
+  // HG phase in volume RIS; omegaO = camera→volume (matches composite SH eval).
+  const float3 volumePos = volumeInteraction.volumeInteraction.position;
+  const float3 cameraPos = cameraGetWorldPosition(cb.camera);
+  const float3 omegaO = safeNormalize(volumePos - cameraPos, float3(0.0f, 1.0f, 0.0f));
+  const float3 omegaI = safeNormalize(lightSample.position - volumePos, float3(0.0f, 1.0f, 0.0f));
+  const float phaseWeight = evalHenyeyGreensteinPhaseFunction(
+    cb.volumeArgs.volumetricFogAnisotropy, dot(omegaO, omegaI));
   // Note: Safe division to do as the light sample's solid angle PDF has been checked to be not 0 by previous checks.
   const float lightThroughput = 1.0f / lightSample.solidAnglePdf;
   vec3 volumeAttenuation = vec3(1.0f);

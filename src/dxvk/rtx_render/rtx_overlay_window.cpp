@@ -144,11 +144,33 @@ void GameOverlay::hide() {
 
   if (m_mouseInsideOverlay) {
     m_mouseInsideOverlay = false;
-    ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
+    m_pendingImGuiMouseLeave.store(true, std::memory_order_release);
   }
 
   SetWindowPos(m_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   ShowWindow(m_hwnd, SW_HIDE);
+}
+
+void GameOverlay::flushPendingImGuiEvents() {
+  // ImGui context must be current (Present/render thread).
+  if (m_pendingImGuiMouseLeave.exchange(false, std::memory_order_acq_rel)) {
+    HWND hwnd = m_hwnd.load(std::memory_order_relaxed);
+    if (hwnd) {
+      ImGui_ImplWin32_WndProcHandler(hwnd, WM_MOUSELEAVE, 0, 0);
+    }
+  }
+
+  const int focus = m_pendingImGuiFocus.exchange(-1, std::memory_order_acq_rel);
+  if (focus >= 0) {
+    HWND hwnd = m_hwnd.load(std::memory_order_relaxed);
+    if (hwnd) {
+      ImGui_ImplWin32_WndProcHandler(hwnd, focus ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
+    }
+  }
+
+  const ImVec2 disp = ImGui::GetIO().DisplaySize;
+  m_displaySizeX.store(disp.x, std::memory_order_relaxed);
+  m_displaySizeY.store(disp.y, std::memory_order_relaxed);
 }
 
 void GameOverlay::gameWndProcHandler(HWND gameHwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -304,9 +326,7 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
   case WM_REMIX_SHOW_OVERLAY: show(); return 0;
   case WM_REMIX_HIDE_OVERLAY: hide(); return 0;
   case WM_REMIX_UPDATE_INPUT_FOCUS:
-    // The non-activating overlay does not receive focus messages itself.
-    ImGui_ImplWin32_WndProcHandler(
-      hWnd, wParam ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
+    m_pendingImGuiFocus.store(wParam ? 1 : 0, std::memory_order_release);
     return 0;
   case WM_DESTROY: PostQuitMessage(0); return 0;
 
@@ -332,18 +352,19 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (!isOurForeground()) {
       if (m_mouseInsideOverlay) { 
         m_mouseInsideOverlay = false;
-        ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
+        m_pendingImGuiMouseLeave.store(true, std::memory_order_release);
       }
       return 0;
     }
 
-    // Stable scale 
+    // Scale from last DisplaySize published on the Present thread (not GetIO here).
     float sx = 1.0f, sy = 1.0f;
     if (m_w > 0 && m_h > 0) {
-      const ImVec2 disp = ImGui::GetIO().DisplaySize;
-      if (disp.x > 0.0f && disp.y > 0.0f) {
-        sx = disp.x / (float) m_w;
-        sy = disp.y / (float) m_h;
+      const float dispX = m_displaySizeX.load(std::memory_order_relaxed);
+      const float dispY = m_displaySizeY.load(std::memory_order_relaxed);
+      if (dispX > 0.0f && dispY > 0.0f) {
+        sx = dispX / (float) m_w;
+        sy = dispY / (float) m_h;
       }
     }
 
@@ -426,7 +447,7 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
       } else {
         if (m_mouseInsideOverlay) {
           m_mouseInsideOverlay = false;
-          ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSELEAVE, 0, 0);
+          m_pendingImGuiMouseLeave.store(true, std::memory_order_release);
         }
       }
 

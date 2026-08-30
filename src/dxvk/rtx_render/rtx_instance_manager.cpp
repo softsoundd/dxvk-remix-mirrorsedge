@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -21,8 +21,10 @@
 */
 #include <assert.h>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <vector>
 
 #include "rtx_context.h"
@@ -183,6 +185,30 @@ namespace dxvk {
 
   void RtInstance::setBlas(BlasEntry& blas) {
     m_linkedBlas = &blas;
+    syncBufferIndicesFromBlas();
+  }
+
+  void RtInstance::syncBufferIndicesFromBlas() {
+    if (m_linkedBlas == nullptr) {
+      return;
+    }
+    const RaytraceGeometry& geo = m_linkedBlas->modifiedGeometryData;
+    surface.positionBufferIndex = geo.positionBufferIndex;
+    surface.positionOffset      = geo.positionBuffer.offsetFromSlice();
+    surface.positionStride      = geo.positionBuffer.stride();
+    surface.normalBufferIndex   = geo.normalBufferIndex;
+    surface.normalOffset        = geo.normalBuffer.offsetFromSlice();
+    surface.normalStride        = geo.normalBuffer.stride();
+    surface.normalFormat        = geo.normalBuffer.vertexFormat();
+    surface.color0BufferIndex   = geo.color0BufferIndex;
+    surface.color0Offset        = geo.color0Buffer.offsetFromSlice();
+    surface.color0Stride        = geo.color0Buffer.stride();
+    surface.texcoordBufferIndex = geo.texcoordBufferIndex;
+    surface.texcoordOffset      = geo.texcoordBuffer.offsetFromSlice();
+    surface.texcoordStride      = geo.texcoordBuffer.stride();
+    surface.previousPositionBufferIndex = geo.previousPositionBufferIndex;
+    surface.indexBufferIndex    = geo.indexBufferIndex;
+    surface.indexStride         = geo.indexBuffer.stride();
   }
 
   void RtInstance::copyInstanceDataFrom(const RtInstance& src) {
@@ -247,10 +273,14 @@ namespace dxvk {
       m_vkInstance.transform = savedVkTransform;
     }
 
+    // Clones are not linked into BlasEntry::m_linkedInstances (see createInstanceCopy), so
+    // updateBufferCache's push never reaches them. Re-derive from the BLAS rather than relying on
+    // the reference instance having been refreshed first.
+    syncBufferIndicesFromBlas();
+
     // Mark dirty so the incremental BLAS cache treats this instance as changed.
     m_blasDirty = true;
     m_billboardGeometryDirty = true;
-
   }
 
   void RtInstance::onTransformChanged() {
@@ -941,26 +971,13 @@ namespace dxvk {
     m_instances.push_back(newInstance);
     notifySceneChanged();
 
-    return newInstance;
-  }
+    // Renderer-created clones (view model, player model, ray-portal virtual instances) deliberately
+    // skip onInstanceAdded, so BlasEntry::linkInstance is never called for them and
+    // updateBufferCache's propagation will not reach them. Derive the indices straight from the BLAS
+    // instead of trusting the indices copied from the reference instance.
+    newInstance->syncBufferIndicesFromBlas();
 
-  void InstanceManager::processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const {
-    currentInstance.surface.positionBufferIndex = blas.modifiedGeometryData.positionBufferIndex;
-    currentInstance.surface.positionOffset = blas.modifiedGeometryData.positionBuffer.offsetFromSlice();
-    currentInstance.surface.positionStride = blas.modifiedGeometryData.positionBuffer.stride();
-    currentInstance.surface.normalBufferIndex = blas.modifiedGeometryData.normalBufferIndex;
-    currentInstance.surface.normalOffset = blas.modifiedGeometryData.normalBuffer.offsetFromSlice();
-    currentInstance.surface.normalStride = blas.modifiedGeometryData.normalBuffer.stride();
-    currentInstance.surface.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
-    currentInstance.surface.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
-    currentInstance.surface.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
-    currentInstance.surface.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
-    currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
-    currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
-    currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
-    currentInstance.surface.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
-    currentInstance.surface.indexBufferIndex = blas.modifiedGeometryData.indexBufferIndex;
-    currentInstance.surface.indexStride = blas.modifiedGeometryData.indexBuffer.stride();
+    return newInstance;
   }
 
   // Returns true if the instance was modified
@@ -1067,8 +1084,6 @@ namespace dxvk {
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate) {
 
       if (isFirstUpdateThisFrame) {
-        processInstanceBuffers(blas, currentInstance);
-
         currentInstance.m_materialType = materialData->getType();
 
         const XXH64_hash_t materialInstanceHash = materialData->getHash();
@@ -1108,7 +1123,7 @@ namespace dxvk {
         }
         currentInstance.surface.colorTextureIsSrgb = colorTextureIsSrgb;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
-        currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
+        currentInstance.surface.cullBackfacesInShadows = currentInstance.testCategoryFlags(InstanceCategories::CullBackfacesInShadows);
 
         // Note: Skip the spritesheet adjustment logic in the surface interaction when using Ray Portal materials as this logic
         // is done later in the Surface Material Interaction (and doing it in both places will just double up the animation).
@@ -1166,7 +1181,14 @@ namespace dxvk {
                                    || currentInstance.testCategoryFlags(InstanceCategories::Particle)
                                    || currentInstance.testCategoryFlags(InstanceCategories::WorldUI);
 
-        hasPreviousPositions = blas.modifiedGeometryData.previousPositionBuffer.defined() && !isMotionUnstable;
+        // previousPositionBuffer is only re-pointed at historyBuffer[1] by processGeometryInfo on a
+        // kUpdateBVH frame. On any later frame it still holds that older slice - e.g. a preserved
+        // BLAS, or the kUpdateInstance early-out in onSceneObjectUpdated when a sibling draw already
+        // touched this BlasEntry. Gate on frameLastUpdated so stale vertices never feed motion vectors.
+        const bool previousPositionsValidThisFrame = blas.frameLastUpdated == m_device->getCurrentFrameId();
+        hasPreviousPositions = previousPositionsValidThisFrame
+                            && blas.modifiedGeometryData.previousPositionBuffer.defined()
+                            && !isMotionUnstable;
         const bool isFirstUpdateAfterCreation = currentInstance.isCreatedThisFrame(m_device->getCurrentFrameId()) && isFirstUpdateThisFrame;
 
         // Note: objectToView is aliased on updates, since findSimilarInstance() doesn't discern it
@@ -1387,15 +1409,24 @@ namespace dxvk {
       bool hasPreviousPositions,
       bool isFirstUpdateThisFrame,
       bool fireEvents) {
-    // Camera registration. Idempotent (RtInstance::m_seenCameraTypes is cumulative and never
-    // cleared), so calling it from updateInstance and again here is harmless. We need it on
-    // the preserve path because that path bypasses updateInstance entirely.
-    instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
+    // Camera registration. This is per-instance, so this detects the first time an instance
+    // is drawn with a given camera each frame.
+    const bool isNewCameraTypeThisFrame =
+        instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
 
     // Re-register view-model candidates every frame; m_viewModelCandidates is cleared in
     // onFrameEnd, and createViewModelInstances() iterates the list later in the frame.
-    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isFirstUpdateThisFrame) {
+    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isNewCameraTypeThisFrame) {
       registerViewModelCandidate(instance);
+    }
+
+    // Clear stale view-model custom index bits inherited from cross-matched frames: an
+    // instance owned by a non-view-model draw this frame is not a view-model reference,
+    // and genuine references are re-flagged every frame by createViewModelInstances.
+    if (drawCall.cameraType != CameraType::ViewModel &&
+        !instance.isCameraRegistered(CameraType::ViewModel) &&
+        instance.isViewModel()) {
+      instance.setCustomIndexBit(CUSTOM_INDEX_IS_VIEW_MODEL, false);
     }
 
     // Re-register player-model instances every frame. m_playerModelInstances is cleared
@@ -1423,6 +1454,8 @@ namespace dxvk {
   }
 
   void InstanceManager::removeInstance(RtInstance* instance) {
+    m_heldEquipmentInstances.erase(instance);
+
     // Always clean up replacement instance references, even for renderer-created instances
     // to avoid use-after-free bugs in ReplacementInstance.prims
     instance->getPrimInstanceOwner().setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex, instance, PrimInstance::Type::Instance);
@@ -1515,6 +1548,9 @@ namespace dxvk {
 
     auto cleanupAllPersistentViewModelInstances = [this]() {
       for (auto& [ref, inst] : m_persistentViewModelInstances) {
+        // Zero the mask in addition to marking for GC: garbage collection can linger for
+        // several frames, and a hide decision must take effect on this frame's TLAS.
+        inst->getVkInstance().mask = 0;
         inst->markForGarbageCollection();
       }
       m_persistentViewModelInstances.clear();
@@ -1530,8 +1566,18 @@ namespace dxvk {
       return;
     }
 
-    // If the first person player model is enabled, hide the view model.
-    if (RtxOptions::PlayerModel::enableInPrimarySpace()) {
+    // Hide the view model when the third-person player model is shown on primary rays.
+    if (m_externalCameraRegime) {
+      for (auto* candidateInstance : m_viewModelCandidates) {
+        candidateInstance->m_vkInstance.mask = 0;
+      }
+      cleanupAllPersistentViewModelInstances();
+      return;
+    }
+
+    // Scoped-zoom hiding: games hide the view model while zoomed via raster tricks ray
+    // tracing ignores. State computed per frame in SceneManager::prepareSceneData.
+    if (m_viewModelHidden) {
       for (auto* candidateInstance : m_viewModelCandidates) {
         candidateInstance->m_vkInstance.mask = 0;
       }
@@ -1576,11 +1622,11 @@ namespace dxvk {
     std::unordered_set<RtInstance*> activeViewModelReferences;
     for (auto* candidateInstance : m_viewModelCandidates) {
 
-      // Valid view model instances must be associated only with the view model camera
-      // Check: exactly one bit set (power-of-two check via raw bitmask)
-      const auto seenMask = candidateInstance->m_seenCameraTypes.raw();
-      if (seenMask == 0 || (seenMask & (seenMask - 1)) != 0)
+      // A valid view-model reference must have been drawn with the view-model camera this
+      // frame.
+      if (!candidateInstance->isCameraRegistered(CameraType::ViewModel)) {
         continue;
+      }
 
       // Hide the reference instance since we'll create a separate instance for the view model 
       candidateInstance->m_vkInstance.mask = 0;
@@ -1597,6 +1643,19 @@ namespace dxvk {
 
     // Create virtual instances for the view model instances
     createRayPortalVirtualViewModelInstances(viewModelInstances, cameraManager, rayPortalManager);
+  }
+
+  // World-space representative position for player-model distance filtering. UE3 skinned
+  // draws carry identity object transforms with bind-pose bounds, so only their bone-derived
+  // world anchor is a real world position (same rule as BLAS matching in rtx_draw_call_cache).
+  // Rigid draws use the transformed bounds centroid, which falls back to the instance
+  // translation when bounds were not computed.
+  static Vector3 getPlayerModelInstancePosition(const RtInstance& instance) {
+    const DrawCallState& input = instance.getBlas()->input;
+    if (input.hasSkinnedWorldAnchor()) {
+      return input.getSkinnedWorldAnchor();
+    }
+    return input.getGeometryData().boundingBox.getTransformedCentroid(instance.getTransform());
   }
 
   static bool isInsidePlayerModel(const Vector3& playerModelPosition, const Vector3& instancePosition) {
@@ -1662,7 +1721,7 @@ namespace dxvk {
           --i;
         }
       } else {
-        const Vector3 instancePosition = instance->getTransform()[3].xyz();
+        const Vector3 instancePosition = getPlayerModelInstancePosition(*instance);
 
         if (!isInsidePlayerModel(playerModelPosition, instancePosition)) {
           // Note: just use the OPAQUE flag here, which works for Portal with current assets.
@@ -1768,6 +1827,225 @@ namespace dxvk {
     *out_FarPortalInfo = (portalIndexForVirtualInstances >= 0) ? &rayPortalPair->pairInfos[!portalIndexForVirtualInstances] : nullptr;
   }
 
+  void InstanceManager::updatePlayerModelBodyCameraDistance(const CameraManager& cameraManager) {
+    m_playerModelBodyCameraDistance = -1.f;
+
+    if (m_playerModelInstances.empty()) {
+      return;
+    }
+
+    // Player-model instances are all pieces of the player, so their minimum camera distance
+    // is the camera-to-player distance. Minimum across both position sources per instance:
+    // degenerate positions (identity transform / bind-pose bounds on captured draws) read as
+    // far away and must not fake an external camera.
+    const Vector3 cameraPosition = cameraManager.getMainCamera().getPosition(/* freecam = */ false);
+    float minDistanceSqr = FLT_MAX;
+    for (const RtInstance* instance : m_playerModelInstances) {
+      const DrawCallState& input = instance->getBlas()->input;
+      const float renderDistanceSqr =
+        lengthSqr(getPlayerModelInstancePosition(*instance) - cameraPosition);
+      const float logicalDistanceSqr = lengthSqr(
+        input.getGeometryData().boundingBox.getTransformedCentroid(input.getTransformData().objectToWorld) - cameraPosition);
+      minDistanceSqr = std::min(minDistanceSqr, std::min(renderDistanceSqr, logicalDistanceSqr));
+    }
+
+    m_playerModelBodyCameraDistance = std::sqrt(minDistanceSqr);
+
+    logPlayerModelInstances(cameraPosition);
+  }
+
+  void InstanceManager::hideDistantPlayerModelInstances(const CameraManager& cameraManager) {
+    const float maxDistance = RtxOptions::PlayerModel::firstPersonMaxDistance();
+
+    // Only meaningful while the player model is standing in for the camera's own body. External
+    // cameras are supposed to see it wherever it is.
+    if (maxDistance <= 0.f || m_externalCameraRegime || m_playerModelInstances.empty()) {
+      return;
+    }
+
+    const Vector3 cameraPosition = cameraManager.getMainCamera().getPosition(/* freecam = */ false);
+    const float maxDistanceSq = maxDistance * maxDistance;
+
+    for (size_t i = 0; i < m_playerModelInstances.size();) {
+      RtInstance* instance = m_playerModelInstances[i];
+      if (lengthSqr(getPlayerModelInstancePosition(*instance) - cameraPosition) <= maxDistanceSq) {
+        ++i;
+        continue;
+      }
+
+      instance->getVkInstance().mask = 0;
+      // Particle instances carry their visibility on the billboards rather than the instance mask.
+      for (uint32_t billboardIndex = 0; billboardIndex < instance->m_billboardCount; ++billboardIndex) {
+        m_billboards[billboardIndex + instance->m_firstBillboard].instanceMask = 0;
+      }
+
+      // Dropped from the list so virtual instances are not created for it either.
+      m_playerModelInstances.erase(m_playerModelInstances.begin() + i);
+    }
+  }
+
+  void InstanceManager::logPlayerModelInstances(const Vector3& cameraPosition) {
+    if (!RtxOptions::PlayerModel::logCameraRegime()) {
+      return;
+    }
+
+    // Throttled: this walks every player-model draw, and the question it answers - whether a
+    // second, stationary copy of the player mesh is being submitted - is visible at any sample.
+    constexpr uint32_t kIntervalFrames = 60;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (frameId - m_lastLoggedPlayerModelInstancesFrame < kIntervalFrames) {
+      return;
+    }
+    m_lastLoggedPlayerModelInstancesFrame = frameId;
+
+    for (const RtInstance* instance : m_playerModelInstances) {
+      const DrawCallState& input = instance->getBlas()->input;
+      const Vector3 anchor = getPlayerModelInstancePosition(*instance);
+
+      // A bone hash that never changes means the game is submitting the same pose every frame.
+      // One that changes while the mesh still renders in bind pose means the instance is being
+      // handed another copy's geometry instead of its own.
+      Logger::info(str::format(
+        "[RTX-PlayerModel] topologyHash=0x",
+        std::hex, std::uppercase, input.getGeometryData().getHashForRule<rules::TopologicalHash>(),
+        " boneHash=0x", input.getSkinningState().boneHash, std::nouppercase, std::dec,
+        " hasAnchor=", input.hasSkinnedWorldAnchor() ? 1 : 0,
+        " anchor=(", anchor.x, ", ", anchor.y, ", ", anchor.z, ")",
+        " camDist=", length(anchor - cameraPosition),
+        " frame=", frameId));
+    }
+  }
+
+  void InstanceManager::detectHeldEquipmentInstances(const fast_unordered_set& viewModelTopologyHashes,
+                                                     const CameraManager& cameraManager) {
+    if (!RtxOptions::PlayerModel::autoDetectHeldEquipment() || viewModelTopologyHashes.empty()) {
+      return;
+    }
+
+    const uint32_t currentFrame = m_device->getCurrentFrameId();
+    const Vector3 cameraPosition = cameraManager.getMainCamera().getPosition(/* freecam = */ false);
+    const float maxDistance = RtxOptions::PlayerModel::heldEquipmentMaxDistance();
+    const float maxDistanceSq = maxDistance * maxDistance;
+
+    // Held equipment renders twice: a view-model copy for the POV and a world-space copy the
+    // game keeps as shadow caster. Per view-model topology hash, the world instance closest
+    // to the camera is that shadow copy. Only that one becomes a player-model instance;
+    // other instances of the same mesh (dropped or NPC-held duplicates) stay world geometry.
+    std::unordered_map<XXH64_hash_t, std::pair<RtInstance*, float>> closestPerHash;
+
+    for (RtInstance* instance : m_instances) {
+      if (instance->isMarkedForGC() || instance->isHidden() ||
+          instance->getFrameLastUpdated() != currentFrame ||
+          instance->getVkInstance().mask == 0) {
+        continue;
+      }
+      // The view-model copies themselves: the hidden reference (mask 0, caught above), the
+      // renderer-created perspective-corrected clone (custom-index view-model bit), and any
+      // other renderer-created instance (virtual copies). Also anything already player-model:
+      // explicitly tagged body/equipment goes through the regular category + body-filter path.
+      if (instance->isCameraRegistered(CameraType::ViewModel) ||
+          instance->isViewModel() ||
+          instance->m_isCreatedByRenderer ||
+          instance->m_isPlayerModel) {
+        continue;
+      }
+      // Particle/billboard topologies are trivial and collide across unrelated systems.
+      if (instance->m_isUnordered) {
+        continue;
+      }
+
+      const XXH64_hash_t topologyHash =
+        instance->getBlas()->input.getGeometryData().getHashForRule<rules::TopologicalHash>();
+      if (!lookupHash(viewModelTopologyHashes, topologyHash)) {
+        continue;
+      }
+
+      // Two position sources: the render/TLAS transform (identity for captured draws whose
+      // vertex data is already world-space) and the draw's logical object transform (may
+      // retain the real extracted transform for such draws). Accept whichever is nearer.
+      const DrawCallState& input = instance->getBlas()->input;
+      const float distanceSq = std::min(
+        lengthSqr(getPlayerModelInstancePosition(*instance) - cameraPosition),
+        lengthSqr(input.getGeometryData().boundingBox.getTransformedCentroid(input.getTransformData().objectToWorld) - cameraPosition));
+      if (distanceSq > maxDistanceSq) {
+        continue;
+      }
+
+      auto [iter, isNew] = closestPerHash.emplace(topologyHash, std::make_pair(instance, distanceSq));
+      if (!isNew && distanceSq < iter->second.second) {
+        iter->second = std::make_pair(instance, distanceSq);
+      }
+    }
+
+    // A moving FOV marks a zoom transition in progress: the game stops the twin draws on
+    // the very first zoom frame, several frames before the FOV crosses the hide threshold,
+    // and twins only resume on the last frame of the zoom-out ramp.
+    const float vmFovDegreesNow =
+      cameraManager.getCamera(CameraType::ViewModel).getFov() * 180.f / 3.14159265f;
+    const bool fovTransitioning = std::abs(vmFovDegreesNow - m_heldEquipmentPrevFovDegrees) > 1.f;
+    m_heldEquipmentPrevFovDegrees = vmFovDegreesNow;
+
+    if (m_externalCameraRegime) {
+      // External cameras show the player model in primary space; held equipment stays
+      // regular world geometry there.
+      m_heldEquipmentInstances.clear();
+    } else {
+      // Fresh winners (re)confirm their classification.
+      for (const auto& [topologyHash, candidate] : closestPerHash) {
+        RtInstance* heldInstance = candidate.first;
+        heldInstance->m_isPlayerModel = true;
+        heldInstance->getVkInstance().mask = OBJECT_MASK_PLAYER_MODEL;
+        m_heldEquipmentInstances[heldInstance] = currentFrame;
+        // Deliberately not registered into m_playerModelInstances: held-ness is proven by the
+        // view-model twin, so the body-anchored distance filter must not second-guess it.
+      }
+
+      // Instances without a twin this frame stay classified while the view model is
+      // force-hidden (scoped zoom) or while the FOV is mid-transition, with a small grace
+      // window bridging frame-to-frame twin jitter. A genuinely dropped weapon (stable FOV,
+      // twin gone) releases within a few frames, before the throw arc makes it noticeable.
+      constexpr uint32_t kTwinJitterGraceFrames = 3;
+      for (auto it = m_heldEquipmentInstances.begin(); it != m_heldEquipmentInstances.end();) {
+        RtInstance* heldInstance = it->first;
+        if (heldInstance->isMarkedForGC() || heldInstance->getFrameLastUpdated() != currentFrame) {
+          it = m_heldEquipmentInstances.erase(it);
+          continue;
+        }
+        if (it->second != currentFrame) {
+          if (m_viewModelHidden || fovTransitioning) {
+            // Hold, and keep the confirmation fresh so the jitter grace restarts once the
+            // zoom settles (twins resume on the final frame of the zoom-out ramp).
+            it->second = currentFrame;
+          } else if (currentFrame - it->second > kTwinJitterGraceFrames) {
+            it = m_heldEquipmentInstances.erase(it);
+            continue;
+          }
+          heldInstance->m_isPlayerModel = true;
+          heldInstance->getVkInstance().mask = OBJECT_MASK_PLAYER_MODEL;
+        }
+        ++it;
+      }
+    }
+
+    // Log classification transitions (held-instance count changes) only.
+    const size_t heldCount = m_heldEquipmentInstances.size();
+    if (heldCount != m_heldEquipmentLastWinnerCount) {
+      m_heldEquipmentLastWinnerCount = heldCount;
+
+      std::ostringstream held;
+      for (const auto& [heldInstance, lastConfirmedFrame] : m_heldEquipmentInstances) {
+        held << std::hex << std::uppercase
+             << heldInstance->getBlas()->input.getGeometryData().getHashForRule<rules::TopologicalHash>()
+             << std::dec << " ";
+      }
+      Logger::debug(str::format(
+        "[RTX-HeldEquipment] held=[ ", held.str(),
+        "] externalCamera=", m_externalCameraRegime ? 1 : 0,
+        " viewModelHidden=", m_viewModelHidden ? 1 : 0,
+        " playerCamDist=", m_playerModelBodyCameraDistance));
+    }
+  }
+
   void InstanceManager::createPlayerModelVirtualInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager) {
     auto cleanupAllPersistentPlayerModelClones = [this]() {
       for (auto& [ref, inst] : m_persistentPlayerModelClones) {
@@ -1799,8 +2077,7 @@ namespace dxvk {
       return;
     }
 
-    // Get the position from the transform matrix - works for Portal
-    Vector3 playerModelPosition = bodyInstance->getTransform()[3].xyz();
+    const Vector3 playerModelPosition = getPlayerModelInstancePosition(*bodyInstance);
 
     // Detect instances that are too far away from the body, make them regular objects.
     // This fixes the guns placed on pedestals to be picked up.

@@ -58,6 +58,10 @@ namespace dxvk {
   static constexpr uint32_t kVertexCaptureFlag_BlendIndicesInputNormalized = 1u << 3;
   static constexpr uint32_t kVertexCaptureFlag_BlendWeightsInputUnnormalized = 1u << 4;
   static constexpr uint32_t kVertexCaptureFlag_PositionFromInput = 1u << 5;
+  // Capture the position the shader itself computed before projection, rather than
+  // inverting its clip-space output. Only valid when the vertex shader's oPos transform
+  // was recognised (see DxsoPreProjectionPositionInfo).
+  static constexpr uint32_t kVertexCaptureFlag_PositionFromPreProjection = 1u << 6;
 
   struct D3D9RtxVertexCaptureData {
     Matrix4 normalTransform;

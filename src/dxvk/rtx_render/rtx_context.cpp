@@ -793,8 +793,10 @@ namespace dxvk {
         // Final output pass converts the linear post-tonemap LDR image to sRGB and applies
         // dithering as the very last step. SRGB conversion is suppressed for screenshot
         // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
-        // for 16bit float formats).
-        const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
+        // for 16bit float formats), and when the Mirror's Edge (UE3) tonemapper ran: its
+        // output is already display-encoded (gamma 2.0 + colour curves), matching what the
+        // game wrote to its backbuffer, so only dithering applies.
+        const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
         dispatchSRGBDither(rtOutput, performSRGBConversion);
 
         if (captureScreenImage) {
@@ -968,6 +970,10 @@ namespace dxvk {
     for (uint32_t i = 0; i < numLights; i++) {
       getSceneManager().addLight(pLights[i]);
     }
+  }
+
+  void RtxContext::setUe3ToneMapCapture(const Ue3ToneMapCapture& capture) {
+    m_common->metaUe3ToneMapping().onCapture(capture, m_device->getCurrentFrameId());
   }
 
   void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
@@ -1174,9 +1180,6 @@ namespace dxvk {
     constants.psrrMaxBounces = RtxOptions::psrrMaxBounces();
     constants.pstrMaxBounces = RtxOptions::pstrMaxBounces();
 
-    auto& rayReconstruction = m_common->metaRayReconstruction();
-    constants.outputParticleLayer = useRR && rayReconstruction.useParticleBuffer();
-
     auto& rtxdi = m_common->metaRtxdiRayQuery();
     constants.enableEmissiveBlendEmissiveOverride = RtxOptions::enableEmissiveBlendEmissiveOverride();
     constants.enableRtxdi = RtxOptions::useRTXDI();
@@ -1190,6 +1193,10 @@ namespace dxvk {
     constants.enablePSTRSecondaryIncidentSplitApproximation = RtxOptions::enablePSTRSecondaryIncidentSplitApproximation();
     constants.psrrNormalDetailThreshold = RtxOptions::psrrNormalDetailThreshold();
     constants.pstrNormalDetailThreshold = RtxOptions::pstrNormalDetailThreshold();
+    const float meterToWorld = RtxOptions::getMeterToWorldUnitScale();
+    constants.psrMaxDistance = RtxOptions::psrMaxDistanceMeters() * meterToWorld;
+    constants.psrMaxDistanceFade = std::min(
+      RtxOptions::psrMaxDistanceFadeMeters(), RtxOptions::psrMaxDistanceMeters()) * meterToWorld;
     constants.enableDirectLighting = RtxOptions::enableDirectLighting();
     constants.enableStochasticAlphaBlend = m_common->metaComposite().enableStochasticAlphaBlend();
     constants.enableSeparateUnorderedApproximations = RtxOptions::enableSeparateUnorderedApproximations() && getResourceManager().getTLAS(Tlas::Unordered).accelStructure != nullptr;
@@ -1223,15 +1230,19 @@ namespace dxvk {
     auto& sparseRendering = m_common->metaSparseRendering();
     if (constants.enableDirectLightBoilingFilter && sparseRendering.isActive()) {
       // RR path disables direct light boiling filter, but in case someone manually enables it.
-      // Technically it can be supported if needed in the future - it would need to ensure a spatial locality of remapped pixels to work for the filter
-      // (it may already since it has group based expectations).
+      // The filter is group cooperative - it accumulates into groupshared memory across
+      // GroupMemoryBarrierWithGroupSync() and zero initializes that memory from a single thread.
+      // Sparse rendering runs it on direct active threads only, so part of the group would skip
+      // the barriers and the accumulators could stay uninitialized. Supporting it needs every
+      // thread in the group to reach the barriers, not just spatial locality of remapped pixels.
       ONCE(Logger::warn("[RTX] Direct Light Boiling Filter is not supported with Sparse Rendering enabled."));
       constants.enableDirectLightBoilingFilter = false;
     }
 
     constants.directLightBoilingThreshold = m_common->metaDemodulate().directLightBoilingThreshold();
     constants.translucentDecalAlbedoFactor = RtxOptions::translucentDecalAlbedoFactor();
-    constants.enablePlayerModelInPrimarySpace = RtxOptions::PlayerModel::enableInPrimarySpace();
+    constants.enablePlayerModelInPrimarySpace =
+      getSceneManager().getInstanceManager().isExternalCameraRegime();
     constants.enablePlayerModelPrimaryShadows = RtxOptions::PlayerModel::enablePrimaryShadows();
     constants.enablePreviousTLAS = RtxOptions::enablePreviousTLAS() && m_common->getSceneManager().isPreviousFrameSceneAvailable();
 
@@ -1269,6 +1280,7 @@ namespace dxvk {
     constants.sssTransmissionBsdfSampleCount = RtxOptions::SubsurfaceScattering::transmissionBsdfSampleCount();
     constants.sssTransmissionSingleScatteringSampleCount = RtxOptions::SubsurfaceScattering::transmissionSingleScatteringSampleCount();
     constants.enableTransmissionDiffusionProfileCorrection = RtxOptions::SubsurfaceScattering::enableTransmissionDiffusionProfileCorrection();
+    constants.metersToWorldUnitScale = RtxOptions::getMeterToWorldUnitScale();
     constants.enableHeuristicSingleScatteringTransmission = RtxOptions::SubsurfaceScattering::enableHeuristicSingleScatteringTransmission();
     constants.sssArgs.diffusionProfileDebuggingPixel = u16vec2 {
       static_cast<uint16_t>(RtxOptions::SubsurfaceScattering::diffusionProfileDebugPixelPosition().x),
@@ -1421,6 +1433,7 @@ namespace dxvk {
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
+    constants.enableShadowBackfaceSkip = getSceneManager().getAccelManager().hasShadowBackfaceSkipInstances();
 
     constants.domeLightArgs = getSceneManager().getLightManager().getDomeLightArgs();
 
@@ -1634,24 +1647,19 @@ namespace dxvk {
   }
 
   void RtxContext::dispatchDenoise(const Resources::RaytracingOutput& rtOutput) {
-    auto& rayReconstruction = getCommonObjects()->metaRayReconstruction();
-
     // Primary direct denoiser used for primary direct lighting when separated, otherwise a special combined direct+indirect denoiser is used when both direct and indirect signals are combined.
     DxvkDenoise& denoiser0 = RtxOptions::denoiseDirectAndIndirectLightingSeparately() ? m_common->metaPrimaryDirectLightDenoiser() : m_common->metaPrimaryCombinedLightDenoiser();
     DxvkDenoise& referenceDenoiserSecondLobe0 = m_common->metaReferenceDenoiserSecondLobe0();
     // Primary Indirect denoiser used for primary indirect lighting when separated.
     DxvkDenoise& denoiser1 = m_common->metaPrimaryIndirectLightDenoiser();
     DxvkDenoise& referenceDenoiserSecondLobe1 = m_common->metaReferenceDenoiserSecondLobe1();
-    // Secondary combined denoiser always used for secondary lighting.
+    // Secondary combined denoiser used for secondary lighting when NRD is active.
     DxvkDenoise& denoiser2 = m_common->metaSecondaryCombinedLightDenoiser();
     DxvkDenoise& referenceDenoiserSecondLobe2 = m_common->metaReferenceDenoiserSecondLobe2();
 
-    bool shouldDenoise = false;
-    if (useRayReconstruction()) {
-      shouldDenoise = (rayReconstruction.enableNRDForTraining() && !RtxOptions::useDenoiserReferenceMode()) || rayReconstruction.preprocessSecondarySignal();
-    } else {
-      shouldDenoise = RtxOptions::useDenoiser() && !RtxOptions::useDenoiserReferenceMode();
-    }
+    const bool shouldDenoise = !useRayReconstruction()
+      && RtxOptions::useDenoiser()
+      && !RtxOptions::useDenoiserReferenceMode();
 
     if (!shouldDenoise) {
       denoiser0.releaseResources();
@@ -1693,10 +1701,7 @@ namespace dxvk {
         denoiser.dispatch(this, m_execBarriers, rtOutput, denoiseInput, denoiseOutput);
     };
 
-    const bool isSecondaryOnly = rayReconstruction.denoiseSecondarySignalWithExternalDenoiser();
-
     // Primary Direct light denoiser
-    if (!isSecondaryOnly)
     {
       ScopedGpuProfileZone(this, "Primary Direct Denoising");
       
@@ -1718,13 +1723,10 @@ namespace dxvk {
       denoiseOutput.specular_hitT = &rtOutput.m_primaryDirectSpecularRadiance.resource(Resources::AccessType::Write);
 
       runDenoising(denoiser0, referenceDenoiserSecondLobe0, denoiseInput, denoiseOutput);
-    } else {
-      denoiser0.releaseResources();
-      referenceDenoiserSecondLobe0.releaseResources();
     }
 
     // Primary Indirect light denoiser, if separate denoiser is used.
-    if (RtxOptions::denoiseDirectAndIndirectLightingSeparately() && !isSecondaryOnly)
+    if (RtxOptions::denoiseDirectAndIndirectLightingSeparately())
     {
       ScopedGpuProfileZone(this, "Primary Indirect Denoising");
 
@@ -1838,6 +1840,8 @@ namespace dxvk {
   void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
 
+    m_ue3DisplayTransformApplied = false;
+
     if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PRE_TONEMAP_OUTPUT) {
       return;
     }
@@ -1862,6 +1866,17 @@ namespace dxvk {
         GlobalTime::get().deltaTimeMs(),
         resetToneMapperHistory,
         autoExposure.enabled());
+    } else if (RtxOptions::tonemappingMode() == TonemappingMode::MirrorsEdge) {
+      // Mirror's Edge (UE3) display transform: outputs display-encoded color
+      // (gamma + colour curves), consumed by the srgb_dither pass with its
+      // sRGB conversion skipped.
+      DxvkUe3ToneMapping& ue3ToneMapper = m_common->metaUe3ToneMapping();
+      ue3ToneMapper.dispatch(this,
+        getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+        autoExposure.getExposureTexture().view,
+        rtOutput,
+        autoExposure.enabled());
+      m_ue3DisplayTransformApplied = true;
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
     if (localTonemapper.isActive()) {
@@ -2188,7 +2203,7 @@ namespace dxvk {
             const uint32_t* readback = mapAs<const uint32_t*>(cReadbackDst);
             if (!readback || cReadbackDst->info().size < onePixelInBytes) {
               assert(0);
-              cCallback(std::vector<ObjectPickingValue>{}, std::nullopt);
+              cCallback(std::vector<ObjectPickingValue>{}, std::nullopt, std::nullopt);
               return;
             }
 
@@ -2211,12 +2226,15 @@ namespace dxvk {
             auto legacyHashForPrimaryValue = g_allowMappingLegacyHashToObjectPickingValue ?
               m_common->getSceneManager().findLegacyTextureHashByObjectPickingValue(primaryValue) :
               std::optional<XXH64_hash_t>{};
+            auto geometryHashForPrimaryValue = g_allowMappingLegacyHashToObjectPickingValue ?
+              m_common->getSceneManager().findGeometryHashByObjectPickingValue(primaryValue) :
+              std::optional<XXH64_hash_t>{};
 
-            cCallback(std::move(values), legacyHashForPrimaryValue);
+            cCallback(std::move(values), legacyHashForPrimaryValue, geometryHashForPrimaryValue);
           }
         ));
       } else {
-        request->callback(std::vector<ObjectPickingValue>{}, std::nullopt);
+        request->callback(std::vector<ObjectPickingValue>{}, std::nullopt, std::nullopt);
       }
     }
 

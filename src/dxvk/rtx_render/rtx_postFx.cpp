@@ -379,6 +379,7 @@ namespace dxvk {
       RemixGui::Checkbox("Motion Blur Enabled", &enableMotionBlurObject());
       if (enableMotionBlur()) {
         RemixGui::Combo("Motion Blur Mode", &motionBlurModeObject(), "Legacy\0Cinematic (Feature-Aware)\0");
+        RemixGui::Checkbox("Motion Blur View Model Enabled", &enableMotionBlurViewModelObject());
 
         if (motionBlurMode() == MotionBlurMode::Cinematic) {
           RemixGui::DragInt("Sample Count (N)", &motionBlurCineSampleCountObject(), 0.2f, 1, POST_FX_MB_MAX_SAMPLE_COUNT, "%d", ImGuiSliderFlags_AlwaysClamp);
@@ -869,6 +870,7 @@ namespace dxvk {
     postFxArgs.frameIdx = frameIdx;
     postFxArgs.enableMotionBlurNoiseSample = enableMotionBlurNoiseSample();
     postFxArgs.enableMotionBlurEmissive = enableMotionBlurEmissive();
+    postFxArgs.enableMotionBlurViewModel = enableMotionBlurViewModel();
     postFxArgs.motionBlurSampleCount = motionBlurSampleCount();
     postFxArgs.exposureFraction = exposureFraction();
     postFxArgs.blurDiameterFraction = blurDiameterFraction();

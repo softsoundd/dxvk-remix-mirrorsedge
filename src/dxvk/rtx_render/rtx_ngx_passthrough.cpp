@@ -1238,23 +1238,23 @@ namespace dxvk {
 
     NVSDK_NGX_DLSS_Hint_Render_Preset renderPresetFromOption(int optionValue) {
       switch (optionValue) {
-      case 1: return NVSDK_NGX_DLSS_Hint_Render_Preset_A;
-      case 2: return NVSDK_NGX_DLSS_Hint_Render_Preset_B;
-      case 3: return NVSDK_NGX_DLSS_Hint_Render_Preset_C;
-      case 4: return NVSDK_NGX_DLSS_Hint_Render_Preset_D;
+      case 1:
+      case 2:
+      case 3:
+      case 4:
+        // CNN presets A-D were removed from the DLSS 4.5 SDK; K is the documented replacement.
+        return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
       case 5: return NVSDK_NGX_DLSS_Hint_Render_Preset_E;
       case 6: return NVSDK_NGX_DLSS_Hint_Render_Preset_F;
+      case 7: return NVSDK_NGX_DLSS_Hint_Render_Preset_G;
+      case 8: return NVSDK_NGX_DLSS_Hint_Render_Preset_H_Reserved;
+      case 9: return NVSDK_NGX_DLSS_Hint_Render_Preset_I_Reserved;
       case 10: return NVSDK_NGX_DLSS_Hint_Render_Preset_J;
-      case 7:
-      case 8:
-      case 9:
-      case 11:
-      case 12:
-      case 13:
-      case 14:
-      case 15:
-        // K/L/M and reserved slots are not named in the bundled NGX 1.5 header.
-        return static_cast<NVSDK_NGX_DLSS_Hint_Render_Preset>(optionValue);
+      case 11: return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+      case 12: return NVSDK_NGX_DLSS_Hint_Render_Preset_L;
+      case 13: return NVSDK_NGX_DLSS_Hint_Render_Preset_M;
+      case 14: return NVSDK_NGX_DLSS_Hint_Render_Preset_N;
+      case 15: return NVSDK_NGX_DLSS_Hint_Render_Preset_O;
       default: return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
       }
     }
@@ -1676,8 +1676,8 @@ namespace dxvk {
                                   /* depthInverted = */ false,
                                   /* autoExposure = */ true,
                                   /* sharpening = */ false,
-                                  perfQuality,
-                                  renderPreset);
+                                  renderPreset,
+                                  perfQuality);
 
       m_dlssInitCount++;
       m_activeRenderPreset = feature.initializedRenderPreset;

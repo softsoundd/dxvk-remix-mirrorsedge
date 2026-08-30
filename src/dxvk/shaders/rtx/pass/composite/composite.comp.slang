@@ -50,14 +50,11 @@ float3 sampleDomeLightTexture(Sampler2D<float3> DomeLight, float3 worldDirection
 
 void preCompositeDebugView(uint2 pixelCoordinate)
 {
-  // Debug views that need to run before the union-active early-out so they cover every pixel.
+  // Debug views that need to run before the active early-out so they cover every pixel.
   switch(cb.debugViewIdx)
   {
-  case DEBUG_VIEW_SPARSE_RENDERING_DIRECT_PIXEL_SAMPLING_RATE:
-    storeInDebugView(pixelCoordinate, SparseRenderingDirectPixelSamplingRate[pixelCoordinate]);
-    break;
-  case DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_PIXEL_SAMPLING_RATE:
-    storeInDebugView(pixelCoordinate, SparseRenderingIndirectPixelSamplingRate[pixelCoordinate]);
+  case DEBUG_VIEW_SPARSE_RENDERING_PIXEL_SAMPLING_RATE:
+    storeInDebugView(pixelCoordinate, SparseRenderingPixelSamplingRate[pixelCoordinate]);
     break;
   case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_DIFFUSE_RADIANCE:
   case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_DIFFUSE_HIT_T:
@@ -74,24 +71,9 @@ void preCompositeDebugView(uint2 pixelCoordinate)
     }
     break;
 
-  case DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_PERCENTAGE:
-    storeInDebugView(pixelCoordinate, SparseRenderingDirectPixelSamplingRate[pixelCoordinate]);
-    break;
-
-  case DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_PERCENTAGE:
-    storeInDebugView(pixelCoordinate, SparseRenderingIndirectPixelSamplingRate[pixelCoordinate]);
-    break;
-
-  case DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_OUTPUT_SCALE:
+  case DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_OUTPUT_SCALE:
   {
-    const float rate = SparseRenderingDirectPixelSamplingRate[pixelCoordinate];
-    storeInDebugView(pixelCoordinate, rate > 0.f ? 1.0 / rate : 0.f);
-    break;
-  }
-
-  case DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_OUTPUT_SCALE:
-  {
-    const float rate = SparseRenderingIndirectPixelSamplingRate[pixelCoordinate];
+    const float rate = SparseRenderingPixelSamplingRate[pixelCoordinate];
     storeInDebugView(pixelCoordinate, rate > 0.f ? 1.0 / rate : 0.f);
     break;
   }
@@ -108,14 +90,8 @@ void preCompositeDebugView(uint2 pixelCoordinate)
   case DEBUG_VIEW_NAN:
   {
     bool isValid = true;
-    const float directRate = SparseRenderingDirectPixelSamplingRate[pixelCoordinate];
-    const float indirectRate = SparseRenderingIndirectPixelSamplingRate[pixelCoordinate];
-    // DEBUG_VIEW_SPARSE_RENDERING_DIRECT_PIXEL_SAMPLING_RATE / _DIRECT_ACTIVE_PIXELS_PERCENTAGE
-    // DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_PIXELS_OUTPUT_SCALE
-    isValid &= isValidValue(directRate);
-    // DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_PIXEL_SAMPLING_RATE / _INDIRECT_ACTIVE_PIXELS_PERCENTAGE
-    // DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_PIXELS_OUTPUT_SCALE
-    isValid &= isValidValue(indirectRate);
+    // DEBUG_VIEW_SPARSE_RENDERING_PIXEL_SAMPLING_RATE / _ACTIVE_PIXELS_OUTPUT_SCALE
+    isValid &= isValidValue(SparseRenderingPixelSamplingRate[pixelCoordinate]);
     // DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_MASK
     isValid &= isValidValue(float(isActivePixelFromMask(SparseRenderingActivePixelMask, pixelCoordinate)));
 
@@ -150,10 +126,7 @@ void updateAlphaBlendDebugView(
 void postCompositeDebugView(
   uint2 pixelCoordinate,
   GeometryFlags geometryFlags,
-  vec4 particleLayer,
-  bool pixelIsActive,
-  bool isDirectActive,
-  bool isIndirectActive)
+  bool pixelIsActive)
 {
   // Output Debug Information
   switch(cb.debugViewIdx)
@@ -161,32 +134,14 @@ void postCompositeDebugView(
   case DEBUG_VIEW_GEOMETRY_FLAGS_FIRST_SAMPLED_LOBE_IS_SPECULAR:
     storeInDebugView(pixelCoordinate, geometryFlags.firstSampledLobeIsSpecular);
     break;
-  case DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER:
-    storeInDebugView(pixelCoordinate, particleLayer);
-    break;
-  case DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER_ALPHA:
-    storeInDebugView(pixelCoordinate, 1.0 - particleLayer.w);
-    break;
   case DEBUG_VIEW_RAY_RECONSTRUCTION_HIT_DISTANCE:
     if (cb.writeRayReconstructionHitDistance)
     {
       storeInDebugView(pixelCoordinate, RayReconstructionHitDistanceOutput[pixelCoordinate] / 1000.0);
     }
     break;
-  case DEBUG_VIEW_SPARSE_RENDERING_UNION_ACTIVE_THREADS:
+  case DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS:
     if (pixelIsActive)
-    {
-      storeInDebugView(pixelCoordinate, 1.0);
-    }
-    break;
-  case DEBUG_VIEW_SPARSE_RENDERING_DIRECT_ACTIVE_THREADS:
-    if (pixelIsActive && isDirectActive)
-    {
-      storeInDebugView(pixelCoordinate, 1.0);
-    }
-    break;
-  case DEBUG_VIEW_SPARSE_RENDERING_INDIRECT_ACTIVE_THREADS:
-    if (pixelIsActive && isIndirectActive)
     {
       storeInDebugView(pixelCoordinate, 1.0);
     }
@@ -197,8 +152,6 @@ void postCompositeDebugView(
     bool isValid = true;
     // DEBUG_VIEW_GEOMETRY_FLAGS_FIRST_SAMPLED_LOBE_IS_SPECULAR
     isValid &= isValidValue(float(geometryFlags.firstSampledLobeIsSpecular));
-    // DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER / _ALPHA
-    isValid &= isValidValue(particleLayer);
     // DEBUG_VIEW_RAY_RECONSTRUCTION_HIT_DISTANCE
     if (cb.writeRayReconstructionHitDistance)
     {
@@ -211,9 +164,8 @@ void postCompositeDebugView(
   }
 }
 
-// Loads and remodulates the secondary (PSR) radiance contribution.
-// Runs unconditionally on PSR pixels regardless of the active-pixel mask so the RR particle
-// layer matches SR-off behavior even when the pixel is sparse-inactive.
+// Loads the secondary (PSR) radiance contribution. RR consumes the raw combined signal directly;
+// other upscalers retain the NRD unpack and remodulation path.
 vec3 loadSecondaryRadiance(
   uint2 pixelCoordinate,
   GeometryFlags geometryFlags,
@@ -229,9 +181,6 @@ vec3 loadSecondaryRadiance(
   vec3 secondaryCombinedDiffuseRadiance = SecondaryCombinedDiffuseRadianceHitDistance[pixelCoordinate].xyz;
   vec3 secondaryCombinedSpecularRadiance = SecondaryCombinedSpecularRadianceHitDistance[pixelCoordinate].xyz;
 
-  unpackDenoiserRadiance(secondaryCombinedDiffuseRadiance, cb.secondaryCombinedDenoiser);
-  unpackDenoiserRadiance(secondaryCombinedSpecularRadiance, cb.secondaryCombinedDenoiser);
-
   if (!cb.compositeSecondaryCombinedDiffuse)
   {
     secondaryCombinedDiffuseRadiance = vec3(0);
@@ -241,40 +190,39 @@ vec3 loadSecondaryRadiance(
     secondaryCombinedSpecularRadiance = vec3(0);
   }
 
+  if (cb.useRayReconstruction)
+  {
+    return (secondaryCombinedDiffuseRadiance + secondaryCombinedSpecularRadiance) * secondaryAttenuation;
+  }
+
+  unpackDenoiserRadiance(secondaryCombinedDiffuseRadiance, cb.secondaryCombinedDenoiser);
+  unpackDenoiserRadiance(secondaryCombinedSpecularRadiance, cb.secondaryCombinedDenoiser);
+
   return (secondaryCombinedDiffuseRadiance * secondaryAlbedo +
           secondaryCombinedSpecularRadiance * secondarySpecularAlbedo) * secondaryAttenuation;
 }
 
 // Loads, combines, and remodulates the primary direct + indirect radiance contribution.
-// Caller must gate this on pixelIsActive — direct/indirect inputs are only valid on active pixels.
+// Caller must gate this on pixelIsActive — the radiance inputs are only valid on active pixels.
 vec3 loadPrimaryRadiance(
   uint2 pixelCoordinate,
-  bool isDirectActive,
-  bool isIndirectActive,
   vec3 primaryAlbedo,
   vec3 primarySpecularAlbedo,
   vec3 primaryAttenuation,
   float perceptualRoughness,
   bool primaryMiss)
 {
-  vec3 primaryDirectDiffuseRadiance = vec3(0);
-  vec3 primaryDirectSpecularRadiance = vec3(0);
+  // In combined-denoiser mode the indirect radiance is combined in the direct buffer.
+  vec3 primaryDirectDiffuseRadiance = PrimaryDirectDiffuseRadianceHitDistance[pixelCoordinate].xyz;
+  vec3 primaryDirectSpecularRadiance = PrimaryDirectSpecularRadianceHitDistance[pixelCoordinate].xyz;
 
-  // In combined-denoiser mode the indirect radiance is combined in the direct buffer 
-  const bool readPrimaryDirect = isDirectActive || (!cb.enableSeparatedDenoisers && isIndirectActive);
-  if (readPrimaryDirect)
-  {
-    primaryDirectDiffuseRadiance = PrimaryDirectDiffuseRadianceHitDistance[pixelCoordinate].xyz;
-    primaryDirectSpecularRadiance = PrimaryDirectSpecularRadianceHitDistance[pixelCoordinate].xyz;
-
-    unpackDenoiserRadiance(primaryDirectDiffuseRadiance, cb.primaryDirectDenoiser);
-    unpackDenoiserRadiance(primaryDirectSpecularRadiance, cb.primaryDirectDenoiser);
-  }
+  unpackDenoiserRadiance(primaryDirectDiffuseRadiance, cb.primaryDirectDenoiser);
+  unpackDenoiserRadiance(primaryDirectSpecularRadiance, cb.primaryDirectDenoiser);
 
   vec3 primaryIndirectDiffuseRadiance = vec3(0);
   vec3 primaryIndirectSpecularRadiance = vec3(0);
 
-  if (cb.enableSeparatedDenoisers && isIndirectActive)
+  if (cb.enableSeparatedDenoisers)
   {
     if (cb.usePostFilter)
     {
@@ -359,8 +307,6 @@ void loadInputRadiance(
   uint2 pixelCoordinate,
   GeometryFlags geometryFlags,
   bool pixelIsActive,
-  bool isDirectActive,
-  bool isIndirectActive,
   vec3 primaryAlbedo,
   vec3 primarySpecularAlbedo,
   vec3 primaryAttenuation,
@@ -386,7 +332,6 @@ void loadInputRadiance(
   {
     remodulatedTotalPrimaryRadiance = loadPrimaryRadiance(
       pixelCoordinate,
-      isDirectActive, isIndirectActive,
       primaryAlbedo, primarySpecularAlbedo, primaryAttenuation,
       perceptualRoughness, primaryMiss);
   }
@@ -407,8 +352,7 @@ void applyVolumetricLighting(
   out vec3 volumeAttenuation,
   out vec3 alphaBlendOutput,
   out float backgroundAlpha,
-  out vec3 radianceOutput,
-  out vec4 particleLayerOutput)
+  out vec3 radianceOutput)
 {
   // Override the default volume sampling RNG seed offset
   setVolumeSamplingRngSeed(1);
@@ -538,32 +482,8 @@ void applyVolumetricLighting(
     updateAlphaBlendDebugView(pixelCoordinate, surface);
   }
 
-  particleLayerOutput = vec4(0);
-  radianceOutput = vec3(0);
-  if (cb.outputParticleLayer)
-  {
-    // Volumetric light composition is independent of secondary signal routing.
-    if (cb.compositeVolumetricLight)
-    {
-      radianceOutput += volumetricPreintegratedRadiance * volumetricRadianceScale;
-    }
-
-    if (cb.outputSecondarySignalToParticleLayer)
-    {
-      // Note: secondary radiance is pre-scaled in the demodulate pass before NRD,
-      // so the denoised output is already at the correct dense level.
-      particleLayerOutput.xyz += remodulatedTotalSecondaryRadiance * volumeAttenuation;
-    }
-    else
-    {
-      radianceOutput += remodulatedTotalSecondaryRadiance * volumeAttenuation;
-    }
-  }
-  else
-  {
-    radianceOutput += volumetricPreintegratedRadiance * volumetricRadianceScale;
-    radianceOutput += remodulatedTotalSecondaryRadiance * volumeAttenuation;
-  }
+  radianceOutput = volumetricPreintegratedRadiance * volumetricRadianceScale;
+  radianceOutput += remodulatedTotalSecondaryRadiance * volumeAttenuation;
 }
 
 void applySkyContribution(
@@ -602,8 +522,7 @@ void applySkyContribution(
 void applyFog(
   float viewDistance,
   float radianceScale,
-  inout vec3 radianceOutput,
-  inout vec4 particleLayerOutput)
+  inout vec3 radianceOutput)
 {
   if (cb.volumeArgs.enable)
   {
@@ -622,54 +541,21 @@ void applyFog(
   // Blend fog over output
   radianceOutput = lerp(radianceOutput, fogColor.rgb, fogColor.a);
   
-  // TODO: Disable fog for particle layer to avoid flickering, need to find a proper way to apply fog to particles
-  // particleLayerOutput.rgb = lerp(particleLayerOutput.rgb, fogColor.rgb, fogColor.a);
-}
-
-void demodulateAttenuation(
-  uint2 pixelCoordinate,
-  vec3 primaryAttenuation,
-  inout vec4 finalOutput,
-  inout vec4 particleLayerOutput)
-{
-  // Filter attenuation to avoid abrupt change and improve stability.
-  vec3 neighborAttenuation = 0;
-  neighborAttenuation += r11g11b10ToColor(PrimaryAttenuation[clampPixelCoordinate(pixelCoordinate, int2(1, 0))]);
-  neighborAttenuation += r11g11b10ToColor(PrimaryAttenuation[clampPixelCoordinate(pixelCoordinate, int2(-1, 0))]);
-  neighborAttenuation += r11g11b10ToColor(PrimaryAttenuation[clampPixelCoordinate(pixelCoordinate, int2(0, 1))]);
-  neighborAttenuation += r11g11b10ToColor(PrimaryAttenuation[clampPixelCoordinate(pixelCoordinate, int2(0, -1))]);
-
-  const float neighborWeight = 0.5;
-  const vec3 blurredAttenuation = (primaryAttenuation + neighborAttenuation * neighborWeight) / (1.0 + neighborWeight * 4.0);
-
-  // Output particles to a separate layer for DLSS-RR.
-  // Demodulate attenuation
-  if (cb.enableDemodulateAttenuation)
-  {
-    float primaryAlpha = max(blurredAttenuation.r, max(blurredAttenuation.g, blurredAttenuation.b));
-    float minAlpha = 0.3;
-    primaryAlpha = max(primaryAlpha, minAlpha);
-    finalOutput.xyz /= primaryAlpha;
-    particleLayerOutput.w = 1 - primaryAlpha;
-  }
 }
 
 vec4 compositeResult(
   uint2 pixelCoordinate,
   bool pixelIsActive,
-  bool isDirectActive,
-  bool isIndirectActive,
   GeometryFlags geometryFlags,
   float primaryLinearViewZ,
-  bool primaryMiss,
-  out vec4 particleLayerOutput)
+  bool primaryMiss)
 {
   RNG randomState = createRNG(pixelCoordinate, cb.frameIdx, 0);
 
   // Load GBuffer Information.
   // PrimaryAttenuation and secondary GBuffer data are needed at every PSR pixel so the secondary
-  // remodulation path in loadInputRadiance produces correct results regardless of sparse active
-  // state — keeps the RR particle layer dense. Primary GBuffer reads stay gated since
+  // composition path in loadInputRadiance produces correct results regardless of sparse active
+  // state. Primary GBuffer reads stay gated since
   // loadPrimaryRadiance is skipped on sparse-inactive pixels.
   const vec3 primaryAttenuation = r11g11b10ToColor(PrimaryAttenuation[pixelCoordinate]);
   vec3 primaryAlbedo = vec3(0);
@@ -710,7 +596,7 @@ vec4 compositeResult(
   vec3 radianceOutput;
   vec3 sharedFinalOutput;
 
-  // Determine radiance scales for sparse rendering. Scaling only applies at union-active pixels;
+  // Determine radiance scales for sparse rendering. Scaling only applies at active pixels;
   // at inactive pixels the contributions that would be scaled (alpha blend, fog, sky) come from
   // dense buffers and should not be amplified.
   //   Note: if we reach this point for a primary ray miss when sparse primary ray misses are disabled
@@ -720,21 +606,14 @@ vec4 compositeResult(
                                    (!primaryMiss || cb.sparseRenderingArgs.enableSparsePrimaryRayMissComposition);
 
   float radianceScale = 1.f;
-  // Volumetric in-scatter is integrated at any union-active pixel (independent of primaryMiss / sky
+  // Volumetric in-scatter is integrated at any active pixel (independent of primaryMiss / sky
   // sparse-composition), so its compensation scale must be computed independently of sparseScalingActive.
   // When sparse volumetrics is disabled for this pixel's primary classification, volumetrics run at every pixel and need no compensation.
   float volumetricRadianceScale = 1.f;
   if (sparseScalingActive)
   {
-    const float directRate = SparseRenderingDirectPixelSamplingRate[pixelCoordinate];
-    const float indirectRate = SparseRenderingIndirectPixelSamplingRate[pixelCoordinate];
-
-    // Sky / fog / volumetrics run for any union-active pixel and are not refilled by the
-    // transparency-layer blur pass, so they need to compensate for union inactivity.
-    // Direct/indirect activations are independent (decorrelated noise channels), so:
-    //   P(union active) = 1 - (1 - directRate) * (1 - indirectRate)
-    const float unionActiveProbability = 1.f - (1.f - directRate) * (1.f - indirectRate);
-    radianceScale = calculateRadianceScaleFromSamplingRate(unionActiveProbability);
+    // Sky, fog, and volumetrics compensate for inactive samples at the current sampling rate.
+    radianceScale = calculateRadianceScaleFromSamplingRate(SparseRenderingPixelSamplingRate[pixelCoordinate]);
   }
   const bool sparseVolumetricsForThisPixel = primaryMiss
     ? bool(cb.sparseRenderingArgs.enableSparseVolumetricsPrimaryMiss)
@@ -743,16 +622,12 @@ vec4 compositeResult(
       cb.sparseRenderingArgs.mode != SparseRenderingMode::Off &&
       sparseVolumetricsForThisPixel)
   {
-    const float directRate = SparseRenderingDirectPixelSamplingRate[pixelCoordinate];
-    const float indirectRate = SparseRenderingIndirectPixelSamplingRate[pixelCoordinate];
-    const float unionActiveProbability = 1.f - (1.f - directRate) * (1.f - indirectRate);
-    volumetricRadianceScale = calculateRadianceScaleFromSamplingRate(unionActiveProbability);
+    volumetricRadianceScale = calculateRadianceScaleFromSamplingRate(SparseRenderingPixelSamplingRate[pixelCoordinate]);
   }
 
   // Load Input Radiance
   loadInputRadiance(
     pixelCoordinate, geometryFlags, pixelIsActive,
-    isDirectActive, isIndirectActive,
     primaryAlbedo, primarySpecularAlbedo, primaryAttenuation,
     secondaryAlbedo, secondarySpecularAlbedo, secondaryAttenuation,
     perceptualRoughness, primaryMiss,
@@ -764,7 +639,7 @@ vec4 compositeResult(
     pixelCoordinate, randomState, primaryRayDirections, pixelIsActive, primaryMiss, viewDistance,
     radianceScale, volumetricRadianceScale, remodulatedTotalSecondaryRadiance, sharedRadiance,
     volumetricPreintegratedRadiance, volumeAttenuation, alphaBlendOutput, backgroundAlpha,
-    radianceOutput, particleLayerOutput);
+    radianceOutput);
 
   // Calculate final combined radiance output
   // Note: The primary hit accumulated radiance value is not affected by the throughput (rather takes attenuation into account
@@ -778,21 +653,10 @@ vec4 compositeResult(
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
   // Apply fog 
-  applyFog(viewDistance, radianceScale, radianceOutput, particleLayerOutput);
+  applyFog(viewDistance, radianceScale, radianceOutput);
 
-  // DLSS-RR needs to do alpha blending using the backgroundAlpha, so the input is untouched here.
-  // Output final composite result for NRD denoiser.
-  vec4 finalOutput = vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);
-
-  if (cb.outputParticleLayer)
-  {
-    demodulateAttenuation(pixelCoordinate, primaryAttenuation, finalOutput, particleLayerOutput);
-
-    particleLayerOutput.xyz += RayReconstructionParticleOutput[pixelCoordinate].xyz;
-    RayReconstructionParticleOutput[pixelCoordinate] = sanitize(particleLayerOutput, 0.f);
-  }
-
-  return finalOutput;
+  // Combine the alpha-blended foreground with the background before upscaling.
+  return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);
 }
 
 [shader("compute")]
@@ -808,11 +672,11 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
 
   uvec2 pixelCoordinate;
   const bool pixelIsActive = loadPixelCoordinate(
-    threadIndex, UnionActiveLocalPixelCoords,
+    threadIndex, ActiveLocalPixelCoords,
     cb.camera.resolution, cb.sparseRenderingArgs, pixelCoordinate);
 
   // Load GBuffer Information.
-  // Always loaded (even at union-inactive pixels) because compositeResult uses primaryLinearViewZ
+  // Always loaded (even at inactive pixels) because compositeResult uses primaryLinearViewZ
   // to compute viewDistance for fog and the alpha-blend volumetric path, and consults geometryFlags
   // for secondarySurfaceMask / firstSampledLobeIsSpecular.
   const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(pixelCoordinate, SharedFlags);
@@ -822,22 +686,11 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
   const bool primaryMiss = primaryLinearViewZ == cb.primaryDirectMissLinearViewZ
                            && !geometryFlags.performedAnyPSR();  // must not be PSR
 
-  // Per-signal active flags: direct/indirect masks are independent. When sparse rendering is off,
-  // both signals run at full rate so treat every pixel as active for both.
-  // Computed before the inactive early-out so the RR hit distance write below sees the correct gates.
-  bool isDirectActive = true;
-  bool isIndirectActive = true;
-  if (cb.sparseRenderingArgs.mode != SparseRenderingMode::Off)
-  {
-    isDirectActive = isActivePixelFromMask(SparseRenderingDirectActivePixelMask, pixelCoordinate);
-    isIndirectActive = isActivePixelFromMask(SparseRenderingIndirectActivePixelMask, pixelCoordinate);
-  }
-
-  // Written from composite (rather than the prepare RR pass) so the value is gated by sparse-indirect activity
+  // Written from composite (rather than the prepare RR pass) so the value is gated by sparse activity
   if (cb.writeRayReconstructionHitDistance)
   {
     float hitDistance = 0;
-    if (isIndirectActive && !primaryMiss &&
+    if (pixelIsActive && !primaryMiss &&
         (cb.enableReSTIRGI || geometryFlags.firstSampledLobeIsSpecular))
     {
       hitDistance = PrimaryIndirectSpecularRadianceHitDistance[pixelCoordinate].a;
@@ -845,11 +698,10 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
     RayReconstructionHitDistanceOutput[pixelCoordinate] = hitDistance;
   }
 
-  vec4 particleLayerOutput;
-  vec4 finalOutput = compositeResult(pixelCoordinate, pixelIsActive, isDirectActive, isIndirectActive, geometryFlags, primaryLinearViewZ, primaryMiss, particleLayerOutput);
+  vec4 finalOutput = compositeResult(pixelCoordinate, pixelIsActive, geometryFlags, primaryLinearViewZ, primaryMiss);
 
   FinalOutput[pixelCoordinate] = accumulate(pixelCoordinate, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
 
   // Note: we only debug output for active pixels
-  postCompositeDebugView(pixelCoordinate, geometryFlags, particleLayerOutput, pixelIsActive, isDirectActive, isIndirectActive);
+  postCompositeDebugView(pixelCoordinate, geometryFlags, pixelIsActive);
 }

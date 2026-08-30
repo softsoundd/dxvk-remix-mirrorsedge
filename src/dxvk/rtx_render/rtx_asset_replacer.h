@@ -230,6 +230,11 @@ namespace dxvk {
       return m_secretReplacements;
     }
 
+    // Replacement anchor diagnostics: logs how many anchors of each type this mod
+    // registered and, when rtx.logReplacementResolution is enabled, dumps every anchor
+    // hash so runtime resolution logs can be cross-referenced against the mod's anchors.
+    void logAnchorSummary(const std::string& modName) const;
+
   private:
     mutable sync::Spinlock m_spinlock;
 

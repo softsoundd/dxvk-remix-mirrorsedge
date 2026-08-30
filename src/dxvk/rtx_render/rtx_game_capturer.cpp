@@ -489,18 +489,11 @@ namespace dxvk {
 
     const bool bIsNewMat = (matHash != 0x0) && (m_pCap->materials.count(matHash) == 0);
     if (bIsNewMat) {
-      // Materials without a resident color texture or sampler (e.g. render-target-only or
-      // evicted textures) can't be exported unless they carry a constant color instead;
-      // the USD exporter tolerates unbound materials.
-      const bool hasResidentColorTexture =
-        material.getColorTexture().getImageView() != nullptr && material.getSampler().ptr() != nullptr;
-      if (hasResidentColorTexture || material.hasUe3ConstantAlbedo) {
-        captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
-      } else {
-        Logger::warn(str::format(
-          "[GameCapturer][", m_pCap->idStr, "] Skipping material 0x", std::hex, matHash, std::dec,
-          " - no resident color texture/sampler to export."));
-      }
+      // Every material a captured mesh binds has to reach the stage, including those with nothing
+      // to export - a render-target-only or evicted texture, or a UE3 draw whose whole sampler set
+      // was lightmaps. Skipping one leaves the mesh bound to a prim the stage never declares, which
+      // the Toolkit can neither select nor author.
+      captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
     }
 
     bool bIsNewMesh = false;
@@ -593,6 +586,12 @@ namespace dxvk {
         std::clamp(materialData.ue3ConstantAlbedo.x, 0.0f, 1.0f),
         std::clamp(materialData.ue3ConstantAlbedo.y, 0.0f, 1.0f),
         std::clamp(materialData.ue3ConstantAlbedo.z, 0.0f, 1.0f));
+    } else {
+      // Nothing bound and no constant to fall back on: export the albedo the runtime renders such a
+      // material with, so the captured stage matches the game.
+      const Vector3& legacyAlbedo = LegacyMaterialDefaults::albedoConstant();
+      lssMat.hasAlbedoConstant = true;
+      lssMat.albedoConstant = pxr::GfVec3f(legacyAlbedo.x, legacyAlbedo.y, legacyAlbedo.z);
     }
     // Opacity
     lssMat.enableOpacity = bEnableOpacity;
@@ -651,9 +650,9 @@ namespace dxvk {
         const InstanceCategories flag = (InstanceCategories) i;
         const bool isSet = flags.test(flag);
 
-        // Keep Hair Cards absent from captured categoryFlags when false instead of authoring an explicit false value.
-        // This preserves existing captures while true hair-card instances still store the category explicitly.
-        if (flag == InstanceCategories::HairCards && !isSet) {
+        // Don't author an explicit false for these; true instances still store the category.
+        if (!isSet && (flag == InstanceCategories::HairCards ||
+                       flag == InstanceCategories::CullBackfacesInShadows)) {
           continue;
         }
 

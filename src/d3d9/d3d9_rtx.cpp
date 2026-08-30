@@ -19,15 +19,21 @@
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_dlfg.h"
 #include "../dxvk/rtx_render/rtx_camera.h"
+#include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
 #include "../dxvk/imgui/dxvk_imgui.h"
 
 #include <algorithm>
+#include <atomic>
+#include <bitset>
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
+#include <shared_mutex>
 #include <sstream>
+#include <system_error>
 
 // Toolhelp snapshots for cross-process game-settings driving.
 #include <tlhelp32.h>
@@ -60,6 +66,7 @@ namespace dxvk {
       uint8_t normalType = 0;
       uint8_t normalStream = 0xFF;
       bool hasBinormal = false;
+      uint8_t binormalType = 0;
       bool hasBlendWeight = false;
       uint8_t blendWeightType = 0;
       bool hasBlendIndices = false;
@@ -98,6 +105,7 @@ namespace dxvk {
           break;
         case D3DDECLUSAGE_BINORMAL:
           sig.hasBinormal = true;
+          sig.binormalType = e.Type;
           break;
         case D3DDECLUSAGE_BLENDWEIGHT:
           sig.hasBlendWeight = true;
@@ -205,9 +213,9 @@ namespace dxvk {
     //
     // The tracer proves, per register component, which interpolant (PS) or IA texcoord
     // input (VS) component a value originates from, and accumulates the affine chain
-    // (scale/offset from draw-time constants or def'd immediates) applied along the way.
-    // Math outside the affine model keeps the origin but marks the affine inexact;
-    // genuinely ambiguous origins are invalidated.
+    // (scale/cross/offset from draw-time constants or def'd immediates) applied along the
+    // way - see UvComponentAffine for the term model. Math outside that model keeps the
+    // origin but marks the affine inexact; genuinely ambiguous origins are invalidated.
     // ---------------------------------------------------------------------------
 
     static bool uvAffineTermPresent(const UvAffineTerm& t) {
@@ -228,14 +236,26 @@ namespace dxvk {
     }
 
     static bool uvComponentAffinesEqual(const UvComponentAffine& a, const UvComponentAffine& b) {
-      return uvAffineTermsEqual(a.scale, b.scale) && uvAffineTermsEqual(a.offset, b.offset);
+      if (a.hasCross != b.hasCross)
+        return false;
+      if (!uvAffineTermsEqual(a.scale, b.scale) || !uvAffineTermsEqual(a.offset, b.offset))
+        return false;
+      if (!a.hasCross)
+        return true;
+      return a.scaleComponent == b.scaleComponent &&
+             a.crossComponent == b.crossComponent &&
+             uvAffineTermsEqual(a.cross, b.cross);
     }
 
     static bool uvComponentAffineExact(const UvComponentAffine& a) {
-      return !a.scale.inexact && !a.offset.inexact;
+      if (a.scale.inexact || a.offset.inexact)
+        return false;
+      return !a.hasCross || !a.cross.inexact;
     }
 
     static bool uvComponentAffineIsIdentity(const UvComponentAffine& a) {
+      if (a.hasCross)
+        return false;
       return uvComponentAffineExact(a) &&
              (!uvAffineTermPresent(a.scale) ||
               (a.scale.immValid && a.scale.imm == 1.0f && a.scale.constReg < 0)) &&
@@ -260,6 +280,9 @@ namespace dxvk {
         return !term.inexact && term.constReg < 0;
       };
 
+      if (affU.hasCross || affV.hasCross)
+        return false;
+
       if (!compileTimeOffset(affU.offset) || !compileTimeOffset(affV.offset))
         return false;
 
@@ -275,116 +298,144 @@ namespace dxvk {
     static void uvAffineMarkInexact(UvComponentAffine& a) {
       a.scale.inexact = true;
       a.offset.inexact = true;
+      if (a.hasCross)
+        a.cross.inexact = true;
     }
 
-    // value' = value * m for a compile-time immediate m
-    static void uvAffineMulImmediate(UvComponentAffine& a, const float value) {
-      if (a.scale.constReg >= 0) {
-        a.scale.factor *= value;
-      } else if (a.scale.immValid) {
-        a.scale.imm *= value;
+    static void uvAffineTermScaleMulImmediate(UvAffineTerm& t, const float value) {
+      if (t.constReg >= 0) {
+        t.factor *= value;
+      } else if (t.immValid) {
+        t.imm *= value;
       } else {
-        a.scale.immValid = true;
-        a.scale.imm = value;
+        t.immValid = true;
+        t.imm = value;
+      }
+    }
+
+    // An offset term is a sum, so multiplying it distributes over every part.
+    static void uvAffineTermOffsetMulImmediate(UvAffineTerm& t, const float value) {
+      if (t.immValid) {
+        t.imm *= value;
+      }
+      if (t.constReg >= 0) {
+        t.factor *= value;
+      }
+      if (t.constReg2 >= 0) {
+        t.factor2 *= value;
+      }
+    }
+
+    static void uvAffineTermScaleMulConstant(UvAffineTerm& t, const int16_t reg, const uint8_t comp, const float factor) {
+      if (t.constReg >= 0) {
+        // the term would become a product of two draw-time constants - not representable
+        t.inexact = true;
+      } else if (t.immValid) {
+        const float staticScale = t.imm;
+        t.immValid = false;
+        t.imm = 0.0f;
+        t.constReg = reg;
+        t.constComp = comp;
+        t.factor = staticScale * factor;
+      } else {
+        t.constReg = reg;
+        t.constComp = comp;
+        t.factor = factor;
+      }
+    }
+
+    static void uvAffineTermOffsetMulConstant(UvAffineTerm& t, const int16_t reg, const uint8_t comp, const float factor) {
+      if (t.constReg >= 0) {
+        // any existing constant part times a new draw-time constant is a product of two
+        // draw-time constants - not representable
+        t.inexact = true;
+      } else if (t.immValid) {
+        if (t.imm != 0.0f) {
+          const float staticOffset = t.imm;
+          t.immValid = false;
+          t.imm = 0.0f;
+          t.constReg = reg;
+          t.constComp = comp;
+          t.factor = staticOffset * factor;
+        } else {
+          t.immValid = false;
+        }
+      }
+    }
+
+    static void uvAffineTermAddImmediate(UvAffineTerm& t, const float value) {
+      if (value == 0.0f)
+        return;
+      t.immValid = true;
+      t.imm += value;
+    }
+
+    static void uvAffineTermAddConstant(UvAffineTerm& t, const int16_t reg, const uint8_t comp, const float factor) {
+      if (t.immValid && t.imm == 0.0f)
+        t.immValid = false;
+
+      if (t.constReg >= 0 && t.constComp == comp && t.constReg == reg) {
+        // same component referenced twice: fold into the first part's factor
+        t.factor += factor;
+        if (t.factor == 0.0f) {
+          // cancelled out: promote the second part into the first slot to keep the
+          // "constReg2 only set when constReg is" invariant
+          t.constReg = t.constReg2;
+          t.constComp = t.constComp2;
+          t.factor = t.factor2;
+          t.constReg2 = -1;
+          t.constComp2 = 0;
+          t.factor2 = 1.0f;
+        }
+        return;
+      }
+      if (t.constReg2 >= 0 && t.constComp2 == comp && t.constReg2 == reg) {
+        t.factor2 += factor;
+        if (t.factor2 == 0.0f) {
+          t.constReg2 = -1;
+          t.constComp2 = 0;
+          t.factor2 = 1.0f;
+        }
+        return;
       }
 
-      // the offset is a sum: multiplying by an immediate distributes over every part
-      if (a.offset.immValid) {
-        a.offset.imm *= value;
+      if (t.constReg < 0) {
+        t.constReg = reg;
+        t.constComp = comp;
+        t.factor = factor;
+      } else if (t.constReg2 < 0) {
+        t.constReg2 = reg;
+        t.constComp2 = comp;
+        t.factor2 = factor;
+      } else {
+        // more than two distinct constant parts - not representable
+        t.inexact = true;
       }
-      if (a.offset.constReg >= 0) {
-        a.offset.factor *= value;
-      }
-      if (a.offset.constReg2 >= 0) {
-        a.offset.factor2 *= value;
-      }
+    }
+
+    // value' = value * m for a compile-time immediate m. `cross` scales like `scale` does:
+    // both multiply an interpolant component, so both take the coefficient.
+    static void uvAffineMulImmediate(UvComponentAffine& a, const float value) {
+      uvAffineTermScaleMulImmediate(a.scale, value);
+      uvAffineTermOffsetMulImmediate(a.offset, value);
+      if (a.hasCross)
+        uvAffineTermScaleMulImmediate(a.cross, value);
     }
 
     // value' = value * consts[reg][comp] * factor
     static void uvAffineMulConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
-      if (a.scale.constReg >= 0) {
-        // scale would become a product of two draw-time constants - not representable
-        a.scale.inexact = true;
-      } else if (a.scale.immValid) {
-        const float staticScale = a.scale.imm;
-        a.scale.immValid = false;
-        a.scale.imm = 0.0f;
-        a.scale.constReg = reg;
-        a.scale.constComp = comp;
-        a.scale.factor = staticScale * factor;
-      } else {
-        a.scale.constReg = reg;
-        a.scale.constComp = comp;
-        a.scale.factor = factor;
-      }
-
-      if (a.offset.constReg >= 0) {
-        // any existing constant part times a new draw-time constant is a product of two
-        // draw-time constants - not representable
-        a.offset.inexact = true;
-      } else if (a.offset.immValid) {
-        if (a.offset.imm != 0.0f) {
-          const float staticOffset = a.offset.imm;
-          a.offset.immValid = false;
-          a.offset.imm = 0.0f;
-          a.offset.constReg = reg;
-          a.offset.constComp = comp;
-          a.offset.factor = staticOffset * factor;
-        } else {
-          a.offset.immValid = false;
-        }
-      }
+      uvAffineTermScaleMulConstant(a.scale, reg, comp, factor);
+      uvAffineTermOffsetMulConstant(a.offset, reg, comp, factor);
+      if (a.hasCross)
+        uvAffineTermScaleMulConstant(a.cross, reg, comp, factor);
     }
 
     static void uvAffineAddImmediate(UvComponentAffine& a, const float value) {
-      if (value == 0.0f)
-        return;
-
-      a.offset.immValid = true;
-      a.offset.imm += value;
+      uvAffineTermAddImmediate(a.offset, value);
     }
 
     static void uvAffineAddConstant(UvComponentAffine& a, const int16_t reg, const uint8_t comp, const float factor) {
-      if (a.offset.immValid && a.offset.imm == 0.0f)
-        a.offset.immValid = false;
-
-      if (a.offset.constReg >= 0 && a.offset.constComp == comp && a.offset.constReg == reg) {
-        // same component referenced twice: fold into the first part's factor
-        a.offset.factor += factor;
-        if (a.offset.factor == 0.0f) {
-          // cancelled out: promote the second part into the first slot to keep the
-          // "constReg2 only set when constReg is" invariant
-          a.offset.constReg = a.offset.constReg2;
-          a.offset.constComp = a.offset.constComp2;
-          a.offset.factor = a.offset.factor2;
-          a.offset.constReg2 = -1;
-          a.offset.constComp2 = 0;
-          a.offset.factor2 = 1.0f;
-        }
-        return;
-      }
-      if (a.offset.constReg2 >= 0 && a.offset.constComp2 == comp && a.offset.constReg2 == reg) {
-        a.offset.factor2 += factor;
-        if (a.offset.factor2 == 0.0f) {
-          a.offset.constReg2 = -1;
-          a.offset.constComp2 = 0;
-          a.offset.factor2 = 1.0f;
-        }
-        return;
-      }
-
-      if (a.offset.constReg < 0) {
-        a.offset.constReg = reg;
-        a.offset.constComp = comp;
-        a.offset.factor = factor;
-      } else if (a.offset.constReg2 < 0) {
-        a.offset.constReg2 = reg;
-        a.offset.constComp2 = comp;
-        a.offset.factor2 = factor;
-      } else {
-        // more than two distinct constant parts - not representable
-        a.offset.inexact = true;
-      }
+      uvAffineTermAddConstant(a.offset, reg, comp, factor);
     }
 
     // Applies a DXSO source modifier to the affine chain; returns false when not representable.
@@ -441,6 +492,78 @@ namespace dxvk {
       return a.valid && b.valid && a.reg == b.reg;
     }
 
+    static bool uvAffineScaleNonIdentity(const UvComponentAffine& a) {
+      return uvAffineTermPresent(a.scale) &&
+             !(a.scale.immValid && a.scale.imm == 1.0f && a.scale.constReg < 0);
+    }
+
+    static void uvAffineTermAddTerm(UvAffineTerm& dest, const UvAffineTerm& src) {
+      if (src.inexact) {
+        dest.inexact = true;
+        return;
+      }
+      if (src.immValid)
+        uvAffineTermAddImmediate(dest, src.imm);
+      if (src.constReg >= 0)
+        uvAffineTermAddConstant(dest, src.constReg, src.constComp, src.factor);
+      if (src.constReg2 >= 0)
+        uvAffineTermAddConstant(dest, src.constReg2, src.constComp2, src.factor2);
+    }
+
+    // Fold sibling into dest as the cross coefficient: dest = dest + sibling, with dest.scale
+    // multiplying dest.component and dest.cross multiplying sibling.component. Fails (and
+    // leaves dest unchanged) when the result would leave the scale/cross/offset model.
+    static bool uvAffineTryAttachCross(UvExactComponentOrigin& dest, const UvExactComponentOrigin& sibling) {
+      if (!uvOriginSameRegister(dest, sibling))
+        return false;
+      if (dest.affine.hasCross || sibling.affine.hasCross)
+        return false;
+      if (!uvComponentAffineExact(dest.affine) || !uvComponentAffineExact(sibling.affine))
+        return false;
+      if (!uvIsSingleComponentMask(dest.componentMask) || !uvIsSingleComponentMask(sibling.componentMask))
+        return false;
+      if (dest.component == sibling.component)
+        return false;
+
+      UvComponentAffine combined = dest.affine;
+      combined.hasCross = true;
+      combined.scaleComponent = dest.component;
+      combined.crossComponent = sibling.component;
+      if (uvAffineTermPresent(sibling.affine.scale)) {
+        combined.cross = sibling.affine.scale;
+      } else {
+        combined.cross.immValid = true;
+        combined.cross.imm = 1.0f;
+      }
+      uvAffineTermAddTerm(combined.offset, sibling.affine.offset);
+      if (!uvComponentAffineExact(combined))
+        return false;
+
+      dest.componentMask = uint8_t(dest.componentMask | sibling.componentMask);
+      dest.affine = combined;
+      return true;
+    }
+
+    static bool uvAffineMixUsesPair(const UvComponentAffine& a, const uint8_t compU, const uint8_t compV) {
+      if (!a.hasCross)
+        return true;
+      const auto isPair = [&](const uint8_t c) {
+        return c == compU || c == compV;
+      };
+      return isPair(a.scaleComponent) && isPair(a.crossComponent);
+    }
+
+    static bool uvAffineIsExactLinearPair(const UvComponentAffine& u,
+                                          const UvComponentAffine& v,
+                                          const uint8_t compU,
+                                          const uint8_t compV) {
+      if (!u.hasCross && !v.hasCross)
+        return false;
+      return uvComponentAffineExact(u) && uvComponentAffineExact(v) &&
+             uvAffineMixUsesPair(u, compU, compV) &&
+             uvAffineMixUsesPair(v, compU, compV);
+    }
+
     // Merges two value origins that both contribute to one result component (blend endpoints,
     // clamps, dot products, etc.). Keeping the origin with an inexact affine when one contributor
     // is unknown deliberately models "base UV plus per-pixel detail" patterns (bump offset,
@@ -492,6 +615,28 @@ namespace dxvk {
         uvAffineAddConstant(a, ref.constReg, ref.constComp, sign * ref.factor);
     }
 
+    static void uvAffineTermCollectConstRegs(const UvAffineTerm& term,
+                                             int32_t* regs,
+                                             uint32_t& count,
+                                             const uint32_t cap) {
+      auto push = [&](const int16_t r) {
+        if (r >= 0 && count < cap)
+          regs[count++] = int32_t(r);
+      };
+      push(term.constReg);
+      push(term.constReg2);
+    }
+
+    static void uvComponentAffineCollectConstRegs(const UvComponentAffine& a,
+                                                  int32_t* regs,
+                                                  uint32_t& count,
+                                                  const uint32_t cap) {
+      uvAffineTermCollectConstRegs(a.scale, regs, count, cap);
+      uvAffineTermCollectConstRegs(a.offset, regs, count, cap);
+      if (a.hasCross)
+        uvAffineTermCollectConstRegs(a.cross, regs, count, cap);
+    }
+
     // -------------------------------------------------------------------------
     // Formatting helpers for rtx.d3d9.ue3LogUvAffineDetail / ue3UvTraceShaderHashes
     // -------------------------------------------------------------------------
@@ -529,7 +674,13 @@ namespace dxvk {
     }
 
     static std::string formatUvComponentAffine(const UvComponentAffine& affine) {
-      return str::format("uv*", formatUvAffineTerm(affine.scale, "1"), "+", formatUvAffineTerm(affine.offset, "0"));
+      if (!affine.hasCross) {
+        return str::format("uv*", formatUvAffineTerm(affine.scale, "1"), "+", formatUvAffineTerm(affine.offset, "0"));
+      }
+      return str::format(
+        "uv.", "xyzw"[affine.scaleComponent & 0x3u], "*", formatUvAffineTerm(affine.scale, "1"),
+        "+uv.", "xyzw"[affine.crossComponent & 0x3u], "*", formatUvAffineTerm(affine.cross, "0"),
+        "+", formatUvAffineTerm(affine.offset, "0"));
     }
 
     static std::string formatUvConstExpr(const UvConstComponentRef& ref) {
@@ -969,6 +1120,15 @@ namespace dxvk {
               uvAffineMulImmediate(origin.affine, 2.0f);
               return origin;
             }
+            // UV matrix / rotator in the form fxc emits when it expands a dot into mul/mad:
+            // a sum of two interpolant components, at least one already carrying a
+            // non-identity scale. Requiring that scale is what keeps a bare U+V - which is
+            // not a coordinate transform - out of the model.
+            if (uvAffineScaleNonIdentity(o0.affine) || uvAffineScaleNonIdentity(o1.affine)) {
+              UvExactComponentOrigin combined = o0;
+              if (uvAffineTryAttachCross(combined, o1))
+                return combined;
+            }
             UvExactComponentOrigin merged = uvMergeOrigins(o0, o1);
             if (merged.valid)
               uvAffineMarkInexact(merged.affine); // sum of two interpolant terms
@@ -1015,6 +1175,11 @@ namespace dxvk {
               return product;
             }
             if (o2.valid) {
+              if (uvAffineScaleNonIdentity(product.affine) || uvAffineScaleNonIdentity(o2.affine)) {
+                UvExactComponentOrigin combined = product;
+                if (uvAffineTryAttachCross(combined, o2))
+                  return combined;
+              }
               UvExactComponentOrigin merged = uvMergeOrigins(product, o2);
               if (merged.valid)
                 uvAffineMarkInexact(merged.affine);
@@ -1099,13 +1264,61 @@ namespace dxvk {
         }
 
         // dot products consume multiple components of their sources: union the origins so
-        // register provenance (and the packed-UV half being read) survives. This is what keeps
-        // UV rotators / matrix transforms (dp2add pairs, m3x2..m4x4) attributable.
+        // register provenance (and the packed-UV half being read) survives. UV rotators /
+        // matrix transforms (dp2add of a UV pair against a constant row) stay exact as
+        // scale+cross+offset; other dots (m3x2..m4x4, lighting) keep origin but mark
+        // the affine inexact.
         case DxsoOpcode::Dp2Add: {
+          const UvExactComponentOrigin o0x = readOrigin(ctx.src[0], 0);
+          const UvExactComponentOrigin o0y = readOrigin(ctx.src[0], 1);
+          const UvExactComponentOrigin o1x = readOrigin(ctx.src[1], 0);
+          const UvExactComponentOrigin o1y = readOrigin(ctx.src[1], 1);
+          const UvConstComponentRef k0x = readConst(ctx.src[0], 0);
+          const UvConstComponentRef k0y = readConst(ctx.src[0], 1);
+          const UvConstComponentRef k1x = readConst(ctx.src[1], 0);
+          const UvConstComponentRef k1y = readConst(ctx.src[1], 1);
+          const UvConstComponentRef k2 = readConst(ctx.src[2], c);
+          const UvExactComponentOrigin o2 = readOrigin(ctx.src[2], c);
+
+          // dest = src0.xy · src1.xy + src2, with the UV pair in either operand and the matrix
+          // row constants in the other. Folds into scale + cross + offset by multiplying each
+          // UV component by its row coefficient and attaching the sibling as `cross`. src2 is
+          // the translation (Center, or Origin - R·Origin); an absent addend contributes 0.
+          auto tryDp2AddRow = [&](const UvExactComponentOrigin& uvx,
+                                  const UvExactComponentOrigin& uvy,
+                                  const UvConstComponentRef& kx,
+                                  const UvConstComponentRef& ky,
+                                  const UvConstComponentRef& addend) -> UvExactComponentOrigin {
+            if (!kx.valid || !ky.valid)
+              return UvExactComponentOrigin{};
+            UvExactComponentOrigin primary = uvx;
+            uvAffineMulConstRef(primary.affine, kx);
+            UvExactComponentOrigin sibling = uvy;
+            uvAffineMulConstRef(sibling.affine, ky);
+            if (!uvAffineTryAttachCross(primary, sibling))
+              return UvExactComponentOrigin{};
+            if (addend.valid)
+              uvAffineAddConstRef(primary.affine, addend, 1.0f);
+            if (!uvComponentAffineExact(primary.affine))
+              return UvExactComponentOrigin{};
+            return primary;
+          };
+
+          if (!o1x.valid && !o1y.valid && !o2.valid) {
+            const UvExactComponentOrigin row = tryDp2AddRow(o0x, o0y, k1x, k1y, k2);
+            if (row.valid)
+              return row;
+          }
+          if (!o0x.valid && !o0y.valid && !o2.valid) {
+            const UvExactComponentOrigin row = tryDp2AddRow(o1x, o1y, k0x, k0y, k2);
+            if (row.valid)
+              return row;
+          }
+
           UvExactComponentOrigin merged = uvMergeOrigins(
             readOriginUnion(ctx.src[0], 2u),
             readOriginUnion(ctx.src[1], 2u));
-          merged = uvMergeOrigins(merged, readOrigin(ctx.src[2], c));
+          merged = uvMergeOrigins(merged, o2);
           if (merged.valid)
             uvAffineMarkInexact(merged.affine);
           return merged;
@@ -1415,8 +1628,8 @@ namespace dxvk {
                 site.compU = uOrigin.component;
                 site.compV = vOrigin.component;
               } else {
-                // component-mixing math (rotators, UV matrices): the register is proven but the
-                // exact pair is not - attribute the packed interpolant half being consumed
+                // component-mixing math (rotators, UV matrices): the exact source pair is not
+                // recoverable, so attribute the packed interpolant half being consumed
                 const uint8_t unionMask = uint8_t(uOrigin.componentMask | vOrigin.componentMask);
                 const bool onlySecondaryHalf =
                   (unionMask & 0b0011u) == 0u && (unionMask & 0b1100u) != 0u;
@@ -1426,10 +1639,11 @@ namespace dxvk {
               site.affineU = uOrigin.affine;
               site.affineV = vOrigin.affine;
               site.affineExact =
-                cleanComponents &&
                 !projected &&
                 uvComponentAffineExact(uOrigin.affine) &&
-                uvComponentAffineExact(vOrigin.affine);
+                uvComponentAffineExact(vOrigin.affine) &&
+                (cleanComponents ||
+                 uvAffineIsExactLinearPair(uOrigin.affine, vOrigin.affine, site.compU, site.compV));
             }
           }
 
@@ -1702,11 +1916,10 @@ namespace dxvk {
     // merged (start, count) register ranges of UniformVector_* / UniformScalar_* constants
     using Ue3MaterialConstRanges = std::vector<std::pair<uint32_t, uint32_t>>;
 
-    // Canonical shader signature serialization, shared by the CTAB parser and the
-    // lightmap-permutation bridge so their digests stay byte-identical. Entries carry
-    // names and register classes only: register indices shift with lightmap sampler
-    // counts and register counts are fxc's *used* element counts, which vary per
-    // permutation - neither may leak into the permutation-invariant signature.
+    // Canonical shader signature serialization. Entries carry names and register classes
+    // only: register indices shift with lightmap sampler counts and register counts are
+    // fxc's *used* element counts, which vary per permutation - neither may leak into the
+    // permutation-invariant signature.
     static std::string makeUe3SignatureEntry(const std::string& lowerName, const uint16_t registerSet) {
       return str::format(lowerName, "\x01", registerSet);
     }
@@ -1740,6 +1953,10 @@ namespace dxvk {
       // leading-register-only streaming keeps the constants identity aligned across lightmap
       // policy permutations, which shift uniform registers.
       std::vector<std::pair<XXH64_hash_t, uint32_t>> namedUniformFirstRegistersByNameOrder;
+      // Registers the shader's own dataflow proves carry a frame-varying expression value
+      // rather than an authored parameter, in ascending order. Diagnostics only; the identity
+      // streams above already exclude them.
+      std::vector<uint32_t> volatileUniformRegisters;
       // XXH3 over the name-sorted material sampler declarations (names and register class
       // only): a shader identity that is stable across the UE3 lightmap policy permutations
       // (directional vs simple texture lightmaps, Mirror's Edge bicubic lightmap filtering)
@@ -1747,343 +1964,14 @@ namespace dxvk {
       // constants are permutation-dependent (fxc strips or trims whatever a permutation does
       // not reference) and deliberately excluded.
       XXH64_hash_t canonicalShaderSignature = kEmptyHash;
-      // shader references lightmap policy symbols (LightMapTextures/LightMapScale/
-      // LightMapResolution, BSplineTexture), so its bytecode identity varies with the
-      // DirectionalLightmaps / TdBicubicFiltering system settings
-      bool hasLightmapPermutationSymbols = false;
       bool hasCtab = false;
+
+      // Set only when a sampler or uniform was left out, for
+      // rtx.d3d9.ue3LogMaterialInstanceHash: comparing it between a DirectionalLightmaps=True
+      // and =False run is the direct way to see whether a material's two compiles agree on
+      // their identity inputs.
+      std::string identitySummary;
     };
-
-    static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(const std::vector<uint8_t>& bytecode) {
-      Ue3PsMaterialIdentityInfo info;
-      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
-        return info;
-
-      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
-      const uint32_t headerToken = tokens[0];
-      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
-      if (headerTypeMask != 0xffff0000u)
-        return info;
-
-      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
-      const uint32_t minorVersion = headerToken & 0xffu;
-      DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, minorVersion, majorVersion);
-
-      DxsoDecodeContext decoder(programInfo);
-      DxsoCodeIter iter(tokens + 1);
-      while (decoder.decodeInstruction(iter)) {
-        if (decoder.getCtabInfo().m_size != 0)
-          break;
-      }
-
-      const DxsoCtab& ctab = decoder.getCtabInfo();
-      if (ctab.m_size == 0 || ctab.m_constantData.empty())
-        return info;
-
-      info.hasCtab = true;
-
-      auto startsWith = [](const std::string& s, const char* prefix) {
-        return s.rfind(prefix, 0) == 0;
-      };
-
-      std::vector<std::pair<std::string, uint32_t>> uniformsByName;
-      std::vector<std::string> samplerSignatureEntries;
-      std::vector<std::string> uniformSignatureEntries;
-
-      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
-        const std::string name = toLowerAscii(c.name);
-
-        // lightmap policy symbols: LightMapTextures / LightMapScale / LightMapResolution and the
-        // Mirror's Edge bicubic B-spline weights LUT. Their presence marks the shader as a
-        // DirectionalLightmaps / TdBicubicFiltering permutation.
-        if (name.find("lightmap") != std::string::npos || name.find("bspline") != std::string::npos) {
-          info.hasLightmapPermutationSymbols = true;
-        }
-
-        if (c.registerSet == kD3dxRegisterSetSampler) {
-          // strict prefix rule: only the numbered sampler names emitted by the UE3 material
-          // translator count as material texture parameters; lightmaps/scene/shadow samplers
-          // use other names and must stay out of the material identity
-          if (c.registerCount != 0 &&
-              (startsWith(name, "texture2d_") || startsWith(name, "texturecube_") || startsWith(name, "texture3d_"))) {
-            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
-            for (uint32_t s = c.registerIndex; s < end; s++) {
-              info.materialSamplerMask |= (1u << s);
-              // arrays get per-register names so name keys stay unambiguous (material samplers
-              // are scalar in practice, this is defensive)
-              const std::string samplerName =
-                c.registerCount > 1u ? str::format(name, "[", s - c.registerIndex, "]") : name;
-              info.materialSamplersByNameOrder.emplace_back(
-                samplerName, XXH3_64bits(samplerName.data(), samplerName.size()), s);
-            }
-            samplerSignatureEntries.push_back(makeUe3SignatureEntry(name, c.registerSet));
-          }
-          continue;
-        }
-
-        const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
-        const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
-        if (!isUniformVector && !isUniformScalar)
-          continue;
-        if (c.registerSet > 2u || c.registerCount == 0)
-          continue;
-        if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
-          continue;
-        if (isUniformVector) {
-          info.uniformVectorRegisters.push_back(c.registerIndex);
-        }
-        uniformsByName.emplace_back(name, c.registerIndex);
-        uniformSignatureEntries.push_back(makeUe3SignatureEntry(name, c.registerSet));
-        info.constRanges.emplace_back(c.registerIndex, c.registerCount);
-      }
-
-      std::sort(info.uniformVectorRegisters.begin(), info.uniformVectorRegisters.end());
-
-      std::sort(uniformsByName.begin(), uniformsByName.end());
-      info.namedUniformFirstRegistersByNameOrder.reserve(uniformsByName.size());
-      for (const auto& [uniformName, uniformRegister] : uniformsByName) {
-        info.namedUniformFirstRegistersByNameOrder.emplace_back(
-          XXH3_64bits(uniformName.data(), uniformName.size()), uniformRegister);
-      }
-
-      // name order is deterministic and identical across permutations, and name keys keep the
-      // streamed identity aligned even if a permutation strips an unreferenced symbol
-      std::sort(info.materialSamplersByNameOrder.begin(), info.materialSamplersByNameOrder.end());
-
-      // canonical shader signature: name-sorted material sampler declarations. Engine symbols
-      // are excluded wholesale (the lightmap policy permutations reference different engine
-      // constants, e.g. AmbientColorAndSkyFactor only outside SIMPLE_LIGHTING), and Uniform*
-      // constants are avoided because fxc strips whichever uniforms a permutation does not
-      // reference (e.g. specular-only expressions in the simple-lightmap compile) - either
-      // would leak the permutation back into the identity. Constant-color materials have no
-      // material samplers, so their signature falls back to the uniform declarations
-      // (invariant whenever both permutations reference the same uniform set).
-      info.canonicalShaderSignature = hashUe3SignatureEntries(
-        !samplerSignatureEntries.empty() ? samplerSignatureEntries : uniformSignatureEntries);
-
-      if (info.constRanges.empty())
-        return info;
-
-      std::sort(info.constRanges.begin(), info.constRanges.end());
-      Ue3MaterialConstRanges merged;
-      for (const auto& r : info.constRanges) {
-        if (merged.empty() || r.first > merged.back().first + merged.back().second) {
-          merged.push_back(r);
-        } else {
-          const uint32_t end = std::max(merged.back().first + merged.back().second, r.first + r.second);
-          merged.back().second = end - merged.back().first;
-        }
-      }
-      info.constRanges = std::move(merged);
-      return info;
-    }
-
-    // Reused XXH3 streaming state: created once per thread instead of heap
-    // allocating/freeing a state per hash operation on the per-draw path. The state is
-    // fully reset before each use, so digests are identical to a fresh state.
-    static XXH3_state_t* getThreadLocalXxh3State() {
-      static thread_local XXH3_state_t* const state = XXH3_createState();
-      return state;
-    }
-
-    // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
-    // fallback would fold per-view/per-mesh constants into the hash.
-    static XXH64_hash_t hashUe3MaterialConstants(
-        const Vector4* fConsts,
-        const Ue3MaterialConstRanges& ranges) {
-      if (ranges.empty())
-        return kEmptyHash;
-
-      XXH3_state_t* const state = getThreadLocalXxh3State();
-      if (state == nullptr)
-        return kEmptyHash;
-      XXH3_64bits_reset(state);
-
-      bool anyRegisterHashed = false;
-      for (const auto& [start, count] : ranges) {
-        if (start + count > caps::MaxFloatConstantsPS)
-          continue;
-        XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
-        anyRegisterHashed = true;
-      }
-
-      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
-    }
-
-    // Permutation-invariant constants identity: streams (name key, leading element value) of
-    // each named Uniform* constant, in name order. fxc trims each uniform array to the
-    // elements the permutation actually references (the directional lightmap path can
-    // reference more expression elements than the simple path, e.g. an unreferenced specular
-    // expression), so higher elements are not comparable across lightmap policy permutations.
-    // The leading element is always within the reported range and the engine uploads the same
-    // expression value to it in every permutation. Name keys keep the stream aligned even if
-    // a permutation strips an entire unreferenced uniform.
-    static XXH64_hash_t hashUe3MaterialConstantsByNameOrder(
-        const Vector4* fConsts,
-        const std::vector<std::pair<XXH64_hash_t, uint32_t>>& namedUniformFirstRegistersByNameOrder) {
-      if (namedUniformFirstRegistersByNameOrder.empty())
-        return kEmptyHash;
-
-      XXH3_state_t* const state = getThreadLocalXxh3State();
-      if (state == nullptr)
-        return kEmptyHash;
-      XXH3_64bits_reset(state);
-
-      bool anyRegisterHashed = false;
-      for (const auto& [nameKey, reg] : namedUniformFirstRegistersByNameOrder) {
-        if (reg >= caps::MaxFloatConstantsPS)
-          continue;
-        XXH3_64bits_update(state, &nameKey, sizeof(nameKey));
-        XXH3_64bits_update(state, &fConsts[reg], sizeof(Vector4));
-        anyRegisterHashed = true;
-      }
-
-      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
-    }
-
-    static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
-
-    static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
-        const XXH64_hash_t psHash,
-        const std::vector<uint8_t>& bytecode) {
-      auto it = s_ue3PsMaterialIdentityCache.find(psHash);
-      if (it == s_ue3PsMaterialIdentityCache.end()) {
-        it = s_ue3PsMaterialIdentityCache.emplace(psHash, parseUe3PsMaterialIdentityFromCtab(bytecode)).first;
-      }
-      return it->second;
-    }
-
-    // UE3 lightmap-permutation bridge (rtx.d3d9.ue3LightmapPermutationBridgeLookup).
-    //
-    // The simple-lightmap compile strips material samplers and uniforms referenced only by
-    // specular/two-sided-lighting expressions, so such materials cannot share one identity
-    // across DirectionalLightmaps states: the simple-state draw computes its identity over a
-    // strict SUBSET of the directional-state draw's symbols. The bridge exploits the superset
-    // direction: from the richer draw, recompute the identity chain for small symbol-drop
-    // combinations - dropping exactly the stripped symbols reproduces the subset state's hash
-    // bit-for-bit (sampler names, streamed values, and the chain formula all match by
-    // construction). The replacement lookup then tries these alternates, so replacements
-    // authored under DirectionalLightmaps=False match under =True with no aliasing heuristics:
-    // an alternate either reconstructs a captured identity exactly or misses.
-    struct Ue3PresentMaterialSampler {
-      // points into the cached Ue3PsMaterialIdentityInfo entry; only consumed within the draw
-      const std::string* name = nullptr;
-      XXH64_hash_t nameKey = kEmptyHash;
-      XXH64_hash_t imageHash = kEmptyHash;
-    };
-
-    struct Ue3PresentMaterialUniform {
-      XXH64_hash_t nameKey = kEmptyHash;
-      Vector4 value;
-    };
-
-    // enumeration limits: strippable symbol counts are small in practice (a spec map and a
-    // couple of spec/two-sided uniforms); larger material graphs are not worth the combinatorics
-    constexpr uint32_t kUe3BridgeMaxSamplers = 8;
-    constexpr uint32_t kUe3BridgeMaxUniforms = 10;
-    constexpr uint32_t kUe3BridgeMaxSamplerDrops = 2;
-    constexpr uint32_t kUe3BridgeMaxUniformDrops = 2;
-    constexpr size_t kUe3BridgeMaxVariants = 64;
-
-    static std::shared_ptr<const std::vector<XXH64_hash_t>> buildUe3LightmapPermutationAlternateHashes(
-        const XXH64_hash_t fullMaterialHash,
-        const Ue3PresentMaterialSampler* samplers,
-        const uint32_t samplerCount,
-        const Ue3PresentMaterialUniform* uniforms,
-        const uint32_t uniformCount) {
-      if (samplerCount == 0 || samplerCount > kUe3BridgeMaxSamplers || uniformCount > kUe3BridgeMaxUniforms)
-        return nullptr;
-
-      XXH3_state_t* const state = getThreadLocalXxh3State();
-      if (state == nullptr)
-        return nullptr;
-
-      auto computeSignature = [&](const uint32_t samplerDropMask) {
-        std::vector<std::string> entries;
-        entries.reserve(samplerCount);
-        for (uint32_t i = 0; i < samplerCount; i++) {
-          if ((samplerDropMask & (1u << i)) == 0) {
-            entries.push_back(makeUe3SignatureEntry(*samplers[i].name, kD3dxRegisterSetSampler));
-          }
-        }
-        return hashUe3SignatureEntries(entries);
-      };
-
-      auto computeTextureSet = [&](const uint32_t samplerDropMask) {
-        XXH3_64bits_reset(state);
-        for (uint32_t i = 0; i < samplerCount; i++) {
-          if ((samplerDropMask & (1u << i)) == 0) {
-            XXH3_64bits_update(state, &samplers[i].nameKey, sizeof(samplers[i].nameKey));
-            XXH3_64bits_update(state, &samplers[i].imageHash, sizeof(samplers[i].imageHash));
-          }
-        }
-        return XXH3_64bits_digest(state);
-      };
-
-      // ~0u = drop all constants (matches the subset state having constants excluded or none left)
-      auto computeConstants = [&](const uint32_t uniformDropMask) -> XXH64_hash_t {
-        if (uniformDropMask == ~0u || uniformCount == 0)
-          return kEmptyHash;
-        XXH3_64bits_reset(state);
-        bool any = false;
-        for (uint32_t i = 0; i < uniformCount; i++) {
-          if ((uniformDropMask & (1u << i)) == 0) {
-            XXH3_64bits_update(state, &uniforms[i].nameKey, sizeof(uniforms[i].nameKey));
-            XXH3_64bits_update(state, &uniforms[i].value, sizeof(uniforms[i].value));
-            any = true;
-          }
-        }
-        return any ? XXH3_64bits_digest(state) : kEmptyHash;
-      };
-
-      std::vector<uint32_t> uniformDropMasks;
-      uniformDropMasks.push_back(0u);
-      for (uint32_t mask = 1; mask < (1u << uniformCount); mask++) {
-        if (bit::popcnt(mask) <= kUe3BridgeMaxUniformDrops) {
-          uniformDropMasks.push_back(mask);
-        }
-      }
-      uniformDropMasks.push_back(~0u);
-
-      auto result = std::make_shared<std::vector<XXH64_hash_t>>();
-      result->reserve(kUe3BridgeMaxVariants);
-
-      for (uint32_t samplerDropMask = 0; samplerDropMask < (1u << samplerCount); samplerDropMask++) {
-        const uint32_t drops = bit::popcnt(samplerDropMask);
-        if (drops > kUe3BridgeMaxSamplerDrops || drops >= samplerCount)
-          continue;
-
-        const XXH64_hash_t signature = computeSignature(samplerDropMask);
-        const XXH64_hash_t textureSetHash = computeTextureSet(samplerDropMask);
-        // replicates LegacyMaterialData::updateCachedHash's seed chain
-        const XXH64_hash_t tier2 = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), signature);
-
-        for (const uint32_t uniformDropMask : uniformDropMasks) {
-          if (samplerDropMask == 0 && uniformDropMask == 0)
-            continue; // identical to the draw's own identity (tier 1)
-
-          const XXH64_hash_t constantsHash = computeConstants(uniformDropMask);
-          const XXH64_hash_t variant = constantsHash != kEmptyHash
-            ? XXH3_64bits_withSeed(&constantsHash, sizeof(constantsHash), tier2)
-            : tier2;
-
-          if (variant != fullMaterialHash &&
-              std::find(result->begin(), result->end(), variant) == result->end()) {
-            result->push_back(variant);
-            if (result->size() >= kUe3BridgeMaxVariants) {
-              return result;
-            }
-          }
-        }
-      }
-
-      if (result->empty())
-        return nullptr;
-      return result;
-    }
-
-    // memoized per full material identity; pure function of the identity's inputs
-    static fast_unordered_cache<std::shared_ptr<const std::vector<XXH64_hash_t>>> s_ue3AlternateHashCache;
 
     // CTAB sampler register -> declared name, for diagnostics. Cached per shader hash.
     static const std::map<uint32_t, std::string>& getUe3PsSamplerNames(
@@ -2172,81 +2060,231 @@ namespace dxvk {
       return s_ue3PsFloatConstantNameCache.emplace(psHash, std::move(names)).first->second;
     }
 
-    // Churn threshold for warning about frame-varying constant registers: genuine
-    // constant-differentiated material instance siblings form small groups (measured 2-8 per
-    // shader+texture set), while frame-varying values sweep unbounded hashes within a single
-    // group. A widely reused shader legitimately produces many hashes spread across many
-    // texture sets, so the count must be per group, not per shader.
-    constexpr uint32_t kUe3MicChurnWarnThreshold = 32;
+    // Shared by the UE3 on-disk caches. Each rewrites its whole file from an in-memory
+    // container, so a save is only safe when that container holds everything the file held:
+    // a load that ends up with less must take the file out of reach for the session, or one
+    // unreadable read becomes permanent loss of data that took a playthrough to accumulate.
+    // Distinguishing "absent" from "unreadable" is what makes a first run still able to save.
+    bool ue3CacheFileExists(const char* path) {
+      std::error_code error;
+      return std::filesystem::exists(path, error);
+    }
 
-    // Runtime auto-exclusion of frame-varying constants from material identity
-    // (rtx.d3d9.ue3MicAutoExcludeFrameVaryingConstants): per (identity seed, texture set)
-    // group, remember the most recent distinct constants hashes in a bounded ring. Re-seeing
-    // a sibling's hash is a ring hit and DECAYS the distinct count: stable siblings redraw
-    // every frame, so legitimate constant-differentiated families - however many siblings
-    // accumulate across levels - hit far more than they miss and never trip. Frame-varying
-    // constants (Time/panner/fade/sub-UV expressions) mint a new hash every draw, never hit
-    // the ring, and cross the threshold within a second - after which the GROUP's constants
-    // are dropped from identity for the session. Exclusion is keyed per group, never per
-    // seed: the canonical seed is only a sampler-name signature shared by many unrelated
-    // materials, and excluding it wholesale would collapse the identity - and break the
-    // replacement matching - of every material that shares it.
-    constexpr uint32_t kUe3MicConstantHashRingSize = kUe3MicChurnWarnThreshold;
+    // Publishes a fully written temp file over the real one, so a process that dies mid-write
+    // leaves the previous cache intact rather than a truncated file that the next load would
+    // read as a short but well-formed one.
+    bool ue3CommitCacheFile(const char* tempPath, const char* path) {
+      std::error_code error;
+      std::filesystem::rename(tempPath, path, error);
+      if (error) {
+        std::filesystem::remove(tempPath, error);
+        return false;
+      }
+      return true;
+    }
 
-    struct Ue3MicConstantChurnEntry {
-      std::array<XXH64_hash_t, kUe3MicConstantHashRingSize> recentHashes = {};
-      uint32_t ringCursor = 0;
-      uint32_t distinctCount = 0;
+    // ===== Replacement identity drift diagnostics =====
+    // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
+    //
+    // Remembers, per material family, the identity tiers behind the last minted material
+    // hash so a mint with a different hash can be attributed to the tier that moved
+    // (texture set, constants, or exclusion state). A family is keyed by (shader identity
+    // seed, primary color texture hash) - both stable across sessions, unlike any of the
+    // minted hashes themselves.
+    constexpr uint32_t kMicDriftMaxTrackedSamplers = 16;  // caps::MaxTexturesPS
+    constexpr uint32_t kMicDriftMaxTrackedConstants = 16;
+    // Per-family log caps: a family whose constants animate in a way volatile-register
+    // classification cannot see would otherwise emit a drift warning per draw.
+    constexpr uint32_t kMicDriftMaxLogsPerFamily = 16;
+    constexpr uint32_t kMicDriftMaxLogsPerTrackedFamily = 64;
+
+    struct Ue3MicIdentitySample {
+      XXH64_hash_t materialHash = kEmptyHash;
+      XXH64_hash_t textureSetHash = kEmptyHash;
+      XXH64_hash_t constantsHash = kEmptyHash;
+      bool constantsExcluded = false;
+      bool valid = false;
+      uint32_t driftLogsEmitted = 0;
+
+      struct SamplerRecord {
+        uint8_t reg = 0xFF;
+        bool isRenderTarget = false;
+        XXH64_hash_t imageHash = kEmptyHash;
+        XXH64_hash_t descriptorHash = kEmptyHash;
+      };
+      std::array<SamplerRecord, kMicDriftMaxTrackedSamplers> samplers = {};
+      uint32_t samplerCount = 0;
+
+      struct ConstantRecord {
+        uint16_t reg = 0xFFFF;
+        Vector4 value;
+      };
+      std::array<ConstantRecord, kMicDriftMaxTrackedConstants> constants = {};
+      uint32_t constantCount = 0;
     };
 
-    static fast_unordered_cache<Ue3MicConstantChurnEntry> s_ue3MicConstantChurnPerGroup;
-    static fast_unordered_set s_ue3MicAutoExcludedGroups;
+    static fast_unordered_cache<Ue3MicIdentitySample> s_ue3MicIdentityByFamily;
+    static fast_unordered_set s_ue3MicRtPoisonWarnedFamilies;
 
-    static XXH64_hash_t makeUe3MicChurnGroupKey(const XXH64_hash_t shaderIdentitySeed,
-                                                const XXH64_hash_t textureSetHash) {
-      return XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentitySeed);
+    // ===== Residual identity churn reporting =====
+    // (rtx.d3d9.ue3ReportMicIdentityChurn)
+    //
+    // Volatile-register classification is a property of the shader, so a material's identity is
+    // decided before its first draw is hashed and cannot move afterwards. What the bytecode
+    // cannot see is a frame-varying expression that reaches the output colour rather than a
+    // coordinate - a time-driven fade or tint is indistinguishable from an authored
+    // VectorParameterValue there. Those families still mint more than one identity, so they are
+    // reported rather than left to break their anchors quietly. Nothing is excluded as a result:
+    // an identity that changes mid-session is exactly what this whole design exists to avoid,
+    // and the fix belongs in a config the next session starts from.
+    //
+    // Keyed on textureSetShaderHash, which already folds in the identity seed and is both the
+    // authoring handle (rtx.d3d9.ue3MicConstantIdentityExcludedMaterials) and the second
+    // replacement lookup tier.
+    //
+    // A second identity on one texture set is also what a colour variant looks like the first time
+    // its sibling is drawn, so reporting at two would bury the families that matter under benign
+    // ones. Measured constant-differentiated sibling sets run to about eight; a frame-varying
+    // register passes any bound within a second, so a threshold well clear of the former separates
+    // them without needing to understand the values.
+    constexpr uint32_t kUe3MicChurnReportThreshold = 16;
+
+    struct Ue3MicChurnReport {
+      XXH64_hash_t firstConstantsHash = kEmptyHash;
+      std::vector<Ue3MicIdentitySample::ConstantRecord> firstConstants;
+      fast_unordered_set seenConstantsHashes;
+      bool warned = false;
+    };
+
+    static fast_unordered_cache<Ue3MicChurnReport> s_ue3MicChurnByMaterialFamily;
+
+    // Walks the registers in the order the constants hash streams them, so a report can name the
+    // ones whose values moved. `emit` returns false to stop early, which is how the fixed-size
+    // drift snapshot applies its bound.
+    template <typename EmitFn>
+    static void forEachUe3MicIdentityConstant(
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream,
+        EmitFn&& emit) {
+      if (useNameOrderStream) {
+        for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
+          if (uniformRegister < caps::MaxFloatConstantsPS && !emit(uniformRegister))
+            return;
+        }
+        return;
+      }
+
+      for (const auto& [rangeStart, rangeCount] : identityInfo.constRanges) {
+        for (uint32_t r = rangeStart; r < rangeStart + rangeCount; r++) {
+          if (r < caps::MaxFloatConstantsPS && !emit(r))
+            return;
+        }
+      }
     }
 
-    static bool isUe3MicGroupAutoExcluded(const XXH64_hash_t churnGroupKey) {
-      return s_ue3MicAutoExcludedGroups.find(churnGroupKey) != s_ue3MicAutoExcludedGroups.end();
+    // Bounded, for the per-family drift sample that is retained for every family while replacement
+    // diagnostics are on.
+    static uint32_t snapshotUe3MicIdentityConstants(
+        const Vector4* fConsts,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream,
+        Ue3MicIdentitySample::ConstantRecord* out,
+        const uint32_t outCapacity) {
+      uint32_t count = 0;
+      forEachUe3MicIdentityConstant(identityInfo, useNameOrderStream, [&](const uint32_t reg) {
+        out[count++] = Ue3MicIdentitySample::ConstantRecord { uint16_t(reg), fConsts[reg] };
+        return count < outCapacity;
+      });
+      return count;
     }
 
-    // Returns true when the group was newly auto-excluded on this call.
-    static bool trackUe3MicConstantChurn(const XXH64_hash_t churnGroupKey,
-                                         const XXH64_hash_t psHash,
-                                         const XXH64_hash_t shaderIdentitySeed,
-                                         const XXH64_hash_t textureSetHash,
-                                         const XXH64_hash_t constantsHash) {
-      Ue3MicConstantChurnEntry& entry = s_ue3MicConstantChurnPerGroup[churnGroupKey];
+    // Unbounded: each family takes at most two, and a cap would silently drop the register that
+    // moved on any shader declaring more uniforms than the cap - leaving a report that says a
+    // family churned but not which value did, which is the only part worth reading.
+    static std::vector<Ue3MicIdentitySample::ConstantRecord> snapshotUe3MicIdentityConstants(
+        const Vector4* fConsts,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream) {
+      std::vector<Ue3MicIdentitySample::ConstantRecord> records;
+      forEachUe3MicIdentityConstant(identityInfo, useNameOrderStream, [&](const uint32_t reg) {
+        records.push_back({ uint16_t(reg), fConsts[reg] });
+        return true;
+      });
+      return records;
+    }
 
-      for (const XXH64_hash_t seenHash : entry.recentHashes) {
-        if (seenHash == constantsHash) {
-          if (entry.distinctCount > 0) {
-            --entry.distinctCount;
+    static void reportUe3MicIdentityChurnOnce(
+        const XXH64_hash_t textureSetShaderHash,
+        const XXH64_hash_t psHash,
+        const XXH64_hash_t shaderIdentitySeed,
+        const XXH64_hash_t primaryTextureHash,
+        const XXH64_hash_t constantsHash,
+        const Vector4* fConsts,
+        const Ue3PsMaterialIdentityInfo& identityInfo,
+        const bool useNameOrderStream,
+        const std::vector<uint8_t>& bytecode) {
+      if (textureSetShaderHash == kEmptyHash || constantsHash == kEmptyHash)
+        return;
+
+      Ue3MicChurnReport& report = s_ue3MicChurnByMaterialFamily[textureSetShaderHash];
+      if (report.warned)
+        return;
+
+      if (report.firstConstantsHash == kEmptyHash) {
+        report.firstConstantsHash = constantsHash;
+        report.firstConstants = snapshotUe3MicIdentityConstants(fConsts, identityInfo, useNameOrderStream);
+        report.seenConstantsHashes.insert(constantsHash);
+        return;
+      }
+
+      if (!report.seenConstantsHashes.insert(constantsHash).second ||
+          report.seenConstantsHashes.size() < kUe3MicChurnReportThreshold) {
+        return;
+      }
+
+      report.warned = true;
+      report.seenConstantsHashes.clear();
+
+      const std::vector<Ue3MicIdentitySample::ConstantRecord> current =
+        snapshotUe3MicIdentityConstants(fConsts, identityInfo, useNameOrderStream);
+
+      const std::map<uint32_t, std::string>& constantNames = getUe3PsFloatConstantNames(psHash, bytecode);
+      std::string detail;
+      for (const Ue3MicIdentitySample::ConstantRecord& now : current) {
+        for (const Ue3MicIdentitySample::ConstantRecord& first : report.firstConstants) {
+          if (first.reg != now.reg)
+            continue;
+          if (first.value.x != now.value.x || first.value.y != now.value.y ||
+              first.value.z != now.value.z || first.value.w != now.value.w) {
+            const auto nameIt = constantNames.find(uint32_t(now.reg));
+            detail += str::format(
+              "\n    c", uint32_t(now.reg),
+              nameIt != constantNames.end() ? str::format(" (", nameIt->second, ")") : std::string(),
+              ": (", first.value.x, ",", first.value.y, ",", first.value.z, ",", first.value.w,
+              ") -> (", now.value.x, ",", now.value.y, ",", now.value.z, ",", now.value.w, ")");
           }
-          return false;
+          break;
         }
       }
 
-      entry.recentHashes[entry.ringCursor] = constantsHash;
-      entry.ringCursor = (entry.ringCursor + 1u) % kUe3MicConstantHashRingSize;
-      ++entry.distinctCount;
+      Logger::warn(str::format(
+        "[RTX-MicChurn] Material family textureSetShader=0x", std::hex, textureSetShaderHash,
+        " (ps=0x", psHash, " seed=0x", shaderIdentitySeed, " tex=0x", primaryTextureHash, std::dec,
+        ") has minted ", kUe3MicChurnReportThreshold,
+        " identities from its constants tier, so a register is very likely animating:",
+        // No register differing while the hash did means the two mints saw different register
+        // *sets*, which for a fixed shader only happens when a permutation trimmed a uniform.
+        detail.empty()
+          ? str::format("\n    (constants hash 0x", std::hex, report.firstConstantsHash, " -> 0x", constantsHash,
+                        std::dec, " with no differing register among the ", current.size(), " compared)")
+          : detail,
+        "\n  Every material hash it mints is unanchorable. Pin it with:"
+        "\n    rtx.d3d9.ue3MicConstantIdentityExcludedMaterials = 0x", std::hex, textureSetShaderHash, std::dec,
+        "\n  then re-anchor the material once. Identity is unchanged for this session."));
 
-      if (entry.distinctCount >= kUe3MicChurnWarnThreshold &&
-          s_ue3MicAutoExcludedGroups.insert(churnGroupKey).second) {
-        Logger::warn(str::format(
-          "[RTX-Compatibility][UE3-MIC] Material group (seed=0x", std::hex, shaderIdentitySeed,
-          ", ps=0x", psHash,
-          ", textureSet=0x", textureSetHash, std::dec,
-          ") minted ", kUe3MicChurnWarnThreshold,
-          "+ distinct constant hashes - its constant registers are frame-varying "
-          "(Time/panner/fade/sub-UV expressions). Excluding this group's constants from "
-          "material identity for this session; add the shader hash or seed to "
-          "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to exclude it permanently."));
-        return true;
-      }
-
-      return false;
+      // Nothing reads these once the family has reported; the record stays only for `warned`.
+      report.firstConstants.clear();
+      report.firstConstants.shrink_to_fit();
     }
 
     static void logUe3MaterialInstanceHashBreakdownOnce(
@@ -2254,6 +2292,7 @@ namespace dxvk {
         const XXH64_hash_t psHash,
         const XXH64_hash_t shaderIdentitySeed,
         const XXH64_hash_t textureSetHash,
+        const XXH64_hash_t textureSetShaderHash,
         const XXH64_hash_t constantsHash,
         const Ue3PsMaterialIdentityInfo& identityInfo,
         const bool constantsExcluded,
@@ -2267,6 +2306,11 @@ namespace dxvk {
         ranges += str::format(ranges.empty() ? "c" : ",c", start, "+", count);
       }
 
+      std::string volatileRegisters;
+      for (const uint32_t reg : identityInfo.volatileUniformRegisters) {
+        volatileRegisters += str::format(volatileRegisters.empty() ? "c" : ",c", reg);
+      }
+
       const bool usedCanonicalSeed = shaderIdentitySeed != psHash;
       Logger::info(str::format(
         "[RTX-Compatibility][UE3-MIC] materialHash=0x", std::hex, materialHash,
@@ -2275,24 +2319,13 @@ namespace dxvk {
         usedCanonicalSeed ? " (canonical, lightmap-permutation invariant)" : " (bytecode)",
         std::hex,
         " textureSet=0x", textureSetHash,
+        " textureSetShader=0x", textureSetShaderHash,
         " consts=0x", constantsHash, std::dec,
         " textures=[", textureList, "]",
         " constRanges=[", ranges, "]",
+        volatileRegisters.empty() ? std::string() : str::format(" volatileRegs=[", volatileRegisters, "]"),
         constantsExcluded ? " constsExcluded=1" : "",
         " ctab=", identityInfo.hasCtab ? 1 : 0));
-
-      static fast_unordered_cache<uint32_t> s_distinctHashCountPerGroup;
-      static fast_unordered_set s_churnWarnedShaders;
-      const XXH64_hash_t groupKey = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), shaderIdentitySeed);
-      const uint32_t distinctCount = ++s_distinctHashCountPerGroup[groupKey];
-      if (distinctCount == kUe3MicChurnWarnThreshold && s_churnWarnedShaders.insert(psHash).second) {
-        Logger::warn(str::format(
-          "[RTX-Compatibility][UE3-MIC] Pixel shader 0x", std::hex, psHash,
-          " has minted ", std::dec, distinctCount, "+ distinct material hashes for a single texture set (0x",
-          std::hex, textureSetHash, std::dec, ") - its constant registers are likely frame-varying ",
-          "(Time/panner/fade/sub-UV expressions). Add it to ",
-          "rtx.d3d9.ue3MicConstantIdentityExcludedShaders to stabilize its material identity."));
-      }
     }
 
     constexpr uint8_t kPsSamplerSemanticEngineAuxiliary = 1u << 0;
@@ -2301,6 +2334,83 @@ namespace dxvk {
     constexpr uint8_t kPsSamplerSemanticNonDiffuse      = 1u << 3;
     constexpr uint8_t kPsSamplerSemanticVideo           = 1u << 4;
     constexpr uint8_t kPsSamplerSemanticMovieTexture    = 1u << 5;
+
+    // How many of DxsoInstructionContext::src an opcode actually reads. The decoder overwrites
+    // that array in order and leaves the rest holding whatever the previous instruction put
+    // there, so anything reading a slot the opcode does not use gets a stale register. The
+    // existing coordinate heuristics tolerate that (an extra provenance bit only nudges
+    // scoring); constant-dependency tracking cannot, because a stale constant would be dropped
+    // from material identity and merge materials that a tint tells apart.
+    //
+    // Unknown opcodes report 0 so the tracking fails closed: a missed dependency leaves an
+    // identity that churns and says so through [RTX-MicChurn], whereas an invented one silently
+    // collapses two anchors into one.
+    static uint32_t getDxsoSourceOperandCount(const DxsoOpcode op) {
+      switch (op) {
+      case DxsoOpcode::Mov:
+      case DxsoOpcode::Rcp:
+      case DxsoOpcode::Rsq:
+      case DxsoOpcode::Exp:
+      case DxsoOpcode::Log:
+      case DxsoOpcode::ExpP:
+      case DxsoOpcode::LogP:
+      case DxsoOpcode::Frc:
+      case DxsoOpcode::Abs:
+      case DxsoOpcode::Nrm:
+      case DxsoOpcode::Sgn:
+      case DxsoOpcode::Lit:
+      case DxsoOpcode::Mova:
+      case DxsoOpcode::DsX:
+      case DxsoOpcode::DsY:
+      case DxsoOpcode::SinCos:  // ps_3_0 folds away the two constant operands ps_2_0 required
+        return 1;
+      case DxsoOpcode::Add:
+      case DxsoOpcode::Sub:
+      case DxsoOpcode::Mul:
+      case DxsoOpcode::Dp3:
+      case DxsoOpcode::Dp4:
+      case DxsoOpcode::Min:
+      case DxsoOpcode::Max:
+      case DxsoOpcode::Slt:
+      case DxsoOpcode::Sge:
+      case DxsoOpcode::Dst:
+      case DxsoOpcode::Pow:
+      case DxsoOpcode::Crs:
+      case DxsoOpcode::M4x4:
+      case DxsoOpcode::M4x3:
+      case DxsoOpcode::M3x4:
+      case DxsoOpcode::M3x3:
+      case DxsoOpcode::M3x2:
+      case DxsoOpcode::Bem:
+        return 2;
+      case DxsoOpcode::Mad:
+      case DxsoOpcode::Lrp:
+      case DxsoOpcode::Cmp:
+      case DxsoOpcode::Cnd:
+      case DxsoOpcode::Dp2Add:
+        return 3;
+      // Sampling ops report none. Their destination holds a sampled value, whose dependency on the
+      // coordinate's constants matters only for a dependent texture read, and their operand layout
+      // varies by shader model (ps_1_x carries the coordinate in the destination). Under-reporting
+      // costs a dependent read's taint and is caught by [RTX-MicChurn]; guessing wrong would taint
+      // from a stale slot and merge two anchors.
+      default:
+        return 0;
+      }
+    }
+
+    // Matrix multiplies name only the first row's constant register; the rest of the matrix
+    // occupies the registers immediately after it. Returns 0 for everything else.
+    static uint32_t getDxsoMatrixRowCount(const DxsoOpcode op) {
+      switch (op) {
+      case DxsoOpcode::M4x4: return 4;
+      case DxsoOpcode::M4x3:
+      case DxsoOpcode::M3x4:
+      case DxsoOpcode::M3x3: return 3;
+      case DxsoOpcode::M3x2: return 2;
+      default:               return 0;
+      }
+    }
 
     // expression-level hints inferred from shader opcode/dataflow around a sampler's UV path
     constexpr uint16_t kPsSamplerExprUvTransform = 1u << 0;
@@ -2381,7 +2491,10 @@ namespace dxvk {
         flags |= kPsSamplerSemanticEngineAuxiliary;
       }
 
-      if (contains("lightmap")) {
+      // UE3 lightmap machinery: the LightMapTextures[] coefficient array declared by every
+      // texture lightmap permutation, plus Mirror's Edge's BSplineTexture weight LUT, which
+      // exists only to filter those coefficients (TdBicubicFiltering).
+      if (contains("lightmap") || contains("bspline")) {
         flags |= kPsSamplerSemanticLightmap;
         flags |= kPsSamplerSemanticEngineAuxiliary;
       }
@@ -2484,6 +2597,12 @@ namespace dxvk {
       bool offsetImmediateValid = false;
       float offsetImmediateU = 0.0f;
       float offsetImmediateV = 0.0f;
+      // Every float constant register this sampler's coordinate depends on, ascending. Unlike
+      // scaleConstReg/offsetConstReg - which are outputs of the affine resolver and so only
+      // exist for the shapes it can express - this is the transitive dataflow, so it also
+      // covers a rotator's 2x2 matrix, a matrix multiply, and any chain through temps. Excludes
+      // `def` literals, which are bytecode rather than draw state.
+      std::vector<uint32_t> coordConstRegs;
     };
 
     struct PsTexcoordScaleHint {
@@ -2574,6 +2693,13 @@ namespace dxvk {
       defFloatConstValid.fill(0);
       std::array<Vector4, caps::MaxFloatConstantsPS> defFloatConsts = {};
 
+      // Which float constant registers each temp's value transitively depends on, as a bitset.
+      // Read at a sample to learn what a coordinate is built from, which is what tells a texture
+      // transform apart from an authored parameter no matter what shape the expression takes.
+      constexpr uint32_t kConstDepWords = (caps::MaxFloatConstantsPS + 63u) / 64u;
+      using ConstDepSet = std::array<uint64_t, kConstDepWords>;
+      std::array<ConstDepSet, 64> tempConstDeps = {};
+
       auto getTexcoordFromRegister = [&](const DxsoRegister& r) -> int32_t {
         auto mapPsInputRegToTexcoordUsage = [&](const uint32_t regNum) -> int32_t {
           if (regNum < inputRegToTexcoord.size()) {
@@ -2615,6 +2741,30 @@ namespace dxvk {
             : 0u;
         default:
           return 0u;
+        }
+      };
+
+      // A `def` literal is baked into the bytecode, so it is already part of the shader identity
+      // seed and can never vary between draws.
+      auto markConstDep = [&](const int32_t reg, ConstDepSet& inOut) {
+        if (reg >= 0 && reg < int32_t(caps::MaxFloatConstantsPS) && !defFloatConstValid[reg])
+          inOut[uint32_t(reg) / 64u] |= 1ull << (uint32_t(reg) % 64u);
+      };
+
+      auto orConstDepsFromRegister = [&](const DxsoRegister& r, ConstDepSet& inOut) {
+        switch (r.id.type) {
+        case DxsoRegisterType::Temp:
+        case DxsoRegisterType::TempFloat16:
+          if (r.id.num < tempConstDeps.size()) {
+            const ConstDepSet& deps = tempConstDeps[r.id.num];
+            for (uint32_t w = 0; w < kConstDepWords; w++)
+              inOut[w] |= deps[w];
+          }
+          break;
+        default:
+          if (isFloatConstantRegisterType(r.id.type) && !r.hasRelative)
+            markConstDep(getFloatConstantRegisterIndex(r), inOut);
+          break;
         }
       };
 
@@ -2875,6 +3025,7 @@ namespace dxvk {
       uint32_t texcoordDerivedSampleCount = 0;
       uint32_t nonTexcoordDerivedSampleCount = 0;
       uint16_t sampledCoordExpressionFlags = 0;
+      ConstDepSet sampledCoordConstDeps = {};  // -> result.coordConstRegs
       bool normalDecodeDetected = false;   // -> kPsSamplerExprNormalDecode
       bool reachesOutputColor = false;     // -> kPsSamplerExprReachesOutputColor
       bool diffuseAnchorDetected = false;  // -> kPsSamplerExprDiffuseAnchor
@@ -2937,6 +3088,30 @@ namespace dxvk {
           const uint8_t anchorB = getAnchorBitsFromRegister(ctx.src[1]);
           if ((roleA && anchorB != 0) || (roleB && anchorA != 0))
             diffuseAnchorDetected = true;
+        }
+
+        // Constant dependency propagation, for every temp write rather than only the ones the
+        // coordinate tracking recognises: a rotator reaches its coordinate through intermediate
+        // temps that are not themselves coordinates. Sources are read before the destination is
+        // assigned, so an in-place update (dst == src) sees its own prior dependencies. Only the
+        // set belonging to a register actually sampled from is ever read back.
+        if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
+            ctx.dst.id.num < tempConstDeps.size() &&
+            op != DxsoOpcode::Def && op != DxsoOpcode::DefI && op != DxsoOpcode::DefB) {
+          ConstDepSet deps = {};
+          const uint32_t srcCount = std::min<uint32_t>(getDxsoSourceOperandCount(op), uint32_t(ctx.src.size()));
+          for (uint32_t s = 0; s < srcCount; s++)
+            orConstDepsFromRegister(ctx.src[s], deps);
+
+          const uint32_t matrixRows = getDxsoMatrixRowCount(op);
+          if (matrixRows > 1u && srcCount >= 2u &&
+              isFloatConstantRegisterType(ctx.src[1].id.type) && !ctx.src[1].hasRelative) {
+            const int32_t base = getFloatConstantRegisterIndex(ctx.src[1]);
+            for (uint32_t row = 1; row < matrixRows; row++)
+              markConstDep(base + int32_t(row), deps);
+          }
+
+          tempConstDeps[ctx.dst.id.num] = deps;
         }
 
         if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
@@ -3603,6 +3778,10 @@ namespace dxvk {
             ? uint16_t(result.sampleCount + 1u)
             : std::numeric_limits<uint16_t>::max();
 
+          // Accumulated across every sample of this sampler, since a material can read the same
+          // texture through more than one coordinate (a sub-UV blend reads two atlas frames).
+          orConstDepsFromRegister(*coordReg, sampledCoordConstDeps);
+
           if ((ctx.dst.id.type == DxsoRegisterType::Temp || ctx.dst.id.type == DxsoRegisterType::TempFloat16) &&
               ctx.dst.id.num < tempSamplerValueRole.size()) {
             uint8_t sampleRole = kSamplerValueRoleColor;
@@ -3782,6 +3961,11 @@ namespace dxvk {
         }
       }
 
+      for (uint32_t reg = 0; reg < caps::MaxFloatConstantsPS; reg++) {
+        if ((sampledCoordConstDeps[reg / 64u] >> (reg % 64u)) & 1ull)
+          result.coordConstRegs.push_back(reg);
+      }
+
       result.expressionFlags = sampledCoordExpressionFlags;
       if (result.scaleConstReg >= 0 || result.scaleImmediateValid)
         result.expressionFlags |= kPsSamplerExprUvTransform;
@@ -3912,6 +4096,411 @@ namespace dxvk {
       }
 
       return result;
+    }
+
+    // A material sampler the base pass only consumes as a lighting *input* rather than as
+    // colour. UE3's simple-lightmap compile does not reference those inputs, so fxc strips them
+    // and the two compiles declare different sampler sets for the same material; leaving them
+    // in identity is what makes a material's hash move with the DirectionalLightmaps setting.
+    //
+    // Excluding them makes the sets agree without knowing which compile is running: where the
+    // sampler is declared it is recognised and dropped, and where fxc already stripped it there
+    // is nothing to drop. The test is deliberately a property of the sampler's own use, so it
+    // cannot key off a symbol that exists in one compile and not the other.
+    static bool isUe3LightingInputSampler(const PsSamplerTexcoordInference& inferred) {
+      // Same signal albedo selection treats as decisive. Guards against the whole rule
+      // misfiring on a material's own base texture.
+      if ((inferred.expressionFlags & kPsSamplerExprDiffuseAnchor) != 0)
+        return false;
+      if ((inferred.expressionFlags & kPsSamplerExprNormalDecode) != 0)
+        return true;
+      if ((inferred.semanticFlags & kPsSamplerSemanticNonDiffuse) != 0)
+        return true;
+      // Sampled but never reaching oC0 as colour: specular and mask inputs collapse into dot
+      // products and comparisons, which is what separates them from a diffuse or emissive map.
+      if (inferred.sampleCount > 0 &&
+          (inferred.expressionFlags & kPsSamplerExprReachesOutputColor) == 0) {
+        return true;
+      }
+      return false;
+    }
+
+    static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(
+        const std::vector<uint8_t>& bytecode,
+        const D3D9CommonShader* pixelShader,
+        const bool detectVolatileConstants) {
+      Ue3PsMaterialIdentityInfo info;
+      if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
+        return info;
+
+      const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+      const uint32_t headerToken = tokens[0];
+      const uint32_t headerTypeMask = headerToken & 0xffff0000u;
+      if (headerTypeMask != 0xffff0000u)
+        return info;
+
+      const uint32_t majorVersion = (headerToken >> 8) & 0xffu;
+      const uint32_t minorVersion = headerToken & 0xffu;
+      DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, minorVersion, majorVersion);
+
+      DxsoDecodeContext decoder(programInfo);
+      DxsoCodeIter iter(tokens + 1);
+      while (decoder.decodeInstruction(iter)) {
+        if (decoder.getCtabInfo().m_size != 0)
+          break;
+      }
+
+      const DxsoCtab& ctab = decoder.getCtabInfo();
+      if (ctab.m_size == 0 || ctab.m_constantData.empty())
+        return info;
+
+      info.hasCtab = true;
+
+      auto startsWith = [](const std::string& s, const char* prefix) {
+        return s.rfind(prefix, 0) == 0;
+      };
+
+      struct DeclaredSampler {
+        std::string name;
+        uint32_t registerIndex = 0;
+        uint32_t registerCount = 0;
+      };
+      struct DeclaredUniform {
+        std::string name;
+        uint16_t registerSet = 0;
+        uint32_t registerIndex = 0;
+        uint32_t registerCount = 0;
+      };
+
+      std::vector<DeclaredSampler> declaredSamplers;
+      std::vector<DeclaredUniform> declaredUniforms;
+      // Every sampler register the CTAB declares, material or engine. A frame-varying uniform
+      // can drive the UV of any of them, and the register has to leave the identity wherever it
+      // is used - an engine sampler sharing a material's panner offset is still that panner.
+      std::vector<uint32_t> allDeclaredSamplerRegisters;
+
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        const std::string name = toLowerAscii(c.name);
+
+        if (c.registerSet == kD3dxRegisterSetSampler) {
+          if (c.registerCount != 0) {
+            const uint32_t declaredEnd = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
+            for (uint32_t s = c.registerIndex; s < declaredEnd; s++)
+              allDeclaredSamplerRegisters.push_back(s);
+          }
+          // strict prefix rule: only the numbered sampler names emitted by the UE3 material
+          // translator count as material texture parameters; lightmaps/scene/shadow samplers
+          // use other names and must stay out of the material identity
+          if (c.registerCount != 0 &&
+              (startsWith(name, "texture2d_") || startsWith(name, "texturecube_") || startsWith(name, "texture3d_"))) {
+            declaredSamplers.push_back({ name, c.registerIndex, c.registerCount });
+          }
+          continue;
+        }
+
+        if (c.registerSet > 2u || c.registerCount == 0)
+          continue;
+        if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
+          continue;
+
+        const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
+        const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
+        if (!isUniformVector && !isUniformScalar)
+          continue;
+        // Constant-colour materials read their colour straight out of these, so the list has to
+        // stay complete even though only the vectors reach the identity hash.
+        if (isUniformVector) {
+          info.uniformVectorRegisters.push_back(c.registerIndex);
+        }
+        declaredUniforms.push_back({ name, c.registerSet, c.registerIndex, c.registerCount });
+      }
+
+      std::vector<std::pair<std::string, uint32_t>> uniformsByName;
+      std::vector<std::string> samplerSignatureEntries;
+      std::vector<std::string> keptSamplerNames, excludedSamplerNames;
+
+      // One bytecode walk per declared sampler, shared by the lighting-input test below and the
+      // volatile-register harvest. This whole parse is memoised per shader hash, so the cost is
+      // paid once per pixel shader rather than per draw.
+      std::map<uint32_t, PsSamplerTexcoordInference> samplerInference;
+      if (pixelShader != nullptr) {
+        for (const uint32_t samplerRegister : allDeclaredSamplerRegisters)
+          samplerInference.emplace(samplerRegister, inferPixelShaderTexcoordForSampler(pixelShader, samplerRegister));
+      }
+
+      // Registers the shader itself proves drive a sampler's coordinate: a texture transform
+      // rather than an authored parameter, wherever the value happens to come from. UE3
+      // re-evaluates every material uniform expression on the CPU per draw and
+      // writes the result into the same registers that carry VectorParameterValues, so a
+      // panner, rotator, flipbook/sub-UV frame or distance blend arrives in one of these and
+      // moves while the material stays the same one. An identity that folds them in is not
+      // reproducible: it re-mints as the material animates, and the replacements anchored on it
+      // match only on the frames the value happens to come back around. The tints UE3's colour
+      // variants are told apart by reach the output colour instead, never a coordinate, so they
+      // are untouched by this.
+      //
+      // Nothing about the material's appearance is lost. The UV path reads these same registers
+      // live and resolves the transform per draw; it is only the identity hash that declines to
+      // include them.
+      std::vector<uint32_t> volatileRegisters;
+      if (detectVolatileConstants) {
+        auto markVolatile = [&](const int32_t reg) {
+          if (reg < 0 || uint32_t(reg) >= caps::MaxFloatConstantsPS)
+            return;
+          const uint32_t value = uint32_t(reg);
+          if (std::find(volatileRegisters.begin(), volatileRegisters.end(), value) == volatileRegisters.end())
+            volatileRegisters.push_back(value);
+        };
+        for (const auto& [samplerRegister, inferred] : samplerInference) {
+          // The transitive dependency set, not the affine resolver's term slots, which only name
+          // the registers a *resolved* transform reads. A register driving a coordinate through
+          // math the resolver cannot express - a Rotator whose row is a product of two live
+          // constants, a matrix multiply, any chain through temporaries - would otherwise be left
+          // in the identity and animate it.
+          for (const uint32_t reg : inferred.coordConstRegs)
+            markVolatile(int32_t(reg));
+        }
+      }
+
+      // Only needed to fall back on if every sampler classifies as a lighting input.
+      uint32_t allSamplerMask = 0;
+      std::vector<std::tuple<std::string, XXH64_hash_t, uint32_t>> allSamplersByNameOrder;
+      std::vector<std::string> allSamplerSignatureEntries;
+
+      for (const DeclaredSampler& sampler : declaredSamplers) {
+        const uint32_t end = std::min<uint32_t>(sampler.registerIndex + sampler.registerCount, caps::MaxTexturesPS);
+        bool anyKept = false;
+        for (uint32_t s = sampler.registerIndex; s < end; s++) {
+          // arrays get per-register names so name keys stay unambiguous (material samplers
+          // are scalar in practice, this is defensive)
+          const std::string samplerName =
+            sampler.registerCount > 1u ? str::format(sampler.name, "[", s - sampler.registerIndex, "]") : sampler.name;
+          const XXH64_hash_t samplerNameKey = XXH3_64bits(samplerName.data(), samplerName.size());
+          allSamplerMask |= (1u << s);
+          allSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
+
+          const auto inferenceIt = samplerInference.find(s);
+          if (inferenceIt != samplerInference.end() && isUe3LightingInputSampler(inferenceIt->second)) {
+            excludedSamplerNames.push_back(samplerName);
+            continue;
+          }
+          keptSamplerNames.push_back(samplerName);
+          anyKept = true;
+          info.materialSamplerMask |= (1u << s);
+          info.materialSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
+        }
+        allSamplerSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
+        if (anyKept)
+          samplerSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
+      }
+
+      // A material that classified as nothing but lighting inputs has been misread; an empty set
+      // would collapse every such material onto one identity. Keep what was declared instead:
+      // that costs invariance for this shader but never merges distinct materials.
+      if (info.materialSamplerMask == 0 && allSamplerMask != 0) {
+        info.materialSamplerMask = allSamplerMask;
+        info.materialSamplersByNameOrder = std::move(allSamplersByNameOrder);
+        samplerSignatureEntries = std::move(allSamplerSignatureEntries);
+        keptSamplerNames.swap(excludedSamplerNames);
+        excludedSamplerNames.clear();
+      }
+
+      std::vector<std::string> keptUniformNames, volatileUniformNames;
+      std::vector<uint32_t> droppedUniformRegisters;
+
+      // Constants are the only thing telling a textureless material apart, so one keeps every
+      // register even where the dataflow marks it volatile. Merging those collapses unrelated
+      // materials onto a single anchor, which is a worse outcome than an identity that moves -
+      // the same trade the all-lighting-inputs guard above makes.
+      const bool keepEveryUniform = info.materialSamplerMask == 0;
+
+      // A uniform is dropped when *any* register in its declared range is volatile, not only
+      // its leading one. The hash streams the leading element, but fxc is free to place the
+      // animated component anywhere inside the range it reported.
+      auto uniformRangeIsVolatile = [&](const DeclaredUniform& uniform) {
+        const uint32_t end = uniform.registerIndex + uniform.registerCount;
+        for (uint32_t r = uniform.registerIndex; r < end; r++) {
+          if (std::find(volatileRegisters.begin(), volatileRegisters.end(), r) != volatileRegisters.end())
+            return true;
+        }
+        return false;
+      };
+
+      for (const DeclaredUniform& uniform : declaredUniforms) {
+        // Vectors only. Scalars are where the two lightmap compiles genuinely disagree:
+        // DiffusePower exponents the lightmap under SIMPLE_LIGHTING and a LightMapBasis-derived
+        // transfer coefficient otherwise, and SpecularPower is its structural twin present in
+        // only one compile - nothing in the bytecode separates them, so keeping either keeps
+        // both. The vectors carry the tint that tells UE3's colour variants apart.
+        if (uniform.name.find("uniformscalar_") != std::string::npos)
+          continue;
+
+        if (!keepEveryUniform && uniformRangeIsVolatile(uniform)) {
+          volatileUniformNames.push_back(uniform.name);
+          // Report the registers that actually left the identity, not every register the
+          // analysis flagged: a UV transform driven by an engine constant marks a register no
+          // material uniform ever covered, and claiming it was excluded would be a lie.
+          droppedUniformRegisters.push_back(uniform.registerIndex);
+          continue;
+        }
+
+        keptUniformNames.push_back(uniform.name);
+        uniformsByName.emplace_back(uniform.name, uniform.registerIndex);
+        info.constRanges.emplace_back(uniform.registerIndex, uniform.registerCount);
+      }
+
+      if (!excludedSamplerNames.empty() || !volatileUniformNames.empty()) {
+        auto join = [](const std::vector<std::string>& names) {
+          std::string out;
+          for (const std::string& name : names) {
+            if (!out.empty())
+              out += ',';
+            out += name;
+          }
+          return out.empty() ? std::string("-") : out;
+        };
+        info.identitySummary = str::format(
+          "samplers kept=[", join(keptSamplerNames), "] excludedAsLightingInputs=[",
+          join(excludedSamplerNames), "] uniforms kept=[", join(keptUniformNames),
+          "] excludedAsVolatile=[", join(volatileUniformNames), "]");
+      }
+
+      std::sort(droppedUniformRegisters.begin(), droppedUniformRegisters.end());
+      info.volatileUniformRegisters = std::move(droppedUniformRegisters);
+
+      std::sort(info.uniformVectorRegisters.begin(), info.uniformVectorRegisters.end());
+
+      std::sort(uniformsByName.begin(), uniformsByName.end());
+      info.namedUniformFirstRegistersByNameOrder.reserve(uniformsByName.size());
+      for (const auto& [uniformName, uniformRegister] : uniformsByName) {
+        info.namedUniformFirstRegistersByNameOrder.emplace_back(
+          XXH3_64bits(uniformName.data(), uniformName.size()), uniformRegister);
+      }
+
+      // name order is deterministic and identical across permutations, and name keys keep the
+      // streamed identity aligned even if a permutation strips an unreferenced symbol
+      std::sort(info.materialSamplersByNameOrder.begin(), info.materialSamplersByNameOrder.end());
+
+      // canonical shader signature: name-sorted material sampler declarations, minus the
+      // lighting inputs the simple-lightmap compile would not have declared. Engine symbols are
+      // excluded wholesale (the lightmap policy permutations reference different engine
+      // constants, e.g. AmbientColorAndSkyFactor only outside SIMPLE_LIGHTING), and register
+      // indices and counts are excluded because both shift with the lightmap sampler count and
+      // with fxc's per-permutation element trimming.
+      //
+      // A shader declaring no material samplers gets no signature and falls back to the bytecode
+      // hash. Seeding it from the uniform declarations instead would identify no material:
+      // UniformVector_0 alone describes a large share of the textureless ones, and with an empty
+      // texture set to pair it with they all collapse onto one textureSet+shader anchor. Bytecode
+      // costs lightmap-policy invariance for these shaders only, the same trade the
+      // all-lighting-inputs guard above makes.
+      info.canonicalShaderSignature =
+        !samplerSignatureEntries.empty() ? hashUe3SignatureEntries(samplerSignatureEntries) : kEmptyHash;
+
+      auto mergeConstRanges = [](Ue3MaterialConstRanges& ranges) {
+        if (ranges.empty())
+          return;
+        std::sort(ranges.begin(), ranges.end());
+        Ue3MaterialConstRanges merged;
+        for (const auto& r : ranges) {
+          if (merged.empty() || r.first > merged.back().first + merged.back().second) {
+            merged.push_back(r);
+          } else {
+            const uint32_t end = std::max(merged.back().first + merged.back().second, r.first + r.second);
+            merged.back().second = end - merged.back().first;
+          }
+        }
+        ranges = std::move(merged);
+      };
+      mergeConstRanges(info.constRanges);
+      return info;
+    }
+
+    // Reused XXH3 streaming state: created once per thread instead of heap
+    // allocating/freeing a state per hash operation on the per-draw path. The state is
+    // fully reset before each use, so digests are identical to a fresh state.
+    static XXH3_state_t* getThreadLocalXxh3State() {
+      static thread_local XXH3_state_t* const state = XXH3_createState();
+      return state;
+    }
+
+    // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
+    // fallback would fold per-view/per-mesh constants into the hash.
+    static XXH64_hash_t hashUe3MaterialConstants(
+        const Vector4* fConsts,
+        const Ue3MaterialConstRanges& ranges) {
+      if (ranges.empty())
+        return kEmptyHash;
+
+      XXH3_state_t* const state = getThreadLocalXxh3State();
+      if (state == nullptr)
+        return kEmptyHash;
+      XXH3_64bits_reset(state);
+
+      bool anyRegisterHashed = false;
+      for (const auto& [start, count] : ranges) {
+        if (start + count > caps::MaxFloatConstantsPS)
+          continue;
+        XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
+        anyRegisterHashed = true;
+      }
+
+      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
+    }
+
+    // Permutation-invariant constants identity: streams (name key, leading element value) of
+    // each named Uniform* constant, in name order. fxc trims each uniform array to the
+    // elements the permutation actually references (the directional lightmap path can
+    // reference more expression elements than the simple path, e.g. an unreferenced specular
+    // expression), so higher elements are not comparable across lightmap policy permutations.
+    // The leading element is always within the reported range and the engine uploads the same
+    // expression value to it in every permutation. Name keys keep the stream aligned even if
+    // a permutation strips an entire unreferenced uniform.
+    static XXH64_hash_t hashUe3MaterialConstantsByNameOrder(
+        const Vector4* fConsts,
+        const std::vector<std::pair<XXH64_hash_t, uint32_t>>& namedUniformFirstRegistersByNameOrder) {
+      if (namedUniformFirstRegistersByNameOrder.empty())
+        return kEmptyHash;
+
+      XXH3_state_t* const state = getThreadLocalXxh3State();
+      if (state == nullptr)
+        return kEmptyHash;
+      XXH3_64bits_reset(state);
+
+      bool anyRegisterHashed = false;
+      for (const auto& [nameKey, reg] : namedUniformFirstRegistersByNameOrder) {
+        if (reg >= caps::MaxFloatConstantsPS)
+          continue;
+        XXH3_64bits_update(state, &nameKey, sizeof(nameKey));
+        XXH3_64bits_update(state, &fConsts[reg], sizeof(Vector4));
+        anyRegisterHashed = true;
+      }
+
+      return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
+    }
+
+    static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
+    // The parse bakes in whether volatile registers were filtered, so a mid-session toggle of
+    // rtx.d3d9.ue3MicVolatileConstantDetection has to invalidate it rather than serve entries
+    // classified under the other setting.
+    static bool s_ue3PsMaterialIdentityCacheDetectedVolatile = true;
+
+    static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
+        const XXH64_hash_t psHash,
+        const std::vector<uint8_t>& bytecode,
+        const D3D9CommonShader* pixelShader,
+        const bool detectVolatileConstants) {
+      if (s_ue3PsMaterialIdentityCacheDetectedVolatile != detectVolatileConstants) {
+        s_ue3PsMaterialIdentityCacheDetectedVolatile = detectVolatileConstants;
+        s_ue3PsMaterialIdentityCache.clear();
+      }
+
+      auto it = s_ue3PsMaterialIdentityCache.find(psHash);
+      if (it == s_ue3PsMaterialIdentityCache.end()) {
+        it = s_ue3PsMaterialIdentityCache.emplace(
+          psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader, detectVolatileConstants)).first;
+      }
+      return it->second;
     }
 
     bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
@@ -4233,6 +4822,24 @@ namespace dxvk {
       return Ue3VertexFactoryType::GPUSkin;
     }
 
+    // Instanced mesh particles share FoliageVertexFactory.usf and the instancing axes in
+    // TEXCOORD1..4, but their declaration has no NORMAL: FParticleInstancedMeshVertexFactory
+    // walks {VEU_Tangent, VEU_Binormal, VEU_Normal} while only filling components 0 and 1, so
+    // the mesh's TangentZ arrives under the BINORMAL semantic. (The stock game's shader still
+    // declares it as NORMAL and therefore never reads it - so UE3 renders these unlit.)
+    if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
+        sig.hasTangent && sig.tangentType == D3DDECLTYPE_UBYTE4 &&
+        sig.hasBinormal && sig.binormalType == D3DDECLTYPE_UBYTE4 &&
+        !sig.hasNormal &&
+        !sig.hasBlendIndices && !sig.hasBlendWeight &&
+        sig.texcoordCount >= 5 &&
+        sig.texcoordTypes[1] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[2] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[3] == D3DDECLTYPE_FLOAT3 &&
+        sig.texcoordTypes[4] == D3DDECLTYPE_FLOAT3) {
+      return Ue3VertexFactoryType::ParticleInstancedMesh;
+    }
+
     // local (static mesh) = POSITION(FLOAT3) + TANGENT(UBYTE4) + NORMAL(UBYTE4) + TEXCOORDs, no BLENDINDICES
     // foliage extends the local layout with instancing axes in TEXCOORD1..4.
     if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
@@ -4296,12 +4903,22 @@ namespace dxvk {
         return info;
       }
 
-      auto markName = [&](const std::string& lowerName, const bool isSampler) {
+      auto markName = [&](const std::string& lowerName, const bool isSampler, const bool isFloat4, const uint32_t registerIndex) {
         if (isSampler) {
           const uint8_t semanticFlags = classifyPixelSamplerSemanticFlags(lowerName);
           info.hasMaterialSampler |= (semanticFlags & kPsSamplerSemanticMaterialTexture) != 0;
           info.hasEngineAuxSampler |= (semanticFlags & kPsSamplerSemanticEngineAuxiliary) != 0;
           info.hasVideoSampler |= (semanticFlags & kPsSamplerSemanticVideo) != 0;
+
+          // TdToneMapping capture: record the exact sampler indices of the
+          // baked colour curve LUT textures.
+          if (registerIndex < 0xFF) {
+            if (lowerName == "colorcurvesktexture") {
+              info.colorCurvesKSamplerIndex = uint8_t(registerIndex);
+            } else if (lowerName == "colorcurvesmtexture") {
+              info.colorCurvesMSamplerIndex = uint8_t(registerIndex);
+            }
+          }
 
           info.hasSceneColorSampler |= containsToken(lowerName, "scenecolor");
           info.hasSceneDepthSampler |= containsToken(lowerName, "scenedepth") ||
@@ -4313,11 +4930,13 @@ namespace dxvk {
                                    containsToken(lowerName, "shadowvariance");
           info.hasVelocitySampler |= containsToken(lowerName, "velocitybuffer") ||
                                      containsToken(lowerName, "velocitytexture");
+          info.hasBlurredImageSampler |= containsToken(lowerName, "blurredimage");
+          info.hasFilterTextureSampler |= containsToken(lowerName, "filtertexture");
           info.hasExposureOrToneSampler |= containsToken(lowerName, "exposure") ||
                                            containsToken(lowerName, "colorcurves") ||
                                            containsToken(lowerName, "saturationmask") ||
-                                           containsToken(lowerName, "blurredimage") ||
-                                           containsToken(lowerName, "filtertexture");
+                                           info.hasBlurredImageSampler ||
+                                           info.hasFilterTextureSampler;
           info.hasUiSampler |= containsToken(lowerName, "scenecoloruitexture") ||
                                containsToken(lowerName, "blurredui") ||
                                containsToken(lowerName, "uitexture") ||
@@ -4375,12 +4994,35 @@ namespace dxvk {
         info.hasUiCompositeConstants |= lowerName == "fade" ||
                                         containsToken(lowerName, "scenecolorui") ||
                                         containsToken(lowerName, "bluramount");
+        info.hasDofPackedParameters |= containsToken(lowerName, "packedparameters");
+        info.hasDofMinMaxBlurClamp |= containsToken(lowerName, "minmaxblurclamp");
+        info.hasFilterSampleWeights |= containsToken(lowerName, "sampleweights");
+
+        // TdToneMapping capture: record the exact float register indices of
+        // the grade constants so the (skipped) tonemap pass's pixel shader
+        // constants can be read at draw time.
+        if (isFloat4 && registerIndex <= 0x7FFF) {
+          if (lowerName == "sceneshadowsanddesaturation") {
+            info.toneMapSceneShadowsReg = int16_t(registerIndex);
+          } else if (lowerName == "sceneinversehighlights") {
+            info.toneMapInverseHighLightsReg = int16_t(registerIndex);
+          } else if (lowerName == "scenemidtones") {
+            info.toneMapMidTonesReg = int16_t(registerIndex);
+          } else if (lowerName == "scenescaledluminanceweights") {
+            info.toneMapScaledLumaWeightsReg = int16_t(registerIndex);
+          } else if (lowerName == "gammacolorscaleandinverse") {
+            info.toneMapGammaColorScaleReg = int16_t(registerIndex);
+          } else if (lowerName == "gammaoverlaycolor") {
+            info.toneMapGammaOverlayReg = int16_t(registerIndex);
+          }
+        }
       };
 
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
         const bool isSampler = c.registerSet == kD3dxRegisterSetSampler;
+        const bool isFloat4 = c.registerSet == kD3dxRegisterSetFloat4;
         const std::string lowerName = toLowerAscii(c.name);
-        markName(lowerName, isSampler);
+        markName(lowerName, isSampler, isFloat4, c.registerIndex);
 
         // Exact names, so UberPostProcessBlend's GammaColorScaleAndInverse/GammaOverlayColor
         // (a different shader, whose output the composite still has to gamma correct) cannot
@@ -4411,6 +5053,7 @@ namespace dxvk {
     case Ue3VertexFactoryType::TerrainMorph:
     case Ue3VertexFactoryType::SpeedTree:
     case Ue3VertexFactoryType::Foliage:
+    case Ue3VertexFactoryType::ParticleInstancedMesh:
     case Ue3VertexFactoryType::Particle:
     case Ue3VertexFactoryType::ParticleBeamTrail:
     case Ue3VertexFactoryType::LensFlare:
@@ -4418,6 +5061,427 @@ namespace dxvk {
     default:
       return false;
     }
+  }
+
+  // UE3 instances a mesh by leaving its placement out of the shader constants entirely: the mesh
+  // streams carry D3DSTREAMSOURCE_INDEXEDDATA | instanceCount, one further stream is tagged
+  // D3DSTREAMSOURCE_INSTANCEDATA, and the vertex factory reads InstanceOffset (TEXCOORD1) plus the
+  // three basis axes (TEXCOORD2..4) out of it. See FParticleInstancedMeshVertexFactory::InitRHI and
+  // FFoliageVertexFactory::InitRHI in the UE3 engine, and GetInstanceToWorld in
+  // FoliageVertexFactory.usf which both compile down to that layout.
+  D3D9Rtx::Ue3InstancingInfo D3D9Rtx::resolveUe3Instancing(
+      const D3D9VertexElements& elements,
+      const std::array<UINT, caps::MaxStreams>& streamFreq,
+      const uint32_t instanceCount) {
+    Ue3InstancingInfo info;
+
+    // D3D9 only honours a stream-0 instance count when some stream the declaration reads is
+    // tagged as instance data; GenerateDrawInfo gates the replayed draw the same way, so the
+    // scene has to agree or it would decompose a draw the hardware runs once.
+    uint32_t usedStreamMask = 0;
+    for (const auto& element : elements) {
+      if (element.Stream < caps::MaxStreams) {
+        usedStreamMask |= 1u << element.Stream;
+      }
+    }
+
+    for (const uint32_t s : bit::BitMask(usedStreamMask)) {
+      if ((streamFreq[s] & D3DSTREAMSOURCE_INSTANCEDATA) != 0) {
+        info.instanceDataStreamMask |= 1u << s;
+      }
+    }
+
+    if (info.instanceDataStreamMask == 0) {
+      return info;
+    }
+    info.instanceCount = std::max(instanceCount, 1u);
+
+    // A complete basis is all four elements, FLOAT3, on one and the same instance-data stream.
+    // Anything short of that is some other instancing scheme and must not be decomposed.
+    const D3DVERTEXELEMENT9* basis[4] = {};
+    for (const auto& element : elements) {
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD ||
+          element.UsageIndex < 1 || element.UsageIndex > 4 ||
+          element.Type != D3DDECLTYPE_FLOAT3 ||
+          element.Stream >= caps::MaxStreams ||
+          (info.instanceDataStreamMask & (1u << element.Stream)) == 0) {
+        continue;
+      }
+      basis[element.UsageIndex - 1] = &element;
+    }
+
+    if (basis[0] == nullptr || basis[1] == nullptr || basis[2] == nullptr || basis[3] == nullptr) {
+      return info;
+    }
+    if (basis[1]->Stream != basis[0]->Stream ||
+        basis[2]->Stream != basis[0]->Stream ||
+        basis[3]->Stream != basis[0]->Stream) {
+      return info;
+    }
+
+    info.hasInstanceTransform = true;
+    info.transformStream = basis[0]->Stream;
+    info.offsetByteOffset = basis[0]->Offset;
+    info.axisByteOffsets[0] = basis[1]->Offset;
+    info.axisByteOffsets[1] = basis[2]->Offset;
+    info.axisByteOffsets[2] = basis[3]->Offset;
+    return info;
+  }
+
+  bool D3D9Rtx::readUe3InstanceTransforms(const VertexContext vertexContext[caps::MaxStreams],
+                                          std::vector<Ue3DecomposedInstance>& instances,
+                                          const char** outReason) const {
+    instances.clear();
+
+    auto fail = [&](const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
+      return false;
+    };
+    if (outReason != nullptr) {
+      *outReason = "";
+    }
+
+    const Ue3InstancingInfo& info = m_currentUe3Instancing;
+    if (!info.hasInstanceTransform || info.instanceCount == 0) {
+      return fail("no per-instance transform basis in the declaration");
+    }
+
+    const VertexContext& ctx = vertexContext[info.transformStream];
+    if (ctx.stride == 0) {
+      return fail("instance stream has no stride");
+    }
+    if (ctx.mappedSlice.mapPtr == nullptr) {
+      return fail("instance stream is not host-visible");
+    }
+
+    // The four FLOAT3 reads have to stay inside the record, and the whole array inside the slice.
+    uint32_t maxByteOffset = info.offsetByteOffset;
+    for (const uint32_t axisOffset : info.axisByteOffsets) {
+      maxByteOffset = std::max(maxByteOffset, axisOffset);
+    }
+    if (maxByteOffset + sizeof(float) * 3 > ctx.stride) {
+      return fail("instance basis does not fit the instance stream's stride");
+    }
+
+    const size_t firstByte = size_t(ctx.offset);
+    const size_t requiredBytes = size_t(ctx.stride) * info.instanceCount;
+    if (firstByte + requiredBytes > ctx.mappedSlice.length) {
+      return fail("instance stream is shorter than the draw's instance count");
+    }
+
+    const uint8_t* records = static_cast<const uint8_t*>(ctx.mappedSlice.mapPtr) + firstByte;
+    auto readVector3 = [](const uint8_t* record, const uint32_t byteOffset) {
+      float v[3];
+      std::memcpy(v, record + byteOffset, sizeof(v));
+      return Vector3(v[0], v[1], v[2]);
+    };
+
+    instances.reserve(info.instanceCount);
+    for (uint32_t i = 0; i < info.instanceCount; i++) {
+      const uint8_t* record = records + size_t(ctx.stride) * i;
+      const Vector3 offset = readVector3(record, info.offsetByteOffset);
+      const Vector3 xAxis = readVector3(record, info.axisByteOffsets[0]);
+      const Vector3 yAxis = readVector3(record, info.axisByteOffsets[1]);
+      const Vector3 zAxis = readVector3(record, info.axisByteOffsets[2]);
+
+      // PhysX only writes the live prefix of an NxFluid emitter's instance buffer, so trailing
+      // records hold whatever the previous frame left - or nothing at all on a fresh allocation.
+      // A zero or non-finite basis is not a placement.
+      const bool finite =
+        std::isfinite(offset.x) && std::isfinite(offset.y) && std::isfinite(offset.z) &&
+        std::isfinite(xAxis.x) && std::isfinite(xAxis.y) && std::isfinite(xAxis.z) &&
+        std::isfinite(yAxis.x) && std::isfinite(yAxis.y) && std::isfinite(yAxis.z) &&
+        std::isfinite(zAxis.x) && std::isfinite(zAxis.y) && std::isfinite(zAxis.z);
+      if (!finite) {
+        continue;
+      }
+      if (std::abs(dot(xAxis, cross(yAxis, zAxis))) <= 1e-12f) {
+        continue;
+      }
+
+      // Row-vector layout to match Remix's Matrix4 (basis in rows 0..2, translation in row 3),
+      // identical to the FMatrix(XAxis, YAxis, ZAxis, Location) the engine's non-instanced
+      // NxFluid mesh path hands to FMeshElement::LocalToWorld.
+      Ue3DecomposedInstance instance;
+      instance.instanceToObject[0] = Vector4(xAxis.x, xAxis.y, xAxis.z, 0.0f);
+      instance.instanceToObject[1] = Vector4(yAxis.x, yAxis.y, yAxis.z, 0.0f);
+      instance.instanceToObject[2] = Vector4(zAxis.x, zAxis.y, zAxis.z, 0.0f);
+      instance.instanceToObject[3] = Vector4(offset.x, offset.y, offset.z, 1.0f);
+      // The buffer position, not the position in this vector: a degenerate record earlier in the
+      // buffer must not shift the identity of everything after it.
+      instance.sourceIndex = i;
+      instances.push_back(instance);
+    }
+
+    if (instances.empty()) {
+      return fail("every instance's basis was degenerate");
+    }
+    return true;
+  }
+
+  // Whatever these bounds drop, the kept set has to be the same set next frame: an instance that
+  // comes and goes as the camera moves flickers, and a selection that reorders the survivors also
+  // renames them (see Ue3DecomposedInstance::sourceIndex). Hence the count clamp keeps the lowest
+  // source indices rather than the nearest to the camera. Distance culling is view-dependent by
+  // definition and can pop at its boundary, which is why it is opt-in.
+  void D3D9Rtx::cullAndClampUe3InstanceTransforms(std::vector<Ue3DecomposedInstance>& instances,
+                                                  uint32_t& outCulledByDistance,
+                                                  uint32_t& outCulledByBudget) const {
+    outCulledByDistance = 0;
+    outCulledByBudget = 0;
+
+    const uint32_t budget = std::max(m_frameOptions.ue3MaxDecomposedInstances, 1u);
+    const float cullDistance = m_frameOptions.ue3DecomposedInstanceCullDistance;
+    if (cullDistance <= 0.0f && instances.size() <= budget) {
+      return;
+    }
+
+    if (cullDistance > 0.0f) {
+      const DrawCallTransforms& transformData = m_activeDrawCallState.transformData;
+
+      // worldToView is affine, so its inverse's translation row is the view origin in world space.
+      // A camera that cannot be inverted leaves distances meaningless; skip to the count clamp.
+      const double det = determinant(transformData.worldToView);
+      if (std::isfinite(det) && std::abs(det) > 1e-24) {
+        const Matrix4 viewToWorld = inverseAffine(transformData.worldToView);
+        const Vector3 cameraPosition(viewToWorld[3].x, viewToWorld[3].y, viewToWorld[3].z);
+        if (std::isfinite(cameraPosition.x) && std::isfinite(cameraPosition.y) &&
+            std::isfinite(cameraPosition.z)) {
+          const float cullDistanceSq = cullDistance * cullDistance;
+          const size_t before = instances.size();
+          // Order-preserving, so the surviving instances keep their relative buffer order.
+          instances.erase(
+            std::remove_if(instances.begin(), instances.end(),
+                           [&](const Ue3DecomposedInstance& instance) {
+                             // Carried through the draw's object transform, which is identity for
+                             // UE3's instanced factories but composed anyway to stay general.
+                             const Vector4 world = transformData.objectToWorld *
+                               Vector4(instance.instanceToObject[3].x,
+                                       instance.instanceToObject[3].y,
+                                       instance.instanceToObject[3].z, 1.0f);
+                             const Vector3 delta = Vector3(world.x, world.y, world.z) - cameraPosition;
+                             return dot(delta, delta) > cullDistanceSq;
+                           }),
+            instances.end());
+          outCulledByDistance = uint32_t(before - instances.size());
+        }
+      }
+    }
+
+    if (instances.size() > budget) {
+      outCulledByBudget = uint32_t(instances.size() - budget);
+      instances.resize(budget);
+    }
+  }
+
+  // Names the batch an instanced draw belongs to, without involving any transform.
+  //
+  // The mesh streams say which mesh is being instanced but not which component is instancing it, and
+  // two piles of the same debris share them. The instance buffer would distinguish those but cannot
+  // serve as an identity - RenderNxFluidInstanced creates a fresh one per frame unless its pool hands
+  // one back - so batches are matched to the previous frame's by continuity of their own centroid,
+  // which holds because a batch as a whole barely moves even while its instances do.
+  XXH64_hash_t D3D9Rtx::resolveUe3InstancedBatchKey(const RasterGeometry& geoData,
+                                                    const std::vector<Ue3DecomposedInstance>& instances) {
+    if (instances.empty()) {
+      return kEmptyHash;
+    }
+
+    struct MeshKey {
+      const void* pVertexDecl;
+      const void* pVertexBuffer0;
+      const void* pIndexBuffer;
+      uint32_t vertexCount;
+      uint32_t indexCount;
+    };
+    const MeshKey meshKey = {
+      d3d9State().vertexDecl.ptr(),
+      d3d9State().vertexBuffers[0].vertexBuffer.ptr(),
+      d3d9State().indices.ptr(),
+      geoData.vertexCount,
+      geoData.indexCount,
+    };
+    const XXH64_hash_t meshHash = XXH3_64bits(&meshKey, sizeof(meshKey));
+
+    Vector3 centroid(0.f, 0.f, 0.f);
+    for (const Ue3DecomposedInstance& instance : instances) {
+      centroid += Vector3(instance.instanceToObject[3].x,
+                          instance.instanceToObject[3].y,
+                          instance.instanceToObject[3].z);
+    }
+    centroid *= 1.0f / float(instances.size());
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    std::vector<Ue3InstancedBatchRecord>& records = m_ue3InstancedBatches[meshHash];
+
+    // Retire batches that have not been drawn for a while so a level change cannot leave a stale
+    // record that a new batch of the same mesh would latch onto.
+    constexpr uint32_t kRetireAfterFrames = 120;
+    records.erase(
+      std::remove_if(records.begin(), records.end(),
+                     [&](const Ue3InstancedBatchRecord& record) {
+                       return currentFrame - record.lastFrame > kRetireAfterFrames;
+                     }),
+      records.end());
+
+    // A whole batch travelling this far in one frame is a different batch, not the same one moved.
+    constexpr float kMaxCentroidDriftSqr = 1000.f * 1000.f;
+    Ue3InstancedBatchRecord* nearest = nullptr;
+    float nearestDistSqr = kMaxCentroidDriftSqr;
+    for (Ue3InstancedBatchRecord& record : records) {
+      if (record.claimedFrame == currentFrame) {
+        continue; // another draw already matched this batch this frame
+      }
+      const Vector3 delta = record.centroid - centroid;
+      const float distSqr = dot(delta, delta);
+      if (distSqr < nearestDistSqr) {
+        nearestDistSqr = distSqr;
+        nearest = &record;
+      }
+    }
+
+    if (nearest == nullptr) {
+      Ue3InstancedBatchRecord record;
+      record.id = XXH3_64bits_withSeed(&m_ue3NextInstancedBatchId, sizeof(m_ue3NextInstancedBatchId), meshHash);
+      ++m_ue3NextInstancedBatchId;
+      records.push_back(record);
+      nearest = &records.back();
+    }
+
+    nearest->centroid = centroid;
+    nearest->lastFrame = currentFrame;
+    nearest->claimedFrame = currentFrame;
+    return nearest->id;
+  }
+
+  void D3D9Rtx::trackUe3InstanceOrderStability(const XXH64_hash_t batchKey,
+                                               const std::vector<Ue3DecomposedInstance>& instances) {
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+
+    // One entry per batch identity, each holding a translation per instance. Batch identities are
+    // minted afresh across a level change, so drop the lot rather than grow without bound.
+    constexpr size_t kMaxProbes = 64;
+    if (m_ue3InstanceOrderProbes.size() > kMaxProbes) {
+      m_ue3InstanceOrderProbes.clear();
+    }
+
+    Ue3InstanceOrderProbe& probe = m_ue3InstanceOrderProbes[batchKey];
+    const bool consecutiveFrames = probe.lastFrame != 0 && probe.lastFrame + 1 == currentFrame;
+
+    if (consecutiveFrames) {
+      if (probe.translations.size() != instances.size()) {
+        // A length change shifts every index past the first added or removed instance, so this
+        // batch cannot be index-paired at all this frame.
+        ++m_ue3InstancedStatOrderSizeChanges;
+      } else {
+        ++m_ue3InstancedStatOrderComparableBatches;
+        const float stableThreshold = RtxOptions::uniqueObjectDistance();
+        for (size_t i = 0; i < instances.size(); i++) {
+          const Matrix4& m = instances[i].instanceToObject;
+          const Vector3 current(m[3].x, m[3].y, m[3].z);
+          const Vector3 delta = current - probe.translations[i];
+          const float displacement = std::sqrt(dot(delta, delta));
+          ++m_ue3InstancedStatOrderPairs;
+          m_ue3InstancedStatOrderDisplacementSum += double(displacement);
+          m_ue3InstancedStatOrderDisplacementMax =
+            std::max(m_ue3InstancedStatOrderDisplacementMax, displacement);
+          if (displacement <= stableThreshold) {
+            ++m_ue3InstancedStatOrderStablePairs;
+          }
+        }
+      }
+    }
+
+    probe.lastFrame = currentFrame;
+    probe.translations.resize(instances.size());
+    for (size_t i = 0; i < instances.size(); i++) {
+      const Matrix4& m = instances[i].instanceToObject;
+      probe.translations[i] = Vector3(m[3].x, m[3].y, m[3].z);
+    }
+  }
+
+  void D3D9Rtx::reportUe3InstancedDrawStats() {
+    if (!m_frameOptions.ue3LogInstancedDrawStats) {
+      return;
+    }
+
+    ++m_ue3InstancedStatFrames;
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+
+    // roughly once a second at any plausible frame rate; this is a diagnostic, not a metric
+    constexpr uint32_t kStatIntervalFrames = 60;
+    if (currentFrame - m_ue3InstancedStatFrameStamp < kStatIntervalFrames) {
+      return;
+    }
+    m_ue3InstancedStatFrameStamp = currentFrame;
+
+    const uint32_t frames = std::max(m_ue3InstancedStatFrames, 1u);
+    const double perFrame = 1.0 / double(frames);
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Instanced] per frame over ", frames, " frames: ",
+      double(m_ue3InstancedStatDraws) * perFrame, " instanced draws, ",
+      double(m_ue3InstancedStatInstancesSeen) * perFrame, " hardware instances, ",
+      double(m_ue3InstancedStatInstancesSubmitted) * perFrame, " submitted, ",
+      double(m_ue3InstancedStatCulledDistance) * perFrame, " distance-culled, ",
+      double(m_ue3InstancedStatCulledBudget) * perFrame, " budget-culled; ",
+      double(m_ue3InstancedStatSubmitNs) * perFrame / 1.0e6, " ms/frame expanding them on the "
+      "submitting thread (the rest of an instance's cost lands on the consumer thread and the GPU)."));
+
+    // ue3StableDecomposedInstanceIdentity rests on the game keeping its instance order, so report how
+    // far index-paired instances actually moved rather than taking that on trust.
+    if (m_ue3InstancedStatOrderPairs > 0 || m_ue3InstancedStatOrderSizeChanges > 0) {
+      const double meanDisplacement = m_ue3InstancedStatOrderPairs > 0
+        ? m_ue3InstancedStatOrderDisplacementSum / double(m_ue3InstancedStatOrderPairs)
+        : 0.0;
+      const uint32_t stablePercent = m_ue3InstancedStatOrderPairs > 0
+        ? uint32_t((m_ue3InstancedStatOrderStablePairs * 100ull) / m_ue3InstancedStatOrderPairs)
+        : 0u;
+
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Instanced] instance order: ",
+        m_ue3InstancedStatOrderComparableBatches, " batch comparisons over ", frames, " frames (",
+        m_ue3InstancedStatOrderSizeChanges, " skipped on an instance count change), ",
+        m_ue3InstancedStatOrderPairs, " index-paired instances, mean displacement ",
+        meanDisplacement, " units, max ", m_ue3InstancedStatOrderDisplacementMax, ", ",
+        stablePercent, "% within rtx.uniqueObjectDistance. A mean on the scale of the batch's own "
+        "extent means the game reorders its instance buffer and index pairing is meaningless."));
+    }
+
+    m_ue3InstancedStatFrames = 0;
+    m_ue3InstancedStatDraws = 0;
+    m_ue3InstancedStatInstancesSeen = 0;
+    m_ue3InstancedStatInstancesSubmitted = 0;
+    m_ue3InstancedStatCulledDistance = 0;
+    m_ue3InstancedStatCulledBudget = 0;
+    m_ue3InstancedStatSubmitNs = 0;
+    m_ue3InstancedStatOrderPairs = 0;
+    m_ue3InstancedStatOrderStablePairs = 0;
+    m_ue3InstancedStatOrderSizeChanges = 0;
+    m_ue3InstancedStatOrderComparableBatches = 0;
+    m_ue3InstancedStatOrderDisplacementSum = 0.0;
+    m_ue3InstancedStatOrderDisplacementMax = 0.f;
+  }
+
+  bool D3D9Rtx::ue3ViewportAspectMatchesBackbuffer(
+      const uint32_t vpW, const uint32_t vpH, const uint32_t bbW, const uint32_t bbH) {
+    if (vpW == 0 || vpH == 0 || bbW == 0 || bbH == 0) {
+      return false;
+    }
+    const double a = double(vpW) * double(bbH);
+    const double b = double(vpH) * double(bbW);
+    const double denom = std::max(a, b);
+    return denom > 0.0 && (std::abs(a - b) / denom) < 0.05;
+  }
+
+  bool D3D9Rtx::ue3ViewportIsMainViewSized(
+      const uint32_t vpW, const uint32_t vpH, const uint32_t bbW, const uint32_t bbH) {
+    return bbW != 0 && bbH != 0 &&
+           vpW * 2 >= bbW && vpH * 2 >= bbH &&
+           ue3ViewportAspectMatchesBackbuffer(vpW, vpH, bbW, bbH);
   }
 
   D3D9Rtx::Ue3PassType D3D9Rtx::classifyUe3Pass(const DrawContext& drawContext) {
@@ -4476,25 +5540,27 @@ namespace dxvk {
     if (psInfo.hasUiSampler || psInfo.hasUiCompositeConstants)
       return Ue3PassType::UiComposite;
 
-    // UE3 SceneCapture probes (SceneCapture2D/Reflect/Portal actors: security monitors,
-    // mirrors) re-render the world from their own camera before the main view, into the same
-    // shared SceneColor render target - only the viewport, sized to the probe's
-    // TextureRenderTarget, tells capture draws apart from main-view draws. Their shaders
-    // declare genuine ViewProjectionMatrix/CameraPosition constants, so CTAB camera
-    // verification alone cannot keep them from steering the Main camera.
+    // UE3 SceneCapture probes re-render the world before the main view; viewport size/aspect
+    // (and later mirrored/undecomposable camera checks) keep them from stealing Main.
     if ((m_frameOptions.ue3SkipSceneCapturePasses || m_frameOptions.ue3EngineMode) &&
         isWorldGeometry &&
         m_activePresentParams.has_value()) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
       const uint32_t bbW = m_activePresentParams->BackBufferWidth;
       const uint32_t bbH = m_activePresentParams->BackBufferHeight;
-      // strictly under half the backbuffer in both dimensions: capture probe targets are small
-      // (typically 256-1024) while the main view renders at backbuffer size or a screen
-      // percentage well above one half; exact-half viewports (splitscreen) stay untouched
-      if (bbW != 0 && bbH != 0 &&
-          vp.Width != 0 && vp.Height != 0 &&
-          vp.Width * 2 < bbW && vp.Height * 2 < bbH) {
-        return Ue3PassType::SceneCapture;
+      if (bbW != 0 && bbH != 0 && vp.Width != 0 && vp.Height != 0) {
+        if (vp.Width * 2 < bbW && vp.Height * 2 < bbH) {
+          return Ue3PassType::SceneCapture;
+        }
+        // Exact-half splitscreen must not be treated as a mismatched-aspect probe.
+        const bool exactHalfSplit =
+          (vp.Width * 2 == bbW && vp.Height == bbH) ||
+          (vp.Height * 2 == bbH && vp.Width == bbW);
+        if (!exactHalfSplit &&
+            (vp.Width < bbW || vp.Height < bbH) &&
+            !ue3ViewportAspectMatchesBackbuffer(vp.Width, vp.Height, bbW, bbH)) {
+          return Ue3PassType::SceneCapture;
+        }
       }
     }
 
@@ -4535,6 +5601,14 @@ namespace dxvk {
       return Ue3PassType::FullscreenPostProcess;
     }
 
+    // Explicit DOFAndBloom/Uber signals (also covered by the catch-all below for typical
+    // ME shaders); kept so FilterColor blur is classified even if z-write state is atypical.
+    if (!isWorldGeometry &&
+        (likelyFullscreen || psSamplesRenderTarget) &&
+        psInfo.looksLikeDofAndBloomPostProcess()) {
+      return Ue3PassType::FullscreenPostProcess;
+    }
+
     // The two screen-space catch-alls below must never swallow world geometry:
     // translucent world meshes render with depth writes off and legitimately declare
     // scene color/depth samplers (DepthBiasedAlpha, DestColor/refraction) or fog inputs
@@ -4565,7 +5639,8 @@ namespace dxvk {
         m_currentUe3VertexFactory == Ue3VertexFactoryType::Terrain ||
         m_currentUe3VertexFactory == Ue3VertexFactoryType::TerrainMorph ||
         m_currentUe3VertexFactory == Ue3VertexFactoryType::SpeedTree ||
-        m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage) {
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::Foliage ||
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleInstancedMesh) {
       return Ue3PassType::Material;
     }
 
@@ -4584,6 +5659,7 @@ namespace dxvk {
     case Ue3VertexFactoryType::ParticleBeamTrail: return "ParticleBeamTrail";
     case Ue3VertexFactoryType::SpeedTree: return "SpeedTree";
     case Ue3VertexFactoryType::Foliage: return "Foliage";
+    case Ue3VertexFactoryType::ParticleInstancedMesh: return "ParticleInstancedMesh";
     case Ue3VertexFactoryType::LocalDecal: return "LocalDecal";
     case Ue3VertexFactoryType::LensFlare: return "LensFlare";
     case Ue3VertexFactoryType::PositionOnly: return "PositionOnly";
@@ -4608,6 +5684,206 @@ namespace dxvk {
     case Ue3PassType::SceneCapture: return "SceneCapture";
     }
     return "Unknown";
+  }
+
+  namespace {
+    // IEEE 754 half -> float (no denormal flush; curve data never relies on
+    // half denormals, but decode them correctly anyway)
+    float ue3HalfToFloat(const uint16_t half) {
+      const uint32_t sign = (half & 0x8000u) << 16;
+      uint32_t exponent = (half & 0x7C00u) >> 10;
+      uint32_t mantissa = half & 0x03FFu;
+
+      if (exponent == 0) {
+        if (mantissa == 0) {
+          const uint32_t bits = sign;
+          float result;
+          std::memcpy(&result, &bits, sizeof(result));
+          return result;
+        }
+        // subnormal half: normalize
+        while ((mantissa & 0x0400u) == 0) {
+          mantissa <<= 1;
+          exponent--;
+        }
+        exponent++;
+        mantissa &= ~0x0400u;
+      } else if (exponent == 0x1F) {
+        const uint32_t bits = sign | 0x7F800000u | (mantissa << 13);
+        float result;
+        std::memcpy(&result, &bits, sizeof(result));
+        return result;
+      }
+
+      const uint32_t bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+      float result;
+      std::memcpy(&result, &bits, sizeof(result));
+      return result;
+    }
+  }
+
+  void D3D9Rtx::onUe3CurveTextureUpload(const D3D9CommonTexture* dstTexture, D3D9CommonTexture* srcTexture, const uint32_t srcSubresource,
+                                        const uint32_t srcTexelOffsetX, const uint32_t dstTexelOffsetX,
+                                        const uint32_t texelWidth, const uint32_t texelHeight) {
+    if (!m_frameOptions.ue3EngineMode || dstTexture == nullptr || srcTexture == nullptr) {
+      return;
+    }
+
+    // The curve LUTs are 16x1 float RGBA textures (one texel per curve segment)
+    const auto* desc = dstTexture->Desc();
+    if (desc->Width != kUe3CurveTexelCount || desc->Height != 1) {
+      return;
+    }
+
+    const D3D9Format format = desc->Format;
+    if (format != D3D9Format::A32B32G32R32F && format != D3D9Format::A16B16G16R16F) {
+      // Near-miss diagnostic: a 16x1 destination in an unexpected format would
+      // mean the game's curve textures need another decode path.
+      ONCE(Logger::info(str::format("[RTX-UE3-Tonemap] Ignoring 16x1 texture upload in unsupported format ",
+                                    uint32_t(format), " (expected A32B32G32R32F/A16B16G16R16F).")));
+      return;
+    }
+
+    if (texelHeight != 1 || texelWidth == 0 || dstTexelOffsetX >= kUe3CurveTexelCount) {
+      return;
+    }
+
+    const void* srcData = srcTexture->GetMappedSlice(srcSubresource).mapPtr;
+    if (srcData == nullptr) {
+      return;
+    }
+
+    // Bounded cache: keys are only ever compared against currently-bound
+    // textures (never dereferenced), so stale entries are harmless; still keep
+    // the map tiny since only a handful of curve textures ever exist.
+    if (m_ue3CurveTexelCache.size() > 16 && m_ue3CurveTexelCache.find(dstTexture) == m_ue3CurveTexelCache.end()) {
+      m_ue3CurveTexelCache.clear();
+    }
+    Ue3CurveTexels& payload = m_ue3CurveTexelCache[dstTexture];
+
+    const uint32_t count = std::min(texelWidth, kUe3CurveTexelCount - dstTexelOffsetX);
+
+    if (format == D3D9Format::A32B32G32R32F) {
+      const float* texels = reinterpret_cast<const float*>(srcData) + srcTexelOffsetX * 4;
+      for (uint32_t i = 0; i < count; i++) {
+        payload.texels[dstTexelOffsetX + i] = Vector4(texels[i * 4 + 0], texels[i * 4 + 1], texels[i * 4 + 2], texels[i * 4 + 3]);
+      }
+    } else {
+      const uint16_t* texels = reinterpret_cast<const uint16_t*>(srcData) + srcTexelOffsetX * 4;
+      for (uint32_t i = 0; i < count; i++) {
+        payload.texels[dstTexelOffsetX + i] = Vector4(ue3HalfToFloat(texels[i * 4 + 0]),
+                                                      ue3HalfToFloat(texels[i * 4 + 1]),
+                                                      ue3HalfToFloat(texels[i * 4 + 2]),
+                                                      ue3HalfToFloat(texels[i * 4 + 3]));
+      }
+    }
+
+    ONCE(Logger::info(str::format("[RTX-UE3-Tonemap] Snooping curve LUT texture uploads (",
+                                  format == D3D9Format::A32B32G32R32F ? "fp32" : "fp16",
+                                  ", rect x=", dstTexelOffsetX, " w=", count, ").")));
+  }
+
+  void D3D9Rtx::maybeCaptureUe3ToneMapState() {
+    if (m_ue3ToneMapCapturedThisFrame || !m_frameOptions.ue3EngineMode) {
+      return;
+    }
+
+    // Only spend effort when the Mirror's Edge tonemapper consumes the capture
+    if (RtxOptions::tonemappingMode() != TonemappingMode::MirrorsEdge) {
+      return;
+    }
+
+    if (!m_parent->UseProgrammablePS() || d3d9State().pixelShader == nullptr) {
+      return;
+    }
+
+    const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+
+    // Only the TdToneMapping pass declares ColorCurvesK/M; require those sampler
+    // indices so UberPostProcessBlend (grade+gamma only) cannot lock out capture.
+    if (!psInfo.hasToneMapConstants || !psInfo.hasGammaConstants ||
+        psInfo.toneMapSceneShadowsReg < 0 || psInfo.toneMapGammaColorScaleReg < 0 ||
+        psInfo.toneMapMidTonesReg < 0 ||
+        psInfo.colorCurvesKSamplerIndex >= caps::MaxTexturesPS ||
+        psInfo.colorCurvesMSamplerIndex >= caps::MaxTexturesPS) {
+      return;
+    }
+
+    Ue3ToneMapCapture capture;
+
+    const auto readConstant = [&](const int16_t reg, Vector4& target) {
+      if (reg >= 0 && reg < int16_t(caps::MaxFloatConstantsPS)) {
+        target = d3d9State().psConsts.fConsts[reg];
+      }
+    };
+    readConstant(psInfo.toneMapSceneShadowsReg, capture.sceneShadowsAndDesaturation);
+    readConstant(psInfo.toneMapInverseHighLightsReg, capture.sceneInverseHighLights);
+    readConstant(psInfo.toneMapMidTonesReg, capture.sceneMidTones);
+    readConstant(psInfo.toneMapScaledLumaWeightsReg, capture.sceneScaledLuminanceWeights);
+    readConstant(psInfo.toneMapGammaColorScaleReg, capture.gammaColorScaleAndInverse);
+    readConstant(psInfo.toneMapGammaOverlayReg, capture.gammaOverlayColor);
+    capture.hasConstants = true;
+
+    const auto resolveCurveTexels = [&](const uint8_t samplerIndex, std::array<Vector4, kUe3CurveTexelCount>& target) {
+      if (samplerIndex >= caps::MaxTexturesPS) {
+        return false;
+      }
+      IDirect3DBaseTexture9* texture = d3d9State().textures[samplerIndex];
+      if (texture == nullptr) {
+        return false;
+      }
+      const auto it = m_ue3CurveTexelCache.find(GetCommonTexture(texture));
+      if (it == m_ue3CurveTexelCache.end()) {
+        return false;
+      }
+      target = it->second.texels;
+      return true;
+    };
+
+    capture.hasCurves = resolveCurveTexels(psInfo.colorCurvesKSamplerIndex, capture.curveK) &&
+                        resolveCurveTexels(psInfo.colorCurvesMSamplerIndex, capture.curveM);
+
+    // Capture the sampler filter bound for the curve LUTs so the tonemapper's
+    // lookup matches the game exactly (point snaps to one segment texel,
+    // bilinear blends adjacent ones).
+    if (psInfo.colorCurvesKSamplerIndex < caps::MaxTexturesPS) {
+      const DWORD magFilter = d3d9State().samplerStates[psInfo.colorCurvesKSamplerIndex][D3DSAMP_MAGFILTER];
+      capture.curvePointFiltering = (magFilter == D3DTEXF_POINT || magFilter == D3DTEXF_NONE);
+      if (capture.curvePointFiltering) {
+        ONCE(Logger::info("[RTX-UE3-Tonemap] Game samples its curve LUTs with point filtering; matching in the tonemapper."));
+      }
+    }
+
+    m_ue3ToneMapCapturedThisFrame = true;
+
+    ONCE(Logger::info(str::format("[RTX-UE3-Tonemap] Capturing TdToneMapping pass state (curve textures resolved: ",
+                                  capture.hasCurves ? "yes" : "no", ")")));
+
+    if (!capture.hasCurves) {
+      // Pinpoint why curve resolution failed: missing CTAB sampler indices,
+      // nothing bound at the slots, or no snooped upload for the bound texture.
+      const auto describeCurveSampler = [&](const uint8_t samplerIndex) -> std::string {
+        if (samplerIndex >= caps::MaxTexturesPS) {
+          return "sampler not in CTAB";
+        }
+        IDirect3DBaseTexture9* texture = d3d9State().textures[samplerIndex];
+        if (texture == nullptr) {
+          return str::format("slot ", uint32_t(samplerIndex), ": no texture bound");
+        }
+        const auto* common = GetCommonTexture(texture);
+        const auto* desc = common->Desc();
+        const bool snooped = m_ue3CurveTexelCache.find(common) != m_ue3CurveTexelCache.end();
+        return str::format("slot ", uint32_t(samplerIndex), ": ", desc->Width, "x", desc->Height,
+                           " fmt=", uint32_t(desc->Format), snooped ? " [snooped]" : " [no snooped upload]");
+      };
+      ONCE(Logger::warn(str::format("[RTX-UE3-Tonemap] Curve textures unresolved at tonemap pass. K={",
+                                    describeCurveSampler(psInfo.colorCurvesKSamplerIndex), "} M={",
+                                    describeCurveSampler(psInfo.colorCurvesMSamplerIndex), "}")));
+    }
+
+    m_parent->EmitCs([capture](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->setUe3ToneMapCapture(capture);
+    });
   }
 
   const char* D3D9Rtx::describeGeometryStatus(const RtxGeometryStatus status) {
@@ -4655,7 +5931,76 @@ namespace dxvk {
       " vsHash=0x", std::hex, vsHash,
       " psHash=0x", psHash, std::dec,
       " rt=", rtWidth, "x", rtHeight,
+      " fg=", m_ue3ForegroundDpgActive ? 1 : 0,
       " reason=", reason));
+  }
+
+  namespace {
+    // Session registry of UE3 lightmap textures recognised from pixel shader CTAB sampler
+    // names. Append-only, and read from texture paths that run on other threads than the
+    // draw-call setup that discovers them.
+    std::shared_mutex g_autoLightmapTexturesMutex;
+    fast_unordered_set g_autoLightmapTextures;
+    // Fast negative for the common case of a title that never discovers any.
+    std::atomic<bool> g_autoLightmapTexturesPopulated { false };
+  }
+
+  bool D3D9Rtx::isAutoDetectedLightmapTexture(const XXH64_hash_t textureHash) {
+    if (textureHash == kEmptyHash || !g_autoLightmapTexturesPopulated.load(std::memory_order_acquire))
+      return false;
+
+    std::shared_lock lock(g_autoLightmapTexturesMutex);
+    return g_autoLightmapTextures.find(textureHash) != g_autoLightmapTextures.end();
+  }
+
+  void D3D9Rtx::registerAutoDetectedLightmapTexture(const XXH64_hash_t textureHash) {
+    if (textureHash == kEmptyHash)
+      return;
+
+    bool inserted = false;
+    {
+      std::unique_lock lock(g_autoLightmapTexturesMutex);
+      inserted = g_autoLightmapTextures.insert(textureHash).second;
+      if (inserted)
+        g_autoLightmapTexturesPopulated.store(true, std::memory_order_release);
+    }
+
+    if (inserted)
+      ImGUI::AddAutoTaggedLightmapTexture(textureHash);
+  }
+
+  void D3D9Rtx::OnClear(DWORD flags) {
+    if (!m_frameOptions.ue3EngineMode || !m_frameOptions.ue3ForegroundDpgIsViewModel) {
+      return;
+    }
+
+    // UE3 renders SDPG_Foreground (first-person arms, held weapon, muzzle flash) after the
+    // world DPG behind a depth-only clear so foreground meshes never depth-clash with the
+    // world. A z-only clear on a main-view-sized viewport after this frame's world draws
+    // marks every subsequent draw as foreground until EndFrame.
+    if ((flags & D3DCLEAR_TARGET) != 0 || (flags & D3DCLEAR_ZBUFFER) == 0) {
+      return;
+    }
+    if (m_ue3ForegroundDpgActive || !m_ue3SeenMainViewWorldDraw) {
+      return;
+    }
+    if (d3d9State().depthStencil == nullptr || !m_activePresentParams.has_value()) {
+      return;
+    }
+
+    // Shadow / SceneCapture depth clears use sub-main-view viewports; ignore those.
+    const D3DVIEWPORT9& vp = d3d9State().viewport;
+    const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+    const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+    if (!ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
+      return;
+    }
+
+    m_ue3ForegroundDpgActive = true;
+    ONCE(Logger::info("[RTX-Compatibility-Info] UE3 foreground DPG boundary detected (mid-scene depth-only clear); subsequent draws classify as ViewModel."));
+    if (m_frameOptions.ue3LogClassification) {
+      Logger::debug(str::format("[RTX-Compatibility][UE3] Foreground DPG boundary after draw=", m_activeDrawCallState.drawCallID));
+    }
   }
 
   bool D3D9Rtx::trackUe3MovieTextureRenderTarget(const char* reason) {
@@ -4712,6 +6057,10 @@ namespace dxvk {
     // Owned bridge parent handle only; GetCurrentProcess() is a pseudo-handle.
     if (m_ngxGameProcessOwned && m_ngxGameProcess != nullptr)
       ::CloseHandle(m_ngxGameProcess);
+
+    // EndFrame saves on an interval, so the tail of a session would otherwise be lost.
+    saveUe3TextureSpreadCache();
+    saveUe3DiffuseSelectionCache();
   }
 
   void D3D9Rtx::SkinningMatrixPool::clear() {
@@ -4783,27 +6132,48 @@ namespace dxvk {
     o.rasterizeFullscreenCompositeToPrimary = rasterizeFullscreenCompositeToPrimaryObject().get();
     o.shaderPathTexcoordIndexFromPixelShader = shaderPathTexcoordIndexFromPixelShaderObject().get();
     o.ue3MaterialInstanceConstantHash = ue3MaterialInstanceConstantHashObject().get();
-    o.ue3LightmapPermutationInvariantHash = ue3LightmapPermutationInvariantHashObject().get();
-    o.ue3LightmapPermutationBridgeLookup = ue3LightmapPermutationBridgeLookupObject().get();
+    o.ue3MicConstantIdentity = ue3MicConstantIdentityObject().get();
+    o.ue3MicExcludeRenderTargetsFromIdentity = ue3MicExcludeRenderTargetsFromIdentityObject().get();
+    o.ue3MicVolatileConstantDetection = ue3MicVolatileConstantDetectionObject().get();
+    o.ue3ReportMicIdentityChurn = ue3ReportMicIdentityChurnObject().get();
     o.ue3LogMaterialInstanceHash = ue3LogMaterialInstanceHashObject().get();
     o.ue3SkipDepthPrepass = ue3SkipDepthPrepassObject().get();
     o.ue3SkipShadowDepthPasses = ue3SkipShadowDepthPassesObject().get();
     o.ue3SkipDepthTestDisabledTranslucency = ue3SkipDepthTestDisabledTranslucencyObject().get();
     o.ue3SkipSceneCapturePasses = ue3SkipSceneCapturePassesObject().get();
+    o.ue3ForegroundDpgIsViewModel = ue3ForegroundDpgIsViewModelObject().get();
     o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
+    o.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB = ue3StaticLocalMeshVertexCaptureCacheBudgetMiBObject().get();
+    o.ue3StaticLocalMeshVertexCaptureCacheMaxEntries = ue3StaticLocalMeshVertexCaptureCacheMaxEntriesObject().get();
+    o.ue3StaticLocalMeshVertexCaptureCacheRetentionFrames = ue3StaticLocalMeshVertexCaptureCacheRetentionFramesObject().get();
+    o.ue3StaticLocalMeshVertexCaptureCacheMinReusePercent = ue3StaticLocalMeshVertexCaptureCacheMinReusePercentObject().get();
+    o.ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames = ue3StaticLocalMeshVertexCaptureCacheReuseProbeFramesObject().get();
+    o.ue3LogStaticVertexCaptureCacheStats = ue3LogStaticVertexCaptureCacheStatsObject().get();
+    o.ue3ExcludePlacementFromVertexShaderHash = ue3ExcludePlacementFromVertexShaderHashObject().get();
+    o.ue3LogVertexConstantChurn = ue3LogVertexConstantChurnObject().get();
+    o.ue3VertexConstantChurnMaxTrackedDraws = ue3VertexConstantChurnMaxTrackedDrawsObject().get();
     o.ue3StaticGeometryHashMemoization = ue3StaticGeometryHashMemoizationObject().get();
-    o.ue3VertexCaptureCameraCellSize = ue3VertexCaptureCameraCellSizeObject().get();
+    o.ue3ExactVertexCapture = ue3ExactVertexCaptureObject().get();
+    o.ue3RequireExactVertexCapture = ue3RequireExactVertexCaptureObject().get();
+    o.ue3VertexCaptureSourceOverride = ue3VertexCaptureSourceOverrideObject().get();
     o.ue3NativeLocalMeshVertexCapture = ue3NativeLocalMeshVertexCaptureObject().get();
+    o.ue3DecomposeInstancedDraws = ue3DecomposeInstancedDrawsObject().get();
+    o.ue3MaxDecomposedInstances = ue3MaxDecomposedInstancesObject().get();
+    o.ue3DecomposedInstanceCullDistance = ue3DecomposedInstanceCullDistanceObject().get();
+    o.ue3StableDecomposedInstanceIdentity = ue3StableDecomposedInstanceIdentityObject().get();
+    o.ue3LogInstancedDrawStats = ue3LogInstancedDrawStatsObject().get();
     o.ue3RequireCtabCameraConstants = ue3RequireCtabCameraConstantsObject().get();
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
-    o.ue3MicAutoExcludeFrameVaryingConstants = ue3MicAutoExcludeFrameVaryingConstantsObject().get();
+    o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
+    o.ue3ConstantAlbedoTintGain = ue3ConstantAlbedoTintGainObject().get();
     o.ue3LogClassification = ue3LogClassificationObject().get();
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
     o.ue3LogAlbedoSelection = ue3LogAlbedoSelectionObject().get();
     o.ue3LogCapturePrecision = ue3LogCapturePrecisionObject().get();
+    o.ue3LogInstancedDraws = ue3LogInstancedDrawsObject().get();
     o.ue3LogDrawStatusFlaps = ue3LogDrawStatusFlapsObject().get();
     o.ue3LogOcclusionQueries = ue3LogOcclusionQueriesObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
@@ -4847,6 +6217,7 @@ namespace dxvk {
     o.enableMultiStageTextureFactorBlending = RtxOptions::enableMultiStageTextureFactorBlendingObject().get();
     o.ignoreAllVertexColorBakedLighting = RtxOptions::ignoreAllVertexColorBakedLightingObject().get();
     o.vertexColorIsBakedLighting = RtxOptions::vertexColorIsBakedLightingObject().get();
+    o.logReplacementResolution = RtxOptions::logReplacementResolutionObject().get();
     o.drawCallRange = RtxOptions::drawCallRangeObject().get();
 
     o.uiTextures = &RtxOptions::uiTexturesObject().get();
@@ -4860,84 +6231,161 @@ namespace dxvk {
     o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
     o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
     o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
+    o.ue3MicConstantIdentityExcludedMaterials = &ue3MicConstantIdentityExcludedMaterialsObject().get();
+    o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
+    o.ue3TraceDrawTextureHashes = &ue3TraceDrawTextureHashesObject().get();
+    o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
 
     o.valid = true;
   }
 
-  bool D3D9Rtx::shouldUseUe3CameraHashCell() const {
-    return (m_frameOptions.ue3CameraFromShaderConstants || m_frameOptions.ue3EngineMode) &&
-           m_frameOptions.ue3VertexCaptureCameraCellSize > 0.0f;
+  const char* D3D9Rtx::describeUe3CapturePositionSource(const Ue3CapturePositionSource source) {
+    switch (source) {
+    case Ue3CapturePositionSource::ClipReconstruction: return "ClipReconstruction";
+    case Ue3CapturePositionSource::InputAssembler: return "InputAssembler";
+    case Ue3CapturePositionSource::PreProjectionRegister: return "PreProjectionRegister";
+    }
+    return "Unknown";
   }
 
-  bool D3D9Rtx::computeUe3CameraHashCell(Ue3CameraHashCell& outCell) const {
-    if (!shouldUseUe3CameraHashCell()) {
+  // Requires the vertex shader's oPos transform to have been recognised at compile time AND
+  // its matrix register to be the one the CTAB names ViewProjectionMatrix. The analyzer only
+  // proves "this register is multiplied by a matrix to make oPos"; the CTAB match is what
+  // proves the register holds a world position rather than some factory-local space.
+  bool D3D9Rtx::canUseUe3PreProjectionVertexCapture(const char** outReason) const {
+    auto fail = [&](const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
       return false;
+    };
+
+    if (!m_frameOptions.ue3ExactVertexCapture) {
+      return fail("exact capture disabled");
+    }
+    if (!m_frameOptions.ue3EngineMode) {
+      return fail("UE3 engine mode disabled");
     }
 
-    const float cellSize = m_frameOptions.ue3VertexCaptureCameraCellSize;
-    if (!std::isfinite(cellSize) || cellSize <= 0.0f) {
-      return false;
+    const D3D9CommonShader* vertexShader = GetCommonShader(d3d9State().vertexShader);
+    if (vertexShader == nullptr) {
+      return fail("no vertex shader");
     }
 
-    // Memoized on the exact (worldToView, cellSize) inputs: this runs up to twice per
-    // draw (static vertex-capture key + live geometry VS hash component) and the view
-    // matrix repeats across most draws of a frame, so the affine inverse below would
-    // otherwise be paid thousands of times per frame for one or two distinct views.
-    const Matrix4& worldToView = m_activeDrawCallState.transformData.worldToView;
-    if (m_ue3CameraCellMemoValid &&
-        m_ue3CameraCellMemoCellSize == cellSize &&
-        std::memcmp(&m_ue3CameraCellMemoWorldToView, &worldToView, sizeof(Matrix4)) == 0) {
-      outCell = m_ue3CameraCellMemoCell;
-      return m_ue3CameraCellMemoResult;
+    const DxsoPreProjectionPositionInfo& preProj = vertexShader->GetPreProjectionPositionInfo();
+    if (!preProj.valid) {
+      // The analyzer's own reason is more specific than anything this layer could say.
+      return fail(preProj.failureReason);
     }
 
-    // compute the full result first, then publish to the memo, so the memo can never
-    // hold a half-written entry regardless of how the paths below evolve
-    Ue3CameraHashCell cell = {};
-    bool result = false;
-
-    const Matrix4 cameraViewToWorld = inverseAffine(worldToView);
-    const Vector3 cameraPos = cameraViewToWorld[3].xyz();
-    if (std::isfinite(cameraPos.x) && std::isfinite(cameraPos.y) && std::isfinite(cameraPos.z)) {
-      cell = {
-        int32_t(std::floor(cameraPos.x / cellSize)),
-        int32_t(std::floor(cameraPos.y / cellSize)),
-        int32_t(std::floor(cameraPos.z / cellSize)),
-      };
-      result = true;
+    if (!m_currentUe3CtabInfo.has_value() || !m_currentUe3CtabInfo->hasViewProjectionMatrix) {
+      return fail("CTAB declares no ViewProjectionMatrix");
+    }
+    if (preProj.matrixConstBase != m_currentUe3CtabInfo->viewProjectionMatrixRegisterIndex) {
+      return fail("oPos matrix is not ViewProjectionMatrix");
     }
 
-    m_ue3CameraCellMemoWorldToView = worldToView;
-    m_ue3CameraCellMemoCellSize = cellSize;
-    m_ue3CameraCellMemoCell = cell;
-    m_ue3CameraCellMemoResult = result;
-    m_ue3CameraCellMemoValid = true;
-
-    outCell = cell;
-    return result;
+    if (outReason != nullptr) {
+      *outReason = "";
+    }
+    return true;
   }
 
-  bool D3D9Rtx::areUe3CameraHashCellsEqual(const Ue3CameraHashCell& a, const Ue3CameraHashCell& b) {
-    return a.x == b.x && a.y == b.y && a.z == b.z;
+  Ue3CapturePositionSource D3D9Rtx::resolveUe3CapturePositionSource(
+      const IndexContext& indexContext,
+      const VertexContext vertexContext[caps::MaxStreams],
+      const RasterGeometry& geoData,
+      const char** outReason) const {
+    const char* preProjReason = "";
+    const bool canPreProj = canUseUe3PreProjectionVertexCapture(&preProjReason);
+    const bool canInputAssembler = canUseUe3NativeLocalVertexCapture(indexContext, vertexContext, geoData);
+
+    auto pick = [&](Ue3CapturePositionSource source, const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
+      return source;
+    };
+
+    // Vertex capture cannot describe a hardware-instanced draw at all: its output buffer is
+    // indexed by vertex, so every instance writes the same slots and the survivors are an
+    // arbitrary mix of placements. The input assembler holds one object-space copy of the mesh,
+    // which is the only self-consistent answer, and the placements come from the instance stream
+    // instead (see readUe3InstanceTransforms). Overrides are deliberately not honoured here.
+    if (m_currentUe3Instancing.instanceCount > 1) {
+      const char* instancedReason = "";
+      if (canUseUe3InstancedMeshVertexPositions(geoData, &instancedReason)) {
+        return pick(Ue3CapturePositionSource::InputAssembler, "hardware-instanced draw");
+      }
+      return pick(Ue3CapturePositionSource::ClipReconstruction, instancedReason);
+    }
+
+    switch (m_frameOptions.ue3VertexCaptureSourceOverride) {
+    case Ue3CapturePositionSourceOverride::ForcePreProjection:
+      // A forced source that does not apply falls through rather than producing geometry in
+      // the wrong space, so the override stays safe to leave on while investigating.
+      if (canPreProj) {
+        return pick(Ue3CapturePositionSource::PreProjectionRegister, "forced");
+      }
+      return pick(Ue3CapturePositionSource::ClipReconstruction, preProjReason);
+
+    case Ue3CapturePositionSourceOverride::ForceInputAssembler:
+      if (canInputAssembler) {
+        return pick(Ue3CapturePositionSource::InputAssembler, "forced");
+      }
+      return pick(Ue3CapturePositionSource::ClipReconstruction, "not a conservative static local mesh");
+
+    case Ue3CapturePositionSourceOverride::ForceReconstruction:
+      return pick(Ue3CapturePositionSource::ClipReconstruction, "forced");
+
+    case Ue3CapturePositionSourceOverride::Auto:
+      break;
+    }
+
+    if (canPreProj) {
+      return pick(Ue3CapturePositionSource::PreProjectionRegister, "");
+    }
+    if (canInputAssembler) {
+      return pick(Ue3CapturePositionSource::InputAssembler, preProjReason);
+    }
+    return pick(Ue3CapturePositionSource::ClipReconstruction, preProjReason);
   }
 
-  void D3D9Rtx::logUe3CameraHashCellIfChanged(const Ue3CameraHashCell& cell, const char* reason) {
-    if (!m_frameOptions.ue3LogCapturePrecision && Logger::logLevel() > LogLevel::Debug) {
+  void D3D9Rtx::logUe3CapturePositionSource(const Ue3CapturePositionSource source, const char* reason) const {
+    if (!m_frameOptions.ue3LogCapturePrecision) {
       return;
     }
 
-    if (m_hasLoggedUe3CameraHashCell &&
-        areUe3CameraHashCellsEqual(m_lastLoggedUe3CameraHashCell, cell)) {
+    const D3D9CommonShader* vertexShader = GetCommonShader(d3d9State().vertexShader);
+    const XXH64_hash_t vsHash = vertexShader != nullptr ? vertexShader->GetBytecodeHash() : kEmptyHash;
+
+    // One line per shader per outcome: enough to enumerate everything that would be dropped
+    // by ue3RequireExactVertexCapture without the volume of a per-draw log.
+    static fast_unordered_set s_loggedSources;
+    const XXH64_hash_t logKey =
+      vsHash ^ (XXH64_hash_t(source) << 48) ^ (XXH64_hash_t(m_currentUe3VertexFactory) << 56);
+    if (!s_loggedSources.insert(logKey).second) {
       return;
     }
 
-    m_hasLoggedUe3CameraHashCell = true;
-    m_lastLoggedUe3CameraHashCell = cell;
-    Logger::debug(str::format(
-      "[RTX-Compatibility][UE3-Capture] cameraCell=(",
-      cell.x, ",", cell.y, ",", cell.z,
-      "), cellSize=", m_frameOptions.ue3VertexCaptureCameraCellSize,
-      ", reason=", reason));
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Capture] position source=", describeUe3CapturePositionSource(source),
+      ", vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      ", vs=0x", std::hex, vsHash, std::dec,
+      (reason != nullptr && reason[0] != '\0') ? ", reason=" : "",
+      (reason != nullptr) ? reason : ""));
+
+    // On a fallback, follow up with what the shader's position math actually looked like -
+    // a compiler is free to emit the same matrix multiply many ways, and this is the only
+    // way to tell an unsupported shape apart from a detector bug without a debugger.
+    if (source == Ue3CapturePositionSource::ClipReconstruction && vertexShader != nullptr) {
+      const DxsoPreProjectionPositionInfo& preProj = vertexShader->GetPreProjectionPositionInfo();
+      if (!preProj.positionDefinitions.empty()) {
+        Logger::info(str::format(
+          "[RTX-Compatibility][UE3-Capture]   vs=0x", std::hex, vsHash, std::dec,
+          " oPos math: ", preProj.positionDefinitions));
+      }
+    }
   }
 
   // Static in the cross-frame sense: content only changes through an explicit upload,
@@ -4960,6 +6408,20 @@ namespace dxvk {
     if (!m_frameOptions.ue3StaticLocalMeshVertexCaptureCache) {
       return false;
     }
+    // Refusing here rather than at insertion also skips building the cache key, whose per-draw
+    // stream hashing is most of the cost the cache exists to save.
+    if (m_ue3VertexCaptureCacheDormant) {
+      return false;
+    }
+    return isUe3StaticVertexCaptureCacheEligible(indexContext, vertexContext, geoData);
+  }
+
+  // The structural half of the test above: whether this draw is the kind the cache is for,
+  // independent of whether the cache is enabled or has stood itself down. The constant-churn
+  // diagnostic keys off this so it can explain a cache that is off or dormant.
+  bool D3D9Rtx::isUe3StaticVertexCaptureCacheEligible(const IndexContext& indexContext,
+                                                     const VertexContext vertexContext[caps::MaxStreams],
+                                                     const RasterGeometry& geoData) const {
     if (!m_frameOptions.ue3EngineMode) {
       return false;
     }
@@ -4969,7 +6431,39 @@ namespace dxvk {
     if (!m_frameOptions.useVertexCapture) {
       return false;
     }
-    if (m_currentUe3VertexFactory != Ue3VertexFactoryType::Local) {
+    // Only exact sources are camera-independent, so only they can be reused across frames.
+    // A cached clip-space reconstruction would pin the mesh to the reconstruction error of
+    // whichever frame captured it, which is worse than recapturing every frame.
+    if (!isUe3ExactCapturePositionSource(m_activeCapturePositionSource)) {
+      return false;
+    }
+    // The cache key deliberately omits the camera constant registers, so it can only serve
+    // factories whose world position is a function of the input assembler plus object and
+    // bone constants. Camera-facing factories (sprites, billboards, leaf cards) and morphing
+    // terrain move their vertices with the view and would be served a stale pose. Terrain is
+    // also left out because a cache hit suppresses the original draw, which the terrain baker
+    // needs to rasterize.
+    switch (m_currentUe3VertexFactory) {
+    case Ue3VertexFactoryType::Local:
+    case Ue3VertexFactoryType::LocalDecal:
+    case Ue3VertexFactoryType::GPUSkin:
+    case Ue3VertexFactoryType::GPUSkinMorph:
+    case Ue3VertexFactoryType::Foliage:
+      break;
+    default:
+      return false;
+    }
+    // The skinned factories are on the list above because a skinned mesh held in a fixed pose is as
+    // cacheable as a static one, but an animating one never is: its bone matrices are in the key's
+    // stable VS-constant hash, so every pose mints a key that can never be hit again. Admission
+    // would catch that, but a character animates essentially always, so refuse them up front rather
+    // than pay a key and an admission record per draw per frame.
+    if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
+      return false;
+    }
+    // Instanced draws never capture in the first place; caching one would only pin a buffer that
+    // is never consulted again.
+    if (m_currentUe3Instancing.instanceCount > 1) {
       return false;
     }
     if (!m_currentUe3CtabInfo.has_value()) {
@@ -4981,9 +6475,6 @@ namespace dxvk {
     if (!geoData.positionBuffer.defined()) {
       return false;
     }
-    if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
-      return false;
-    }
     if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::WorldUI) ||
         m_activeDrawCallState.testCategoryFlags(InstanceCategories::Terrain)) {
       return false;
@@ -4993,13 +6484,6 @@ namespace dxvk {
     }
 
     const auto& elements = d3d9State().vertexDecl->GetElements();
-    const VDeclSignature sig = buildVDeclSignature(elements);
-    // UE3 static meshes use FPositionVertexBuffer for POSITION and FStaticMeshVertexBuffer
-    // for tangent/normal/UV data. Ref-pose skeletal LocalVertexFactory draws use a unified
-    // stream and are not stable static-local cache candidates.
-    if (sig.positionStream == sig.tangentStream || sig.positionStream == sig.normalStream) {
-      return false;
-    }
 
     if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticD3D9Buffer(indexContext.ibo)) {
       return false;
@@ -5054,6 +6538,12 @@ namespace dxvk {
         return false;
       }
 
+      // Instance-data streams are dynamic by nature and contribute nothing to the geometry the
+      // memo describes; computeUe3IaGeometryMemoKey leaves them out of the key for the same reason.
+      if ((m_currentUe3Instancing.instanceDataStreamMask & (1u << element.Stream)) != 0) {
+        continue;
+      }
+
       const VertexContext& ctx = vertexContext[element.Stream];
       if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticD3D9Buffer(ctx.pVBO)) {
         return false;
@@ -5096,10 +6586,15 @@ namespace dxvk {
       return record;
     }
 
+    // excludeStreamMask drops streams whose contents are not part of the identity being keyed.
+    // Instance-data streams are the case that matters: they are reallocated and rewritten every
+    // frame, so including them would mint a key that can never repeat, while none of their
+    // contents reaches the geometry the key describes.
     template<typename ElementsT, typename VertexContextT>
     XXH64_hash_t hashUe3KeyStreamRecords(const ElementsT& elements,
                                          const VertexContextT* vertexContext,
-                                         XXH64_hash_t seed) {
+                                         XXH64_hash_t seed,
+                                         const uint32_t excludeStreamMask = 0) {
       // decl layout itself (semantics, formats, offsets, stream assignment)
       XXH64_hash_t hash = XXH3_64bits_withSeed(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9), seed);
 
@@ -5109,6 +6604,9 @@ namespace dxvk {
       for (const auto& element : elements) {
         // stream bounds are pre-validated by the canUse/canMemoize eligibility gates
         assert(element.Stream < caps::MaxStreams);
+        if ((excludeStreamMask & (1u << element.Stream)) != 0) {
+          continue;
+        }
         records[recordCount++] = makeUe3KeyStreamRecord(vertexContext[element.Stream]);
         if (recordCount == records.size()) {
           hash = XXH3_64bits_withSeed(records.data(), recordCount * sizeof(Ue3KeyStreamRecord), hash);
@@ -5179,9 +6677,9 @@ namespace dxvk {
 
   // IA-only identity for the geometry hash/AABB memo: draw range, decl, texcoord selection
   // (it decides which stream feeds the hashed texcoord region) and per-buffer physical
-  // identity + content generation. Deliberately excludes the stable VS-constant hash, the
-  // object transform and the camera cell, so every instance of a mesh - and every animation
-  // pose of a skinned mesh - shares one entry.
+  // identity + content generation. Deliberately excludes the stable VS-constant hash and
+  // the object transform, so every instance of a mesh - and every animation pose of a
+  // skinned mesh - shares one entry.
   XXH64_hash_t D3D9Rtx::computeUe3IaGeometryMemoKey(const IndexContext& indexContext,
                                                     const VertexContext vertexContext[caps::MaxStreams],
                                                     const DrawContext& drawContext,
@@ -5195,7 +6693,8 @@ namespace dxvk {
         uint32_t(m_uvResolutionMode), m_forceIaTexcoordForOutlier);
 
     const XXH64_hash_t headerHash = XXH3_64bits_withSeed(&header, sizeof(header), kSeed);
-    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash);
+    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash,
+                                   m_currentUe3Instancing.instanceDataStreamMask);
   }
 
   namespace {
@@ -5203,15 +6702,13 @@ namespace dxvk {
       Ue3IaMemoKeyHeader iaHeader; // shared IA identity block
       uint32_t cullMode;
       uint32_t frontFace;
-      uint32_t nativeLocalCapture;
-      uint32_t cameraCellValid;
+      uint32_t positionSource;
+      uint32_t explicitPad0;
       uint64_t stableVsHash;
       Matrix4 objectToWorld;
-      int32_t cameraCell[3];
-      uint32_t explicitPad0;
     };
     static_assert(sizeof(Ue3VertexCaptureKeyHeader) ==
-                    sizeof(Ue3IaMemoKeyHeader) + 4 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(Matrix4) + 4 * sizeof(int32_t),
+                    sizeof(Ue3IaMemoKeyHeader) + 4 * sizeof(uint32_t) + sizeof(uint64_t) + sizeof(Matrix4),
                   "Ue3VertexCaptureKeyHeader must have no implicit padding (it is hashed by memory).");
   }
 
@@ -5229,22 +6726,22 @@ namespace dxvk {
         uint32_t(m_uvResolutionMode), m_forceIaTexcoordForOutlier);
     header.cullMode = uint32_t(geoData.cullMode);
     header.frontFace = uint32_t(geoData.frontFace);
-    header.nativeLocalCapture = m_frameOptions.ue3NativeLocalMeshVertexCapture ? 1u : 0u;
+    // Positions from different sources are not interchangeable, so switching source (e.g. via
+    // ue3VertexCaptureSourceOverride) must not serve an entry captured through the other one.
+    header.positionSource = uint32_t(m_activeCapturePositionSource);
     // computed once per draw in internalPrepareDraw and shared with computeHash
     header.stableVsHash = m_activeStableVsHash;
     header.objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
-    Ue3CameraHashCell cameraCell;
-    if (computeUe3CameraHashCell(cameraCell)) {
-      header.cameraCellValid = 1u;
-      header.cameraCell[0] = cameraCell.x;
-      header.cameraCell[1] = cameraCell.y;
-      header.cameraCell[2] = cameraCell.z;
-    }
 
     const XXH64_hash_t headerHash = XXH3_64bits_withSeed(&header, sizeof(header), kSeed);
-    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash);
+    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash,
+                                   m_currentUe3Instancing.instanceDataStreamMask);
   }
 
+  // Second-choice exact source, for shaders whose oPos transform was not recognised. Only
+  // safe where the shader does nothing to the position but move it rigidly by LocalToWorld,
+  // so the conditions here stay deliberately narrow: static LocalVertexFactory meshes with
+  // no skinning, decal, wind or view-space CTAB constants in play.
   bool D3D9Rtx::canUseUe3NativeLocalVertexCapture(const IndexContext& indexContext,
                                                   const VertexContext vertexContext[caps::MaxStreams],
                                                   const RasterGeometry& geoData) const {
@@ -5316,6 +6813,146 @@ namespace dxvk {
     return true;
   }
 
+  // An instanced mesh factory's world position is GetInstanceToWorld(Input) * Input.Position
+  // (FoliageVertexFactory.usf, shared by FFoliageVertexFactory and
+  // FParticleInstancedMeshVertexFactory), so the declaration's POSITION is object space by
+  // construction - there is no shader constant involved and nothing to prove about the transform.
+  // That makes the conservatism canUseUe3NativeLocalVertexCapture applies to Local draws, where
+  // reading the input assembler is a guess about what the shader does, unnecessary here.
+  bool D3D9Rtx::canUseUe3InstancedMeshVertexPositions(const RasterGeometry& geoData,
+                                                     const char** outReason) const {
+    auto fail = [&](const char* reason) {
+      if (outReason != nullptr) {
+        *outReason = reason;
+      }
+      return false;
+    };
+
+    if (!m_frameOptions.ue3EngineMode) {
+      return fail("UE3 engine mode disabled");
+    }
+    if (!m_currentUe3Instancing.hasInstanceTransform) {
+      return fail("no per-instance transform basis in the declaration");
+    }
+    if (m_currentUe3VertexFactory != Ue3VertexFactoryType::Foliage &&
+        m_currentUe3VertexFactory != Ue3VertexFactoryType::ParticleInstancedMesh) {
+      return fail("not a recognised instanced mesh vertex factory");
+    }
+    // Object-space positions are only meaningful alongside the transforms that place them.
+    if (m_ue3InstanceTransformReadFailure != nullptr) {
+      return fail(m_ue3InstanceTransformReadFailure);
+    }
+    if (!geoData.positionBuffer.defined()) {
+      return fail("no input-assembler position buffer");
+    }
+    // Skinning would move the vertices after the input assembler; instanced factories never skin.
+    if (geoData.blendWeightBuffer.defined() || geoData.blendIndicesBuffer.defined()) {
+      return fail("draw carries skinning data");
+    }
+
+    if (outReason != nullptr) {
+      *outReason = "";
+    }
+    return true;
+  }
+
+  // Resolved once per vertex shader. The camera registers are always excluded: hashing them would
+  // make every draw's identity move with the view. Stock UE3 reserves two (VSR_ViewProjMatrix at c0,
+  // VSR_ViewOrigin at c4), which the defaults encode. The second variant additionally drops the
+  // object transform and the shading-only constants, which describe where a mesh is and how it is
+  // lit rather than what its geometry is.
+  D3D9Rtx::Ue3VsHashExclusions D3D9Rtx::buildUe3VsHashExclusions(
+      const Ue3VsShaderCtabInfo& ctabInfo,
+      const std::vector<Ue3VsConstantSymbol>* symbols) {
+    using Range = Ue3VsHashExclusions::Range;
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> raw = {};
+    uint32_t rawCount = 0;
+    auto add = [&](const uint32_t begin, const uint32_t count) {
+      if (count == 0 || rawCount >= Ue3VsHashExclusions::kMaxRanges) {
+        return;
+      }
+      raw[rawCount++] = Range { begin, begin + count };
+    };
+
+    // Sorts, merges overlaps, and writes the result out. Merging means the per-draw path can walk
+    // the ranges once in order and hash the gaps between them.
+    auto finalize = [](std::array<Range, Ue3VsHashExclusions::kMaxRanges>& ranges,
+                       const uint32_t count,
+                       std::array<Range, Ue3VsHashExclusions::kMaxRanges>& out,
+                       uint32_t& outCount) {
+      outCount = 0;
+      if (count == 0) {
+        return;
+      }
+      std::sort(ranges.begin(), ranges.begin() + count,
+                [](const Range& a, const Range& b) { return a.begin < b.begin; });
+      out[0] = ranges[0];
+      outCount = 1;
+      for (uint32_t i = 1; i < count; i++) {
+        if (ranges[i].begin <= out[outCount - 1].end) {
+          out[outCount - 1].end = std::max(out[outCount - 1].end, ranges[i].end);
+        } else {
+          out[outCount++] = ranges[i];
+        }
+      }
+    };
+
+    // Where the CTAB names them, those locations replace the reserved defaults rather than adding
+    // to them. Excluding both would drop c0..c4 from the hash for a shader that keeps real
+    // per-draw state there, letting draws that differ collide on the same hash.
+    uint32_t viewProjReg = kUe3VsrViewProjMatrixRegister;
+    uint32_t viewProjRegCount = 4;
+    uint32_t viewOriginReg = kUe3VsrViewOriginRegister;
+    uint32_t viewOriginRegCount = 1;
+    if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
+      viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
+      viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
+    }
+    if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
+      viewOriginReg = ctabInfo.cameraPositionRegisterIndex;
+      viewOriginRegCount = ctabInfo.cameraPositionRegisterCount;
+    }
+    add(viewProjReg, viewProjRegCount);
+    add(viewOriginReg, viewOriginRegCount);
+
+    Ue3VsHashExclusions result;
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> cameraRaw = raw;
+    const uint32_t cameraRawCount = rawCount;
+    finalize(cameraRaw, cameraRawCount, result.cameraOnly, result.cameraOnlyCount);
+
+    if (symbols != nullptr) {
+      auto contains = [](const std::string& haystack, const char* needle) {
+        return haystack.find(needle) != std::string::npos;
+      };
+      for (const Ue3VsConstantSymbol& symbol : *symbols) {
+        const std::string name = toLowerAscii(symbol.name);
+        // Shading-only: these reach interpolators, never vertex positions.
+        if (contains(name, "lightmapscale") ||
+            contains(name, "light_map_scale") ||
+            contains(name, "lightmapcoordinatescalebias") ||
+            contains(name, "light_map_coordinate_scale_bias") ||
+            contains(name, "shadowcoordinatescalebias") ||
+            contains(name, "shadow_coordinate_scale_bias")) {
+          add(symbol.registerIndex, symbol.registerCount);
+        }
+      }
+    }
+
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> shadingRaw = raw;
+    const uint32_t shadingRawCount = rawCount;
+    finalize(shadingRaw, shadingRawCount, result.cameraAndShading, result.cameraAndShadingCount);
+
+    if (ctabInfo.hasLocalToWorld) {
+      add(ctabInfo.localToWorldRegisterIndex, ctabInfo.localToWorldRegisterCount);
+    }
+    if (ctabInfo.hasWorldToLocal) {
+      add(ctabInfo.worldToLocalRegisterIndex, ctabInfo.worldToLocalRegisterCount);
+    }
+    finalize(raw, rawCount, result.withPlacement, result.withPlacementCount);
+
+    return result;
+  }
+
   XXH64_hash_t D3D9Rtx::computeUe3StableVertexShaderHash(bool* outHashedFloatConstsWithExclusions) const {
     if (outHashedFloatConstsWithExclusions != nullptr) {
       *outHashedFloatConstsWithExclusions = false;
@@ -5343,63 +6980,38 @@ namespace dxvk {
       hash = XXH3_64bits_withSeed(floatConstBase + offsetBytes, sizeBytes, hash);
     };
 
+    // The exclusion ranges are a pure function of the shader's CTAB, so they are resolved once per
+    // shader and borrowed here. This path runs for every draw; it must not build or sort anything.
     bool hashedFloatConstsWithExclusions = false;
-    if ((m_frameOptions.ue3CameraFromShaderConstants || m_frameOptions.ue3EngineMode) && floatConstRegCount > 0) {
-      constexpr uint32_t kFallbackViewProjReg = 0;
-      constexpr uint32_t kFallbackViewProjRegCount = 4;
-      constexpr uint32_t kFallbackViewOriginReg = 4;
-      constexpr uint32_t kFallbackViewOriginRegCount = 1;
-
-      uint32_t viewProjReg = kFallbackViewProjReg;
-      uint32_t viewProjRegCount = kFallbackViewProjRegCount;
-      uint32_t viewOriginReg = kFallbackViewOriginReg;
-      uint32_t viewOriginRegCount = kFallbackViewOriginRegCount;
-
-      if (m_currentUe3CtabInfo.has_value()) {
-        const Ue3VsShaderCtabInfo& ctabInfo = *m_currentUe3CtabInfo;
-        if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
-          viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
-          viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
-        }
-        if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
-          viewOriginReg = ctabInfo.cameraPositionRegisterIndex;
-          viewOriginRegCount = ctabInfo.cameraPositionRegisterCount;
-        }
+    if ((m_frameOptions.ue3CameraFromShaderConstants || m_frameOptions.ue3EngineMode) &&
+        floatConstRegCount > 0) {
+      // A shader with no resolved CTAB still must not hash the reserved camera registers, or its
+      // identity would move with the view.
+      static const Ue3VsHashExclusions s_reservedOnly = buildUe3VsHashExclusions(Ue3VsShaderCtabInfo {}, nullptr);
+      const Ue3VsHashExclusions& exclusions =
+        m_currentUe3VsHashExclusions != nullptr ? *m_currentUe3VsHashExclusions : s_reservedOnly;
+      const bool excludePlacement = m_frameOptions.ue3ExcludePlacementFromVertexShaderHash;
+      // Dropping the shading-only constants is free and keeps the hash off the lightmap policy,
+      // so UE3 mode takes it unconditionally; the placement registers stay opt-in for their cost.
+      const bool excludeShading = m_frameOptions.ue3EngineMode;
+      const Ue3VsHashExclusions::Range* ranges = exclusions.cameraOnly.data();
+      uint32_t rangeCount = exclusions.cameraOnlyCount;
+      if (excludePlacement) {
+        ranges = exclusions.withPlacement.data();
+        rangeCount = exclusions.withPlacementCount;
+      } else if (excludeShading) {
+        ranges = exclusions.cameraAndShading.data();
+        rangeCount = exclusions.cameraAndShadingCount;
       }
 
-      struct RegRange {
-        uint32_t begin = 0;
-        uint32_t end = 0;
-      };
-
-      std::array<RegRange, 2> ranges = {{
-        { viewProjReg, viewProjReg + viewProjRegCount },
-        { viewOriginReg, viewOriginReg + viewOriginRegCount },
-      }};
-      std::array<RegRange, 2> validRanges = {};
-      uint32_t validRangeCount = 0;
-      for (const RegRange& r : ranges) {
-        RegRange clamped;
-        clamped.begin = std::min(r.begin, floatConstRegCount);
-        clamped.end = std::min(r.end, floatConstRegCount);
-        if (clamped.begin < clamped.end) {
-          validRanges[validRangeCount++] = clamped;
-        }
-      }
-
-      if (validRangeCount > 0) {
-        if (validRangeCount == 2 && validRanges[1].begin < validRanges[0].begin) {
-          std::swap(validRanges[0], validRanges[1]);
-        }
-        if (validRangeCount == 2 && validRanges[1].begin <= validRanges[0].end) {
-          validRanges[0].end = std::max(validRanges[0].end, validRanges[1].end);
-          validRangeCount = 1;
-        }
-
+      if (rangeCount > 0) {
         uint32_t cursor = 0;
-        for (uint32_t i = 0; i < validRangeCount; i++) {
-          hashFloatConstRange(cursor, validRanges[i].begin);
-          cursor = std::max(cursor, validRanges[i].end);
+        for (uint32_t i = 0; i < rangeCount; i++) {
+          if (ranges[i].begin >= floatConstRegCount) {
+            break;
+          }
+          hashFloatConstRange(cursor, ranges[i].begin);
+          cursor = std::max(cursor, ranges[i].end);
         }
         hashFloatConstRange(cursor, floatConstRegCount);
         hashedFloatConstsWithExclusions = true;
@@ -5441,10 +7053,8 @@ namespace dxvk {
 
     Ue3VertexCaptureCacheEntry& entry = it->second;
     const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
-    const uint32_t warmupFrames = std::max(1u, m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames);
     if (entry.vertexCount != geoData.vertexCount ||
         !entry.positionBuffer.defined() ||
-        entry.captureCount < warmupFrames ||
         entry.lastFrameTouched == currentFrame) {
       return false;
     }
@@ -5454,27 +7064,668 @@ namespace dxvk {
     geoData.texcoordBuffer = entry.texcoordBuffer;
     geoData.color0Buffer = entry.color0Buffer;
     entry.lastFrameTouched = currentFrame;
+    ++m_ue3VertexCaptureCacheFrameReuses;
 
     return true;
   }
 
+  // Two-tier admission. A fresh capture is recorded in the CPU-only admission map first and
+  // only promoted to the retention tier once its key has been seen on enough distinct frames,
+  // because the key covers the object transform and the shader's non-camera constants: any
+  // draw that animates or moves mints a new key every frame, so retaining on first sighting
+  // would pin a device-local capture buffer per such draw per frame with no possible reuse.
   void D3D9Rtx::updateUe3StaticVertexCaptureCache(XXH64_hash_t cacheKey, const RasterGeometry& geoData) {
-    Ue3VertexCaptureCacheEntry& entry = m_ue3VertexCaptureCache[cacheKey];
+    const VkDeviceSize budgetBytes =
+      VkDeviceSize(m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB) * 1024ull * 1024ull;
+    if (budgetBytes == 0) {
+      return;
+    }
+
+    // The four views alias one capture buffer, so the position slice's length is the entry's
+    // whole VRAM cost.
+    const VkDeviceSize byteSize = geoData.positionBuffer.length();
+    if (byteSize > budgetBytes) {
+      // a single capture larger than the whole budget would evict everything and then itself
+      return;
+    }
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+
+    // An already-retained key reaching here was recaptured rather than reused - drawn a second
+    // time in one frame, or its vertex count changed - so refresh it in place instead of
+    // sending it back through admission.
+    auto it = m_ue3VertexCaptureCache.find(cacheKey);
+    if (it == m_ue3VertexCaptureCache.end()) {
+      const uint32_t warmupFrames = std::max(1u, m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames);
+
+      Ue3VertexCaptureAdmissionEntry& admission = m_ue3VertexCaptureAdmission[cacheKey];
+      if (admission.vertexCount != geoData.vertexCount) {
+        // same key over different geometry: restart, the previous sightings prove nothing
+        admission.vertexCount = geoData.vertexCount;
+        admission.sightings = 0;
+      }
+      if (admission.lastFrameSeen != currentFrame || admission.sightings == 0) {
+        // count one sighting per frame, so a mesh drawn many times within a single frame does
+        // not look like a key that has proven itself across frames
+        admission.sightings = std::min(admission.sightings + 1, 0xFFFFu);
+        admission.lastFrameSeen = currentFrame;
+      }
+
+      if (admission.sightings < warmupFrames) {
+        return;
+      }
+
+      it = m_ue3VertexCaptureCache.emplace(cacheKey, Ue3VertexCaptureCacheEntry {}).first;
+      // the admission record has served its purpose; if the budget later evicts this entry
+      // the key simply serves its warmup again
+      m_ue3VertexCaptureAdmission.erase(cacheKey);
+    }
+
+    Ue3VertexCaptureCacheEntry& entry = it->second;
+    m_ue3VertexCaptureCacheBytes -= std::min(m_ue3VertexCaptureCacheBytes, entry.byteSize);
     entry.positionBuffer = geoData.positionBuffer;
     entry.normalBuffer = geoData.normalBuffer;
     entry.texcoordBuffer = geoData.texcoordBuffer;
     entry.color0Buffer = geoData.color0Buffer;
     entry.vertexCount = geoData.vertexCount;
-    entry.captureCount = std::min(entry.captureCount + 1, 0xFFFFu);
-    entry.lastFrameTouched = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    entry.lastFrameTouched = currentFrame;
+    entry.byteSize = byteSize;
+    m_ue3VertexCaptureCacheBytes += byteSize;
+  }
+
+  void D3D9Rtx::eraseUe3StaticVertexCaptureCacheEntry(XXH64_hash_t cacheKey) {
+    auto it = m_ue3VertexCaptureCache.find(cacheKey);
+    if (it == m_ue3VertexCaptureCache.end()) {
+      return;
+    }
+    m_ue3VertexCaptureCacheBytes -= std::min(m_ue3VertexCaptureCacheBytes, it->second.byteSize);
+    m_ue3VertexCaptureCache.erase(it);
+  }
+
+  void D3D9Rtx::clearUe3StaticVertexCaptureCache() {
+    m_ue3VertexCaptureCache.clear();
+    m_ue3VertexCaptureCacheBytes = 0;
+    m_ue3VertexCaptureAdmission.clear();
   }
 
   void D3D9Rtx::pruneUe3StaticVertexCaptureCache() {
-    constexpr uint32_t kMaxUntouchedFrames = 600;
     const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    const uint32_t retentionFrames =
+      std::max(1u, m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheRetentionFrames);
+
     m_ue3VertexCaptureCache.erase_if([&](auto it) {
-      return currentFrame - it->second.lastFrameTouched > kMaxUntouchedFrames;
+      if (currentFrame - it->second.lastFrameTouched <= retentionFrames) {
+        return false;
+      }
+      m_ue3VertexCaptureCacheBytes -= std::min(m_ue3VertexCaptureCacheBytes, it->second.byteSize);
+      return true;
     });
+
+    // Admission records are pure bookkeeping, but a churning key mints one per draw per frame,
+    // so they need the same expiry to stay bounded. A key still warming up is re-seen every
+    // frame, so the retention window is more than enough to keep it alive.
+    m_ue3VertexCaptureAdmission.erase_if([&](auto it) {
+      return currentFrame - it->second.lastFrameSeen > retentionFrames;
+    });
+
+    enforceUe3StaticVertexCaptureCacheBudget();
+  }
+
+  // Backstop for the admission policy: if a game still manages to push more repeating keys
+  // than expected (many placements of the same mesh each key on their own transform), the
+  // cache gives up hit rate rather than VRAM.
+  void D3D9Rtx::enforceUe3StaticVertexCaptureCacheBudget() {
+    const VkDeviceSize budgetBytes =
+      VkDeviceSize(m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB) * 1024ull * 1024ull;
+    const size_t maxEntries = m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheMaxEntries;
+
+    auto overBudget = [&]() {
+      return m_ue3VertexCaptureCacheBytes > budgetBytes ||
+             (maxEntries > 0 && m_ue3VertexCaptureCache.size() > maxEntries);
+    };
+
+    if (!overBudget()) {
+      return;
+    }
+
+    // A once-per-session note: from here on the cache trades hit rate for a VRAM ceiling, which
+    // is worth knowing when diagnosing why captures are not being reused.
+    ONCE(Logger::warn(str::format(
+      "[RTX-Compatibility][UE3-Capture] static vertex capture cache reached its limit (",
+      m_ue3VertexCaptureCacheBytes / (1024 * 1024), " MiB over ",
+      m_ue3VertexCaptureCache.size(), " entries, budget ",
+      budgetBytes / (1024 * 1024), " MiB / ", maxEntries, " entries); evicting least recently "
+      "used entries from here on. Raise rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB "
+      "if reuse suffers.")));
+
+    if (budgetBytes == 0) {
+      clearUe3StaticVertexCaptureCache();
+      return;
+    }
+
+    std::vector<std::pair<uint32_t, XXH64_hash_t>> byLastTouched;
+    byLastTouched.reserve(m_ue3VertexCaptureCache.size());
+    for (const auto& [key, entry] : m_ue3VertexCaptureCache) {
+      byLastTouched.emplace_back(entry.lastFrameTouched, key);
+    }
+    std::sort(byLastTouched.begin(), byLastTouched.end());
+
+    for (const auto& candidate : byLastTouched) {
+      if (!overBudget()) {
+        break;
+      }
+      eraseUe3StaticVertexCaptureCacheEntry(candidate.second);
+      ++m_ue3VertexCaptureCacheEvictions;
+    }
+  }
+
+  std::string D3D9Rtx::describeUe3VsConstantRegister(XXH64_hash_t vsBytecodeHash, uint32_t reg) const {
+    auto it = m_ue3VsConstantSymbols.find(vsBytecodeHash);
+    if (it != m_ue3VsConstantSymbols.end()) {
+      for (const Ue3VsConstantSymbol& symbol : it->second) {
+        if (reg < symbol.registerIndex || reg >= symbol.registerIndex + symbol.registerCount) {
+          continue;
+        }
+        // Name the row for multi-register symbols, so a churning matrix says which row moved.
+        if (symbol.registerCount > 1) {
+          return str::format("c", reg, " (", symbol.name, "[", reg - symbol.registerIndex, "])");
+        }
+        return str::format("c", reg, " (", symbol.name, ")");
+      }
+    }
+    return str::format("c", reg);
+  }
+
+  // Accumulates the three levels described on Ue3ChurnMeshEntry. Levels 1 and 2 are decided on the
+  // first draw of a mesh in a new frame, since only then is the previous frame's placement set
+  // complete; level 3 compares that same first draw's constants against the previous frame's.
+  void D3D9Rtx::trackUe3ConstantChurn(const XXH64_hash_t iaKey, const RasterGeometry& geoData) {
+    ScopedCpuProfileZone();
+
+    const D3D9CommonShader* vertexShader =
+      d3d9State().vertexShader.ptr() != nullptr ? d3d9State().vertexShader->GetCommonShader() : nullptr;
+    if (vertexShader == nullptr) {
+      return;
+    }
+
+    const uint32_t floatConstRegCount =
+      std::min(m_parent->m_consts[DxsoProgramTypes::VertexShader].meta.maxConstIndexF,
+               uint32_t(caps::MaxFloatConstantsSoftware));
+    if (floatConstRegCount == 0) {
+      return;
+    }
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    const Vector4* floatConsts = &d3d9State().vsConsts.fConsts[0];
+
+    // Keyed per mesh, not per placement: the transform is recorded inside the entry so that a
+    // moving transform and a moving IA identity stay distinguishable.
+    const XXH64_hash_t transformHash =
+      XXH3_64bits(&m_activeDrawCallState.transformData.objectToWorld, sizeof(Matrix4));
+
+    // Hash the registers the transform was extracted from, using the current draw's CTAB rather
+    // than the entry's cached ranges so it is right even on the first sighting.
+    XXH64_hash_t rawTransformHash = 0;
+    if (m_currentUe3CtabInfo.has_value()) {
+      const Ue3VsShaderCtabInfo& ctabInfo = *m_currentUe3CtabInfo;
+      auto foldRange = [&](const uint32_t base, const uint32_t count) {
+        if (count == 0 || base >= floatConstRegCount) {
+          return;
+        }
+        const uint32_t end = std::min(base + count, floatConstRegCount);
+        rawTransformHash = XXH3_64bits_withSeed(
+          &floatConsts[base], size_t(end - base) * sizeof(Vector4), rawTransformHash);
+      };
+      if (ctabInfo.hasLocalToWorld) {
+        foldRange(ctabInfo.localToWorldRegisterIndex, ctabInfo.localToWorldRegisterCount);
+      }
+      if (ctabInfo.hasWorldToLocal) {
+        foldRange(ctabInfo.worldToLocalRegisterIndex, ctabInfo.worldToLocalRegisterCount);
+      }
+    }
+
+    auto it = m_ue3ConstantChurn.find(iaKey);
+    if (it == m_ue3ConstantChurn.end()) {
+      if (m_ue3ConstantChurn.size() >= m_frameOptions.ue3VertexConstantChurnMaxTrackedDraws) {
+        // An IA identity that changes every frame never revisits a key, so without eviction the
+        // sample fills once with entries that can never be compared and the diagnostic goes blind.
+        m_ue3ConstantChurn.erase_if([currentFrame](auto stale) {
+          return stale->second.lastFrameSeen + 2 < currentFrame;
+        });
+        if (m_ue3ConstantChurn.size() >= m_frameOptions.ue3VertexConstantChurnMaxTrackedDraws) {
+          return;
+        }
+      }
+      it = m_ue3ConstantChurn.emplace(iaKey, Ue3ChurnMeshEntry {}).first;
+      ++m_ue3ChurnMeshKeysCreated;
+    }
+
+    Ue3ChurnMeshEntry& entry = it->second;
+
+    // Level 1 and 2 are evaluated on the first draw of this mesh in a new frame, because only then
+    // is the previous frame's set of placements complete.
+    const bool firstTouchThisFrame = entry.currentSetFrame != currentFrame;
+    if (firstTouchThisFrame) {
+      if (entry.currentSetFrame != 0) {
+        std::sort(entry.transformsThisFrame.begin(), entry.transformsThisFrame.end());
+        std::sort(entry.rawTransformsThisFrame.begin(), entry.rawTransformsThisFrame.end());
+        const XXH64_hash_t setHash = XXH3_64bits(
+          entry.transformsThisFrame.data(), entry.transformsThisFrame.size() * sizeof(XXH64_hash_t));
+        const XXH64_hash_t rawSetHash = XXH3_64bits(
+          entry.rawTransformsThisFrame.data(), entry.rawTransformsThisFrame.size() * sizeof(XXH64_hash_t));
+        const uint32_t setSize = uint32_t(entry.transformsThisFrame.size());
+
+        // Compare two *completed* sets, and only when they belong to consecutive frames.
+        if (entry.completedSetFrame != 0 && entry.completedSetFrame + 1 == entry.currentSetFrame) {
+          ++m_ue3ChurnMeshRevisited;
+          const bool extractedIdentical = setHash == entry.completedSetHash;
+          const bool rawIdentical = rawSetHash == entry.completedRawSetHash;
+
+          if (extractedIdentical) {
+            ++m_ue3ChurnTransformSetIdentical;
+          } else {
+            ++m_ue3ChurnTransformSetDiffered;
+            if (setSize != entry.completedSetSize) {
+              ++m_ue3ChurnTransformSetSizeChanged;
+            }
+          }
+          if (rawIdentical) {
+            ++m_ue3ChurnRawTransformSetIdentical;
+            if (!extractedIdentical) {
+              // Same registers in, different matrices out.
+              ++m_ue3ChurnExtractionUnstable;
+            }
+          }
+        }
+
+        entry.completedSetHash = setHash;
+        entry.completedRawSetHash = rawSetHash;
+        entry.completedSetSize = setSize;
+        entry.completedSetFrame = entry.currentSetFrame;
+      }
+      entry.transformsThisFrame.clear();
+      entry.rawTransformsThisFrame.clear();
+      entry.currentSetFrame = currentFrame;
+    }
+    entry.transformsThisFrame.push_back(transformHash);
+    entry.rawTransformsThisFrame.push_back(rawTransformHash);
+
+    // Level 3: do any constants move that are neither camera-derived nor part of the object
+    // transform? Those are the only ones that could destabilise geometry identity spuriously.
+    // Excluding the transform registers is what makes this independent of which placement of the
+    // mesh happened to be drawn first in each frame.
+    const bool canCompareConstants =
+      firstTouchThisFrame &&
+      entry.lastFrameSeen != 0 &&
+      entry.lastFrameSeen + 1 == currentFrame &&
+      entry.vsBytecodeHash == vertexShader->GetBytecodeHash() &&
+      entry.floatConsts.size() == floatConstRegCount;
+
+    if (canCompareConstants) {
+      auto isExcludedRegister = [&entry](const uint32_t reg) {
+        auto inRange = [reg](const uint32_t base, const uint32_t count) {
+          return count > 0 && reg >= base && reg < base + count;
+        };
+        return inRange(entry.viewProjReg, entry.viewProjRegCount) ||
+               inRange(entry.cameraPosReg, entry.cameraPosRegCount) ||
+               inRange(entry.localToWorldReg, entry.localToWorldRegCount) ||
+               inRange(entry.worldToLocalReg, entry.worldToLocalRegCount);
+      };
+
+      const bool viewMoved =
+        std::memcmp(&entry.worldToView, &m_activeDrawCallState.transformData.worldToView, sizeof(Matrix4)) != 0;
+      // Dumps only while the view is moving: a camera-derived constant is the interesting
+      // hypothesis, and a still-camera example cannot distinguish one.
+      const bool wantDetail = viewMoved && m_ue3ConstantChurnDetailDumps < 8;
+
+      std::string detail;
+      uint32_t changedRegisters = 0;
+      for (uint32_t reg = 0; reg < floatConstRegCount; reg++) {
+        if (std::memcmp(&entry.floatConsts[reg], &floatConsts[reg], sizeof(Vector4)) == 0) {
+          continue;
+        }
+        if (isExcludedRegister(reg)) {
+          continue;
+        }
+        ++changedRegisters;
+        Ue3ChurnRegisterTally& tally = m_ue3ConstantChurnByRegister[reg];
+        ++tally.count;
+        tally.vsBytecodeHash = entry.vsBytecodeHash;
+
+        if (wantDetail && changedRegisters <= 6) {
+          const Vector4& was = entry.floatConsts[reg];
+          const Vector4& now = floatConsts[reg];
+          detail += str::format(
+            detail.empty() ? "" : ", ",
+            describeUe3VsConstantRegister(entry.vsBytecodeHash, reg),
+            " (", was.x, ",", was.y, ",", was.z, ",", was.w, ")->(",
+            now.x, ",", now.y, ",", now.z, ",", now.w, ")");
+        }
+      }
+
+      ++m_ue3ConstantChurnComparisons;
+      if (changedRegisters > 0) {
+        ++m_ue3ChurnOtherConstantsChanged;
+        if (viewMoved) {
+          ++m_ue3ConstantChurnWhileViewMoved;
+        } else {
+          ++m_ue3ConstantChurnWhileViewStill;
+        }
+      }
+
+      if (!detail.empty()) {
+        ++m_ue3ConstantChurnDetailDumps;
+        Logger::info(str::format(
+          "[RTX-Compatibility][UE3-ConstantChurn] same mesh, next frame, ignoring camera and transform "
+          "registers: vs=0x", std::hex, entry.vsBytecodeHash, std::dec,
+          " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+          " verts=", geoData.vertexCount,
+          " changedRegs=", changedRegisters, ": ", detail));
+      }
+    }
+
+    if (firstTouchThisFrame) {
+      entry.lastFrameSeen = currentFrame;
+      entry.vsBytecodeHash = vertexShader->GetBytecodeHash();
+      entry.worldToView = m_activeDrawCallState.transformData.worldToView;
+      entry.floatConsts.assign(floatConsts, floatConsts + floatConstRegCount);
+
+      entry.viewProjReg = kUe3VsrViewProjMatrixRegister;
+      entry.viewProjRegCount = 4;
+      entry.cameraPosReg = kUe3VsrViewOriginRegister;
+      entry.cameraPosRegCount = 1;
+      entry.localToWorldReg = 0;
+      entry.localToWorldRegCount = 0;
+      entry.worldToLocalReg = 0;
+      entry.worldToLocalRegCount = 0;
+      if (m_currentUe3CtabInfo.has_value()) {
+        const Ue3VsShaderCtabInfo& ctabInfo = *m_currentUe3CtabInfo;
+        if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
+          entry.viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
+          entry.viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
+        }
+        if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
+          entry.cameraPosReg = ctabInfo.cameraPositionRegisterIndex;
+          entry.cameraPosRegCount = ctabInfo.cameraPositionRegisterCount;
+        }
+        if (ctabInfo.hasLocalToWorld && ctabInfo.localToWorldRegisterCount > 0) {
+          entry.localToWorldReg = ctabInfo.localToWorldRegisterIndex;
+          entry.localToWorldRegCount = ctabInfo.localToWorldRegisterCount;
+        }
+        if (ctabInfo.hasWorldToLocal && ctabInfo.worldToLocalRegisterCount > 0) {
+          entry.worldToLocalReg = ctabInfo.worldToLocalRegisterIndex;
+          entry.worldToLocalRegCount = ctabInfo.worldToLocalRegisterCount;
+        }
+      }
+    }
+  }
+
+  void D3D9Rtx::reportUe3ConstantChurn() {
+    if (!m_frameOptions.ue3LogVertexConstantChurn) {
+      return;
+    }
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    constexpr uint32_t kReportIntervalFrames = 300;
+    if (currentFrame - m_ue3ConstantChurnReportFrameStamp < kReportIntervalFrames) {
+      return;
+    }
+    m_ue3ConstantChurnReportFrameStamp = currentFrame;
+
+    const uint64_t meshKeys = m_ue3ChurnMeshKeysCreated;
+    const uint64_t revisits = m_ue3ChurnMeshRevisited;
+
+    // The interpretation guide is worth saying once; repeating it every window buries the numbers.
+    ONCE(Logger::info(
+      "[RTX-Compatibility][UE3-ConstantChurn] reading the levels below: level 1 is whether a mesh's "
+      "input-assembler identity comes back at all (if not, nothing downstream can repeat and the draws are "
+      "re-uploading their vertex/index data); level 2 is whether its placements are the same, compared as a "
+      "multiset so draw order does not matter, with a changed instance count meaning ordinary culling rather "
+      "than movement; level 3 is whether any other constant moved, which is the only one of the three that "
+      "rtx.d3d9.ue3ExcludePlacementFromVertexShaderHash cannot address."));
+
+    if (revisits == 0) {
+      ONCE(Logger::warn(str::format(
+        "[RTX-Compatibility][UE3-ConstantChurn] level 1: ", meshKeys, " mesh keys minted and not one "
+        "input-assembler identity came back on the next frame, so no cache key can repeat regardless of "
+        "transforms or constants.")));
+      m_ue3ChurnMeshKeysCreated = 0;
+      return;
+    }
+
+    auto pct = [](const uint64_t n, const uint64_t of) {
+      return of > 0 ? uint32_t((n * 100ull) / of) : 0u;
+    };
+
+    const uint64_t setComparisons = m_ue3ChurnTransformSetIdentical + m_ue3ChurnTransformSetDiffered;
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-ConstantChurn] level 1: ", revisits, " next-frame revisits against ",
+      meshKeys, " new mesh keys, ", m_ue3ConstantChurn.size(), " sampled. level 2: of ", setComparisons,
+      " comparisons the placement set was identical ", pct(m_ue3ChurnTransformSetIdentical, setComparisons),
+      "%, differed ", pct(m_ue3ChurnTransformSetDiffered, setComparisons), "% (",
+      m_ue3ChurnTransformSetSizeChanged, " with a changed instance count), and the raw LocalToWorld registers "
+      "behind them were identical ", pct(m_ue3ChurnRawTransformSetIdentical, setComparisons),
+      "%. level 3: ", pct(m_ue3ChurnOtherConstantsChanged, m_ue3ConstantChurnComparisons),
+      "% of ", m_ue3ConstantChurnComparisons, " comparisons moved another constant (view had moved on ",
+      m_ue3ConstantChurnWhileViewMoved, ", was still on ", m_ue3ConstantChurnWhileViewStill, ")."));
+
+    // The conclusions are one-shot: they identify a property of the title, not of this window.
+    if (m_ue3ChurnExtractionUnstable > 0) {
+      ONCE(Logger::warn(str::format(
+        "[RTX-Compatibility][UE3-ConstantChurn] ", pct(m_ue3ChurnExtractionUnstable, setComparisons),
+        "% of comparisons had identical raw LocalToWorld registers but a different extracted objectToWorld. "
+        "Same input, different output means this runtime's transform extraction is not reproducible, which is a "
+        "bug here rather than a property of the game.")));
+    } else if (m_ue3ChurnTransformSetDiffered > 0) {
+      ONCE(Logger::info(
+        "[RTX-Compatibility][UE3-ConstantChurn] every differing placement set also had differing raw "
+        "LocalToWorld registers, so the game uploads a new transform each frame for these draws and the "
+        "extraction of it is reproducible. Those registers are in the stable VS hash, hence in "
+        "rules::FullGeometryHash, so DrawCallCache::exactMatch cannot match them across frames and a fresh "
+        "BlasEntry is allocated per draw per frame. rtx.d3d9.ue3ExcludePlacementFromVertexShaderHash addresses "
+        "this, at the cost described in its documentation."));
+    }
+
+    // Only worth reporting when frequent enough to matter; a handful of shadow-atlas reallocations
+    // per window is not a finding.
+    constexpr uint32_t kConstantChurnWarnPercent = 5;
+    if (pct(m_ue3ChurnOtherConstantsChanged, m_ue3ConstantChurnComparisons) >= kConstantChurnWarnPercent) {
+      ONCE(Logger::warn(
+        "[RTX-Compatibility][UE3-ConstantChurn] a constant that is neither camera-derived nor part of the object "
+        "transform is moving often enough to destabilise geometry identity on its own. The register tally names "
+        "it; changes only while the view moves point at a camera-derived constant, changes with the view still "
+        "are animation or time driven."));
+    }
+
+    if (!m_ue3ConstantChurnByRegister.empty()) {
+      // Busiest first: that ordering is the answer to "which constant is doing this".
+      std::vector<std::pair<uint64_t, uint32_t>> byCount;
+      byCount.reserve(m_ue3ConstantChurnByRegister.size());
+      for (const auto& [reg, tally] : m_ue3ConstantChurnByRegister) {
+        byCount.emplace_back(tally.count, reg);
+      }
+      std::sort(byCount.rbegin(), byCount.rend());
+
+      std::string top;
+      const size_t shown = std::min<size_t>(byCount.size(), 12);
+      for (size_t i = 0; i < shown; i++) {
+        const uint32_t reg = byCount[i].second;
+        top += str::format(
+          top.empty() ? "" : ", ",
+          describeUe3VsConstantRegister(m_ue3ConstantChurnByRegister[reg].vsBytecodeHash, reg),
+          " x", byCount[i].first);
+      }
+
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-ConstantChurn] registers that moved (", byCount.size(),
+        " distinct, busiest first): ", top));
+    }
+
+    m_ue3ConstantChurnByRegister.clear();
+    m_ue3ChurnMeshKeysCreated = 0;
+    m_ue3ChurnMeshRevisited = 0;
+    m_ue3ChurnTransformSetIdentical = 0;
+    m_ue3ChurnTransformSetDiffered = 0;
+    m_ue3ChurnTransformSetSizeChanged = 0;
+    m_ue3ChurnRawTransformSetIdentical = 0;
+    m_ue3ChurnExtractionUnstable = 0;
+    m_ue3ConstantChurnComparisons = 0;
+    m_ue3ChurnOtherConstantsChanged = 0;
+    m_ue3ConstantChurnWhileViewMoved = 0;
+    m_ue3ConstantChurnWhileViewStill = 0;
+  }
+
+  void D3D9Rtx::updateUe3StaticVertexCaptureCacheState() {
+    const uint32_t reuses = m_ue3VertexCaptureCacheFrameReuses;
+    const uint32_t captures = m_ue3VertexCaptureCacheFrameCaptures;
+    m_ue3VertexCaptureCacheFrameReuses = 0;
+    m_ue3VertexCaptureCacheFrameCaptures = 0;
+
+    // Toggling the cache off in the dev UI should not leave a stale dormancy verdict behind,
+    // and nothing should stay resident while it is off.
+    if (!m_frameOptions.ue3StaticLocalMeshVertexCaptureCache) {
+      if (m_ue3VertexCaptureCacheDormant || !m_ue3VertexCaptureCache.empty() || !m_ue3VertexCaptureAdmission.empty()) {
+        clearUe3StaticVertexCaptureCache();
+        m_ue3VertexCaptureCacheDormant = false;
+        m_ue3VertexCaptureCacheProbeCountdown = 0;
+      }
+      return;
+    }
+
+    m_ue3VertexCaptureWindowReuses += reuses;
+    m_ue3VertexCaptureWindowCaptures += captures;
+    ++m_ue3VertexCaptureWindowFrames;
+
+    m_ue3VertexCaptureCacheStatReuses += reuses;
+    m_ue3VertexCaptureCacheStatCaptures += captures;
+    ++m_ue3VertexCaptureCacheStatFrames;
+
+    evaluateUe3StaticVertexCaptureCacheDormancy();
+    reportUe3StaticVertexCaptureCacheStats();
+  }
+
+  void D3D9Rtx::evaluateUe3StaticVertexCaptureCacheDormancy() {
+    auto resetWindow = [this]() {
+      m_ue3VertexCaptureWindowFrames = 0;
+      m_ue3VertexCaptureWindowReuses = 0;
+      m_ue3VertexCaptureWindowCaptures = 0;
+    };
+
+    const uint32_t minReusePercent = m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheMinReusePercent;
+    if (minReusePercent == 0) {
+      // Guard disabled: never stand the cache down, and keep the window empty so re-enabling the
+      // guard later judges the cache on fresh frames rather than accumulated history.
+      m_ue3VertexCaptureCacheDormant = false;
+      m_ue3VertexCaptureCacheProbeCountdown = 0;
+      resetWindow();
+      return;
+    }
+
+    if (m_ue3VertexCaptureCacheDormant) {
+      // Nothing is eligible while dormant, so the window cannot measure anything. Wait out the
+      // probe interval, then wake up and let the window below judge the cache afresh - a later
+      // level or a different shader set may well be cacheable.
+      if (m_ue3VertexCaptureCacheProbeCountdown > 0) {
+        --m_ue3VertexCaptureCacheProbeCountdown;
+        resetWindow();
+        return;
+      }
+      m_ue3VertexCaptureCacheDormant = false;
+      resetWindow();
+      if (m_frameOptions.ue3LogStaticVertexCaptureCacheStats) {
+        Logger::info("[RTX-Compatibility][UE3-Capture] static vertex capture cache waking to re-measure its reuse rate.");
+      }
+      return;
+    }
+
+    // Long enough to span a camera pause without being fooled by one, short enough that a
+    // hopeless title is stood down within a few seconds of gameplay.
+    constexpr uint32_t kReuseEvaluationFrames = 120;
+    if (m_ue3VertexCaptureWindowFrames < kReuseEvaluationFrames) {
+      return;
+    }
+
+    const uint64_t considered = m_ue3VertexCaptureWindowReuses + m_ue3VertexCaptureWindowCaptures;
+    const uint32_t reusePercent = considered > 0
+      ? uint32_t((m_ue3VertexCaptureWindowReuses * 100ull) / considered)
+      : 100u;
+    resetWindow();
+
+    if (considered == 0) {
+      // no eligible draws in the window (menu, loading screen): no evidence either way
+      return;
+    }
+    if (reusePercent >= minReusePercent) {
+      return;
+    }
+
+    m_ue3VertexCaptureCacheDormant = true;
+    m_ue3VertexCaptureCacheProbeCountdown = m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames;
+    const size_t releasedEntries = m_ue3VertexCaptureCache.size();
+    const VkDeviceSize releasedBytes = m_ue3VertexCaptureCacheBytes;
+    const size_t releasedKeys = m_ue3VertexCaptureAdmission.size();
+    clearUe3StaticVertexCaptureCache();
+
+    // Worth one line per session even without diagnostics on: it explains why an enabled
+    // option stopped doing anything, and points at the option that turns the guard off.
+    ONCE(Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Capture] static vertex capture cache stood down: only ", reusePercent,
+      "% of eligible draws were reused (threshold ", minReusePercent, "%), so its keys are not repeating in this "
+      "title - most likely a camera-dependent vertex shader constant or object transform. Released ",
+      releasedBytes / (1024 * 1024), " MiB over ", releasedEntries, " entries and ", releasedKeys,
+      " pending keys. Re-tested every ", m_ue3VertexCaptureCacheProbeCountdown, " frames; set "
+      "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCacheMinReusePercent = 0 to keep it running regardless.")));
+
+    if (m_frameOptions.ue3LogStaticVertexCaptureCacheStats) {
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Capture] static vertex capture cache going dormant at ", reusePercent,
+        "% reuse; released ", releasedBytes / (1024 * 1024), " MiB / ", releasedEntries, " entries / ",
+        releasedKeys, " pending keys."));
+    }
+  }
+
+  void D3D9Rtx::reportUe3StaticVertexCaptureCacheStats() {
+    if (!m_frameOptions.ue3LogStaticVertexCaptureCacheStats) {
+      return;
+    }
+
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+
+    // roughly once a second at any plausible frame rate; this is a diagnostic, not a metric
+    constexpr uint32_t kStatIntervalFrames = 60;
+    if (currentFrame - m_ue3VertexCaptureCacheStatFrameStamp < kStatIntervalFrames) {
+      return;
+    }
+    m_ue3VertexCaptureCacheStatFrameStamp = currentFrame;
+
+    if (m_ue3VertexCaptureCacheDormant) {
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Capture] static vertex capture cache: dormant, re-testing in ",
+        m_ue3VertexCaptureCacheProbeCountdown, " frames."));
+      m_ue3VertexCaptureCacheStatReuses = 0;
+      m_ue3VertexCaptureCacheStatCaptures = 0;
+      m_ue3VertexCaptureCacheStatFrames = 0;
+      return;
+    }
+
+    const uint64_t considered = m_ue3VertexCaptureCacheStatReuses + m_ue3VertexCaptureCacheStatCaptures;
+    const uint32_t reusePercent = considered > 0
+      ? uint32_t((m_ue3VertexCaptureCacheStatReuses * 100ull) / considered)
+      : 0u;
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Capture] static vertex capture cache: ",
+      m_ue3VertexCaptureCache.size(), " retained entries, ",
+      m_ue3VertexCaptureCacheBytes / (1024 * 1024), " MiB, ",
+      m_ue3VertexCaptureAdmission.size(), " keys awaiting admission, ",
+      reusePercent, "% of eligible draws reused over the last ",
+      m_ue3VertexCaptureCacheStatFrames, " frames, ",
+      m_ue3VertexCaptureCacheEvictions, " total evictions."));
+
+    m_ue3VertexCaptureCacheStatReuses = 0;
+    m_ue3VertexCaptureCacheStatCaptures = 0;
+    m_ue3VertexCaptureCacheStatFrames = 0;
   }
 
   void D3D9Rtx::pruneUe3GeometryMemoCache() {
@@ -5559,10 +7810,13 @@ namespace dxvk {
     info.access = VK_ACCESS_TRANSFER_READ_BIT;
     info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.size = size;
-    return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppBuffer, "Vertex Capture Buffer"));
+    // Own category rather than AppBuffer: these are Remix-side allocations whose lifetime the
+    // runtime controls (per-draw, or held by the UE3 static capture cache), so lumping them in
+    // with the game's own buffers hides them from memory profiling.
+    return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXVertexCapture, "Vertex Capture Buffer"));
   }
 
-  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const bool capturePositionFromInput) {
+  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const Ue3CapturePositionSource positionSource) {
     ScopedCpuProfileZone();
 
     static_assert(sizeof CapturedVertex == 48, "The injected shader code is expecting this exact structure size to work correctly, see emitVertexCaptureWrite in dxso_compiler.cpp");
@@ -5577,7 +7831,12 @@ namespace dxvk {
       };
 
       const auto& t = m_activeDrawCallState.transformData;
-      if (!detOk(t.viewToProjection) || !detOk(t.worldToView) || !detOk(t.objectToWorld)) {
+      // objectToWorld is inverted for every source; the projection and view inverses only
+      // matter to the clip-space path, so a singular projection cannot veto an exact capture.
+      const bool transformsOk = detOk(t.objectToWorld)
+        && (positionSource != Ue3CapturePositionSource::ClipReconstruction
+            || (detOk(t.viewToProjection) && detOk(t.worldToView)));
+      if (!transformsOk) {
         ONCE(Logger::warn("[RTX-Compatibility] Skipping vertex capture due to non-invertible transform(s)."));
         return false;
       }
@@ -5736,8 +7995,8 @@ namespace dxvk {
     }
 
     // normals for vertex-capture draws
-    // positions are captured from VS output (post-skinning for GPU-skinned draws) then unprojected to object
-    // space, when a skinned shader doesn't output a normal semantic IA normals alone are bind-pose and do not
+    // captured positions are post-skinning for GPU-skinned draws whichever source they come from, so when a
+    // skinned shader doesn't output a normal semantic IA normals alone are bind-pose and do not
     // match captured positions, for UE3 we therefore prioritise:
     // 1 VS NORMAL output when available
     // 2 VS COLOR0 encoded skinned normal output
@@ -5799,8 +8058,15 @@ namespace dxvk {
     }
 
     uint32_t vertexCaptureFlags = 0;
-    if (capturePositionFromInput) {
+    switch (positionSource) {
+    case Ue3CapturePositionSource::InputAssembler:
       vertexCaptureFlags |= kVertexCaptureFlag_PositionFromInput;
+      break;
+    case Ue3CapturePositionSource::PreProjectionRegister:
+      vertexCaptureFlags |= kVertexCaptureFlag_PositionFromPreProjection;
+      break;
+    case Ue3CapturePositionSource::ClipReconstruction:
+      break;
     }
 
     if (vsOutputsNormal && (m_frameOptions.useVertexCapturedNormals || m_frameOptions.ue3EngineMode)) {
@@ -5841,7 +8107,7 @@ namespace dxvk {
       // keep bind-pose IA normals as smooth fallback, they're in the wrong orientation for animated poses (missing bone transform), but provide smooth per-vertex interpolation
       ONCE(Logger::info("[RTX-Compatibility] UE3 GPU-skinned mesh without COLOR0 output: using bind-pose IA normals as smooth fallback."));
     }
-    // 3 : non-skinned, VS doesn't output NORMAL, just keep IA normals from processVertices they're in the same object space as the un-projected captured positions anyway..
+    // 3 : non-skinned, VS doesn't output NORMAL, just keep IA normals from processVertices they're in the same object space as the captured positions anyway..
 
     // Check if we should/can get colors
     if (BoundShaderHas(vertexShader, DxsoUsage::Color, false) && d3d9State().pixelShader.ptr() == nullptr) {
@@ -5854,8 +8120,16 @@ namespace dxvk {
 
     // Upload
     auto& data = *reinterpret_cast<D3D9RtxVertexCaptureData*>(constants.mapPtr);
-    data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
-    data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
+    // Only the clip-space path consumes these, and only it required them to be invertible
+    // above, so inverting them unconditionally would trip math validation on a draw whose
+    // projection is singular but whose position comes from an exact source.
+    if (positionSource == Ue3CapturePositionSource::ClipReconstruction) {
+      data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
+      data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
+    } else {
+      data.invProj = Matrix4();
+      data.viewToWorld = Matrix4();
+    }
     data.worldToObject = inverseAffine(m_activeDrawCallState.transformData.objectToWorld);
     data.normalTransform = m_activeDrawCallState.transformData.objectToWorld;
     // note - BaseVertexIndex can be negative, so we store the raw value as uint32 so the shader's unsigned
@@ -5893,12 +8167,24 @@ namespace dxvk {
     ScopedCpuProfileZoneN("Process Vertices");
     DxvkBufferSlice streamCopies[caps::MaxStreams] {};
 
+    // FParticleInstancedMeshVertexFactory hands the mesh's TangentZ to the BINORMAL semantic
+    // rather than NORMAL (see classifyUe3VertexFactory), so this is the one factory whose surface
+    // normal has to be read from there.
+    const bool normalFromBinormal =
+      m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleInstancedMesh;
+
     // Process vertex buffers from CPU
     for (const auto& element : d3d9State().vertexDecl->GetElements()) {
       // Get vertex context
       const VertexContext& ctx = vertexContext[element.Stream];
 
       if (ctx.mappedSlice.handle == VK_NULL_HANDLE)
+        continue;
+
+      // An instance-data stream advances once per instance, so indexing it by vertex reads an
+      // unrelated instance's record (and walks off the end of a short instance buffer).
+      if (element.Stream < caps::MaxStreams &&
+          (m_currentUe3Instancing.instanceDataStreamMask & (1u << element.Stream)) != 0)
         continue;
 
       const int32_t vertexOffset = ctx.offset + ctx.stride * vertexIndexOffset;
@@ -5928,11 +8214,18 @@ namespace dxvk {
           targetBuffer = &geoData.blendIndicesBuffer;
         break;
       case D3DDECLUSAGE_NORMAL:
-        if (element.UsageIndex == 0)
+        if (element.UsageIndex == 0 && !normalFromBinormal)
+          targetBuffer = &geoData.normalBuffer;
+        break;
+      case D3DDECLUSAGE_BINORMAL:
+        if (element.UsageIndex == 0 && normalFromBinormal)
           targetBuffer = &geoData.normalBuffer;
         break;
       case D3DDECLUSAGE_TEXCOORD:
-        if (m_iaTexcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_iaTexcoordIndex)
+        // A D3DCOLOR-typed TEXCOORD under UE3 is a vertex lightmap coefficient stream, never a
+        // coordinate (see resolveIaTexcoordAvoidingNonUvElements).
+        if (m_iaTexcoordIndex <= MAXD3DDECLUSAGEINDEX && element.UsageIndex == m_iaTexcoordIndex &&
+            !(m_frameOptions.ue3EngineMode && element.Type == D3DDECLTYPE_D3DCOLOR))
           targetBuffer = &geoData.texcoordBuffer;
         break;
       case D3DDECLUSAGE_COLOR:
@@ -5989,7 +8282,7 @@ namespace dxvk {
 
         // UE3 packed normals use D3DDECLTYPE_UBYTE4 (not normalised) so for remix purposes we want a decoded
         // [-1, 1] normal and the interleaver supports VK_FORMAT_R8G8B8A8_UNORM for this
-        if (element.Usage == D3DDECLUSAGE_NORMAL && fmt == VK_FORMAT_R8G8B8A8_USCALED) {
+        if (targetBuffer == &geoData.normalBuffer && fmt == VK_FORMAT_R8G8B8A8_USCALED) {
           fmt = VK_FORMAT_R8G8B8A8_UNORM;
         }
         *targetBuffer = RasterBuffer(streamCopies[element.Stream], elementOffset, ctx.stride, fmt);
@@ -6188,7 +8481,7 @@ namespace dxvk {
     m_activeDrawCallState.allowMainCameraUpdate = true;
     m_activeDrawCallState.programmableVertexShaderBytecodeHash = 0;
     m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
-    m_activeDrawCallState.ue3LightmapPermutationAlternateHashes.reset();
+    m_activeDrawCallState.isUe3ForegroundDpg = m_ue3ForegroundDpgActive;
 
     const bool isUe3Mode = m_frameOptions.ue3EngineMode;
     const bool effectiveUe3Camera = m_frameOptions.ue3CameraFromShaderConstants || isUe3Mode;
@@ -6210,6 +8503,7 @@ namespace dxvk {
 
     const Ue3VsShaderCtabInfo* ue3CtabInfoPtr = nullptr;
     m_currentUe3CtabInfo.reset();
+    m_currentUe3VsHashExclusions = nullptr;
     bool ue3CameraUsedTranspose = false;
 
     const bool needsUe3CtabInfo =
@@ -6218,7 +8512,8 @@ namespace dxvk {
       m_frameOptions.useVertexCapture;
     if (usesProgrammableVs && vertexShaderCommon != nullptr &&
         needsUe3CtabInfo) {
-      auto parseCtabInfo = [&](const std::vector<uint8_t>& bytecode) -> Ue3VsShaderCtabInfo {
+      auto parseCtabInfo = [&](const std::vector<uint8_t>& bytecode,
+                               std::vector<Ue3VsConstantSymbol>* outSymbols) -> Ue3VsShaderCtabInfo {
         Ue3VsShaderCtabInfo info;
         info.initialized = true;
 
@@ -6269,16 +8564,23 @@ namespace dxvk {
           uint32_t inferredBoneMatricesRegisterIndex = 0;
           uint32_t inferredBoneMatricesRegisterCount = 0;
 
+          if (outSymbols != nullptr) {
+            outSymbols->reserve(ctab.m_constantData.size());
+            for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+              // float constant registers only - the churn diagnostic compares fConsts
+              if (c.registerSet != kD3dxRegisterSetFloat4 || c.registerCount == 0) {
+                continue;
+              }
+              Ue3VsConstantSymbol symbol;
+              symbol.registerIndex = c.registerIndex;
+              symbol.registerCount = c.registerCount;
+              symbol.name = c.name;
+              outSymbols->push_back(std::move(symbol));
+            }
+          }
+
           for (const DxsoCtab::Constant& c : ctab.m_constantData) {
             const std::string name = lower(c.name);
-
-            // Any lightmap policy symbol marks the shader pair as recompiled per lightmap
-            // permutation. Vertex-lightmap policies put LightMapScale in the VERTEX shader
-            // only (the lightmap reaches the pixel shader through interpolators), so this is
-            // the only signal for their pixel shader's material identity normalization.
-            if (!info.hasLightmapSymbols && contains(name, "lightmap")) {
-              info.hasLightmapSymbols = true;
-            }
 
             // ViewProjectionMatrix (4 registers)
             if (!info.hasViewProjectionMatrix && c.registerCount >= 4) {
@@ -6460,8 +8762,20 @@ namespace dxvk {
       if (shaderHash != 0) {
         auto it = m_ue3VsShaderCtabCache.find(shaderHash);
         if (it == m_ue3VsShaderCtabCache.end()) {
-          m_ue3VsShaderCtabCache.emplace(shaderHash, parseCtabInfo(bytecode));
+          std::vector<Ue3VsConstantSymbol> symbols;
+          const Ue3VsShaderCtabInfo parsed = parseCtabInfo(bytecode, &symbols);
+          m_ue3VsHashExclusionCache.emplace(shaderHash, buildUe3VsHashExclusions(parsed, &symbols));
+          m_ue3VsShaderCtabCache.emplace(shaderHash, parsed);
+          if (!symbols.empty()) {
+            m_ue3VsConstantSymbols.emplace(shaderHash, std::move(symbols));
+          }
           it = m_ue3VsShaderCtabCache.find(shaderHash);
+        }
+
+        {
+          const auto exclusionIt = m_ue3VsHashExclusionCache.find(shaderHash);
+          m_currentUe3VsHashExclusions =
+            exclusionIt != m_ue3VsHashExclusionCache.end() ? &exclusionIt->second : nullptr;
         }
 
         if (it != m_ue3VsShaderCtabCache.end()) {
@@ -6516,6 +8830,11 @@ namespace dxvk {
 
       auto classifySceneCaptureView = [&](const char* reason) {
         m_currentUe3PassType = Ue3PassType::SceneCapture;
+        // Undo probe draws that armed the main-view gate before mirror/oblique detection.
+        if (!m_ue3ForegroundDpgActive) {
+          m_ue3SeenMainViewWorldDraw = false;
+        }
+        m_activeDrawCallState.allowMainCameraUpdate = false;
         m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
         logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, reason);
       };
@@ -6553,6 +8872,20 @@ namespace dxvk {
 
         if ((m_frameOptions.ue3RequireCtabCameraConstants || isUe3Mode) && !ctabVerifiedCamera) {
           m_activeDrawCallState.allowMainCameraUpdate = false;
+        }
+
+        // Non-main-view-sized world draws (below half and/or wrong aspect) must not steer Main.
+        if (isUe3Mode &&
+            isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
+            m_activePresentParams.has_value() &&
+            m_activeDrawCallState.allowMainCameraUpdate) {
+          const D3DVIEWPORT9& vp = d3d9State().viewport;
+          if (!ue3ViewportIsMainViewSized(
+                vp.Width, vp.Height,
+                m_activePresentParams->BackBufferWidth,
+                m_activePresentParams->BackBufferHeight)) {
+            m_activeDrawCallState.allowMainCameraUpdate = false;
+          }
         }
 
         // Once per vertex shader, so info level stays low-volume
@@ -6811,9 +9144,7 @@ namespace dxvk {
         if (!texture || texture->GetImage() == nullptr)
           continue;
 
-        const XXH64_hash_t texDescHash = texture->GetImage()->getDescriptorHash();
-        if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, texDescHash) ||
-            lookupHash(m_autoRaytracedRenderTargetDescHashes, texDescHash)) {
+        if (isTaggedRaytracedRenderTarget(texture->GetImage(), true)) {
           m_activeDrawCallState.isUsingRaytracedRenderTarget = true;
         }
       }
@@ -6849,16 +9180,21 @@ namespace dxvk {
     // depth-test-disabled translucency skip directly below and the deferred-overlay
     // branch further down.
     XXH64_hash_t deferredUiMatchedTextureHash = 0;
-    bool deferredUiMatchedTextureIsRenderTarget = false;
-    XXH64_hash_t deferredUiMatchedRtDescriptorHash = 0;
     int deferredUiTagState = -1;
     auto isDeferredUiTagged = [&]() {
       if (deferredUiTagState < 0) {
-        deferredUiTagState = isDeferredUiTaggedDraw(&deferredUiMatchedTextureHash,
-                                                    &deferredUiMatchedTextureIsRenderTarget,
-                                                    &deferredUiMatchedRtDescriptorHash) ? 1 : 0;
+        deferredUiTagState = isDeferredUiTaggedDraw(&deferredUiMatchedTextureHash) ? 1 : 0;
       }
       return deferredUiTagState == 1;
+    };
+    // A matched hash of zero means the pixel shader tag matched, which the option documents as
+    // explicit intent - unlike a texture tag, which a shared texture can trigger on any draw.
+    // The emptiness test keeps post-process draws from building a bound-texture snapshot just
+    // to discover that no pixel shader tag exists to find.
+    auto isDeferredUiPixelShaderTagged = [&]() {
+      return !m_frameOptions.deferredUiPixelShaders->empty() &&
+             isDeferredUiTagged() &&
+             deferredUiMatchedTextureHash == kEmptyHash;
     };
 
     // UE3 depth test disabled translucency -  NeedsDepthTestDisabled materials, fog volume composites,
@@ -6909,6 +9245,12 @@ namespace dxvk {
     assert(m_activePresentParams.has_value());
 
     m_currentUe3PassType = classifyUe3Pass(drawContext);
+
+    // Capture TdToneMapping state before the draw is ignored below.
+    if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess) {
+      maybeCaptureUe3ToneMapState();
+    }
+
     switch (m_currentUe3PassType) {
     case Ue3PassType::DepthPrepass:
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "position-only depth prepass");
@@ -6926,9 +9268,23 @@ namespace dxvk {
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native modulated shadow projection");
       return { RtxGeometryStatus::Ignored, false };
     case Ue3PassType::SceneCapture:
-      ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 scene capture offscreen view draw (world geometry, sub-half-backbuffer viewport)."));
+      if (!m_ue3ForegroundDpgActive) {
+        m_ue3SeenMainViewWorldDraw = false;
+      }
+      ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 scene capture offscreen view draw (world geometry, probe viewport)."));
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "scene capture offscreen view");
       return { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::FullscreenPostProcess:
+    case Ue3PassType::FogOrDistortion:
+      // Ignore before the non-primary RT → Rasterized fallback; DoF gather/blur/blend
+      // target FilterColor/SceneColor and would otherwise still execute. Only a deferred-UI
+      // pixel shader tag outranks this: these passes sample the scene-colour target, so a
+      // texture tag on it matches every one of them and would replay DoF over the frame.
+      if (!isDeferredUiPixelShaderTagged()) {
+        logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+        return { RtxGeometryStatus::Ignored, false };
+      }
+      break;
     case Ue3PassType::UiComposite:
       logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "UI composite");
       return { RtxGeometryStatus::Rasterized, true };
@@ -6944,30 +9300,45 @@ namespace dxvk {
       break;
     }
 
+    // Arm the foreground-DPG gate only after a true main-view-sized world draw.
+    if (m_frameOptions.ue3EngineMode &&
+        !m_ue3SeenMainViewWorldDraw &&
+        m_currentUe3PassType == Ue3PassType::Material &&
+        isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
+        m_activePresentParams.has_value()) {
+      const D3DVIEWPORT9& vp = d3d9State().viewport;
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+      if (ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
+        m_ue3SeenMainViewWorldDraw = true;
+      }
+    }
+
     // Deferred UI overlays (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders, e.g. UE3
     // MaterialEffect fullscreen fades): rasterized on top of the ray-traced image WITHOUT
     // triggering RTX injection - the draw is captured and replayed after injection fires later
-    // in the frame. Placed after the pass switch above so UI composites and video passes can
-    // never be deferred, and before the fullscreen-composite/post-process filters below so
-    // tagging wins over those. World geometry and depth-writing draws are never deferred even
+    // in the frame. Placed after the pass switch above, so UI composites, video passes and the
+    // screen-space contribution passes can never be deferred by a texture tag (only a pixel
+    // shader tag reaches here from those), and before the fullscreen-composite filter below so
+    // tagging wins over that. World geometry and depth-writing draws are never deferred even
     // when tagged: shared textures (e.g. a scene-color render target sampled by translucent
     // meshes) must not pull geometry out of the ray-traced scene.
     if (!m_frameOptions.deferredUiTextures->empty() || !m_frameOptions.deferredUiPixelShaders->empty()) {
       const XXH64_hash_t& matchedTextureHash = deferredUiMatchedTextureHash;
-      const bool& matchedTextureIsRenderTarget = deferredUiMatchedTextureIsRenderTarget;
-      const XXH64_hash_t& matchedRtDescriptorHash = deferredUiMatchedRtDescriptorHash;
 
       if (isDeferredUiTagged()) {
-        const bool matchedByPixelShaderTag = matchedTextureHash == 0;
+        const bool matchedByPixelShaderTag = isDeferredUiPixelShaderTagged();
         const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
         const bool isWorldGeometryVertexFactory = isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory);
 
         // Engine post-process/composite shaders (gamma-correction scene copy, tone mapping,
-        // motion blur, distortion, fog) legitimately sample the scene render target but must
-        // never be deferred: replaying e.g. the gamma copy over the ray-traced image uniformly
-        // brightens the whole screen and, being opaque and later in the frame, overwrites the
-        // real overlay effects. Only texture tags skip them - an explicit pixel shader tag is
-        // taken as user intent and still defers.
+        // motion blur, distortion, fog, depth of field, bloom) legitimately sample the scene
+        // render target but must never be deferred: replaying e.g. the gamma copy over the
+        // ray-traced image uniformly brightens the whole screen and, being opaque and later in
+        // the frame, overwrites the real overlay effects; replaying a DoF gather paints a flat
+        // rectangle over it. This is the only guard for a texture tag once the draw classifies
+        // as anything but a screen-space contribution pass, so it matches the same DoF/bloom
+        // signatures the pass classifier uses. An explicit pixel shader tag still defers.
         bool isEnginePostProcessShader = false;
         if (!matchedByPixelShaderTag && m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
           const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
@@ -6978,7 +9349,8 @@ namespace dxvk {
                                       psInfo.hasVelocitySampler ||
                                       psInfo.hasDistortionSampler ||
                                       psInfo.hasFogConstants ||
-                                      psInfo.hasHazeConstants;
+                                      psInfo.hasHazeConstants ||
+                                      psInfo.looksLikeDofAndBloomPostProcess();
         }
 
         // Fullscreen overlay tiles (UE3 MaterialEffect quads via FTileRenderer) use a
@@ -7023,18 +9395,6 @@ namespace dxvk {
             " ztest=", depthTestDisabled ? 0 : 1,
             " zwrite=", zWriteEnabled ? 1 : 0,
             matchedDescription));
-
-          if (eligible && matchedTextureIsRenderTarget) {
-            Logger::info(str::format(
-              "[RTX-DeferredUI] Tagged texture 0x", std::hex, matchedTextureHash, std::dec,
-              " is a render target: its texture hash changes every time the game recreates it "
-              "(respawn/level load). For a stable tag use the pixel shader instead: add 0x",
-              std::hex, psHash, std::dec, " to rtx.d3d9.deferredUiPixelShaders",
-              matchedRtDescriptorHash != 0
-                ? str::format(" (the render target's stable descriptor hash 0x", std::hex, matchedRtDescriptorHash, std::dec, " also matches this category)")
-                : std::string(),
-              "."));
-          }
         }
 
         if (eligible) {
@@ -7042,7 +9402,16 @@ namespace dxvk {
           logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "deferred UI overlay");
           return { RtxGeometryStatus::Rasterized, false, true };
         }
-        // Ineligible tagged draws fall through to normal classification - never suppressed.
+
+        // Screen-space contribution passes only reached this branch through a pixel shader tag;
+        // a refusal here restores the pass switch's decision rather than promoting a DoF/fog
+        // draw to normal classification.
+        if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess ||
+            m_currentUe3PassType == Ue3PassType::FogOrDistortion) {
+          logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+          return { RtxGeometryStatus::Ignored, false };
+        }
+        // Other ineligible tagged draws fall through to normal classification - never suppressed.
       }
     }
 
@@ -7082,13 +9451,9 @@ namespace dxvk {
       D3D9CommonTexture* texture = GetCommonTexture(d3d9State().renderTargets[kRenderTargetIndex]->GetBaseTexture());
       if (texture) {
         const Rc<DxvkImage> image = texture->GetImage();
-        if (image != nullptr) {
-          const XXH64_hash_t descHash = image->getDescriptorHash();
-          if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, descHash) ||
-              lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash)) {
-            m_activeDrawCallState.isDrawingToRaytracedRenderTarget = true;
-            return { RtxGeometryStatus::RayTraced, false };
-          }
+        if (image != nullptr && isTaggedRaytracedRenderTarget(image, true)) {
+          m_activeDrawCallState.isDrawingToRaytracedRenderTarget = true;
+          return { RtxGeometryStatus::RayTraced, false };
         }
       }
     }
@@ -7109,8 +9474,10 @@ namespace dxvk {
                   "[RTX-Compatibility] Non-primary RT0 encountered: ",
                   rtDesc->Width, "x", rtDesc->Height,
                   " (backbuffer ", m_activePresentParams->BackBufferWidth, "x", m_activePresentParams->BackBufferHeight, "), ",
-                  "rtDescHash=0x", std::hex, rtDescHash, std::dec,
-                  ". If this RT contains the main scene, add it to rtx.raytracedRenderTargetTextures."));
+                  "rtDescHash=0x", std::hex, rtDescHash,
+                  " resolutionAgnosticDescHash=0x", rtTex->GetImage()->getResolutionAgnosticDescriptorHash(), std::dec,
+                  ". If this RT contains the main scene, add either hash to rtx.raytracedRenderTargetTextures "
+                  "(the resolution-agnostic one survives resolution changes)."));
               }
             }
           }
@@ -7141,11 +9508,15 @@ namespace dxvk {
         };
 
         XXH64_hash_t bestHash = 0;
+        XXH64_hash_t bestAgnosticHash = 0;
         uint64_t bestArea = 0;
 
         for (uint32_t i : bit::BitMask(rtSamplerMask)) {
           D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[i]);
           if (!tex || tex->GetImage() == nullptr)
+            continue;
+
+          if (isTaggedRaytracedRenderTarget(tex->GetImage(), true))
             continue;
 
           const auto* desc = tex->Desc();
@@ -7159,16 +9530,20 @@ namespace dxvk {
           const uint64_t area = uint64_t(desc->Width) * uint64_t(desc->Height);
           if (area > bestArea) {
             bestArea = area;
+            // Absolute hash: this set is session-local, and the aspect-normalized hash would
+            // alias the backbuffer-sized target skipped above.
             bestHash = tex->GetImage()->getDescriptorHash();
+            bestAgnosticHash = tex->GetImage()->getResolutionAgnosticDescriptorHash();
           }
         }
 
-        if (bestHash != 0 &&
-            !lookupHash(*m_frameOptions.raytracedRenderTargetTextures, bestHash) &&
-            m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
+        // Already-tagged targets were skipped as candidates above, so anything reaching here is new.
+        if (bestHash != kEmptyHash && m_autoRaytracedRenderTargetDescHashes.insert(bestHash).second) {
           Logger::info(str::format(
             "[RTX-Compatibility] Auto-selected Raytraced Render Target from fullscreen composite: texDescHash=0x",
-            std::hex, bestHash, std::dec, "."));
+            std::hex, bestHash,
+            " resolutionAgnosticDescHash=0x", bestAgnosticHash, std::dec,
+            " (tag either in rtx.raytracedRenderTargetTextures to pin it)."));
         }
       }
 
@@ -7184,7 +9559,8 @@ namespace dxvk {
             Logger::debug(str::format(
               "[RTX-Compatibility] Sampled render-target texture: ",
               desc->Width, "x", desc->Height,
-              ", texDescHash=0x", std::hex, texDescHash, std::dec,
+              ", texDescHash=0x", std::hex, texDescHash,
+              " resolutionAgnosticDescHash=0x", tex->GetImage()->getResolutionAgnosticDescriptorHash(), std::dec,
               " (sampler ", i, ")."));
           }
         }
@@ -7196,12 +9572,6 @@ namespace dxvk {
         ONCE(Logger::info("[RTX-Compatibility] Rasterizing likely fullscreen composite pass to primary RT (post-process)."));
         return { RtxGeometryStatus::Rasterized, false };
       }
-    }
-
-    if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess ||
-        m_currentUe3PassType == Ue3PassType::FogOrDistortion) {
-      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
-      return { RtxGeometryStatus::Ignored, false };
     }
 
     // Detect stencil shadow draws and ignore them
@@ -7266,6 +9636,22 @@ namespace dxvk {
       entry.imageHash = entry.hasImage ? image->getHash() : kEmptyHash;
       entry.isRenderTarget = texture->IsRenderTarget();
       entry.rtDescriptorHash = (entry.isRenderTarget && entry.hasImage) ? image->getDescriptorHash() : 0;
+      entry.rtResolutionAgnosticDescriptorHash =
+        (entry.isRenderTarget && entry.hasImage) ? image->getResolutionAgnosticDescriptorHash() : 0;
+      // Non-RT images carry no descriptor hash on the DxvkImage; compute one only when
+      // the identity exclusion option or the replacement diagnostics actually consume it.
+      const bool wantDescriptorHashes =
+        (m_frameOptions.ue3MicIdentityExcludedTextureDescHashes != nullptr &&
+         !m_frameOptions.ue3MicIdentityExcludedTextureDescHashes->empty()) ||
+        m_frameOptions.logReplacementResolution ||
+        m_frameOptions.ue3LogMaterialInstanceHash;
+      if (entry.rtDescriptorHash != 0) {
+        entry.descriptorHash = entry.rtDescriptorHash;
+      } else if (wantDescriptorHashes && entry.hasImage && texture->Desc() != nullptr) {
+        entry.descriptorHash = texture->Desc()->CalculateHash();
+      } else {
+        entry.descriptorHash = 0;
+      }
 
       m_boundTextureSnapshot.mask |= (1u << idx);
     }
@@ -7302,9 +9688,55 @@ namespace dxvk {
     return checkBoundTextureCategory(*m_frameOptions.uiTextures);
   }
 
-  bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash,
-                                       bool* pMatchedTextureIsRenderTarget,
-                                       XXH64_hash_t* pMatchedRtDescriptorHash) const {
+  bool D3D9Rtx::isTaggedRaytracedRenderTarget(const Rc<DxvkImage>& image, bool includeAutoDetected) const {
+    if (image == nullptr) {
+      return false;
+    }
+
+    const XXH64_hash_t descriptorHash = image->getDescriptorHash();
+
+    if (matchAuthoredRenderTargetTag(*m_frameOptions.raytracedRenderTargetTextures,
+                                     descriptorHash,
+                                     image->getResolutionAgnosticDescriptorHash()) != kEmptyHash) {
+      return true;
+    }
+
+    // Auto-detection is session-local and keys on the absolute hash: the aspect-normalized hash
+    // aliases every same-format target of the same aspect, including the backbuffer-sized target
+    // the detector deliberately skips. The size check catches a resolution change turning a
+    // previously detected size into the backbuffer's.
+    return includeAutoDetected &&
+           descriptorHash != kEmptyHash &&
+           lookupHash(m_autoRaytracedRenderTargetDescHashes, descriptorHash) &&
+           !isBackBufferSizedImage(image);
+  }
+
+  XXH64_hash_t D3D9Rtx::matchAuthoredRenderTargetTag(const fast_unordered_set& tags,
+                                                     const XXH64_hash_t descriptorHash,
+                                                     const XXH64_hash_t resolutionAgnosticDescriptorHash) {
+    if (tags.empty()) {
+      return kEmptyHash;
+    }
+    if (resolutionAgnosticDescriptorHash != kEmptyHash &&
+        lookupHash(tags, resolutionAgnosticDescriptorHash)) {
+      return resolutionAgnosticDescriptorHash;
+    }
+    if (descriptorHash != kEmptyHash && lookupHash(tags, descriptorHash)) {
+      return descriptorHash;
+    }
+    return kEmptyHash;
+  }
+
+  bool D3D9Rtx::isBackBufferSizedImage(const Rc<DxvkImage>& image) const {
+    if (image == nullptr || !m_activePresentParams.has_value()) {
+      return false;
+    }
+    const VkExtent3D& extent = image->info().extent;
+    return extent.width == m_activePresentParams->BackBufferWidth &&
+           extent.height == m_activePresentParams->BackBufferHeight;
+  }
+
+  bool D3D9Rtx::isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash) const {
     // Pixel shader tag: stable across texture streaming and render target recreation
     if (!m_frameOptions.deferredUiPixelShaders->empty() &&
         m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
@@ -7327,32 +9759,28 @@ namespace dxvk {
         continue;
       }
 
-      const bool isRenderTarget = entry.isRenderTarget;
-      const XXH64_hash_t descriptorHash = entry.rtDescriptorHash;
-
-      const auto reportMatch = [&](XXH64_hash_t matchedHash, bool matchedIsRenderTarget) {
+      const auto reportMatch = [&](XXH64_hash_t matchedHash) {
         if (pMatchedTextureHash) {
           *pMatchedTextureHash = matchedHash;
-        }
-        if (pMatchedTextureIsRenderTarget) {
-          *pMatchedTextureIsRenderTarget = matchedIsRenderTarget;
-        }
-        if (pMatchedRtDescriptorHash) {
-          *pMatchedRtDescriptorHash = descriptorHash;
         }
         return true;
       };
 
-      const XXH64_hash_t texHash = entry.imageHash;
-      if (texHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
-        return reportMatch(texHash, isRenderTarget);
+      // Non-RT overlays carry no descriptor hash, so they can only match by image hash.
+      if (!entry.isRenderTarget) {
+        const XXH64_hash_t texHash = entry.imageHash;
+        if (texHash != kEmptyHash && lookupHash(*m_frameOptions.deferredUiTextures, texHash)) {
+          return reportMatch(texHash);
+        }
+        continue;
       }
 
-      // Render targets: also match by descriptor hash, which is derived from the target's
-      // properties and thus stable across recreation (the image hash embeds a creation-order
-      // counter and changes on every respawn/level load).
-      if (descriptorHash != 0 && lookupHash(*m_frameOptions.deferredUiTextures, descriptorHash)) {
-        return reportMatch(descriptorHash, true);
+      const XXH64_hash_t matchedHash =
+        matchAuthoredRenderTargetTag(*m_frameOptions.deferredUiTextures,
+                                     entry.rtDescriptorHash,
+                                     entry.rtResolutionAgnosticDescriptorHash);
+      if (matchedHash != kEmptyHash) {
+        return reportMatch(matchedHash);
       }
     }
 
@@ -8032,7 +10460,7 @@ namespace dxvk {
         "=hash:0x", std::hex, texture->GetImage()->getHash(),
         ",desc:0x", texture->GetImage()->getDescriptorHash(), std::dec,
         texture->IsRenderTarget() ? ",RT" : "",
-        lookupHash(RtxOptions::lightmapTextures(), texture->GetImage()->getHash()) ? ",lightmapTagged" : "",
+        isLightmapTexture(texture->GetImage()->getHash()) ? ",lightmap" : "",
         ",type:", uint32_t(texture->GetType()),
         ",samples:", inferredEntry != nullptr ? inferredEntry->samplerSampleCount[stage] : 0);
     }
@@ -8057,7 +10485,8 @@ namespace dxvk {
           }
         }
       }
-      const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode);
+      const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
+        psHash, bytecode, pixelShader, m_frameOptions.ue3MicVolatileConstantDetection);
       for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
         if (reg >= caps::MaxFloatConstantsPS) {
           continue;
@@ -8080,6 +10509,407 @@ namespace dxvk {
       " srcBlend=", d3d9State().renderStates[D3DRS_SRCBLEND],
       " dstBlend=", d3d9State().renderStates[D3DRS_DESTBLEND],
       constantLog));
+  }
+
+  void D3D9Rtx::logUe3ParticleDrawOnce() {
+    if (!m_frameOptions.ue3LogClassification || !m_frameOptions.ue3EngineMode) {
+      return;
+    }
+
+    const Ue3VertexFactoryType vf = m_currentUe3VertexFactory;
+    if (vf != Ue3VertexFactoryType::Particle &&
+        vf != Ue3VertexFactoryType::ParticleBeamTrail &&
+        vf != Ue3VertexFactoryType::LensFlare) {
+      return;
+    }
+
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    const XXH64_hash_t textureHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+    const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+    const XXH64_hash_t textureSetShaderHash = m_activeDrawCallState.materialData.getTextureSetAndShaderHash();
+    const bool hasAlbedo = m_activeDrawCallState.materialData.colorTextures[0].isValid();
+    const bool hasConstantAlbedo = m_activeDrawCallState.materialData.hasUe3ConstantAlbedo;
+
+    const auto& cats = m_activeDrawCallState.getCategoryFlags();
+    const bool particleTagged = cats.test(InstanceCategories::Particle);
+    const bool beamTagged = cats.test(InstanceCategories::Beam);
+    const bool hideTagged = cats.test(InstanceCategories::Hidden);
+    const bool ignoreTagged = cats.test(InstanceCategories::Ignore);
+
+    // Include category bits so author tag toggles produce a fresh line.
+    XXH64_hash_t key = XXH3_64bits_withSeed(&vf, sizeof(vf), 0);
+    key = XXH3_64bits_withSeed(&psHash, sizeof(psHash), key);
+    key = XXH3_64bits_withSeed(&materialHash, sizeof(materialHash), key);
+    key = XXH3_64bits_withSeed(&textureHash, sizeof(textureHash), key);
+    const uint32_t categoryBits =
+      (particleTagged ? 1u : 0u) |
+      (beamTagged ? 2u : 0u) |
+      (hideTagged ? 4u : 0u) |
+      (ignoreTagged ? 8u : 0u);
+    key = XXH3_64bits_withSeed(&categoryBits, sizeof(categoryBits), key);
+
+    if (!m_loggedUe3ParticleDraws.insert(key).second) {
+      return;
+    }
+
+    const bool alphaBlend = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
+    const DWORD srcBlend = d3d9State().renderStates[D3DRS_SRCBLEND];
+    const DWORD dstBlend = d3d9State().renderStates[D3DRS_DESTBLEND];
+    const bool likelyEmissiveBlend =
+      alphaBlend &&
+      ((srcBlend == D3DBLEND_SRCALPHA && dstBlend == D3DBLEND_ONE) ||
+       (srcBlend == D3DBLEND_ONE && dstBlend == D3DBLEND_ONE) ||
+       (srcBlend == D3DBLEND_SRCCOLOR && dstBlend == D3DBLEND_ONE) ||
+       (srcBlend == D3DBLEND_ONE && dstBlend == D3DBLEND_SRCCOLOR));
+
+    std::string constantAlbedoLog;
+    if (hasConstantAlbedo) {
+      const Vector4& c = m_activeDrawCallState.materialData.ue3ConstantAlbedo;
+      constantAlbedoLog = str::format(" constantAlbedo=(", c.x, ",", c.y, ",", c.z, ",", c.w, ")");
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Particle] vf=", describeUe3VertexFactory(vf),
+      " ps=0x", std::hex, psHash,
+      " materialHash=0x", materialHash,
+      " textureHash=0x", textureHash,
+      " textureSetShaderHash=0x", textureSetShaderHash, std::dec,
+      " hasAlbedo=", hasAlbedo ? 1 : 0,
+      " hasConstantAlbedo=", hasConstantAlbedo ? 1 : 0,
+      " particleTagged=", particleTagged ? 1 : 0,
+      " beamTagged=", beamTagged ? 1 : 0,
+      " hideTagged=", hideTagged ? 1 : 0,
+      " ignoreTagged=", ignoreTagged ? 1 : 0,
+      " alphaBlend=", alphaBlend ? 1 : 0,
+      " srcBlend=", srcBlend,
+      " dstBlend=", dstBlend,
+      " likelyEmissiveBlend=", likelyEmissiveBlend ? 1 : 0,
+      constantAlbedoLog));
+  }
+
+  namespace {
+    const char* ue3DeclUsageName(const BYTE usage) {
+      switch (usage) {
+      case D3DDECLUSAGE_POSITION:     return "POSITION";
+      case D3DDECLUSAGE_BLENDWEIGHT:  return "BLENDWEIGHT";
+      case D3DDECLUSAGE_BLENDINDICES: return "BLENDINDICES";
+      case D3DDECLUSAGE_NORMAL:       return "NORMAL";
+      case D3DDECLUSAGE_PSIZE:        return "PSIZE";
+      case D3DDECLUSAGE_TEXCOORD:     return "TEXCOORD";
+      case D3DDECLUSAGE_TANGENT:      return "TANGENT";
+      case D3DDECLUSAGE_BINORMAL:     return "BINORMAL";
+      case D3DDECLUSAGE_TESSFACTOR:   return "TESSFACTOR";
+      case D3DDECLUSAGE_POSITIONT:    return "POSITIONT";
+      case D3DDECLUSAGE_COLOR:        return "COLOR";
+      case D3DDECLUSAGE_FOG:          return "FOG";
+      case D3DDECLUSAGE_DEPTH:        return "DEPTH";
+      case D3DDECLUSAGE_SAMPLE:       return "SAMPLE";
+      default:                        return "?";
+      }
+    }
+
+    const char* ue3DeclTypeName(const BYTE type) {
+      switch (type) {
+      case D3DDECLTYPE_FLOAT1:    return "FLOAT1";
+      case D3DDECLTYPE_FLOAT2:    return "FLOAT2";
+      case D3DDECLTYPE_FLOAT3:    return "FLOAT3";
+      case D3DDECLTYPE_FLOAT4:    return "FLOAT4";
+      case D3DDECLTYPE_D3DCOLOR:  return "D3DCOLOR";
+      case D3DDECLTYPE_UBYTE4:    return "UBYTE4";
+      case D3DDECLTYPE_SHORT2:    return "SHORT2";
+      case D3DDECLTYPE_SHORT4:    return "SHORT4";
+      case D3DDECLTYPE_UBYTE4N:   return "UBYTE4N";
+      case D3DDECLTYPE_SHORT2N:   return "SHORT2N";
+      case D3DDECLTYPE_SHORT4N:   return "SHORT4N";
+      case D3DDECLTYPE_USHORT2N:  return "USHORT2N";
+      case D3DDECLTYPE_USHORT4N:  return "USHORT4N";
+      case D3DDECLTYPE_UDEC3:     return "UDEC3";
+      case D3DDECLTYPE_DEC3N:     return "DEC3N";
+      case D3DDECLTYPE_FLOAT16_2: return "FLOAT16_2";
+      case D3DDECLTYPE_FLOAT16_4: return "FLOAT16_4";
+      case D3DDECLTYPE_UNUSED:    return "UNUSED";
+      default:                    return "?";
+      }
+    }
+
+    std::string formatMatrixRows(const Matrix4& m) {
+      std::string out;
+      for (uint32_t row = 0; row < 4; row++) {
+        out += str::format(row == 0 ? "[" : " [",
+                           m[row].x, ",", m[row].y, ",", m[row].z, ",", m[row].w, "]");
+      }
+      return out;
+    }
+  }
+
+  // Shader, material and bound-texture hashes for a draw, so a warning about one names something
+  // that can be looked up in the texture picker or fed to rtx.d3d9.ue3TraceDrawTextureHashes.
+  std::string D3D9Rtx::describeUe3DrawIdentity() const {
+    XXH64_hash_t vsHash = kEmptyHash;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+    }
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    std::string textures;
+    for (uint32_t stage = 0; stage < LegacyMaterialData::kMaxSupportedTextures; stage++) {
+      const XXH64_hash_t imageHash = m_activeDrawCallState.materialData.colorTextures[stage].getImageHash();
+      if (imageHash == kEmptyHash) {
+        continue;
+      }
+      textures += str::format(textures.empty() ? "" : " ", "s", stage, ":0x", std::hex, imageHash, std::dec);
+    }
+
+    return str::format(
+      "vs=0x", std::hex, vsHash,
+      " ps=0x", psHash,
+      " materialHash=0x", m_activeDrawCallState.materialData.getHash(), std::dec,
+      " textures=[", textures.empty() ? "none" : textures, "]");
+  }
+
+  std::string D3D9Rtx::describeUe3VertexDeclaration() const {
+    if (d3d9State().vertexDecl == nullptr) {
+      return "none";
+    }
+
+    std::string out;
+    for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+      out += str::format(out.empty() ? "" : " | ",
+                         "s", uint32_t(element.Stream), ":",
+                         ue3DeclUsageName(element.Usage), uint32_t(element.UsageIndex),
+                         " ", ue3DeclTypeName(element.Type),
+                         " @", uint32_t(element.Offset));
+    }
+    return out.empty() ? "empty" : out;
+  }
+
+  std::string D3D9Rtx::describeUe3DrawInstancing(const VertexContext vertexContext[caps::MaxStreams]) const {
+    const Ue3InstancingInfo& info = m_currentUe3Instancing;
+
+    std::string streams;
+    for (uint32_t s = 0; s < caps::MaxStreams; s++) {
+      const VertexContext& ctx = vertexContext[s];
+      if (ctx.mappedSlice.mapPtr == nullptr && d3d9State().streamFreq[s] == 1) {
+        continue;
+      }
+      const bool dynamic =
+        ctx.pVBO != nullptr && ctx.pVBO->Desc() != nullptr &&
+        (ctx.pVBO->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0;
+      streams += str::format(streams.empty() ? "" : " | ",
+                             "s", s,
+                             " freq=0x", std::hex, uint32_t(d3d9State().streamFreq[s]), std::dec,
+                             " stride=", ctx.stride,
+                             " dynamic=", dynamic ? 1 : 0);
+    }
+
+    std::string transform = "none";
+    if (info.hasInstanceTransform) {
+      transform = str::format("stream=", info.transformStream,
+                              " offset@", info.offsetByteOffset,
+                              " axes@", info.axisByteOffsets[0],
+                              "/", info.axisByteOffsets[1],
+                              "/", info.axisByteOffsets[2]);
+    }
+
+    return str::format("instances=", info.instanceCount,
+                       " instanceDataStreams=0x", std::hex, info.instanceDataStreamMask, std::dec,
+                       " instanceTransform=[", transform, "]",
+                       " decomposed=", uint32_t(m_ue3DecomposedInstances.size()),
+                       " streams=[", streams.empty() ? "none" : streams, "]");
+  }
+
+  void D3D9Rtx::logUe3InstancedDrawOnce(const DrawContext& drawContext,
+                                        const VertexContext vertexContext[caps::MaxStreams],
+                                        const RasterGeometry& geoData) {
+    if (!m_frameOptions.ue3LogInstancedDraws || !m_currentUe3Instancing.isInstanced()) {
+      return;
+    }
+
+    XXH64_hash_t vsHash = kEmptyHash;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+    }
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    // The instance count varies with the particle population, so it is deliberately left out of
+    // the key: one line per (shader, declaration, factory) is the point.
+    struct Key {
+      XXH64_hash_t vsHash;
+      XXH64_hash_t psHash;
+      const void* pVertexDecl;
+      uint32_t vertexFactory;
+      uint32_t passType;
+      uint32_t positionSource;
+      uint32_t hasInstanceTransform;
+    };
+    const Key key = {
+      vsHash,
+      psHash,
+      d3d9State().vertexDecl.ptr(),
+      uint32_t(m_currentUe3VertexFactory),
+      uint32_t(m_currentUe3PassType),
+      uint32_t(m_activeCapturePositionSource),
+      m_currentUe3Instancing.hasInstanceTransform ? 1u : 0u,
+    };
+    if (!m_loggedUe3InstancedDraws.insert(XXH3_64bits(&key, sizeof(key))).second) {
+      return;
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-Instanced] vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      " pass=", describeUe3PassType(m_currentUe3PassType),
+      " posSource=", describeUe3CapturePositionSource(m_activeCapturePositionSource),
+      " ", describeUe3DrawInstancing(vertexContext),
+      " prims=", drawContext.PrimitiveCount,
+      " verts=", geoData.vertexCount,
+      " indices=", geoData.indexCount,
+      " ", describeUe3DrawIdentity(),
+      " decl=[", describeUe3VertexDeclaration(), "]"));
+  }
+
+  void D3D9Rtx::logUe3TracedDrawOnce(const DrawContext& drawContext,
+                                     const VertexContext vertexContext[caps::MaxStreams],
+                                     RasterGeometry& geoData) {
+    if (m_frameOptions.ue3TraceDrawTextureHashes == nullptr ||
+        m_frameOptions.ue3TraceDrawTextureHashes->empty()) {
+      return;
+    }
+
+    // Any bound colour texture matching the list arms the dossier, not just the chosen albedo:
+    // the point is to find a draw from a hash read off the texture picker.
+    bool matched = false;
+    for (const auto& texture : m_activeDrawCallState.materialData.colorTextures) {
+      const XXH64_hash_t imageHash = texture.getImageHash();
+      if (imageHash != kEmptyHash && lookupHash(*m_frameOptions.ue3TraceDrawTextureHashes, imageHash)) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return;
+    }
+
+    XXH64_hash_t vsHash = kEmptyHash;
+    if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
+      vsHash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+    }
+    XXH64_hash_t psHash = kEmptyHash;
+    if (m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      psHash = d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash();
+    }
+
+    const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+
+    struct Key {
+      XXH64_hash_t vsHash;
+      XXH64_hash_t psHash;
+      XXH64_hash_t materialHash;
+      const void* pVertexDecl;
+      uint32_t vertexFactory;
+      uint32_t passType;
+      uint32_t positionSource;
+      uint32_t reserved;
+    };
+    const Key key = {
+      vsHash,
+      psHash,
+      materialHash,
+      d3d9State().vertexDecl.ptr(),
+      uint32_t(m_currentUe3VertexFactory),
+      uint32_t(m_currentUe3PassType),
+      uint32_t(m_activeCapturePositionSource),
+      0u,
+    };
+    if (!m_loggedUe3TracedDraws.insert(XXH3_64bits(&key, sizeof(key))).second) {
+      return;
+    }
+
+    // Geometry hashing normally completes on a worker and is collected on the CS thread. Sync it
+    // here so the dossier can report the value replacements anchor on; finalizeGeometryHashes
+    // accepts an already-resolved RasterGeometry, so consuming the future is safe.
+    if (geoData.futureGeometryHashes.valid()) {
+      geoData.hashes = geoData.futureGeometryHashes.get();
+    }
+    const XXH64_hash_t assetGeometryHash = geoData.getHashForRule(RtxOptions::geometryAssetHashRule());
+    const XXH64_hash_t fullGeometryHash = geoData.getHashForRule<rules::FullGeometryHash>();
+
+    std::string textures;
+    for (uint32_t stage = 0; stage < LegacyMaterialData::kMaxSupportedTextures; stage++) {
+      const XXH64_hash_t imageHash = m_activeDrawCallState.materialData.colorTextures[stage].getImageHash();
+      if (imageHash == kEmptyHash) {
+        continue;
+      }
+      textures += str::format(textures.empty() ? "" : " ", "s", stage, ":0x", std::hex, imageHash, std::dec);
+    }
+
+    std::string instanceTransforms;
+    {
+      constexpr size_t kMaxLoggedTransforms = 4;
+      const size_t count = std::min(kMaxLoggedTransforms, m_ue3DecomposedInstances.size());
+      for (size_t i = 0; i < count; i++) {
+        const Ue3DecomposedInstance& instance = m_ue3DecomposedInstances[i];
+        instanceTransforms += str::format("\n    instance[", instance.sourceIndex, "]=",
+                                          formatMatrixRows(instance.instanceToObject));
+      }
+      if (m_ue3DecomposedInstances.size() > count) {
+        instanceTransforms += str::format("\n    ... ",
+                                          uint32_t(m_ue3DecomposedInstances.size() - count),
+                                          " more");
+      }
+    }
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3-DrawTrace] vf=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+      " pass=", describeUe3PassType(m_currentUe3PassType),
+      " posSource=", describeUe3CapturePositionSource(m_activeCapturePositionSource),
+      " vs=0x", std::hex, vsHash,
+      " ps=0x", psHash,
+      " materialHash=0x", materialHash,
+      " assetGeometryHash=0x", assetGeometryHash,
+      " fullGeometryHash=0x", fullGeometryHash, std::dec,
+      "\n    prims=", drawContext.PrimitiveCount,
+      " verts=", geoData.vertexCount,
+      " indices=", geoData.indexCount,
+      " topology=", uint32_t(geoData.topology),
+      " cull=", uint32_t(geoData.cullMode),
+      " textures=[", textures.empty() ? "none" : textures, "]",
+      "\n    ", describeUe3DrawInstancing(vertexContext),
+      "\n    decl=[", describeUe3VertexDeclaration(), "]",
+      "\n    objectToWorld=", formatMatrixRows(m_activeDrawCallState.transformData.objectToWorld),
+      instanceTransforms));
+  }
+
+  bool D3D9Rtx::isUe3RenderTargetRefusedAsAlbedo(D3D9CommonTexture* texture,
+                                                 const uint32_t stage,
+                                                 const PsSamplerTexcoordEntry* inferredEntry) const {
+    if (texture == nullptr || !texture->IsRenderTarget() || texture->GetImage() == nullptr) {
+      return false;
+    }
+
+    const Rc<DxvkImage>& image = texture->GetImage();
+    if (isUe3MovieTextureDescHash(image->getDescriptorHash())) {
+      return false;
+    }
+    if (inferredEntry != nullptr && stage < caps::MaxTexturesPS &&
+        (inferredEntry->samplerSemanticFlags[stage] & kPsSamplerSemanticMovieTexture) != 0) {
+      return false;
+    }
+    // Author intent wins: a preferred-albedo tag, or a screen whose material needs the target
+    // itself bound as the albedo.
+    if (lookupHash(*m_frameOptions.preferredAlbedoTextures, image->getHash())) {
+      return false;
+    }
+    return !isTaggedRaytracedRenderTarget(image, true);
   }
 
   PrepareDrawFlags D3D9Rtx::internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext) {
@@ -8115,10 +10945,7 @@ namespace dxvk {
         if (texture) {
           const Rc<DxvkImage> image = texture->GetImage();
           if (image != nullptr) {
-            const XXH64_hash_t descHash = image->getDescriptorHash();
-            isRaytracedRenderTarget =
-              lookupHash(*m_frameOptions.raytracedRenderTargetTextures, descHash) ||
-              lookupHash(m_autoRaytracedRenderTargetDescHashes, descHash);
+            isRaytracedRenderTarget = isTaggedRaytracedRenderTarget(image, true);
           }
         }
       }
@@ -8150,6 +10977,26 @@ namespace dxvk {
         m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
         m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
       }
+    }
+
+    // Hardware instancing state is needed before the capture source is resolved: a per-vertex
+    // capture buffer cannot represent a draw that runs its vertices once per instance. Kept behind
+    // ue3EngineMode with the rest of the UE3 behaviour - recovering placements from a stream relies
+    // on knowing the engine's instance layout, and without that there is nothing better to do with
+    // an instanced draw than what Remix already did.
+    // Leaving this at its default (no instancing seen) is what makes ue3DecomposeInstancedDraws a
+    // true bypass: every decision downstream keys off instanceCount, so with the option off an
+    // instanced draw is handled exactly as it was before decomposition existed.
+    m_currentUe3Instancing = Ue3InstancingInfo();
+    m_ue3DecomposedInstances.clear();
+    m_ue3DecomposedBatchKey = kEmptyHash;
+    // m_activeDrawCallState is reused across draws, so a previous draw's per-instance identity must
+    // not leak into an ordinary one and detach it from the transform its identity depends on.
+    m_activeDrawCallState.decomposedInstanceId = kEmptyHash;
+    if (m_frameOptions.ue3EngineMode && m_frameOptions.ue3DecomposeInstancedDraws &&
+        d3d9State().vertexDecl != nullptr) {
+      m_currentUe3Instancing = resolveUe3Instancing(
+        d3d9State().vertexDecl->GetElements(), d3d9State().streamFreq, m_parent->GetInstanceCount());
     }
 
     const auto [status, triggerRtxInjection, deferUntilInjection] = makeDrawCallType(drawContext);
@@ -8247,9 +11094,11 @@ namespace dxvk {
         // Try and find the has of the positions
         for (uint32_t i : bit::BitMask(m_parent->GetActiveRTTextures())) {
           D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-          auto hash = texture->GetImage()->getDescriptorHash();
-          if (lookupHash(*m_frameOptions.raytracedRenderTargetTextures, hash)) {
-            // Mark this as a valid Raytraced Render Target draw call
+          if (texture == nullptr || texture->GetImage() == nullptr) {
+            continue;
+          }
+          // Manual tags only here (auto-detection applies to drawing *to* an RT, not sampling it).
+          if (isTaggedRaytracedRenderTarget(texture->GetImage(), false)) {
             m_activeDrawCallState.isUsingRaytracedRenderTarget = true;
           }
         }
@@ -8276,11 +11125,57 @@ namespace dxvk {
     // Copy all the vertices into a staging buffer.  Assign fields of the geoData structure.
     processVertices(vertexContext, vertexIndexOffset, geoData);
 
-    // for UE3 vertex shader skinned (GPUSkin) draws the LocalToWorld placement is baked into the
-    // bone matrices where objectToWorld stays identity and the captured vertices are already in world
-    // space. We should derive a per-instance worldspace anchor from the first bone's translation so the
-    // BLAS cache can spatially determine simultaneous instances of a shared skeletal mesh and
-    // give skinningData a real bone hash so the geometry refit decision tracks the animated pose
+    // Recover the placements UE3 hid in the instance-data stream. Done before the capture source is
+    // resolved so that path can prefer input-assembler positions once the placements are in hand:
+    // object-space positions are only usable if there is a transform to place them with.
+    m_ue3InstanceTransformReadFailure = nullptr;
+    if (m_currentUe3Instancing.instanceCount > 1) {
+      const char* readReason = "";
+      if (readUe3InstanceTransforms(vertexContext, m_ue3DecomposedInstances, &readReason)) {
+        const size_t instancesRead = m_ue3DecomposedInstances.size();
+
+        // Both of these read the batch as the game wrote it, before any culling: the batch key's
+        // centroid has to stay view-independent, and the order probe measures the game's order.
+        m_ue3DecomposedBatchKey = resolveUe3InstancedBatchKey(geoData, m_ue3DecomposedInstances);
+        if (m_frameOptions.ue3LogInstancedDrawStats) {
+          trackUe3InstanceOrderStability(m_ue3DecomposedBatchKey, m_ue3DecomposedInstances);
+        }
+
+        uint32_t culledByDistance = 0;
+        uint32_t culledByBudget = 0;
+        cullAndClampUe3InstanceTransforms(m_ue3DecomposedInstances, culledByDistance, culledByBudget);
+
+        if (culledByBudget > 0) {
+          ONCE(Logger::warn(str::format(
+            "[RTX-Compatibility] UE3 instanced draw expands to ", instancesRead,
+            " instances, above rtx.d3d9.ue3MaxDecomposedInstances (",
+            std::max(m_frameOptions.ue3MaxDecomposedInstances, 1u), "); keeping a fixed ",
+            m_ue3DecomposedInstances.size(), " of them and dropping ", culledByBudget,
+            ". The kept subset is deliberately the same every frame - a view-dependent one flickers. ",
+            describeUe3DrawIdentity(),
+            " verts=", geoData.vertexCount, " prims=", drawContext.PrimitiveCount)));
+        }
+
+        if (m_frameOptions.ue3LogInstancedDrawStats) {
+          ++m_ue3InstancedStatDraws;
+          m_ue3InstancedStatInstancesSeen += instancesRead;
+          m_ue3InstancedStatInstancesSubmitted += m_ue3DecomposedInstances.size();
+          m_ue3InstancedStatCulledDistance += culledByDistance;
+          m_ue3InstancedStatCulledBudget += culledByBudget;
+        }
+      } else {
+        // Without placements, input-assembler positions would put the mesh at the world origin, so
+        // the draw is refused below rather than rendered somewhere it does not belong.
+        m_ue3InstanceTransformReadFailure = readReason;
+      }
+    }
+
+    // UE3 vertex shader skinned (GPUSkin) draws share one bind-pose vertex buffer and bounding box
+    // across every instance of a skeletal mesh, so the BLAS cache cannot tell simultaneous instances
+    // apart on geometry alone. The first bone's translation separates them, and its bone hash gives
+    // the geometry refit decision a handle on the animated pose. The bone matrices are RefToLocal,
+    // so that translation only becomes a world position once carried through the LocalToWorld
+    // processRenderState resolved above; used raw, every instance anchors near the world origin.
     m_activeDrawCallState.m_hasSkinnedWorldAnchor = false;
     // Reset the per-draw skinning identity: only VS-skinned draws (re)assign a bone hash
     // below, and processSkinning() leaves programmable-VS skinningData untouched. Without
@@ -8303,18 +11198,55 @@ namespace dxvk {
         std::min(m_currentUe3CtabInfo->boneMatricesRegisterCount, floatConstRegCount > boneReg ? floatConstRegCount - boneReg : 0u);
       if (boneRegCount >= 3) {
         const auto& fConsts = d3d9State().vsConsts.fConsts;
-        // UE3 bone matrices are float4x3 (3 float4 rows per bone) and the world translation lives in
+        // UE3 bone matrices are float4x3 (3 float4 rows per bone) and the translation lives in
         // the .w of the first three rows of the first bone
-        m_activeDrawCallState.m_skinnedWorldAnchor = Vector3(
+        const Vector3 boneTranslation(
           fConsts[boneReg + 0].w,
           fConsts[boneReg + 1].w,
           fConsts[boneReg + 2].w);
+        m_activeDrawCallState.m_skinnedWorldAnchor =
+          (m_activeDrawCallState.transformData.objectToWorld * Vector4(boneTranslation, 1.0f)).xyz();
         m_activeDrawCallState.m_hasSkinnedWorldAnchor = true;
 
         // processSkinning() returns no SkinningData for programmable-VS draws, so skinningData
         // stays default (numBones == 0) and this bone hash will not be overwritten by finalise
         m_activeDrawCallState.skinningData.boneHash =
           XXH3_64bits(&fConsts[boneReg], size_t(boneRegCount) * sizeof(Vector4));
+      }
+    }
+
+    // Resolve where this draw's positions come from before anything keys off it: the capture
+    // cache is only valid for exact sources, and the strict gate below refuses the inexact one.
+    m_activeCapturePositionSource = Ue3CapturePositionSource::ClipReconstruction;
+    if (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture) {
+      const char* positionSourceReason = "";
+      m_activeCapturePositionSource = resolveUe3CapturePositionSource(
+        indexContext, vertexContext, geoData, &positionSourceReason);
+      logUe3CapturePositionSource(m_activeCapturePositionSource, positionSourceReason);
+
+      if (m_frameOptions.ue3RequireExactVertexCapture &&
+          !isUe3ExactCapturePositionSource(m_activeCapturePositionSource)) {
+        m_ue3LastDrawDecision = "no exact vertex capture position source";
+        ONCE(Logger::info("[RTX-Compatibility-Info] Ignoring draw without an exact vertex capture position source (rtx.d3d9.ue3RequireExactVertexCapture)."));
+        return finishPrepare(prepareFlagsForIgnoredDraws);
+      }
+
+      // An instanced draw that did not land on input-assembler positions has no correct answer
+      // left: capture would have every hardware instance overwrite one another's slots, producing
+      // a cloud of triangles built from mixed placements that changes every time it is captured.
+      // Dropping the draw is the honest outcome.
+      if (m_currentUe3Instancing.instanceCount > 1 &&
+          m_activeCapturePositionSource != Ue3CapturePositionSource::InputAssembler) {
+        m_ue3LastDrawDecision = "hardware-instanced draw without input-assembler positions";
+        ONCE(Logger::warn(str::format(
+          "[RTX-Compatibility] Ignoring hardware-instanced draw: its positions would have to come from "
+          "vertex capture, which is indexed per vertex and so cannot separate instances (vf=",
+          describeUe3VertexFactory(m_currentUe3VertexFactory),
+          ", reason='", positionSourceReason, "') ",
+          describeUe3DrawIdentity(), " ",
+          describeUe3DrawInstancing(vertexContext),
+          " decl=[", describeUe3VertexDeclaration(), "]")));
+        return finishPrepare(prepareFlagsForIgnoredDraws);
       }
     }
 
@@ -8325,9 +11257,8 @@ namespace dxvk {
 
       // Stable VS hash (bytecode + camera-excluded constants), computed once per draw and
       // shared between the geometry hash below and the static vertex-capture cache key.
-      m_activeStableVsHashUsedExclusions = false;
       m_activeStableVsHash = (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture)
-        ? computeUe3StableVertexShaderHash(&m_activeStableVsHashUsedExclusions)
+        ? computeUe3StableVertexShaderHash()
         : kEmptyHash;
 
       // Static-draw identity for the vertex-capture cache.
@@ -8351,6 +11282,18 @@ namespace dxvk {
         canMemoizeIaGeometry
           ? computeUe3IaGeometryMemoKey(indexContext, vertexContext, drawContext, geoData)
           : kEmptyHash;
+
+      // Diagnostic only. Reuses the memo key above rather than recomputing its own - that hash
+      // walks every vertex stream record, which is far too much to spend twice per draw. Keyed off
+      // structural eligibility rather than canUseCachedVertexCapture, because the question it
+      // answers is why the cache is not hitting, so it has to keep working once the cache has
+      // stood itself down.
+      if (m_frameOptions.ue3LogVertexConstantChurn &&
+          canMemoizeIaGeometry &&
+          isUe3StaticVertexCaptureCacheEligible(indexContext, vertexContext, geoData)) {
+        trackUe3ConstantChurn(iaGeometryMemoKey, geoData);
+      }
+
       if (canMemoizeIaGeometry) {
         const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
         const auto memoIt = m_ue3GeometryMemoCache.find(iaGeometryMemoKey);
@@ -8399,21 +11342,6 @@ namespace dxvk {
     // Note: the material hash was already updated inside processTextures; nothing
     // mutates material data after that point, so no second update is needed here.
 
-    const bool useUe3NativeLocalCapture =
-      canUseUe3NativeLocalVertexCapture(indexContext, vertexContext, geoData);
-    if (useUe3NativeLocalCapture) {
-      ONCE(Logger::info("[RTX-Compatibility] UE3 native LocalVertexFactory capture: using IA object-space positions for conservative static local meshes."));
-      if (m_frameOptions.ue3LogCapturePrecision && Logger::logLevel() <= LogLevel::Debug) {
-        static fast_unordered_set s_loggedNativeLocalDraws;
-        const XXH64_hash_t nativeKey = XXH3_64bits(&m_activeDrawCallState.transformData.objectToWorld, sizeof(Matrix4));
-        if (s_loggedNativeLocalDraws.insert(nativeKey).second) {
-          Logger::debug(str::format(
-            "[RTX-Compatibility][UE3-Capture] native local mesh capture active, vertices=",
-            geoData.vertexCount, ", indices=", geoData.indexCount));
-        }
-      }
-    }
-
     const bool reusedCachedVertexCapture =
       canUseCachedVertexCapture &&
       tryReuseUe3StaticVertexCapture(vertexCaptureCacheKey, geoData);
@@ -8424,22 +11352,29 @@ namespace dxvk {
       const XXH64_hash_t logKey = vertexCaptureCacheKey ^ (reusedCachedVertexCapture ? 0x9E3779B97F4A7C15ull : 0xD1B54A32D192ED03ull);
       if (s_loggedCacheReuse.insert(logKey).second) {
         Logger::debug(str::format(
-          "[RTX-Compatibility][UE3-Capture] static local vertex capture cache ",
+          "[RTX-Compatibility][UE3-Capture] static vertex capture cache ",
           reusedCachedVertexCapture ? "reused" : "recapturing",
           ", key=0x", std::hex, vertexCaptureCacheKey, std::dec,
           ", vertices=", geoData.vertexCount));
       }
     }
 
+    // Every captured member is written at data[vertexId - baseVertex], so a draw whose vertices run
+    // once per hardware instance has all of its instances aliasing one another. The declaration
+    // already supplied this draw's positions, normals and UVs in object space.
+    const bool instancedDrawSuppressesCapture = m_currentUe3Instancing.instanceCount > 1;
+
     // For shader based drawcalls we also want to capture the vertex shader output
     bool needVertexCapture =
       m_parent->UseProgrammableVS() &&
       m_frameOptions.useVertexCapture &&
-      !reusedCachedVertexCapture;
+      !reusedCachedVertexCapture &&
+      !instancedDrawSuppressesCapture;
     if (needVertexCapture) {
-      needVertexCapture = prepareVertexCapture(vertexIndexOffset, useUe3NativeLocalCapture);
+      needVertexCapture = prepareVertexCapture(vertexIndexOffset, m_activeCapturePositionSource);
     }
     if (canUseCachedVertexCapture && !reusedCachedVertexCapture && needVertexCapture) {
+      ++m_ue3VertexCaptureCacheFrameCaptures;
       updateUe3StaticVertexCaptureCache(vertexCaptureCacheKey, geoData);
     }
     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
@@ -8476,6 +11411,9 @@ namespace dxvk {
     }
 
     assert(status == RtxGeometryStatus::RayTraced);
+
+    logUe3InstancedDrawOnce(drawContext, vertexContext, geoData);
+    logUe3TracedDrawOnce(drawContext, vertexContext, geoData);
 
     const bool preserveOriginalDraw = needVertexCapture;
 
@@ -8516,6 +11454,25 @@ namespace dxvk {
       params.vertexCount = drawInfo.vertexCount;
     }
 
+    if (!m_ue3DecomposedInstances.empty()) {
+      // UE3 only instances through programmable vertex shaders, for which processSkinning returns
+      // nothing. Were skinning data pending, duplicating the draw state would hand several copies
+      // the same one-shot task, and finalizeSkinningData would recompute objectToWorld from the
+      // camera and discard the per-instance placement anyway - so leave such a draw undecomposed.
+      if (m_activeDrawCallState.futureSkinningData.valid()) {
+        ONCE(Logger::warn("[RTX-Compatibility] Not decomposing a hardware-instanced draw with pending "
+                          "skinning data; the batch will be placed as a single instance."));
+      } else {
+        // One ray-traced instance per hardware instance, each carrying the placement read out of the
+        // instance stream. The geometry is a single object-space copy of the mesh, so this reproduces
+        // what UE3's non-instanced NxFluid mesh path submits: one draw per particle with
+        // LocalToWorld = FMatrix(XAxis, YAxis, ZAxis, Location).
+        params.instanceCount = 1;
+        submitUe3DecomposedInstanceDrawCallStates(params);
+        return;
+      }
+    }
+
     submitActiveDrawCallState();
 
     m_parent->EmitCs([params, this](DxvkContext* ctx) {
@@ -8525,6 +11482,79 @@ namespace dxvk {
         static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, drawCallState);
       }
     });
+  }
+
+  void D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates(const DrawParameters& params) {
+    ScopedCpuProfileZone();
+
+    const bool timeSubmission = m_frameOptions.ue3LogInstancedDrawStats;
+    const auto submitStart = timeSubmission ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point();
+
+    // Every copy of the draw state shares the pending futures' task pointers, and a task result is
+    // a one-shot: the first consumer disposes it and the rest would wait on a result that is never
+    // set again. Resolve them here so all copies carry finished data. Steady state usually costs
+    // nothing, because the geometry hash memo serves these draws without scheduling a future at all.
+    // (The caller guarantees there is no pending skinning future.)
+    RasterGeometry& geoData = m_activeDrawCallState.geometryData;
+    if (geoData.futureGeometryHashes.valid()) {
+      geoData.hashes = geoData.futureGeometryHashes.get();
+    }
+    if (geoData.futureBoundingBox.valid()) {
+      geoData.boundingBox = geoData.futureBoundingBox.get();
+    }
+
+    const Matrix4 objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
+    const Matrix4 worldToView = m_activeDrawCallState.transformData.worldToView;
+    const size_t instanceCount = m_ue3DecomposedInstances.size();
+
+    const bool stableIdentity =
+      m_frameOptions.ue3StableDecomposedInstanceIdentity && m_ue3DecomposedBatchKey != kEmptyHash;
+
+    for (size_t i = 0; i < instanceCount; i++) {
+      const Ue3DecomposedInstance& instance = m_ue3DecomposedInstances[i];
+
+      DrawCallTransforms& transforms = m_activeDrawCallState.transformData;
+      transforms.objectToWorld = objectToWorld * instance.instanceToObject;
+      transforms.objectToView = worldToView * transforms.objectToWorld;
+      transforms.sanitize();
+
+      if (stableIdentity) {
+        // Keyed on the instance's position in the game's buffer, not in this vector: culling changes
+        // how many instances precede it, and renaming an instance costs it its history.
+        const uint64_t sourceIndex = uint64_t(instance.sourceIndex);
+        XXH64_hash_t instanceId =
+          XXH3_64bits_withSeed(&sourceIndex, sizeof(sourceIndex), m_ue3DecomposedBatchKey);
+        if (instanceId == kEmptyHash) {
+          instanceId = 1; // kEmptyHash means "not a decomposed instance"
+        }
+        m_activeDrawCallState.decomposedInstanceId = instanceId;
+      }
+
+      if (i + 1 < instanceCount) {
+        // push() leaves its argument untouched when the queue is full, so retrying with the same
+        // copy is safe.
+        DrawCallState instanceDrawCallState = m_activeDrawCallState;
+        while (!m_drawCallStateQueue.push(std::move(instanceDrawCallState))) {
+          Sleep(0);
+        }
+      } else {
+        submitActiveDrawCallState();
+      }
+
+      m_parent->EmitCs([params, this](DxvkContext* ctx) {
+        assert(dynamic_cast<RtxContext*>(ctx));
+        DrawCallState drawCallState;
+        if (m_drawCallStateQueue.pop(drawCallState)) {
+          static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, drawCallState);
+        }
+      });
+    }
+
+    if (timeSubmission) {
+      m_ue3InstancedStatSubmitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - submitStart).count());
+    }
   }
 
   void D3D9Rtx::submitActiveDrawCallState() {
@@ -8769,7 +11799,7 @@ namespace dxvk {
         const XXH64_hash_t texHash = texture->GetSampleView(true)->image()->getHash();
 
         // Currently we only support regular textures, skip lightmaps.
-        if (lookupHash(*m_frameOptions.lightmapTextures, texHash)) {
+        if (isLightmapTexture(texHash)) {
           continue;
         }
 
@@ -8812,7 +11842,11 @@ namespace dxvk {
       vfType == Ue3VertexFactoryType::Particle ||
       vfType == Ue3VertexFactoryType::ParticleBeamTrail ||
       vfType == Ue3VertexFactoryType::LensFlare;
-    const bool isUe3FoliageVF = vfType == Ue3VertexFactoryType::Foliage;
+    // Instanced mesh particles compile the same FoliageVertexFactory.usf and pack their UVs the
+    // same way, so they follow foliage rather than the camera-facing particle factories.
+    const bool isUe3FoliageVF =
+      vfType == Ue3VertexFactoryType::Foliage ||
+      vfType == Ue3VertexFactoryType::ParticleInstancedMesh;
     const bool isUe3SpeedTreeVF = vfType == Ue3VertexFactoryType::SpeedTree;
     const bool isUe3LocalDecalVF = vfType == Ue3VertexFactoryType::LocalDecal;
     const bool isUe3MorphVF = vfType == Ue3VertexFactoryType::GPUSkinMorph;
@@ -8949,6 +11983,8 @@ namespace dxvk {
           entry.samplerOffsetImmediateValid[s] = inferred.offsetImmediateValid ? 1u : 0u;
           entry.samplerOffsetImmediateU[s] = inferred.offsetImmediateU;
           entry.samplerOffsetImmediateV[s] = inferred.offsetImmediateV;
+          if ((inferred.semanticFlags & kPsSamplerSemanticLightmap) != 0)
+            entry.lightmapSamplerMask |= (1u << s);
         }
       }
 
@@ -8957,6 +11993,9 @@ namespace dxvk {
 
     if constexpr (!FixedFunction) {
       if ((m_frameOptions.shaderPathTexcoordIndexFromPixelShader || m_frameOptions.ue3EngineMode) && d3d9State().pixelShader.ptr() != nullptr) {
+        // Measures the bytecode analysis a shader's first sighting pays; the result is cached,
+        // so the zone is near-empty on every later draw.
+        ScopedCpuProfileZoneN("UE3 PS sampler analysis");
         inferredPs = d3d9State().pixelShader->GetCommonShader();
         inferredPsEntry = getOrInitPsSamplerTexcoordEntry(inferredPs, inferredPsHash);
       }
@@ -9033,7 +12072,32 @@ namespace dxvk {
       int32_t strictCubemapFallbackScore = std::numeric_limits<int32_t>::min();
 
       const uint32_t usedSamplerMask = m_parent->m_psShaderMasks.samplerMask;
-      const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask;
+      // UE3 lightmaps are removed from the draw's texture set before anything reads it. A
+      // score penalty is not enough: DirectionalLightmaps=True binds three coefficient
+      // samplers where False binds one, so leaving them in changes the candidate pool, the
+      // selection cache key and its area sum, and the per-texture material spread - every
+      // one of which can flip the albedo pick between the two settings. Remix owns lighting,
+      // so the coefficients carry nothing a raytraced surface wants.
+      const uint32_t lightmapStageMask =
+        (m_frameOptions.ue3EngineMode && inferredPsEntry != nullptr) ? inferredPsEntry->lightmapSamplerMask : 0u;
+      const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask & ~lightmapStageMask;
+
+      // Publish what was bound at those samplers so the texture paths that cannot see a pixel
+      // shader - hash preservation on CPU writes, the terrain baker's stage filter, the texture
+      // picker - recognise the same images. First sight per hash only; the session set is
+      // append-only so the repeat check stays local.
+      if (m_frameOptions.ue3AutoDetectLightmapTextures) {
+        for (const uint32_t stage : bit::BitMask(lightmapStageMask & m_parent->m_activeTextures)) {
+          if (stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
+            continue;
+          D3D9CommonTexture* lightmap = GetCommonTexture(d3d9State().textures[stage]);
+          if (lightmap == nullptr || lightmap->GetImage() == nullptr)
+            continue;
+          const XXH64_hash_t lightmapHash = lightmap->GetImage()->getHash();
+          if (lightmapHash != kEmptyHash && m_ue3SeenLightmapTextures.insert(lightmapHash).second)
+            registerAutoDetectedLightmapTexture(lightmapHash);
+        }
+      }
 
       // Deterministic diffuse selection: the scoring below reads live shader constant
       // values (hasNonZeroInferredSamplerOffset), which UE3 rewrites per draw for
@@ -9044,8 +12108,14 @@ namespace dxvk {
       bool selectionCacheUsable = false;
       bool selectionFromCache = false;
       uint64_t selectionBoundAreaSum = 0;
+      bool auditingPinnedSelection = false;
+      uint8_t auditedPinnedStages[2] = { kInvalidStage, kInvalidStage };
+      uint8_t auditedPinnedCubemapStage = kInvalidStage;
       if ((m_frameOptions.ue3StableDiffuseSelection || m_frameOptions.ue3EngineMode) &&
           inferredPsEntry != nullptr && inferredPsHash != kEmptyHash) {
+        ScopedCpuProfileZoneN("UE3 diffuse selection lookup");
+        if (!m_ue3DiffuseSelectionLoaded)
+          loadUe3DiffuseSelectionCache();
         // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
         // decisions when those sets change so texture tagging takes effect immediately
         const size_t lightmapSetSize = m_frameOptions.lightmapTextures->size();
@@ -9055,6 +12125,9 @@ namespace dxvk {
             neverAlbedoSetSize != m_ue3DiffuseSelectionNeverAlbedoSetSize ||
             preferredAlbedoSetSize != m_ue3DiffuseSelectionPreferredAlbedoSetSize) {
           m_ue3DiffuseSelectionCache.clear();
+          // Tagging invalidates every stored decision, so the persisted set has to shrink with
+          // the in-memory one rather than keep serving picks the tags have just overruled.
+          m_ue3DiffuseSelectionDirty = true;
           // re-log re-scored selections so tag effects are visible in ue3LogAlbedoSelection output
           m_loggedAlbedoSelections.clear();
           m_ue3DiffuseSelectionLightmapSetSize = lightmapSetSize;
@@ -9108,6 +12181,41 @@ namespace dxvk {
             chosenStages[1] = cachedSelection->second.chosenStages[1];
             strictCubemapFallbackStage = cachedSelection->second.cubemapFallbackStage;
             selectionFromCache = true;
+
+            // Drop cached picks that landed on a refused render target so a real material
+            // sampler can re-compete. Reusing the scoring-loop predicate keeps a legitimately
+            // tagged pick from being discarded and re-scored every frame.
+            const auto cachedPickRefused = [&](const uint8_t stage) {
+              if (stage == kInvalidStage || stage >= SamplerCount ||
+                  d3d9State().textures[stage] == nullptr) {
+                return false;
+              }
+              return isUe3RenderTargetRefusedAsAlbedo(
+                GetCommonTexture(d3d9State().textures[stage]), stage, inferredPsEntry);
+            };
+
+            if (m_frameOptions.ue3EngineMode &&
+                (cachedPickRefused(chosenStages[0]) || cachedPickRefused(chosenStages[1]))) {
+              chosenStages[0] = kInvalidStage;
+              chosenStages[1] = kInvalidStage;
+              strictCubemapFallbackStage = kInvalidStage;
+              selectionFromCache = false;
+              m_ue3DiffuseSelectionCache.erase(cachedSelection);
+              m_loggedAlbedoSelections.erase(selectionCacheKey);
+            } else if (cachedSelection->second.fromDisk && m_ue3DiffuseSelectionAuditsRemaining > 0) {
+              // Score this one anyway and compare. The pinned pick still wins - re-scoring at an
+              // arbitrary moment is exactly the transient the pin exists to avoid - so the audit
+              // only reports.
+              --m_ue3DiffuseSelectionAuditsRemaining;
+              auditingPinnedSelection = true;
+              auditedPinnedStages[0] = chosenStages[0];
+              auditedPinnedStages[1] = chosenStages[1];
+              auditedPinnedCubemapStage = strictCubemapFallbackStage;
+              chosenStages[0] = kInvalidStage;
+              chosenStages[1] = kInvalidStage;
+              strictCubemapFallbackStage = kInvalidStage;
+              selectionFromCache = false;
+            }
           } else {
             // superseding re-score: let ue3LogAlbedoSelection dump the authoritative decision
             m_loggedAlbedoSelections.erase(selectionCacheKey);
@@ -9115,13 +12223,34 @@ namespace dxvk {
         }
       }
 
-      // per-stage score breakdown for rtx.d3d9.ue3LogAlbedoSelection, dumped once per selection key
+      // per-stage score breakdown for rtx.d3d9.ue3LogAlbedoSelection, dumped once per selection key.
+      // Audited draws are excluded: their scoring is discarded, so dumping it would report a
+      // decision the draw did not use.
       const bool logAlbedoSelection =
         m_frameOptions.ue3LogAlbedoSelection &&
         selectionCacheUsable &&
         !selectionFromCache &&
+        !auditingPinnedSelection &&
         m_loggedAlbedoSelections.find(selectionCacheKey) == m_loggedAlbedoSelections.end();
       std::string albedoSelectionLog;
+
+      // Size credit in mip steps: one doubling of texel area is worth a fixed amount, so a
+      // texture that has streamed one mip further gains a fixed, small advantage instead of
+      // one proportional to the texel count.
+      auto albedoAreaScore = [](const uint64_t area) -> int64_t {
+        constexpr int64_t kScorePerMipStep = 40'000;
+        constexpr int64_t kMaxMipSteps = 24;  // 4096x4096
+        int64_t steps = 0;
+        for (uint64_t remaining = area >> 1; remaining != 0 && steps < kMaxMipSteps; remaining >>= 1)
+          ++steps;
+        return steps * kScorePerMipStep;
+      };
+
+      // The unprovable-origin penalty only means something where the resolved UV transform is
+      // actually consumed; the gate mirrors the one guarding that resolution below.
+      const bool uvOriginPenaltyActive =
+        (m_frameOptions.shaderPathTexcoordIndexFromPixelShader || m_frameOptions.ue3EngineMode) &&
+        inferredPsEntry != nullptr;
 
       const uint32_t scoringTextureMask = selectionFromCache ? 0u : usedTextureMask;
       for (uint32_t stage : bit::BitMask(scoringTextureMask)) {
@@ -9139,14 +12268,18 @@ namespace dxvk {
           continue;
 
         const XXH64_hash_t texHash = texture->GetSampleView(false)->image()->getHash();
-        if (lookupHash(*m_frameOptions.lightmapTextures, texHash))
+        if (isLightmapTexture(texHash))
           continue;
         const bool isNeverAlbedo = lookupHash(*m_frameOptions.neverAlbedoTextures, texHash);
         const bool isPreferredAlbedo = lookupHash(*m_frameOptions.preferredAlbedoTextures, texHash);
 
         // material spread: distinct pixel shaders sampling this texture. Identity albedos stay
         // at 1-2 (material instances share their parent's bytecode); shared library assets -
-        // detail patterns, grunge/dirt overlays, tint ramps - appear across many unrelated shaders
+        // detail patterns, grunge/dirt overlays, tint ramps - appear across many unrelated shaders.
+        // Scoring reads the spread loaded from disk, never the live count: a statistic that grows
+        // as the level streams in would give the same material a different answer depending on
+        // when it was first drawn, and the pinned selections would have to be thrown away every
+        // time one texture crossed the threshold. This session's discoveries score from the next.
         uint32_t materialSpread = 0;
         if (inferredPsHash != kEmptyHash && texHash != kEmptyHash) {
           if (!m_ue3TextureSpreadLoaded)
@@ -9162,14 +12295,8 @@ namespace dxvk {
           if (!psKnown && spread.count < spread.psHashes.size()) {
             spread.psHashes[spread.count++] = inferredPsHash;
             m_ue3TextureSpreadDirty = true;
-            // crossing the penalty threshold changes scores of already-pinned selections;
-            // drop them so every material re-evaluates against the discovered spread
-            if (spread.count == 8) {
-              m_ue3DiffuseSelectionCache.clear();
-              m_loggedAlbedoSelections.clear();
-            }
           }
-          materialSpread = spread.count;
+          materialSpread = spread.scoringCount;
         }
 
         const bool srgb = (d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1) != 0;
@@ -9207,7 +12334,20 @@ namespace dxvk {
         bool inferredUsesXy = false;
         bool inferredUsesPackedSecondary = false;
         bool hasNonZeroInferredOffset = false;
+        // Whether this sampler's UV origin was proven back to a single interpolant. The
+        // surface's texture transform is derived from the winning stage alone, so a stage
+        // without a provable origin cannot carry one: winning the slot costs the surface
+        // its whole UV transform and leaves the texture at raw interpolant scale.
+        bool inferredSamplerUvOriginProvable = false;
+        bool inferredSamplerReadsPrimaryUvPair = false;
         if (inferredPsEntry != nullptr && stage < caps::MaxTexturesPS) {
+          const PsSamplerUvOrigin& stageUvOrigin = inferredPsEntry->samplerUvOrigin[stage];
+          inferredSamplerUvOriginProvable = stageUvOrigin.originValid;
+          // UE3 packs UV set 0 into an interpolant's .xy and set 1 into its .zw, so a proven
+          // origin on the .xy pair names the mesh's primary channel.
+          inferredSamplerReadsPrimaryUvPair =
+            stageUvOrigin.originValid && stageUvOrigin.sitesAgree &&
+            stageUvOrigin.compU == 0 && stageUvOrigin.compV == 1;
           sampleCount = inferredPsEntry->samplerSampleCount[stage];
           inferredTexcoordIdx = inferredPsEntry->samplerToTexcoord[stage];
           // GPUSkinMorphVF - TEXCOORD6/7 are morph delta streams, treat as noninferable UV
@@ -9285,6 +12425,11 @@ namespace dxvk {
         // albedo; letting one win a slot starves the real diffuse and leaves the
         // surface white with no clickable texture hash
         if (texHash == kEmptyHash)
+          continue;
+
+        // Non-UE3 keeps the score penalties below instead.
+        if (m_frameOptions.ue3EngineMode &&
+            isUe3RenderTargetRefusedAsAlbedo(texture, stage, inferredPsEntry))
           continue;
 
         // effective area: a small texture tiled NxM times covers N*M times its pixel area
@@ -9367,6 +12512,15 @@ namespace dxvk {
           !inferredSamplerExprMaskControl &&
           !isNeverAlbedo &&
           (inferredSamplerLooksMaterialTexture || inferredSamplerSemanticFlags == 0);
+        // On a static mesh UV set 1 is the secondary/lightmap channel, so between two material
+        // samplers the one reading the primary .xy pair is the surface's own diffuse. Proven per
+        // sampler from bytecode and therefore decided on the first frame, which matters because
+        // the winner also fixes the surface's texcoord set: leaving equally-sized candidates to
+        // the near-tie tiebreaks below would let a second layer take the slot and drag the whole
+        // surface onto its UV set. The packed-UV block below expresses the same idea from
+        // statistical inference, so it cannot separate samplers whose inference came out equal;
+        // this term is additive to it.
+        score += (looksExpressionDrivenMaterial && inferredSamplerReadsPrimaryUvPair) ? 150'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvTransform && hasResolvedTiling) ? 95'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvOffset) ? 52'000 : 0;
         score += (looksExpressionDrivenMaterial && inferredSamplerExprUvAnimated) ? 115'000 : 0;
@@ -9383,10 +12537,22 @@ namespace dxvk {
         // sky/ambient lighting terms but can never be a surface albedo.
         score += (looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
                   inferredSamplerExprDiffuseAnchor) ? 2'500'000 : 0;
-        // normal maps get no size credit - resolution advantage must not offset the decode penalty
-        score += normalDecodeActive
+        // A sampler whose UV origin is unprovable must not win on size: the transform is taken
+        // from the winner only, so promoting one drops the surface to raw interpolant UVs.
+        // Flat, so a shader where no sampler resolves is left unaffected.
+        score -= (uvOriginPenaltyActive && !inferredSamplerUvOriginProvable) ? 1'200'000 : 0;
+        // normal maps get no size credit - resolution advantage must not offset the decode penalty.
+        // Under UE3 the same applies to render targets that only survived the refusal above
+        // through an explicit tag: their near-backbuffer area would dominate every other signal.
+        const bool renderTargetSizeCreditDenied =
+          m_frameOptions.ue3EngineMode && isRenderTarget && !isMovieTexture;
+        // Size counts in mip steps, not texels: streaming rewrites the bound dimensions as a
+        // level pages in, so raw area would let whichever candidate had paged in further win
+        // outright. One doubling is worth less than any single structural signal, which orders
+        // equally-classified candidates by size without letting residency overturn class.
+        score += (normalDecodeActive || renderTargetSizeCreditDenied)
           ? 0
-          : int64_t(std::min<uint64_t>(effectiveArea, 16ull * 1024ull * 1024ull));
+          : int64_t(albedoAreaScore(effectiveArea));
         // near-exact ties among color-chain candidates (magnitudes stay below any real signal):
         // prefer a UV transform (the tiled base material - overlays sample raw UVs), then the
         // LATER sampler (the material translator assigns Texture2D_N slots in property compile
@@ -9497,6 +12663,8 @@ namespace dxvk {
           appendFlag(isNeverAlbedo, "TAG:NEVERALBEDO");
           appendFlag(isPreferredAlbedo, "TAG:PREFERALBEDO");
           appendFlag(isRenderTarget, "RT");
+          appendFlag(uvOriginPenaltyActive && !inferredSamplerUvOriginProvable, "NOUVORIGIN");
+          appendFlag(inferredSamplerReadsPrimaryUvPair, "UV0XY");
 
           albedoSelectionLog += str::format(
             "\n  s", stage,
@@ -9534,14 +12702,21 @@ namespace dxvk {
 
       // if no candidate scored, fall back to the lowest PS-used sampler holding a bindable
       // (hashed) texture - never raw stage 0, which may hold a stale texture the shader
-      // never samples, and never a hashless render target the binding loop would reject
-      if (chosenStages[0] == kInvalidStage) {
+      // never samples, and never a hashless texture.
+      // The second pass relaxes the render-target refusal: a refused target must not displace a
+      // real material texture, but when the shader samples nothing else it is the material's only
+      // colour source, and dropping it leaves the surface with no albedo and no taggable hash.
+      for (uint32_t pass = 0; pass < 2 && chosenStages[0] == kInvalidStage; pass++) {
+        const bool allowRefusedRenderTargets = pass == 1;
         for (uint32_t stage : bit::BitMask(usedTextureMask)) {
           if (stage >= SamplerCount || d3d9State().textures[stage] == nullptr)
             continue;
           D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[stage]);
           if (texture == nullptr || texture->GetImage() == nullptr ||
               texture->GetImage()->getHash() == kEmptyHash)
+            continue;
+          if (!allowRefusedRenderTargets && m_frameOptions.ue3EngineMode &&
+              isUe3RenderTargetRefusedAsAlbedo(texture, stage, inferredPsEntry))
             continue;
           chosenStages[0] = uint8_t(stage);
           break;
@@ -9773,13 +12948,30 @@ namespace dxvk {
 
       // remember the final (post-fallback, post-promotion) decision for this material key,
       // overwriting any decision made against a smaller (streamed-down) texel area
-      if (selectionCacheUsable && !selectionFromCache) {
+      if (auditingPinnedSelection) {
+        if ((chosenStages[0] != auditedPinnedStages[0] || chosenStages[1] != auditedPinnedStages[1]) &&
+            !m_ue3DiffuseSelectionAuditWarned) {
+          m_ue3DiffuseSelectionAuditWarned = true;
+          Logger::warn(str::format(
+            "[RTX-Compatibility][UE3] Albedo selection cache disagrees with current scoring "
+            "(material key 0x", std::hex, selectionCacheKey, ": stored [s",
+            uint32_t(auditedPinnedStages[0]), ",s", uint32_t(auditedPinnedStages[1]),
+            "], scored [s", uint32_t(chosenStages[0]), ",s", uint32_t(chosenStages[1]), "])", std::dec,
+            ". Stored picks are being used, so a scoring change will not take effect: bump "
+            "kUe3DiffuseSelectionScoringVersion, or delete ", kUe3DiffuseSelectionCachePath, "."));
+        }
+        // The pin stands regardless - the audit reports, it does not re-decide.
+        chosenStages[0] = auditedPinnedStages[0];
+        chosenStages[1] = auditedPinnedStages[1];
+        strictCubemapFallbackStage = auditedPinnedCubemapStage;
+      } else if (selectionCacheUsable && !selectionFromCache) {
         Ue3DiffuseSelectionEntry cacheEntry;
         cacheEntry.chosenStages[0] = chosenStages[0];
         cacheEntry.chosenStages[1] = chosenStages[1];
         cacheEntry.cubemapFallbackStage = strictCubemapFallbackStage;
         cacheEntry.decisionAreaSum = selectionBoundAreaSum;
         m_ue3DiffuseSelectionCache[selectionCacheKey] = cacheEntry;
+        m_ue3DiffuseSelectionDirty = true;
       }
 
       if (logAlbedoSelection) {
@@ -9932,28 +13124,24 @@ namespace dxvk {
       // must run before setupCategoriesForTexture so category lookups use the full material hash
       if constexpr (!FixedFunction) {
         if ((m_frameOptions.ue3MaterialInstanceConstantHash || m_frameOptions.ue3EngineMode) && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+          ScopedCpuProfileZoneN("UE3 material identity");
           const D3D9CommonShader* psCommonShader = d3d9State().pixelShader->GetCommonShader();
           const auto& bytecode = psCommonShader->GetBytecode();
           const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
           if (psHash != 0) {
-            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(psHash, bytecode);
+            const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
+              psHash, bytecode, psCommonShader, m_frameOptions.ue3MicVolatileConstantDetection);
 
-            // Lightmap-bearing shaders are recompiled per lightmap policy permutation
-            // (DirectionalLightmaps 3-coefficient vs simple 1-coefficient, Mirror's Edge
-            // TdBicubicFiltering), so their bytecode hash - and everything seeded by it -
-            // varies with those system settings. Seed such shaders with the canonical CTAB
-            // material signature instead so material identity survives setting flips.
-            // Texture-lightmap permutations declare lightmap symbols in the pixel shader;
-            // vertex-lightmap permutations only in the vertex shader (the lightmap arrives
-            // through interpolators), so the draw's VS CTAB flag must be considered too.
-            // Shaders without lightmap symbols on either stage keep the bytecode hash and
-            // their existing material hashes.
-            const bool drawHasLightmapPermutationSymbols =
-              identityInfo.hasLightmapPermutationSymbols ||
-              (m_currentUe3CtabInfo.has_value() && m_currentUe3CtabInfo->hasLightmapSymbols);
+            // UE3 recompiles the same material's base pass per lightmap policy, so a bytecode
+            // hash - and everything seeded by it - varies with DirectionalLightmaps and
+            // TdBicubicFiltering. Seed every UE3 material with the canonical CTAB signature
+            // instead. This deliberately covers the permutations that carry no lightmap symbols
+            // at all: FNoLightMapPolicy compiles the same material for movable geometry,
+            // translucency and the unlit viewmode, and gating on lightmap symbols would have
+            // given those draws a bytecode-seeded identity that could never match their
+            // lightmapped selves.
             const bool useInvariantShaderIdentity =
-              (m_frameOptions.ue3LightmapPermutationInvariantHash || m_frameOptions.ue3EngineMode) &&
-              drawHasLightmapPermutationSymbols &&
+              m_frameOptions.ue3EngineMode &&
               identityInfo.canonicalShaderSignature != kEmptyHash;
             const XXH64_hash_t shaderIdentitySeed =
               useInvariantShaderIdentity ? identityInfo.canonicalShaderSignature : psHash;
@@ -9967,20 +13155,29 @@ namespace dxvk {
             // register: lightmap sampler counts shift register assignments between
             // permutations while the material's own sampler names stay fixed.
             const bool logMicHash = m_frameOptions.ue3LogMaterialInstanceHash;
-            const bool bridgeLookupEnabled =
-              useInvariantShaderIdentity &&
-              (m_frameOptions.ue3LightmapPermutationBridgeLookup || m_frameOptions.ue3EngineMode);
+            if (logMicHash && !identityInfo.identitySummary.empty()) {
+              static fast_unordered_set s_loggedIdentitySummaries;
+              if (s_loggedIdentitySummaries.insert(psHash).second) {
+                Logger::info(str::format(
+                  "[RTX-Ue3Identity] ps=0x", std::hex, psHash,
+                  " seed=0x", identityInfo.canonicalShaderSignature, std::dec,
+                  " ", identityInfo.identitySummary));
+              }
+            }
             std::string micTextureListLog;
-            std::array<Ue3PresentMaterialSampler, kUe3BridgeMaxSamplers> presentSamplers;
-            uint32_t presentSamplerCount = 0;
-            bool presentSamplersOverflowed = false;
+            // Replacement identity drift diagnostics: record the (register, image hash, RT flag)
+            // tuples that feed textureSetHash so tier drift can be attributed per sampler.
+            Ue3MicIdentitySample::SamplerRecord micDiagSamplers[kMicDriftMaxTrackedSamplers];
+            uint32_t micDiagSamplerCount = 0;
+            const BoundTextureSnapshot& identityBoundTextures = ensureBoundTextureSnapshot();
+
             XXH64_hash_t textureSetHash = kEmptyHash;
             if (identityInfo.materialSamplerMask != 0) {
               XXH3_state_t* const state = getThreadLocalXxh3State();
               if (state != nullptr) {
                 XXH3_64bits_reset(state);
                 bool anyTextureHashed = false;
-                const BoundTextureSnapshot& boundTextures = ensureBoundTextureSnapshot();
+                const BoundTextureSnapshot& boundTextures = identityBoundTextures;
                 auto hashMaterialSamplerTexture = [&](const void* samplerKey, const size_t samplerKeySize, const uint32_t samplerRegister, const char* samplerLogName) -> XXH64_hash_t {
                   if (samplerRegister >= SamplerCount || (boundTextures.mask & (1u << samplerRegister)) == 0)
                     return kEmptyHash;
@@ -9990,14 +13187,70 @@ namespace dxvk {
                   const XXH64_hash_t imageHash = entry.imageHash;
                   if (imageHash == kEmptyHash)
                     return kEmptyHash; // hashless (e.g. render target bound as a material texture)
+                  if (m_frameOptions.ue3MicExcludeRenderTargetsFromIdentity && entry.isRenderTarget) {
+                    // RT image hashes change on every recreation (respawn/checkpoint/level
+                    // load) and would re-mint the identity each time; treat as hashless.
+                    if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
+                      static fast_unordered_set s_loggedRtIdentityExclusions;
+                      const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
+                      if (s_loggedRtIdentityExclusions.insert(exclusionLogKey).second) {
+                        Logger::info(str::format(
+                          "[RTX-Compatibility][UE3-MIC] Excluded render-target image 0x", std::hex, imageHash,
+                          " (RT descriptor hash 0x", entry.rtDescriptorHash,
+                          ") at material sampler s", std::dec, samplerRegister,
+                          " of pixel shader 0x", std::hex, psHash, std::dec,
+                          " from material identity (rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity)."));
+                      }
+                    }
+                    return kEmptyHash;
+                  }
+                  if (!m_frameOptions.ue3MicIdentityExcludedTextureDescHashes->empty() &&
+                      lookupHash(*m_frameOptions.ue3MicIdentityExcludedTextureDescHashes, entry.descriptorHash)) {
+                    // A texture whose contents are not reproducible (engine-composited, or
+                    // re-uploaded with a different animation frame every level load) still has a
+                    // reproducible *shape*, so the sampler is identified by its descriptor hash
+                    // rather than dropped. Dropping it would be self-defeating on a material
+                    // whose only sampler this is: an empty texture set falls back to the primary
+                    // colour texture's image hash, which is the very value being excluded.
+                    if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
+                      static fast_unordered_set s_loggedDescIdentityExclusions;
+                      const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
+                      if (s_loggedDescIdentityExclusions.insert(exclusionLogKey).second) {
+                        Logger::info(str::format(
+                          "[RTX-Compatibility][UE3-MIC] Identifying material sampler s", std::dec, samplerRegister,
+                          " of pixel shader 0x", std::hex, psHash,
+                          " by its descriptor hash 0x", entry.descriptorHash,
+                          " instead of its image hash 0x", imageHash, std::dec,
+                          " (rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes)."));
+                      }
+                    }
+                    XXH3_64bits_update(state, samplerKey, samplerKeySize);
+                    XXH3_64bits_update(state, &entry.descriptorHash, sizeof(entry.descriptorHash));
+                    anyTextureHashed = true;
+                    if (micDiagSamplerCount < kMicDriftMaxTrackedSamplers) {
+                      micDiagSamplers[micDiagSamplerCount++] = Ue3MicIdentitySample::SamplerRecord {
+                        uint8_t(samplerRegister), entry.isRenderTarget, entry.descriptorHash, entry.descriptorHash };
+                    }
+                    if (logMicHash) {
+                      micTextureListLog += str::format(
+                        micTextureListLog.empty() ? "s" : ",s", samplerRegister,
+                        samplerLogName != nullptr ? str::format("(", samplerLogName, ")") : std::string(),
+                        ":desc0x", std::hex, entry.descriptorHash, std::dec);
+                    }
+                    return kEmptyHash;
+                  }
                   XXH3_64bits_update(state, samplerKey, samplerKeySize);
                   XXH3_64bits_update(state, &imageHash, sizeof(imageHash));
                   anyTextureHashed = true;
+                  if (micDiagSamplerCount < kMicDriftMaxTrackedSamplers) {
+                    micDiagSamplers[micDiagSamplerCount++] = Ue3MicIdentitySample::SamplerRecord {
+                      uint8_t(samplerRegister), entry.isRenderTarget, imageHash, entry.descriptorHash };
+                  }
                   if (logMicHash) {
                     micTextureListLog += str::format(
                       micTextureListLog.empty() ? "s" : ",s", samplerRegister,
                       samplerLogName != nullptr ? str::format("(", samplerLogName, ")") : std::string(),
-                      ":0x", std::hex, imageHash, std::dec);
+                      ":0x", std::hex, imageHash, "(desc:0x", entry.descriptorHash, ")", std::dec);
                   }
                   return imageHash;
                 };
@@ -10005,15 +13258,7 @@ namespace dxvk {
                   // name-keyed: register assignments shift between lightmap policy permutations
                   for (const auto& [samplerName, samplerNameKey, samplerRegister] : identityInfo.materialSamplersByNameOrder) {
                     if (samplerRegister < caps::MaxTexturesPS) {
-                      const XXH64_hash_t imageHash =
-                        hashMaterialSamplerTexture(&samplerNameKey, sizeof(samplerNameKey), samplerRegister, samplerName.c_str());
-                      if (bridgeLookupEnabled && imageHash != kEmptyHash) {
-                        if (presentSamplerCount < presentSamplers.size()) {
-                          presentSamplers[presentSamplerCount++] = Ue3PresentMaterialSampler { &samplerName, samplerNameKey, imageHash };
-                        } else {
-                          presentSamplersOverflowed = true;
-                        }
-                      }
+                      hashMaterialSamplerTexture(&samplerNameKey, sizeof(samplerNameKey), samplerRegister, samplerName.c_str());
                     }
                   }
                 } else {
@@ -10031,16 +13276,26 @@ namespace dxvk {
             }
             m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
 
-            const bool autoExcludeEnabled = m_frameOptions.ue3MicAutoExcludeFrameVaryingConstants;
-            // Manual exclusion honours both the raw bytecode hash (existing configs) and the
-            // identity seed; auto-exclusion is scoped to the (seed, texture set) group, which
-            // is permutation-consistent for invariant-identity shaders yet never wider than
-            // the one churning material family.
-            const XXH64_hash_t micChurnGroupKey = makeUe3MicChurnGroupKey(shaderIdentitySeed, textureSetHash);
-            bool constantsExcluded =
+            // Constants tier. Frame-varying registers are already gone by this point: the parse
+            // left them out of identityInfo (rtx.d3d9.ue3MicVolatileConstantDetection), so what
+            // remains is hashed unconditionally and the result cannot change mid-session.
+            //
+            // Both manual escape hatches are keyed on values that outlive a session. The shader
+            // one honours the raw bytecode hash (for existing configs) as well as the identity
+            // seed. The per-material one is keyed on textureSetShaderHash, the same value the
+            // second replacement lookup tier uses, so an exclusion and an anchor are named alike.
+            const XXH64_hash_t identityTextureSetHash =
+              (textureSetHash != kEmptyHash)
+                ? textureSetHash
+                : m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+            const XXH64_hash_t textureSetShaderHash =
+              XXH3_64bits_withSeed(&identityTextureSetHash, sizeof(identityTextureSetHash), shaderIdentitySeed);
+            const bool constantsExcluded =
+              // The tier that cannot be made lightmap-policy independent; opt-in only.
+              !m_frameOptions.ue3MicConstantIdentity ||
               lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, psHash) ||
               (useInvariantShaderIdentity && lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, shaderIdentitySeed)) ||
-              (autoExcludeEnabled && isUe3MicGroupAutoExcluded(micChurnGroupKey));
+              lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedMaterials, textureSetShaderHash);
             // Invariant-identity shaders hash constants by uniform name and leading register:
             // lightmap policy permutations shift uniform registers and trim per-permutation
             // unreferenced elements, so the raw register-range stream is not comparable
@@ -10052,54 +13307,150 @@ namespace dxvk {
                 ? hashUe3MaterialConstantsByNameOrder(d3d9State().psConsts.fConsts, identityInfo.namedUniformFirstRegistersByNameOrder)
                 : hashUe3MaterialConstants(d3d9State().psConsts.fConsts, identityInfo.constRanges);
             }
-            // frame-varying constant registers would mint a new material identity every
-            // draw; detect that here and drop constants-based identity for the group
-            if (!constantsExcluded && psConstsHash != kEmptyHash && autoExcludeEnabled &&
-                trackUe3MicConstantChurn(micChurnGroupKey, psHash, shaderIdentitySeed, textureSetHash, psConstsHash)) {
-              constantsExcluded = true;
-              psConstsHash = kEmptyHash;
-            }
             m_activeDrawCallState.materialData.setPixelShaderConstantsHashForMaterialInstance(psConstsHash);
 
-            // Lightmap-permutation bridge: publish the identity hashes this draw would produce
-            // under lightmap permutations that reference fewer material symbols (see
-            // buildUe3LightmapPermutationAlternateHashes). Memoized per material identity.
-            if (bridgeLookupEnabled && !presentSamplersOverflowed && presentSamplerCount > 0) {
+            // Report - never act on - a family that still mints more than one identity, so a
+            // frame-varying register the bytecode could not see announces itself instead of
+            // quietly breaking the replacements anchored on it.
+            if (m_frameOptions.ue3ReportMicIdentityChurn && !constantsExcluded && psConstsHash != kEmptyHash) {
+              reportUe3MicIdentityChurnOnce(
+                textureSetShaderHash, psHash, shaderIdentitySeed,
+                m_activeDrawCallState.materialData.getColorTexture().getImageHash(),
+                psConstsHash, d3d9State().psConsts.fConsts, identityInfo, useInvariantShaderIdentity, bytecode);
+            }
+
+            // Replacement identity drift diagnostics: attribute a changed material hash
+            // to the tier that moved and flag RT-poisoned identities.
+            const bool replacementDiagActive =
+              m_frameOptions.logReplacementResolution ||
+              (m_frameOptions.replacementDebugHashes != nullptr && !m_frameOptions.replacementDebugHashes->empty());
+            if (replacementDiagActive) {
               m_activeDrawCallState.materialData.updateCachedHash();
-              const XXH64_hash_t fullMaterialHash = m_activeDrawCallState.materialData.getHash();
-              if (fullMaterialHash != kEmptyHash) {
-                auto it = s_ue3AlternateHashCache.find(fullMaterialHash);
-                if (it == s_ue3AlternateHashCache.end()) {
-                  std::array<Ue3PresentMaterialUniform, kUe3BridgeMaxUniforms> presentUniforms;
-                  uint32_t presentUniformCount = 0;
-                  bool presentUniformsOverflowed = false;
-                  // Excluded constants collapse every sibling onto one identity; baking the
-                  // first-seen sibling's live values into the memoized variants would make
-                  // bridge results depend on draw order. Structural (constants-free) variants
-                  // only for those.
-                  if (!constantsExcluded) {
-                    for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
-                      if (uniformRegister >= caps::MaxFloatConstantsPS)
-                        continue;
-                      if (presentUniformCount < presentUniforms.size()) {
-                        presentUniforms[presentUniformCount++] =
-                          Ue3PresentMaterialUniform { uniformNameKey, d3d9State().psConsts.fConsts[uniformRegister] };
-                      } else {
-                        presentUniformsOverflowed = true;
-                        break;
+              const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+              const XXH64_hash_t primaryTexHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+
+              bool tracked = false;
+              if (m_frameOptions.replacementDebugHashes != nullptr && !m_frameOptions.replacementDebugHashes->empty()) {
+                const fast_unordered_set& dbg = *m_frameOptions.replacementDebugHashes;
+                tracked = lookupHash(dbg, primaryTexHash) || lookupHash(dbg, materialHash) || lookupHash(dbg, textureSetShaderHash);
+                for (uint32_t i = 0; !tracked && i < micDiagSamplerCount; i++) {
+                  tracked = lookupHash(dbg, micDiagSamplers[i].imageHash);
+                }
+              }
+
+              if (m_frameOptions.logReplacementResolution || tracked) {
+                const XXH64_hash_t familyKey = XXH3_64bits_withSeed(&primaryTexHash, sizeof(primaryTexHash), shaderIdentitySeed);
+
+                // Snapshot the constant registers feeding the identity so drift can name the
+                // register(s) whose values moved.
+                Ue3MicIdentitySample::ConstantRecord curConstants[kMicDriftMaxTrackedConstants];
+                uint32_t curConstantCount = 0;
+                if (!constantsExcluded && psConstsHash != kEmptyHash) {
+                  curConstantCount = snapshotUe3MicIdentityConstants(
+                    d3d9State().psConsts.fConsts, identityInfo, useInvariantShaderIdentity,
+                    curConstants, kMicDriftMaxTrackedConstants);
+                }
+
+                Ue3MicIdentitySample& prev = s_ue3MicIdentityByFamily[familyKey];
+                if (prev.valid && prev.materialHash != materialHash &&
+                    prev.driftLogsEmitted < (tracked ? kMicDriftMaxLogsPerTrackedFamily : kMicDriftMaxLogsPerFamily)) {
+                  ++prev.driftLogsEmitted;
+                  std::string detail;
+                  if (prev.textureSetHash != textureSetHash) {
+                    detail += str::format("\n  textureSet 0x", std::hex, prev.textureSetHash, " -> 0x", textureSetHash, std::dec, ":");
+                    for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                      const Ue3MicIdentitySample::SamplerRecord& cur = micDiagSamplers[i];
+                      const Ue3MicIdentitySample::SamplerRecord* old = nullptr;
+                      for (uint32_t j = 0; j < prev.samplerCount; j++) {
+                        if (prev.samplers[j].reg == cur.reg) {
+                          old = &prev.samplers[j];
+                          break;
+                        }
+                      }
+                      if (old == nullptr) {
+                        detail += str::format(" s", uint32_t(cur.reg), " added=0x", std::hex, cur.imageHash,
+                                              "(desc:0x", cur.descriptorHash, ")", std::dec, cur.isRenderTarget ? "(RT)" : "");
+                      } else if (old->imageHash != cur.imageHash) {
+                        detail += str::format(" s", uint32_t(cur.reg), " 0x", std::hex, old->imageHash, "->0x", cur.imageHash,
+                                              "(desc:0x", cur.descriptorHash, ")", std::dec, cur.isRenderTarget ? "(RT)" : "");
+                      }
+                    }
+                    for (uint32_t j = 0; j < prev.samplerCount; j++) {
+                      bool stillPresent = false;
+                      for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                        if (micDiagSamplers[i].reg == prev.samplers[j].reg) {
+                          stillPresent = true;
+                          break;
+                        }
+                      }
+                      if (!stillPresent) {
+                        detail += str::format(" s", uint32_t(prev.samplers[j].reg), " removed=0x", std::hex, prev.samplers[j].imageHash, std::dec,
+                                              prev.samplers[j].isRenderTarget ? "(RT)" : "");
                       }
                     }
                   }
-                  it = s_ue3AlternateHashCache.emplace(
-                    fullMaterialHash,
-                    presentUniformsOverflowed
-                      ? nullptr
-                      : buildUe3LightmapPermutationAlternateHashes(
-                          fullMaterialHash,
-                          presentSamplers.data(), presentSamplerCount,
-                          presentUniforms.data(), presentUniformCount)).first;
+                  if (prev.constantsExcluded != constantsExcluded) {
+                    detail += str::format("\n  constantsExcluded ", prev.constantsExcluded ? 1 : 0, " -> ", constantsExcluded ? 1 : 0);
+                  }
+                  if (prev.constantsHash != psConstsHash) {
+                    detail += str::format("\n  consts 0x", std::hex, prev.constantsHash, " -> 0x", psConstsHash, std::dec, ":");
+                    for (uint32_t i = 0; i < curConstantCount; i++) {
+                      const Ue3MicIdentitySample::ConstantRecord& cur = curConstants[i];
+                      for (uint32_t j = 0; j < prev.constantCount; j++) {
+                        const Ue3MicIdentitySample::ConstantRecord& old = prev.constants[j];
+                        if (old.reg == cur.reg) {
+                          if (old.value.x != cur.value.x || old.value.y != cur.value.y ||
+                              old.value.z != cur.value.z || old.value.w != cur.value.w) {
+                            detail += str::format(" c", uint32_t(cur.reg),
+                                                  " (", old.value.x, ",", old.value.y, ",", old.value.z, ",", old.value.w,
+                                                  ")->(", cur.value.x, ",", cur.value.y, ",", cur.value.z, ",", cur.value.w, ")");
+                          }
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  Logger::warn(str::format(
+                    "[RTX-MicDrift] Material identity changed for family tex=0x", std::hex, primaryTexHash,
+                    " seed=0x", shaderIdentitySeed,
+                    ": materialHash 0x", prev.materialHash, " -> 0x", materialHash,
+                    " (textureSet+shader tier 0x", textureSetShaderHash, ")", std::dec,
+                    detail.empty() ? "\n  (no attributable tier diff captured)" : detail.c_str(),
+                    "\n  Replacements anchored on the previous hash no longer match this draw."));
                 }
-                m_activeDrawCallState.ue3LightmapPermutationAlternateHashes = it->second;
+
+                prev.valid = true;
+                prev.materialHash = materialHash;
+                prev.textureSetHash = textureSetHash;
+                prev.constantsHash = psConstsHash;
+                prev.constantsExcluded = constantsExcluded;
+                prev.samplerCount = micDiagSamplerCount;
+                for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                  prev.samplers[i] = micDiagSamplers[i];
+                }
+                prev.constantCount = curConstantCount;
+                for (uint32_t i = 0; i < curConstantCount; i++) {
+                  prev.constants[i] = curConstants[i];
+                }
+
+                // RT-poisoning sweep: a render-target-backed image hash inside the identity
+                // makes it unstable across RT recreation (respawn / level load).
+                for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                  if (micDiagSamplers[i].isRenderTarget) {
+                    if (s_ue3MicRtPoisonWarnedFamilies.insert(familyKey).second) {
+                      Logger::warn(str::format(
+                        "[RTX-MicRtPoisoning] Material identity for family tex=0x", std::hex, primaryTexHash,
+                        " seed=0x", shaderIdentitySeed,
+                        " includes render-target image hash 0x", micDiagSamplers[i].imageHash,
+                        " at material sampler s", std::dec, uint32_t(micDiagSamplers[i].reg),
+                        std::hex, " (stable RT descriptor hash 0x", micDiagSamplers[i].descriptorHash,
+                        "): materialHash 0x", materialHash, std::dec,
+                        " will change whenever the game recreates this render target (respawn/level load),"
+                        " breaking replacements anchored on it."));
+                    }
+                    break;
+                  }
+                }
               }
             }
 
@@ -10110,6 +13461,7 @@ namespace dxvk {
             if (identityInfo.materialSamplerMask == 0 &&
                 !identityInfo.uniformVectorRegisters.empty() &&
                 !m_activeDrawCallState.materialData.colorTextures[0].isValid()) {
+              const float tintGain = m_frameOptions.ue3ConstantAlbedoTintGain;
               for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
                 if (reg >= caps::MaxFloatConstantsPS)
                   continue;
@@ -10119,10 +13471,25 @@ namespace dxvk {
                   continue;
                 const float maxComp = std::max({ uniformColor.x, uniformColor.y, uniformColor.z });
                 const float minComp = std::min({ uniformColor.x, uniformColor.y, uniformColor.z });
-                // reject blacks/negatives (not visible albedo) and HDR-scale values (intensities)
+                // reject blacks/negatives (not visible albedo) and HDR-scale values (intensities).
+                // Rejecting black also lets a register holding the material's switched-off colour
+                // fall through to whichever one holds its real tint.
                 if (minComp < 0.0f || maxComp <= 0.01f || maxComp > 8.0f)
                   continue;
-                m_activeDrawCallState.materialData.ue3ConstantAlbedo = uniformColor;
+
+                Vector4 albedo = uniformColor;
+                if (tintGain > 0.0f) {
+                  // The register holds a tint UE3 multiplied against baked lighting for brightness,
+                  // so raw it is near-black once the lightmap is gone. Blend the legacy constant
+                  // towards the fully saturated hue by the register's own strength, which keeps a
+                  // ramping tint continuous instead of stepping away from the unlit surface.
+                  const Vector3 base = LegacyMaterialDefaults::albedoConstant();
+                  const float weight = std::min(maxComp * tintGain, 1.0f);
+                  albedo.x = base.x + (uniformColor.x / maxComp - base.x) * weight;
+                  albedo.y = base.y + (uniformColor.y / maxComp - base.y) * weight;
+                  albedo.z = base.z + (uniformColor.z / maxComp - base.z) * weight;
+                }
+                m_activeDrawCallState.materialData.ue3ConstantAlbedo = albedo;
                 m_activeDrawCallState.materialData.hasUe3ConstantAlbedo = true;
                 break;
               }
@@ -10131,8 +13498,8 @@ namespace dxvk {
             if (logMicHash) {
               m_activeDrawCallState.materialData.updateCachedHash();
               logUe3MaterialInstanceHashBreakdownOnce(
-                m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash, psConstsHash,
-                identityInfo, constantsExcluded, micTextureListLog);
+                m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash,
+                textureSetShaderHash, psConstsHash, identityInfo, constantsExcluded, micTextureListLog);
             }
           }
         }
@@ -10161,6 +13528,7 @@ namespace dxvk {
       }
 
       m_activeDrawCallState.setupCategoriesForTexture();
+      logUe3ParticleDrawOnce();
 
       // Track the material hash before checking if it should be ignored
       // This ensures we track all materials sent by the game, not just the ones that are actually rendered.
@@ -10345,6 +13713,7 @@ namespace dxvk {
 
       if ((m_frameOptions.shaderPathTexcoordIndexFromPixelShader || m_frameOptions.ue3EngineMode) &&
           d3d9State().pixelShader.ptr() != nullptr) {
+        ScopedCpuProfileZoneN("UE3 UV resolution");
         const D3D9CommonShader* ps = inferredPs != nullptr
           ? inferredPs
           : d3d9State().pixelShader->GetCommonShader();
@@ -10355,7 +13724,59 @@ namespace dxvk {
 
         if (entryPtr != nullptr && firstStage < caps::MaxTexturesPS) {
           const auto& entry = *entryPtr;
-          const PsSamplerUvOrigin& uvOrigin = entry.samplerUvOrigin[firstStage];
+
+          // A sampler whose own origin cannot be proven falls through to the fixed-function TSS
+          // texcoord index below. UE3 is fully programmable and never sets that meaningfully, so
+          // it is leftover device state, and a device reset restores it to the D3D9 default of
+          // "stage N reads texcoord N" - the surface's UV set would change for reasons unrelated
+          // to the material, presenting as the texture spontaneously rescaling.
+          //
+          // The shader's other material samplers shade the same surface, so where they
+          // unanimously name one interpolant that agreement is proven from bytecode. Only the
+          // origin is borrowed; a sibling's tiling is not this sampler's.
+          PsSamplerUvOrigin borrowedUvOrigin;
+          bool uvOriginBorrowed = false;
+          if (!entry.samplerUvOrigin[firstStage].originValid &&
+              (m_frameOptions.ue3EngineMode || m_frameOptions.shaderPathTexcoordIndexFromPixelShader)) {
+            bool haveCandidate = false;
+            bool candidatesConflict = false;
+            uint8_t sharedSemantic = 0;
+            uint8_t sharedCompU = 0;
+            uint8_t sharedCompV = 1;
+            for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+              if (s == firstStage || s >= SamplerCount || d3d9State().textures[s] == nullptr)
+                continue;
+              const PsSamplerUvOrigin& other = entry.samplerUvOrigin[s];
+              if (!other.originValid || !other.sitesAgree)
+                continue;
+              // Lightmap and engine buffers legitimately read their own UV set, so they must
+              // not vote on the material's.
+              const uint8_t semanticFlags = entry.samplerSemanticFlags[s];
+              if ((semanticFlags & (kPsSamplerSemanticLightmap | kPsSamplerSemanticEngineAuxiliary)) != 0)
+                continue;
+              if (!haveCandidate) {
+                haveCandidate = true;
+                sharedSemantic = other.semanticIndex;
+                sharedCompU = other.compU;
+                sharedCompV = other.compV;
+              } else if (other.semanticIndex != sharedSemantic ||
+                         other.compU != sharedCompU ||
+                         other.compV != sharedCompV) {
+                candidatesConflict = true;
+                break;
+              }
+            }
+            if (haveCandidate && !candidatesConflict) {
+              borrowedUvOrigin.originValid = true;
+              borrowedUvOrigin.semanticIndex = sharedSemantic;
+              borrowedUvOrigin.compU = sharedCompU;
+              borrowedUvOrigin.compV = sharedCompV;
+              uvOriginBorrowed = true;
+            }
+          }
+
+          const PsSamplerUvOrigin& uvOrigin =
+            uvOriginBorrowed ? borrowedUvOrigin : entry.samplerUvOrigin[firstStage];
 
           // rtx.d3d9.ue3LogUvAffineDetail: one-shot per-shader dump of every sampler's UV
           // origin and affine chain, with the textures bound on this draw
@@ -10476,53 +13897,138 @@ namespace dxvk {
             }
 
             // exact UV transform: sampledUv = psAffine(interpolant),
-            // interpolant = vsAffine(iaUv) when the IA path is used
-            float psScaleU = 1.0f;
-            float psScaleV = 1.0f;
-            float psOffsetU = 0.0f;
-            float psOffsetV = 0.0f;
-            const bool psAffineResolved =
-              uvOrigin.affineExact &&
-              resolvePsAffineTermValue(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
-              resolvePsAffineTermValue(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
-              resolvePsAffineTermValue(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
-              resolvePsAffineTermValue(uvOrigin.affineV.offset, 0.0f, psOffsetV);
-            if (!psAffineResolved) {
-              // non-affine or unresolvable PS math: keep the proven base UV, apply no transform
-              psScaleU = 1.0f;
-              psScaleV = 1.0f;
-              psOffsetU = 0.0f;
-              psOffsetV = 0.0f;
+            // interpolant = vsAffine(iaUv) when the IA path is used. Resolves to
+            // U' = aU + bV + tx, V' = cU + dV + ty, where an axis-aligned transform
+            // (tiling, panner) leaves the cross terms b and c at zero.
+            float psA = 1.0f;
+            float psB = 0.0f;
+            float psC = 0.0f;
+            float psD = 1.0f;
+            float psTx = 0.0f;
+            float psTy = 0.0f;
+            const bool hasCross =
+              uvOrigin.affineU.hasCross || uvOrigin.affineV.hasCross;
+            bool psAffineResolved = false;
+
+            if (!hasCross) {
+              float psScaleU = 1.0f;
+              float psScaleV = 1.0f;
+              float psOffsetU = 0.0f;
+              float psOffsetV = 0.0f;
+              psAffineResolved =
+                uvOrigin.affineExact &&
+                resolvePsAffineTermValue(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
+                resolvePsAffineTermValue(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
+                resolvePsAffineTermValue(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
+                resolvePsAffineTermValue(uvOrigin.affineV.offset, 0.0f, psOffsetV);
+              if (!psAffineResolved) {
+                psScaleU = 1.0f;
+                psScaleV = 1.0f;
+                psOffsetU = 0.0f;
+                psOffsetV = 0.0f;
+              }
+              psA = psScaleU;
+              psD = psScaleV;
+              psTx = psOffsetU;
+              psTy = psOffsetV;
+            } else {
+              auto resolveCrossRow = [&](const UvComponentAffine& aff,
+                                         const bool scaleAppliesToU,
+                                         float& outCoeffU, float& outCoeffV, float& outTrans) -> bool {
+                if (!uvComponentAffineExact(aff))
+                  return false;
+                if (!aff.hasCross) {
+                  float scale = 1.0f;
+                  float offset = 0.0f;
+                  if (!resolvePsAffineTermValue(aff.scale, 1.0f, scale) ||
+                      !resolvePsAffineTermValue(aff.offset, 0.0f, offset))
+                    return false;
+                  outCoeffU = scaleAppliesToU ? scale : 0.0f;
+                  outCoeffV = scaleAppliesToU ? 0.0f : scale;
+                  outTrans = offset;
+                  return true;
+                }
+                float scale = 1.0f;
+                float cross = 0.0f;
+                float offset = 0.0f;
+                if (!resolvePsAffineTermValue(aff.scale, 1.0f, scale) ||
+                    !resolvePsAffineTermValue(aff.cross, 0.0f, cross) ||
+                    !resolvePsAffineTermValue(aff.offset, 0.0f, offset))
+                  return false;
+                outCoeffU = 0.0f;
+                outCoeffV = 0.0f;
+                auto accumulate = [&](const uint8_t comp, const float coeff) -> bool {
+                  if (comp == m_texcoordCompU) {
+                    outCoeffU += coeff;
+                    return true;
+                  }
+                  if (comp == m_texcoordCompV) {
+                    outCoeffV += coeff;
+                    return true;
+                  }
+                  return false;
+                };
+                if (!accumulate(aff.scaleComponent, scale) ||
+                    !accumulate(aff.crossComponent, cross))
+                  return false;
+                outTrans = offset;
+                return std::isfinite(outCoeffU) && std::isfinite(outCoeffV) && std::isfinite(outTrans);
+              };
+
+              psAffineResolved =
+                uvOrigin.affineExact &&
+                resolveCrossRow(uvOrigin.affineU, true, psA, psB, psTx) &&
+                resolveCrossRow(uvOrigin.affineV, false, psC, psD, psTy);
+              if (!psAffineResolved) {
+                psA = 1.0f;
+                psB = 0.0f;
+                psC = 0.0f;
+                psD = 1.0f;
+                psTx = 0.0f;
+                psTy = 0.0f;
+              }
             }
 
-            float finalScaleU = psScaleU;
-            float finalScaleV = psScaleV;
-            float finalOffsetU = psOffsetU;
-            float finalOffsetV = psOffsetV;
+            float finalA = psA;
+            float finalB = psB;
+            float finalC = psC;
+            float finalD = psD;
+            float finalTx = psTx;
+            float finalTy = psTy;
             if (m_uvResolutionMode == UvResolutionMode::ProvenIa && vsAffineFold) {
-              // ps(vs(uv)) = (psScale * vsScale) * uv + (psScale * vsOffset + psOffset)
-              finalScaleU = psScaleU * vsScaleU;
-              finalScaleV = psScaleV * vsScaleV;
-              finalOffsetU = psScaleU * vsOffsetU + psOffsetU;
-              finalOffsetV = psScaleV * vsOffsetV + psOffsetV;
+              finalA = psA * vsScaleU;
+              finalB = psB * vsScaleV;
+              finalC = psC * vsScaleU;
+              finalD = psD * vsScaleV;
+              finalTx = psA * vsOffsetU + psB * vsOffsetV + psTx;
+              finalTy = psC * vsOffsetU + psD * vsOffsetV + psTy;
             }
 
             constexpr float kMinAbsScale = 1e-6f;
+            constexpr float kMinAbsDeterminant = 1e-12f;  // a product of two scales, so squared
             const bool transformIsIdentity =
-              finalScaleU == 1.0f && finalScaleV == 1.0f &&
-              finalOffsetU == 0.0f && finalOffsetV == 0.0f;
+              finalA == 1.0f && finalB == 0.0f &&
+              finalC == 0.0f && finalD == 1.0f &&
+              finalTx == 0.0f && finalTy == 0.0f;
+            // A rotation puts zeroes on the diagonal every quarter turn, so a mixed transform
+            // is judged degenerate by its determinant rather than by its diagonal terms.
             const bool transformIsUsable =
-              std::isfinite(finalScaleU) && std::isfinite(finalScaleV) &&
-              std::isfinite(finalOffsetU) && std::isfinite(finalOffsetV) &&
-              std::abs(finalScaleU) > kMinAbsScale && std::abs(finalScaleV) > kMinAbsScale;
+              std::isfinite(finalA) && std::isfinite(finalB) &&
+              std::isfinite(finalC) && std::isfinite(finalD) &&
+              std::isfinite(finalTx) && std::isfinite(finalTy) &&
+              (hasCross
+                 ? std::abs(finalA * finalD - finalB * finalC) > kMinAbsDeterminant
+                 : (std::abs(finalA) > kMinAbsScale && std::abs(finalD) > kMinAbsScale));
 
             if (!transformIsIdentity && transformIsUsable) {
               Matrix4& texXform = m_activeDrawCallState.transformData.textureTransform;
               texXform = Matrix4();
-              texXform[0].x = finalScaleU;
-              texXform[1].y = finalScaleV;
-              texXform[3].x = finalOffsetU;
-              texXform[3].y = finalOffsetV;
+              texXform[0].x = finalA;
+              texXform[1].x = finalB;
+              texXform[3].x = finalTx;
+              texXform[0].y = finalC;
+              texXform[1].y = finalD;
+              texXform[3].y = finalTy;
             }
 
             // rtx.d3d9.ue3LogUvAffineDetail: per-draw affine resolution outcome, logged once
@@ -10539,10 +14045,12 @@ namespace dxvk {
               };
               mixDetail(firstStage);
               mixDetail(uint64_t(m_uvResolutionMode));
-              mixDetail(quantize(finalScaleU));
-              mixDetail(quantize(finalScaleV));
-              mixDetail(quantize(finalOffsetU));
-              mixDetail(quantize(finalOffsetV));
+              mixDetail(quantize(finalA));
+              mixDetail(quantize(finalB));
+              mixDetail(quantize(finalC));
+              mixDetail(quantize(finalD));
+              mixDetail(quantize(finalTx));
+              mixDetail(quantize(finalTy));
               mixDetail(uint64_t(psAffineResolved ? 1 : 0) | (uint64_t(applied ? 1 : 0) << 1));
 
               XXH64_hash_t capKey = psHash;
@@ -10559,14 +14067,14 @@ namespace dxvk {
                 std::string ctabLog;
                 if (ps != nullptr && psHash != 0) {
                   const auto& constNames = getUe3PsFloatConstantNames(psHash, ps->GetBytecode());
-                  std::array<int32_t, 8> referencedRegs = {
-                    uvOrigin.affineU.scale.constReg, uvOrigin.affineU.offset.constReg,
-                    uvOrigin.affineV.scale.constReg, uvOrigin.affineV.offset.constReg,
-                    uvOrigin.affineU.scale.constReg2, uvOrigin.affineU.offset.constReg2,
-                    uvOrigin.affineV.scale.constReg2, uvOrigin.affineV.offset.constReg2 };
-                  std::sort(referencedRegs.begin(), referencedRegs.end());
+                  std::array<int32_t, 32> referencedRegs = {};
+                  uint32_t referencedCount = 0;
+                  uvComponentAffineCollectConstRegs(uvOrigin.affineU, referencedRegs.data(), referencedCount, uint32_t(referencedRegs.size()));
+                  uvComponentAffineCollectConstRegs(uvOrigin.affineV, referencedRegs.data(), referencedCount, uint32_t(referencedRegs.size()));
+                  std::sort(referencedRegs.begin(), referencedRegs.begin() + referencedCount);
                   int32_t lastLogged = -1;
-                  for (const int32_t reg : referencedRegs) {
+                  for (uint32_t i = 0; i < referencedCount; i++) {
+                    const int32_t reg = referencedRegs[i];
                     if (reg < 0 || reg == lastLogged || uint32_t(reg) >= caps::MaxFloatConstantsPS)
                       continue;
                     lastLogged = reg;
@@ -10615,9 +14123,9 @@ namespace dxvk {
                   " | U:[", formatUvComponentAffine(uvOrigin.affineU),
                   "] V:[", formatUvComponentAffine(uvOrigin.affineV),
                   "] | psResolved=", psAffineResolved ? 1 : 0,
-                  " ps=(", psScaleU, ",", psScaleV, ",", psOffsetU, ",", psOffsetV, ")",
+                  " ps=(", psA, ",", psB, ",", psC, ",", psD, ",", psTx, ",", psTy, ")",
                   " vsFold=", vsAffineFold ? 1 : 0, vsLog,
-                  " final=(", finalScaleU, ",", finalScaleV, ",", finalOffsetU, ",", finalOffsetV, ")",
+                  " final=(", finalA, ",", finalB, ",", finalC, ",", finalD, ",", finalTx, ",", finalTy, ")",
                   " identity=", transformIsIdentity ? 1 : 0,
                   " usable=", transformIsUsable ? 1 : 0,
                   " applied=", applied ? 1 : 0,
@@ -10700,6 +14208,7 @@ namespace dxvk {
                 ", sites=", uvOrigin.validSiteCount, " valid/", uvOrigin.invalidSiteCount, " invalid",
                 siteDisagreementNote,
                 uvOrigin.affineExact ? "" : " [affine-inexact]",
+                uvOriginBorrowed ? " [origin borrowed from sibling material samplers]" : "",
                 m_forceIaTexcoordForOutlier ? " [outlier-override]" : "");
               if (m_frameOptions.ue3LogUvResolution) {
                 Logger::info(msg);
@@ -10713,9 +14222,58 @@ namespace dxvk {
     }
 
     m_texcoordIndex = texcoordIdx;
-    m_iaTexcoordIndex = iaTexcoordIdx;
+    m_iaTexcoordIndex = resolveIaTexcoordAvoidingNonUvElements(iaTexcoordIdx);
 
     return true;
+  }
+
+  // Two kinds of UE3 TEXCOORD element are not coordinates at all:
+  //  - vertex lightmap policies append packed lighting coefficients as TEXCOORD5 (simple) or
+  //    TEXCOORD5/6/7 (directional), typed D3DCOLOR rather than a float pair. The element count
+  //    moves with the DirectionalLightmaps setting, and a D3DCOLOR-typed TEXCOORD is never a UV
+  //    set in UE3, so the type alone identifies them without consulting the vertex shader.
+  //  - instanced vertex factories put the per-instance basis in TEXCOORD1..4 on an instance-data
+  //    stream. Those advance once per instance, so they carry no per-vertex meaning.
+  uint32_t D3D9Rtx::resolveIaTexcoordAvoidingNonUvElements(const uint32_t iaTexcoordIdx) const {
+    if (!m_frameOptions.ue3EngineMode || d3d9State().vertexDecl == nullptr)
+      return iaTexcoordIdx;
+
+    const uint32_t instanceDataStreamMask = m_currentUe3Instancing.instanceDataStreamMask;
+    auto isNonUvElement = [instanceDataStreamMask](const D3DVERTEXELEMENT9& element) {
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD)
+        return false;
+      if (element.Type == D3DDECLTYPE_D3DCOLOR)
+        return true;
+      return element.Stream < caps::MaxStreams &&
+             (instanceDataStreamMask & (1u << element.Stream)) != 0;
+    };
+
+    const auto& elements = d3d9State().vertexDecl->GetElements();
+    bool requestedIsNonUv = false;
+    for (const auto& element : elements) {
+      if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == iaTexcoordIdx) {
+        requestedIsNonUv = isNonUvElement(element);
+        break;
+      }
+    }
+
+    if (!requestedIsNonUv)
+      return iaTexcoordIdx;
+
+    // Fall back to the mesh's lowest real UV set rather than leaving the surface with the
+    // lighting stream: an unresolvable index would drop the texcoord buffer entirely.
+    uint32_t fallback = iaTexcoordIdx;
+    bool found = false;
+    for (const auto& element : elements) {
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD || isNonUvElement(element))
+        continue;
+      if (!found || element.UsageIndex < fallback) {
+        fallback = element.UsageIndex;
+        found = true;
+      }
+    }
+
+    return fallback;
   }
 
   D3D9Rtx::NgxCameraCtabRegs D3D9Rtx::scanNgxCameraCtabRegs(const std::vector<uint8_t>& bytecode) const {
@@ -15854,24 +19412,190 @@ namespace dxvk {
 
   namespace {
     constexpr char kUe3TextureSpreadCachePath[] = "rtx-remix/ue3TextureSpread.cache";
+    constexpr char kUe3TextureSpreadCacheTempPath[] = "rtx-remix/ue3TextureSpread.cache.tmp";
     constexpr uint64_t kUe3TextureSpreadCacheMagic = 0x3144525053334555ull; // "UE3SPRD1"
     constexpr uint32_t kUe3TextureSpreadCacheMaxEntries = 1u << 20;
-    constexpr uint32_t kUe3TextureSpreadSaveIntervalFrames = 600;
+    // Both learned caches are rewritten whole, so they are saved on an interval rather than on
+    // every change; the destructor flushes whatever the last interval missed.
+    constexpr uint32_t kUe3CacheSaveIntervalFrames = 600;
+
+    constexpr char kUe3DiffuseSelectionCachePath[] = "rtx-remix/ue3DiffuseSelection.cache";
+    constexpr char kUe3DiffuseSelectionCacheTempPath[] = "rtx-remix/ue3DiffuseSelection.cache.tmp";
+    constexpr uint64_t kUe3DiffuseSelectionCacheMagic = 0x324C455344334555ull; // "UE3DSEL2"
+    constexpr uint32_t kUe3DiffuseSelectionCacheMaxEntries = 1u << 20;
+    // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
+    // the albedo score changes, so a build with different scoring re-derives instead of serving
+    // decisions its own scoring would no longer make.
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 2;
+    // How many loaded picks to re-score and check against current scoring per session. A scoring
+    // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
+    constexpr uint32_t kUe3DiffuseSelectionAuditCount = 32;
+  }
+
+  void D3D9Rtx::loadUe3DiffuseSelectionCache() {
+    m_ue3DiffuseSelectionLoaded = true;
+
+    auto refuseFutureSaves = [this](const std::string& reason) {
+      m_ue3DiffuseSelectionSaveBlocked = true;
+      Logger::warn(str::format(
+        "[RTX-Compatibility][UE3] Albedo selection cache ", reason,
+        ". Leaving the file untouched for this session; albedo picks re-derive as materials are "
+        "first drawn. Delete ", kUe3DiffuseSelectionCachePath, " to start a fresh one."));
+    };
+
+    const bool fileExists = ue3CacheFileExists(kUe3DiffuseSelectionCachePath);
+
+    std::ifstream file(kUe3DiffuseSelectionCachePath, std::ios::binary);
+    if (!file.is_open()) {
+      if (fileExists)
+        refuseFutureSaves("exists but could not be opened");
+      return;
+    }
+
+    // Scoring reads the taggable texture sets, so a stored pick is only valid under the tags that
+    // produced it. Adopting the current sizes here is also what stops the tag-change check on the
+    // first scoring draw from comparing against zero and clearing everything just loaded.
+    const uint32_t currentLightmapSize = uint32_t(m_frameOptions.lightmapTextures->size());
+    const uint32_t currentNeverAlbedoSize = uint32_t(m_frameOptions.neverAlbedoTextures->size());
+    const uint32_t currentPreferredAlbedoSize = uint32_t(m_frameOptions.preferredAlbedoTextures->size());
+    m_ue3DiffuseSelectionLightmapSetSize = currentLightmapSize;
+    m_ue3DiffuseSelectionNeverAlbedoSetSize = currentNeverAlbedoSize;
+    m_ue3DiffuseSelectionPreferredAlbedoSetSize = currentPreferredAlbedoSize;
+
+    uint64_t magic = 0;
+    uint32_t scoringVersion = 0;
+    uint32_t lightmapSize = 0;
+    uint32_t neverAlbedoSize = 0;
+    uint32_t preferredAlbedoSize = 0;
+    uint32_t entryCount = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&scoringVersion), sizeof(scoringVersion));
+    file.read(reinterpret_cast<char*>(&lightmapSize), sizeof(lightmapSize));
+    file.read(reinterpret_cast<char*>(&neverAlbedoSize), sizeof(neverAlbedoSize));
+    file.read(reinterpret_cast<char*>(&preferredAlbedoSize), sizeof(preferredAlbedoSize));
+    file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
+    if (!file || magic != kUe3DiffuseSelectionCacheMagic || entryCount > kUe3DiffuseSelectionCacheMaxEntries) {
+      refuseFutureSaves("header is unreadable or not recognised");
+      return;
+    }
+    if (scoringVersion != kUe3DiffuseSelectionScoringVersion) {
+      // Our own file, written by different scoring: discard and rewrite rather than refuse.
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3] Albedo selection cache was written by scoring version ",
+        scoringVersion, " (this build is ", kUe3DiffuseSelectionScoringVersion,
+        "); re-deriving picks and rewriting it."));
+      m_ue3DiffuseSelectionDirty = true;
+      return;
+    }
+    if (lightmapSize != currentLightmapSize ||
+        neverAlbedoSize != currentNeverAlbedoSize ||
+        preferredAlbedoSize != currentPreferredAlbedoSize) {
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3] Albedo selection cache was written under different texture tags "
+        "(lightmap/never/preferred ", lightmapSize, "/", neverAlbedoSize, "/", preferredAlbedoSize,
+        ", now ", currentLightmapSize, "/", currentNeverAlbedoSize, "/", currentPreferredAlbedoSize,
+        "); re-deriving picks and rewriting it."));
+      m_ue3DiffuseSelectionDirty = true;
+      return;
+    }
+
+    for (uint32_t i = 0; i < entryCount; i++) {
+      XXH64_hash_t key = 0;
+      Ue3DiffuseSelectionEntry entry;
+      file.read(reinterpret_cast<char*>(&key), sizeof(key));
+      file.read(reinterpret_cast<char*>(&entry.chosenStages[0]), sizeof(entry.chosenStages[0]));
+      file.read(reinterpret_cast<char*>(&entry.chosenStages[1]), sizeof(entry.chosenStages[1]));
+      file.read(reinterpret_cast<char*>(&entry.cubemapFallbackStage), sizeof(entry.cubemapFallbackStage));
+      file.read(reinterpret_cast<char*>(&entry.decisionAreaSum), sizeof(entry.decisionAreaSum));
+      if (!file) {
+        refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " entries readable"));
+        return;
+      }
+      entry.fromDisk = true;
+      m_ue3DiffuseSelectionCache[key] = entry;
+    }
+
+    m_ue3DiffuseSelectionAuditsRemaining = kUe3DiffuseSelectionAuditCount;
+
+    Logger::info(str::format(
+      "[RTX-Compatibility][UE3] Loaded albedo selection cache: ", entryCount, " materials"));
+  }
+
+  void D3D9Rtx::saveUe3DiffuseSelectionCache() {
+    if (!m_ue3DiffuseSelectionDirty || m_ue3DiffuseSelectionSaveBlocked)
+      return;
+
+    {
+      std::ofstream file(kUe3DiffuseSelectionCacheTempPath, std::ios::binary | std::ios::trunc);
+      if (!file.is_open())
+        return;
+
+      const uint32_t entryCount =
+        uint32_t(std::min<size_t>(m_ue3DiffuseSelectionCache.size(), kUe3DiffuseSelectionCacheMaxEntries));
+      // The tracked sizes rather than the live sets: these are what the stored decisions were
+      // scored against, and they are readable from the destructor, where the frame options a
+      // draw would have populated may never have existed.
+      const uint32_t lightmapSize = uint32_t(m_ue3DiffuseSelectionLightmapSetSize);
+      const uint32_t neverAlbedoSize = uint32_t(m_ue3DiffuseSelectionNeverAlbedoSetSize);
+      const uint32_t preferredAlbedoSize = uint32_t(m_ue3DiffuseSelectionPreferredAlbedoSetSize);
+      file.write(reinterpret_cast<const char*>(&kUe3DiffuseSelectionCacheMagic), sizeof(kUe3DiffuseSelectionCacheMagic));
+      file.write(reinterpret_cast<const char*>(&kUe3DiffuseSelectionScoringVersion), sizeof(kUe3DiffuseSelectionScoringVersion));
+      file.write(reinterpret_cast<const char*>(&lightmapSize), sizeof(lightmapSize));
+      file.write(reinterpret_cast<const char*>(&neverAlbedoSize), sizeof(neverAlbedoSize));
+      file.write(reinterpret_cast<const char*>(&preferredAlbedoSize), sizeof(preferredAlbedoSize));
+      file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+      uint32_t written = 0;
+      for (const auto& entry : m_ue3DiffuseSelectionCache) {
+        if (written >= entryCount)
+          break;
+        file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+        file.write(reinterpret_cast<const char*>(&entry.second.chosenStages[0]), sizeof(entry.second.chosenStages[0]));
+        file.write(reinterpret_cast<const char*>(&entry.second.chosenStages[1]), sizeof(entry.second.chosenStages[1]));
+        file.write(reinterpret_cast<const char*>(&entry.second.cubemapFallbackStage), sizeof(entry.second.cubemapFallbackStage));
+        file.write(reinterpret_cast<const char*>(&entry.second.decisionAreaSum), sizeof(entry.second.decisionAreaSum));
+        written++;
+      }
+
+      file.close();
+      if (!file)
+        return;
+    }
+
+    if (ue3CommitCacheFile(kUe3DiffuseSelectionCacheTempPath, kUe3DiffuseSelectionCachePath))
+      m_ue3DiffuseSelectionDirty = false;
   }
 
   void D3D9Rtx::loadUe3TextureSpreadCache() {
     m_ue3TextureSpreadLoaded = true;
 
+    auto refuseFutureSaves = [this](const std::string& reason) {
+      m_ue3TextureSpreadSaveBlocked = true;
+      Logger::warn(str::format(
+        "[RTX-Compatibility][UE3] Texture material-spread cache ", reason,
+        ". Leaving the file untouched for this session so it is not overwritten with less "
+        "than it holds; albedo scoring falls back to no spread data. Delete ",
+        kUe3TextureSpreadCachePath, " to start a fresh one."));
+    };
+
+    const bool fileExists = ue3CacheFileExists(kUe3TextureSpreadCachePath);
+
     std::ifstream file(kUe3TextureSpreadCachePath, std::ios::binary);
-    if (!file.is_open())
+    if (!file.is_open()) {
+      // No file at all is an ordinary first run, and saving must stay available to create one.
+      if (fileExists)
+        refuseFutureSaves("exists but could not be opened");
       return;
+    }
 
     uint64_t magic = 0;
     uint32_t entryCount = 0;
     file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
-    if (!file || magic != kUe3TextureSpreadCacheMagic || entryCount > kUe3TextureSpreadCacheMaxEntries)
+    if (!file || magic != kUe3TextureSpreadCacheMagic || entryCount > kUe3TextureSpreadCacheMaxEntries) {
+      refuseFutureSaves("header is unreadable or not recognised");
       return;
+    }
 
     for (uint32_t i = 0; i < entryCount; i++) {
       XXH64_hash_t texHash = 0;
@@ -15879,13 +19603,18 @@ namespace dxvk {
       file.read(reinterpret_cast<char*>(&texHash), sizeof(texHash));
       file.read(reinterpret_cast<char*>(&count), sizeof(count));
       Ue3TextureMaterialSpread spread;
-      if (!file || count > spread.psHashes.size())
+      if (!file || count > spread.psHashes.size()) {
+        refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " entries readable"));
         return;
+      }
       for (uint8_t p = 0; p < count; p++)
         file.read(reinterpret_cast<char*>(&spread.psHashes[p]), sizeof(XXH64_hash_t));
-      if (!file)
+      if (!file) {
+        refuseFutureSaves(str::format("is truncated: ", i, " of ", entryCount, " entries readable"));
         return;
+      }
       spread.count = count;
+      spread.scoringCount = count;
       m_ue3TextureMaterialSpread[texHash] = spread;
     }
 
@@ -15894,29 +19623,38 @@ namespace dxvk {
   }
 
   void D3D9Rtx::saveUe3TextureSpreadCache() {
-    if (!m_ue3TextureSpreadDirty)
-      return;
-    m_ue3TextureSpreadDirty = false;
-
-    std::ofstream file(kUe3TextureSpreadCachePath, std::ios::binary | std::ios::trunc);
-    if (!file.is_open())
+    if (!m_ue3TextureSpreadDirty || m_ue3TextureSpreadSaveBlocked)
       return;
 
-    const uint32_t entryCount =
-      uint32_t(std::min<size_t>(m_ue3TextureMaterialSpread.size(), kUe3TextureSpreadCacheMaxEntries));
-    file.write(reinterpret_cast<const char*>(&kUe3TextureSpreadCacheMagic), sizeof(kUe3TextureSpreadCacheMagic));
-    file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+    {
+      std::ofstream file(kUe3TextureSpreadCacheTempPath, std::ios::binary | std::ios::trunc);
+      if (!file.is_open())
+        return;
 
-    uint32_t written = 0;
-    for (const auto& entry : m_ue3TextureMaterialSpread) {
-      if (written >= entryCount)
-        break;
-      file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
-      file.write(reinterpret_cast<const char*>(&entry.second.count), sizeof(entry.second.count));
-      for (uint8_t p = 0; p < entry.second.count; p++)
-        file.write(reinterpret_cast<const char*>(&entry.second.psHashes[p]), sizeof(XXH64_hash_t));
-      written++;
+      const uint32_t entryCount =
+        uint32_t(std::min<size_t>(m_ue3TextureMaterialSpread.size(), kUe3TextureSpreadCacheMaxEntries));
+      file.write(reinterpret_cast<const char*>(&kUe3TextureSpreadCacheMagic), sizeof(kUe3TextureSpreadCacheMagic));
+      file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
+
+      uint32_t written = 0;
+      for (const auto& entry : m_ue3TextureMaterialSpread) {
+        if (written >= entryCount)
+          break;
+        file.write(reinterpret_cast<const char*>(&entry.first), sizeof(entry.first));
+        file.write(reinterpret_cast<const char*>(&entry.second.count), sizeof(entry.second.count));
+        for (uint8_t p = 0; p < entry.second.count; p++)
+          file.write(reinterpret_cast<const char*>(&entry.second.psHashes[p]), sizeof(XXH64_hash_t));
+        written++;
+      }
+
+      file.close();
+      if (!file)
+        return;
     }
+
+    // Cleared only once the new file is in place, so a failed write is retried next interval.
+    if (ue3CommitCacheFile(kUe3TextureSpreadCacheTempPath, kUe3TextureSpreadCachePath))
+      m_ue3TextureSpreadDirty = false;
   }
 
   void D3D9Rtx::recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
@@ -16104,6 +19842,13 @@ namespace dxvk {
     // Update the effective settings before the next frame.
     applyNgxPassthroughScreenPercentage();
     
+    // Allow the next frame's TdToneMapping pass to be captured again
+    m_ue3ToneMapCapturedThisFrame = false;
+
+    // New frame: forget the UE3 foreground DPG segment
+    m_ue3SeenMainViewWorldDraw = false;
+    m_ue3ForegroundDpgActive = false;
+
     if (m_frameOptions.ue3LogOcclusionQueries) {
       flushOcclusionQueryDiagnostics();
     }
@@ -16127,10 +19872,8 @@ namespace dxvk {
 
     const auto currentReflexFrameId = GetReflexFrameId();
 
-    // persist newly discovered texture material-spread so the next session scores
-    // deterministically from its first frame instead of re-converging
     if (!m_frameOptions.ngxPassthroughMode && m_ue3TextureSpreadDirty &&
-        currentReflexFrameId >= m_ue3TextureSpreadLastSaveFrame + kUe3TextureSpreadSaveIntervalFrames) {
+        currentReflexFrameId >= m_ue3TextureSpreadLastSaveFrame + kUe3CacheSaveIntervalFrames) {
       m_ue3TextureSpreadLastSaveFrame = uint32_t(currentReflexFrameId);
       saveUe3TextureSpreadCache();
     }
@@ -16152,6 +19895,12 @@ namespace dxvk {
         static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
       });
     }
+    if (m_ue3DiffuseSelectionDirty &&
+        currentReflexFrameId >= m_ue3DiffuseSelectionLastSaveFrame + kUe3CacheSaveIntervalFrames) {
+      m_ue3DiffuseSelectionLastSaveFrame = uint32_t(currentReflexFrameId);
+      saveUe3DiffuseSelectionCache();
+    }
+
 
     // Flush any pending game and RTX work
     m_parent->Flush();
@@ -16189,9 +19938,17 @@ namespace dxvk {
     if (!m_frameOptions.ngxPassthroughMode) {
       pruneUe3StaticVertexCaptureCache();
       pruneUe3GeometryMemoCache();
+      updateUe3StaticVertexCaptureCacheState();
+      // Independent of the capture cache, whose state update returns early when it is disabled.
+      reportUe3InstancedDrawStats();
+      reportUe3ConstantChurn();
     }
 
     DrawCallState::refreshCategoryLookupTable();
+
+    // The per-draw profile zones in this file are only meaningful against the draw count, which
+    // a UE3 title moves by an order of magnitude depending on its occlusion and frustum culling.
+    ProfilerPlotValue("D3D9 Draw Calls", int64_t(m_drawCallID));
 
     // Reset for the next frame
     m_rtxInjectTriggered = false;

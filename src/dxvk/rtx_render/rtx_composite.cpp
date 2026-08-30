@@ -83,7 +83,6 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
       END_PARAMETER()
     };
@@ -113,16 +112,13 @@ namespace dxvk {
         CONSTANT_BUFFER(COMPOSITE_CONSTANTS_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR2_INPUT)
-        TEXTURE2D(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT)
-        TEXTURE2D(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT)
+        TEXTURE2D(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_CO_CG_INPUT)
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
         TEXTURE2D(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
         TEXTURE2D(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
-        TEXTURE2D(COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT)
-        TEXTURE2D(COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
@@ -133,7 +129,6 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT)
       END_PARAMETER()
@@ -347,13 +342,10 @@ namespace dxvk {
     const DxvkReSTIRGIRayQuery& restirGI = ctx->getCommonObjects()->metaReSTIRGIRayQuery();
     ctx->bindResourceView(COMPOSITE_BSDF_FACTOR_INPUT, rtOutput.m_bsdfFactor.view, nullptr);
     ctx->bindResourceView(COMPOSITE_BSDF_FACTOR2_INPUT, restirGI.getBsdfFactor2().view, nullptr);
-    ctx->bindResourceView(COMPOSITE_DIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingDirectPixelSamplingRate.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_INDIRECT_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingIndirectPixelSamplingRate.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ALPHA_GBUFFER_INPUT, rtOutput.m_alphaBlendGBuffer.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingUnionActivePixelMask.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingUnionActiveLocalPixelCoords.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_DIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingDirectActivePixelMask.view, nullptr);
-    ctx->bindResourceView(COMPOSITE_INDIRECT_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingIndirectActivePixelMask.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
 
     // Note: Clamp to edge used to avoid interpolation to black on the edges of the view.
     Rc<DxvkSampler> linearSampler = ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -383,7 +375,6 @@ namespace dxvk {
 
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(COMPOSITE_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
-    ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT, rtOutput.m_rayReconstructionParticleBuffer.view, nullptr);
     ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT,
       ctx->useRayReconstruction() ? rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Write) : nullptr, nullptr);
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
@@ -434,11 +425,8 @@ namespace dxvk {
     compositeArgs.enableReSTIRGI = RtxOptions::useReSTIRGI();
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
-    compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
-    compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
-    compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();
+    compositeArgs.useRayReconstruction = ctx->useRayReconstruction();
     compositeArgs.enhanceAlbedo = ctx->useRayReconstruction() && rayReconstruction.enableDetailEnhancement();
-    compositeArgs.compositeVolumetricLight = ctx->useRayReconstruction() && rayReconstruction.compositeVolumetricLight();
     compositeArgs.writeRayReconstructionHitDistance = ctx->useRayReconstruction() ? 1u : 0u;
 
     NrdArgs primaryDirectNrdArgs;
