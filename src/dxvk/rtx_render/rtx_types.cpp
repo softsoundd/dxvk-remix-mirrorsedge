@@ -436,7 +436,6 @@ namespace dxvk {
       { InstanceCategories::Hidden, &RtxOptions::hideInstanceTextures() },
       { InstanceCategories::Particle, &RtxOptions::particleTextures() },
       { InstanceCategories::Beam, &RtxOptions::beamTextures() },
-      { InstanceCategories::IgnoreTransparencyLayer, &RtxOptions::ignoreTransparencyLayerTextures() },
       { InstanceCategories::DecalStatic, &RtxOptions::decalTextures() },
       { InstanceCategories::DecalDynamic, &RtxOptions::dynamicDecalTextures() },
       { InstanceCategories::DecalSingleOffset, &RtxOptions::singleOffsetDecalTextures() },
@@ -510,7 +509,6 @@ namespace dxvk {
 
     setCategory(InstanceCategories::Particle, matched(InstanceCategories::Particle));
     setCategory(InstanceCategories::Beam, matched(InstanceCategories::Beam));
-    setCategory(InstanceCategories::IgnoreTransparencyLayer, matched(InstanceCategories::IgnoreTransparencyLayer));
 
     setCategory(InstanceCategories::DecalStatic, matched(InstanceCategories::DecalStatic));
     setCategory(InstanceCategories::DecalDynamic, matched(InstanceCategories::DecalDynamic));

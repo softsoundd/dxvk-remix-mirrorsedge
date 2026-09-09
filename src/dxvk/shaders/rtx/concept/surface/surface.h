@@ -153,17 +153,11 @@ struct Surface
     set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 29) : packedFlagUnset(data2.w, 1 << 29); }
   }
 
-  property bool ignoreTransparencyLayer
-  {
-    get { return packedFlagGet(data2.w, 1 << 30); }
-    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
-  }
-
   // SceneManager preserve path (usePreservePath); not the same as motion-related isStatic.
   property bool isPreservePath
   {
-    get { return packedFlagGet(data2.w, 1 << 31); }
-    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 31) : packedFlagUnset(data2.w, 1 << 31); }
+    get { return packedFlagGet(data2.w, 1 << 30); }
+    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
   }
 
   // Matrices

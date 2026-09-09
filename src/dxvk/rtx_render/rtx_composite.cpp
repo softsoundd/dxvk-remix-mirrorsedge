@@ -84,7 +84,6 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
       END_PARAMETER()
     };
@@ -137,7 +136,6 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT)
       END_PARAMETER()
@@ -389,7 +387,6 @@ namespace dxvk {
 
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(COMPOSITE_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
-    ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT, rtOutput.m_rayReconstructionParticleBuffer.view, nullptr);
     ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT,
       ctx->useRayReconstruction() ? rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Write) : nullptr, nullptr);
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
@@ -457,11 +454,8 @@ namespace dxvk {
     }
     compositeArgs.unoccludedSunRadiance = unoccludedSunRadiance;
     compositeArgs.unoccludedSunDirection = unoccludedSunDirection;
-    compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
-    compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
-    compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();
+    compositeArgs.useRayReconstruction = ctx->useRayReconstruction();
     compositeArgs.enhanceAlbedo = ctx->useRayReconstruction() && rayReconstruction.enableDetailEnhancement();
-    compositeArgs.compositeVolumetricLight = ctx->useRayReconstruction() && rayReconstruction.compositeVolumetricLight();
     compositeArgs.writeRayReconstructionHitDistance = ctx->useRayReconstruction() ? 1u : 0u;
 
     NrdArgs primaryDirectNrdArgs;

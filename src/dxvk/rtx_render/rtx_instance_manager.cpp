@@ -1123,7 +1123,6 @@ namespace dxvk {
         }
         currentInstance.surface.colorTextureIsSrgb = colorTextureIsSrgb;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
-        currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
         currentInstance.surface.cullBackfacesInShadows = currentInstance.testCategoryFlags(InstanceCategories::CullBackfacesInShadows);
 
         // Note: Skip the spritesheet adjustment logic in the surface interaction when using Ray Portal materials as this logic

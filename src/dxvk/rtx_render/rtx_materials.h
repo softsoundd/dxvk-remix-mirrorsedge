@@ -171,8 +171,7 @@ struct RtSurface {
     flags1 |= isTextureFactorBlend ?          (1 << 27) : 0;
     flags1 |= isMotionBlurMaskOut ?           (1 << 28) : 0;
     flags1 |= skipSurfaceInteractionSpritesheetAdjustment ? (1 << 29) : 0;
-    flags1 |= ignoreTransparencyLayer ?       (1 << 30) : 0;
-    flags1 |= isPreservePath ?                (1u << 31) : 0;
+    flags1 |= isPreservePath ?                (1u << 30) : 0;
 
     writeGPUHelper(data, offset, flags1);
 
@@ -341,7 +340,6 @@ struct RtSurface {
   bool colorTextureIsSrgb = false;
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
-  bool ignoreTransparencyLayer = false;
   bool cullBackfacesInShadows = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
@@ -411,7 +409,6 @@ struct RtSurface {
       "  isTextureFactorBlend: ", isTextureFactorBlend, "\n",
       "  isMotionBlurMaskOut: ", isMotionBlurMaskOut, "\n",
       "  skipSurfaceInteractionSpritesheetAdjustment: ", skipSurfaceInteractionSpritesheetAdjustment, "\n",
-      "  ignoreTransparencyLayer: ", ignoreTransparencyLayer, "\n",
       "  cullBackfacesInShadows: ", cullBackfacesInShadows));
     
     // Print alpha state

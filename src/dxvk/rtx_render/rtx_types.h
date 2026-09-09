@@ -662,7 +662,6 @@ enum class InstanceCategories : uint32_t {
   ThirdPersonPlayerModel,
   ThirdPersonPlayerBody,
   IgnoreBakedLighting,
-  IgnoreTransparencyLayer,
   ParticleEmitter,
   SmoothNormals,
   HairCards,
