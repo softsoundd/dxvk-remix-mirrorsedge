@@ -4337,6 +4337,9 @@ namespace dxvk {
 
     // DXVK Meta
     enabled.core.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    // NV-DXVK start
+    enabled.core.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
+    // NV-DXVK end
     enabled.core.features.imageCubeArray = VK_TRUE;
 
     // SM1 level hardware
