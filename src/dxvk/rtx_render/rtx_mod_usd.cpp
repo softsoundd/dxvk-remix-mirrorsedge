@@ -1784,7 +1784,7 @@ bool UsdMod::Impl::applyPendingRebuild(const Rc<DxvkContext>& context, AssetChan
       std::move(*m_pending.replacements),
       m_pending.changes);
 
-  m_owner.m_replacements->logAnchorSummary(m_owner.m_name);
+  m_owner.m_replacements->logAnchorSummary(m_owner.m_filePath.string());
 
   m_owner.m_status = std::move(m_pending.status);
 
