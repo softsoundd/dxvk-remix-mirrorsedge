@@ -36,6 +36,14 @@
 // ColorCurvesK texel = [Ms.r, Bs.r, Ms.g, Bs.g], ColorCurvesM texel = [Ms.b, Bs.b, -, -].
 #define UE3_TONEMAP_NUM_CURVE_SEGMENTS   16
 
+// Which hue the Faithful Luma shoulder aims an over-range colour at.
+#define UE3_TONEMAP_HUE_REFERENCE_SCENE          0  // the scene's hue
+#define UE3_TONEMAP_HUE_REFERENCE_APPROVED_LOOK  1  // turned toward the shipped clip's hue by the share of luminance the clip could not show
+
+// Which curve limits the graded colour to the display range under Faithful Luma.
+#define UE3_TONEMAP_RANGE_COMPRESSION_NEUTWO                  0  // x / sqrt(x^2 + 1) family, compresses from mid grey, asymptotic headroom
+#define UE3_TONEMAP_RANGE_COMPRESSION_FAITHFUL_LUMA_SHOULDER  1  // identity below the knee, extended Reinhard to the white point
+
 // Note: layout is kept to full 16-byte rows (vec4 or 4 scalars) so the C++ struct
 // matches the shader constant buffer layout without packing surprises.
 struct ToneMappingUe3Args {
@@ -47,29 +55,27 @@ struct ToneMappingUe3Args {
   vec4 gammaOverlayColor;             // rgb: engine overlay colour (fades)
 
   uint enableAutoExposure;
-  float exposureFactor;
-  uint huePreservingShoulder;         // FaithfulLuma luminance-anchored extended Reinhard
-  float linearWhite;                  // luminance mapped to display white (shipped MAX_SCENE_COLOR = 4)
-
-  uint highlightDesaturation;
-  float highlightDesaturationStrength;
-  uint gradePreserveBlend;            // preserve per-channel midtone grade in shadows/mids
-  float gradePreservePivot;
-
-  float gradePreserveSlope;
+  float exposureFactor;               // exp2(exposure bias + user brightness EV), multiplied into the auto exposure
   uint applyColorCurves;              // 0 when no captured curves are available (identity)
   uint curvePointSampling;            // 1 when the game bound the curve LUTs with point filtering
-  uint whiteNeutrality;
 
-  float whiteLumaStart;
-  float whiteLumaRange;
-  float whiteChromaStart;
-  float whiteChromaRange;
+  // Faithful Luma: the shipped grade without its per-channel clip, a range compression curve in
+  // its place, the curve's hue shift replaced by an OKLab hue solve, and no pow() guard so black
+  // reaches 0.
+  uint faithfulLuma;                  // 0 = verbatim shipped TdToneMapping (hard clip at exposed 1.0, #020202 black floor)
+  uint rangeCompression;              // UE3_TONEMAP_RANGE_COMPRESSION_*
+  float softClipKnee;                 // shoulder: graded value where it starts (identity below)
+  float softClipWhite;                // shoulder: graded value that reaches 1.0
 
-  float whiteNeutralityStrength;
+  float huePreservation;              // 0 = the curve's per-channel hue shifts, 1 = the target hue
+  float bezoldBruckePerStop;          // degrees of OKLab hue the target turns per stop the curve darkened the colour
+  uint hueReference;                  // UE3_TONEMAP_HUE_REFERENCE_*
+  float highlightDesaturation;        // 0..1: desaturate over-range colours to the chroma the shipped clip left them
+
+  float neutwoWhiteClip;              // Neutwo: graded value that lands exactly on display white
+  float neutwoContrast;               // Neutwo: power around mid grey (0.18) applied to luminance before the curve; 1 = none
   uint pad0;
   uint pad1;
-  uint pad2;
 };
 
 #endif  // TONEMAPPING_UE3_H

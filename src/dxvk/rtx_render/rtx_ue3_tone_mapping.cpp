@@ -27,8 +27,10 @@
 #include "rtx_context.h"
 #include "rtx_imgui.h"
 #include "rtx/pass/tonemap/tonemapping_ue3.h"
+#include "rtx/pass/tonemap/tonemapping_ue3_exposure.h"
 
 #include <rtx_shaders/tonemapping_ue3.h>
+#include <rtx_shaders/tonemapping_ue3_exposure.h>
 
 #include <algorithm>
 #include <cmath>
@@ -50,7 +52,35 @@ namespace dxvk {
       END_PARAMETER()
     };
 
+    class Ue3ExposureMeterShader : public ManagedShader {
+      SHADER_SOURCE(Ue3ExposureMeterShader, VK_SHADER_STAGE_COMPUTE_BIT, tonemapping_ue3_exposure)
+
+      PUSH_CONSTANTS(ToneMappingUe3ExposureArgs)
+
+      BEGIN_PARAMETER()
+        RW_TEXTURE2D(TONEMAPPING_UE3_EXPOSURE_COLOR_INPUT)
+        RW_TEXTURE1D(TONEMAPPING_UE3_EXPOSURE_OUTPUT)
+      END_PARAMETER()
+    };
+
     constexpr VkExtent3D kCurveTextureExtent = { kUe3CurveSegmentCount, 1, 1 };
+    constexpr VkExtent3D kMeterTextureExtent = { 1, 1, 1 };
+
+    // The engine uploads dt * min(Scene_ExposureSpeedUp, 2.5) and dt * min(Scene_ExposureSpeedDown, 3.0);
+    // dividing by our own frame time and the cap recovers the level's speed relative to the cap.
+    constexpr float kEngineSpeedUpCap = 2.5f;
+    constexpr float kEngineSpeedDownCap = 3.0f;
+
+    float levelSpeedFactor(const float upload, const float cap, const float deltaTimeSeconds) {
+      return std::clamp(upload / (deltaTimeSeconds * cap), 0.f, 1.f);
+    }
+
+    // Frame time for the meter's adaptation; falls back to the configured constant frame time (or
+    // 60 FPS) when the per-frame delta is 0, as the auto exposure pass does.
+    float meterDeltaTimeSeconds(const float frameTimeMilliseconds) {
+      const float fallbackMs = RtxOptions::timeDeltaBetweenFrames() > 0.f ? RtxOptions::timeDeltaBetweenFrames() : 16.6f;
+      return (frameTimeMilliseconds > 0.f ? frameTimeMilliseconds : fallbackMs) * 0.001f;
+    }
 
     // Identity segments (y = x) in the game's K/M texel layout
     std::array<Vector4, kUe3CurveSegmentCount> identityCurveK() {
@@ -77,6 +107,7 @@ namespace dxvk {
     }
 
     Ue3ToneMappingShader::getShader();
+    Ue3ExposureMeterShader::getShader();
   }
 
   void DxvkUe3ToneMapping::createResources(Rc<RtxContext> ctx) {
@@ -86,6 +117,10 @@ namespace dxvk {
                                               1, VK_IMAGE_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D);
     m_curveM = Resources::createImageResource(baseCtx, "ue3 tonemap curve M", kCurveTextureExtent, VK_FORMAT_R32G32B32A32_SFLOAT,
                                               1, VK_IMAGE_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D);
+    // Cleared to 0, which the meter reads as "no state" and starts on its target
+    m_meterExposure = Resources::createImageResource(baseCtx, "ue3 tonemap exposure meter", kMeterTextureExtent, VK_FORMAT_R32_SFLOAT,
+                                                     1, VK_IMAGE_TYPE_1D, VK_IMAGE_VIEW_TYPE_1D);
+    m_meterResetPending = true;
 
     uploadMsBsTexels(ctx, identityCurveK(), identityCurveM());
   }
@@ -122,13 +157,16 @@ namespace dxvk {
     Rc<DxvkSampler> linearSampler,
     Rc<DxvkImageView> exposureView,
     const Resources::RaytracingOutput& rtOutput,
-    bool autoExposureEnabled) {
+    bool autoExposureEnabled,
+    float frameTimeMilliseconds,
+    bool resetHistory) {
 
     ScopedGpuProfileZone(ctx, "Mirror's Edge Tone Mapping");
 
     if (m_curveK.image == nullptr) {
       createResources(ctx);
     }
+    m_meterResetPending |= resetHistory;
 
     const uint32_t currentFrame = device()->getCurrentFrameId();
     const uint32_t captureAge = (m_hasCapture && currentFrame >= m_captureFrameId) ? (currentFrame - m_captureFrameId) : ~0u;
@@ -157,9 +195,8 @@ namespace dxvk {
       const Vector3 highLights = manualSceneHighLights();
       const Vector3 midTones = manualSceneMidTones();
       const float desaturation = std::clamp(manualSceneDesaturation(), 0.f, 1.f);
-      const Vector3 lumaWeights = manualUseRec709LumaWeights()
-        ? Vector3(0.2126f, 0.7152f, 0.0722f)
-        : Vector3(0.3f, 0.59f, 0.11f);  // shipped TdToneMapping weights
+      // The shipped TdToneMapping desaturation weights; the game's grade was authored against them
+      const Vector3 lumaWeights = Vector3(0.3f, 0.59f, 0.11f);
       const Vector3 gammaColorScale = manualGammaColorScale();
 
       args.sceneShadowsAndDesaturation = Vector4(shadows.x, shadows.y, shadows.z, 1.f - desaturation);
@@ -175,25 +212,86 @@ namespace dxvk {
       args.gammaOverlayColor = Vector4(0.f, 0.f, 0.f, 0.f);
     }
 
-    args.enableAutoExposure = autoExposureEnabled;
-    args.exposureFactor = exp2f(exposureBias() + RtxOptions::calcUserEVBias());
-    args.huePreservingShoulder = huePreservingShoulder();
-    args.linearWhite = std::max(linearWhite(), 0.01f);
-    args.highlightDesaturation = highlightDesaturation();
-    args.highlightDesaturationStrength = highlightDesaturationStrength();
-    args.gradePreserveBlend = gradePreserveBlend();
-    args.gradePreservePivot = gradePreservePivot();
-    args.gradePreserveSlope = gradePreserveSlope();
+    const Resources::Resource& inputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Read);
+    const Resources::Resource& outputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Write);
+
+    // Scene calibration: Remix radiance times this is in the game's scene units
+    const float sceneScale = exp2f(exposureBias());
+    const float userBrightness = exp2f(RtxOptions::calcUserEVBias());
+
+    // --- Exposure: the game's meter on Remix's radiance, or Remix's auto exposure ---
+    const bool usingMeter = exposureModel() == Ue3ExposureModel::MirrorsEdgeMeter;
+    Rc<DxvkImageView> exposureViewToBind = exposureView;
+    bool meterClampsFromCapture = false;
+    float meterLow = manualExposureLow();
+    float meterHigh = manualExposureHigh();
+    float meterManual = manualExposureManual();
+    float meterSpeedFactorUp = 1.f;
+    float meterSpeedFactorDown = 1.f;
+
+    if (usingMeter) {
+      const float deltaTimeSeconds = meterDeltaTimeSeconds(frameTimeMilliseconds);
+
+      if (meterUseCapturedSettings() && captureUsable && m_capture.hasExposureSettings) {
+        meterClampsFromCapture = true;
+        meterLow = m_capture.exposureSettings.z;
+        meterHigh = m_capture.exposureSettings.w;
+        meterManual = m_capture.exposureSettings.x;
+        if (meterHonourLevelSpeeds()) {
+          meterSpeedFactorUp = levelSpeedFactor(m_capture.exposureSettings.y, kEngineSpeedUpCap, deltaTimeSeconds);
+          meterSpeedFactorDown = levelSpeedFactor(m_capture.maxDeltaDown, kEngineSpeedDownCap, deltaTimeSeconds);
+        }
+      }
+      meterLow = std::max(meterLow, 1e-3f);
+      meterHigh = std::max(meterHigh, meterLow);
+      meterManual = std::max(meterManual, 1e-3f);
+
+      ToneMappingUe3ExposureArgs meterArgs = {};
+      meterArgs.sceneScale = sceneScale;
+      meterArgs.deltaTimeSeconds = deltaTimeSeconds;
+      meterArgs.exposureLow = meterLow;
+      meterArgs.exposureHigh = meterHigh;
+      // Into light the exposure falls, governed by the level's SpeedDown; into dark it rises, by SpeedUp
+      meterArgs.speedToLight = std::max(meterSpeedToLight(), 0.f) * meterSpeedFactorDown;
+      meterArgs.speedToDark = std::max(meterSpeedToDark(), 0.f) * meterSpeedFactorUp;
+      meterArgs.transitionStops = std::max(meterTransitionStops(), 1e-3f);
+      meterArgs.resetHistory = m_meterResetPending ? 1u : 0u;
+      m_meterResetPending = false;
+
+      {
+        ScopedGpuProfileZone(ctx, "Mirror's Edge Exposure Meter");
+        ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+        ctx->pushConstants(0, sizeof(meterArgs), &meterArgs);
+        ctx->bindResourceView(TONEMAPPING_UE3_EXPOSURE_COLOR_INPUT, inputColorBuffer.view, nullptr);
+        ctx->bindResourceView(TONEMAPPING_UE3_EXPOSURE_OUTPUT, m_meterExposure.view, nullptr);
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, Ue3ExposureMeterShader::getShader());
+        ctx->dispatch(1, 1, 1);
+      }
+
+      exposureViewToBind = m_meterExposure.view;
+    }
+
+    // The meter's texel is E as the game's shader stores it; Scene_ExposureManual, the scene
+    // calibration and the user brightness multiply it here.
+    args.enableAutoExposure = usingMeter ? 1u : (autoExposureEnabled ? 1u : 0u);
+    args.exposureFactor = sceneScale * userBrightness * (usingMeter ? meterManual : 1.f);
     args.applyColorCurves = usingCapturedCurves;
     // Match the sampler filter the game bound for the curve LUTs (Mirror's
     // Edge point-filters them, i.e. exact piecewise-segment evaluation)
     args.curvePointSampling = usingCapturedCurves && m_capture.curvePointFiltering;
-    args.whiteNeutrality = whiteNeutrality();
-    args.whiteLumaStart = whiteLumaStart();
-    args.whiteLumaRange = std::max(whiteLumaRange(), 1e-4f);
-    args.whiteChromaStart = whiteChromaStart();
-    args.whiteChromaRange = std::max(whiteChromaRange(), 1e-4f);
-    args.whiteNeutralityStrength = whiteNeutralityStrength();
+
+    // Faithful Luma; the clamps keep every curve monotonic (knee below display white, white
+    // points at or above it)
+    args.faithfulLuma = faithfulLuma();
+    args.rangeCompression = uint32_t(rangeCompression());
+    args.neutwoWhiteClip = std::max(neutwoWhiteClip(), 1.f);
+    args.neutwoContrast = std::clamp(neutwoContrast(), 0.1f, 4.f);
+    args.softClipKnee = std::clamp(softClipKnee(), 0.05f, 0.99f);
+    args.softClipWhite = std::max(softClipWhite(), 1.01f);
+    args.huePreservation = std::clamp(huePreservation(), 0.f, 1.f);
+    args.bezoldBruckePerStop = bezoldBruckePerStop();
+    args.hueReference = uint32_t(hueReference());
+    args.highlightDesaturation = std::clamp(highlightDesaturation(), 0.f, 1.f);
 
     if (m_constants == nullptr) {
       DxvkBufferCreateInfo info;
@@ -207,13 +305,10 @@ namespace dxvk {
     ctx->writeToBuffer(m_constants, 0, sizeof(ToneMappingUe3Args), &args);
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constants);
 
-    const Resources::Resource& inputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Read);
-    const Resources::Resource& outputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Write);
-
     const VkExtent3D workgroups = util::computeBlockCount(outputColorBuffer.view->imageInfo().extent, VkExtent3D { 16, 16, 1 });
 
     ctx->bindResourceView(TONEMAPPING_UE3_COLOR_INPUT, inputColorBuffer.view, nullptr);
-    ctx->bindResourceView(TONEMAPPING_UE3_EXPOSURE_INPUT, exposureView, nullptr);
+    ctx->bindResourceView(TONEMAPPING_UE3_EXPOSURE_INPUT, exposureViewToBind, nullptr);
     ctx->bindResourceView(TONEMAPPING_UE3_CURVE_K_INPUT, m_curveK.view, nullptr);
     ctx->bindResourceSampler(TONEMAPPING_UE3_CURVE_K_INPUT, linearSampler);
     ctx->bindResourceView(TONEMAPPING_UE3_CURVE_M_INPUT, m_curveM.view, nullptr);
@@ -232,6 +327,13 @@ namespace dxvk {
       m_status.captureHasCurves = m_capture.hasCurves;
       m_status.captureAgeFrames = m_hasCapture ? captureAge : 0;
       m_status.usingCapturedConstants = usingCapturedConstants;
+      m_status.usingMeter = usingMeter;
+      m_status.meterClampsFromCapture = meterClampsFromCapture;
+      m_status.meterLow = meterLow;
+      m_status.meterHigh = meterHigh;
+      m_status.meterManual = meterManual;
+      m_status.meterSpeedFactorUp = meterSpeedFactorUp;
+      m_status.meterSpeedFactorDown = meterSpeedFactorDown;
       m_status.capturedState = m_capture;
     }
   }
@@ -258,7 +360,35 @@ namespace dxvk {
 
     RemixGui::Separator();
 
-    RemixGui::DragFloat("Exposure Bias (EV)", &exposureBiasObject(), 0.01f, -4.f, 4.f);
+    // --- Exposure ---
+    RemixGui::Combo("Exposure Model", &exposureModelObject(), "Remix Auto Exposure\0Mirror's Edge Meter (game model, captured per-volume clamps)\0");
+    const bool meterSelected = exposureModel() == Ue3ExposureModel::MirrorsEdgeMeter;
+    RemixGui::DragFloat(meterSelected ? "Scene Calibration (EV)" : "Exposure Bias (EV)", &exposureBiasObject(), 0.01f, -6.f, 6.f);
+    if (meterSelected) {
+      ImGui::Indent();
+      if (status.usingMeter) {
+        ImGui::Text("Clamps: Low %.3f  High %.3f  ->  E in [%.3f, %.3f]  (%s)  Manual %.3f",
+                    status.meterLow, status.meterHigh,
+                    status.meterLow * status.meterLow, status.meterHigh * status.meterHigh,
+                    status.meterClampsFromCapture ? "captured from the current volume" : "manual",
+                    status.meterManual);
+        if (status.meterClampsFromCapture && meterHonourLevelSpeeds()) {
+          ImGui::Text("Level speed factors: up %.2f  down %.2f", status.meterSpeedFactorUp, status.meterSpeedFactorDown);
+        }
+      }
+      RemixGui::Checkbox("Use Captured Exposure Settings", &meterUseCapturedSettingsObject());
+      RemixGui::DragFloat("Manual Scene_ExposureLow", &manualExposureLowObject(), 0.005f, 0.05f, 4.f);
+      RemixGui::DragFloat("Manual Scene_ExposureHigh", &manualExposureHighObject(), 0.005f, 0.05f, 4.f);
+      RemixGui::DragFloat("Manual Scene_ExposureManual", &manualExposureManualObject(), 0.005f, 0.05f, 4.f);
+      RemixGui::DragFloat("Adaptation To Light (stops/s)", &meterSpeedToLightObject(), 0.1f, 0.f, 60.f);
+      RemixGui::DragFloat("Adaptation To Dark (stops/s)", &meterSpeedToDarkObject(), 0.1f, 0.f, 60.f);
+      RemixGui::DragFloat("Transition (stops)", &meterTransitionStopsObject(), 0.05f, 0.05f, 6.f);
+      RemixGui::Checkbox("Honour Level Exposure Speeds", &meterHonourLevelSpeedsObject());
+      ImGui::Unindent();
+    }
+
+    RemixGui::Separator();
+
     RemixGui::Checkbox("Use Captured Grade Constants", &useCapturedConstantsObject());
     if (useCapturedConstants()) {
       ImGui::Indent();
@@ -270,34 +400,30 @@ namespace dxvk {
 
     RemixGui::Separator();
 
-    // --- FaithfulLuma modernization toggles ---
-    RemixGui::Checkbox("Hue-Preserving Shoulder", &huePreservingShoulderObject());
-    if (huePreservingShoulder()) {
+    // --- Faithful Luma ---
+    RemixGui::Checkbox("Faithful Luma", &faithfulLumaObject());
+    if (faithfulLuma()) {
       ImGui::Indent();
-      RemixGui::DragFloat("Linear White", &linearWhiteObject(), 0.01f, 0.5f, 16.f);
-      RemixGui::Checkbox("Highlight Desaturation", &highlightDesaturationObject());
-      if (highlightDesaturation()) {
-        RemixGui::DragFloat("Highlight Desaturation Strength", &highlightDesaturationStrengthObject(), 0.01f, 0.f, 1.f);
+      ImGui::TextWrapped("Shipped grade, gamma and curves; the per-channel clip at exposed 1.0 becomes a range compression curve with its hue solved in OKLab, and black reaches code 0.");
+
+      RemixGui::Combo("Range Compression", &rangeCompressionObject(), "Neutwo (compresses from mid grey, asymptotic headroom)\0Faithful Luma Shoulder (identity to the knee, white at 3x)\0");
+      ImGui::Indent();
+      if (rangeCompression() == Ue3RangeCompression::Neutwo) {
+        RemixGui::DragFloat("White Clip", &neutwoWhiteClipObject(), 0.1f, 1.f, 100.f, "%.1f", ImGuiSliderFlags_Logarithmic);
+        RemixGui::DragFloat("Contrast", &neutwoContrastObject(), 0.005f, 0.5f, 2.f);
+      } else {
+        RemixGui::DragFloat("Soft Clip Knee", &softClipKneeObject(), 0.005f, 0.05f, 0.99f);
+        RemixGui::DragFloat("Soft Clip White", &softClipWhiteObject(), 0.01f, 1.01f, 16.f);
       }
-      RemixGui::Checkbox("Preserve Grade In Shadows", &gradePreserveBlendObject());
-      if (gradePreserveBlend()) {
-        RemixGui::DragFloat("Grade Preserve Pivot", &gradePreservePivotObject(), 0.005f, 0.f, 1.f);
-        RemixGui::DragFloat("Grade Preserve Slope", &gradePreserveSlopeObject(), 0.01f, 0.1f, 8.f);
-      }
+      ImGui::Unindent();
+
+      RemixGui::DragFloat("Hue Preservation", &huePreservationObject(), 0.01f, 0.f, 1.f);
+      RemixGui::DragFloat("Bezold-Brucke Per Stop (deg)", &bezoldBruckePerStopObject(), 0.05f, 0.f, 10.f);
+      RemixGui::Combo("Hue Reference", &hueReferenceObject(), "Scene\0Approved Look (share of the clip's hue)\0");
+      RemixGui::DragFloat("Highlight Desaturation", &highlightDesaturationObject(), 0.01f, 0.f, 1.f);
       ImGui::Unindent();
     } else {
-      ImGui::TextWrapped("Shoulder disabled: verbatim shipped behavior (per-channel grade, hard clip at scene white).");
-    }
-
-    RemixGui::Checkbox("White Neutrality Correction", &whiteNeutralityObject());
-    if (whiteNeutrality()) {
-      ImGui::Indent();
-      RemixGui::DragFloat("White Luma Start", &whiteLumaStartObject(), 0.005f, 0.f, 1.f);
-      RemixGui::DragFloat("White Luma Range", &whiteLumaRangeObject(), 0.005f, 0.01f, 1.f);
-      RemixGui::DragFloat("White Chroma Start", &whiteChromaStartObject(), 0.005f, 0.f, 1.f);
-      RemixGui::DragFloat("White Chroma Range", &whiteChromaRangeObject(), 0.005f, 0.01f, 1.f);
-      RemixGui::DragFloat("White Neutrality Strength", &whiteNeutralityStrengthObject(), 0.01f, 0.f, 1.f);
-      ImGui::Unindent();
+      ImGui::TextWrapped("Faithful Luma disabled: verbatim shipped TdToneMapping (per-channel clip at exposed 1.0 with its hue shifts, black floor at #020202).");
     }
 
     RemixGui::Separator();
@@ -311,7 +437,7 @@ namespace dxvk {
       RemixGui::DragFloat("Scene Desaturation", &manualSceneDesaturationObject(), 0.005f, 0.f, 1.f);
       RemixGui::DragFloat("Display Gamma", &manualDisplayGammaObject(), 0.01f, 1.f, 3.f);
       RemixGui::DragFloat3("Gamma Color Scale", &manualGammaColorScaleObject(), 0.005f, 0.f, 2.f);
-      RemixGui::Checkbox("Rec.709 Luma Weights For Desaturation", &manualUseRec709LumaWeightsObject());
+      ImGui::TextWrapped("Desaturation uses the shipped 0.3 / 0.59 / 0.11 luminance weights.");
       ImGui::Unindent();
     }
 
@@ -334,6 +460,13 @@ namespace dxvk {
                   c.gammaColorScaleAndInverse.w != 0.f ? 1.f / c.gammaColorScaleAndInverse.w : 0.f);
       ImGui::Text("GammaOverlayColor: %.4f %.4f %.4f",
                   c.gammaOverlayColor.x, c.gammaOverlayColor.y, c.gammaOverlayColor.z);
+      if (c.hasExposureSettings) {
+        ImGui::Text("TdToneMapExposure: Manual %.3f  Low %.3f  High %.3f  dt*min(SpeedUp,2.5) %.5f  dt*min(SpeedDown,3.0) %.5f",
+                    c.exposureSettings.x, c.exposureSettings.z, c.exposureSettings.w,
+                    c.exposureSettings.y, c.maxDeltaDown);
+      } else {
+        ImGui::Text("TdToneMapExposure: not seen");
+      }
       ImGui::Text("Curve textures: %s", c.hasCurves ? "captured" : "not resolved");
       if (c.hasCurves) {
         ImGui::Text("Curve LUT filtering: %s", c.curvePointFiltering ? "point" : "linear");

@@ -117,17 +117,88 @@ Other UE3 titles may upload a different `LocalToWorld` every frame for every dra
 
 ## Mirror's Edge tonemapper and colour curves
 
-Select "Mirror's Edge (UE3)" under Tonemapping in the developer menu, or set:
+The Mirror's Edge game profile selects this mode by default. Elsewhere, select "Mirror's Edge (UE3)" under Tonemapping in the developer menu, or set:
 
 ```
 rtx.tonemappingMode = 2
 ```
 
-This mode applies the game's TdToneMapping display transform to Remix's path-traced HDR: exposure (Remix auto exposure plus `rtx.tonemap.ue3.exposureBias`), the per-channel `SceneShadows` / `SceneHighLights` / `SceneMidTones` grade, desaturation, display gamma (Mirror's Edge authors around 2.0, not stock UE3's 2.2), and per-map colour curves matching the PC shader. Because the output is already display-encoded, the final sRGB pass skips its own conversion. Dithering still applies.
+This mode applies the game's TdToneMapping display transform to Remix's path-traced HDR: exposure (see [Exposure](#exposure)), the per-channel `SceneHighLights` / `SceneShadows` / `SceneMidTones` grade, desaturation and overlay, display gamma, and the per-map colour curves, matching the PC shader. Because the output is already display-encoded, the final sRGB pass skips its own conversion. Dithering still applies.
 
-Pathtraced radiance is unbounded where the original renderer hard-clipped at scene white, so [FaithfulLuma](https://softsoundd.github.io/posts/faithful-luma-overview/) modernisations are enabled by default to correct this.
+### Live capture
 
-The game's curves and grade constants are captured live: with `TdTonemapping` on, the engine blends and uploads them every frame (e.g. curves blending off when entering certain indoor areas). The fork skips that fullscreen pass and forwards the captured data to the tonemapper, giving per-map curves, volume blends, and SKU-adjusted values.
+The game's curves and grade constants are captured live: with `TdTonemapping` on, the engine blends and uploads them every frame (e.g. curves blending off when entering certain indoor areas). The fork skips that fullscreen pass and forwards the captured data to the tonemapper, giving per-map curves, volume blends, and SKU-adjusted values. The `TdToneMapExposure` pass (the 1x1 auto-exposure draw, also skipped) is read as well: its constants carry the current volume's `Scene_ExposureManual`, `Scene_ExposureLow`, `Scene_ExposureHigh` and speed uploads, which feed the exposure meter.
+
+With `TdTonemapping` off no capture arrives; the last capture is held (`rtx.tonemap.ue3.holdStaleCapture`) or the `rtx.tonemap.ue3.manual*` constants apply.
+
+### Exposure
+
+Post-process settings in Mirror's Edge are authored per area: the persistent level's `WorldInfo.DefaultPostProcessSettings` cover the open rooftops, and interiors sit inside `PostProcessVolume`s with their own settings, usually more neutral (identity curves, a small `Scene_HighLights` lift) and their own exposure clamps. The shipped meter is `sqrt(E) = clamp(sqrt(0.25 / L), Scene_ExposureLow, Scene_ExposureHigh)`, so `E` is limited to `[Low^2, High^2]`, and those clamps carry the authored intent: in the Prologue the rooftops run `Low = 0.5, High = 1.5` (`E` in `[0.25, 2.25]`) while the interior volume runs `Low = 0.8` with the default `High = 1.65` (`E` in `[0.64, 2.72]`), so the white city sits exposed down at its floor and the interior may rise to a ceiling 3.4 stops above it. A generic auto exposure cannot see those clamps, and no single exposure window reproduces both areas.
+
+`rtx.tonemap.ue3.exposureModel = MirrorsEdgeMeter` (default) runs the game's own exposure model on Remix's radiance, in a small compute pass before the display transform:
+
+- **Meter.** Remix's linear radiance is scaled into the game's scene units by `rtx.tonemap.ue3.exposureBias` (a scene calibration in EV), then averaged over a 256x256 grid of samples with every channel clamped at 1.0 first, as the shipped fixed-point downsample chain does. Luminosity uses the shipped `0.3 / 0.59 / 0.11` weights; an exact black or NaN mean is replaced with 0.25 as shipped.
+- **Key and clamps.** `sqrt(E) = clamp(sqrt(0.25 / L), Low, High)` with `Low`, `High` and `Scene_ExposureManual` from the live capture of the current volume (`rtx.tonemap.ue3.meterUseCapturedSettings`), or from `rtx.tonemap.ue3.manualExposureLow/High/Manual` (PostProcessVolume defaults 0.85 / 1.65 / 1.0) when no capture is available. The previous exposure is clamped into the current range as shipped, so entering an area with a different range snaps into it and then adapts.
+- **Adaptation.** Faithful Luma's law rather than the shipped quadratic step: movement in stops at `rtx.tonemap.ue3.meterSpeedToLight` / `meterSpeedToDark` that eases in exponentially inside `meterTransitionStops` of the target, frame-rate independent. With `meterHonourLevelSpeeds` the speeds are scaled by the level's `Scene_ExposureSpeedUp/Down` relative to the engine caps (2.5 / 3.0), recovered from the captured `dt * min(speed, cap)` uploads divided by Remix's frame time; the PostProcessVolume defaults exceed the caps, so most areas run at full speed, and a zeroed speed holds the exposure as shipped.
+- **Applied exposure** = `E * Scene_ExposureManual * exp2(exposureBias) * exp2(user brightness EV)`. The calibration is set once, on a reference exterior; every other area then follows its authored clamps.
+
+`RemixAutoExposure` keeps `rtx.autoExposure.*` as the exposure source, with `exposureBias` as a plain bias.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.tonemap.ue3.exposureModel` | MirrorsEdgeMeter | MirrorsEdgeMeter = the game's meter with the captured per-volume clamps; RemixAutoExposure = `rtx.autoExposure` |
+| `rtx.tonemap.ue3.exposureBias` | 0 | Scene calibration in EV (meter), or a plain bias (Remix auto exposure) |
+| `rtx.tonemap.ue3.meterUseCapturedSettings` | True | Take `Low` / `High` / `Manual` from the capture; off or no capture = the manual values |
+| `rtx.tonemap.ue3.manualExposureLow` / `High` / `Manual` | 0.85 / 1.65 / 1.0 | PostProcessVolume defaults |
+| `rtx.tonemap.ue3.meterSpeedToLight` / `meterSpeedToDark` | 12 / 6 | Adaptation in stops per second, exposure falling / rising |
+| `rtx.tonemap.ue3.meterTransitionStops` | 1.5 | Distance from the target inside which the adaptation eases in exponentially |
+| `rtx.tonemap.ue3.meterHonourLevelSpeeds` | True | Scale the speeds by the level's `Scene_ExposureSpeedUp/Down` relative to the engine caps |
+
+### Shipped behaviour
+
+Facts about `TdToneMappingPixelShader.usf` that the transform reproduces (with `rtx.tonemap.ue3.faithfulLuma = False` it is the shipped shader verbatim):
+
+- `saturate(Color * Exposure)` clips each channel at exposed 1.0 before the grade, so anything brighter is flat white and clipped colours shift hue (warm light toward yellow, blue sky toward cyan).
+- `Common.usf` redefines `pow()` as `ClampedPow`, `pow(max(abs(x), 1e-4), y)`. The `abs` folds a base that `SceneShadows` pushed negative back to positive (the shipped shader does not NaN there), and the `1e-4` guard is the entire source of the shipped black floor: the midtone `pow` floors linear at `1e-4` and the gamma `pow` encodes it to `0.01`, i.e. `#020202`.
+- Mirror's Edge maps its brightness slider midpoint to display gamma 2.0 (`SetGamma` is `GammaValue * 1.5 + 1.25`), not stock UE3's 2.2. The captured `GammaColorScaleAndInverse.w` is `1 / DisplayGamma` and is applied as is.
+- The curve lookup's `15/16` is LUT addressing for the 16-texel point-sampled curve textures (segment = `floor(15x)`, texel 15 only at `x = 1`), not an output domain; nothing is divided back out after the lookup. The sampler filter the game bound (point in Mirror's Edge) is matched.
+- Desaturation uses the game's `SceneScaledLuminanceWeights` verbatim; the manual constants path uses the shipped `0.3 / 0.59 / 0.11` weights.
+
+### Faithful Luma
+
+Path-traced radiance is unbounded where the original renderer clipped at exposed 1.0, so `rtx.tonemap.ue3.faithfulLuma` is on by default. It keeps the shipped grade, gamma and curve math and changes the shipped shader only where it loses information:
+
+- **Range compression.** The shipped grade is applied without its clip, then the per-channel clip is replaced by a per-channel curve chosen with `rangeCompression`:
+  - `Neutwo` (default) is the `x / sqrt(x^2 + 1)` family in RenoDX's display-peak / white-clip form, `f(x) = c * x / sqrt(x^2 * (c^2 - 1) + c^2)` with `c = neutwoWhiteClip`: slope 1 at black, near-identity at mid grey, compressing gradually from there and exactly white at `c` (100 by default, effectively the asymptotic curve; lower values give hot sources a true white sooner). `neutwoContrast` is RenoDRT's contrast, a power around mid grey applied to luminance before the curve with chromaticity kept. The curve spends its compression from mid grey up, which suits path-traced radiance: Remix's sky and lights run far past the 3x white the game's raster scene rarely exceeded.
+  - `FaithfulLumaShoulder` is the reference shaders' curve, sized for the game's own range: identity below `softClipKnee` (0.8), slope-continuous at it, exactly 1.0 at `softClipWhite` (3.0), white above, so below the knee the image is the shipped image. All of its compression sits in the last two stops.
+
+  Encoded 8-bit values at gamma 2.0 for the same exposed value:
+
+  | Exposed | Shipped clip | Shoulder (0.8 / 3.0) | Neutwo (clip 100) |
+  | ---: | ---: | ---: | ---: |
+  | 0.18 | 108 | 108 | 107 |
+  | 0.50 | 180 | 180 | 170 |
+  | 1.00 | 255 | 242 | 214 |
+  | 2.00 | 255 | 252 | 241 |
+  | 4.00 | 255 | 255 | 251 |
+  | 8.00 | 255 | 255 | 254 |
+
+- **Hue.** A per-channel curve compresses the peak channel most and shifts hue the way the clip did, only less. The curve's value (peak channel) and saturation (floor over peak) are kept and its HSV hue is solved so the result's OKLab hue matches a target. Within one sextant this is the reference shaders' middle-channel solve; solving the HSV hue keeps it continuous where two channels cross, where a middle-channel solve clamps at the floor and jumps (banding on saturated colours). The target is the scene's hue turned by the Bezold-Brucke shift a dimmer rendering needs (`bezoldBruckePerStop`, degrees per stop the curve darkened the colour, toward yellow or blue by hue region) and, with `hueReference = ApprovedLook` (default), part of the way toward the hue the shipped clip gave the colour, weighted by the share of its luminance above display white that the clip could not show, discounted by the chroma the clip kept. `huePreservation` blends from the curve's own result (0) to the target (1). Neutrals are unchanged, and light sources still blow out to white as their floor channel climbs the curve.
+- **Highlight desaturation** (`highlightDesaturation`, default 0). Over-range colours are desaturated toward their peak channel until their saturation is no higher than `min(graded, 1)` would have had, i.e. the chroma the shipped clip left them. At 1, a sunlit white with every channel over 1.0 is white as shipped rather than the colour of the light; saturated colours and anything at or below 1.0 are unaffected.
+- **Black.** The shipped `1e-4` guard is dropped from the midtone and gamma `pow`, so black reaches code 0. Only encoded values below `0.01` change.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.tonemap.ue3.faithfulLuma` | True | Master toggle; off is the shipped shader verbatim |
+| `rtx.tonemap.ue3.rangeCompression` | Neutwo | Neutwo = compresses from mid grey with asymptotic headroom; FaithfulLumaShoulder = identity to the knee, white at the white point |
+| `rtx.tonemap.ue3.neutwoWhiteClip` | 100 | Neutwo: graded value that lands exactly on display white; 1 is the shipped hard clip |
+| `rtx.tonemap.ue3.neutwoContrast` | 1.0 | Neutwo: power around mid grey on luminance before the curve |
+| `rtx.tonemap.ue3.softClipKnee` | 0.8 | Shoulder: graded value where it starts; identity below |
+| `rtx.tonemap.ue3.softClipWhite` | 3.0 | Shoulder: graded value that reaches display white |
+| `rtx.tonemap.ue3.huePreservation` | 1.0 | 0 = the curve's per-channel hue shifts, 1 = the target hue |
+| `rtx.tonemap.ue3.bezoldBruckePerStop` | 1.5 | Degrees of OKLab hue per stop of curve darkening; 0 disables |
+| `rtx.tonemap.ue3.hueReference` | ApprovedLook | Scene = the scene's hue; ApprovedLook = turned toward the clip's hue by the luminance share the clip could not show |
+| `rtx.tonemap.ue3.highlightDesaturation` | 0.0 | Desaturate over-range colours to the chroma the shipped clip left them |
 
 ## UE3 lightmaps are bypassed
 

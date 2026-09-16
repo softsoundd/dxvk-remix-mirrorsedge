@@ -1956,7 +1956,9 @@ namespace dxvk {
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         autoExposure.getExposureTexture().view,
         rtOutput,
-        autoExposure.enabled());
+        autoExposure.enabled(),
+        GlobalTime::get().deltaTimeMs(),
+        resetToneMapperHistory);
       m_ue3DisplayTransformApplied = true;
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();

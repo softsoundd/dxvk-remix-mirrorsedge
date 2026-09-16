@@ -1191,6 +1191,9 @@ namespace dxvk {
       int16_t toneMapScaledLumaWeightsReg = -1;    // SceneScaledLuminanceWeights
       int16_t toneMapGammaColorScaleReg = -1;      // GammaColorScaleAndInverse
       int16_t toneMapGammaOverlayReg = -1;         // GammaOverlayColor
+      // TdToneMapExposure pass
+      int16_t exposureSettingsReg = -1;            // ExposureSettings (Manual, dt*SpeedUp, Low, High)
+      int16_t maxDeltaDownReg = -1;                // MaxDeltaDown (dt*SpeedDown)
     };
 
     fast_unordered_cache<Ue3ShaderFeatureInfo> m_ue3ShaderFeatureCache;
@@ -1218,9 +1221,15 @@ namespace dxvk {
     std::unordered_map<const D3D9CommonTexture*, Ue3CurveTexels> m_ue3CurveTexelCache;
     bool m_ue3ToneMapCapturedThisFrame = false;
 
+    // TdToneMapExposure constants from the most recent exposure draw, joined into the capture
+    bool m_ue3HasExposureSettings = false;
+    Vector4 m_ue3ExposureSettings = Vector4(0.f, 0.f, 0.f, 0.f);
+    float m_ue3MaxDeltaDown = 0.f;
+
     // Captures the TdToneMapping grade constants + curve texels once per
     // frame at the (not raytraced) tonemap draw and forwards them to the
-    // renderer.
+    // renderer; records the TdToneMapExposure constants when that pass is
+    // the current draw.
     void maybeCaptureUe3ToneMapState();
 
     struct Ue3VsShaderCtabInfo {

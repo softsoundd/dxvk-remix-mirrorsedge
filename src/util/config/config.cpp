@@ -123,6 +123,7 @@ namespace dxvk {
     /* Mirror's Edge (2008)                       */
     { R"(\\MirrorsEdge\.exe$)", {{
       { "rtx.d3d9.ue3EngineMode",                                    "True" },
+      { "rtx.tonemappingMode",                                       "2" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",            "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
       { "rtx.d3d9.ue3ExactVertexCapture",                            "True" },

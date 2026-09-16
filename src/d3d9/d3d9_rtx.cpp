@@ -5007,6 +5007,10 @@ namespace dxvk {
             info.toneMapGammaColorScaleReg = int16_t(registerIndex);
           } else if (lowerName == "gammaoverlaycolor") {
             info.toneMapGammaOverlayReg = int16_t(registerIndex);
+          } else if (lowerName == "exposuresettings") {
+            info.exposureSettingsReg = int16_t(registerIndex);
+          } else if (lowerName == "maxdeltadown") {
+            info.maxDeltaDownReg = int16_t(registerIndex);
           }
         }
       };
@@ -5764,7 +5768,7 @@ namespace dxvk {
   }
 
   void D3D9Rtx::maybeCaptureUe3ToneMapState() {
-    if (m_ue3ToneMapCapturedThisFrame || !m_frameOptions.ue3EngineMode) {
+    if (!m_frameOptions.ue3EngineMode) {
       return;
     }
 
@@ -5778,6 +5782,28 @@ namespace dxvk {
     }
 
     const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+
+    // The TdToneMapExposure draw (ExposureSettings + MaxDeltaDown, no curve samplers) precedes
+    // the tonemap draw, so it is recognised ahead of the once-per-frame tonemap gate. Its
+    // constants are the current PostProcessVolume's exposure clamps and speeds, joined into the
+    // tonemap capture below for the Mirror's Edge exposure meter.
+    if (psInfo.exposureSettingsReg >= 0 && psInfo.exposureSettingsReg < int16_t(caps::MaxFloatConstantsPS) &&
+        psInfo.colorCurvesKSamplerIndex >= caps::MaxTexturesPS) {
+      m_ue3ExposureSettings = d3d9State().psConsts.fConsts[psInfo.exposureSettingsReg];
+      if (psInfo.maxDeltaDownReg >= 0 && psInfo.maxDeltaDownReg < int16_t(caps::MaxFloatConstantsPS)) {
+        m_ue3MaxDeltaDown = d3d9State().psConsts.fConsts[psInfo.maxDeltaDownReg].x;
+      }
+      if (!m_ue3HasExposureSettings) {
+        Logger::info(str::format("[RTX-UE3-Tonemap] Captured TdToneMapExposure settings (Manual=", m_ue3ExposureSettings.x,
+                                 " Low=", m_ue3ExposureSettings.z, " High=", m_ue3ExposureSettings.w, ")."));
+      }
+      m_ue3HasExposureSettings = true;
+      return;
+    }
+
+    if (m_ue3ToneMapCapturedThisFrame) {
+      return;
+    }
 
     // Only the TdToneMapping pass declares ColorCurvesK/M; require those sampler
     // indices so UberPostProcessBlend (grade+gamma only) cannot lock out capture.
@@ -5803,6 +5829,10 @@ namespace dxvk {
     readConstant(psInfo.toneMapGammaColorScaleReg, capture.gammaColorScaleAndInverse);
     readConstant(psInfo.toneMapGammaOverlayReg, capture.gammaOverlayColor);
     capture.hasConstants = true;
+
+    capture.hasExposureSettings = m_ue3HasExposureSettings;
+    capture.exposureSettings = m_ue3ExposureSettings;
+    capture.maxDeltaDown = m_ue3MaxDeltaDown;
 
     const auto resolveCurveTexels = [&](const uint8_t samplerIndex, std::array<Vector4, kUe3CurveTexelCount>& target) {
       if (samplerIndex >= caps::MaxTexturesPS) {
