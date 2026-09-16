@@ -1339,7 +1339,6 @@ namespace dxvk {
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
 
     m_common->metaSparseRendering().setSparseRenderingArgs(*this, constants.sparseRenderingArgs);
-    constants.sparseRenderingArgs.nrcArgs = constants.nrcArgs;
 
     auto* cameraTeleportDirectionInfo = getSceneManager().getRayPortalManager().getCameraTeleportationRayPortalDirectionInfo();
     constants.teleportationPortalIndex = cameraTeleportDirectionInfo ? cameraTeleportDirectionInfo->entryPortalInfo.portalIndex + 1 : 0;
@@ -2763,7 +2762,7 @@ namespace dxvk {
     if (!TerrainBaker::debugDisableBaking()) {
 
       // Retrieve the replacement material
-      MaterialData* replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
+      std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
 
       if (replacementMaterial) {
         if (replacementMaterial->getType() == MaterialDataType::Opaque) {
@@ -2827,7 +2826,7 @@ namespace dxvk {
 
     // Grab and apply replacement texture if any
     // NOTE: only the original color texture will be replaced with albedo-opacity texture
-    MaterialData* replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
+    std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
     bool replacemenIsLDR = false;
     Rc<DxvkImageView> replacementTexture = {};
     uint32_t replacementTextureSlot = UINT32_MAX;

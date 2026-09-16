@@ -63,7 +63,8 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
       bool active = false;
       if (inBounds)
       {
-        active = isActivePixelFromSamplingRate(pixelCoordinate, PixelSamplingRate[pixelCoordinate], cb.sparseRenderingArgs, cb.frameIdx);
+        const float rate = PixelSamplingRate[pixelCoordinate];
+        active = isActivePixelFromSamplingRate(pixelCoordinate, rate, cb.sparseRenderingArgs, cb.frameIdx);
       }
 
       const uint bitIndex = y * ACTIVE_PIXEL_MASK_BLOCK_WIDTH + x;

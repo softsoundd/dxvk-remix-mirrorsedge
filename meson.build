@@ -201,11 +201,20 @@ else
   nrc_include_path = 'submodules/nrc/include'
 endif
 
+nsight_graphics_capture_supported = target_machine.cpu_family() == 'x86_64'
+if nsight_graphics_capture_supported
+  add_project_arguments('-DDXVK_ENABLE_NSIGHT_GRAPHICS_CAPTURE=1', language : 'cpp')
+endif
+
 dxvk_include_dirs = [
   './include',
   './include/vulkan/include',
   nrc_include_path
 ]
+
+if nsight_graphics_capture_supported
+  dxvk_include_dirs += './external/nsight_graphics/include'
+endif
 
 dxvk_include_path = include_directories(dxvk_include_dirs)
 dxvk_shader_include_path = include_directories('./src/dxvk/shaders')
@@ -521,23 +530,13 @@ add_project_arguments('-DVK_ENABLE_BETA_EXTENSIONS', language : 'cpp')
 
 # External dependencies configuration
 # Configures Sentry, USD include/lib paths, MDL includes and the RTX IO dependency.
-# (NVAPI, Reflex, Aftermath, DLSS, DLFG, NRD, NRC and XeSS are configured below,
-#  as they carry Windows-on-Arm specific handling.)
+# (Reflex, NRD, NRC and XeSS are configured below)
 subdir('external-build')
 
 # This will be populated by the usd plugin builder
 usd_plugins = []
 usd_plugin_deps = []
 usd_plugin_delay_load_args = []
-
-nvapi_include_paths = include_directories('submodules/nvapi')
-if dxvk_is_woa
-  nvapi_lib_path = join_paths(global_src_root_norm, 'external/nvapi_arm64/arm64')
-  nvapi_lib = dxvk_compiler.find_library('nvapia64', dirs : nvapi_lib_path)
-else
-  nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi/amd64')
-  nvapi_lib = dxvk_compiler.find_library('nvapi64', dirs : nvapi_lib_path)
-endif
 
 # Cache lib locations
 external_dll_paths += usd_lib_path
@@ -582,34 +581,6 @@ endif
 external_dll_paths += reflex_lib_path
 reflex_lib = dxvk_compiler.find_library('NvLowLatencyVk', dirs : reflex_lib_path)
 
-if dxvk_is_woa
-  aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath_arm64/lib/arm64/')
-  external_dll_paths += aftermath_lib_path
-  aftermath_lib = dxvk_compiler.find_library('GFSDK_Aftermath_Lib.arm64', dirs : aftermath_lib_path)
-  aftermath_include_path = include_directories( 'external/aftermath_arm64/include')
-else
-  aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath/lib/x64/')
-  external_dll_paths += aftermath_lib_path
-  aftermath_lib = dxvk_compiler.find_library('GFSDK_Aftermath_Lib.x64', dirs : aftermath_lib_path)
-  aftermath_include_path = include_directories( 'external/aftermath/include')
-endif
-
-# this is repeated below, since we overwrite dlss_lib_path in src/dxvk/meson.build for some reason
-if dxvk_is_woa
-  dlss_root_path = 'external/ngx_sdk_dldn_arm64'
-  dlfg_root_path = 'external/ngx_sdk_dlfg_arm64'
-  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_arm64/rel/')
-  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_arm64/rel/')
-else
-  dlss_root_path = 'external/ngx_sdk_dldn'
-  dlfg_root_path = 'external/ngx_sdk_dlfg'
-  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
-  dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_x86_64/rel/')
-endif
-
-external_dll_paths += dlss_lib_path
-external_dll_paths += dlfg_lib_path
-
 nrc_dll_name = 'NRC_Vulkan.dll'
 if dxvk_is_woa
   nrc_dll_path = join_paths(global_src_root_norm, 'external/nrc_arm64/bin/')
@@ -635,16 +606,6 @@ reflex_dep = declare_dependency(
   dependencies : [ reflex_lib ],
   include_directories : reflex_include_path
 )
-
-aftermath_dep = declare_dependency(
-    dependencies : [ aftermath_lib ],
-    include_directories : aftermath_include_path
-  )
-
-nvapi_dep = declare_dependency(
-    dependencies : [ nvapi_lib ],
-    include_directories : nvapi_include_paths
-  )
 
 embedded_includes = [ mdl_include_dir ]
 
@@ -688,19 +649,6 @@ if dxvk_is_ninja or dxvk_is_woa_ec
   fs.read('vsgen/testcase_project.vcxproj.user.template')
   fs.read('vsgen/testcase_project.args.json.template')
   fs.read('vsgen/vsutil.py')
-
-  # ... and now we do this again, because src/dxvk/meson.build overwrites this for some reason
-  if dxvk_is_woa
-    dlss_root_path = 'external/ngx_sdk_dldn_arm64'
-    dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_arm64/rel/')
-    dlfg_root_path = 'external/ngx_sdk_dlfg_arm64'
-    dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_arm64/rel/')
-  else
-    dlss_root_path = 'external/ngx_sdk_dldn'
-    dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
-    dlfg_root_path = 'external/ngx_sdk_dlfg'
-    dlfg_lib_path = join_paths(global_src_root_norm, dlfg_root_path, 'lib/Windows_x86_64/rel/')
-  endif
 
   # meson seems to force / as the path separator in custom_target
   # ... except in the case where the path separators are inconsistent, in which case it does nothing
@@ -832,18 +780,13 @@ if dxvk_is_ninja or dxvk_is_woa_ec
       install_data(join_paths(xess_dll_path, 'libxess.dll'), install_dir : output_path, install_tag: target_suffix)
     endif
 
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(dlss_lib_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
-
-    install_data(join_paths(dlfg_lib_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlss_bin_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlss_bin_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlss_bin_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix) 
 
     install_data(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'), install_dir : output_path, install_tag: target_suffix) 
 
-    if dxvk_is_woa
-      install_data(join_paths(aftermath_lib_path, 'GFSDK_Aftermath_Lib.arm64.dll'), install_dir : output_path, install_tag: target_suffix) 
-    else
-      install_data(join_paths(aftermath_lib_path, 'GFSDK_Aftermath_Lib.x64.dll'), install_dir : output_path, install_tag: target_suffix)
-    endif
+    install_data(aftermath_binary, install_dir : output_path, install_tag: target_suffix)
 
     if enable_rtxio == true
       install_data(join_paths(rtxio_bin_path, 'rtxio.dll'), install_dir : output_path, install_tag: target_suffix)

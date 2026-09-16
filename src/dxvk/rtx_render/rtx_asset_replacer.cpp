@@ -25,6 +25,7 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "rtx_context.h"
+#include "rtx_initializer.h"
 #include "rtx_options.h"
 #include "rtx_utils.h"
 #include "rtx_asset_data_manager.h"
@@ -33,14 +34,13 @@ namespace dxvk {
 
 void AssetReplacements::logAnchorSummary(const std::string& modName) const {
   std::lock_guard<sync::Spinlock> lock(m_spinlock);
-  // Note: mesh/light anchors are registered asynchronously after their upload command
-  // list completes on the GPU (addReplacementsSync), so counts logged at processUSD end
-  // only cover what has landed so far - typically just the synchronously stored materials.
+  // Counts the live table after applyPendingRebuild mergeFrom, so mesh/light
+  // buckets and materials published this load/reload are all included.
   Logger::info(str::format(
-    "[RTX-ReplacementResolve] Mod '", modName, "' anchors registered so far: ",
+    "[RTX-ReplacementResolve] Mod '", modName, "' anchors registered: ",
     m_meshReplacers.size(), " mesh, ",
     m_lightReplacers.size(), " light, ",
-    m_materials.size(), " material (mesh/light anchors may still register asynchronously after GPU sync)."));
+    m_materials.size(), " material."));
 
   if (!RtxOptions::logReplacementResolution()) {
     return;
@@ -66,7 +66,7 @@ void AssetReplacements::logAnchorSummary(const std::string& modName) const {
   dump("material", m_materials);
 }
 
-std::vector<AssetReplacement>* AssetReplacer::getReplacementsForMesh(XXH64_hash_t hash) {
+std::shared_ptr<const ReplacementBucket> AssetReplacer::getReplacementsForMesh(XXH64_hash_t hash) {
   if (!RtxOptions::getEnableReplacementMeshes())
     return nullptr;
 
@@ -85,7 +85,7 @@ std::vector<AssetReplacement>* AssetReplacer::getReplacementsForMesh(XXH64_hash_
   return nullptr;
 }
 
-std::vector<AssetReplacement>* AssetReplacer::getReplacementsForLight(XXH64_hash_t hash) {
+std::shared_ptr<const ReplacementBucket> AssetReplacer::getReplacementsForLight(XXH64_hash_t hash) {
   if (!RtxOptions::getEnableReplacementLights())
     return nullptr;
 
@@ -98,13 +98,13 @@ std::vector<AssetReplacement>* AssetReplacer::getReplacementsForLight(XXH64_hash
   return nullptr;
 }
 
-MaterialData* AssetReplacer::getReplacementMaterial(XXH64_hash_t hash) {
+std::shared_ptr<MaterialData> AssetReplacer::getReplacementMaterial(XXH64_hash_t hash) {
   if (!RtxOptions::getEnableReplacementMaterials())
     return nullptr;
 
   for (auto& mod : m_modManager.mods()) {
-    MaterialData* material;
-    if (mod->replacements().getObject(hash, material)) {
+    std::shared_ptr<MaterialData> material;
+    if (mod->replacements().getMaterial(hash, material)) {
       return material;
     }
   }
@@ -114,6 +114,12 @@ MaterialData* AssetReplacer::getReplacementMaterial(XXH64_hash_t hash) {
 
 void AssetReplacer::initialize(const Rc<DxvkContext>& context) {
   for (auto& mod : m_modManager.mods()) {
+    // Each mod cancels internally too; this stops us starting the next one. Returning
+    // rather than breaking skips the secret-replacement pass, which has nothing to do
+    // over a mod set we deliberately stopped populating.
+    if (m_modManager.isLoadingCancelled()) {
+      return;
+    }
     mod->load(context);
   }
   updateSecretReplacements();
@@ -132,19 +138,33 @@ bool AssetReplacer::checkForChanges(const Rc<DxvkContext>& context) {
   return changed;
 }
 
-bool AssetReplacer::areAllReplacementsLoaded() const {
-  for (auto& mod : m_modManager.mods()) {
-    if (mod->state().progressState != Mod::ProgressState::Loaded) {
-      return false;
-    }
-  }
+bool AssetReplacer::applyPendingRebuilds(const Rc<DxvkContext>& context, AssetChanges& changes) {
+  ScopedCpuProfileZone();
 
-  return true;
+  bool applied = false;
+  for (auto& mod : m_modManager.mods()) {
+    applied |= mod->applyPendingRebuild(context, changes);
+  }
+  if (applied) {
+    updateSecretReplacements();
+  }
+  return applied;
+}
+
+void AssetReplacer::onDestroy() {
+  for (auto& mod : m_modManager.mods()) {
+    mod->onDestroy();
+  }
+}
+
+bool AssetReplacer::hasAnyMods() const {
+  return !m_modManager.mods().empty();
 }
 
 std::vector<Mod::State> AssetReplacer::getReplacementStates() const {
   const auto& mods = m_modManager.mods();
-  std::vector<Mod::State> modStates(mods.size());
+  std::vector<Mod::State> modStates;
+  modStates.reserve(mods.size());
 
   for (auto& mod : mods) {
     modStates.emplace_back(mod->state());
@@ -153,10 +173,26 @@ std::vector<Mod::State> AssetReplacer::getReplacementStates() const {
   return modStates;
 }
 
+void AssetReplacer::requestReload() {
+  for (auto& mod : m_modManager.mods()) {
+    mod->requestReload();
+  }
+}
+
+bool AssetReplacer::isReloadPending() const {
+  for (auto& mod : m_modManager.mods()) {
+    const auto p = mod->state();
+    if (mod->isReloadRequested() || (p.progressState != Mod::ProgressState::Unloaded && p.progressState != Mod::ProgressState::Loaded)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 void AssetReplacer::updateSecretReplacements() {
   bool updated = false;
 
-  m_variantInfos.clear();
   m_secretReplacements.clear();
 
   for (auto& mod : m_modManager.mods()) {
@@ -180,13 +216,28 @@ void AssetReplacer::updateSecretReplacements() {
           }
         );
 
-        auto& numVariants = m_variantInfos[secrets.first].numVariants;
-        numVariants = std::max(secret.variantId, numVariants);
-
         updated = true;
       }
     }
   }
+
+  // Selected variants are user state keyed by asset hash, not data derived from the mod
+  // tables, so they outlive a reload. Drop only selections whose variant is gone.
+  m_variantInfos.erase_if([this](const auto& it) {
+    if (it->second.selectedVariant == VariantInfo::kDefaultVariant) {
+      return false;
+    }
+    const auto secrets = m_secretReplacements.find(it->first);
+    if (secrets == m_secretReplacements.end()) {
+      return true;
+    }
+    for (const auto& secret : secrets->second) {
+      if (secret.variantId == it->second.selectedVariant) {
+        return false;
+      }
+    }
+    return true;
+  });
 
   m_bSecretReplacementsUpdated = updated;
 }
@@ -229,16 +280,16 @@ void AssetReplacer::registerExternalMesh(remixapi_MeshHandle handle, std::vector
     return;
   }
 
-  m_extMeshes.emplace(handle, std::make_unique< std::vector<RasterGeometry>>(std::move(submeshes)));
+  m_extMeshes.emplace(handle, std::make_shared<std::vector<RasterGeometry>>(std::move(submeshes)));
 }
 
-const std::vector<RasterGeometry>& AssetReplacer::accessExternalMesh(remixapi_MeshHandle handle) const {
+std::shared_ptr<const std::vector<RasterGeometry>> AssetReplacer::accessExternalMesh(remixapi_MeshHandle handle) const {
   auto found = m_extMeshes.find(handle);
   if (found == m_extMeshes.end()) {
-    static const auto s_empty = std::vector<RasterGeometry> {};
+    static const auto s_empty = std::make_shared<const std::vector<RasterGeometry>>();
     return s_empty;
   }
-  return *found->second;
+  return found->second;
 }
 
 void AssetReplacer::destroyExternalMesh(remixapi_MeshHandle handle) {

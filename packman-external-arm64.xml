@@ -28,23 +28,14 @@
     <dependency name="usd_release" linkPath="external/usd_stock_arm64/release">
       <package name="open_usd" version="25.11+265538d9-windows-aarch64-release-nopython"/>
     </dependency>
-    <dependency name="aftermath_arm64" linkPath="external/aftermath_arm64">
-        <package name="aftermath_arm64" version="1" />
-    </dependency>
-    <dependency name="ngx_sdk_dlfg_arm64" linkPath="external/ngx_sdk_dlfg_arm64">
-        <package name="ngx_sdk_dlfg_arm64" version="1" />
-    </dependency>
-    <dependency name="ngx_sdk_dldn_arm64" linkPath="external/ngx_sdk_dldn_arm64">
-        <package name="ngx_sdk_dldn_arm64" version="1" />
+    <dependency name="aftermath" linkPath="external/aftermath">
+        <package name="rtx-remix-aftermath" version="2026.3.0.26197" />
     </dependency>
     <dependency name="nrc_arm64" linkPath="external/nrc_arm64">
         <package name="nrc_arm64" version="2" />
     </dependency>
     <dependency name="nrd_arm64" linkPath="external/nrd_arm64">
         <package name="nrd_arm64" version="1" />
-    </dependency>
-    <dependency name="nvapi_arm64" linkPath="external/nvapi_arm64">
-        <package name="nvapi_arm64" version="1" />
     </dependency>
     <dependency name="reflex_arm64" linkPath="external/reflex_arm64">
         <package name="reflex_arm64" version="1" />

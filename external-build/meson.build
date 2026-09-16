@@ -3,7 +3,7 @@
 # that are not managed by the version control system (external/)
 # and third-party submodules (submodules/).
 #
-# NOTE: NVAPI, Reflex, Aftermath, DLSS, DLFG, NRD, NRC and XeSS are configured
+# NOTE: NVAPI, Reflex, DLSS, DLFG, NRD, NRC and XeSS are configured
 # directly in the root meson.build, as they carry Windows-on-Arm (dxvk_is_woa)
 # specific handling that selects between x64 and arm64 binaries.
 
@@ -129,3 +129,62 @@ endif
 # Materials and Shaders
 # ============================================================================
 mdl_include_dir = include_directories('../external/omni_core_materials')
+
+# ============================================================================
+# Aftermath
+# ============================================================================
+aftermath_platform = dxvk_is_woa ? 'arm64' : 'x64'
+aftermath_lib_path = join_paths(global_src_root_norm, 'external/aftermath/lib/' + aftermath_platform)
+external_dll_paths += aftermath_lib_path
+aftermath_lib = dxvk_compiler.find_library('GFSDK_Aftermath_Lib.' + aftermath_platform, dirs : aftermath_lib_path)
+aftermath_include_path = include_directories('../external/aftermath/include')
+aftermath_binary = join_paths(aftermath_lib_path, 'GFSDK_Aftermath_Lib.' + aftermath_platform + '.dll')
+
+aftermath_dep = declare_dependency(
+  dependencies : [ aftermath_lib ],
+  include_directories : aftermath_include_path
+)
+
+# ============================================================================
+# DLSS SDK
+# ============================================================================
+dlss_root_path = 'submodules/dlss'
+if dxvk_is_woa
+  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_aarch64/')
+  dlss_bin_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_aarch64/rel/')
+else
+  dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/x64/')
+  dlss_bin_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/rel/')
+endif
+
+external_dll_paths += dlss_lib_path
+
+dlss_include_dir = include_directories(join_paths('..', dlss_root_path, 'include'))
+cc = meson.get_compiler('c')
+dlss_lib_name = 'nvsdk_ngx_d'
+if get_option('buildtype') == 'debug'
+  dlss_lib_name = 'nvsdk_ngx_d_dbg'
+endif
+dlss_lib = cc.find_library(dlss_lib_name, dirs : dlss_lib_path)
+dlss_dep = declare_dependency(
+  dependencies : [ dlss_lib ],
+  include_directories : [ dlss_include_dir ]
+)
+
+# ============================================================================
+# NVAPI
+# ============================================================================
+nvapi_include_paths = include_directories('../submodules/nvapi')
+
+if dxvk_is_woa
+  nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi/aarch64')
+  nvapi_lib = dxvk_compiler.find_library('nvapia64', dirs : nvapi_lib_path)
+else
+  nvapi_lib_path = join_paths(global_src_root_norm, 'submodules/nvapi/amd64')
+  nvapi_lib = dxvk_compiler.find_library('nvapi64', dirs : nvapi_lib_path)
+endif
+
+nvapi_dep = declare_dependency(
+  dependencies : [ nvapi_lib ],
+  include_directories : nvapi_include_paths
+)
