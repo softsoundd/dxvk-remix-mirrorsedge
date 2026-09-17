@@ -126,6 +126,9 @@ namespace dxvk {
      */
     void bindRenderTargets(
       const DxvkRenderTargets&    targets);
+
+    void bindRenderTargets(
+            DxvkRenderTargets&&   targets);
     
     /**
      * \brief Binds indirect argument buffer
@@ -150,6 +153,10 @@ namespace dxvk {
     void bindIndexBuffer(
       const DxvkBufferSlice&      buffer,
             VkIndexType           indexType);
+
+    void bindIndexBuffer(
+            DxvkBufferSlice&&     buffer,
+            VkIndexType           indexType);
     
     /**
      * \brief Binds buffer as a shader resource
@@ -161,6 +168,10 @@ namespace dxvk {
     void bindResourceBuffer(
             uint32_t              slot,
       const DxvkBufferSlice&      buffer);
+
+    void bindResourceBuffer(
+            uint32_t              slot,
+            DxvkBufferSlice&&     buffer);
     
     /**
      * \brief Binds image or buffer view
@@ -176,6 +187,11 @@ namespace dxvk {
             uint32_t              slot,
       const Rc<DxvkImageView>&    imageView,
       const Rc<DxvkBufferView>&   bufferView);
+
+    void bindResourceView(
+            uint32_t              slot,
+            Rc<DxvkImageView>&&   imageView,
+            Rc<DxvkBufferView>&&  bufferView);
     
     /**
      * \brief Binds image sampler
@@ -188,6 +204,10 @@ namespace dxvk {
     void bindResourceSampler(
             uint32_t              slot,
       const Rc<DxvkSampler>&      sampler);
+
+    void bindResourceSampler(
+            uint32_t              slot,
+            Rc<DxvkSampler>&&     sampler);
 
     /**
      * \brief Binds acceleration structure
@@ -217,6 +237,10 @@ namespace dxvk {
     void bindShader(
             VkShaderStageFlagBits stage,
       const Rc<DxvkShader>&       shader);
+
+    void bindShader(
+            VkShaderStageFlagBits stage,
+            Rc<DxvkShader>&&      shader);
     
     /**
      * \brief Binds vertex buffer
@@ -228,6 +252,11 @@ namespace dxvk {
     void bindVertexBuffer(
             uint32_t              binding,
       const DxvkBufferSlice&      buffer,
+            uint32_t              stride);
+
+    void bindVertexBuffer(
+            uint32_t              binding,
+            DxvkBufferSlice&&     buffer,
             uint32_t              stride);
     
     /**

@@ -2815,13 +2815,13 @@ namespace dxvk {
         cInstanceCount = GetInstanceCount(),
         cStride = VertexStreamZeroStride,
         cDrawCall = bool(drawPrepare & PrepareDrawFlag::OriginalDrawCall)
-      ](DxvkContext* ctx) {
+      ](DxvkContext* ctx) mutable {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
         ApplyPrimitiveType(ctx, cPrimType);
 
         ctx->setPushConstantBank(DxvkPushConstantBank::D3D9);
-        ctx->bindVertexBuffer(0, cBufferSlice, cStride);
+        ctx->bindVertexBuffer(0, std::move(cBufferSlice), cStride);
         if (cDrawCall) {
           ScopedGpuProfileZone(ctx, "D3D9 draw");
           ctx->draw(drawInfo.vertexCount, drawInfo.instanceCount, 0, 0);
@@ -3433,7 +3433,9 @@ namespace dxvk {
     if (unlikely(ShouldRecord()))
       return m_recorder->SetStreamSourceFreq(StreamNumber, Setting);
 
-    if (m_state.streamFreq[StreamNumber] == Setting)
+    const UINT oldSetting = m_state.streamFreq[StreamNumber];
+
+    if (oldSetting == Setting)
       return D3D_OK;
 
     m_state.streamFreq[StreamNumber] = Setting;
@@ -3443,7 +3445,10 @@ namespace dxvk {
     else
       m_instancedData &= ~(1u << StreamNumber);
 
-    m_flags.set(D3D9DeviceFlag::DirtyInputLayout);
+    // If neither the previous nor the new setting is instance data, the
+    // change only affects the instance count, not the input layout.
+    if ((oldSetting | Setting) & D3DSTREAMSOURCE_INSTANCEDATA)
+      m_flags.set(D3D9DeviceFlag::DirtyInputLayout);
 
     return D3D_OK;
   }
@@ -6266,8 +6271,8 @@ namespace dxvk {
     // Create and bind the framebuffer object to the context
     EmitCs([
       cAttachments = std::move(attachments)
-    ] (DxvkContext* ctx) {
-      ctx->bindRenderTargets(cAttachments);
+    ] (DxvkContext* ctx) mutable {
+      ctx->bindRenderTargets(std::move(cAttachments));
     });
   }
 
@@ -6637,8 +6642,8 @@ namespace dxvk {
     EmitCs([
       cSlot = slot,
       cImageView = commonTex->GetSampleView(srgb)
-    ](DxvkContext* ctx) {
-      ctx->bindResourceView(cSlot, cImageView, nullptr);
+    ](DxvkContext* ctx) mutable {
+      ctx->bindResourceView(cSlot, std::move(cImageView), nullptr);
     });
   }
 
@@ -6917,8 +6922,8 @@ namespace dxvk {
     ScopedCpuProfileZone();
     EmitCs([
       cShader = pShaderModule->GetShader(Permutation)
-    ] (DxvkContext* ctx) {
-      ctx->bindShader(GetShaderStage(ShaderStage), cShader);
+    ] (DxvkContext* ctx) mutable {
+      ctx->bindShader(GetShaderStage(ShaderStage), std::move(cShader));
     });
   }
 
@@ -7048,8 +7053,8 @@ namespace dxvk {
           pBuffer->GetCommonBuffer()->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>(Offset)
         : DxvkBufferSlice(),
       cStride       = pBuffer != nullptr ? Stride : 0
-    ] (DxvkContext* ctx) {
-      ctx->bindVertexBuffer(cSlotId, cBufferSlice, cStride);
+    ] (DxvkContext* ctx) mutable {
+      ctx->bindVertexBuffer(cSlotId, std::move(cBufferSlice), cStride);
     });
   }
 
@@ -7066,8 +7071,8 @@ namespace dxvk {
     EmitCs([
       cBufferSlice = buffer != nullptr ? buffer->GetBufferSlice<D3D9_COMMON_BUFFER_TYPE_REAL>() : DxvkBufferSlice(),
       cIndexType   = indexType
-    ](DxvkContext* ctx) {
-      ctx->bindIndexBuffer(cBufferSlice, cIndexType);
+    ](DxvkContext* ctx) mutable {
+      ctx->bindIndexBuffer(std::move(cBufferSlice), cIndexType);
     });
   }
 
@@ -7209,6 +7214,18 @@ namespace dxvk {
       }
     }
 
+    // Only mark the constant set dirty if any value actually changed, so that
+    // draws which re-set identical constants do not re-upload them.
+    const bool changed = UpdateStateConstants<ProgramType, ConstantType, T>(
+      &m_state,
+      StartRegister,
+      pConstantData,
+      Count,
+      m_d3d9Options.d3d9FloatEmulation == D3D9FloatEmulation::Enabled);
+
+    if (!changed)
+      return D3D_OK;
+
     if constexpr (ConstantType != D3D9ConstantType::Bool) {
       uint32_t maxCount = ConstantType == D3D9ConstantType::Float
         ? m_consts[ProgramType].meta.maxConstIndexF
@@ -7220,13 +7237,6 @@ namespace dxvk {
         m_consts[DxsoProgramType::VertexShader].dirty |= StartRegister < m_consts[ProgramType].meta.maxConstIndexB;
       }
     }
-
-    UpdateStateConstants<ProgramType, ConstantType, T>(
-      &m_state,
-      StartRegister,
-      pConstantData,
-      Count,
-      m_d3d9Options.d3d9FloatEmulation == D3D9FloatEmulation::Enabled);
 
     return D3D_OK;
   }

@@ -192,6 +192,22 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::bindRenderTargets(
+    DxvkRenderTargets&& targets) {
+    ScopedCpuProfileZone();
+    m_state.om.renderTargets = std::move(targets);
+
+    this->resetRenderPassOps(
+      m_state.om.renderTargets,
+      m_state.om.renderPassOps);
+
+    if (!m_state.om.framebufferInfo.hasTargets(m_state.om.renderTargets))
+      m_flags.set(DxvkContextFlag::GpDirtyFramebuffer);
+    else
+      m_flags.clr(DxvkContextFlag::GpDirtyFramebuffer);
+  }
+
+
   void DxvkContext::bindDrawBuffers(
     const DxvkBufferSlice& argBuffer,
     const DxvkBufferSlice& cntBuffer) {
@@ -211,6 +227,20 @@ namespace dxvk {
       m_vbTracked.clr(MaxNumVertexBindings);
 
     m_state.vi.indexBuffer = buffer;
+    m_state.vi.indexType = indexType;
+
+    m_flags.set(DxvkContextFlag::GpDirtyIndexBuffer);
+  }
+
+
+  void DxvkContext::bindIndexBuffer(
+    DxvkBufferSlice&&     buffer,
+    VkIndexType           indexType) {
+    ScopedCpuProfileZone();
+    if (!m_state.vi.indexBuffer.matchesBuffer(buffer))
+      m_vbTracked.clr(MaxNumVertexBindings);
+
+    m_state.vi.indexBuffer = std::move(buffer);
     m_state.vi.indexType = indexType;
 
     m_flags.set(DxvkContextFlag::GpDirtyIndexBuffer);
@@ -245,6 +275,34 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::bindResourceBuffer(
+    uint32_t              slot,
+    DxvkBufferSlice&&     buffer) {
+    ScopedCpuProfileZone();
+    bool needsUpdate = !m_rc[slot].bufferSlice.matchesBuffer(buffer);
+
+    if (likely(needsUpdate))
+      m_rcTracked.clr(slot);
+    else
+      needsUpdate = m_rc[slot].bufferSlice.length() != buffer.length();
+
+    if (likely(needsUpdate)) {
+      m_flags.set(
+        DxvkContextFlag::CpDirtyResources,
+        DxvkContextFlag::GpDirtyResources,
+        DxvkContextFlag::RpDirtyResources);
+    }
+    else {
+      m_flags.set(
+        DxvkContextFlag::CpDirtyDescriptorBinding,
+        DxvkContextFlag::GpDirtyDescriptorBinding,
+        DxvkContextFlag::RpDirtyDescriptorBinding);
+    }
+
+    m_rc[slot].bufferSlice = std::move(buffer);
+  }
+
+
   void DxvkContext::bindResourceView(
     uint32_t              slot,
     const Rc<DxvkImageView>& imageView,
@@ -264,11 +322,44 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::bindResourceView(
+    uint32_t              slot,
+    Rc<DxvkImageView>&&   imageView,
+    Rc<DxvkBufferView>&&  bufferView) {
+    ScopedCpuProfileZone();
+    m_rc[slot].bufferSlice = bufferView != nullptr
+      ? bufferView->slice()
+      : DxvkBufferSlice();
+    m_rc[slot].imageView = std::move(imageView);
+    m_rc[slot].bufferView = std::move(bufferView);
+    m_rcTracked.clr(slot);
+
+    m_flags.set(
+      DxvkContextFlag::CpDirtyResources,
+      DxvkContextFlag::GpDirtyResources,
+      DxvkContextFlag::RpDirtyResources);
+  }
+
+
   void DxvkContext::bindResourceSampler(
     uint32_t              slot,
     const Rc<DxvkSampler>& sampler) {
     ScopedCpuProfileZone();
     m_rc[slot].sampler = sampler;
+    m_rcTracked.clr(slot);
+
+    m_flags.set(
+      DxvkContextFlag::CpDirtyResources,
+      DxvkContextFlag::GpDirtyResources,
+      DxvkContextFlag::RpDirtyResources);
+  }
+
+
+  void DxvkContext::bindResourceSampler(
+    uint32_t              slot,
+    Rc<DxvkSampler>&&     sampler) {
+    ScopedCpuProfileZone();
+    m_rc[slot].sampler = std::move(sampler);
     m_rcTracked.clr(slot);
 
     m_flags.set(
@@ -346,6 +437,39 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::bindShader(
+    VkShaderStageFlagBits stage,
+    Rc<DxvkShader>&&      shader) {
+    ScopedCpuProfileZone();
+    Rc<DxvkShader>* shaderStage;
+
+    switch (stage) {
+    case VK_SHADER_STAGE_VERTEX_BIT:                  shaderStage = &m_state.gp.shaders.vs;  break;
+    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:    shaderStage = &m_state.gp.shaders.tcs; break;
+    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: shaderStage = &m_state.gp.shaders.tes; break;
+    case VK_SHADER_STAGE_GEOMETRY_BIT:                shaderStage = &m_state.gp.shaders.gs;  break;
+    case VK_SHADER_STAGE_FRAGMENT_BIT:                shaderStage = &m_state.gp.shaders.fs;  break;
+    case VK_SHADER_STAGE_COMPUTE_BIT:                 shaderStage = &m_state.cp.shaders.cs;  break;
+    default: return;
+    }
+
+    *shaderStage = std::move(shader);
+
+    if (stage == VK_SHADER_STAGE_COMPUTE_BIT) {
+      m_flags.set(
+        DxvkContextFlag::CpDirtyPipeline,
+        DxvkContextFlag::CpDirtyPipelineState,
+        DxvkContextFlag::CpDirtyResources);
+    }
+    else {
+      m_flags.set(
+        DxvkContextFlag::GpDirtyPipeline,
+        DxvkContextFlag::GpDirtyPipelineState,
+        DxvkContextFlag::GpDirtyResources);
+    }
+  }
+
+
   void DxvkContext::bindVertexBuffer(
     uint32_t              binding,
     const DxvkBufferSlice& buffer,
@@ -360,6 +484,28 @@ namespace dxvk {
     if (unlikely(!buffer.defined())
       && unlikely(!m_features.test(DxvkContextFeature::NullDescriptors)))
       stride = 0;
+
+    if (unlikely(m_state.vi.vertexStrides[binding] != stride)) {
+      m_state.vi.vertexStrides[binding] = stride;
+      m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
+    }
+  }
+
+
+  void DxvkContext::bindVertexBuffer(
+    uint32_t              binding,
+    DxvkBufferSlice&&     buffer,
+    uint32_t              stride) {
+    ScopedCpuProfileZone();
+    if (!m_state.vi.vertexBuffers[binding].matchesBuffer(buffer))
+      m_vbTracked.clr(binding);
+
+    if (unlikely(!buffer.defined())
+      && unlikely(!m_features.test(DxvkContextFeature::NullDescriptors)))
+      stride = 0;
+
+    m_state.vi.vertexBuffers[binding] = std::move(buffer);
+    m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);
 
     if (unlikely(m_state.vi.vertexStrides[binding] != stride)) {
       m_state.vi.vertexStrides[binding] = stride;
