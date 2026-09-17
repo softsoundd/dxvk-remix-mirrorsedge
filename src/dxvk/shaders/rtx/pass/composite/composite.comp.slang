@@ -721,8 +721,11 @@ vec4 compositeResult(
     // A reflection PSR declined arrives through the indirect integrator, which stashed its first bounce
     // length. Only the length is stashed; since the segment is lit by a single value its direction enters
     // only through the density field, so the mirror direction serves a rough lobe.
+    // The term is scaled by the primary specular albedo below, so the second froxel integration is skipped
+    // where that reflectance is too small for the fog to show (most dielectrics away from grazing angles).
     const float indirectSegment = IndirectReflectionSegment[pixelCoordinate];
-    if (indirectSegment != 0.0f)
+    const float reflectionFogReflectance = max(primarySpecularAlbedo.x, max(primarySpecularAlbedo.y, primarySpecularAlbedo.z));
+    if (indirectSegment != 0.0f && reflectionFogReflectance >= cb.volumeArgs.reflectionFogMinSpecularAlbedo)
     {
       const float3 shadingNormal =
         PrimaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].xyz * 2.0f - 1.0f;

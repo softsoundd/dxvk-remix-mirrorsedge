@@ -506,6 +506,10 @@ namespace dxvk {
   // Hooked into D3D9 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
     ScopedCpuProfileZone();
+    // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+    RtxGpuPassTimer::CpuScope injectCpuScope(RtxGpuPassTimer::isEnabled() ? &getCommonObjects()->metaGpuPassTimer() : nullptr,
+                                             RtxGpuPassTimer::CpuCounter::CsInjectRtx);
+    // NV-DXVK end
 #ifdef REMIX_DEVELOPMENT
     m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
@@ -526,6 +530,12 @@ namespace dxvk {
     commitGraphicsState<true, false>();
 
     auto common = getCommonObjects();
+
+    // NV-DXVK start: built-in GPU pass timings
+    // Resolve timestamp queries of completed frames before this frame records new zones.
+    common->metaGpuPassTimer().onFrameBegin(this);
+    // NV-DXVK end
+
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
 

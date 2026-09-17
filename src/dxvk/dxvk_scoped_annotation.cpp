@@ -24,6 +24,10 @@
 #include "dxvk_scoped_annotation.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
+// NV-DXVK start: built-in GPU pass timings
+#include "dxvk_objects.h"
+#include "rtx_render/rtx_gpu_pass_timer.h"
+// NV-DXVK end
 #include "client/TracyProfiler.hpp"
 
 // Global overload
@@ -39,9 +43,22 @@ namespace dxvk {
     // NV-DXVK start: Integrate Aftermath
     m_ctx->deviceDiagnosticCheckpoint(name);
     // NV-DXVK end
+    // NV-DXVK start: built-in GPU pass timings
+    if (RtxGpuPassTimer::isEnabled() && RtxGpuPassTimer::gpuZones()) {
+      if (DxvkObjects* common = m_ctx->getCommonObjects()) {
+        common->metaGpuPassTimer().beginZone(m_ctx.ptr(), name);
+        m_gpuTimed = true;
+      }
+    }
+    // NV-DXVK end
   }
 
   __ScopedAnnotation::~__ScopedAnnotation() {
+    // NV-DXVK start: built-in GPU pass timings
+    if (m_gpuTimed) {
+      m_ctx->getCommonObjects()->metaGpuPassTimer().endZone(m_ctx.ptr());
+    }
+    // NV-DXVK end
     m_ctx->endDebugLabel();
   }
 

@@ -62,6 +62,7 @@
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_gpu_crash.h"
+#include "rtx_render/rtx_gpu_pass_timer.h"
 
 #include "rtx_render/rtx_denoise_type.h"
 #include "../util/util_lazy.h"
@@ -334,6 +335,10 @@ namespace dxvk {
       return m_pointInstancerSystem.get(m_device);
     }
 
+    RtxGpuPassTimer& metaGpuPassTimer() {
+      return m_gpuPassTimer.get(m_device);
+    }
+
     void onDestroy();
 
     void setWindowHandle(const HWND hwnd) {
@@ -416,6 +421,7 @@ namespace dxvk {
     Lazy<RtxDustParticles>                  m_dustParticles;
     Lazy<RtxParticleSystemManager>          m_particleSystem;
     Lazy<RtxPointInstancerSystem>            m_pointInstancerSystem;
+    Lazy<RtxGpuPassTimer>                   m_gpuPassTimer;
 
     std::atomic<HWND>                       m_lastKnownWindowHandle;
   };

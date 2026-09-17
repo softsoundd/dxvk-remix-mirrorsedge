@@ -82,6 +82,10 @@ namespace dxvk {
 
   private:
     Rc<DxvkContext> m_ctx;
+    // NV-DXVK start: built-in GPU pass timings
+    // Latched at construction so a mid-zone option flip cannot unbalance begin/end.
+    bool m_gpuTimed = false;
+    // NV-DXVK end
   };
 
   class __ScopedQueueAnnotation {

@@ -13,7 +13,11 @@ namespace dxvk {
     MaxNumViewports             =    16,
     MaxNumResourceSlots         =  1216,
     MaxNumActiveBindings        =   384,
-    MaxNumQueuedCommandBuffers  =    18,
+    // NV-DXVK start: Remix records well over a dozen command lists per frame and the GPU-heavy injectRTX
+    // lists come last, so with room for barely one frame the CS thread blocks in DxvkSubmissionQueue::submit
+    // whenever the application runs a frame ahead. Sized for about three frames of lists.
+    MaxNumQueuedCommandBuffers  =    48,
+    // NV-DXVK end
     MaxNumQueryCountPerPool     =   128,
     MaxNumSpecConstants         =    14,
     MaxUniformBufferSize        = 65536,

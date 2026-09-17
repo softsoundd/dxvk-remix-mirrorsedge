@@ -16,6 +16,9 @@
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
+// NV-DXVK start: draw disposition statistics
+#include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
+// NV-DXVK end
 #include "../dxvk/imgui/dxvk_imgui.h"
 
 #include <algorithm>
@@ -6143,6 +6146,9 @@ namespace dxvk {
     o.ue3SkipSceneCapturePasses = ue3SkipSceneCapturePassesObject().get();
     o.ue3ForegroundDpgIsViewModel = ue3ForegroundDpgIsViewModelObject().get();
     o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
+    o.eventQueryCsCompletion = eventQueryCsCompletionObject().get();
+    o.sequenceTrackedLockWaits = sequenceTrackedLockWaitsObject().get();
+    o.skipRenderTargetCopies = skipRenderTargetCopiesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheBudgetMiB = ue3StaticLocalMeshVertexCaptureCacheBudgetMiBObject().get();
@@ -7553,6 +7559,33 @@ namespace dxvk {
     m_ue3ConstantChurnWhileViewMoved = 0;
     m_ue3ConstantChurnWhileViewStill = 0;
   }
+
+  // NV-DXVK start: draw disposition statistics
+  void D3D9Rtx::reportDrawDispositionStats() {
+    DrawDispositionStats& s = m_drawDispositionStats;
+    if (!RtxGpuPassTimer::isEnabled()) {
+      s = DrawDispositionStats {};
+      return;
+    }
+
+    ++s.frames;
+    constexpr uint32_t kReportIntervalFrames = 300;
+    if (s.frames < kReportIntervalFrames) {
+      return;
+    }
+
+    const double inv = 1.0 / static_cast<double>(s.frames);
+    Logger::info(str::format(
+      "[RTX-DrawStats] per frame over ", s.frames, " frames: draws=", static_cast<double>(s.draws) * inv,
+      " rayTraced=", static_cast<double>(s.rayTraced) * inv,
+      " rasterized(originalDraw)=", static_cast<double>(s.rasterized) * inv, " (", static_cast<double>(s.rasterizedPrims) * inv, " prims)",
+      " ofWhichForVertexCapture=", static_cast<double>(s.rasterizedForCapture) * inv, " (", static_cast<double>(s.rasterizedForCapturePrims) * inv, " prims)",
+      " postInjection=", static_cast<double>(s.rasterizedPostInjection) * inv,
+      " ignored=", static_cast<double>(s.ignored) * inv,
+      " renderTargetCopiesSkipped=", static_cast<double>(s.renderTargetCopiesSkipped) * inv));
+    s = DrawDispositionStats {};
+  }
+  // NV-DXVK end
 
   void D3D9Rtx::updateUe3StaticVertexCaptureCacheState() {
     const uint32_t reuses = m_ue3VertexCaptureCacheFrameReuses;
@@ -10895,6 +10928,31 @@ namespace dxvk {
       if (m_frameOptions.ue3LogDrawStatusFlaps && m_frameOptions.ue3EngineMode) {
         trackUe3DrawStatusFlap(drawContext, flags);
       }
+      // NV-DXVK start: draw disposition statistics (with the pass timer enabled) - how many draws
+      // still execute on the GPU as rasterised draws, and how many primitives they carry.
+      if (RtxGpuPassTimer::isEnabled()) {
+        DrawDispositionStats& s = m_drawDispositionStats;
+        ++s.draws;
+        const bool rayTraced = (flags & PrepareDrawFlag::CommitToRayTracing) != 0;
+        const bool original = (flags & PrepareDrawFlag::OriginalDrawCall) != 0;
+        if (rayTraced) {
+          ++s.rayTraced;
+        }
+        if (original) {
+          ++s.rasterized;
+          s.rasterizedPrims += drawContext.PrimitiveCount;
+          if (rayTraced) {
+            ++s.rasterizedForCapture;
+            s.rasterizedForCapturePrims += drawContext.PrimitiveCount;
+          } else if (m_rtxInjectTriggered) {
+            ++s.rasterizedPostInjection;
+          }
+        }
+        if (!rayTraced && !original) {
+          ++s.ignored;
+        }
+      }
+      // NV-DXVK end
       return flags;
     };
 
@@ -14788,6 +14846,10 @@ namespace dxvk {
     // Refresh the per-frame option snapshot: EndFrame's own consumers (deferred UI
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
+
+    // NV-DXVK start: draw disposition statistics
+    reportDrawDispositionStats();
+    // NV-DXVK end
 
     // Allow the next frame's TdToneMapping pass to be captured again
     m_ue3ToneMapCapturedThisFrame = false;

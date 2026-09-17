@@ -61,6 +61,11 @@ class AccelManager : public CommonDeviceObject {
     uint32_t reorderedSurfacesOffset = UINT32_MAX;
     bool hasOmmInstances = false;
     bool hasSssInstances = false;
+    // NV-DXVK start: churn-aware bucketing
+    // Buckets holding instances that move or animate every frame are kept apart from the static
+    // ones so that the per-frame rebuild/refit and CPU re-routing only touch the churning set.
+    bool churning = false;
+    // NV-DXVK end
 
     // The PooledBlas assigned to this bucket by createBlasBuffersAndInstances.
     // Stored here so the per-bucket cache can capture it after buildBlases.
@@ -69,8 +74,15 @@ class AccelManager : public CommonDeviceObject {
     // Tries to add a geometry instance to the bucket. The addition is successful if either:
     //   a) the bucket is empty,
     //   b) the instance has the same mask etc. as all other instances in the bucket.
-    bool tryAddInstance(RtInstance* instance);
+    bool tryAddInstance(RtInstance* instance, bool instanceChurning);
   };
+
+  // NV-DXVK start: churn-aware bucketing
+  // An instance churns when its transform or its geometry has been changing on back-to-back
+  // frames (with a short hold once it stops). Such instances dirty whichever merged bucket they
+  // sit in every frame, so they are bucketed separately from the static geometry.
+  static bool isInstanceChurning(const RtInstance* instance, uint32_t currentFrame);
+  // NV-DXVK end
 
   // Key for O(1) bucket lookup in the merged-BLAS path.
   // Two instances can share a merged BLAS bucket iff they have identical keys.
@@ -81,7 +93,7 @@ class AccelManager : public CommonDeviceObject {
     uint8_t instanceMask = 0;
     bool usesUnorderedApproximations = false;
     bool isSubsurface = false;
-    uint8_t pad = 0;
+    bool churning = false;  // NV-DXVK: see BlasBucket::churning
 
     bool operator==(const BlasBucketKey& other) const {
       return instanceMask == other.instanceMask &&
@@ -89,7 +101,8 @@ class AccelManager : public CommonDeviceObject {
              customIndexFlags == other.customIndexFlags &&
              instanceFlags == other.instanceFlags &&
              usesUnorderedApproximations == other.usesUnorderedApproximations &&
-             isSubsurface == other.isSubsurface;
+             isSubsurface == other.isSubsurface &&
+             churning == other.churning;
     }
   };
 
@@ -102,7 +115,7 @@ class AccelManager : public CommonDeviceObject {
           &BlasBucketKey::instanceMask,
           &BlasBucketKey::usesUnorderedApproximations,
           &BlasBucketKey::isSubsurface,
-          &BlasBucketKey::pad>(k));
+          &BlasBucketKey::churning>(k));
     }
   };
 
@@ -271,8 +284,48 @@ private:
     // Which TLAS type(s) this bucket was emitted to
     bool isUnordered = false;
     bool hasSssInstances = false;
+    bool churning = false;  // NV-DXVK: see BlasBucket::churning
+    // Set when one of this bucket's instances was destroyed: the bucket must be rebuilt from the
+    // live instance list next frame and its cached instance pointers must not be dereferenced.
+    bool forceDirty = false;
   };
   std::vector<CachedBucketState> m_cachedBuckets;
+
+  // NV-DXVK start: churn-aware bucketing
+  static BlasBucketKey cachedBucketKey(const CachedBucketState& bucket);
+
+  // Bucket dirty diagnostics (rtx.logDynamicGeometryStats): how many merged buckets were
+  // re-routed per frame, why, and which instances triggered it.
+  enum class BucketDirtyReason : uint32_t {
+    InstanceRemoved = 0,
+    IdentityChanged,
+    InstanceDirty,
+    GeometryUpdated,
+    KeyChanged,
+    Consolidation,
+    Count
+  };
+  struct BucketDirtyOffender {
+    uint32_t prims = 0;
+    uint32_t hits = 0;
+    uint32_t transformHits = 0;   // hits where the instance's transform changed that frame
+    uint32_t bucketInstances = 0; // size of the largest bucket this instance dirtied
+    bool churnBucket = false;
+  };
+  struct BucketStats {
+    uint32_t firstFrame = kInvalidFrameIndex;
+    uint32_t frames = 0;
+    uint64_t bucketsScanned = 0;
+    uint64_t bucketsDirty = 0;
+    uint64_t staticBucketsDirty = 0;
+    uint64_t instancesInDirtyBuckets = 0;
+    uint32_t reasons[static_cast<size_t>(BucketDirtyReason::Count)] = {};
+    std::unordered_map<XXH64_hash_t, BucketDirtyOffender> offenders;
+  };
+  BucketStats m_bucketStats;
+  void noteBucketDirty(const CachedBucketState& bucket, BucketDirtyReason reason, const RtInstance* inst, uint32_t currentFrame);
+  void reportBucketStats(uint32_t currentFrame);
+  // NV-DXVK end
 
   // Maps a merged instance pointer to its bucket index in m_cachedBuckets.
   // Allows O(1) "is this instance in a clean bucket?" check in the main loop.

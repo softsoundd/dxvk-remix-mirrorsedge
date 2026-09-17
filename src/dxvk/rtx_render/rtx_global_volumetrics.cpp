@@ -678,6 +678,7 @@ namespace dxvk {
       RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere ? multiScatterResidualScale() : 0.0f;
     volumeArgs.skyVisibilitySampleCount = std::max(skyVisibilitySampleCount(), 1u);
     volumeArgs.skyAmbientVisibility = skyAmbientVisibility() ? 1u : 0u;
+    volumeArgs.reflectionFogMinSpecularAlbedo = reflectionFogMinSpecularAlbedo();
 
     Vector3 sunsetTint(1.0f, 1.0f, 1.0f);
     float sunsetBlend = 0.0f;

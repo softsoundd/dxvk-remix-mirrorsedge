@@ -995,6 +995,35 @@ struct BlasEntry {
 
   // Frame when the vertex data of this geometry was last updated, used to detect static geometries
   uint32_t frameLastUpdated = kInvalidFrameIndex;
+  // NV-DXVK start: per-frame dynamic geometry routing
+  // The update before frameLastUpdated; together they tell whether the geometry changes on
+  // consecutive frames (animated meshes), which AccelManager routes to a refitted dynamic BLAS.
+  uint32_t framePreviouslyUpdated = kInvalidFrameIndex;
+
+  void markUpdated(uint32_t frame) {
+    if (frameLastUpdated != frame) {
+      framePreviouslyUpdated = frameLastUpdated;
+      frameLastUpdated = frame;
+    }
+  }
+
+  bool updatedOnConsecutiveFrames(uint32_t currentFrame) const {
+    return frameLastUpdated == currentFrame &&
+           framePreviouslyUpdated != kInvalidFrameIndex &&
+           framePreviouslyUpdated + 1 == currentFrame;
+  }
+
+  // True while the geometry has recently been updating on back-to-back frames. Held for a short
+  // while after the last update so an animation that pauses does not bounce the geometry between
+  // the churn bucket and the static buckets (each bounce dirties the static bucket).
+  static constexpr uint32_t kChurnHoldFrames = 60;
+  bool isGeometryChurning(uint32_t currentFrame) const {
+    return frameLastUpdated != kInvalidFrameIndex &&
+           framePreviouslyUpdated != kInvalidFrameIndex &&
+           currentFrame - frameLastUpdated <= kChurnHoldFrames &&
+           frameLastUpdated - framePreviouslyUpdated <= 2;
+  }
+  // NV-DXVK end
 
   Rc<PooledBlas> dynamicBlas = nullptr;
 

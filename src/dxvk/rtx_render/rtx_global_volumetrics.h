@@ -279,11 +279,19 @@ namespace dxvk {
                "Physical Atmosphere only. Trace a visibility ray per sky ambient sample so interiors do not inherit\n"
                "outdoor sky radiance. Disabling it leaves the estimate unoccluded, which tints indoor translucent\n"
                "surfaces with sky colour since their diffuse layer reads the froxel cache directly.");
-    RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, skyVisibilitySampleCount, 2,
+    RTX_OPTION_ARGS("rtx.volumetrics", uint32_t, skyVisibilitySampleCount, 1,
                "Physical Atmosphere only. Sky ambient samples (and therefore visibility rays) per froxel per frame.\n"
-               "Variance is absorbed by the froxel history, so low counts are usually fine; raise if fast camera\n"
-               "motion leaves visible noise in freshly disoccluded fog.",
+               "Each sample is an unbiased 2*pi/N estimate of the visible sky hemisphere and the froxel history averages up to\n"
+               "maxAccumulationFrames of them, so one sample per frame converges to the same result as more; every extra sample\n"
+               "traces another full-length visibility ray per froxel. Raise only if fast camera motion leaves visible noise in\n"
+               "freshly disoccluded fog.",
                args.minValue = 1u, args.maxValue = 8u);
+    RTX_OPTION_ARGS("rtx.volumetrics", float, reflectionFogMinSpecularAlbedo, 0.06f,
+               "Composite fogs the first indirect bounce of non-PSR pixels along the mirror direction as a stand-in for fog seen in\n"
+               "glossy reflections, scaled by the surface's primary specular albedo. That second froxel integration is skipped when the\n"
+               "specular albedo is below this value on every channel, since the term is then a fraction of a percent of the pixel\n"
+               "(dielectrics at non-grazing angles sit near 0.04). Metals and grazing angles keep it. 0 integrates every pixel.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogSunVisibilityGain, 1.2f,
                "Artistic gain on directional froxel in-scatter (sun shafts / anisotropic lobe excess over isotropic sky fill).\n"
                "Does not scale the isotropic sky floor or multiScatteringEstimate — raise for stronger shafts without washing ambient fog.\n"

@@ -4,6 +4,11 @@
 // NV-DXVK start: notify user and kill process on exception in CS thread to avoid silent hangs
 #include "rtx_render/rtx_env.h"
 // NV-DXVK end
+// NV-DXVK start: CPU frame breakdown for the built-in pass timer
+#include "dxvk_device.h"
+#include "dxvk_objects.h"
+#include "rtx_render/rtx_gpu_pass_timer.h"
+// NV-DXVK end
 
 #include "../tracy/TracyC.h"
 
@@ -159,6 +164,12 @@ namespace dxvk {
 
       m_device->addStatCtr(DxvkStatCounter::CsSyncCount, 1);
       m_device->addStatCtr(DxvkStatCounter::CsSyncTicks, ticks.count());
+      // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+      if (RtxGpuPassTimer::isEnabled()) {
+        m_device->getCommon()->metaGpuPassTimer().addCpuSample(RtxGpuPassTimer::CpuCounter::AppCsSync,
+                                                               std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+      }
+      // NV-DXVK end
     }
   }
   
@@ -197,6 +208,10 @@ namespace dxvk {
         
         if (chunk) {
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
+          // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+          RtxGpuPassTimer::CpuScope csBusyScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
+                                                RtxGpuPassTimer::CpuCounter::CsBusy);
+          // NV-DXVK end
           chunk->executeAll(m_context.ptr());
         }
       }

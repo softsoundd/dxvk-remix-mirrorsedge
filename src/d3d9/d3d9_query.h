@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "d3d9_device_child.h"
 
 #include "../dxvk/dxvk_context.h"
@@ -72,12 +74,25 @@ namespace dxvk {
     void SetRtxOcclusionBracketId(uint32_t id) {
       m_rtxOcclusionBracketId = id;
     }
+
+    // Conservative occlusion queries never reach the GPU: Begin records that no Vulkan query was
+    // begun, End then balances the Issue(D3DISSUE_END) reset counter instead of emitting to the CS thread.
+    void SetGpuQuerySkipped(bool skipped) {
+      m_rtxGpuQuerySkipped = skipped;
+    }
+    bool IsGpuQuerySkipped() const {
+      return m_rtxGpuQuerySkipped;
+    }
+    void SkipGpuEnd() {
+      m_resetCtr.fetch_sub(1, std::memory_order_release);
+    }
     // NV-DXVK end
 
   private:
 
     // NV-DXVK start: occlusion query diagnostics (rtx.d3d9.ue3LogOcclusionQueries)
     uint32_t m_rtxOcclusionBracketId = 0;
+    bool m_rtxGpuQuerySkipped = false;
     // NV-DXVK end
 
     D3DQUERYTYPE      m_queryType;
@@ -93,6 +108,11 @@ namespace dxvk {
     std::atomic<uint32_t> m_resetCtr = { 0u };
 
     D3D9_QUERY_DATA m_dataCache;
+
+    // NV-DXVK start: CPU frame breakdown - time spent polling a pending EVENT query
+    std::chrono::steady_clock::time_point m_eventPendingSince = {};
+    bool m_eventPending = false;
+    // NV-DXVK end
 
     UINT64 GetTimestampQueryFrequency() const;
 

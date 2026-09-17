@@ -127,7 +127,9 @@ struct VolumeArgs {
   // 0 leaves the sky ambient estimate unoccluded, which leaks sky radiance into interiors.
   uint16_t skyAmbientVisibility;
   uint16_t pad0;
-  uint pad1;
+  // Composite skips the reflection-segment fog integration for non-PSR pixels whose primary specular
+  // albedo (the reflectance that fog term is seen through) stays below this on every channel.
+  float reflectionFogMinSpecularAlbedo;
   uint pad2;
   uint pad3;
 };

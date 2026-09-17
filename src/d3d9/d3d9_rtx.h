@@ -333,6 +333,33 @@ namespace dxvk {
                "occlusion culling, with no game-side console access, ini edits or patches required; "
                "pixel-count consumers (e.g. UE3 lens flare fading) see fully-visible. Only active while ray "
                "tracing is enabled. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+    RTX_OPTION_ARGS("rtx.d3d9", bool, eventQueryCsCompletion, false,
+                    "Report D3DQUERYTYPE_EVENT queries as complete once Remix's command stream thread has consumed the "
+                    "game's commands up to the event, instead of once the GPU has executed them. Engines issue an event "
+                    "after Present and poll it at the end of the next frame to stay at most one frame ahead of the GPU "
+                    "(UE3's FrameSyncEvent). Under Remix a frame's GPU work is only submitted after Present, once "
+                    "injectRTX has been recorded, so that throttle makes the game wait for the GPU frame plus the "
+                    "injectRTX CPU time every frame and the GPU idles for the latter. Completing the event once the "
+                    "draws have been captured lets the GPU keep a frame queued; frame time becomes the larger of the "
+                    "CPU and GPU frame times. Costs up to one frame of input latency when the CPU is faster than the "
+                    "GPU (Reflex re-paces the CPU against the GPU queue). Games that rely on the event to protect "
+                    "D3DLOCK_NOOVERWRITE buffer reuse need GPU completion; Mirror's Edge does not use that lock mode. "
+                    "Only active while ray tracing is enabled.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.d3d9", bool, skipRenderTargetCopies, true,
+                    "Drop StretchRect copies out of a render target of 512x512 pixels or more that are issued before the "
+                    "frame's ray tracing is injected and do not target the back buffer. UE3 copies its full-resolution "
+                    "scene colour into resolve textures several times per frame for its post-processing chain, whose "
+                    "output the ray-traced image replaces; the game does not read these targets back on the CPU. The "
+                    "resolve textures keep whatever they last held. Only active while ray tracing is enabled.",
+                    args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.d3d9", bool, sequenceTrackedLockWaits, true,
+                    "When a Lock has to wait for a resource, drain the command stream thread only up to the last command "
+                    "that touched it (tracked per buffer and texture subresource: uploads, readbacks and the draws whose "
+                    "geometry is captured for ray tracing) instead of everything queued, which includes the previous "
+                    "frame's injectRTX recording once the game runs ahead of the GPU. Same model as current upstream "
+                    "DXVK. Disable to fall back to the full drain.",
+                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
                "UE3 compat: for static draws captured through an exact position source, reuse the vertex shader "
                "output captured on an earlier frame rather than preserving a new vertex-capture draw. Only exact "
@@ -717,6 +744,36 @@ namespace dxvk {
     bool ConservativeOcclusionQueriesEnabled() const {
       return m_frameOptions.enableRaytracing &&
              (m_frameOptions.conservativeOcclusionQueries || m_frameOptions.ue3EngineMode);
+    }
+
+    // rtx.d3d9.eventQueryCsCompletion
+    bool EventQueryCsCompletionEnabled() const {
+      return m_frameOptions.enableRaytracing && m_frameOptions.eventQueryCsCompletion;
+    }
+
+    // rtx.d3d9.sequenceTrackedLockWaits
+    bool SequenceTrackedLockWaitsEnabled() const {
+      return m_frameOptions.sequenceTrackedLockWaits;
+    }
+
+    // True once this frame's ray tracing has been injected; later draws are UI / post work.
+    bool IsRtxInjectTriggered() const {
+      return m_rtxInjectTriggered;
+    }
+
+    // rtx.d3d9.skipRenderTargetCopies
+    bool ShouldSkipRenderTargetCopy(const VkExtent3D& srcExtent, bool srcIsRenderTarget, bool dstIsBackBuffer) const {
+      constexpr uint32_t kMinLargeTargetPixels = 512 * 512;
+      return m_frameOptions.enableRaytracing &&
+             m_frameOptions.skipRenderTargetCopies &&
+             !m_rtxInjectTriggered &&
+             srcIsRenderTarget &&
+             !dstIsBackBuffer &&
+             srcExtent.width * srcExtent.height >= kMinLargeTargetPixels;
+    }
+
+    void NoteRenderTargetCopySkipped() {
+      ++m_drawDispositionStats.renderTargetCopiesSkipped;
     }
 
     /**
@@ -1764,6 +1821,23 @@ namespace dxvk {
     // Called once per frame after pruning: folds the frame's reuse/capture counts into the
     // dormancy window and the diagnostic interval, then runs both.
     void updateUe3StaticVertexCaptureCacheState();
+
+    // NV-DXVK start: draw disposition statistics (logged every 300 frames while the pass timer is on)
+    struct DrawDispositionStats {
+      uint32_t frames = 0;
+      uint64_t draws = 0;
+      uint64_t rayTraced = 0;
+      uint64_t rasterized = 0;              // draws whose original draw call executes on the GPU
+      uint64_t rasterizedPrims = 0;
+      uint64_t rasterizedForCapture = 0;    // ray-traced draws kept only so the vertex shader runs for vertex capture
+      uint64_t rasterizedForCapturePrims = 0;
+      uint64_t rasterizedPostInjection = 0; // UI and other draws after injectRTX
+      uint64_t ignored = 0;
+      uint64_t renderTargetCopiesSkipped = 0; // StretchRects dropped by rtx.d3d9.skipRenderTargetCopies
+    };
+    DrawDispositionStats m_drawDispositionStats;
+    void reportDrawDispositionStats();
+    // NV-DXVK end
     void evaluateUe3StaticVertexCaptureCacheDormancy();
     void reportUe3StaticVertexCaptureCacheStats();
 
@@ -1969,6 +2043,9 @@ namespace dxvk {
       bool ue3SkipSceneCapturePasses = false;
       bool ue3ForegroundDpgIsViewModel = false;
       bool conservativeOcclusionQueries = false;
+      bool eventQueryCsCompletion = false;
+      bool sequenceTrackedLockWaits = true;
+      bool skipRenderTargetCopies = true;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheBudgetMiB = 0;

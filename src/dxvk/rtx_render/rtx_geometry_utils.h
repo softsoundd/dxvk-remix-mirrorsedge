@@ -28,6 +28,7 @@
 #include "../util/util_matrix.h"
 #include "rtx/pass/gen_tri_list_index_buffer_indices.h"
 #include "rtx/pass/terrain_baking/decode_and_add_opacity_binding_indices.h"
+#include "rtx/pass/smooth_normals_binding_indices.h"
 #include "rtx_types.h"
 #include "rtx_common_object.h"
 #include "rtx_staging.h"
@@ -51,6 +52,29 @@ namespace dxvk {
     std::unique_ptr<RtxStagingDataAlloc> m_pSmoothNormalsHashData;
     Rc<DxvkContext> m_skinningContext;
     uint32_t m_skinningCommands = 0;
+
+    // NV-DXVK start: batched smooth normals
+    // GPU smooth-normal jobs are queued while draw calls are processed and dispatched together by
+    // flushSmoothNormals: every mesh needs a hash table clear, an accumulate pass and a scatter pass,
+    // and issuing them per mesh costs a pipeline drain between each dependent step. Issuing all clears,
+    // then all accumulates, then all scatters needs two drains per frame instead of three per mesh.
+    // The buffers are held by value so a job stays valid even if its BLAS entry is collected first.
+    struct SmoothNormalsJob {
+      RaytraceBuffer positionBuffer;
+      RaytraceBuffer normalBuffer;
+      RaytraceBuffer indexBuffer;
+      SmoothNormalsArgs params = {};
+      VkDeviceSize hashBufferSize = 0;
+    };
+    std::vector<SmoothNormalsJob> m_pendingSmoothNormalsJobs;
+
+    // GPU vertex interleaving is queued the same way: recorded per draw it sits between the vertex
+    // capture of consecutive draws and pays a read-after-write drain each time, recorded together
+    // before scene preparation all interleaves share one. Defined in the .cpp, which owns the
+    // shader-shared InterleaveGeometryArgs include; the vector only needs the complete type there.
+    struct InterleaveJob;
+    std::vector<InterleaveJob> m_pendingInterleaveJobs;
+    // NV-DXVK end
 
   public:
     explicit RtxGeometryUtils(DxvkDevice* pDevice);
@@ -171,7 +195,9 @@ namespace dxvk {
     static void processGeometryBuffers(const InterleavedGeometryDescriptor& desc, RaytraceGeometry& output);
     static void processGeometryBuffers(const RasterGeometry& input, RaytraceGeometry& output);
     static size_t computeOptimalVertexStride(const RasterGeometry& input, bool forceNormals = false);
-    static void cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals = false);
+    // deferGpuInterleave queues the GPU interleave for flushInterleaveGeometry instead of recording it inline;
+    // only safe when nothing reads the output before scene preparation (see SceneManager::processGeometryInfo).
+    static void cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals = false, bool deferGpuInterleave = false);
     
     // Calculate the maximum UV tile size (i.e. minimum UV density) of a draw call.
     static float computeMaxUVTileSize(const RasterGeometry& input, const Matrix4& objectToWorld);
@@ -188,7 +214,18 @@ namespace dxvk {
       const Rc<DxvkContext>& ctx,
       const RasterGeometry& input,
       InterleavedGeometryDescriptor& output,
-      bool forceNormals = false) const;
+      bool forceNormals = false,
+      bool deferGpuDispatch = false);
+
+    // NV-DXVK start: batched geometry interleaving
+    /**
+     * \brief Records the GPU work for every interleave queued with deferGpuDispatch
+     *
+     * Must run before anything consumes those vertex buffers on the GPU (scene preparation, smooth
+     * normals, CPU-side normal writes into the same buffers). Cheap when nothing is queued.
+     */
+    void flushInterleaveGeometry(const Rc<DxvkContext>& ctx);
+    // NV-DXVK end
 
     /**
       * \brief Execute a compute shader to generate smooth normals on the GPU
@@ -204,6 +241,16 @@ namespace dxvk {
       const Rc<DxvkContext>& ctx,
       const RasterGeometry& input,
       RaytraceGeometry& geo);
+
+    // NV-DXVK start: batched smooth normals
+    /**
+     * \brief Records the GPU work for every smooth-normal job queued by dispatchSmoothNormals
+     *
+     * Must run on the context that consumes the normals before they are read (SceneManager calls it
+     * at the start of scene preparation). Cheap when nothing is queued.
+     */
+    void flushSmoothNormals(const Rc<DxvkContext>& ctx);
+    // NV-DXVK end
 
     inline void flushCommandList() {
       if (m_skinningContext->getCommandList() != nullptr && m_skinningCommands > 0) {
