@@ -3,7 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
-#include <queue>
+#include <vector>
 
 #include "../util/thread.h"
 
@@ -288,7 +288,7 @@ namespace dxvk {
     
   private:
     
-    sync::Spinlock            m_mutex;
+    dxvk::mutex               m_mutex;
     std::vector<DxvkCsChunk*> m_chunks;
     
   };
@@ -320,7 +320,7 @@ namespace dxvk {
       this->incRef();
     }
     
-    DxvkCsChunkRef(DxvkCsChunkRef&& other)
+    DxvkCsChunkRef(DxvkCsChunkRef&& other) noexcept
     : m_chunk (other.m_chunk),
       m_pool  (other.m_pool) {
       other.m_chunk = nullptr;
@@ -371,6 +371,15 @@ namespace dxvk {
         m_pool->freeChunk(m_chunk);
     }
     
+  };
+
+
+  /**
+   * \brief Queued chunk entry
+   */
+  struct DxvkCsQueuedChunk {
+    DxvkCsChunkRef  chunk;
+    uint64_t        seq = 0ull;
   };
 
 
@@ -427,14 +436,20 @@ namespace dxvk {
     Rc<DxvkDevice>              m_device;
     Rc<DxvkContext>             m_context;
 
-    std::atomic<uint64_t>       m_chunksDispatched = { 0ull };
+    // The executed counter has its own mutex so that synchronize()
+    // never contends with the queue mutex taken by dispatchChunk().
+    alignas(CACHE_LINE_SIZE)
+    dxvk::mutex                 m_counterMutex;
+    dxvk::condition_variable    m_condOnSync;
     std::atomic<uint64_t>       m_chunksExecuted   = { 0ull };
-    
-    std::atomic<bool>           m_stopped = { false };
+
+    alignas(CACHE_LINE_SIZE)
     dxvk::mutex                 m_mutex;
     dxvk::condition_variable    m_condOnAdd;
-    dxvk::condition_variable    m_condOnSync;
-    std::queue<DxvkCsChunkRef>  m_chunksQueued;
+    std::vector<DxvkCsQueuedChunk> m_chunksQueued;
+    std::atomic<uint64_t>       m_chunksDispatched = { 0ull };
+    std::atomic<bool>           m_stopped = { false };
+
     dxvk::thread                m_thread;
     
     void threadFunc();

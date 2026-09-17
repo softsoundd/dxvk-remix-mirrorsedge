@@ -328,35 +328,25 @@ namespace dxvk {
     }
   };
 
+  /**
+   * \brief Writes shader constants into the capturable state
+   *
+   * \returns \c true if any constant value actually changed, so that
+   *    callers can skip re-uploading constants that were re-set with
+   *    identical data. Bool constants always report a change.
+   */
   template <
     DxsoProgramType  ProgramType,
     D3D9ConstantType ConstantType,
     typename         T>
-  HRESULT UpdateStateConstants(
+  bool UpdateStateConstants(
           D3D9CapturableState* pState,
           UINT                 StartRegister,
     const T*                   pConstantData,
           UINT                 Count,
           bool                 FloatEmu) {
-    auto UpdateHelper = [&] (auto& set) {
-      if constexpr (ConstantType == D3D9ConstantType::Float) {
-
-        if (!FloatEmu) {
-          size_t size = Count * sizeof(Vector4);
-
-          std::memcpy(set.fConsts[StartRegister].data, pConstantData, size);
-        }
-        else {
-          for (UINT i = 0; i < Count; i++)
-            set.fConsts[StartRegister + i] = replaceNaN(Vector4{ pConstantData + (i * 4) });
-        }
-      }
-      else if constexpr (ConstantType == D3D9ConstantType::Int) {
-        size_t size = Count * sizeof(Vector4i);
-
-        std::memcpy(set.iConsts[StartRegister].data, pConstantData, size);
-      }
-      else {
+    auto UpdateHelper = [&] (auto& set) -> bool {
+      if constexpr (ConstantType == D3D9ConstantType::Bool) {
         for (uint32_t i = 0; i < Count; i++) {
           const uint32_t constantIdx = StartRegister + i;
           const uint32_t arrayIdx    = constantIdx / 32;
@@ -368,9 +358,64 @@ namespace dxvk {
           if (pConstantData[i])
             set.bConsts[arrayIdx] |= bit;
         }
-      }
 
-      return D3D_OK;
+        return true;
+      }
+      else {
+        static_assert(sizeof(T) == 4u);
+
+        __m128i* dstPtr;
+
+        if constexpr (ConstantType == D3D9ConstantType::Float)
+          dstPtr = reinterpret_cast<__m128i*>(&set.fConsts[StartRegister]);
+        else
+          dstPtr = reinterpret_cast<__m128i*>(&set.iConsts[StartRegister]);
+
+        const __m128i* srcPtr = reinterpret_cast<const __m128i*>(pConstantData);
+
+        // Float emulation replaces NaN with zero on the way in (same as replaceNaN).
+        const bool replaceNaNs = ConstantType == D3D9ConstantType::Float && FloatEmu;
+
+        auto loadSrc = [&] (uint32_t index) {
+          __m128i src = _mm_loadu_si128(srcPtr + index);
+
+          if (replaceNaNs) {
+            __m128 value = _mm_castsi128_ps(src);
+            src = _mm_castps_si128(_mm_and_ps(value, _mm_cmpeq_ps(value, value)));
+          }
+
+          return src;
+        };
+
+        // Find the first register that differs from the stored state and copy
+        // only that one; if none differs, the stored state is already current.
+        uint32_t index = 0u;
+        bool dirty = false;
+
+        while (index < Count) {
+          __m128i src = loadSrc(index);
+          __m128i dst = _mm_loadu_si128(dstPtr + index);
+
+          dirty = _mm_movemask_epi8(_mm_cmpeq_epi32(src, dst)) != 0xffff;
+
+          if (dirty) {
+            _mm_storeu_si128(dstPtr + index, src);
+            index += 1u;
+            break;
+          }
+
+          index += 1u;
+        }
+
+        if (!dirty)
+          return false;
+
+        // Once a change has been found, copy the rest unconditionally.
+        for (; index < Count; index++)
+          _mm_storeu_si128(dstPtr + index, loadSrc(index));
+
+        return true;
+      }
     };
 
     return ProgramType == DxsoProgramTypes::VertexShader

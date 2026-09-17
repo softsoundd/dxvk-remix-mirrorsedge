@@ -85,7 +85,7 @@ namespace dxvk {
     ScopedCpuProfileZone();
     DxvkCsChunk* chunk = nullptr;
 
-    { std::lock_guard<sync::Spinlock> lock(m_mutex);
+    { std::lock_guard<dxvk::mutex> lock(m_mutex);
       
       if (m_chunks.size() != 0) {
         chunk = m_chunks.back();
@@ -105,7 +105,7 @@ namespace dxvk {
     ScopedCpuProfileZone();
     chunk->reset();
     
-    std::lock_guard<sync::Spinlock> lock(m_mutex);
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
     m_chunks.push_back(chunk);
   }
   
@@ -136,10 +136,14 @@ namespace dxvk {
 
     { std::unique_lock<dxvk::mutex> lock(m_mutex);
       seq = ++m_chunksDispatched;
-      m_chunksQueued.push(std::move(chunk));
+
+      auto& entry = m_chunksQueued.emplace_back();
+      entry.chunk = std::move(chunk);
+      entry.seq = seq;
+
+      m_condOnAdd.notify_one();
     }
     
-    m_condOnAdd.notify_one();
     return seq;
   }
   
@@ -150,15 +154,17 @@ namespace dxvk {
     // Avoid locking if we know the sync is a no-op, may
     // reduce overhead if this is being called frequently
     if (seq > m_chunksExecuted.load(std::memory_order_acquire)) {
-      std::unique_lock<dxvk::mutex> lock(m_mutex);
-
       if (seq == SynchronizeAll)
         seq = m_chunksDispatched.load();
 
       auto t0 = dxvk::high_resolution_clock::now();
-      m_condOnSync.wait(lock, [this, seq] {
-        return m_chunksExecuted.load() >= seq;
-      });
+
+      { std::unique_lock<dxvk::mutex> lock(m_counterMutex);
+        m_condOnSync.wait(lock, [this, seq] {
+          return m_chunksExecuted.load() >= seq;
+        });
+      }
+
       auto t1 = dxvk::high_resolution_clock::now();
       auto ticks = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0);
 
@@ -179,41 +185,47 @@ namespace dxvk {
 
     env::setThreadName("dxvk-cs");
 
-    DxvkCsChunkRef chunk;
+    // Queued chunks are taken over in batches so that the queue
+    // mutex is acquired once per batch rather than once per chunk.
+    std::vector<DxvkCsQueuedChunk> chunks;
 
     try {
       while (!m_stopped.load()) {
         { 
           ScopedCpuProfileZoneN("waiting for work");
           std::unique_lock<dxvk::mutex> lock(m_mutex);
-          if (chunk) {
-            m_chunksExecuted++;
-            m_condOnSync.notify_one();
-            
-            chunk = DxvkCsChunkRef();
-          }
-          
-          if (m_chunksQueued.size() == 0) {
+
+          if (m_chunksQueued.empty()) {
             m_condOnAdd.wait(lock, [this] {
-              return (m_chunksQueued.size() != 0)
-                  || (m_stopped.load());
+              return !m_chunksQueued.empty()
+                  || m_stopped.load();
             });
           }
-          
-          if (m_chunksQueued.size() != 0) {
-            chunk = std::move(m_chunksQueued.front());
-            m_chunksQueued.pop();
-          }
+
+          std::swap(chunks, m_chunksQueued);
         }
-        
-        if (chunk) {
+
+        for (auto& entry : chunks) {
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
-          // NV-DXVK start: CPU frame breakdown for the built-in pass timer
-          RtxGpuPassTimer::CpuScope csBusyScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
-                                                RtxGpuPassTimer::CpuCounter::CsBusy);
-          // NV-DXVK end
-          chunk->executeAll(m_context.ptr());
+
+          {
+            // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+            RtxGpuPassTimer::CpuScope csBusyScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
+                                                  RtxGpuPassTimer::CpuCounter::CsBusy);
+            // NV-DXVK end
+            entry.chunk->executeAll(m_context.ptr());
+          }
+
+          { std::lock_guard<dxvk::mutex> lock(m_counterMutex);
+            m_chunksExecuted.store(entry.seq);
+            m_condOnSync.notify_one();
+          }
+
+          // Release the chunk, and the resources its commands reference, right away
+          entry.chunk = DxvkCsChunkRef();
         }
+
+        chunks.clear();
       }
     } catch (const DxvkError& e) {
       Logger::err("Exception on CS thread!");
