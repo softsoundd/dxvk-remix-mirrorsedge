@@ -48,13 +48,14 @@
 #define BINDING_GPU_PRINT_BUFFER                 17
 #define BINDING_VALUE_NOISE_SAMPLER              18
 #define BINDING_SAMPLER_READBACK_BUFFER          19
+#define BINDING_LIGHT_IDENTITY_BUFFER            20
 
 // Atmosphere LUTs use high binding slots to avoid conflicts with pass-specific bindings.
 #define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     200
 #define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   201
 #define BINDING_ATMOSPHERE_SKY_VIEW_LUT          202
 
-#define COMMON_MAX_BINDING                       BINDING_SAMPLER_READBACK_BUFFER
+#define COMMON_MAX_BINDING                       BINDING_LIGHT_IDENTITY_BUFFER
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 
 // Note: Used to represent a non-existent buffer
@@ -105,8 +106,9 @@
   RW_STRUCTURED_BUFFER(BINDING_GPU_PRINT_BUFFER)                    \
   SAMPLER3D(BINDING_VALUE_NOISE_SAMPLER)                            \
   RW_STRUCTURED_BUFFER(BINDING_SAMPLER_READBACK_BUFFER)             \
+  STRUCTURED_BUFFER(BINDING_LIGHT_IDENTITY_BUFFER)                  \
   TEXTURE2D(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)                   \
   TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
   TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)
-  
+
 #endif
