@@ -393,7 +393,9 @@ namespace dxvk {
           "RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
           "and allows paths to terminate early by looking up the cached value and saving performance.\n"
           "NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
-          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."}
+          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."},
+        {IntegrateIndirectMode::Sharc, "SHARC (experimental)",
+          "Sparse world-space diffuse radiance cache. Uses compute RayQuery; see SHARC settings for support status."}
     } }
   };
 
@@ -1817,6 +1819,8 @@ namespace dxvk {
           resourceAliasingQueryText += "NRC)";
         } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           resourceAliasingQueryText += "ReSTIR-GI)";
+        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+          resourceAliasingQueryText += "SHARC)";
         } else {
           resourceAliasingQueryText += "ImportanceSampled)";
         }
@@ -4208,6 +4212,10 @@ namespace dxvk {
       if (RemixGui::CollapsingHeader("Indirect Illumination", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
         integrateIndirectModeCombo.getKey(&RtxOptions::integrateIndirectModeObject());
+
+        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+          common->metaSharc().showImguiSettings();
+        }
 
         if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           if (RemixGui::CollapsingHeader("ReSTIR GI", collapsingHeaderClosedFlags)) {

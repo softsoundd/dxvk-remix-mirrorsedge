@@ -32,6 +32,7 @@
 
 #include "rtx/pass/nrd_args.h"
 #include "rtx/pass/nrc_args.h"
+#include "rtx/pass/sharc/sharc_args.h"
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/material_args.h"
 #include "rtx/pass/view_distance_args.h"
@@ -161,6 +162,7 @@ struct RaytraceArgs {
   NeeCacheArgs neeCacheArgs;
   DomeLightArgs domeLightArgs;
   NrcArgs nrcArgs;
+  SharcArgs sharcArgs;
   SssArgs sssArgs;
   AtmosphereArgs atmosphereArgs;
   EyeArgs eyeArgs;

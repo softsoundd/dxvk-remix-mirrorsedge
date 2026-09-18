@@ -43,7 +43,7 @@ namespace dxvk {
 
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
-    void dispatch(class RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
+    void dispatch(class RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, bool sharcUpdate = false);
 
     void dispatchNEE(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput);
 
@@ -51,7 +51,7 @@ namespace dxvk {
 
   private:
     static DxvkRaytracingPipelineShaders getPipelineShaders(const bool useRayQuery, const bool serEnabled, const bool ommEnabled, const bool useNeeCache, const bool includePortals, const bool pomEnabled, const bool nrcEnabled, const bool wboitEnbaled);
-    Rc<DxvkShader> getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled) const;
+    Rc<DxvkShader> getComputeShader(const bool useNeeCache, const bool nrcEnabled, const bool wboitEnabled, const bool sharcUpdate = false, const bool sharcQuery = false) const;
     void logIntegrateIndirectMode();
     
     IntegrateIndirectMode m_integrateIndirectMode;

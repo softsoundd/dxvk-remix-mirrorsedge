@@ -503,6 +503,12 @@ namespace dxvk {
     };
 
     auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
+      // A preset selects a quality level, not an indirect backend, so an explicit SHARC
+      // selection has to survive it -- otherwise one preset click silently moves the user
+      // off SHARC.
+      if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+        return;
+      }
       NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
       // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
       // Should refactor this to use a separate global for the final state, and indicate user preference with the option. 

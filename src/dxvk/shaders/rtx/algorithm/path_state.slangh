@@ -21,10 +21,26 @@
 */
 #pragma once
 
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 0
+#endif
+#ifndef ENABLE_SHARC
+#define ENABLE_SHARC 0
+#endif
+#ifndef SHARC_QUERY_STATS
+#define SHARC_QUERY_STATS 0
+#endif
+
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #include "rtx/utility/packing.slangh"
 #include "rtx/algorithm/resolve_expanded.slangh"
 #include "rtx/external/NRC.slangh"
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#include "rtx/pass/sharc/sharc_update.slangh"
+#endif
 
 // RNG state is not carried via PathState from RayGen to Hit shader, 
 // but instead it is reconstructed using following explicit constants.
@@ -57,6 +73,11 @@ struct PathState : IBasePayloadState
 
   // Note: Radiance, throughput and hit distances are passed in and then written back out
   // so they can be accumulated into in the path tracing loop.
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+  SharcUpdateState sharcState;
+#elif SHARC_UPDATE
+  SharcState sharcState;
+#endif
   vec3 radiance;
   float _segmentHitDistance;
 
@@ -82,6 +103,12 @@ struct PathState : IBasePayloadState
                  // indirectLightPortalID(uint:2b), 
                  // bounceIteration(uint:4b)
   uint8_t _roughness;
+#if ENABLE_SHARC
+  uint8_t _skyGatherEligible;
+#if SHARC_QUERY
+  uint8_t _sharcSegmentDistanceHi;
+#endif
+#endif
 
   // Need to track pixel coordinate for sparse rendering where threads can remap to different pixels
   u16vec2 _pixelCoordinate;
@@ -282,7 +309,11 @@ struct PathState : IBasePayloadState
   {
     get
     {
+#if SHARC_UPDATE
+      return uint8_t(min(cb.sharcArgs.updateBounces, uint(SHARC_PROPAGATION_DEPTH)));
+#else
       return cb.pathMaxBounces;
+#endif
     }
   }
 
@@ -375,6 +406,42 @@ struct PathState : IBasePayloadState
       get { return packedFlagGet(_flags, 1 << 7); }
       set { _flags = packedFlagAssign(_flags, 1 << 7, newValue); }
   }
+
+#if ENABLE_SHARC
+  property bool skyGatherEligible
+  {
+#if SHARC_QUERY
+      get { return (_skyGatherEligible & uint8_t(1u)) != uint8_t(0u); }
+      set { _skyGatherEligible = (_skyGatherEligible & uint8_t(0xFEu)) | (newValue ? uint8_t(1u) : uint8_t(0u)); }
+#else
+      get { return _skyGatherEligible != uint8_t(0u); }
+      set { _skyGatherEligible = newValue ? uint8_t(1u) : uint8_t(0u); }
+#endif
+  }
+
+#if SHARC_QUERY
+  property float sharcSegmentDistance
+  {
+      get
+      {
+        const uint bits = (uint(_sharcSegmentDistanceHi) << 7) | (uint(_skyGatherEligible) >> 1);
+        return uint16BitsToF32(uint16_t(bits));
+      }
+      set
+      {
+        const uint bits = uint(float16BitsToUint16(float16_t(clamp(newValue, 0.0f, 65504.0f))));
+        _skyGatherEligible = uint8_t((uint(_skyGatherEligible) & 1u) | ((bits & 0x7Fu) << 1));
+        _sharcSegmentDistanceHi = uint8_t((bits >> 7) & 0xFFu);
+      }
+  }
+
+  property float sharcLaunchPerceptualRoughness
+  {
+      get { return unorm8ToF32(_roughness); }
+      set { _roughness = f32ToUnorm8(newValue); }
+  }
+#endif
+#endif
 
   property bool directionAltered
   {

@@ -1,0 +1,74 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+#include "rtx/pass/sharc/sharc_sdk.slangh"
+#include "rtx/pass/sharc/sharc_binding_indices.h"
+#include "rtx/utility/debug_view_indices.h"
+
+#ifndef SHARC_QUERY_STATS
+#define SHARC_QUERY_STATS 0
+#endif
+
+#if SHARC_UPDATE
+// Per-path tally behind DEBUG_VIEW_SHARC_UPDATE_DEPOSIT and _BUDGET. The update stage is the only
+// place the deposit distribution is visible -- the query-side Cached Radiance view shows a cell
+// mean, which is a different and smaller quantity -- and maxDepositLuminance is set against this
+// one. Kept outside the deferred guard so the hook signatures are the same on both backends;
+// only the deferred backend fills it in, which is also the only backend the clamp applies to.
+struct SharcDepositStats {
+  float peakLuminance;  // brightest deposit this path made, measured before the clamp
+  uint clamped;         // how many of its deposits the clamp caught
+  uint deposits;        // how many it made at all
+};
+
+SharcDepositStats sharcDepositStatsInit() {
+  SharcDepositStats stats;
+  stats.peakLuminance = 0.0f;
+  stats.clamped = 0;
+  stats.deposits = 0;
+  return stats;
+}
+
+// cb.debugView is uniform, so this whole tally costs one uniform branch when no view is selected.
+bool sharcUpdateDebugActive() {
+  return cb.debugView == DEBUG_VIEW_SHARC_UPDATE_DEPOSIT || cb.debugView == DEBUG_VIEW_SHARC_UPDATE_BUDGET;
+}
+#endif
+
+
+layout(binding = SHARC_BINDING_HASH)
+RWStructuredBuffer<HashGridKey> SharcHash;
+layout(binding = SHARC_BINDING_ACCUMULATION)
+RWStructuredBuffer<SharcAccumulationData> SharcAccumulation;
+layout(binding = SHARC_BINDING_RESOLVED)
+RWStructuredBuffer<SharcPackedData> SharcResolved;
+
+#if SHARC_QUERY_STATS
+layout(binding = SHARC_BINDING_QUERY_STATS)
+RWStructuredBuffer<uint> SharcQueryStats;
+
+void sharcCount(uvec2 pixel, uint counter) {
+  // Rotate a 1/64 pixel sample to keep diagnostics out of most tracing lanes.
+  const uint sample = pixel.x * 1973u + pixel.y * 9277u + cb.frameIdx * 26699u;
+  if ((sample & 63u) == 0u) {
+    InterlockedAdd(SharcQueryStats[counter], 1u);
+  }
+}
+#endif
+
+// portalSpace defaults to main space: callers that only touch existing entries (resolve,
+// the deferred flush, miss accumulation) never recompute a spatial key, so the value is
+// unused there.
+SharcParameters makeSharcParameters(uint portalSpace = PORTAL_SPACE_NONE) {
+  SharcParameters p;
+  p.hashGridParameters.portalSpace = portalSpace;
+  p.hashGridParameters.cameraPosition = cb.sharcArgs.cameraPosition;
+  p.hashGridParameters.logarithmBase = SHARC_GRID_LOGARITHM_BASE;
+  p.hashGridParameters.sceneScale = cb.sharcArgs.gridScale;
+  p.hashGridParameters.levelBias = 0.0f;
+  p.hashGridData.capacity = cb.sharcArgs.capacity;
+  p.hashGridData.hashEntriesBuffer = SharcHash;
+  p.accumulationBuffer = SharcAccumulation;
+  p.resolvedBuffer = SharcResolved;
+  p.radianceScale = cb.sharcArgs.radianceScale;
+  return p;
+}

@@ -1,0 +1,102 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+#include "rtx/pass/sharc/sharc_bindings.slangh"
+#include "rtx/utility/common.slangh"
+
+#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+// Record between cached vertices, then propagate once in reverse. No camera
+// throughput or division is needed, including zero-throughput color channels.
+// Unrolled constant-index accesses let the compiler scalarize the small arrays.
+struct SharcUpdateState {
+  uint indices[SHARC_PROPAGATION_DEPTH];
+  vec3 radiance[SHARC_PROPAGATION_DEPTH];
+  vec3 weights[SHARC_PROPAGATION_DEPTH];
+  uint count;
+};
+
+void sharcAccumulateRadiance(inout SharcUpdateState state, vec3 radiance) {
+  [unroll]
+  for (uint i = 0; i < SHARC_PROPAGATION_DEPTH; ++i) {
+    if (state.count == i + 1) {
+      state.radiance[i] += state.weights[i] * radiance;
+    }
+  }
+}
+
+void sharcAccumulateThroughput(inout SharcUpdateState state, vec3 throughput) {
+  [unroll]
+  for (uint i = 0; i < SHARC_PROPAGATION_DEPTH; ++i) {
+    if (state.count == i + 1) {
+      state.weights[i] *= throughput;
+    }
+  }
+}
+
+void sharcInsertVertex(inout SharcUpdateState state, SharcHitData hit, uint portalSpace) {
+  // Update bounce count is capped at the compiled storage depth.
+  if (state.count >= SHARC_PROPAGATION_DEPTH) {
+    return;
+  }
+  SharcParameters p = makeSharcParameters(portalSpace);
+  HashGridKey key;
+  HashGridIndex index;
+  if (!HashGridInsertEntry(p.hashGridData, hit.positionWorld, hit.normalWorld,
+                          p.hashGridParameters, key, index)) {
+    return;
+  }
+  [unroll]
+  for (uint i = 0; i < SHARC_PROPAGATION_DEPTH; ++i) {
+    if (state.count == i) {
+      state.indices[i] = index;
+      state.radiance[i] = vec3(0.0f);
+      state.weights[i] = vec3(1.0f);
+    }
+  }
+  ++state.count;
+}
+
+// Seeds the vertex just inserted with lighting already known at insertion and the weight of
+// the segment leaving it. The primary vertex needs both: the direct pass lit it and sampled
+// its continuation before this stage ran.
+void sharcSeedVertex(inout SharcUpdateState state, vec3 radiance, vec3 weight) {
+  [unroll]
+  for (uint i = 0; i < SHARC_PROPAGATION_DEPTH; ++i) {
+    if (state.count == i + 1) {
+      state.radiance[i] = radiance;
+      state.weights[i] = weight;
+    }
+  }
+}
+
+// The one place a deposit enters a cell on the shipping update backend, and therefore the
+// only place an outlier can be bounded at its source.  A cell is a mean, and the resolve
+// pass gives one frame's samples a weight of 1/(accumulationFrames + 1) of it (SDK:924-947),
+// so a single deposit of luminance L moves a cell fed k times per frame by L/((N+1)*k).  k
+// falls with render resolution -- the update dispatch is ceil(resolution / tile) wide
+// (indirect.cpp:788-793) -- which is why one outlier is worth several times more in a cell at
+// a low DLSS preset than at DLAA.  maxDepositLuminance bounds L directly.  It is the cache's
+// own, tighter equivalent of rtx.fireflyFilteringLuminanceThreshold, which clamps the path
+// tracer's output but never the value stored here; 0 disables it, as in fireflyFiltering
+// itself.  The running propagated value is deliberately left alone: clamping only the deposit
+// bounds every cell in the chain by the same rule without altering path propagation.
+void sharcFlushVertices(SharcUpdateState state, inout SharcDepositStats stats) {
+  SharcParameters p = makeSharcParameters();
+  vec3 radiance = vec3(0.0f);
+  [unroll]
+  for (int i = SHARC_PROPAGATION_DEPTH - 1; i >= 0; --i) {
+    if (uint(i) < state.count) {
+      radiance = state.radiance[i] + state.weights[i] * radiance;
+      const vec3 deposit = fireflyFiltering(radiance, cb.sharcArgs.maxDepositLuminance);
+      SharcAddVoxelData(p, state.indices[i], deposit, vec3(1.0f), vec3(0.0f, 0.0f, 1.0f), 0.0f, 1);
+      if (sharcUpdateDebugActive()) {
+        // Measured before the clamp: the point of the view is to show the distribution the
+        // threshold is being chosen against, which clamping would hide.
+        const float luminance = calcBt709Luminance(radiance);
+        stats.peakLuminance = max(stats.peakLuminance, luminance);
+        stats.clamped += (cb.sharcArgs.maxDepositLuminance > 0.0f && luminance > cb.sharcArgs.maxDepositLuminance) ? 1u : 0u;
+        stats.deposits += 1u;
+      }
+    }
+  }
+}
+#endif

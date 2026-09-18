@@ -1,0 +1,48 @@
+// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+#pragma once
+// This software contains source code provided by NVIDIA Corporation.
+#ifndef HASH_GRID_ENABLE_64_BIT_ATOMICS
+#define HASH_GRID_ENABLE_64_BIT_ATOMICS 1
+#endif
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 0
+#endif
+#ifndef SHARC_ENABLE_GLSL
+#define SHARC_ENABLE_GLSL 0
+#endif
+#ifndef SHARC_ENABLE_RESPONSIVE_LIGHTING
+#define SHARC_ENABLE_RESPONSIVE_LIGHTING 0
+#endif
+#ifndef SHARC_ENABLE_SH_ENCODING
+#define SHARC_ENABLE_SH_ENCODING 0
+#endif
+#ifndef SHARC_ENABLE_FADE_ACCELERATION
+#define SHARC_ENABLE_FADE_ACCELERATION 0
+#endif
+#ifndef SHARC_SEPARATE_EMISSIVE
+#define SHARC_SEPARATE_EMISSIVE 1
+#endif
+// Keep the initial estimator finite and free of cache feedback.
+#ifndef SHARC_ENABLE_CACHE_RESAMPLING
+#define SHARC_ENABLE_CACHE_RESAMPLING 0
+#endif
+#ifndef SHARC_PROPAGATION_DEPTH
+#define SHARC_PROPAGATION_DEPTH 8
+#endif
+// Query probes are read-only; leave update insertion and resolve loops unchanged.
+#if SHARC_QUERY
+#define HASH_GRID_FIND_LOOP_ATTR [unroll]
+#endif
+// Runtime, not a constant: the right floor depends on how fast the camera reveals new
+// geometry, so it has to be tunable without a rebuild. Expands at the SDK's five comparison
+// sites, all of which are compiled where cb is already in scope.
+#ifndef SHARC_SAMPLE_NUM_THRESHOLD
+#define SHARC_SAMPLE_NUM_THRESHOLD cb.sharcArgs.minSampleCount
+#endif
+#include "rtx/external/sharc/SharcCommon.h"
+#if SHARC_QUERY
+#undef HASH_GRID_FIND_LOOP_ATTR
+#endif

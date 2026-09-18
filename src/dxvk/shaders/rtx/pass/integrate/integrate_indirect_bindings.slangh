@@ -26,6 +26,17 @@
 #include "rtx/algorithm/rtxdi/rtxdi.slangh"
 #include "rtx/utility/shader_types.slangh"
 
+#ifndef ENABLE_SHARC
+#define ENABLE_SHARC 0
+#endif
+#ifndef SHARC_UPDATE
+#define SHARC_UPDATE 0
+#endif
+
+#if ENABLE_SHARC
+#include "rtx/pass/sharc/sharc_bindings.slangh"
+#endif
+
 // Shared Inputs
 
 layout(binding = INTEGRATE_INDIRECT_BINDING_LINEAR_WRAP_SAMPLER)
@@ -48,6 +59,16 @@ Texture2D<uint> SharedSurfaceIndex;
 
 layout(rg16ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_SUBSURFACE_DATA_INPUT)
 Texture2D<uint2> SharedSubsurfaceData;
+
+#if defined(SHARC_UPDATE) && SHARC_UPDATE
+// The update stage judges its primary vertex by the material terms the cache hook applies to
+// secondary hits; opacity and emission live only in these packed words.
+layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA0_INPUT)
+Texture2D<uint> SharedMaterialData0;
+
+layout(r32ui, binding = INTEGRATE_INDIRECT_BINDING_SHARED_MATERIAL_DATA1_INPUT)
+Texture2D<uint> SharedMaterialData1;
+#endif
 
 // Inputs
 
@@ -169,9 +190,11 @@ RWTexture2D<float4> RestirGIHitGeometry;
 layout(rgba16f, binding = INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT)
 RWTexture2D<float4> IndirectRadianceHitDistance;        
 
+#if !SHARC_UPDATE
 // Signed length of the first bounce; negative means that bounce reached the sky.
 layout(r32f, binding = INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT)
 RWTexture2D<float> ReflectionSegment;
+#endif
 
 layout(binding = INTEGRATE_INDIRECT_BINDING_NEE_CACHE)
 ByteAddressBuffer NeeCache;

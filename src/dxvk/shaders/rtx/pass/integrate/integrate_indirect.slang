@@ -206,11 +206,234 @@
 //!>       UNORDERED_RESOLVE_WBOIT
 
 
+// SHARC variants
+//!variant integrate_indirect_sharc_update.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred4.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_stats.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_raygen.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_query_raygen_stats.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+
+//!variant integrate_indirect_sharc_update_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred4_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_update_deferred4_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_UPDATE=1
+//!>       SHARC_DEFERRED_UPDATE=1
+//!>       SHARC_PROPAGATION_DEPTH=4
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_stats_wboit.comp
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_raygen_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_raygen_stats_wboit.rgen
+//!>       RAY_PIPELINE
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       SHARC_QUERY_STATS=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+
+//!variant integrate_indirect_sharc_query_trace_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace_stats.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_QUERY_STATS=1
+
+//!variant integrate_indirect_sharc_query_trace_stats_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       SHARC_QUERY_STATS=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace_ser.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+
+//!variant integrate_indirect_sharc_query_trace_ser_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       UNORDERED_RESOLVE_WBOIT
+
+//!variant integrate_indirect_sharc_query_trace_ser_stats.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_QUERY_STATS=1
+
+//!variant integrate_indirect_sharc_query_trace_ser_stats_wboit.rgen
+//!>       ENABLE_SHARC=1
+//!>       SHARC_QUERY=1
+//!>       NEE_CACHE_ENABLE=1
+//!>       RT_TRACE_RAY
+//!>       RAY_PIPELINE
+//!>       RT_SHADER_EXECUTION_REORDERING
+//!>       SHARC_QUERY_STATS=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
 //!end-variants
+
+#ifndef ENABLE_SHARC
+#define ENABLE_SHARC 0
+#endif
+#ifndef SHARC_QUERY
+#define SHARC_QUERY 0
+#endif
 
 #define INTEGRATE_INDIRECT
 #define RAB_HAS_PREVIOUS_GBUFFER 1
 #define OPAQUE_MATERIAL_USE_POM 1
+// The compute and RayQuery ray-generation backends run integratePathVertex inline, so they
+// need the same reservoir access as the TraceRay closest-hit stage. Without these defines
+// RAB_LoadReservoir / RAB_LoadGIReservoir return empty reservoirs: an RTXDI steal at a
+// camera-visible secondary vertex then fails and skips the NEE cache / RIS fallback (no
+// shadow ray, no direct light at that vertex), and a ReSTIR GI steal in StealSample mode
+// adds zero radiance and still terminates the path on rough surfaces. SHARC stages keep
+// the inline policy of never touching the reservoirs; see integrator_indirect.slangh.
+#if !ENABLE_SHARC
+#define RAB_HAS_RTXDI_RESERVOIRS 1
+#define RAB_HAS_RESTIR_GI_RESERVOIRS 1
+#endif
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat
 // important in reflections off shiny surfaces (as without this it can make areas with many particles look weird in reflections).
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1
@@ -233,7 +456,11 @@ void main()
 }
 #else
 [shader("compute")]
+#if SHARC_QUERY
+[numthreads(8, 8, 1)]
+#else
 [numthreads(16, 8, 1)]
+#endif
 void main(uint2 dispatchThreadId : SV_DispatchThreadID)
 {
   integrate_indirect_pass(dispatchThreadId);
