@@ -110,6 +110,7 @@ tests += exe
 
 dxso_analysis_src = files([
   '../../../src/dxso/dxso_analysis.cpp',
+  '../../../src/dxso/dxso_color_terms.cpp',
   '../../../src/dxso/dxso_decoder.cpp',
   '../../../src/dxso/dxso_ctab.cpp',
   '../../../src/dxso/dxso_code.cpp',
@@ -123,6 +124,10 @@ dxso_analysis_src = files([
 # compiler object also pulls in the d3d9 fixed-function SPIR-V helpers.
 exe = executable('test_dxso_preproj_position',  files('test_dxso_preproj_position.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_dxso_preproj_position', exe, env: test_env)
+tests += exe
+
+exe = executable('test_dxso_color_terms',  files('test_dxso_color_terms.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dxso_color_terms', exe, env: test_env)
 tests += exe
 
 alias_target('unit_tests', tests)
