@@ -2250,7 +2250,11 @@ namespace dxvk {
         roughnessConstant, metallicConstant,
         emissiveColorConstant, enableEmissive,
         ignoreAlphaChannel, thinFilmEnable, alphaIsThinFilmThickness,
-        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut, 
+        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut,
+        opaqueMaterialData.getEnableDLSSControlMask(),
+        opaqueMaterialData.getDLSSControlMaskIntensity(),
+        opaqueMaterialData.getDLSSControlMaskToneStrength(),
+        opaqueMaterialData.getDLSSControlMaskStructuralStrength(),
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget, isHairCard,
         samplerFeedbackStamp,
         secondaryTextureIndex

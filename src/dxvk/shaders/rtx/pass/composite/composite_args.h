@@ -109,6 +109,7 @@ struct CompositeArgs {
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
   uint timeSinceStartMS;
+  uint enableDlssNrVolumetricControlMask;
 
   // Unoccluded distant-sun illuminance and world direction for reflection-segment fog.
   vec3 unoccludedSunRadiance;

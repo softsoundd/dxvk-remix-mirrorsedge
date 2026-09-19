@@ -459,6 +459,7 @@ namespace dxvk {
       { RtxFramePassStage::Composition, "Composition" },
       { RtxFramePassStage::DLSS, "DLSS" },
       { RtxFramePassStage::DLSSRR, "DLSSRR" },
+      { RtxFramePassStage::DLSSNR, "DLSSNR" },
       { RtxFramePassStage::NIS, "NIS" },
       { RtxFramePassStage::XeSS, "XeSS" },
       { RtxFramePassStage::TAA, "TAA" },
@@ -4025,6 +4026,19 @@ namespace dxvk {
       RemixGui::Separator();
 
       RemixGui::Checkbox("Allow Full Screen Exclusive?", &RtxOptions::allowFSEObject());
+
+      auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
+      if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
+        RemixGui::Separator();
+
+        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::PushID("DLSS 3D-Guided Neural Generation");
+          dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
+          ImGui::PopID();
+          ImGui::Unindent();
+        }
+      }
 
       ImGui::Unindent();
     }

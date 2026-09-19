@@ -318,6 +318,11 @@ namespace dxvk
       AliasedResource m_primaryWorldShadingNormalDLSSRR;
       Resource m_primaryScreenSpaceMotionVectorDLSSRR;
 
+      // DLSSNR Data
+      AliasedResource m_neuralRenderingOutput;
+      Resource m_controlMask;
+      AliasedResource m_neuralRenderingInput;
+
       Resource m_bsdfFactor;
 
       VkExtent3D m_compositeOutputExtent;
@@ -326,7 +331,7 @@ namespace dxvk
       VkExtent3D m_finalOutputExtent;
       AliasedResource m_finalOutput;
 
-      Resource m_postFxIntermediateTexture;
+      AliasedResource m_postFxIntermediateTexture;
 
       Resource m_gbufferLast;
       Resource m_reprojectionConfidence;
@@ -485,6 +490,7 @@ namespace dxvk
 
     VkExtent3D m_downscaledExtent = { 0, 0, 0 };
     bool m_nrdDenoisingGuideResourcesAllocated = false;
+    bool m_dlssNeuralRenderingResourcesAllocated = false;
     VkExtent3D m_targetExtent = { 0, 0, 0 };
 
     using ResizeEventList = std::vector<std::weak_ptr<EventHandler::ResizeEvent>>;
@@ -499,6 +505,9 @@ namespace dxvk
     void createRaytracingOutput(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent);
 
     void createTargetResources(Rc<DxvkContext>& ctx);
+
+    void createNeuralRenderingOutput(Rc<DxvkContext>& ctx);
+    void updateDlssNeuralRenderingResources(Rc<DxvkContext>& ctx);
 
     void createDownscaledResources(Rc<DxvkContext>& ctx);
   };
