@@ -60,6 +60,7 @@ namespace dxvk {
 
   extern bool g_allowSrgbConversionForOutput;
   extern bool g_forceKeepObjectPickingImage;
+  extern bool g_remixApiEditorModeEnabled;   // defined in rtx_scene_manager.cpp
 
   extern std::array<uint8_t, 3> g_customHighlightColor;
 }
@@ -1049,7 +1050,8 @@ namespace {
     }
     std::lock_guard lock { s_mutex };
     remixDevice->EmitCs([cHandle = handle](dxvk::DxvkContext* ctx) {
-      ctx->getCommonObjects()->getSceneManager().destroyExternalMesh(cHandle);
+      ctx->getCommonObjects()->getSceneManager()
+        .destroyExternalMesh(dxvk::Rc<dxvk::DxvkContext>(ctx), cHandle);
     });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
@@ -1339,6 +1341,7 @@ namespace {
     g_combineGuiInFinalColor = info.combineGuiInFinalColor;
     dxvk::g_allowSrgbConversionForOutput = !info.disableSrgbConversionForOutput;
     dxvk::g_allowMappingLegacyHashToObjectPickingValue = !info.editorModeEnabled;
+    dxvk::g_remixApiEditorModeEnabled = info.editorModeEnabled;
 
     // slightly different initial settings for HdRemix
     if (info.editorModeEnabled) {

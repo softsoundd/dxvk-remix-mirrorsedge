@@ -1858,6 +1858,13 @@ struct LegacyMaterialData {
     m_materialTextureSetHash = hash;
   }
 
+  // When set, an empty material texture set is the identity's texture tier as-is, rather than
+  // falling back to the primary colour texture: the shader signature already names a textureless
+  // material, and the display albedo the runtime bound for it is not part of what it is.
+  void setMaterialTextureSetIsComplete(bool complete) {
+    m_materialTextureSetIsComplete = complete;
+  }
+
   // Hash over the material constant registers (CTAB UniformVector_* / UniformScalar_*).
   // Differentiates MaterialInstanceConstants that override VectorParameterValues/
   // ScalarParameterValues on an identical texture set. kEmptyHash for shaders listed in
@@ -1890,10 +1897,11 @@ private:
     // always produces the same hash
     const XXH64_hash_t textureHash = colorTextures[0].getImageHash();
     if (m_pixelShaderHashForMaterialInstance != kEmptyHash) {
-      // when the shader's CTAB exposes no material samplers, fall back to the primary
-      // color texture so the identity keeps the texture+shader structure
+      // when the shader's CTAB exposes no material samplers and the signature does not already
+      // cover that, fall back to the primary color texture so the identity keeps the
+      // texture+shader structure
       const XXH64_hash_t textureSetHash =
-        (m_materialTextureSetHash != kEmptyHash) ? m_materialTextureSetHash : textureHash;
+        (m_materialTextureSetHash != kEmptyHash || m_materialTextureSetIsComplete) ? m_materialTextureSetHash : textureHash;
       XXH64_hash_t hash = XXH3_64bits_withSeed(&textureSetHash, sizeof(textureSetHash), m_pixelShaderHashForMaterialInstance);
       m_textureSetShaderHash = hash;
       if (m_pixelShaderConstantsHashForMaterialInstance != kEmptyHash) {
@@ -1918,6 +1926,7 @@ private:
   XXH64_hash_t m_cachedHash = kEmptyHash;
   XXH64_hash_t m_pixelShaderHashForMaterialInstance = kEmptyHash;
   XXH64_hash_t m_materialTextureSetHash = kEmptyHash;
+  bool m_materialTextureSetIsComplete = false;
   XXH64_hash_t m_pixelShaderConstantsHashForMaterialInstance = kEmptyHash;
   // Derived in updateCachedHash: PS bytecode + material texture set (no constants).
   XXH64_hash_t m_textureSetShaderHash = kEmptyHash;

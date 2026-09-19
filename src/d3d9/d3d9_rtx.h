@@ -212,6 +212,16 @@ namespace dxvk {
                "unavoidable: their identity was not reproducible in the first place.\n"
                "Turning this off restores raw all-UniformVector_* identity and re-mints the hashes of every "
                "material carrying a volatile register.");
+    RTX_OPTION("rtx.d3d9", bool, ue3TexturelessIdentityFromBytecode, false,
+               "UE3 MaterialInstanceConstant support: seed the identity of a material with no "
+               "identity-bearing texture (constant-colour and lightmap-only materials, and materials whose "
+               "only textures are lighting inputs) from its pixel shader bytecode hash instead of its "
+               "canonical signature. UE3 compiles one base pass per lightmap policy, so a bytecode seed "
+               "gives such a material a different hash under DirectionalLightmaps=True, =False and with "
+               "Mirror's Edge's TdBicubicFiltering; the canonical signature (the material's kept "
+               "UniformVector_* names and the literals that reach its colour output unlit) is the same in "
+               "every permutation. Enable this only to keep replacements that were anchored on the old "
+               "bytecode-seeded hashes matching until they have been re-anchored.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
                "UE3 MaterialInstanceConstant support: pixel shader hashes whose UniformVector_* constants are "
                "excluded from material identity hashing wholesale. Reach for this only when every material on "
@@ -1419,6 +1429,9 @@ namespace dxvk {
       std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
       std::array<uint8_t, caps::MaxTexturesPS> samplerSemanticFlags;
       std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlags;
+      // expression flags the register-granular inference derived that the lane-precise
+      // coordinate analysis showed to be impossible on the sampler's own lanes (diagnostic)
+      std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlagsCleared;
       std::array<uint16_t, caps::MaxTexturesPS> samplerSampleCount;
       std::array<int16_t, caps::MaxTexturesPS> samplerScaleConstReg;
       std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompU;
@@ -2035,6 +2048,7 @@ namespace dxvk {
       bool ue3MicConstantIdentity = false;
       bool ue3MicExcludeRenderTargetsFromIdentity = true;
       bool ue3MicVolatileConstantDetection = true;
+      bool ue3TexturelessIdentityFromBytecode = false;
       bool ue3ReportMicIdentityChurn = true;
       bool ue3LogMaterialInstanceHash = false;
       bool ue3SkipDepthPrepass = false;

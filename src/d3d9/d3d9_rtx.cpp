@@ -13,6 +13,7 @@
 #include "../util/util_math.h"
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
+#include "../dxso/dxso_color_terms.h"
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
@@ -1936,7 +1937,13 @@ namespace dxvk {
     struct Ue3PsMaterialIdentityInfo {
       Ue3MaterialConstRanges constRanges;
       // bit per sampler index: CTAB sampler strictly named texture2d_* / texturecube_* / texture3d_*
+      // that carries the material's identity - colour and opacity inputs; lighting-only inputs
+      // removed, coordinate-only inputs removed unless they are all the material has
       uint32_t materialSamplerMask = 0;
+      // material samplers the base pass consumes only as lighting inputs (normal, specular,
+      // transfer masks): out of identity and out of the albedo candidate pool, so the
+      // directional-lightmap compile renders and hashes like the simple one
+      uint32_t lightingInputSamplerMask = 0;
       // UniformVector_* float registers in ascending register order - for constant-color
       // materials (no material texture samplers) one of these holds the material's color
       std::vector<uint32_t> uniformVectorRegisters;
@@ -1958,8 +1965,11 @@ namespace dxvk {
       // (directional vs simple texture lightmaps, Mirror's Edge bicubic lightmap filtering)
       // compiled from the same material. Register indices, element counts, and Uniform*
       // constants are permutation-dependent (fxc strips or trims whatever a permutation does
-      // not reference) and deliberately excluded.
+      // not reference) and deliberately excluded. A shader with no identity-bearing sampler
+      // is signed from its kept UniformVector_* names and the literals reaching its colour
+      // output unlit instead (see documentation/UE3Compatibility.md, "Identity").
       XXH64_hash_t canonicalShaderSignature = kEmptyHash;
+      bool texturelessSignature = false;
       bool hasCtab = false;
 
       // Set only when a sampler or uniform was left out, for
@@ -2312,7 +2322,10 @@ namespace dxvk {
         "[RTX-Compatibility][UE3-MIC] materialHash=0x", std::hex, materialHash,
         " ps=0x", psHash,
         " seed=0x", shaderIdentitySeed, std::dec,
-        usedCanonicalSeed ? " (canonical, lightmap-permutation invariant)" : " (bytecode)",
+        usedCanonicalSeed
+          ? (identityInfo.texturelessSignature ? " (canonical textureless, lightmap-permutation invariant)"
+                                                : " (canonical, lightmap-permutation invariant)")
+          : " (bytecode)",
         std::hex,
         " textureSet=0x", textureSetHash,
         " textureSetShader=0x", textureSetShaderHash,
@@ -4103,6 +4116,9 @@ namespace dxvk {
     // sampler is declared it is recognised and dropped, and where fxc already stripped it there
     // is nothing to drop. The test is deliberately a property of the sampler's own use, so it
     // cannot key off a symbol that exists in one compile and not the other.
+    //
+    // Fallback for bytecode the colour-term analysis cannot read (see
+    // classifyDxsoColorTermSource for the path every UE3 base pass takes).
     static bool isUe3LightingInputSampler(const PsSamplerTexcoordInference& inferred) {
       // Same signal albedo selection treats as decisive. Guards against the whole rule
       // misfiring on a material's own base texture.
@@ -4124,7 +4140,8 @@ namespace dxvk {
     static Ue3PsMaterialIdentityInfo parseUe3PsMaterialIdentityFromCtab(
         const std::vector<uint8_t>& bytecode,
         const D3D9CommonShader* pixelShader,
-        const bool detectVolatileConstants) {
+        const bool detectVolatileConstants,
+        const bool texturelessIdentityFromBytecode) {
       Ue3PsMaterialIdentityInfo info;
       if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0)
         return info;
@@ -4175,14 +4192,22 @@ namespace dxvk {
       // is used - an engine sampler sharing a material's panner offset is still that panner.
       std::vector<uint32_t> allDeclaredSamplerRegisters;
 
+      // Inputs of the colour-term analysis that classifies every material input by how its
+      // value reaches the colour output (see documentation/UE3Compatibility.md, "Identity").
+      DxsoColorTermInputs colorTermInputs;
+      colorTermInputs.trackLiterals = true;
+
       for (const DxsoCtab::Constant& c : ctab.m_constantData) {
         const std::string name = toLowerAscii(c.name);
 
         if (c.registerSet == kD3dxRegisterSetSampler) {
           if (c.registerCount != 0) {
             const uint32_t declaredEnd = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
-            for (uint32_t s = c.registerIndex; s < declaredEnd; s++)
+            for (uint32_t s = c.registerIndex; s < declaredEnd; s++) {
               allDeclaredSamplerRegisters.push_back(s);
+              if (name.find("lightmap") != std::string::npos)
+                colorTermInputs.lightmapSamplerMask |= 1u << s;
+            }
           }
           // strict prefix rule: only the numbered sampler names emitted by the UE3 material
           // translator count as material texture parameters; lightmaps/scene/shadow samplers
@@ -4190,6 +4215,9 @@ namespace dxvk {
           if (c.registerCount != 0 &&
               (startsWith(name, "texture2d_") || startsWith(name, "texturecube_") || startsWith(name, "texture3d_"))) {
             declaredSamplers.push_back({ name, c.registerIndex, c.registerCount });
+            const uint32_t declaredEnd = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
+            for (uint32_t s = c.registerIndex; s < declaredEnd; s++)
+              colorTermInputs.trackedSamplerMask |= 1u << s;
           }
           continue;
         }
@@ -4199,6 +4227,16 @@ namespace dxvk {
         if (c.registerIndex + c.registerCount > caps::MaxFloatConstantsPS)
           continue;
 
+        // BasePassPixelShader.usf: unlit/dynamic diffuse is multiplied by
+        // AmbientColorAndSkyFactor.rgb; sky-lit diffuse by Upper/LowerSkyColor
+        if (name.find("ambientcolorandskyfactor") != std::string::npos ||
+            name.find("upperskycolor") != std::string::npos ||
+            name.find("lowerskycolor") != std::string::npos) {
+          for (uint32_t r = c.registerIndex; r < c.registerIndex + c.registerCount && r < kDxsoColorTermMaxConstRegs; r++)
+            colorTermInputs.lightingConstRegs.set(r);
+          continue;
+        }
+
         const bool isUniformVector = name.find("uniformvector_") != std::string::npos;
         const bool isUniformScalar = name.find("uniformscalar_") != std::string::npos;
         if (!isUniformVector && !isUniformScalar)
@@ -4207,9 +4245,14 @@ namespace dxvk {
         // stay complete even though only the vectors reach the identity hash.
         if (isUniformVector) {
           info.uniformVectorRegisters.push_back(c.registerIndex);
+          if (c.registerIndex < kDxsoColorTermMaxConstRegs)
+            colorTermInputs.trackedConstRegs.set(c.registerIndex);
         }
         declaredUniforms.push_back({ name, c.registerSet, c.registerIndex, c.registerCount });
       }
+
+      const DxsoColorTermResult colorTerms =
+        analyzeDxsoColorTerms(tokens, bytecode.size() / sizeof(uint32_t), colorTermInputs);
 
       std::vector<std::pair<std::string, uint32_t>> uniformsByName;
       std::vector<std::string> samplerSignatureEntries;
@@ -4247,37 +4290,81 @@ namespace dxvk {
           if (std::find(volatileRegisters.begin(), volatileRegisters.end(), value) == volatileRegisters.end())
             volatileRegisters.push_back(value);
         };
-        for (const auto& [samplerRegister, inferred] : samplerInference) {
-          // The transitive dependency set, not the affine resolver's term slots, which only name
-          // the registers a *resolved* transform reads. A register driving a coordinate through
-          // math the resolver cannot express - a Rotator whose row is a product of two live
-          // constants, a matrix multiply, any chain through temporaries - would otherwise be left
-          // in the identity and animate it.
-          for (const uint32_t reg : inferred.coordConstRegs)
-            markVolatile(int32_t(reg));
+        // The transitive dependency set, not the affine resolver's term slots, which only name
+        // the registers a *resolved* transform reads. A register driving a coordinate through
+        // math the resolver cannot express - a Rotator whose row is a product of two live
+        // constants, a matrix multiply, any chain through temporaries - would otherwise be left
+        // in the identity and animate it.
+        //
+        // The colour-term analysis tracks the set per register lane; the sampler inference
+        // tracks it per register, so a material vector fxc packed into the spare lane of a
+        // register carrying coordinate math counts as driving the coordinate. How much
+        // coordinate math there is to share a register with differs per lightmap-policy
+        // compile (the bicubic lightmap filter alone is dozens of instructions), which made the
+        // constants tier differ between permutations of one material. The inference's set is
+        // the fallback for bytecode the analysis cannot read.
+        if (colorTerms.analyzed) {
+          for (const uint32_t samplerRegister : allDeclaredSamplerRegisters) {
+            if (samplerRegister >= kDxsoColorTermMaxSamplers)
+              continue;
+            const auto& regs = colorTerms.samplerCoordConstRegs[samplerRegister];
+            for (uint32_t reg = 0; reg < caps::MaxFloatConstantsPS && reg < kDxsoColorTermMaxConstRegs; reg++) {
+              if (regs.test(reg))
+                markVolatile(int32_t(reg));
+            }
+          }
+        } else {
+          for (const auto& [samplerRegister, inferred] : samplerInference) {
+            for (const uint32_t reg : inferred.coordConstRegs)
+              markVolatile(int32_t(reg));
+          }
         }
       }
 
-      // Only needed to fall back on if every sampler classifies as a lighting input.
-      uint32_t allSamplerMask = 0;
-      std::vector<std::tuple<std::string, XXH64_hash_t, uint32_t>> allSamplersByNameOrder;
-      std::vector<std::string> allSamplerSignatureEntries;
+      // Samplers set aside by the role rule below, kept only when nothing else identifies the
+      // material.
+      uint32_t fallbackSamplerMask = 0;
+      std::vector<std::tuple<std::string, XXH64_hash_t, uint32_t>> fallbackSamplersByNameOrder;
+      std::vector<std::string> fallbackSignatureEntries, fallbackSamplerNames;
 
       for (const DeclaredSampler& sampler : declaredSamplers) {
         const uint32_t end = std::min<uint32_t>(sampler.registerIndex + sampler.registerCount, caps::MaxTexturesPS);
-        bool anyKept = false;
+        bool anyKept = false, anyFallback = false;
         for (uint32_t s = sampler.registerIndex; s < end; s++) {
           // arrays get per-register names so name keys stay unambiguous (material samplers
           // are scalar in practice, this is defensive)
           const std::string samplerName =
             sampler.registerCount > 1u ? str::format(sampler.name, "[", s - sampler.registerIndex, "]") : sampler.name;
           const XXH64_hash_t samplerNameKey = XXH3_64bits(samplerName.data(), samplerName.size());
-          allSamplerMask |= (1u << s);
-          allSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
 
-          const auto inferenceIt = samplerInference.find(s);
-          if (inferenceIt != samplerInference.end() && isUe3LightingInputSampler(inferenceIt->second)) {
+          bool keep = true, keepIfNothingElse = false;
+          if (colorTerms.analyzed) {
+            const DxsoColorTermRole role = classifyDxsoColorTermSource(
+              colorTerms.samplerTerms[s], colorTerms.samplerReach[s], colorTerms.hasLightConstTerm);
+            // Opacity masks and coordinate drivers both exist in every permutation. A mask is
+            // often all that separates a material from another sharing its colour inputs (a
+            // masked sheet and a bare pane on one reflection map) and stays; a coordinate driver
+            // is nearly always a normal map perturbing a cube lookup, which most reflective
+            // materials have, so keeping those would re-mint most identities to separate very
+            // few - it counts only when the material has nothing else.
+            keep = role == DxsoColorTermRole::Color || role == DxsoColorTermRole::Opacity;
+            keepIfNothingElse = role == DxsoColorTermRole::Coordinate;
+            if (role == DxsoColorTermRole::LightingOnly || role == DxsoColorTermRole::Unused)
+              info.lightingInputSamplerMask |= (1u << s);
+          } else {
+            const auto inferenceIt = samplerInference.find(s);
+            keep = inferenceIt == samplerInference.end() || !isUe3LightingInputSampler(inferenceIt->second);
+            keepIfNothingElse = !keep;
+          }
+
+          if (!keep) {
             excludedSamplerNames.push_back(samplerName);
+            if (keepIfNothingElse) {
+              anyFallback = true;
+              fallbackSamplerMask |= (1u << s);
+              fallbackSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
+              fallbackSamplerNames.push_back(samplerName);
+            }
             continue;
           }
           keptSamplerNames.push_back(samplerName);
@@ -4285,29 +4372,34 @@ namespace dxvk {
           info.materialSamplerMask |= (1u << s);
           info.materialSamplersByNameOrder.emplace_back(samplerName, samplerNameKey, s);
         }
-        allSamplerSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
         if (anyKept)
           samplerSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
+        if (anyFallback)
+          fallbackSignatureEntries.push_back(makeUe3SignatureEntry(sampler.name, kD3dxRegisterSetSampler));
       }
 
-      // A material that classified as nothing but lighting inputs has been misread; an empty set
-      // would collapse every such material onto one identity. Keep what was declared instead:
-      // that costs invariance for this shader but never merges distinct materials.
-      if (info.materialSamplerMask == 0 && allSamplerMask != 0) {
-        info.materialSamplerMask = allSamplerMask;
-        info.materialSamplersByNameOrder = std::move(allSamplersByNameOrder);
-        samplerSignatureEntries = std::move(allSamplerSignatureEntries);
-        keptSamplerNames.swap(excludedSamplerNames);
-        excludedSamplerNames.clear();
+      // A material with no other identifying sampler keeps the ones set aside (a bump-offset
+      // map; under the heuristic path, whatever it excluded): an empty set would merge every
+      // such material onto one identity.
+      if (info.materialSamplerMask == 0 && fallbackSamplerMask != 0) {
+        info.materialSamplerMask = fallbackSamplerMask;
+        info.materialSamplersByNameOrder = std::move(fallbackSamplersByNameOrder);
+        samplerSignatureEntries = std::move(fallbackSignatureEntries);
+        std::vector<std::string> stillExcluded;
+        for (const std::string& name : excludedSamplerNames) {
+          if (std::find(fallbackSamplerNames.begin(), fallbackSamplerNames.end(), name) == fallbackSamplerNames.end())
+            stillExcluded.push_back(name);
+        }
+        excludedSamplerNames = std::move(stillExcluded);
+        keptSamplerNames = std::move(fallbackSamplerNames);
       }
 
-      std::vector<std::string> keptUniformNames, volatileUniformNames;
+      std::vector<std::string> keptUniformNames, volatileUniformNames, roleExcludedUniformNames;
       std::vector<uint32_t> droppedUniformRegisters;
 
       // Constants are the only thing telling a textureless material apart, so one keeps every
       // register even where the dataflow marks it volatile. Merging those collapses unrelated
-      // materials onto a single anchor, which is a worse outcome than an identity that moves -
-      // the same trade the all-lighting-inputs guard above makes.
+      // materials onto a single anchor, which is a worse outcome than an identity that moves.
       const bool keepEveryUniform = info.materialSamplerMask == 0;
 
       // A uniform is dropped when *any* register in its declared range is volatile, not only
@@ -4340,12 +4432,39 @@ namespace dxvk {
           continue;
         }
 
+        // A vector the base pass consumes only as a lighting input (specular colour, two-sided
+        // lighting mask) exists in the directional compile alone; one that only ever drives a
+        // coordinate is a texture transform, whatever the volatile scan made of it.
+        if (colorTerms.analyzed && uniform.registerIndex < kDxsoColorTermMaxConstRegs) {
+          const DxsoColorTermRole role = classifyDxsoColorTermSource(
+            colorTerms.constTerms[uniform.registerIndex], colorTerms.constReach[uniform.registerIndex],
+            colorTerms.hasLightConstTerm);
+          if (role == DxsoColorTermRole::LightingOnly || role == DxsoColorTermRole::Unused ||
+              role == DxsoColorTermRole::Coordinate) {
+            roleExcludedUniformNames.push_back(uniform.name);
+            droppedUniformRegisters.push_back(uniform.registerIndex);
+            continue;
+          }
+        }
+
         keptUniformNames.push_back(uniform.name);
         uniformsByName.emplace_back(uniform.name, uniform.registerIndex);
         info.constRanges.emplace_back(uniform.registerIndex, uniform.registerCount);
       }
 
-      if (!excludedSamplerNames.empty() || !volatileUniformNames.empty()) {
+      // Signature literals: `def` components that reach the colour output unlit. Emissive and
+      // colour-expression constants do in every permutation; lightmap epsilons, basis vectors,
+      // normal unpack and specular exponents never do.
+      std::vector<std::string> signatureLiteralEntries;
+      if (colorTerms.analyzed) {
+        for (const DxsoColorTermLiteral& literal : colorTerms.literals) {
+          if (dxsoColorTermSetHasUnlitTerm(literal.terms))
+            signatureLiteralEntries.push_back(str::format("literal:", std::hex, literal.bits));
+        }
+      }
+      std::sort(signatureLiteralEntries.begin(), signatureLiteralEntries.end());
+
+      if (!excludedSamplerNames.empty() || !volatileUniformNames.empty() || !roleExcludedUniformNames.empty()) {
         auto join = [](const std::vector<std::string>& names) {
           std::string out;
           for (const std::string& name : names) {
@@ -4356,9 +4475,11 @@ namespace dxvk {
           return out.empty() ? std::string("-") : out;
         };
         info.identitySummary = str::format(
-          "samplers kept=[", join(keptSamplerNames), "] excludedAsLightingInputs=[",
+          "samplers kept=[", join(keptSamplerNames), "] excludedByRole=[",
           join(excludedSamplerNames), "] uniforms kept=[", join(keptUniformNames),
-          "] excludedAsVolatile=[", join(volatileUniformNames), "]");
+          "] excludedAsVolatile=[", join(volatileUniformNames),
+          "] excludedByRole=[", join(roleExcludedUniformNames), "]",
+          colorTerms.analyzed ? "" : " colorTerms=unanalyzed");
       }
 
       std::sort(droppedUniformRegisters.begin(), droppedUniformRegisters.end());
@@ -4372,7 +4493,6 @@ namespace dxvk {
         info.namedUniformFirstRegistersByNameOrder.emplace_back(
           XXH3_64bits(uniformName.data(), uniformName.size()), uniformRegister);
       }
-
       // name order is deterministic and identical across permutations, and name keys keep the
       // streamed identity aligned even if a permutation strips an unreferenced symbol
       std::sort(info.materialSamplersByNameOrder.begin(), info.materialSamplersByNameOrder.end());
@@ -4384,14 +4504,24 @@ namespace dxvk {
       // indices and counts are excluded because both shift with the lightmap sampler count and
       // with fxc's per-permutation element trimming.
       //
-      // A shader declaring no material samplers gets no signature and falls back to the bytecode
-      // hash. Seeding it from the uniform declarations instead would identify no material:
-      // UniformVector_0 alone describes a large share of the textureless ones, and with an empty
-      // texture set to pair it with they all collapse onto one textureSet+shader anchor. Bytecode
-      // costs lightmap-policy invariance for these shaders only, the same trade the
-      // all-lighting-inputs guard above makes.
-      info.canonicalShaderSignature =
-        !samplerSignatureEntries.empty() ? hashUe3SignatureEntries(samplerSignatureEntries) : kEmptyHash;
+      // A shader with no identity-bearing sampler is signed from what else survives every
+      // permutation: its kept UniformVector_* names and the literals reaching its colour output
+      // unlit. Only when even those are absent does the bytecode hash remain, and with it the
+      // policy dependence. rtx.d3d9.ue3TexturelessIdentityFromBytecode restores the bytecode
+      // seed for such shaders wholesale.
+      if (!samplerSignatureEntries.empty()) {
+        info.canonicalShaderSignature = hashUe3SignatureEntries(samplerSignatureEntries);
+      } else if (!texturelessIdentityFromBytecode && colorTerms.analyzed) {
+        std::vector<std::string> texturelessEntries;
+        for (const std::string& name : keptUniformNames)
+          texturelessEntries.push_back(makeUe3SignatureEntry(name, kD3dxRegisterSetFloat4));
+        texturelessEntries.insert(texturelessEntries.end(), signatureLiteralEntries.begin(), signatureLiteralEntries.end());
+        if (!texturelessEntries.empty()) {
+          texturelessEntries.push_back("ue3:textureless");
+          info.canonicalShaderSignature = hashUe3SignatureEntries(texturelessEntries);
+          info.texturelessSignature = true;
+        }
+      }
 
       auto mergeConstRanges = [](Ue3MaterialConstRanges& ranges) {
         if (ranges.empty())
@@ -4476,25 +4606,30 @@ namespace dxvk {
     }
 
     static fast_unordered_cache<Ue3PsMaterialIdentityInfo> s_ue3PsMaterialIdentityCache;
-    // The parse bakes in whether volatile registers were filtered, so a mid-session toggle of
-    // rtx.d3d9.ue3MicVolatileConstantDetection has to invalidate it rather than serve entries
-    // classified under the other setting.
+    // The parse bakes in whether volatile registers were filtered and how textureless shaders
+    // are seeded, so a mid-session toggle of rtx.d3d9.ue3MicVolatileConstantDetection or
+    // rtx.d3d9.ue3TexturelessIdentityFromBytecode has to invalidate it rather than serve
+    // entries classified under the other setting.
     static bool s_ue3PsMaterialIdentityCacheDetectedVolatile = true;
+    static bool s_ue3PsMaterialIdentityCacheTexturelessFromBytecode = false;
 
     static const Ue3PsMaterialIdentityInfo& getOrParseUe3PsMaterialIdentityInfo(
         const XXH64_hash_t psHash,
         const std::vector<uint8_t>& bytecode,
         const D3D9CommonShader* pixelShader,
-        const bool detectVolatileConstants) {
-      if (s_ue3PsMaterialIdentityCacheDetectedVolatile != detectVolatileConstants) {
+        const bool detectVolatileConstants,
+        const bool texturelessIdentityFromBytecode) {
+      if (s_ue3PsMaterialIdentityCacheDetectedVolatile != detectVolatileConstants ||
+          s_ue3PsMaterialIdentityCacheTexturelessFromBytecode != texturelessIdentityFromBytecode) {
         s_ue3PsMaterialIdentityCacheDetectedVolatile = detectVolatileConstants;
+        s_ue3PsMaterialIdentityCacheTexturelessFromBytecode = texturelessIdentityFromBytecode;
         s_ue3PsMaterialIdentityCache.clear();
       }
 
       auto it = s_ue3PsMaterialIdentityCache.find(psHash);
       if (it == s_ue3PsMaterialIdentityCache.end()) {
         it = s_ue3PsMaterialIdentityCache.emplace(
-          psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader, detectVolatileConstants)).first;
+          psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader, detectVolatileConstants, texturelessIdentityFromBytecode)).first;
       }
       return it->second;
     }
@@ -6138,6 +6273,7 @@ namespace dxvk {
     o.ue3MicConstantIdentity = ue3MicConstantIdentityObject().get();
     o.ue3MicExcludeRenderTargetsFromIdentity = ue3MicExcludeRenderTargetsFromIdentityObject().get();
     o.ue3MicVolatileConstantDetection = ue3MicVolatileConstantDetectionObject().get();
+    o.ue3TexturelessIdentityFromBytecode = ue3TexturelessIdentityFromBytecodeObject().get();
     o.ue3ReportMicIdentityChurn = ue3ReportMicIdentityChurnObject().get();
     o.ue3LogMaterialInstanceHash = ue3LogMaterialInstanceHashObject().get();
     o.ue3SkipDepthPrepass = ue3SkipDepthPrepassObject().get();
@@ -10483,7 +10619,8 @@ namespace dxvk {
         }
       }
       const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
-        psHash, bytecode, pixelShader, m_frameOptions.ue3MicVolatileConstantDetection);
+        psHash, bytecode, pixelShader, m_frameOptions.ue3MicVolatileConstantDetection,
+        m_frameOptions.ue3TexturelessIdentityFromBytecode);
       for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
         if (reg >= caps::MaxFloatConstantsPS) {
           continue;
@@ -11953,6 +12090,7 @@ namespace dxvk {
         entry.samplerCoordCompV.fill(1);
         entry.samplerSemanticFlags.fill(0);
         entry.samplerExpressionFlags.fill(0);
+        entry.samplerExpressionFlagsCleared.fill(0);
         entry.samplerSampleCount.fill(0);
         entry.samplerScaleConstReg.fill(-1);
         entry.samplerScaleConstCompU.fill(0);
@@ -11997,6 +12135,45 @@ namespace dxvk {
           entry.samplerOffsetImmediateV[s] = inferred.offsetImmediateV;
           if ((inferred.semanticFlags & kPsSamplerSemanticLightmap) != 0)
             entry.lightmapSamplerMask |= (1u << s);
+        }
+
+        // The inference tracks coordinate expressions per register, so a sampler's coordinate
+        // inherits whatever else fxc packed into its register's spare lanes. In UE3's base pass
+        // that is the lightmap coordinate, which shares TEXCOORD0 with the material UV and
+        // under TdBicubicFiltering goes through an offset and a `frc`; material samplers in
+        // that compile alone were flagged UVOFS|UVANIM, and the score followed. The colour-term
+        // analysis follows the coordinate lanes alone, and a flag it shows to be impossible on
+        // those lanes is cleared. Clears only, so a flag derived from the sampler's own read
+        // stays.
+        const std::vector<uint8_t>& bytecode = ps->GetBytecode();
+        const DxsoColorTermResult coordFacts = analyzeDxsoColorTerms(
+          reinterpret_cast<const uint32_t*>(bytecode.data()), bytecode.size() / sizeof(uint32_t), DxsoColorTermInputs {});
+        if (coordFacts.analyzed) {
+          for (uint32_t s = 0; s < caps::MaxTexturesPS && s < kDxsoColorTermMaxSamplers; s++) {
+            if (entry.samplerSampleCount[s] == 0 || coordFacts.samplerSampleCount[s] == 0)
+              continue;
+            const uint8_t expr = coordFacts.samplerCoordExpr[s];
+            uint16_t& flags = entry.samplerExpressionFlags[s];
+            const uint16_t before = flags;
+            if ((expr & DxsoCoordExpr_Arith) == 0) {
+              // a plain interpolant read: the only transform it can carry is a non-.xy swizzle
+              flags &= ~uint16_t(kPsSamplerExprUvOffset | kPsSamplerExprUvAnimated | kPsSamplerExprBlendMath);
+              const bool swizzled =
+                entry.samplerCoordCompValid[s] != 0 &&
+                (entry.samplerCoordCompU[s] != 0 || entry.samplerCoordCompV[s] != 1);
+              if (!swizzled)
+                flags &= ~uint16_t(kPsSamplerExprUvTransform);
+            }
+            if ((expr & DxsoCoordExpr_Offset) == 0)
+              flags &= ~uint16_t(kPsSamplerExprUvOffset);
+            const bool animatedPossible =
+              (expr & (DxsoCoordExpr_Wrap | DxsoCoordExpr_UnknownOffset)) != 0 ||
+              entry.samplerSampleCount[s] >= 2u ||
+              (flags & kPsSamplerExprUvTimeDriven) != 0;
+            if (!animatedPossible)
+              flags &= ~uint16_t(kPsSamplerExprUvAnimated);
+            entry.samplerExpressionFlagsCleared[s] = uint16_t(before & ~flags);
+          }
         }
       }
 
@@ -12092,7 +12269,20 @@ namespace dxvk {
       // so the coefficients carry nothing a raytraced surface wants.
       const uint32_t lightmapStageMask =
         (m_frameOptions.ue3EngineMode && inferredPsEntry != nullptr) ? inferredPsEntry->lightmapSamplerMask : 0u;
-      const uint32_t usedTextureMask = m_parent->m_activeTextures & usedSamplerMask & ~lightmapStageMask;
+      // Material samplers the base pass consumes only as lighting inputs (normal maps, specular
+      // colour, transfer masks) leave the pool with them: the simple-lightmap compile never
+      // declares them, so a directional compile that could pick one would render the same
+      // material differently. Opacity masks and coordinate drivers stay eligible - a cutout's
+      // mask is its albedo's alpha.
+      uint32_t lightingInputStageMask = 0;
+      if (m_frameOptions.ue3EngineMode && inferredPs != nullptr && inferredPsHash != kEmptyHash) {
+        lightingInputStageMask = getOrParseUe3PsMaterialIdentityInfo(
+          inferredPsHash, inferredPs->GetBytecode(), inferredPs,
+          m_frameOptions.ue3MicVolatileConstantDetection,
+          m_frameOptions.ue3TexturelessIdentityFromBytecode).lightingInputSamplerMask;
+      }
+      const uint32_t usedTextureMask =
+        m_parent->m_activeTextures & usedSamplerMask & ~lightmapStageMask & ~lightingInputStageMask;
 
       // Publish what was bound at those samplers so the texture paths that cannot see a pixel
       // shader - hash preservation on CPU writes, the terrain baker's stage filter, the texture
@@ -12677,6 +12867,16 @@ namespace dxvk {
           appendFlag(isRenderTarget, "RT");
           appendFlag(uvOriginPenaltyActive && !inferredSamplerUvOriginProvable, "NOUVORIGIN");
           appendFlag(inferredSamplerReadsPrimaryUvPair, "UV0XY");
+          // what the register-granular inference had derived that the coordinate lanes rule out
+          if (inferredPsEntry != nullptr && inferredPsEntry->samplerExpressionFlagsCleared[stage] != 0) {
+            const uint16_t cleared = inferredPsEntry->samplerExpressionFlagsCleared[stage];
+            std::string clearedList;
+            if (cleared & kPsSamplerExprUvTransform) clearedList += "UVXFORM ";
+            if (cleared & kPsSamplerExprUvOffset)    clearedList += "UVOFS ";
+            if (cleared & kPsSamplerExprUvAnimated)  clearedList += "UVANIM ";
+            if (cleared & kPsSamplerExprBlendMath)   clearedList += "BLEND ";
+            appendFlag(true, str::format("LANECLEARED:", clearedList).c_str());
+          }
 
           albedoSelectionLog += str::format(
             "\n  s", stage,
@@ -13142,7 +13342,8 @@ namespace dxvk {
           const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
           if (psHash != 0) {
             const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
-              psHash, bytecode, psCommonShader, m_frameOptions.ue3MicVolatileConstantDetection);
+              psHash, bytecode, psCommonShader, m_frameOptions.ue3MicVolatileConstantDetection,
+              m_frameOptions.ue3TexturelessIdentityFromBytecode);
 
             // UE3 recompiles the same material's base pass per lightmap policy, so a bytecode
             // hash - and everything seeded by it - varies with DirectionalLightmaps and
@@ -13287,6 +13488,10 @@ namespace dxvk {
               }
             }
             m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
+            // A canonical textureless signature already names the material; whatever albedo
+            // scoring bound for display must not leak into its identity.
+            const bool textureSetIsComplete = useInvariantShaderIdentity && identityInfo.materialSamplerMask == 0;
+            m_activeDrawCallState.materialData.setMaterialTextureSetIsComplete(textureSetIsComplete);
 
             // Constants tier. Frame-varying registers are already gone by this point: the parse
             // left them out of identityInfo (rtx.d3d9.ue3MicVolatileConstantDetection), so what
@@ -13297,7 +13502,7 @@ namespace dxvk {
             // seed. The per-material one is keyed on textureSetShaderHash, the same value the
             // second replacement lookup tier uses, so an exclusion and an anchor are named alike.
             const XXH64_hash_t identityTextureSetHash =
-              (textureSetHash != kEmptyHash)
+              (textureSetHash != kEmptyHash || textureSetIsComplete)
                 ? textureSetHash
                 : m_activeDrawCallState.materialData.getColorTexture().getImageHash();
             const XXH64_hash_t textureSetShaderHash =
@@ -13467,27 +13672,29 @@ namespace dxvk {
             }
 
             // Constant-color materials: the surface color lives in a UniformVector_*
-            // register. Register order is compile-order, not semantic, and the lowest
-            // register frequently holds a zero vector (fades, unused parameters), so scan
-            // for the first value that is plausibly a color (finite, non-black, LDR-ish)
+            // register. Scan the identity's kept vectors in CTAB-name order - the same list in
+            // every lightmap-policy compile, whereas register order shifts per permutation and a
+            // specular-only vector declared by one compile could otherwise win - and take the
+            // first value that is plausibly a color (finite, non-black, LDR-ish). The lowest
+            // name frequently holds a zero vector (fades, unused parameters).
             if (identityInfo.materialSamplerMask == 0 &&
                 !identityInfo.uniformVectorRegisters.empty() &&
                 !m_activeDrawCallState.materialData.colorTextures[0].isValid()) {
               const float tintGain = m_frameOptions.ue3ConstantAlbedoTintGain;
-              for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
+              auto tryConstantAlbedo = [&](const uint32_t reg) {
                 if (reg >= caps::MaxFloatConstantsPS)
-                  continue;
+                  return false;
                 const Vector4& uniformColor = d3d9State().psConsts.fConsts[reg];
                 if (!std::isfinite(uniformColor.x) || !std::isfinite(uniformColor.y) ||
                     !std::isfinite(uniformColor.z) || !std::isfinite(uniformColor.w))
-                  continue;
+                  return false;
                 const float maxComp = std::max({ uniformColor.x, uniformColor.y, uniformColor.z });
                 const float minComp = std::min({ uniformColor.x, uniformColor.y, uniformColor.z });
                 // reject blacks/negatives (not visible albedo) and HDR-scale values (intensities).
                 // Rejecting black also lets a register holding the material's switched-off colour
                 // fall through to whichever one holds its real tint.
                 if (minComp < 0.0f || maxComp <= 0.01f || maxComp > 8.0f)
-                  continue;
+                  return false;
 
                 Vector4 albedo = uniformColor;
                 if (tintGain > 0.0f) {
@@ -13503,7 +13710,18 @@ namespace dxvk {
                 }
                 m_activeDrawCallState.materialData.ue3ConstantAlbedo = albedo;
                 m_activeDrawCallState.materialData.hasUe3ConstantAlbedo = true;
-                break;
+                return true;
+              };
+              if (!identityInfo.namedUniformFirstRegistersByNameOrder.empty()) {
+                for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
+                  if (tryConstantAlbedo(uniformRegister))
+                    break;
+                }
+              } else {
+                for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
+                  if (tryConstantAlbedo(reg))
+                    break;
+                }
               }
             }
 
@@ -13513,6 +13731,7 @@ namespace dxvk {
                 m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash,
                 textureSetShaderHash, psConstsHash, identityInfo, constantsExcluded, micTextureListLog);
             }
+
           }
         }
       }
@@ -14434,7 +14653,8 @@ namespace dxvk {
     // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
     // the albedo score changes, so a build with different scoring re-derives instead of serving
     // decisions its own scoring would no longer make.
-    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 2;
+    // 3: UV expression flags constrained to the sampler's own coordinate lanes.
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 3;
     // How many loaded picks to re-score and check against current scoring per session. A scoring
     // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
     constexpr uint32_t kUe3DiffuseSelectionAuditCount = 32;

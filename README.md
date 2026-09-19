@@ -24,7 +24,7 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
 - Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
 - First person geometry (arms, held weapon) is detected via UE3's `SDPG_Foreground` boundary (mid-scene depth-only clear) and classified as ViewModel, overriding player-model tags (`rtx.d3d9.ue3ForegroundDpgIsViewModel`).
-- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`, the game profile's default) reproduces the game's display transform - the game's own exposure model with each PostProcessVolume's authored clamps, the per-channel highlights/shadows/midtones grade, display gamma 2.0 and the per-map 16-segment colour curves - on Remix's path-traced output, with curves, grade constants and exposure settings captured live from the game's (skipped) post-process passes. Faithful Luma (`rtx.tonemap.ue3.faithfulLuma`, on by default) changes that shipped math only where it loses information: the per-channel clip at exposed white becomes a range compression curve sized for path-traced radiance with its hue shift corrected in OKLab, and the shipped `#020202` black floor reaches true black. See [Mirror's Edge tonemapper and colour curves](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves).
+- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`, the game profile's default) reproduces the game's display transform in Remix, which includes the game's own exposure model, the per-channel highlights/shadows/midtones grade, and the per-map colour grading curves. See [Mirror's Edge tonemapper and colour curves](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves).
 
 ### 2) Mirror's Edge/UE3 setup:
 
@@ -34,7 +34,7 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 
 2. *(Recommended)* Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`). This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
 > [!NOTE]
-> Lightmaps are not used as a surface's colour, whichever way this is set. Material identity is *mostly* independent of the setting, but not entirely - switching it can give a material a different hash. For this reason you should pick one setting before Toolkit authoring and stay on it. `False` is the better option of the two. See [UE3 lightmaps are bypassed](documentation/UE3Compatibility.md#ue3-lightmaps-are-bypassed).
+> Lightmaps are not used as a surface's colour whichever way this is set - Remix's material identity is independent of it. A material hashes the same either way so assets authored under one setting match under the others. `False` is still recommended as it compiles the smaller shaders and binds one lightmap texture per surface instead of three. See [UE3 lightmaps are bypassed](documentation/UE3Compatibility.md#ue3-lightmaps-are-bypassed).
 
 3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```

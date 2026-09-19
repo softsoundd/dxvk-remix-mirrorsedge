@@ -10,6 +10,7 @@ dxso_src = files([
   'dxso_tables.cpp',
   'dxso_decoder.cpp',
   'dxso_analysis.cpp',
+  'dxso_color_terms.cpp',
   'dxso_compiler.cpp',
   'dxso_enums.cpp'
 ])
