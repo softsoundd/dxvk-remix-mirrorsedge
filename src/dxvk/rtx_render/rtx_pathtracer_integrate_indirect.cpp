@@ -261,9 +261,14 @@ namespace dxvk {
     public:
       static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() {
         auto slots = IntegrateIndirectRayGenShader::getResourceSlots();
+        // SHARC stages do not consume NRC or ReSTIR GI state and never read previous-frame lights.
+        // The primary RTXDI reservoir is deliberately NOT dropped: secondary NEE steals from it, and
+        // the cache needs that more than the path tracer does, because noise deposited into a cell is
+        // shared by every pixel that reads the cell rather than being per-pixel. Dropping it here was
+        // what forced the reservoir guard in integrator_indirect.slangh to take its no-op branch.
+        // Previous-frame lights stay dropped: the steal passes usePreviousLights = false.
         slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) {
           switch (slot.slot) {
-          case INTEGRATE_INDIRECT_BINDING_PRIMARY_RTXDI_RESERVOIR:
           case BINDING_PREVIOUS_LIGHT_DATA_BUFFER:
           case INTEGRATE_INDIRECT_BINDING_NRC_PATH_DATA0_INPUT:
           case INTEGRATE_INDIRECT_BINDING_NRC_UPDATE_PATH_DATA0_INPUT:

@@ -480,6 +480,39 @@ void sharcDebugUpdate(uvec2 pixel, SharcDepositStats stats)
 }
 #endif
 
+// NVIDIA's prescribed update-stage roughness clamp, called once per resolved vertex after the cache
+// has already decided what it thinks of the surface. A cell stores one non-directional radiance value,
+// so a narrow specular lobe is the one thing it cannot represent: every update path reaching a glossy
+// surface from a different direction deposits a different answer, and the cell's mean keeps moving
+// however many samples it accumulates. Roughening the material first makes the deposit describe what
+// the surface would reflect if it were rough, which is a quantity a single value can actually hold.
+//
+// Deliberately separate from sharcRejectReason's minRoughness, and deliberately ordered after it: the
+// guidance is explicit that the clamp must never feed query eligibility. Eligibility therefore still
+// sees the true roughness, and the clamp costs no coverage -- it refuses no lookup, rejects no surface
+// and creates no cell. It changes what a cell holds, not which surfaces have one.
+void sharcClampUpdateRoughness(inout PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction, uint materialType)
+{
+#if ENABLE_SHARC && SHARC_UPDATE
+  const float roughnessFloor = cb.sharcArgs.updateRoughnessClamp;
+  if (roughnessFloor <= 0.0f || materialType != surfaceMaterialTypeOpaque)
+  {
+    return;
+  }
+  OpaqueSurfaceMaterialInteraction material = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
+  // An anisotropic axis can sit below the floor while the isotropic value clears it, so all three are tested.
+  if (material.isotropicRoughness >= roughnessFloor && all(material.anisotropicRoughness >= vec2(roughnessFloor)))
+  {
+    return;
+  }
+  // Raising every axis to the same floor also flattens anisotropy, which is the intended direction: the
+  // cache cannot represent that either.
+  material.isotropicRoughness = max(material.isotropicRoughness, roughnessFloor);
+  material.anisotropicRoughness = max(material.anisotropicRoughness, vec2(roughnessFloor));
+  polymorphicSurfaceMaterialInteraction = polymorphicSurfaceMaterialInteractionCreateInternal(material);
+#endif
+}
+
 // Called once per resolved opaque vertex, after emissive radiance has been accumulated
 // (the cache stores reflected lighting, so emission must already be live).
 //

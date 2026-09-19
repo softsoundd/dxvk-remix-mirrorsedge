@@ -97,6 +97,8 @@ namespace dxvk {
     // stricter test, so a lower value here would invert the whole point of the split.
     const float roughnessSpecular = std::max(roughness,
       std::isfinite(minRoughnessSpecular()) ? std::clamp(minRoughnessSpecular(), 0.05f, 1.0f) : 0.5f);
+    const float roughnessClamp = std::isfinite(updateRoughnessClamp())
+      ? std::clamp(updateRoughnessClamp(), 0.0f, 1.0f) : 0.0f;
     const uint32_t sampleFloor = uint32_t(std::clamp(minSampleCount(), 0, 32));
     const float emissiveLimit = std::isfinite(maxEmissiveLuminance()) ? std::max(maxEmissiveLuminance(), 0.0f) : 0.0f;
     const uint32_t updateBounceLimit = std::clamp(updateBounces(), 1, 8);
@@ -104,6 +106,7 @@ namespace dxvk {
       || m_args.gridScale != scale || m_args.minRoughness != roughness
       || m_args.maxEmissiveLuminance != emissiveLimit
       || m_args.minRoughnessSpecular != roughnessSpecular
+      || m_args.updateRoughnessClamp != roughnessClamp
       || m_args.minSampleCount != sampleFloor
       || m_args.updateBounces != updateBounceLimit;
     if (m_hash == nullptr || m_args.capacity != capacity) {
@@ -148,6 +151,7 @@ namespace dxvk {
     m_args.minRoughness = roughness;
     m_args.maxEmissiveLuminance = emissiveLimit;
     m_args.minRoughnessSpecular = roughnessSpecular;
+    m_args.updateRoughnessClamp = roughnessClamp;
     m_args.minSampleCount = sampleFloor;
     m_args.accumulationFrames = std::clamp(accumulationFrames(), 1, 64);
     m_args.staleFrames = std::clamp(staleFrames(), 8, 128);
@@ -161,6 +165,11 @@ namespace dxvk {
     // of the few options that can be dragged live, which is what a threshold found by eye needs.
     m_args.maxDepositLuminance = (deferredUpdates() && std::isfinite(maxDepositLuminance()))
       ? std::max(maxDepositLuminance(), 0.0f) : 0.0f;
+    // Deliberately absent from the clear condition above, for the same reason as the cap it
+    // replaces: a cell already holding an unclamped outlier washes it out on its own.
+    m_args.maxDepositRatio = (deferredUpdates() && std::isfinite(maxDepositRatio()))
+      ? std::max(maxDepositRatio(), 0.0f) : 0.0f;
+    m_args.minDepositCeiling = std::isfinite(minDepositCeiling()) ? std::max(minDepositCeiling(), 0.0f) : 0.0f;
     m_args.enabled = 1u | (updatePrimaryVertex() ? SHARC_UPDATE_FLAG_PRIMARY_VERTEX : 0u)
       | (skyRetries << SHARC_UPDATE_SKY_RETRY_SHIFT);
     m_args.allowSpecularPaths = allowSpecularPaths() ? 1u : 0u;
@@ -393,6 +402,14 @@ namespace dxvk {
         minRoughnessObject().setDeferred(0.05f);
         minRoughnessSpecularObject().setDeferred(0.7f);
         maxEmissiveLuminanceObject().setDeferred(0.1f);
+        updateRoughnessClampObject().setDeferred(0.25f);
+        // Deposit bounds are shared by every preset because they are not a budget: they decide what a
+        // cell is allowed to hold, not how much work is spent filling it. The relative ceiling replaced
+        // an absolute one that had to be set below the dimmest cell worth keeping and so darkened the
+        // scene at any value low enough to catch an outlier; the absolute cap stays available at 0.
+        maxDepositRatioObject().setDeferred(20.0f);
+        minDepositCeilingObject().setDeferred(2.0f);
+        maxDepositLuminanceObject().setDeferred(0.0f);
       };
       // The primary deposit is the one preset value backed by a frame-time measurement rather
       // than an estimate: the user read about 0.1 ms for it in game, which is the same order as
@@ -408,35 +425,37 @@ namespace dxvk {
       };
       if (ImGui::Selectable("Quality")) {
         applyShared();
-        applyUpdateBudget(4, 8, 22, 2, true);
+        applyUpdateBudget(3, 8, 22, 2, true);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "Four times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
-        "hidden faces, surfaces off screen, distant relief -- are fed as well as the camera-visible ones, and update "
-        "paths run to the full eight bounces so cells hold more of the multi-bounce tail. The update pass is the "
-        "price and it is a large one: with the deeper bounce limit on top, roughly eight times Balanced's "
-        "traced segments. Unmeasured.");
+        "About 2.8 times the update paths of Balanced and twice the sky retries, so the cells Balanced leaves sparse -- "
+        "hidden faces, surfaces off screen, distant relief -- are fed better, and update paths run to the full eight "
+        "bounces so cells hold more of the multi-bounce tail. That depth is the real cost rather than the tile size: "
+        "it more than doubles the traced segments per path and drops back to the eight-slot update shader, which "
+        "Balanced avoids. Unmeasured.");
       if (ImGui::Selectable("Balanced (default)")) {
         applyShared();
-        applyUpdateBudget(8, 4, 22, 1, true);
+        applyUpdateBudget(5, 3, 22, 1, true);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "The shipped default, and the configuration tested in Fallout New Vegas. With the primary vertex deposited, "
-        "every camera-visible eligible surface is fed by every update tile that lands on it, which is what a "
-        "four-bounce, tile-8 update budget is sized for. That deposit measured about 0.1 ms in game and Balanced "
-        "keeps it, because the quality it buys is confirmed and the time it costs is under a percent of a frame. "
-        "Setting nothing in rtx.conf gives you this.");
+        "The shipped default, tuned in Half-Life 2 RTX until cache boiling sat level with NRC. Tile 5 is NVIDIA's own "
+        "recommended update downscale; the earlier tile 8 starved the cells that are reached only by a bounce, which "
+        "is what boiled. Three bounces rather than four is most of what pays for that: with the primary vertex "
+        "deposited it fits the compact four-slot update shader, where four bounces forced the eight-slot one and its "
+        "register cost. The primary deposit itself measured about 0.1 ms in game and Balanced keeps it, because the "
+        "quality it buys is confirmed and the time it costs is under a percent of a frame. Setting nothing in "
+        "rtx.conf gives you this.");
       if (ImGui::Selectable("Performance")) {
         applyShared();
         applyUpdateBudget(12, 3, 20, 0, false);
         m_resetRequested = true;
       }
       RemixGui::SetTooltipToLastWidgetOnHover(
-        "About 2.25 times fewer update paths than Balanced, one bounce shallower -- which also drops the update "
-        "shader back to its compact four-slot variant -- no sky retries, a quarter of the resolve threads, and no "
-        "primary-vertex deposit, which is the one item here with a measured price: about 0.1 ms. It gives up the "
+        "About 5.8 times fewer update paths than Balanced, no sky retries, a quarter of the resolve threads, and no "
+        "primary-vertex deposit, which is the one item here with a measured price: about 0.1 ms. Bounce depth already "
+        "matches Balanced, so the compact four-slot update shader is not something this preset buys. It gives up the "
         "sparsest cells first: hidden faces, freshly revealed geometry and outdoor relief. Expect tenths of a "
         "millisecond, not a transformation -- the whole cache measured about 0.1 ms net, so this trims the cost "
         "side and the benefit side together. Under open sky, without the primary deposit most update paths exit "
@@ -452,9 +471,35 @@ namespace dxvk {
     RemixGui::DragInt("Stale frames", &staleFramesObject(), 1.0f, 8, 128);
     RemixGui::DragFloat("Grid density (SHARC scene scale)", &gridScaleObject(), 1.0f, 1.0f, 1000.0f);
     RemixGui::DragFloat("Minimum roughness (squared)", &minRoughnessObject(), 0.01f, 0.05f, 1.0f);
+    RemixGui::DragFloat("Update roughness clamp (squared)", &updateRoughnessClampObject(), 0.01f, 0.0f, 1.0f);
+    RemixGui::SetTooltipToLastWidgetOnHover(
+      "0 disables it. Roughens materials to at least this value while the cache is being updated, before the "
+      "continuation is sampled and before NEE is evaluated. A cell holds one non-directional radiance value and "
+      "cannot stand in for a narrow highlight, so on a glossy surface every update path arriving from a different "
+      "direction deposits a different value and the cell's mean never settles -- which is what boils in reflections, "
+      "and why neither a longer accumulation window nor a smaller tile fixes it. This makes a cell store what its "
+      "surface would reflect if it were rough, which an isotropic cell can represent. Costs no coverage: no lookup "
+      "refused, no surface rejected, no cell lost. Cached reflections soften in exchange. Same scale as Minimum "
+      "roughness above, but a different job -- that one decides what may be cached, this one never affects "
+      "eligibility. Clears the cache when changed. Unmeasured.");
     RemixGui::DragFloat("Max emissive luminance", &maxEmissiveLuminanceObject(), 0.001f, 0.0f, 1.0f);
     RemixGui::DragInt("Minimum cell samples", &minSampleCountObject(), 1.0f, 0, 32);
     if (deferredUpdates()) {
+      RemixGui::DragFloat("Max deposit ratio", &maxDepositRatioObject(), 0.5f, 0.0f, 200.0f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "0 disables it. Caps a single deposit at this multiple of what the cell already holds. An absolute cap has "
+        "to be set below the dimmest cell worth keeping, so any value low enough to catch fireflies also caps every "
+        "cell's mean and darkens the whole scene -- which is why Max deposit luminance is so hard to set. This asks "
+        "the question that matters instead: is this deposit wildly unlike what this cell has already converged on? "
+        "A bright cell keeps its headroom, a dark one still refuses spikes. Cells below Minimum cell samples are "
+        "exempt, having no mean to measure against yet. Washes out within Accumulation frames, so it can be dragged "
+        "live. Unmeasured.");
+      RemixGui::DragFloat("Min deposit ceiling", &minDepositCeilingObject(), 0.1f, 0.0f, 100.0f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Floor under the ratio ceiling above, in absolute luminance. A cell sitting near black would otherwise pin "
+        "its own ceiling near zero and never brighten when the lighting changes, since every deposit that would "
+        "have raised it gets clamped away first. Raise it if lights turning on are slow to show up in indirect "
+        "lighting; lower it if dark areas still sparkle.");
       RemixGui::DragFloat("Max deposit luminance", &maxDepositLuminanceObject(), 0.5f, 0.0f, 1000.0f);
       RemixGui::SetTooltipToLastWidgetOnHover(
         "0 disables it. Caps the luminance of a single value an update path writes into a cell. A cell is a mean, so "
@@ -463,8 +508,10 @@ namespace dxvk {
         "fireflies on reflective surfaces get worse the lower the DLSS preset, and why lowering the tile size cures "
         "them: both move the same divisor. This bounds the outlier instead, and unlike every other remedy it costs no "
         "coverage -- no lookup is refused, no surface rejected, no cell lost. The cost is bias: a cell whose true "
-        "radiance exceeds the threshold is stored dark. Pick the value from debug view 583 (Cached Radiance), not by "
-        "taste, and set it above the brightest cached radiance you legitimately want. Takes effect within "
+        "radiance exceeds the threshold is stored dark. Pick the value from debug view 591 (Update Deposit), whose red "
+        "channel is the brightest single deposit a path made, measured before the clamp. Not view 583: that is a "
+        "cell mean, a smaller number, and setting this from it would clamp far too hard. View 591 draws one pixel "
+        "per update tile, so most of the frame is black by design. Takes effect within "
         "Accumulation frames without clearing the cache, so it can be dragged live. Unmeasured.");
     }
     if (allowSpecularPaths() && !footprintGate()) {

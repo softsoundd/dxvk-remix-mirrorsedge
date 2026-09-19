@@ -354,12 +354,19 @@
 #define RAY_PIPELINE
 #define INTEGRATE_INDIRECT
 #define RAB_HAS_PREVIOUS_GBUFFER 1
-// Match the inline SHARC query reservoir policy across tracing backends.
-#if !ENABLE_SHARC
+// Upstream judges RTXDI sample stealing "no visibile IQ gains" (rtx_rtxdi_rayquery.h), a call made
+// on a per-pixel signal that a denoiser then cleans up. It does not carry over here. A cache cell is
+// read by every pixel whose ray lands in it, so NEE noise deposited during the update stage stops
+// being per-pixel grain and becomes a voxel-sized blob that flickers as one unit -- which is exactly
+// what a denoiser cannot remove. The cheaper light sampler is therefore worth much more to the cache
+// than it is to the path tracer, and leaving it off is what made SHARC noisier than the plain
+// importance-sampled mode it is supposed to quieten. rtx.di.enableSampleStealing still gates it.
 #define RAB_HAS_RTXDI_RESERVOIRS 1
 
 // Note: ReSTIR GI Reservoirs are not available with NRC enabled, but
-// the usage of the reservoirs is gated on ReSTIR GI being enabled
+// the usage of the reservoirs is gated on ReSTIR GI being enabled.
+// They stay out of SHARC, which is a different integrate-indirect mode.
+#if !ENABLE_SHARC
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #endif
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat

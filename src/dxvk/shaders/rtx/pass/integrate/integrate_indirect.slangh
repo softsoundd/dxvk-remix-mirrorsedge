@@ -100,6 +100,22 @@ bool nrcCombinedToGbufferPixelCoordinate(
 // Returns false if the thread should terminate
 bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool isNrcUpdate)
 {
+  isNrcUpdate = false;
+#if SHARC_UPDATE
+  // The update dispatch is tile sized rather than screen sized.  Select one
+  // stable, rotating source pixel from each tile so the cache sees the whole
+  // view over time without using NRC's expanded coordinate space.
+  const uint tileSize = max(cb.sharcArgs.updateTileSize, 1u);
+  const uvec2 tileCount = (cb.camera.resolution + tileSize - 1u) / tileSize;
+  if (any(gbufferPixelCoordinate >= tileCount))
+  {
+    return false;
+  }
+  const uvec2 tileOffset = sharcTileOffset(gbufferPixelCoordinate, tileSize);
+  gbufferPixelCoordinate = min(gbufferPixelCoordinate * tileSize + tileOffset,
+                               cb.camera.resolution - 1u);
+  return true;
+#else
   if (!nrcCombinedToGbufferPixelCoordinate(
       gbufferPixelCoordinate,
       gbufferPixelCoordinate,
@@ -123,6 +139,7 @@ bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool is
 
   return loadPixelCoordinate(gbufferPixelCoordinate, ActiveLocalPixelCoords,
                              cb.camera.resolution, cb.sparseRenderingArgs, gbufferPixelCoordinate);
+#endif
 }
 
 void integrate_indirect_pass(uvec2 threadIndex)
@@ -157,9 +174,9 @@ void integrate_indirect_pass(uvec2 threadIndex)
   // Note: Early out if no more work on the active surface is needed.
   if (gbufferMissOfASelectedIntegrationSurface)
   {
-    if (isNrcUpdate)
+    if (isNrcUpdate || SHARC_UPDATE)
     {
-      // IndirectRadianceHitDistance is not used for update pixels, so no need to write it out
+      // Update traces are training work and have no screen-space output.
       return;
     }
 

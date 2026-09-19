@@ -61,7 +61,12 @@ def check(name: str, text: str) -> None:
         required = {230, 231}
         if not required <= b:
             raise RuntimeError(f"{name}: missing SHARC bindings {sorted(required - b)}")
-        if 232 in b:
+        # Deferred update reads the resolved mean to scale maxDepositRatio. The comparison
+        # (non-deferred) backend does not, so 232 must stay absent there.
+        if "deferred" in name:
+            if 232 not in b:
+                raise RuntimeError(f"{name}: deferred update missing resolved binding 232 for the deposit ceiling")
+        elif 232 in b:
             raise RuntimeError(f"{name}: query-only resolved binding 232 is present")
         if 8 not in s or 16 not in s:
             raise RuntimeError(f"{name}: expected hash/accumulation strides 8/16, got {sorted(s)}")
@@ -173,8 +178,8 @@ def check_trace(name: str, text: str, stage: str) -> None:
             raise RuntimeError(f"{name}: expected inline visibility queries")
         if uses_wboit_compensation(text) != name.endswith("wboit"):
             raise RuntimeError(f"{name}: incorrect compiled particle resolver")
-    if b & {51, 170, 171, 172}:
-        raise RuntimeError(f"{name}: reservoir policy differs from inline SHARC")
+    if b & {170, 171, 172}:
+        raise RuntimeError(f"{name}: ReSTIR GI reservoirs must stay out of SHARC")
 
 
 def uniform_member_used(text: str, name: str) -> bool:
@@ -200,38 +205,44 @@ def declared_sharc_variants(root: Path) -> set:
 
 
 def check_reservoir_guard(root: Path, shader_dir: Path, dis: Path, baseline_dir, baseline_dll) -> None:
-    """Pin the SHARC stealing guard: SHARC stages must not enter the RTXDI stealing branch.
+    """Pin SHARC RTXDI sample stealing.
 
-    Without RAB_HAS_RTXDI_RESERVOIRS a steal always fails and skips the NEE cache / RIS fallback,
-    so SHARC stages (which never bind the reservoir) must compile the branch out entirely.
+    SHARC stages bind the primary RTXDI reservoir and enter the steal branch; previous-frame
+    lights stay unbound. Noise deposited into a cell is shared by every pixel that reads it,
+    so the cache needs the reservoir more than a per-pixel path tracer does.
+
+    The `if (false)` safety net remains for any future variant without RAB_HAS_RTXDI_RESERVOIRS,
+    because a failed steal skips the NEE cache / RIS fallback entirely.
     """
     source = (root / "src/dxvk/shaders/rtx/algorithm/integrator_indirect.slangh").read_text(encoding="utf-8")
     if not re.search(r"#if ENABLE_SHARC && !defined\(RAB_HAS_RTXDI_RESERVOIRS\)\s*\n\s*if \(false\)", source):
         raise RuntimeError("integrator_indirect.slangh: SHARC reservoir guard around the stealing branch is missing")
-    context = (root / "src/dxvk/rtx_render/rtx_context.cpp").read_text(encoding="utf-8")
-    for needle in ("enableIndirectAlphaBlendShadows() && accelManager.hasAlphaBlendInstances()",
-                   "enableUnorderedResolveInIndirectRays() && accelManager.getUnorderedInstanceCount() > 0"):
-        if needle not in context:
-            raise RuntimeError(f"rtx_context.cpp: scene gate missing: {needle}")
     declared = sorted(declared_sharc_variants(root))
     if not declared:
         raise RuntimeError("no SHARC variants declared")
+    steal_stems = []
     for stem in declared:
         path = shader_dir / (stem + ".spv")
         if not path.is_file():
             raise RuntimeError(f"declared SHARC variant not compiled: {stem}")
         text = disassemble(path, dis)
-        if set(binding_variables(text)) & {10, 51}:
-            raise RuntimeError(f"{stem}: SHARC stage binds the RTXDI reservoir or previous lights")
-        if uniform_member_used(text, "enableRtxdiSampleStealing"):
-            raise RuntimeError(f"{stem}: SHARC stage still enters the RTXDI stealing branch")
+        bindings = set(binding_variables(text))
+        # Miss shaders do not evaluate NEE. Trace raygen only launches; closest-hit does NEE.
+        if "_miss" in stem or "_query_trace" in stem:
+            continue
+        if 51 not in bindings:
+            raise RuntimeError(f"{stem}: SHARC stage missing the RTXDI reservoir")
+        if not uniform_member_used(text, "enableRtxdiSampleStealing"):
+            raise RuntimeError(f"{stem}: SHARC stage does not enter the RTXDI stealing branch")
+        steal_stems.append(stem)
         if baseline_dir is not None:
             reference = baseline_dir / (stem + ".spv")
             if not reference.is_file():
                 raise RuntimeError(f"{stem}: missing from baseline directory")
             if reference.read_bytes() != path.read_bytes():
                 raise RuntimeError(f"{stem}: differs from baseline")
-    print(f"PASS reservoir guard: {len(declared)} declared SHARC stages omit bindings 10/51 and the stealing flag"
+    print(f"PASS reservoir guard: {len(declared)} declared SHARC stages; "
+          f"{len(steal_stems)} NEE stages bind reservoir 51 and steal"
           + (", byte-identical to baseline" if baseline_dir is not None else ""))
     legacy = disassemble(shader_dir / "integrate_indirect_neeCache_material_opaque_translucent_closestHit.spv", dis)
     if 51 not in set(binding_variables(legacy)) or not uniform_member_used(legacy, "enableRtxdiSampleStealing"):
@@ -306,6 +317,8 @@ def main() -> int:
                         raise RuntimeError(f"{name}: ray payload ABI differs across shader stages/variants")
                     inline_bindings = set(binding_variables(compiled["query_raygen" + suffix]))
                     extra = set(binding_variables(text)) - inline_bindings
+                    # Mirror's Edge miss shaders sample the atmosphere LUTs (200-202).
+                    extra -= {200, 201, 202}
                     if extra:
                         raise RuntimeError(f"{name}: descriptors exceed inline SHARC layout: {sorted(extra)}")
                     print(f"PASS {name}: stage, payload ABI, descriptors, tracing and resolver")

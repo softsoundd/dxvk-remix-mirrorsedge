@@ -624,6 +624,13 @@ void integratePathVertex(
     float restirHitT = kMissHitDistance;
     updateReSTIRGIHitDistance(oldLuminance, calcBt709Luminance(pathState.radiance), restirHitT, pathState.accumulatedHitDistance);
     
+    // Roughen the material for the cache's benefit before anything reads it. Both the continuation
+    // sampled below and the NEE evaluated further down decode their material from this one, so this is
+    // the single point that covers both, and it is past the cache's own eligibility test by design.
+#if ENABLE_SHARC && SHARC_UPDATE
+    sharcClampUpdateRoughness(polymorphicSurfaceMaterialInteraction, materialType);
+#endif
+
     const bool oldInsideMedium = pathState.insideMedium;
     vec3 continuationThroughput = vec3(1.0);
     uint8_t continuationLobe = 0;
@@ -691,8 +698,10 @@ void integratePathVertex(
       uint16_t lightIdx = kInvalidLightIdx;
       // Sample stealing needs the primary RTXDI reservoir buffer. Stages without
       // RAB_HAS_RTXDI_RESERVOIRS load an empty reservoir, so the steal always fails,
-      // and a failed steal skips the NEE cache / RIS fallback below. SHARC stages
-      // never bind the reservoir, so they must not enter this branch at all.
+      // and a failed steal skips the NEE cache / RIS fallback below -- no shadow ray and
+      // no direct light at that vertex. SHARC stages do bind and define it now, so this
+      // guard is inert for them; it stays as the safety net for any future variant that
+      // does not, since silently losing NEE is far worse than losing the steal.
 #if ENABLE_SHARC && !defined(RAB_HAS_RTXDI_RESERVOIRS)
       if (false)
 #else

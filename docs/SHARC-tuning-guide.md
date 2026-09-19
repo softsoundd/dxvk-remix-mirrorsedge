@@ -31,7 +31,9 @@ preset, which is the profile below, so `rtx.integrateIndirectMode = 3` on its ow
 The panel also has a **SHARC preset** dropdown with Quality, Balanced and Performance. Only five
 of the fourteen values a preset writes differ between them — the update tile size, the update
 bounce count, the sky retries, the primary-vertex deposit and the cache capacity. The other nine
-are correctness and coverage controls that all three write identically.
+are correctness and coverage controls that all three write identically. Balanced ships tile size 5
+and 3 update bounces (NVIDIA's recommended update downscale, tuned so cache boiling sits closer to
+NRC); Quality is tile 3 / 8 bounces; Performance is tile 12 / 3 bounces with no primary deposit.
 
 Paste this only if you want the settings written out explicitly, or you are on an older build
 whose defaults predate the presets:
@@ -47,11 +49,14 @@ rtx.sharc.footprintGate       = True    # default; leave on
 rtx.sharc.minRoughness        = 0.05
 rtx.sharc.maxEmissiveLuminance = 0.1
 rtx.sharc.minSampleCount      = 2       # default
+rtx.sharc.updateRoughnessClamp = 0.25   # default; roughens update deposits, not eligibility
+rtx.sharc.maxDepositRatio     = 20      # default; relative firefly ceiling
+rtx.sharc.minDepositCeiling   = 2       # default; floor under that ceiling
 
 # Budget
 rtx.sharc.capacityLog2     = 20
-rtx.sharc.updateTileSize   = 8
-rtx.sharc.updateBounces    = 4
+rtx.sharc.updateTileSize   = 5
+rtx.sharc.updateBounces    = 3
 rtx.sharc.accumulationFrames = 4
 rtx.sharc.staleFrames      = 32         # default
 rtx.sharc.gridScale        = 50         # default
@@ -66,8 +71,8 @@ Why these values, and what each one is protecting you from:
 | `maxEmissiveLuminance` | `0.1` | At 0 *any* emission at all disqualifies a surface, which throws out every faint emissive map. **Measured** in Portal: this alone took the emissive reject share from "almost every surface" down to 0.8%. |
 | `minSampleCount` | `2` | Stops a cell answering from a single sample. **Measured**: this is what removed the glow on geometry coming into view. |
 | `capacityLog2` | `22` | Occupancy was never measurably short even at 20, but the resolve pass runs one thread per slot, so this costs a little every frame regardless. See §5. |
-| `updateTileSize` | `8` | One update path per 8×8 pixel tile. **Measured** Portal still hit 99.2% at this rate. |
-| `updateBounces` | `4` | 8 was more depth than the cache needed. Note this is *not* `rtx.pathMaxBounces`. |
+| `updateTileSize` | `5` | One update path per 5×5 pixel tile. NVIDIA's recommended update downscale; larger tiles starve bounce-only cells and boil. |
+| `updateBounces` | `3` | With the primary vertex deposited this fits the compact four-slot update shader. Note this is *not* `rtx.pathMaxBounces`. |
 | `accumulationFrames` | `8` | Response to lighting changes versus per-cell noise. See §4 before changing it in either direction. |
 
 Two more are **on by default**: `rtx.sharc.updatePrimaryVertex = True` and
@@ -256,8 +261,8 @@ Act on the miss split:
   fed once every *k* frames is only ever readable if *k* is smaller than `accumulationFrames`, so
   at 4 anything fed less than every fourth frame is permanently stuck below the floor. Then
   `staleFrames` to 128, but *only together with the accumulation raise* — alone it just keeps
-  cells whose history the next sample destroys. Then `updateTileSize` 8 → 4 for 4× the samples,
-  at 4× the update cost.
+  cells whose history the next sample destroys. Then `updateTileSize` 5 → 3 for more samples,
+  at the matching update cost.
 - **no cell dominant**: try `capacityLog2 = 22` for one session. If the share does not move,
   capacity is exonerated — go back to 20 and treat it as a density problem instead.
 - Two options exist specifically for this and are **on by default**:
@@ -474,8 +479,10 @@ them readable.
 
 #### `rtx.sharc.maxDepositLuminance` — default `0` (off). **Unmeasured.**
 
-Caps the luminance of a single value an update path writes into a cell. The cure for **fireflies on
-reflective materials** with `allowSpecularPaths` on.
+Caps the luminance of a single value an update path writes into a cell. The older absolute cure for
+**fireflies on reflective materials** with `allowSpecularPaths` on. Prefer
+`rtx.sharc.maxDepositRatio` first: an absolute cap has to sit below the dimmest cell worth keeping,
+so a value low enough to catch outliers also darkens every converged cell.
 
 A cell is a mean, so one outlier is never averaged away — only divided by the cell's sample count,
 which works out as `L / ((accumulationFrames + 1) * k)` for a cell fed `k` times a frame. And `k`
@@ -485,20 +492,51 @@ get worse the lower the DLSS preset (about **9x** worse at Ultra Performance tha
 and lowering `updateTileSize` cures them (4 quarters them). Both move the same divisor, and only one
 of them is free.
 
-**Set it** from debug view **583 (Cached Radiance)**: read the brightest cached radiance you
-legitimately want, then set this comfortably *above* it — 583 shows the cell mean, and this bounds a
-single deposit, which is larger. **Too far down** looks like bright cached areas going flat before
-the fireflies go.
+**Set it** from debug view **591 (Update Deposit)**: the red channel is the peak deposit luminance
+an update path wrote, measured before the clamp. Not view 583 — that is a cell mean, a smaller
+number, and setting this from it clamps far too hard. View 591 draws one pixel per update tile, so
+most of the frame is black by design. **Too far down** looks like bright cached areas going flat
+before the fireflies go.
 
 Unlike every other remedy it **costs no coverage**: it refuses no lookup, rejects no surface and
 loses no cell, so it cannot take back the detail `allowSpecularPaths` buys. What it costs instead is
-bias — a cell whose true radiance is above the threshold is stored dark.
+bias — a cell whose true radiance is above the threshold is stored dark. When both this and
+`maxDepositRatio` are set, the tighter of the two wins.
 
 > **Depends on:** `rtx.sharc.deferredUpdates` must be on (it is by default); the comparison backend
 > ignores this. **Takes effect live — does not clear the cache**; old values wash out in
 > `accumulationFrames` frames, so you can drag it and watch. Full reasoning, with the arithmetic and
 > the four alternatives that were ranked below it:
 > [SHARC-specular-fireflies-2026-09-16.md](SHARC-specular-fireflies-2026-09-16.md).
+
+#### `rtx.sharc.maxDepositRatio` — default `20`. **Unmeasured.**
+
+Ceiling on a single deposit as a multiple of what that cell already holds; 0 disables it and leaves
+only `maxDepositLuminance`. A relative ceiling asks whether this deposit is wildly unlike what the
+cell has already converged on, so a bright cell keeps its headroom and a dark one still refuses
+spikes. Cells at or below `minSampleCount` take `minDepositCeiling` as their ceiling rather than
+being exempted — they are the population that boils.
+
+> **Depends on:** `deferredUpdates`. **Takes effect live — does not clear the cache.**
+
+#### `rtx.sharc.minDepositCeiling` — default `2`. **Unmeasured.**
+
+Floor under `maxDepositRatio`'s ceiling, as absolute luminance. Without it a cell sitting near black
+pins its own ceiling near zero and can never brighten when the lighting changes.
+
+> **Depends on:** ignored when `maxDepositRatio` is 0. **Takes effect live — does not clear the cache.**
+
+#### `rtx.sharc.updateRoughnessClamp` — default `0.25`. **Unmeasured.**
+
+Roughens opaque materials to at least this isotropic GGX roughness *while the cache is being
+updated*, after eligibility has already been decided. A cell holds one non-directional radiance
+value and cannot stand in for a narrow highlight, so on a glossy surface every update path arriving
+from a different direction deposits a different value and the mean never settles. This makes a cell
+store what its surface would reflect if it were rough. Costs no coverage; cached reflections soften
+in exchange. 0 disables it. Do not confuse it with `minRoughness`, which decides whether a surface
+may be cached at all.
+
+> **Depends on:** update stage only. **Changing it clears the cache.**
 
 ### Budget — what the cache costs
 
@@ -516,24 +554,25 @@ more threads every frame.
 > **Depends on:** nothing. Reallocates buffers and clears the cache on change. Watch
 > `GPU ms: resolve` when you raise it.
 
-#### `rtx.sharc.updateTileSize` — default `8`, range 1–16
+#### `rtx.sharc.updateTileSize` — default `5`, range 1–16
 
-One cache-filling path is traced per N×N pixel tile. 8 means 1/64 of the pixels. This is the main
-lever on how densely the cache is fed.
+One cache-filling path is traced per N×N pixel tile. 5 is NVIDIA's recommended update downscale
+(about 1/25 of the pixels). This is the main lever on how densely the cache is fed. Larger tiles
+starve the cells that are only ever reached by a bounce, which is what boils.
 
-**Lower it** (8 → 4) for 4× the samples per cell when cells are starved; **raise it** when the hit
+**Lower it** (5 → 3) for more samples per cell when cells are starved; **raise it** when the hit
 rate is already in the high 90s and you want the update pass cheaper. **Measured** Portal at tile 8:
 99.2% hit rate — over-served, and the obvious place to claw back cost. **Too far down** shows up
 directly on `GPU ms: update`; indoors those update paths are the long ones, so the cost climbs fast.
 
 > **Depends on:** nothing. **Takes effect live — does not clear the cache.**
 
-#### `rtx.sharc.updateBounces` — default `4`, range 1–8
+#### `rtx.sharc.updateBounces` — default `3`, range 1–8
 
 How many bounces a cache-filling path runs. Russian roulette is forced off for these paths, so they
 run the full count unless they miss or lose all their weight first.
 
-**Lower it** (4) to cut update cost. **Raise it** when the panel shows `Cache terminates` well below
+**Lower it** (to 2) to cut update cost. **Raise it** when the panel shows `Cache terminates` well below
 the hit rate indoors — cells exist, but the update paths are stopping short of where queries land.
 Outdoors it is nearly moot: update paths end at the sky anyway.
 

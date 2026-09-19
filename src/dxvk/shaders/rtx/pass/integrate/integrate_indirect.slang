@@ -428,10 +428,18 @@
 // RAB_LoadReservoir / RAB_LoadGIReservoir return empty reservoirs: an RTXDI steal at a
 // camera-visible secondary vertex then fails and skips the NEE cache / RIS fallback (no
 // shadow ray, no direct light at that vertex), and a ReSTIR GI steal in StealSample mode
-// adds zero radiance and still terminates the path on rough surfaces. SHARC stages keep
-// the inline policy of never touching the reservoirs; see integrator_indirect.slangh.
-#if !ENABLE_SHARC
+// adds zero radiance and still terminates the path on rough surfaces.
+// Upstream judges RTXDI sample stealing "no visibile IQ gains" (rtx_rtxdi_rayquery.h), a call made
+// on a per-pixel signal that a denoiser then cleans up. It does not carry over here. A cache cell is
+// read by every pixel whose ray lands in it, so NEE noise deposited during the update stage stops
+// being per-pixel grain and becomes a voxel-sized blob that flickers as one unit -- which is exactly
+// what a denoiser cannot remove. The cheaper light sampler is therefore worth much more to the cache
+// than it is to the path tracer, and leaving it off is what made SHARC noisier than the plain
+// importance-sampled mode it is supposed to quieten. rtx.di.enableSampleStealing still gates it.
 #define RAB_HAS_RTXDI_RESERVOIRS 1
+// ReSTIR GI reservoirs stay out of SHARC: ReSTIR GI is a different integrate-indirect mode and
+// its reservoirs hold nothing while SHARC is the selected one.
+#if !ENABLE_SHARC
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #endif
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat

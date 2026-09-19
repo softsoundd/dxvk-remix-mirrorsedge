@@ -79,6 +79,29 @@ void sharcSeedVertex(inout SharcUpdateState state, vec3 radiance, vec3 weight) {
 // tracer's output but never the value stored here; 0 disables it, as in fireflyFiltering
 // itself.  The running propagated value is deliberately left alone: clamping only the deposit
 // bounds every cell in the chain by the same rule without altering path propagation.
+// The ceiling a single deposit into this cell may reach. An absolute cap has to be set below the
+// dimmest cell worth keeping, so a value low enough to catch fireflies also caps every cell's mean
+// and drags the whole cache dark -- which is what makes maxDepositLuminance so hard to set by hand.
+// Scale by what the cell has already converged on instead: a bright cell keeps its headroom, a dark
+// one refuses spikes it could never average away, and neither depends on the scene's absolute scale.
+float sharcDepositCeiling(SharcParameters p, uint index) {
+  if (cb.sharcArgs.maxDepositRatio <= 0.0f) {
+    return 0.0f;
+  }
+  const SharcVoxelData voxel = SharcGetVoxelData(p.resolvedBuffer, index);
+  // A cell this thin has no mean worth scaling by, but exempting it from the clamp entirely is exactly
+  // wrong: it is the population that boils. One deposit is a third or more of the mean a cell holding
+  // two samples will resolve to, so an unbounded deposit here is not averaged away by anything. Hold it
+  // to the absolute floor instead -- the only clamp that reached these cells before was the absolute
+  // cap, which is why that was the one setting that visibly helped, and why it darkened everything:
+  // it applied the same low ceiling to converged cells that did not need it.
+  if (voxel.accumulatedSampleNum <= float(cb.sharcArgs.minSampleCount)) {
+    return cb.sharcArgs.minDepositCeiling;
+  }
+  const float mean = SharcLuma(SharcDecodeRadiance(voxel.accumulatedRadiance, vec3(0.0f, 0.0f, 1.0f)));
+  return max(cb.sharcArgs.maxDepositRatio * mean, cb.sharcArgs.minDepositCeiling);
+}
+
 void sharcFlushVertices(SharcUpdateState state, inout SharcDepositStats stats) {
   SharcParameters p = makeSharcParameters();
   vec3 radiance = vec3(0.0f);
@@ -86,14 +109,19 @@ void sharcFlushVertices(SharcUpdateState state, inout SharcDepositStats stats) {
   for (int i = SHARC_PROPAGATION_DEPTH - 1; i >= 0; --i) {
     if (uint(i) < state.count) {
       radiance = state.radiance[i] + state.weights[i] * radiance;
-      const vec3 deposit = fireflyFiltering(radiance, cb.sharcArgs.maxDepositLuminance);
+      // The absolute cap still applies when set, and wins wherever it is the tighter of the two.
+      float ceiling = sharcDepositCeiling(p, state.indices[i]);
+      if (cb.sharcArgs.maxDepositLuminance > 0.0f) {
+        ceiling = ceiling > 0.0f ? min(ceiling, cb.sharcArgs.maxDepositLuminance) : cb.sharcArgs.maxDepositLuminance;
+      }
+      const vec3 deposit = fireflyFiltering(radiance, ceiling);
       SharcAddVoxelData(p, state.indices[i], deposit, vec3(1.0f), vec3(0.0f, 0.0f, 1.0f), 0.0f, 1);
       if (sharcUpdateDebugActive()) {
         // Measured before the clamp: the point of the view is to show the distribution the
         // threshold is being chosen against, which clamping would hide.
         const float luminance = calcBt709Luminance(radiance);
         stats.peakLuminance = max(stats.peakLuminance, luminance);
-        stats.clamped += (cb.sharcArgs.maxDepositLuminance > 0.0f && luminance > cb.sharcArgs.maxDepositLuminance) ? 1u : 0u;
+        stats.clamped += (ceiling > 0.0f && luminance > ceiling) ? 1u : 0u;
         stats.deposits += 1u;
       }
     }

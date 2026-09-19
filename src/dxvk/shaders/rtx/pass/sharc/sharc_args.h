@@ -45,16 +45,31 @@ struct SharcArgs {
   // no coverage: it refuses no query, rejects no surface and creates no cell that did not exist.
   // Applies to the deferred update backend, the shipping one.
   float maxDepositLuminance;
-  // Every struct in RaytraceArgs must be a whole number of 16B rows, and this pad is what keeps
-  // that true here. The shader lays the block out with scalar rules (-fvk-use-scalar-layout) and
+  // Ceiling on a single deposit expressed as a multiple of what the cell already holds, 0 to disable.
+  // An absolute cap has to sit below the dimmest cell worth keeping, so a value low enough to catch
+  // fireflies also drags the whole cache dark -- every cell's mean is capped at it. Scaling by the
+  // cell's own converged value instead lets a bright cell keep accepting bright deposits while a dark
+  // one stops accepting spikes it could never average away.
+  float maxDepositRatio;
+  // Floor under that ceiling, as absolute luminance. Without it a cell sitting near black would pin its
+  // own ceiling near zero and could never brighten again when the lighting changes.
+  float minDepositCeiling;
+  // Isotropic roughness (GGX alpha) floor applied to a material during the update stage only, before
+  // the continuation is sampled and before NEE is evaluated; 0 disables it. Unrelated to minRoughness,
+  // which decides eligibility and is deliberately left alone -- NVIDIA's guidance is explicit that the
+  // clamp must not feed query eligibility. An isotropic cell cannot represent a narrow highlight, so
+  // without this a glossy surface deposits a different value for every direction an update path arrives
+  // from, and the cell's mean never settles however many samples it gets.
+  float updateRoughnessClamp;
+  // The two fields above replaced the trailing pad this struct used to carry, which is why the size
+  // is unchanged. Every struct in RaytraceArgs must stay a whole number of 16B rows: add a member
+  // here without removing 4 bytes elsewhere and the next one must be a pad.
+  // The shader lays the block out with scalar rules (-fvk-use-scalar-layout) and
   // pads nothing; the C++ struct it is memcpy'd from carries alignas(16) on vec4 and mat4. The
   // two agree only while no C++ padding appears: at 84 bytes this struct pushed
   // renderTargetCamera, the first alignas(16) member after it, 12 bytes past where every shader
   // reads it, and with it frameIdx, pathMaxBounces, secondaryRayMaxInteractions and
   // numActiveRayPortals -- path-tracer loop bounds read as garbage, which hangs the GPU.
-  uint pad0;
-  uint pad1;
-  uint pad2;
 };
 #define SHARC_UPDATE_FLAG_PRIMARY_VERTEX 2u
 #define SHARC_UPDATE_SKY_RETRY_SHIFT 2u
@@ -64,5 +79,5 @@ static_assert(sizeof(SharcArgs) == 96);
 // The invariant the size above exists to hold. Keep both: the first catches an unintended
 // change, the second explains which change is never allowed.
 static_assert(sizeof(SharcArgs) % 16 == 0,
-              "SharcArgs must be a whole number of 16B rows; see the comment on pad0.");
+              "SharcArgs must be a whole number of 16B rows; see the comment above.");
 #endif
