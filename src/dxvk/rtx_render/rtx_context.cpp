@@ -1350,7 +1350,7 @@ namespace dxvk {
     constants.enableNrc = nrc.isActive();
     constants.allowNrcTraining = NeuralRadianceCache::NrcOptions::trainCache();
     nrc.setRaytraceArgs(constants);
-    m_common->metaSharc().prepareFrame(*this, constants, m_resetHistory);
+    m_common->metaSharc().setRaytraceArgs(*this, constants);
 
     m_common->metaNeeCache().setRaytraceArgs(constants, m_resetHistory);
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
@@ -1716,26 +1716,7 @@ namespace dxvk {
       ScopedGpuProfileZone(this, "Integrate Indirect Raytracing");
       setFramePassStage(RtxFramePassStage::IndirectIntegration);
 
-      RtxSharc& sharc = m_common->metaSharc();
-      if (sharc.isActive()) {
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::Begin);
-        {
-          ScopedGpuProfileZone(this, "SHARC Update");
-          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, true);
-        }
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::UpdateEnd);
-        sharc.dispatchResolve(*this, rtOutput);
-        sharc.beginQueryStats(*this);
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::ResolveEnd);
-        {
-          ScopedGpuProfileZone(this, "SHARC Query");
-          m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput, false);
-        }
-        sharc.recordTimestamp(*this, RtxSharc::TimingPoint::QueryEnd);
-        sharc.endQueryStats(*this);
-      } else {
-        m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
-      }
+      m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
     }
 
     // Integrate indirect - NEE Cache pass

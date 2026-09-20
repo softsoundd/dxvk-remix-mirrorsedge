@@ -485,8 +485,10 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.descriptorBindingVariableDescriptorCount = m_deviceFeatures.vulkan12Features.descriptorBindingVariableDescriptorCount;
     enabledFeatures.vulkan12Features.shaderInt8 = m_deviceFeatures.vulkan12Features.shaderInt8;
     enabledFeatures.vulkan12Features.shaderFloat16 = m_deviceFeatures.vulkan12Features.shaderFloat16;
+    // NV-DXVK start: Optional SHARC hash-table capabilities
     enabledFeatures.core.features.shaderInt64 = m_deviceFeatures.core.features.shaderInt64;
     enabledFeatures.vulkan12Features.shaderBufferInt64Atomics = m_deviceFeatures.vulkan12Features.shaderBufferInt64Atomics;
+    // NV-DXVK end
     enabledFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess = m_deviceFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess;
     enabledFeatures.khrAccelerationStructureFeatures.accelerationStructure = m_deviceFeatures.khrAccelerationStructureFeatures.accelerationStructure;
     enabledFeatures.khrRayQueryFeatures.rayQuery = m_deviceFeatures.khrRayQueryFeatures.rayQuery;

@@ -20,13 +20,12 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
-#include "rtx/utility/debug_view_indices.h"
-#include "rtx/utility/color.slangh"
-
 #ifndef SHARC_UPDATE
 #define SHARC_UPDATE 0
 #endif
+
+#include "rtx/utility/debug_view_indices.h"
+#include "rtx/utility/color.slangh"
 
 vec4 readInDebugView(uvec2 pixelCoordinate)
 {
@@ -35,6 +34,7 @@ vec4 readInDebugView(uvec2 pixelCoordinate)
 
 void storeInDebugView(uvec2 pixelCoordinate, bool value)
 {
+// Cache update paths must not alter the render debug image
 #if !SHARC_UPDATE
   imageStore(DebugView, ivec2(pixelCoordinate), value ? vec4(1.0) : vec4(0.0));
 #endif
@@ -42,6 +42,7 @@ void storeInDebugView(uvec2 pixelCoordinate, bool value)
 
 void storeInDebugView(uvec2 pixelCoordinate, vec4 value)
 {
+// Cache update paths must not alter the render debug image
 #if !SHARC_UPDATE
   imageStore(DebugView, ivec2(pixelCoordinate), value);
 #endif
@@ -50,17 +51,6 @@ void storeInDebugView(uvec2 pixelCoordinate, vec4 value)
 void storeInDebugView(uvec2 pixelCoordinate, vec3 value)
 {
   storeInDebugView(pixelCoordinate, vec4(value, 1.0f));
-}
-
-// Deliberate writes from the cache update stages, where storeInDebugView is a no-op.
-void storeInDebugViewFromUpdatePath(uvec2 pixelCoordinate, vec4 value)
-{
-  imageStore(DebugView, ivec2(pixelCoordinate), value);
-}
-
-void storeInDebugViewFromUpdatePath(uvec2 pixelCoordinate, vec3 value)
-{
-  storeInDebugViewFromUpdatePath(pixelCoordinate, vec4(value, 1.0f));
 }
 
 void storeInDebugView(uvec2 pixelCoordinate, vec2 value)

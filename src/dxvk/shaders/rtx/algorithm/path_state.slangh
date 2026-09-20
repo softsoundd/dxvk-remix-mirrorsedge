@@ -20,25 +20,21 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
-
+#ifndef ENABLE_SHARC
+#define ENABLE_SHARC 0
+#endif
 #ifndef SHARC_UPDATE
 #define SHARC_UPDATE 0
 #endif
 #ifndef SHARC_QUERY
 #define SHARC_QUERY 0
 #endif
-#ifndef ENABLE_SHARC
-#define ENABLE_SHARC 0
-#endif
-#ifndef SHARC_QUERY_STATS
-#define SHARC_QUERY_STATS 0
-#endif
 
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #include "rtx/utility/packing.slangh"
 #include "rtx/algorithm/resolve_expanded.slangh"
 #include "rtx/external/NRC.slangh"
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#if SHARC_UPDATE
 #include "rtx/pass/sharc/sharc_update.slangh"
 #endif
 
@@ -73,10 +69,9 @@ struct PathState : IBasePayloadState
 
   // Note: Radiance, throughput and hit distances are passed in and then written back out
   // so they can be accumulated into in the path tracing loop.
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#if SHARC_UPDATE
+  // Cached vertices of this update path, propagated once in reverse at path end.
   SharcUpdateState sharcState;
-#elif SHARC_UPDATE
-  SharcState sharcState;
 #endif
   vec3 radiance;
   float _segmentHitDistance;
@@ -104,10 +99,18 @@ struct PathState : IBasePayloadState
                  // bounceIteration(uint:4b)
   uint8_t _roughness;
 #if ENABLE_SHARC
-  uint8_t _skyGatherEligible;
-#if SHARC_QUERY
-  uint8_t _sharcSegmentDistanceHi;
+  // 1 when the segment in flight was launched by a diffuse lobe. Declared only for SHARC
+  // stages, so every other variant keeps its exact payload layout.
+  uint8_t _sharcDiffuseArrival;
 #endif
+#if SHARC_QUERY
+  // Length of the secondary segment in flight, summed over every resolve leg. Cutouts,
+  // clipped geometry, portal quads and teleports re-trace from the interaction and restart
+  // _segmentHitDistance, so that field alone is the last leg rather than the whole segment.
+  float16_t _sharcSegmentDistance;
+  // Perceptual roughness of the surface that launched the segment in flight, for the
+  // query footprint gate.
+  float16_t _sharcLaunchPerceptualRoughness;
 #endif
 
   // Need to track pixel coordinate for sparse rendering where threads can remap to different pixels
@@ -310,6 +313,7 @@ struct PathState : IBasePayloadState
     get
     {
 #if SHARC_UPDATE
+      // An update path can deposit no more vertices than the compiled propagation depth.
       return uint8_t(min(cb.sharcArgs.updateBounces, uint(SHARC_PROPAGATION_DEPTH)));
 #else
       return cb.pathMaxBounces;
@@ -407,47 +411,35 @@ struct PathState : IBasePayloadState
       set { _flags = packedFlagAssign(_flags, 1 << 7, newValue); }
   }
 
-#if ENABLE_SHARC
-  property bool skyGatherEligible
-  {
-#if SHARC_QUERY
-      get { return (_skyGatherEligible & uint8_t(1u)) != uint8_t(0u); }
-      set { _skyGatherEligible = (_skyGatherEligible & uint8_t(0xFEu)) | (newValue ? uint8_t(1u) : uint8_t(0u)); }
-#else
-      get { return _skyGatherEligible != uint8_t(0u); }
-      set { _skyGatherEligible = newValue ? uint8_t(1u) : uint8_t(0u); }
-#endif
-  }
-
-#if SHARC_QUERY
-  property float sharcSegmentDistance
-  {
-      get
-      {
-        const uint bits = (uint(_sharcSegmentDistanceHi) << 7) | (uint(_skyGatherEligible) >> 1);
-        return uint16BitsToF32(uint16_t(bits));
-      }
-      set
-      {
-        const uint bits = uint(float16BitsToUint16(float16_t(clamp(newValue, 0.0f, 65504.0f))));
-        _skyGatherEligible = uint8_t((uint(_skyGatherEligible) & 1u) | ((bits & 0x7Fu) << 1));
-        _sharcSegmentDistanceHi = uint8_t((bits >> 7) & 0xFFu);
-      }
-  }
-
-  property float sharcLaunchPerceptualRoughness
-  {
-      get { return unorm8ToF32(_roughness); }
-      set { _roughness = f32ToUnorm8(newValue); }
-  }
-#endif
-#endif
-
   property bool directionAltered
   {
       get { return false; }
       set { }
   }
+
+#if ENABLE_SHARC
+  // True when the ray in flight came from a diffuse lobe. A diffuse lobe is as wide as lobes
+  // get, so the cache serves it without testing the lobe footprint.
+  property bool sharcDiffuseArrival
+  {
+      get { return _sharcDiffuseArrival != uint8_t(0u); }
+      set { _sharcDiffuseArrival = newValue ? uint8_t(1u) : uint8_t(0u); }
+  }
+#endif
+
+#if SHARC_QUERY
+  property float sharcSegmentDistance
+  {
+      get { return float(_sharcSegmentDistance); }
+      set { _sharcSegmentDistance = float16_t(clamp(newValue, 0.0f, 65504.0f)); }
+  }
+
+  property float sharcLaunchPerceptualRoughness
+  {
+      get { return float(_sharcLaunchPerceptualRoughness); }
+      set { _sharcLaunchPerceptualRoughness = float16_t(newValue); }
+  }
+#endif
 
   // Packed members
 
@@ -533,7 +525,11 @@ struct PathState : IBasePayloadState
     }
 #endif    
 
+#if SHARC_UPDATE
+    return false;
+#else
     return useRussianRoulette;
+#endif
   }
 
   // Note: Using separate accumulation for particles and whatever else as while they should be visible in reflections

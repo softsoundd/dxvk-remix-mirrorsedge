@@ -1,104 +1,150 @@
-// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
 #pragma once
-#include <array>
-#include "dxvk_gpu_query.h"
-#include "dxvk_gpu_event.h"
+
 #include "rtx_option.h"
 #include "rtx_resources.h"
+#include "rtx/pass/sharc/sharc_args.h"
 
 namespace dxvk {
   class RtxContext;
+  class DxvkDevice;
 
-  class RtxSharc : public CommonDeviceObject {
+  // Owns the SHARC world-space radiance cache: a hash grid of irradiance keyed on position,
+  // distance level, normal octant and ray portal space. A sparse update pass fills it and the
+  // full-resolution indirect pass reads it, terminating paths that hit a converged cell.
+  class RtxSharc : public CommonDeviceObject, public RtxPass {
   public:
-    explicit RtxSharc(DxvkDevice* device);
-    static bool isSupported(const DxvkDevice& device);
-    void prepareFrame(RtxContext& ctx, RaytraceArgs& args, bool resetHistory);
-    void bindResources(RtxContext& ctx) const;
-    void dispatchResolve(RtxContext& ctx, const Resources::RaytracingOutput& output);
-    enum class TimingPoint { Begin, UpdateEnd, ResolveEnd, QueryEnd };
-    void recordTimestamp(RtxContext& ctx, TimingPoint point);
-    void showImguiSettings();
-    void logFallbackStatsIfDue();
-    void beginQueryStats(RtxContext& ctx);
-    void endQueryStats(RtxContext& ctx);
-    bool queryStatsActive() const { return m_statsSlot >= 0; }
-    bool isActive() const { return m_active; }
+    enum class QualityPreset : uint32_t {
+      Medium = 0,
+      High,
+      Ultra,
 
-    RTX_OPTION("rtx.sharc", bool, allowRayPortals, false, "Allow SHARC while a ray portal is active. Portal space is part of the cache key, so a vertex reached through a portal is inserted into its own cell and can never be read back by a main-space path; portal-only geometry is cached rather than left to brute-force paths, and queries are unrestricted. Confirmed in a Portal RTX session with portals open. Splitting cells by portal space raises occupancy against the fixed capacity.");
-    RTX_OPTION("rtx.sharc", bool, deferredUpdates, true, "Accumulate lighting locally and flush each cache vertex once per update path. Disable to compare with the original update shader.");
-    RTX_OPTION("rtx.sharc", bool, queryTraceRay, true, "Run SHARC queries with separate TraceRay hit/miss shaders and the indirect pass SER setting when supported. Disable to compare the inline RayQuery backends with the same cache policy.");
-    RTX_OPTION("rtx.sharc", bool, queryRayGeneration, true, "Run SHARC queries as inline RayQuery in a ray-generation shader. Disable to compare the compute backend; lighting and cache eligibility are unchanged.");
-    RTX_OPTION("rtx.sharc", bool, updateRayGeneration, true, "Run sparse SHARC updates as inline RayQuery in a ray-generation shader. Disable to compare compute updates with the same sampling and estimator.");
-    RTX_OPTION("rtx.sharc", bool, allowSpecularPaths, true, "Allow cache insertion and reuse at rough opaque surfaces reached by non-diffuse rays. Can soften reflected lighting; changing this resets the cache.");
-    RTX_OPTION("rtx.sharc", bool, footprintGate, true, "Gate cache reads on specular paths by the footprint of the lobe that launched the segment, NVIDIA's prescribed test, instead of by the roughness of the surface the path hit: footprint = segment length * sqrt(0.5 * alpha^2 / (1 - alpha^2)) must exceed the voxel size, alpha being the launching surface's GGX roughness. While on, rtx.sharc.minRoughnessSpecular is not used and specular arrivals share rtx.sharc.minRoughness with diffuse ones. Only matters with allowSpecularPaths on; changing it resets the cache.");
-    RTX_OPTION("rtx.sharc", bool, updatePrimaryVertex, true, "Let cache update paths also deposit their primary, camera-visible vertex, valued as the direct pass's RTXDI lighting plus the sampled continuation, so a path whose first bounce exits to the sky still feeds one cell. Every camera-visible eligible surface then receives a sample from each update tile that lands on it. Off reproduces the original behaviour, where only secondary hits are cached. Changing it resets the cache.");
-    RTX_OPTION("rtx.sharc", int, updateSkyRetries, 1, "When an update path's first bounce exits to the sky, re-sample that bounce from a cosine lobe about the primary normal up to this many times, 0..4, so the update budget lands on geometry more often outdoors. Each retry costs one extra ray on the paths that missed; what a cell stores does not depend on how a ray reached it. Changing it resets the cache.");
-    RTX_OPTION("rtx.sharc", bool, collectQueryStats, false, "Collect sampled cache reuse and rejection counts while GPU timing is enabled. Disable for timing comparisons without diagnostic atomics.");
-    RTX_OPTION("rtx.sharc", bool, logFallbackStats, false, "Periodically log how often SHARC was selected but fell back to importance-sampled paths, split by reason. Diagnostic only; counts cost nothing when this is disabled.");
-    RTX_OPTION("rtx.sharc", bool, measureGpuTime, false, "Measure SHARC update, resolve and query GPU times. Timing boundaries can affect overlap; disable for final frame-time comparisons.");
-    RTX_OPTION("rtx.sharc", int, capacityLog2, 22, "Cache capacity exponent, 18..22. 20 uses 40 MiB, 21 uses 80 MiB, 22 uses 160 MiB. The resolve pass runs one thread per slot every frame, so a larger capacity costs resolve time whether or not the slots hold anything; raise it only if the panel no-cell miss share moves when you do.");
-    RTX_OPTION("rtx.sharc", int, updateTileSize, 5, "One cache update path per NxN tile, 1..16. Five is NVIDIA's recommended update downscale; larger tiles starve the cells that are only ever reached by a bounce, which is what boils. The update pass traces one path per tile, so its cost falls as 1/N squared and rises as N shrinks; this is the cache's main cost lever.");
-    RTX_OPTION("rtx.sharc", int, updateBounces, 3, "Maximum finite cache update bounces, 1..8. With rtx.sharc.updatePrimaryVertex on the primary takes a propagation slot, so 3 or fewer selects the compact four-slot update shader and 4 or more selects the eight-slot one.");
-    RTX_OPTION("rtx.sharc", int, accumulationFrames, 8, "Temporal cache accumulation, 1..64 frames.");
-    RTX_OPTION("rtx.sharc", int, staleFrames, 32, "Evict unobserved entries after 8..128 frames.");
-    RTX_OPTION("rtx.sharc", float, gridScale, 50.0f, "SHARC hash grid density, 1 to 1000; this is the SDK's sceneScale parameter under a different name. A cell's edge is the vertex's distance from the camera rounded down to a power of two and divided by this value, so cells grow with distance and the setting is an angle rather than a length: at 50 a cell spans 0.57 to 1.15 degrees of arc anywhere in the scene. Being an angle it carries no world units, which is why it needs no reference to rtx.sceneScale and why one value suits every game whatever its unit convention. Larger values give finer cells and quadratically more of them, and they loosen the too-close gate, which requires a segment longer than 1.732 voxels. NVIDIA documents 1 to 100 for it. Changing it clears the cache.");
-    RTX_OPTION("rtx.sharc", float, maxEmissiveLuminance, 0.1f, "Cache surfaces whose emissive luminance is at or below this. The cache holds reflected light and the path adds emission separately, so emissive surfaces are normally excluded; at 0 any emission at all disqualifies a surface, which rejects every faint emissive map. Raise until emissive surfaces start bleeding their own light into the cache.");
-    RTX_OPTION("rtx.sharc", int, minSampleCount, 2, "Ignore cache cells until they hold more than this many accumulated samples, 0..32. At 0 a single sample answers a query, so geometry coming into view for the first time can read one bright path as converged radiance and glow. Raising it trades coverage in freshly revealed areas for stability there.");
-    RTX_OPTION("rtx.sharc", float, minRoughnessSpecular, 0.7f, "Minimum roughness for caching a vertex a specular lobe arrived at, used only when Reuse rough surfaces in specular paths is on. Lower values make smooth reflective materials glow, because an isotropic cache cannot stand in for a directional reflection; keep this well above rtx.sharc.minRoughness.");
-    RTX_OPTION("rtx.sharc", float, maxDepositLuminance, 0.0f, "Clamp the luminance of a single value an update path deposits into a cache cell, 0 to disable. A cell is a mean of its accumulated samples, so one outlier is never averaged away, only divided by the sample count -- and the update pass traces one path per rtx.sharc.updateTileSize tile of the *render* target, so that count falls with the render resolution and an outlier is worth several times more in a cell at a low DLSS preset than at DLAA. That is what makes fireflies on reflective surfaces worse the lower the preset, and why lowering the tile size cures them: both change the same divisor. Clamping the deposit bounds the outlier at its source instead, and is the only remedy here that costs no coverage -- it refuses no lookup, rejects no surface and creates no cell that would not otherwise exist. In exchange it is biased: a cell whose true radiance is above the threshold is stored dark. Set it from debug view 591, whose red channel is the peak deposit luminance an update path wrote, measured before the clamp -- not from view 583, which shows a cell mean and is therefore a smaller number that would set this far too low. View 591 is written only by update paths, so it draws one pixel per tile and the rest of the frame stays black; that lattice is the sample, not a bug. Does not clear the cache; the old values wash out in rtx.sharc.accumulationFrames frames. Ignored when rtx.sharc.deferredUpdates is off.");
-    RTX_OPTION("rtx.sharc", float, updateRoughnessClamp, 0.25f, "Roughen materials to at least this isotropic roughness while the cache is being updated, 0 to disable. This is NVIDIA's prescribed remedy for boiling reflections and it is not a coverage gate: it changes what a cell stores, not which surfaces qualify, so it refuses no lookup and rejects no surface. A cell holds one non-directional radiance value, which cannot stand in for a narrow specular highlight -- so on a glossy surface every update path that arrives from a different direction deposits a different value, and the cell's mean keeps moving no matter how many samples it accumulates. Clamping roughness during the update makes each cell store what its surface would reflect if it were rough, which is a thing an isotropic cell can actually represent. Cached reflections soften in exchange. The scale is GGX alpha, matching rtx.sharc.minRoughness: 0.25 here is 0.5 perceptual. Do not confuse the two -- minRoughness decides whether a surface may be cached at all and is deliberately left alone, while this one never affects eligibility. Changing it clears the cache.");
-    RTX_OPTION("rtx.sharc", float, maxDepositRatio, 20.0f, "Ceiling on a single deposit into a cell, as a multiple of what that cell already holds; 0 disables it and leaves only rtx.sharc.maxDepositLuminance. This exists because an absolute cap is nearly impossible to set well: it has to sit below the dimmest cell worth keeping, so any value low enough to catch fireflies also caps every cell mean and drags the whole scene dark. A relative ceiling asks the question that actually matters -- is this deposit wildly unlike what this cell has already converged on -- so a bright cell keeps its headroom and a dark one still refuses spikes. Cells below rtx.sharc.minSampleCount are exempt, since they have no mean to be measured against yet. Does not clear the cache; old values wash out within rtx.sharc.accumulationFrames. Ignored when rtx.sharc.deferredUpdates is off.");
-    RTX_OPTION("rtx.sharc", float, minDepositCeiling, 2.0f, "Floor under rtx.sharc.maxDepositRatio's ceiling, as absolute luminance. Without it a cell sitting near black pins its own ceiling near zero and can never brighten again when the lighting changes, because every deposit that would have raised it is clamped away first. Raise it if lights turning on take too long to appear in indirect lighting; lower it if dark areas still sparkle. Ignored when rtx.sharc.maxDepositRatio is 0.");
-    RTX_OPTION("rtx.sharc", float, minRoughness, 0.05f, "Minimum isotropic roughness for cached diffuse surfaces, 0.05..1. The default is the floor: with rtx.sharc.footprintGate on it is the footprint of the launching lobe, not this threshold, that keeps an isotropic cache out of directional reflection, and in both tested titles the floor bought coverage without visibly flattening reflections. Raise it if cached reflections do flatten.");
+      Count
+    };
+
+    explicit RtxSharc(DxvkDevice* device);
+
+    static bool checkIsSupported(const DxvkDevice* device);
+
+    void setRaytraceArgs(RtxContext& ctx, RaytraceArgs& args);
+    void bindResources(RtxContext& ctx) const;
+    void dispatchResolve(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
+    void showImguiSettings();
+    void setQualityPreset(QualityPreset preset);
+
+    // Selects between the compact and full propagation depth update shaders.
+    uint32_t getUpdateBounces() const { return m_args.updateBounces; }
+    uint32_t getUpdateTileSize() const { return m_args.updateTileSize; }
+
+    // Applies the tier by writing the individual knobs below, as NRC does.
+    static void onQualityPresetChanged(DxvkDevice* device);
+
+    RTX_OPTION_ARGS("rtx.sharc", QualityPreset, qualityPreset, QualityPreset::High,
+                    "Quality Preset: Medium (0), High (1), Ultra (2).\n"
+                    "Adjusts how much of the frame ray budget the cache update consumes, how deep its update\n"
+                    "paths run, and how many cells it can hold. Lower presets trace fewer and shorter update\n"
+                    "paths, which is cheaper but leaves cells that are only reached by a bounce under-sampled.",
+                    args.environment = "RTX_SHARC_QUALITY_PRESET",
+                    args.onChangeCallback = &onQualityPresetChanged,
+                    args.flags = RtxOptionFlags::UserSetting);
+    inline static QualityPreset s_prevQualityPreset = QualityPreset::Count;
+
+    RTX_OPTION("rtx.sharc", int, capacityLog2, 22,
+               "Cache capacity exponent, 18 to 22. Each slot costs 40 bytes, so 20 uses 40 MiB, 21 uses 80 MiB "
+               "and 22 uses 160 MiB. The resolve pass runs one thread per slot every frame, so a larger capacity "
+               "costs resolve time whether or not the slots hold anything.");
+    RTX_OPTION("rtx.sharc", int, updateTileSize, 5,
+               "One cache update path per NxN tile of the render target, 1 to 16. The update pass traces one path "
+               "per tile, so its cost falls as 1/N squared; this is the main cost lever. Larger tiles under-sample "
+               "the cells that are only ever reached by a bounce.");
+    RTX_OPTION("rtx.sharc", int, updateBounces, 3,
+               "Maximum cache update bounces, 1 to 8. With rtx.sharc.updatePrimaryVertex enabled the primary takes "
+               "a propagation slot, so 3 or fewer selects the compact four-slot update shader.");
+    RTX_OPTION("rtx.sharc", int, accumulationFrames, 8, "Temporal cache accumulation, 1 to 64 frames.");
+    RTX_OPTION("rtx.sharc", int, staleFrames, 32, "Evict entries that go unobserved for this many frames, 8 to 128.");
+    RTX_OPTION("rtx.sharc", float, gridScale, 50.0f,
+               "Hash grid density, 1 to 1000. A cell edge is the vertex distance from the camera rounded down to a "
+               "power of two and divided by this value, so cells grow with distance and the setting behaves as an "
+               "angle rather than a length: at 50 a cell spans roughly 0.6 to 1.1 degrees of arc anywhere in the "
+               "scene. Carrying no world units, one value suits any game whatever its unit convention. Larger "
+               "values give finer cells and quadratically more of them.");
+    RTX_OPTION("rtx.sharc", float, minRoughness, 0.05f,
+               "Minimum isotropic roughness (GGX alpha) for a cached surface, 0.05 to 1. A cell holds one "
+               "non-directional radiance value, so a surface below this reflects more sharply than the cell can "
+               "represent. The width of the lobe that reached the surface is tested separately, at query time.");
+    RTX_OPTION("rtx.sharc", float, maxEmissiveLuminance, 0.1f,
+               "Cache surfaces whose emissive luminance is at or below this. The cache holds reflected light and "
+               "the path adds emission separately, so emissive surfaces are excluded; at 0 any emission at all "
+               "disqualifies a surface, which rejects every faint emissive map.");
+    RTX_OPTION("rtx.sharc", int, minSampleCount, 2,
+               "Ignore cells holding this many accumulated samples or fewer, 0 to 32. At 0 a single sample answers "
+               "a query, so geometry coming into view can read one bright path as converged radiance and glow.");
+    RTX_OPTION("rtx.sharc", float, maxDepositRatio, 20.0f,
+               "Ceiling on a single deposit into a cell, as a multiple of what the cell already holds; 0 disables "
+               "it. A cell is a mean of its samples, so an outlier is not averaged away, only divided by the sample "
+               "count. An absolute cap has to sit below the dimmest cell worth keeping, so scaling the limit by the "
+               "converged value of the cell leaves a bright cell its headroom while a dark one refuses spikes.");
+    RTX_OPTION("rtx.sharc", float, minDepositCeiling, 2.0f,
+               "Absolute luminance floor under the rtx.sharc.maxDepositRatio ceiling. Without it a cell near black "
+               "pins its own ceiling near zero and can never brighten when the lighting changes.");
+    RTX_OPTION("rtx.sharc", float, updateRoughnessClamp, 0.25f,
+               "Roughen materials to at least this isotropic roughness (GGX alpha) while the cache is updated, 0 to "
+               "disable. A cell cannot represent a narrow specular highlight, so on a glossy surface every update "
+               "path arriving from a different direction deposits a different value and the cell mean never "
+               "settles. This changes what a cell stores, not which surfaces qualify.");
+    RTX_OPTION("rtx.sharc", bool, allowSpecularPaths, true,
+               "Allow cache insertion and reuse at rough opaque surfaces reached by a non-diffuse lobe. The lobe "
+               "footprint must still have spread wider than the cell. Changing this resets the cache.");
+    RTX_OPTION("rtx.sharc", bool, updatePrimaryVertex, true,
+               "Let update paths also deposit their camera-visible primary vertex, valued as the direct pass RTXDI "
+               "lighting plus the sampled continuation, so a path whose first bounce exits to the sky still feeds "
+               "one cell. Changing this resets the cache.");
+    RTX_OPTION("rtx.sharc", int, updateSkyRetries, 1,
+               "When the first bounce of an update path exits to the sky, re-sample that bounce from a cosine lobe "
+               "about the primary normal up to this many times, 0 to 4, so the update budget lands on geometry more "
+               "often outdoors. Changing this resets the cache.");
 
   private:
     friend class ImGUI;
-    struct FrameTiming {
-      std::array<Rc<DxvkGpuQuery>, 4> queries;
-      bool pending = false;
-    };
-    std::array<FrameTiming, 8> m_frameTimings;
-    std::array<float, 3> m_gpuTimes = {};
-    int m_timingSlot = -1;
-    bool m_haveGpuTimes = false;
-    static constexpr uint32_t kStatsStride = 256;
-    // Counter slots are documented at the sharcCount call sites in sharc_integrator_hooks.slangh
-    // and integrator_indirect.slangh: 0..13 the path and eligibility aggregates, 14..18 the
-    // surface term behind slot 9, 19..21 the too-close splits, 22 the footprint gate.
-    static constexpr uint32_t kStatsCount = 25;
-    static_assert(kStatsCount * sizeof(uint32_t) <= kStatsStride);
-    std::array<Rc<DxvkGpuEvent>, 8> m_statsReady;
-    Rc<DxvkBuffer> m_statsGpu;
-    Rc<DxvkBuffer> m_statsReadback;
-    std::array<uint32_t, kStatsCount> m_queryStats = {};
-    // Per-frame counters are cleared every frame, so displaying them directly flickers
-    // unreadably and any frame without a lookup reads as 0%. Accumulate over a window and
-    // publish ratios of sums, which is both stable and the statistically correct ratio.
-    static constexpr uint32_t kStatsWindowFrames = 120;
-    std::array<uint64_t, kStatsCount> m_queryStatsAccum = {};
-    std::array<uint64_t, kStatsCount> m_queryStatsWindow = {};
-    uint32_t m_queryStatsAccumFrames = 0;
-    bool m_haveQueryStatsWindow = false;
-    int m_statsSlot = -1;
-    bool m_haveQueryStats = false;
-    uint32_t m_cacheAge = 0;
+
+    bool isEnabled() const override;
+    void onFrameBegin(Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx) override;
+    bool onActivation(Rc<DxvkContext>& ctx) override;
+    void onDeactivation() override;
+
+    bool allocateBuffers(uint32_t capacity);
+
     Rc<DxvkBuffer> m_hash;
     Rc<DxvkBuffer> m_accumulation;
     Rc<DxvkBuffer> m_resolved;
+
     SharcArgs m_args = {};
-    bool m_active = false;
     bool m_resetRequested = true;
     bool m_allocationFailed = false;
-    const char* m_status = "Inactive";
     uint32_t m_compatibilityFlags = 0;
+    uint32_t m_cacheAge = 0;
     uint32_t m_lastFrame = ~0u;
-    // Fallback accounting.  SHARC can be selected yet inactive for a whole frame; these
-    // counters say how often that happens and why, so the cost of each fallback reason
-    // can be judged from a real play session instead of guessed at.
-    static constexpr uint32_t kFallbackLogInterval = 1800;
-    uint32_t m_selectedFrames = 0;
-    uint32_t m_rttFallbackFrames = 0;
-    uint32_t m_otherFallbackFrames = 0;
+    bool m_clearedThisFrame = true;
+    const char* m_status = "Inactive";
   };
 }

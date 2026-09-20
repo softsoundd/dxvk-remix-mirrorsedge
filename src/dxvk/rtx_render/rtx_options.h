@@ -629,7 +629,9 @@ namespace dxvk {
                    "   and allows paths to terminate early by looking up the cached value and saving performance.\n"
                    "   NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
                    "   while improving performance in scenarios where ray paths have 2 or more bounces on average.\n"
-                   "3: SHARC (experimental). Spatially hashed world-space radiance cache. Opt-in alternative to NRC.\n",
+                   "3: SHARC. Spatially Hashed Radiance Cache. A world space cache of irradiance held in a hash grid,\n"
+                   "   filled by a sparse update pass that traces one path per screen tile and read by the full resolution\n"
+                   "   indirect pass, which terminates a path into a cell once that cell has converged.\n",
                    args.environment = "RTX_INTEGRATE_INDIRECT_MODE",
                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",

@@ -90,6 +90,10 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 #####                                                                         #####
 ###################################################################################
 
+Includes the NVIDIA SHARC SDK 1.8.3 (commit 4e21b585c33c83d723ca9a1e11bbb1090d145793),
+https://github.com/NVIDIA-RTX/SHARC, whose shader headers are vendored under
+src/dxvk/shaders/rtx/external/sharc/ with local modifications noted in the README there.
+
 NVIDIA RTX SDKs LICENSE
 
 This license is a legal agreement between you and NVIDIA Corporation ("NVIDIA")

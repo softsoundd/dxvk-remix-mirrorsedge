@@ -50,6 +50,7 @@
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_terrain_baker.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
+#include "rtx_render/rtx_sharc.h"
 #include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
@@ -394,8 +395,10 @@ namespace dxvk {
           "and allows paths to terminate early by looking up the cached value and saving performance.\n"
           "NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
           "while increasing performance in scenarios where ray paths have 2 or more bounces on average."},
-        {IntegrateIndirectMode::Sharc, "SHARC (experimental)",
-          "Sparse world-space diffuse radiance cache. Uses compute RayQuery; see SHARC settings for support status."}
+        {IntegrateIndirectMode::Sharc, "SHARC",
+          "Spatially Hashed Radiance Cache (SHARC). A world space cache of irradiance held in a hash grid,\n"
+          "filled by a sparse update pass that traces one path per screen tile and read by the full resolution\n"
+          "indirect pass, which terminates a path into a cell once that cell has converged."}
     } }
   };
 
@@ -641,6 +644,11 @@ namespace dxvk {
     if (!NeuralRadianceCache::checkIsSupported(device)) {
       // Remove unsupported option
       integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::NeuralRadianceCache);
+    }
+
+    if (!RtxSharc::checkIsSupported(device)) {
+      // Remove unsupported option
+      integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::Sharc);
     }
 
     m_device->vkd()->vkCreateDescriptorPool(m_device->handle(), &pool_info, nullptr, &m_imguiPool);
@@ -4227,10 +4235,6 @@ namespace dxvk {
         ImGui::Indent();
         integrateIndirectModeCombo.getKey(&RtxOptions::integrateIndirectModeObject());
 
-        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
-          common->metaSharc().showImguiSettings();
-        }
-
         if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
           if (RemixGui::CollapsingHeader("ReSTIR GI", collapsingHeaderClosedFlags)) {
             ImGui::Indent();
@@ -4247,6 +4251,14 @@ namespace dxvk {
             ImGui::PushID("Neural Radiance Cache");
             NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
             nrc.showImguiSettings(*ctx);
+            ImGui::PopID();
+            ImGui::Unindent();
+          }
+        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::Sharc) {
+          if (RemixGui::CollapsingHeader("SHARC", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+            ImGui::PushID("SHARC");
+            common->metaSharc().showImguiSettings();
             ImGui::PopID();
             ImGui::Unindent();
           }

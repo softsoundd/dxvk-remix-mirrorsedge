@@ -62,81 +62,53 @@
 //!>       NEE_CACHE_ENABLE=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
-// SHARC variants
+/* SHARC */
+// A token in the name means that feature is on.
+
 //!variant integrate_indirect_sharc_query_miss.rmiss
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
 //!>       ENABLE_SHARC=1
 //!>       SHARC_QUERY=1
 //!>       NEE_CACHE_ENABLE=1
 
 //!variant integrate_indirect_sharc_query_miss_wboit.rmiss
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
 //!>       ENABLE_SHARC=1
 //!>       SHARC_QUERY=1
 //!>       NEE_CACHE_ENABLE=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
-//!variant integrate_indirect_sharc_query_miss_stats.rmiss
+//!variant integrate_indirect_sharc_query_miss_portals.rmiss
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_ALL
 //!>       ENABLE_SHARC=1
 //!>       SHARC_QUERY=1
 //!>       NEE_CACHE_ENABLE=1
-//!>       SHARC_QUERY_STATS=1
 
-//!variant integrate_indirect_sharc_query_miss_stats_wboit.rmiss
+//!variant integrate_indirect_sharc_query_miss_portals_wboit.rmiss
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_ALL
 //!>       ENABLE_SHARC=1
 //!>       SHARC_QUERY=1
 //!>       NEE_CACHE_ENABLE=1
-//!>       SHARC_QUERY_STATS=1
-//!>       UNORDERED_RESOLVE_WBOIT
-
-//!variant integrate_indirect_sharc_query_miss_no_portals.rmiss
-//!>       ENABLE_SHARC=1
-//!>       SHARC_QUERY=1
-//!>       NEE_CACHE_ENABLE=1
-//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
-
-//!variant integrate_indirect_sharc_query_miss_no_portals_wboit.rmiss
-//!>       ENABLE_SHARC=1
-//!>       SHARC_QUERY=1
-//!>       NEE_CACHE_ENABLE=1
-//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
-//!>       UNORDERED_RESOLVE_WBOIT
-
-//!variant integrate_indirect_sharc_query_miss_no_portals_stats.rmiss
-//!>       ENABLE_SHARC=1
-//!>       SHARC_QUERY=1
-//!>       NEE_CACHE_ENABLE=1
-//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
-//!>       SHARC_QUERY_STATS=1
-
-//!variant integrate_indirect_sharc_query_miss_no_portals_stats_wboit.rmiss
-//!>       ENABLE_SHARC=1
-//!>       SHARC_QUERY=1
-//!>       NEE_CACHE_ENABLE=1
-//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
-//!>       SHARC_QUERY_STATS=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
 //!end-variants
-
-#ifndef ENABLE_SHARC
-#define ENABLE_SHARC 0
-#endif
 
 #define RAY_PIPELINE
 #define INTEGRATE_INDIRECT
 #define ATMOSPHERE_AVAILABLE
 #define RAB_HAS_PREVIOUS_GBUFFER 1
-// Upstream judges RTXDI sample stealing "no visibile IQ gains" (rtx_rtxdi_rayquery.h), a call made
-// on a per-pixel signal that a denoiser then cleans up. It does not carry over here. A cache cell is
-// read by every pixel whose ray lands in it, so NEE noise deposited during the update stage stops
-// being per-pixel grain and becomes a voxel-sized blob that flickers as one unit -- which is exactly
-// what a denoiser cannot remove. The cheaper light sampler is therefore worth much more to the cache
-// than it is to the path tracer, and leaving it off is what made SHARC noisier than the plain
-// importance-sampled mode it is supposed to quieten. rtx.di.enableSampleStealing still gates it.
 #define RAB_HAS_RTXDI_RESERVOIRS 1
-// ReSTIR GI reservoirs stay out of SHARC, which is a different integrate-indirect mode.
+#if ENABLE_SHARC && !defined(RAB_HAS_RTXDI_RESERVOIRS)
+// A SHARC stage without these loads an empty reservoir, so the steal always fails, and a
+// failed steal skips the NEE cache and RIS fallback below: no shadow ray, no direct light.
+#error "SHARC stages require RAB_HAS_RTXDI_RESERVOIRS."
+#endif
+
 #if !ENABLE_SHARC
+// ReSTIR GI is a different integrate-indirect mode; its reservoirs hold nothing under SHARC.
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #endif
+
 // Note: Opacity lighting approximation used in the indirect integration pass due to particle lighting being somewhat
 // important in reflections off shiny surfaces (as without this it can make areas with many particles look weird in reflections).
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1

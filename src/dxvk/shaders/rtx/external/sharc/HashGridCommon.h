@@ -303,11 +303,7 @@ bool HashGrid_(Find)(in HashGrid_(Data) hashData, const HASH_GRID_KEY_TYPE hashK
     probeRange = min(probeRange, HASH_GRID_HASH_MAP_BUCKET_SIZE);
     uint emptyEntires = 0;
 
-#ifdef HASH_GRID_FIND_LOOP_ATTR
-    HASH_GRID_FIND_LOOP_ATTR
-#else
     HASH_GRID_LOOP_ATTR
-#endif
     for (bucketOffset = 0; bucketOffset < probeRange; ++bucketOffset)
     {
         HASH_GRID_KEY_TYPE storedHashKey = BUFFER_AT_OFFSET(hashData.hashEntriesBuffer, baseSlot + bucketOffset);

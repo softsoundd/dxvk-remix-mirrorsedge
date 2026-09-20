@@ -1,12 +1,34 @@
-// Copyright (c) 2026, NVIDIA CORPORATION. SPDX-License-Identifier: MIT
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
 #pragma once
+
 #include "rtx/pass/sharc/sharc_bindings.slangh"
 #include "rtx/utility/common.slangh"
 
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
-// Record between cached vertices, then propagate once in reverse. No camera
-// throughput or division is needed, including zero-throughput color channels.
-// Unrolled constant-index accesses let the compiler scalarize the small arrays.
+#if SHARC_UPDATE
+// Radiance and segment weight are recorded between cached vertices and propagated once, in
+// reverse, at path end. The camera prefix never enters the propagation, so no throughput
+// division is needed and a zero-throughput colour channel stays well defined. Constant array
+// indices let the compiler scalarize the small arrays.
 struct SharcUpdateState {
   uint indices[SHARC_PROPAGATION_DEPTH];
   vec3 radiance[SHARC_PROPAGATION_DEPTH];
@@ -33,17 +55,18 @@ void sharcAccumulateThroughput(inout SharcUpdateState state, vec3 throughput) {
 }
 
 void sharcInsertVertex(inout SharcUpdateState state, SharcHitData hit, uint portalSpace) {
-  // Update bounce count is capped at the compiled storage depth.
   if (state.count >= SHARC_PROPAGATION_DEPTH) {
     return;
   }
+
   SharcParameters p = makeSharcParameters(portalSpace);
   HashGridKey key;
   HashGridIndex index;
   if (!HashGridInsertEntry(p.hashGridData, hit.positionWorld, hit.normalWorld,
-                          p.hashGridParameters, key, index)) {
+                           p.hashGridParameters, key, index)) {
     return;
   }
+
   [unroll]
   for (uint i = 0; i < SHARC_PROPAGATION_DEPTH; ++i) {
     if (state.count == i) {
@@ -55,8 +78,8 @@ void sharcInsertVertex(inout SharcUpdateState state, SharcHitData hit, uint port
   ++state.count;
 }
 
-// Seeds the vertex just inserted with lighting already known at insertion and the weight of
-// the segment leaving it. The primary vertex needs both: the direct pass lit it and sampled
+// Seeds the vertex just inserted with lighting already known at insertion and the weight of the
+// segment leaving it. The primary vertex needs both, because the direct pass lit it and sampled
 // its continuation before this stage ran.
 void sharcSeedVertex(inout SharcUpdateState state, vec3 radiance, vec3 weight) {
   [unroll]
@@ -68,62 +91,37 @@ void sharcSeedVertex(inout SharcUpdateState state, vec3 radiance, vec3 weight) {
   }
 }
 
-// The one place a deposit enters a cell on the shipping update backend, and therefore the
-// only place an outlier can be bounded at its source.  A cell is a mean, and the resolve
-// pass gives one frame's samples a weight of 1/(accumulationFrames + 1) of it (SDK:924-947),
-// so a single deposit of luminance L moves a cell fed k times per frame by L/((N+1)*k).  k
-// falls with render resolution -- the update dispatch is ceil(resolution / tile) wide
-// (indirect.cpp:788-793) -- which is why one outlier is worth several times more in a cell at
-// a low DLSS preset than at DLAA.  maxDepositLuminance bounds L directly.  It is the cache's
-// own, tighter equivalent of rtx.fireflyFilteringLuminanceThreshold, which clamps the path
-// tracer's output but never the value stored here; 0 disables it, as in fireflyFiltering
-// itself.  The running propagated value is deliberately left alone: clamping only the deposit
-// bounds every cell in the chain by the same rule without altering path propagation.
-// The ceiling a single deposit into this cell may reach. An absolute cap has to be set below the
-// dimmest cell worth keeping, so a value low enough to catch fireflies also caps every cell's mean
-// and drags the whole cache dark -- which is what makes maxDepositLuminance so hard to set by hand.
-// Scale by what the cell has already converged on instead: a bright cell keeps its headroom, a dark
-// one refuses spikes it could never average away, and neither depends on the scene's absolute scale.
+// The ceiling one deposit into this cell may reach, as a multiple of what the cell already holds.
+// An absolute cap has to sit below the dimmest cell worth keeping, so a value low enough to catch
+// fireflies also caps every cell's mean. Scaling by the cell's own converged value instead leaves a
+// bright cell its headroom while a dark one refuses spikes it could never average away.
 float sharcDepositCeiling(SharcParameters p, uint index) {
   if (cb.sharcArgs.maxDepositRatio <= 0.0f) {
     return 0.0f;
   }
+
   const SharcVoxelData voxel = SharcGetVoxelData(p.resolvedBuffer, index);
-  // A cell this thin has no mean worth scaling by, but exempting it from the clamp entirely is exactly
-  // wrong: it is the population that boils. One deposit is a third or more of the mean a cell holding
-  // two samples will resolve to, so an unbounded deposit here is not averaged away by anything. Hold it
-  // to the absolute floor instead -- the only clamp that reached these cells before was the absolute
-  // cap, which is why that was the one setting that visibly helped, and why it darkened everything:
-  // it applied the same low ceiling to converged cells that did not need it.
+  // A cell this thin has no mean to scale by, but exempting it would exempt the population that
+  // boils: one deposit is a third or more of the mean a two-sample cell resolves to. Hold those to
+  // the absolute floor instead.
   if (voxel.accumulatedSampleNum <= float(cb.sharcArgs.minSampleCount)) {
     return cb.sharcArgs.minDepositCeiling;
   }
+
   const float mean = SharcLuma(SharcDecodeRadiance(voxel.accumulatedRadiance, vec3(0.0f, 0.0f, 1.0f)));
   return max(cb.sharcArgs.maxDepositRatio * mean, cb.sharcArgs.minDepositCeiling);
 }
 
-void sharcFlushVertices(SharcUpdateState state, inout SharcDepositStats stats) {
+void sharcFlushVertices(SharcUpdateState state) {
   SharcParameters p = makeSharcParameters();
   vec3 radiance = vec3(0.0f);
+
   [unroll]
   for (int i = SHARC_PROPAGATION_DEPTH - 1; i >= 0; --i) {
     if (uint(i) < state.count) {
       radiance = state.radiance[i] + state.weights[i] * radiance;
-      // The absolute cap still applies when set, and wins wherever it is the tighter of the two.
-      float ceiling = sharcDepositCeiling(p, state.indices[i]);
-      if (cb.sharcArgs.maxDepositLuminance > 0.0f) {
-        ceiling = ceiling > 0.0f ? min(ceiling, cb.sharcArgs.maxDepositLuminance) : cb.sharcArgs.maxDepositLuminance;
-      }
-      const vec3 deposit = fireflyFiltering(radiance, ceiling);
+      const vec3 deposit = fireflyFiltering(radiance, sharcDepositCeiling(p, state.indices[i]));
       SharcAddVoxelData(p, state.indices[i], deposit, vec3(1.0f), vec3(0.0f, 0.0f, 1.0f), 0.0f, 1);
-      if (sharcUpdateDebugActive()) {
-        // Measured before the clamp: the point of the view is to show the distribution the
-        // threshold is being chosen against, which clamping would hide.
-        const float luminance = calcBt709Luminance(radiance);
-        stats.peakLuminance = max(stats.peakLuminance, luminance);
-        stats.clamped += (ceiling > 0.0f && luminance > ceiling) ? 1u : 0u;
-        stats.deposits += 1u;
-      }
     }
   }
 }

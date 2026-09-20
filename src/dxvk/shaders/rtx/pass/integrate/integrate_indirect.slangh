@@ -102,15 +102,16 @@ bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool is
 {
   isNrcUpdate = false;
 #if SHARC_UPDATE
-  // The update dispatch is tile sized rather than screen sized.  Select one
-  // stable, rotating source pixel from each tile so the cache sees the whole
-  // view over time without using NRC's expanded coordinate space.
+  // The update dispatch is tile sized rather than screen sized. Select one rotating source pixel
+  // per tile so the cache sees the whole view over time, without using NRC's expanded coordinate
+  // space.
   const uint tileSize = max(cb.sharcArgs.updateTileSize, 1u);
   const uvec2 tileCount = (cb.camera.resolution + tileSize - 1u) / tileSize;
   if (any(gbufferPixelCoordinate >= tileCount))
   {
     return false;
   }
+
   const uvec2 tileOffset = sharcTileOffset(gbufferPixelCoordinate, tileSize);
   gbufferPixelCoordinate = min(gbufferPixelCoordinate * tileSize + tileOffset,
                                cb.camera.resolution - 1u);
@@ -176,7 +177,7 @@ void integrate_indirect_pass(uvec2 threadIndex)
   {
     if (isNrcUpdate || SHARC_UPDATE)
     {
-      // Update traces are training work and have no screen-space output.
+      // IndirectRadianceHitDistance is not used for update pixels, so no need to write it out
       return;
     }
 

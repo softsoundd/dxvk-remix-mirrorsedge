@@ -254,18 +254,11 @@
 // the shader gates all of them with one range compare. 590 is already NRC.
 #define DEBUG_VIEW_SHARC_QUERY_OUTCOME 580       // green hit, red miss, blue too close, yellow footprint too narrow, grey rejected
 #define DEBUG_VIEW_SHARC_REJECT_REASON 581       // first failing eligibility term, colour-coded
-#define DEBUG_VIEW_SHARC_TOO_CLOSE 582           // the distance guard, last leg vs whole segment
-#define DEBUG_VIEW_SHARC_CACHED_RADIANCE 583     // radiance read from the cache where the path ended on it
-#define DEBUG_VIEW_SHARC_TERMINATION_BOUNCE 584  // bounce at which the cache ended the path, 0 never
-#define DEBUG_VIEW_SHARC_GRID_CELLS 585          // hash-coloured cell at the vertex
-#define DEBUG_VIEW_SHARC_GRID_LEVEL 586          // R level, G voxel size, B last resolve leg
-#define DEBUG_VIEW_SHARC_CELL_AGE 587            // R accumulated frames, G stale frames, B sample count
-#define DEBUG_VIEW_SHARC_CELL_FOOTPRINT 588      // R cell width in screen pixels, G voxel size in world units, B camera distance
+#define DEBUG_VIEW_SHARC_CACHED_RADIANCE 582     // radiance read from the cache where the path ended on it
+#define DEBUG_VIEW_SHARC_TERMINATION_BOUNCE 583  // bounce at which the cache ended the path, 0 never
+#define DEBUG_VIEW_SHARC_GRID_CELLS 584          // hash-coloured cell at the vertex
+#define DEBUG_VIEW_SHARC_CELL_AGE 585            // R accumulated frames, G stale frames, B sample count
 #define DEBUG_VIEW_NRC_IS_OUTSIDE_SCENE_AABB 590
-
-// SHARC update stages. Written from the update dispatch rather than the query stages.
-#define DEBUG_VIEW_SHARC_UPDATE_DEPOSIT 591      // R peak deposit luminance before the clamp, G deposits clamped, B deposits made
-#define DEBUG_VIEW_SHARC_UPDATE_BUDGET 592       // green the path fed a cell, red it fed none
 
 #define DEBUG_VIEW_IS_BAKED_TERRAIN 600
 #define DEBUG_VIEW_TERRAIN_MAP  601

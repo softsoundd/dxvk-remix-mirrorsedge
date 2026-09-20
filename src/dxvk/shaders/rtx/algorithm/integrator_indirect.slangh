@@ -46,10 +46,8 @@ static const uint kRestirGIAcceptLowRoughnessInput = false;
 PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
 {
   PathState pathState;
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#if SHARC_UPDATE
   pathState.sharcState.count = 0;
-#elif SHARC_UPDATE
-  SharcInit(pathState.sharcState);
 #endif
 
   // Note: Primary linear roughness, origin, cone radius, medium material index, inside medium flag and
@@ -74,7 +72,7 @@ PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
   pathState.restirGiHasHitGeometry = false;
   pathState.restirGiHasHitOpaque = false;
 #if ENABLE_SHARC
-  pathState.skyGatherEligible = false;
+  pathState.sharcDiffuseArrival = false;
 #endif
   pathState.segmentHitDistance = 0.0;
 
@@ -91,10 +89,8 @@ PathState pathStateCreateEmpty(GeometryFlags geometryFlags)
 // Helper function to accumulate attenuation or other throughputs into the Path State throughput.
 void accumulateThroughput(inout PathState pathState, vec3 throughput)
 {
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#if SHARC_UPDATE
   sharcAccumulateThroughput(pathState.sharcState, throughput);
-#elif SHARC_UPDATE
-  SharcSetThroughput(pathState.sharcState, throughput);
 #endif
   pathState.throughput = clampedMaximumPositiveMultiply(pathState.throughput, throughput, kThroughputClampedDivisionMaximum);
 }
@@ -114,11 +110,8 @@ void accumulateRadiance(inout vec3 accumulatedRadiance, PathState pathState, vec
 // Overload for simpler path state usage when accumulating radiance.
 void accumulateRadiance(inout PathState pathState, vec3 radiance)
 {
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
+#if SHARC_UPDATE
   sharcAccumulateRadiance(pathState.sharcState, radiance);
-#elif SHARC_UPDATE
-  // Stored weights start at the cached surface, excluding the camera prefix.
-  SharcUpdateMiss(makeSharcParameters(), pathState.sharcState, radiance);
 #endif
   accumulateRadiance(pathState.radiance, pathState, radiance);
 }
@@ -557,9 +550,8 @@ void integratePathVertex(
   }
 #endif // SURFACE_MATERIAL_RESOLVE_TYPE_RAY_PORTAL
 
-  // Every resolve leg counts towards the segment length the cache diagnostics compare against.
-  // Gated rather than left to the empty non-SHARC body: the inout copy-back of an empty call
-  // still emits a store, which would cost the legacy stages their byte-identity.
+  // Each resolve leg contributes to the length of the segment in flight. Guarded rather than
+  // relying on an empty body: the inout copy-back of an empty call still emits a store.
 #if ENABLE_SHARC
   sharcOnResolveLeg(pathState);
 #endif
@@ -574,9 +566,6 @@ void integratePathVertex(
   // Exit on a miss
   if (!rayInteractionHasHit(rayInteraction))
   {
-#if SHARC_QUERY_STATS
-    sharcCount(pathState.pixelCoordinate, 10); // Path exits to sky.
-#endif
     // Reduce the bounce iteration on miss so that when integrator loop exits and increments the variable one more time,
     // the bounce iteration is + 1 since the last surface hit for both misses and hits
     --pathState.bounceIteration;
@@ -596,7 +585,7 @@ void integratePathVertex(
     accumulateRadiance(pathState, emissiveLightRadiance);
   }
 
-  // Keep emission above this point live: the cache contains reflected lighting.
+  // Emission above this point must already be accumulated: the cache holds reflected lighting.
   if (sharcOnResolvedVertex(pathState, surfaceInteraction, polymorphicSurfaceMaterialInteraction, materialType, emissiveLight))
   {
     return;
@@ -623,14 +612,15 @@ void integratePathVertex(
     
     float restirHitT = kMissHitDistance;
     updateReSTIRGIHitDistance(oldLuminance, calcBt709Luminance(pathState.radiance), restirHitT, pathState.accumulatedHitDistance);
-    
-    // Roughen the material for the cache's benefit before anything reads it. Both the continuation
-    // sampled below and the NEE evaluated further down decode their material from this one, so this is
-    // the single point that covers both, and it is past the cache's own eligibility test by design.
+
+    // Both the continuation sampled below and the NEE evaluated further down decode their
+    // material from this one, so this single point covers both. It sits after the cache's own
+    // eligibility test by design.
 #if ENABLE_SHARC && SHARC_UPDATE
     sharcClampUpdateRoughness(polymorphicSurfaceMaterialInteraction, materialType);
 #endif
 
+    
     const bool oldInsideMedium = pathState.insideMedium;
     vec3 continuationThroughput = vec3(1.0);
     uint8_t continuationLobe = 0;
@@ -658,14 +648,6 @@ void integratePathVertex(
       pathState.coneRadius = sampledRay.coneRadius;
       pathState.direction = sampledRay.direction;
       pathState.solidAnglePdf = solidAnglePdf;
-
-#if ENABLE_SHARC
-      // Classify the lobe that generated this ray for cache eligibility / footprint gating.
-      pathState.skyGatherEligible =
-        (materialType == surfaceMaterialTypeOpaque) &&
-        (continuationLobe == opaqueLobeTypeDiffuseReflection ||
-         continuationLobe == opaqueLobeTypeDiffuseTransmission);
-#endif
     }
     
     // Set the material medium index if a medium was entered or exited
@@ -680,9 +662,12 @@ void integratePathVertex(
     const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
     // polymorphicSurfaceMaterialInteraction is no longer live since this point.
 
+    // The query at the next vertex gates on the lobe that launched its segment and cannot see
+    // this vertex, so record it here.
 #if ENABLE_SHARC
     sharcOnContinuationSampled(pathState, isOpaqueMaterial, continuationLobe, opaqueSurfaceMaterialInteraction.isotropicRoughness);
 #endif
+
     
     // Perform NEE
     
@@ -696,18 +681,8 @@ void integratePathVertex(
       // The value is based on experiment.
       const float baseReflectivityFactor = 3.0f;
       uint16_t lightIdx = kInvalidLightIdx;
-      // Sample stealing needs the primary RTXDI reservoir buffer. Stages without
-      // RAB_HAS_RTXDI_RESERVOIRS load an empty reservoir, so the steal always fails,
-      // and a failed steal skips the NEE cache / RIS fallback below -- no shadow ray and
-      // no direct light at that vertex. SHARC stages do bind and define it now, so this
-      // guard is inert for them; it stays as the safety net for any future variant that
-      // does not, since silently losing NEE is far worse than losing the steal.
-#if ENABLE_SHARC && !defined(RAB_HAS_RTXDI_RESERVOIRS)
-      if (false)
-#else
       if (cb.enableRtxdi && cb.enableRtxdiSampleStealing &&
-        calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity) < baseReflectivityFactor * opaqueSurfaceMaterialInteraction.isotropicRoughness)
-#endif
+        calcBt709Luminance(opaqueSurfaceMaterialInteraction.baseReflectivity) < baseReflectivityFactor * opaqueSurfaceMaterialInteraction.isotropicRoughness) 
       {
         // Perform some safety checks, and if lucky, steal some high quality samples from RTX-DI reservoirs
         ivec2 pixelCoordinate;
@@ -892,9 +867,6 @@ void integratePathVertex(
       }
     }
 
-    // Physical Atmosphere sun is an RtDistantLight sampled by the NEE/RTXDI loop above.
-    // No bespoke atmosphere sun NEE (would double-count).
-
     // Terminate the path if NRC requested it
     if (ENABLE_NRC && nrcProgressState == NrcProgressState::TerminateAfterDirectLighting)
     {
@@ -913,9 +885,6 @@ void integratePathVertex(
     {
       // Note: Don't continue paths past the maximum number of requested bounces.
       pathState.continuePath = false;
-#if SHARC_QUERY_STATS
-      sharcCount(pathState.pixelCoordinate, 11); // Bounce limit.
-#endif
     }
     else if (all(continuationThroughput == vec3(0.0f)))
     {
@@ -929,9 +898,6 @@ void integratePathVertex(
       // avoid this potential mistake by forcing callers to consider the boolean separately rather than encoding
       // it in the throughput.
       pathState.continuePath = false;
-#if SHARC_QUERY_STATS
-      sharcCount(pathState.pixelCoordinate, 12); // Zero continuation weight.
-#endif
     }
     else if (pathState.calculateUseRussianRoulette())
     {
@@ -956,9 +922,6 @@ void integratePathVertex(
       if (terminate)
       {
         pathState.continuePath = false;
-#if SHARC_QUERY_STATS
-        sharcCount(pathState.pixelCoordinate, 13); // Russian roulette.
-#endif
       }
       else
       {
@@ -1115,7 +1078,7 @@ void integratePathVertex(
 // Update the hit distance when a significant contribution to the final result is found
 void updateReSTIRGIHitDistance(inout float oldLuminance, float newLuminance, inout float restirHitT, float newHitT)
 {
-#if !ENABLE_NRC && !ENABLE_SHARC 
+#if !ENABLE_NRC && !ENABLE_SHARC
   // If both oldLuminance and newLuminance are 0, still update hit distance
   if (newLuminance >= oldLuminance * cb.reSTIRGIVirtualSampleLuminanceThreshold)
   {
@@ -1173,7 +1136,7 @@ vec3 calculateReSTIRGIRadianceFactor(
 // multiple times as the integrator progresses through the scene, and with a texture store it's only spilled once.
 void storeRestirGIRadiance(PathState pathState, GeometryFlags geometryFlags, float gbufferSurfaceHitDistance)
 {
-#if !ENABLE_NRC && !ENABLE_SHARC  
+#if !ENABLE_NRC && !ENABLE_SHARC
   if (!(cb.enableReSTIRGI && geometryFlags.primarySelectedIntegrationSurface))
   {
     return;
@@ -1405,9 +1368,10 @@ void integrateIndirectPath(
     (geometryFlags.performPSRR || NEECache.shouldUseHigherBounceNeeCache(geometryFlags.firstSampledLobeIsSpecular, calcRoughness(firstHitPerceptualRoughness)));
   pathState.gbufferPerceptualRoughness = firstHitPerceptualRoughness;
 #if ENABLE_SHARC
-  // The first indirect ray inherits cache eligibility from the primary surface's first sampled lobe.
-  pathState.skyGatherEligible = !geometryFlags.firstSampledLobeIsSpecular;
+  // firstSampledLobeIsSpecular is the only lobe class available here.
+  pathState.sharcDiffuseArrival = !geometryFlags.firstSampledLobeIsSpecular;
 #endif
+
   
   initNrc(pathState, gbufferPixelCoordinate, isNrcUpdate, geometryFlags, firstSampledSolidAnglePdf);
 
@@ -1491,23 +1455,16 @@ void integrateIndirectPath(
   }
 
   // Integrate Secondary Vertices
-#if SHARC_QUERY_STATS
-  if (cb.enableSecondaryBounces && pathState.continuePath) {
-    sharcCount(pathState.pixelCoordinate, 0); // Paths that actually launch rays.
-  }
-#endif
 #if SHARC_UPDATE
   // The primary deposit needs the launch throughput final, so it follows the POM attenuation
-  // above, and it happens whether or not the path launches (see the hook); the retry budget is
-  // loop state, not payload.
-  uint sharcSkyRetries = (cb.sharcArgs.enabled >> SHARC_UPDATE_SKY_RETRY_SHIFT) & SHARC_UPDATE_SKY_RETRY_MASK;
-  // Debug-view tally only; the sky retry flushes too, so it has to survive across both flushes.
-  SharcDepositStats sharcDepositStats = sharcDepositStatsInit();
+  // above, and it happens whether or not the path goes on to launch.
+  uint sharcSkyRetries = (cb.sharcArgs.flags >> SHARC_SKY_RETRY_SHIFT) & SHARC_SKY_RETRY_MASK;
   if (cb.enableSecondaryBounces)
   {
     sharcOnPathStart(pathState, gbufferPixelCoordinate, geometryFlags, mediumMaterialIndex, firstHitPerceptualRoughness);
   }
 #endif
+
 
   if (cb.enableSecondaryBounces)
   for (; pathState.continuePath; ++pathState.bounceIteration)
@@ -1516,9 +1473,7 @@ void integrateIndirectPath(
     // This is done to easily account for the various cases the path vertex function may return on
     // which do not require path extension.
     pathState.continuePath = false;
-#if SHARC_QUERY_STATS
-    sharcCount(pathState.pixelCoordinate, 1); // Ray segments per sampled path.
-#endif
+
 #if ENABLE_SHARC
     sharcOnSegmentBegin(pathState);
 #endif
@@ -1552,17 +1507,16 @@ void integrateIndirectPath(
       DEBUG_VIEW_SECONDARY_RAY_AND_UNORDERED_INTERACTIONS,
       (!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)));
 #if SHARC_UPDATE
-    sharcOnSegmentEnd(pathState, gbufferPixelCoordinate, geometryFlags, rayOrigin, rayConeRadius, mediumMaterialIndex, sharcSkyRetries, sharcDepositStats);
+    sharcOnSegmentEnd(pathState, gbufferPixelCoordinate, geometryFlags, rayOrigin, rayConeRadius, mediumMaterialIndex, sharcSkyRetries);
 #endif
   }
 
-#if SHARC_UPDATE && SHARC_DEFERRED_UPDATE
-  sharcFlushVertices(pathState.sharcState, sharcDepositStats);
-  sharcDebugUpdate(gbufferPixelCoordinate, sharcDepositStats);
+#if SHARC_UPDATE
+  sharcFlushVertices(pathState.sharcState);
 #endif
 
 #if !SHARC_UPDATE
-  if ((!SHARC_UPDATE && TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery)))
+  if (TRUE_OR_CHECK_WHEN_NRC_ENABLED(pathState.isNrcQuery))
   {
     const u16vec2 gbufferPixelCoordinate = pathState.pixelCoordinate;
 
