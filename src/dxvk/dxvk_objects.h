@@ -64,6 +64,7 @@
 #include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_gpu_crash.h"
 #include "rtx_render/rtx_gpu_pass_timer.h"
+#include "rtx_render/rtx_dlss_neural_rendering.h"
 
 #include "rtx_render/rtx_denoise_type.h"
 #include "../util/util_lazy.h"
@@ -229,6 +230,10 @@ namespace dxvk {
 
     DxvkDLFG& metaDLFG() {
       return m_dlfg.get();
+    }
+
+    DlssNeuralRendering& metaDlssNeuralRendering() {
+      return m_dlssNeuralRendering.get();
     }
 
     DxvkNIS& metaNIS() {
@@ -409,6 +414,7 @@ namespace dxvk {
     Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe2;
     Active<DxvkDLSS>                        m_dlss;
     Active<DxvkRayReconstruction>           m_rayReconstruction;
+    Active<DlssNeuralRendering>             m_dlssNeuralRendering;
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
