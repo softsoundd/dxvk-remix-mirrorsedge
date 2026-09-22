@@ -368,14 +368,6 @@ rtx_shaders_command_arguments = [
   '-include', shader_directory,
   '-include', rtxcr_include_path_string,
   '-include', submodules_include_path_string,
-  # Lighting, G-buffer, and volumetrics passes include the RTXDI SDK and are not dispatched.
-  '-exclude', 'pass/rtxdi',
-  '-exclude', 'pass/integrate',
-  '-exclude', 'pass/volumetrics',
-  '-exclude', 'pass/gbuffer',
-  '-exclude', 'pass/composite',
-  '-exclude', 'pass/particles',
-  '-exclude', 'pass/nee_cache',
   '-output', rtx_shader_output_directory,
   '-parallel',
 ]

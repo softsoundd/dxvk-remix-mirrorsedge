@@ -123,5 +123,5 @@ struct ParticleVertex {
 #define PARTICLE_SYSTEM_MIN_BINDING                           PARTICLE_SYSTEM_BINDING_CONSTANTS
 
 #if PARTICLE_SYSTEM_MIN_BINDING <= COMMON_MAX_BINDING
-#error "Increase the base index of dust particles bindings to avoid overlap with common bindings!"
+#error "Increase the base index of particle system bindings to avoid overlap with common bindings!"
 #endif

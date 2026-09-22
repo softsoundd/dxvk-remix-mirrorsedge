@@ -115,7 +115,7 @@ struct GeometryFlags
 
   // True only when BOTH PSRR and PSTR fired for this pixel (e.g. glass that both reflects and transmits),
   // in which case one becomes the primary surface and the other is stored as a distinct secondary surface
-  // with its own GBuffer/attenuation data. See geometry_resolver.slangh where secondarySurfaceMask is set.
+  // with its own GBuffer/attenuation data.
   bool hasSecondarySurface()
   {
     return performPSTR && performPSRR;

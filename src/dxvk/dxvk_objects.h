@@ -61,7 +61,6 @@
 namespace dxvk {
 
   class DxvkDevice;
-  class DxvkDenoise;
   class DxvkRayReconstruction;
   class DxvkRtxdiRayQuery;
   class DxvkReSTIRGIRayQuery;

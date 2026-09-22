@@ -25,9 +25,7 @@
 #include "dxvk_context.h"
 #include "../util/util_blueNoise_128x128x64.h"
 #include "rtx/pass/raytrace_args.h"
-#include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
 #include "rtx/pass/post_fx/post_fx.h"
-#include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 #include "rtx/algorithm/nee_cache_data.h"
 #include "rtx/utility/procedural_noise.h"
 #include <assert.h>
