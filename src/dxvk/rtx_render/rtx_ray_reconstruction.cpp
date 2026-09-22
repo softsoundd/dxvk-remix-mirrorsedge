@@ -70,6 +70,7 @@ namespace dxvk {
         TEXTURE2D(RAY_RECONSTRUCTION_NORMALS_DLSSRR_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_DEPTHS_INPUT)
         TEXTURE2D(RAY_RECONSTRUCTION_MOTION_VECTOR_INPUT)
+        TEXTURE2D(RAY_RECONSTRUCTION_INPUT_COLOR_INPUT)
 
         RW_TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(RAY_RECONSTRUCTION_PRIMARY_SPECULAR_ALBEDO_INPUT_OUTPUT)
@@ -198,6 +199,8 @@ namespace dxvk {
       ctx->bindResourceView(RAY_RECONSTRUCTION_NORMALS_DLSSRR_INPUT, rtOutput.m_primaryWorldShadingNormalDLSSRR.view(Resources::AccessType::Read), nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_DEPTHS_INPUT, depthInput->view, nullptr);
       ctx->bindResourceView(RAY_RECONSTRUCTION_MOTION_VECTOR_INPUT, motionVectorInput->view, nullptr);
+      // Color fed into DLSS-RR (composite output), for the input-color debug view.
+      ctx->bindResourceView(RAY_RECONSTRUCTION_INPUT_COLOR_INPUT, rtOutput.m_compositeOutput.view(Resources::AccessType::Read), nullptr);
 
       // Inputs/Outputs
 
@@ -400,7 +403,7 @@ namespace dxvk {
     // Update our requested profile
     mProfile = profile;
 
-    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
+    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality<NVSDK_NGX_PerfQuality_Value>(mActualProfile);
 
     if (!m_rayReconstructionContext) {
       m_rayReconstructionContext = m_device->getCommon()->metaNGXContext().createRayReconstructionContext();
@@ -424,7 +427,7 @@ namespace dxvk {
       m_rayReconstructionContext = m_device->getCommon()->metaNGXContext().createRayReconstructionContext();
     }
 
-    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
+    NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality<NVSDK_NGX_PerfQuality_Value>(mActualProfile);
 
     if (m_rayReconstructionContext) {
 

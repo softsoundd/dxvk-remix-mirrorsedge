@@ -39,6 +39,7 @@
 #include "rtx_texture_manager.h"
 #include "rtx_debug_view.h"
 #include "rtx_xess.h"
+#include "rtx_ray_reconstruction.h"
 #include "../util/util_global_time.h"
 
 namespace dxvk {
@@ -350,13 +351,22 @@ namespace dxvk {
 
     assert(targetExtent.width > 0 && targetExtent.height > 0 && targetExtent.depth > 0);
 
-    if (m_downscaledExtent != downscaledExtent) {
+    const bool downscaledExtentChanged = m_downscaledExtent != downscaledExtent;
+    const bool targetExtentChanged = m_targetExtent != targetExtent;
+
+    if (downscaledExtentChanged || targetExtentChanged) {
+      m_raytracingOutput.m_neuralRenderingOutput.reset();
+      m_raytracingOutput.m_controlMask.reset();
+      m_dlssNeuralRenderingResourcesAllocated = false;
+    }
+
+    if (downscaledExtentChanged) {
       m_downscaledExtent = downscaledExtent;
 
       createDownscaledResources(ctx);
     }
 
-    if (targetExtent != m_targetExtent) {
+    if (targetExtentChanged) {
       m_targetExtent = targetExtent;
 
       createTargetResources(ctx);
@@ -365,6 +375,51 @@ namespace dxvk {
 
   bool Resources::validateRaytracingOutput(const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent) const {
     return m_raytracingOutput.isReady() && m_targetExtent == targetExtent && m_downscaledExtent == downscaledExtent;
+  }
+
+  bool Resources::needsNrdDenoisingGuideResources() const {
+    return !device()->getCommon()->metaRayReconstruction().useRayReconstruction() &&
+           RtxOptions::useDenoiser() &&
+           !RtxOptions::useDenoiserReferenceMode();
+  }
+
+  // Tracks the denoiser at frame granularity rather than through a resolution reset, so toggling the denoiser
+  // does not cost a waitForIdle and a full downscaled resource rebuild.
+  void Resources::createNrdDenoisingGuideResources(Rc<DxvkContext>& ctx) {
+    const bool resourcesAreNeeded = needsNrdDenoisingGuideResources();
+
+    if (resourcesAreNeeded == m_nrdDenoisingGuideResourcesAllocated) {
+      return;
+    }
+
+    if (resourcesAreNeeded) {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness denoising", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    } else {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.reset();
+    }
+
+    m_nrdDenoisingGuideResourcesAllocated = resourcesAreNeeded;
+  }
+
+  void Resources::updateDlssNeuralRenderingResources(Rc<DxvkContext>& ctx) {
+    const bool resourcesAreNeeded =
+      device()->getCommon()->metaDlssNeuralRendering().useDlssNeuralRendering();
+
+    if (resourcesAreNeeded == m_dlssNeuralRenderingResourcesAllocated) {
+      return;
+    }
+
+    if (resourcesAreNeeded) {
+      m_raytracingOutput.m_controlMask =
+        createImageResource(ctx, "DLSS-NR Control Mask texture", m_downscaledExtent, VK_FORMAT_R8G8B8A8_UNORM,
+        1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 0, 8, { 1, 1, 1, 1 });
+      createNeuralRenderingOutput(ctx);
+    } else {
+      m_raytracingOutput.m_controlMask.reset();
+      m_raytracingOutput.m_neuralRenderingOutput.reset();
+    }
+
+    m_dlssNeuralRenderingResourcesAllocated = resourcesAreNeeded;
   }
 
   void Resources::onFrameBegin(
@@ -385,6 +440,8 @@ namespace dxvk {
 
     executeFrameBeginEventList(m_onFrameBegin, ctx, frameBeginCtx);
 
+    updateDlssNeuralRenderingResources(ctx);
+
     if (ctx->isDLFGEnabled()) {
       const uint32_t currentFrameId = ctx->getDevice()->getCurrentFrameId();
       const Rc<RtxSemaphore>& frameEndSemaphore = ctx->getCommonObjects()->metaDLFG().getFrameEndSemaphore();
@@ -402,6 +459,8 @@ namespace dxvk {
         }
       }
     }
+
+    createNrdDenoisingGuideResources(ctx);
 
     // Alias resources that alias to different resources frame to frame
     m_raytracingOutput.m_secondaryConeRadius = AliasedResource(m_raytracingOutput.getCurrentRtxdiConfidence(), ctx, m_downscaledExtent, VK_FORMAT_R16_SFLOAT, "Secondary Cone Radius");
@@ -1062,6 +1121,7 @@ namespace dxvk {
       }
     }
     m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness = createImageResource(ctx, "primary virtual world shading normal perceptual roughness", m_downscaledExtent, VK_FORMAT_R16G16B16A16_UNORM);
+    // Note: this is unused when RR is ON, but the resource is aliased by m_primaryRtxdiTemporalPosition which is used almost everytime, so keep this allocated for simplicity.
     m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "primary virtual world shading normal perceptual roughness denoising", true);;
     m_raytracingOutput.m_primaryHitDistance = createImageResource(ctx, "primary hit distance", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     m_raytracingOutput.m_primaryViewDirection = createImageResource(ctx, "primary view direction", m_downscaledExtent, VK_FORMAT_R16G16_SNORM);
@@ -1098,7 +1158,12 @@ namespace dxvk {
     m_raytracingOutput.m_secondaryBaseReflectivity, ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "Secondary Specular Albedo");
     m_raytracingOutput.m_secondaryVirtualMotionVector = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Secondary Virtual Motion Vector");
     m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughness = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness", m_downscaledExtent, VK_FORMAT_R16G16B16A16_UNORM);
-    m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness denoising", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    m_nrdDenoisingGuideResourcesAllocated = needsNrdDenoisingGuideResources();
+    if (m_nrdDenoisingGuideResourcesAllocated) {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness denoising", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    } else {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.reset();
+    }
     m_raytracingOutput.m_secondaryHitDistance = createImageResource(ctx, "secondary hit distance", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     m_raytracingOutput.m_secondaryViewDirection = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16_SNORM, "Secondary View Direction", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_secondaryWorldPositionWorldTriangleNormal = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32G32B32A32_SFLOAT, "Secondary World Position World Triangle Normal", allowCompatibleFormatAliasing);
@@ -1257,7 +1322,9 @@ namespace dxvk {
     m_raytracingOutput.m_finalOutputExtent = m_targetExtent;
 
     // Post Effect intermediate textures
-    m_raytracingOutput.m_postFxIntermediateTexture = createImageResource(ctx, "postfx intermediate texture", m_targetExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+    m_raytracingOutput.m_postFxIntermediateTexture = AliasedResource(ctx, m_targetExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "postfx intermediate texture");
+    m_raytracingOutput.m_neuralRenderingInput = AliasedResource(
+      m_raytracingOutput.m_postFxIntermediateTexture, ctx, m_targetExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-NR input");
 
     // Cinematic motion blur intermediates
     {
@@ -1277,6 +1344,23 @@ namespace dxvk {
 
     // Let other systems know of the resize
     executeResizeEventList(m_onTargetResize, ctx, m_targetExtent);
+  }
+
+  void Resources::createNeuralRenderingOutput(Rc<DxvkContext>& ctx) {
+    if (m_targetExtent == m_downscaledExtent) {
+      m_raytracingOutput.m_neuralRenderingOutput = AliasedResource(
+        m_raytracingOutput.m_primaryWorldShadingNormalDLSSRR,
+        ctx,
+        m_targetExtent,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        "DLSS-NR output");
+    } else {
+      m_raytracingOutput.m_neuralRenderingOutput = AliasedResource(
+        ctx,
+        m_targetExtent,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        "DLSS-NR output");
+    }
   }
 
   void Resources::executeResizeEventList(

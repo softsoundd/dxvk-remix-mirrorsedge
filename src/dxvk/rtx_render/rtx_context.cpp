@@ -289,7 +289,7 @@ namespace dxvk {
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
 
-    // Resize the RT screen dependant buffers (if needed). The NGX passthrough mode never
+    // Resize the RT screen dependent buffers (if needed). The NGX passthrough mode never
     // touches the path tracer's output resources, so skip the (large) allocation there;
     // should the mode be disabled at runtime, the ray traced path recreates them inline
     // via onInjectRtxFrameBegin's validateRaytracingOutput check.
@@ -299,6 +299,9 @@ namespace dxvk {
 
     uint32_t renderSize[] = { downscaleExtent.width, downscaleExtent.height };
     uint32_t displaySize[] = { upscaleExtent.width, upscaleExtent.height };
+
+    DlssNeuralRendering& dlssnr = m_common->metaDlssNeuralRendering();
+    dlssnr.setDlssNeuralRenderingSettings(displaySize);
 
     // Set resolution to cameras for jittering
     for (int i = 0; i < CameraType::Count; i++) {
@@ -779,12 +782,14 @@ namespace dxvk {
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
 
+        const bool dlssNrEnabled = dispatchDlssNR(rtOutput);
+
         dispatchBloom(rtOutput);
 
         // Motion blur runs before tonemapping while the image is still in linear HDR space.
         dispatchPostFxMotionBlur(rtOutput);
 
-        dispatchToneMapping(rtOutput);
+        dispatchToneMapping(rtOutput, !dlssNrEnabled);
 
         // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
         // display-space artifacts so they operate on post-tonemap LDR data.
@@ -1344,7 +1349,6 @@ namespace dxvk {
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
 
     m_common->metaSparseRendering().setSparseRenderingArgs(*this, constants.sparseRenderingArgs);
-    constants.sparseRenderingArgs.nrcArgs = constants.nrcArgs;
 
     auto* cameraTeleportDirectionInfo = getSceneManager().getRayPortalManager().getCameraTeleportationRayPortalDirectionInfo();
     constants.teleportationPortalIndex = cameraTeleportDirectionInfo ? cameraTeleportDirectionInfo->entryPortalInfo.portalIndex + 1 : 0;
@@ -1365,7 +1369,13 @@ namespace dxvk {
       constants.debugView = debugView.debugViewIdx();
       constants.debugKnob = debugView.debugKnob();
       constants.forceFirstHitInGBufferPass = debugView.showFirstGBufferHit();
-      
+      constants.enableDlssNrControlMask =
+        m_common->metaDlssNeuralRendering().useDlssNeuralRendering() &&
+        !DlssNeuralRendering::useAutoMask();
+      constants.enableDlssNrVolumetricControlMask =
+        constants.enableDlssNrControlMask &&
+        DlssNeuralRendering::enableVolumetricControlMask();
+
       constants.gpuPrintThreadIndex = u16vec2 { kInvalidThreadIndex, kInvalidThreadIndex };
       constants.gpuPrintElementIndex = frameIdx % kMaxFramesInFlight;
 
@@ -1447,6 +1457,25 @@ namespace dxvk {
     constants.setLogValueForDisocclusionMaskForDLSSRR = DxvkRayReconstruction::enableDisocclusionMaskBlur();
     constants.invalidateHistoryForAnimatedWater = DxvkRayReconstruction::invalidateHistoryForAnimatedWater();
 
+    // The denoising normals are consumed only by NRD. dispatchDenoise reads these back rather than
+    // recomputing the condition, so the GBuffer never writes a guide nothing will read.
+    {
+      // The guides are allocated exactly when NRD is the effective denoiser, and Resources::onFrameBegin has
+      // already reconciled that this frame, so the flag is the condition.
+      const bool willNrdDenoise = getResourceManager().areNrdDenoisingGuideResourcesAllocated();
+      constants.writeSecondaryDenoisingGuides = willNrdDenoise;
+      constants.writePrimaryDenoisingNormal = willNrdDenoise;
+
+      // The primary virtual motion vector is not an NRD guide alone - RTXDI temporal reuse and gradients,
+      // ReSTIR GI temporal reuse and the worldMotion debug screenshot all read it.
+      constants.writePrimaryVirtualMotionVector =
+        willNrdDenoise || RtxOptions::useRTXDI() || restirGI.isActive() || RtxOptions::captureDebugImage();
+    }
+
+    // Force static-scene primary motion vectors (camera motion still accounted for), avoiding
+    // world-space position precision drift on static geometry such as view models.
+    constants.forceStaticSceneMotionVectors = RtxOptions::forceStaticSceneMotionVectors();
+
     NrdArgs primaryDirectNrdArgs;
     NrdArgs primaryIndirectNrdArgs;
     NrdArgs secondaryNrdArgs;
@@ -1495,6 +1524,7 @@ namespace dxvk {
     Rc<DxvkBuffer> lightBuffer = getSceneManager().getLightManager().getLightBuffer();
     Rc<DxvkBuffer> previousLightBuffer = getSceneManager().getLightManager().getPreviousLightBuffer();
     Rc<DxvkBuffer> lightMappingBuffer = getSceneManager().getLightManager().getLightMappingBuffer();
+    Rc<DxvkBuffer> lightIdentityBuffer = getSceneManager().getLightManager().getLightIdentityBuffer();
     Rc<DxvkBuffer> gpuPrintBuffer = getResourceManager().getRaytracingOutput().m_gpuPrintBuffer;
     Rc<DxvkImageView> valueNoiseLut = getResourceManager().getValueNoiseLut(this);
     Rc<DxvkSampler> linearSampler = getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
@@ -1514,6 +1544,7 @@ namespace dxvk {
     bindResourceBuffer(BINDING_LIGHT_DATA_BUFFER, DxvkBufferSlice(lightBuffer, 0, lightBuffer.ptr() ? lightBuffer->info().size : 0));
     bindResourceBuffer(BINDING_PREVIOUS_LIGHT_DATA_BUFFER, DxvkBufferSlice(previousLightBuffer, 0, previousLightBuffer.ptr() ? previousLightBuffer->info().size : 0));
     bindResourceBuffer(BINDING_LIGHT_MAPPING, DxvkBufferSlice(lightMappingBuffer, 0, lightMappingBuffer.ptr() ? lightMappingBuffer->info().size : 0));
+    bindResourceBuffer(BINDING_LIGHT_IDENTITY_BUFFER, lightIdentityBuffer.ptr() ? DxvkBufferSlice(lightIdentityBuffer, 0, lightIdentityBuffer->info().size) : DxvkBufferSlice());
     bindResourceBuffer(BINDING_BILLBOARDS_BUFFER, DxvkBufferSlice(billboardsBuffer, 0, billboardsBuffer.ptr() ? billboardsBuffer->info().size : 0));
     bindResourceView(BINDING_BLUE_NOISE_TEXTURE, getResourceManager().getBlueNoiseTexture(this), nullptr);
     bindResourceBuffer(BINDING_CONSTANTS, DxvkBufferSlice(constantsBuffer, 0, constantsBuffer->info().size));
@@ -1657,9 +1688,8 @@ namespace dxvk {
     DxvkDenoise& denoiser2 = m_common->metaSecondaryCombinedLightDenoiser();
     DxvkDenoise& referenceDenoiserSecondLobe2 = m_common->metaReferenceDenoiserSecondLobe2();
 
-    const bool shouldDenoise = !useRayReconstruction()
-      && RtxOptions::useDenoiser()
-      && !RtxOptions::useDenoiserReferenceMode();
+    // The same condition the GBuffer's guide writes are gated on, so the two cannot disagree.
+    const bool shouldDenoise = getResourceManager().areNrdDenoisingGuideResourcesAllocated();
 
     if (!shouldDenoise) {
       denoiser0.releaseResources();
@@ -1837,7 +1867,40 @@ namespace dxvk {
       rtOutput, settings);
   }
 
-  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput) {
+  bool RtxContext::dispatchDlssNR(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+
+    auto& dlssNr = m_common->metaDlssNeuralRendering();
+    if (!dlssNr.useDlssNeuralRendering()) {
+      return false;
+    }
+
+    DxvkToneMapping& toneMapper = m_common->metaToneMapping();
+    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
+    autoExposure.dispatch(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
+      rtOutput, GlobalTime::get().deltaTimeMs());
+
+    // DLSS-NR operates in SDR space; inverse tone mapping restores HDR for downstream post-processing.
+    toneMapper.dispatchFastToneMapping(
+      this,
+      autoExposure.getExposureTexture().view,
+      rtOutput,
+      autoExposure.enabled());
+
+    const bool useRayReconstructionGuides = m_currentUpscaler == InternalUpscaler::DLSS_RR;
+    if (dlssNr.dispatch(this, m_execBarriers, rtOutput, m_resetHistory, useRayReconstructionGuides)) {
+      toneMapper.dispatchInverseToneMapping(
+        this,
+        autoExposure.getExposureTexture().view,
+        rtOutput,
+        autoExposure.enabled());
+    }
+
+    return true;
+  }
+
+  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure) {
     ScopedCpuProfileZone();
 
     m_ue3DisplayTransformApplied = false;
@@ -1851,9 +1914,11 @@ namespace dxvk {
     this->unbindComputePipeline();
 
     DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
-    autoExposure.dispatch(this,
-      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
-      rtOutput, GlobalTime::get().deltaTimeMs());
+    if (updateAutoExposure) {
+      autoExposure.dispatch(this,
+        getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
+        rtOutput, GlobalTime::get().deltaTimeMs());
+    }
 
     const bool resetToneMapperHistory = m_resetHistory || getSceneManager().getCamera().isCameraCut();
     setFramePassStage(RtxFramePassStage::ToneMapping);
@@ -2767,7 +2832,7 @@ namespace dxvk {
     if (!TerrainBaker::debugDisableBaking()) {
 
       // Retrieve the replacement material
-      MaterialData* replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
+      std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
 
       if (replacementMaterial) {
         if (replacementMaterial->getType() == MaterialDataType::Opaque) {
@@ -2826,7 +2891,7 @@ namespace dxvk {
   void RtxContext::rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState) {
     // Grab and apply replacement texture if any
     // NOTE: only the original color texture will be replaced with albedo-opacity texture
-    MaterialData* replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
+    std::shared_ptr<MaterialData> replacementMaterial = getSceneManager().getAssetReplacer()->getReplacementMaterial(drawCallState.getMaterialData().getHash());
     bool replacemenIsLDR = false;
     Rc<DxvkImageView> replacementTexture = {};
     uint32_t replacementTextureSlot = UINT32_MAX;

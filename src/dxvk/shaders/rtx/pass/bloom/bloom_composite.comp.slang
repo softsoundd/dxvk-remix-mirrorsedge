@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -44,7 +44,7 @@ void main(uint2 ipos : SV_DispatchThreadID)
   float4 src = InBloomBuffer.SampleLevel(uv, 0);
   float4 dst = InOutColorBuffer[ipos];
 
-  if (any(isnan(dst)) || any(isinf(dst)))
+  if (any(isnan(dst)) || any(isinf(dst)) || any(isnan(src)) || any(isinf(src)))
   {
     return;
   }

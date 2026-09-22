@@ -40,6 +40,7 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Constants: `k` prefix and camelCase, i.e. `kConstantName`
   - Macros and defines: `UPPER_CASE`
   - Classes and structs: `PascalCase`
+- **Conditions**: Test an integer flag by referencing the variable on its own, `if (flag)`, not `if (flag != 0)`. Applies to C++ and Slang, including `uint` flags in constant buffers. Bit tests like `(flags & kSomeBit) != 0` are unaffected.
 - **Includes**: Standard library first, then third-party, then local. Separate groups with blank lines.
 - **Memory**: Prefer smart pointers (`std::unique_ptr`, `std::shared_ptr`). Use `Rc<T>` for GPU resources.
 - **Profiling**: Use `ScopedCpuProfileZone()` / `ScopedGpuProfileZone(ctx, "name")` for performance-critical code.
@@ -110,6 +111,7 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 
 ### Slang Conventions
 
+- Declare only one variable per declaration.
 - `mat4x3` for 3x4 matrices (3 rows of 4 columns, row-major in Slang).
 - `f16vec3` / `float16_t` for half-precision where appropriate.
 - `BUFFER_ARRAY(bufferName, bufferIndex, elementIndex)` macro for bindless buffer access.

@@ -27,6 +27,7 @@
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_render/rtx_sparse_rendering.h"
+#include "rtx_render/rtx_ray_reconstruction.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
 #include "rtx_imgui.h"
@@ -37,6 +38,7 @@
 #include "rtx_debug_view.h"
 
 #include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
+#include "rtx/pass/integrate/integrate_direct_binding_indices.h"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 #include "rtx/pass/nrc/nrc_resolve_binding_indices.h"
 #include <rtx_shaders/nrc_resolve.h>
@@ -745,6 +747,12 @@ namespace dxvk {
       nrcFrameSettings.numTrainingIterations = calculateNumTrainingIterations();
     }
 
+    // Evaluated fresh rather than read off SparseRendering::isActive(), which is latched per frame with no ordering
+    // guarantee against this pass and so could size these an extent too small. This can only over-allocate, which
+    // costs anything only if the pass then fails to activate.
+    const bool sparseRenderingResamplesTrainingPaths = SparseRendering::isEnabledByOptions() &&
+      ctx->getCommonObjects()->metaRayReconstruction().useRayReconstruction();
+
     // Allocate resources dependent on runtime settings
     {
       // Allocate query path data only when include direct lighting option is disabled. 
@@ -756,14 +764,28 @@ namespace dxvk {
         m_queryPathData0.reset();
       }
 
-      // Allocate resources if they are invalid or have stale dimensions
-      if (m_trainingGBufferSurfaceRadianceRG.image == nullptr 
-          || m_trainingGBufferSurfaceRadianceRG.image->info().extent.width != m_nrcCtxSettings->trainingDimensions.x 
-          || m_trainingGBufferSurfaceRadianceRG.image->info().extent.height != m_nrcCtxSettings->trainingDimensions.y) {
+      const VkExtent3D trainingExtent = VkExtent3D { m_nrcCtxSettings->trainingDimensions.x, m_nrcCtxSettings->trainingDimensions.y, 1 };
 
-        VkExtent3D newImageExtent = VkExtent3D { m_nrcCtxSettings->trainingDimensions.x, m_nrcCtxSettings->trainingDimensions.y, 1 };
-        m_trainingGBufferSurfaceRadianceRG = Resources::createImageResource(ctx, "NRC Training shared radiance RG", newImageExtent, VK_FORMAT_R16G16_SFLOAT);
-        m_trainingGBufferSurfaceRadianceB = Resources::createImageResource(ctx, "NRC Training shared radiance B", newImageExtent, VK_FORMAT_R16_SFLOAT);
+      // Deferred setup stores surface radiance per pixel rather than per training cell, so it needs the render extent.
+      const VkExtent3D surfaceRadianceExtent = sparseRenderingResamplesTrainingPaths ? downscaledExtent : trainingExtent;
+
+      // Allocate resources if they are invalid or have stale dimensions
+      if (m_trainingGBufferSurfaceRadianceRG.image == nullptr
+          || m_trainingGBufferSurfaceRadianceRG.image->info().extent.width != surfaceRadianceExtent.width
+          || m_trainingGBufferSurfaceRadianceRG.image->info().extent.height != surfaceRadianceExtent.height) {
+
+        m_trainingGBufferSurfaceRadianceRG = Resources::createImageResource(ctx, "NRC Training shared radiance RG", surfaceRadianceExtent, VK_FORMAT_R16G16_SFLOAT);
+        m_trainingGBufferSurfaceRadianceB = Resources::createImageResource(ctx, "NRC Training shared radiance B", surfaceRadianceExtent, VK_FORMAT_R16_SFLOAT);
+      }
+
+      // Training query-pixel resampling reservoir: selection key plus the winning pixel's offset in its cell.
+      if (!sparseRenderingResamplesTrainingPaths) {
+        m_trainingQueryReservoir.reset();
+      } else if (m_trainingQueryReservoir.image == nullptr
+          || m_trainingQueryReservoir.image->info().extent.width != trainingExtent.width
+          || m_trainingQueryReservoir.image->info().extent.height != trainingExtent.height) {
+
+        m_trainingQueryReservoir = Resources::createImageResource(ctx, "NRC Training Query Reservoir", trainingExtent, VK_FORMAT_R32_UINT);
       }
     }
     
@@ -787,6 +809,18 @@ namespace dxvk {
       if (m_nrcCtx->isDebugBufferRequired()) {
         m_nrcCtx->clearBuffer(*ctx, nrc::BufferIdx::DebugTrainingPathInfo, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
       }
+    }
+
+    // Reset the reservoir to empty each frame.
+    if (m_trainingQueryReservoir.image != nullptr) {
+      VkImageSubresourceRange subRange = {};
+      subRange.layerCount = 1;
+      subRange.levelCount = 1;
+      subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+      VkClearColorValue reservoirClear = {};
+      reservoirClear.uint32[0] = 0u;
+      ctx->clearColorImage(m_trainingQueryReservoir.image, reservoirClear, subRange);
     }
   }
 
@@ -842,6 +876,8 @@ namespace dxvk {
     m_trainingGBufferSurfaceRadianceRG.reset();
     m_trainingGBufferSurfaceRadianceB.reset();
 
+    m_trainingQueryReservoir.reset();
+
     m_queryPathData1.reset();
     m_trainingPathData1.reset();
   }
@@ -867,6 +903,26 @@ namespace dxvk {
     }
   }
 
+  void NeuralRadianceCache::bindIntegrateDirectPathTracingResources(RtxContext& ctx, const bool deferredNrcTrainingSetup) {
+    ctx.bindResourceView(INTEGRATE_DIRECT_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT, m_trainingQueryReservoir.view, nullptr);
+
+    ctx.bindResourceBuffer(INTEGRATE_DIRECT_BINDING_NRC_QUERY_PATH_INFO_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::QueryPathInfo));
+    ctx.bindResourceBuffer(INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_INFO_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::TrainingPathInfo));
+    ctx.bindResourceBuffer(INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_VERTICES_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::TrainingPathVertices));
+    ctx.bindResourceBuffer(INTEGRATE_DIRECT_BINDING_NRC_QUERY_RADIANCE_PARAMS_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::QueryRadianceParams));
+    ctx.bindResourceBuffer(INTEGRATE_DIRECT_BINDING_NRC_COUNTERS_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::Counters));
+
+    ctx.bindResourceView(INTEGRATE_DIRECT_BINDING_NRC_QUERY_PATH_DATA0_OUTPUT, m_queryPathData0.view, nullptr);
+
+    if (isActive()) {
+      // Only the deferred variant writes this, so the aliasing bookkeeping is told when it is actually accessed.
+      ctx.bindResourceView(INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_DATA1_OUTPUT,
+                           m_trainingPathData1.view(Resources::AccessType::Write, deferredNrcTrainingSetup), nullptr);
+    } else {
+      ctx.bindResourceView(INTEGRATE_DIRECT_BINDING_NRC_TRAINING_PATH_DATA1_OUTPUT, nullptr, nullptr);
+    }
+  }
+
   void NeuralRadianceCache::bindIntegrateIndirectPathTracingResources(RtxContext& ctx) {
     ctx.bindResourceBuffer(INTEGRATE_INDIRECT_BINDING_NRC_QUERY_PATH_INFO_INPUT_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::QueryPathInfo));
     ctx.bindResourceBuffer(INTEGRATE_INDIRECT_BINDING_NRC_TRAINING_PATH_INFO_INPUT_OUTPUT, getBufferSlice(ctx, NeuralRadianceCache::ResourceType::TrainingPathInfo));
@@ -876,6 +932,7 @@ namespace dxvk {
 
     ctx.bindResourceView(INTEGRATE_INDIRECT_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_RG_INPUT, m_trainingGBufferSurfaceRadianceRG.view, nullptr);
     ctx.bindResourceView(INTEGRATE_INDIRECT_BINDING_NRC_TRAINING_GBUFFER_SURFACE_RADIANCE_B_INPUT, m_trainingGBufferSurfaceRadianceB.view, nullptr);
+    ctx.bindResourceView(INTEGRATE_INDIRECT_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT, m_trainingQueryReservoir.view, nullptr);
     ctx.bindResourceView(INTEGRATE_INDIRECT_BINDING_NRC_PATH_DATA0_INPUT, m_queryPathData0.view, nullptr);
 
     // Aliased resource methods must not be called when the resource is invalid
@@ -925,6 +982,10 @@ namespace dxvk {
         static_cast<uint32_t>(m_nrcCtxSettings->trainingDimensions.x),
         static_cast<uint32_t>(m_nrcCtxSettings->trainingDimensions.y) };
 
+      // Note: this is noop but called here to check and print out a warning should the NRC with sparse rendering be asking for 
+      // training resolution larger than supported.
+      clampTrainingDimensionsToReservoirOffsetRange(m_activeTrainingDimensions);
+
       m_smoothingResetFrameIdx = frameIdx;
       m_smoothedNumberOfTrainingRecords = 0;
 
@@ -967,6 +1028,8 @@ namespace dxvk {
                     m_nrcCtxSettings->trainingDimensions.y),
         };
 
+        clampTrainingDimensionsToReservoirOffsetRange(newActiveTrainingDimensions);
+
         // Active training dimensions changed
         if (0 != memcmp(&newActiveTrainingDimensions, &m_activeTrainingDimensions, sizeof(newActiveTrainingDimensions))) {
           m_activeTrainingDimensions = newActiveTrainingDimensions;
@@ -979,6 +1042,39 @@ namespace dxvk {
         }
       }
     }
+  }
+
+  void NeuralRadianceCache::clampTrainingDimensionsToReservoirOffsetRange(nrc_uint2& trainingDimensions) const {
+    // The reservoir stores the winning pixel as an offset in its cell, so a cell may not span more query pixels
+    // than that offset addresses. Nothing else reads it, so leave NRC's own sizing alone.
+    if (!SparseRendering::isEnabledByOptions()) {
+      return;
+    }
+
+    const nrc_uint2 minTrainingDimensions = nrc_uint2 {
+      divCeil(m_nrcCtxSettings->frameDimensions.x, NRC_MAX_QUERY_PIXELS_PER_TRAINING_PIXEL_PER_AXIS),
+      divCeil(m_nrcCtxSettings->frameDimensions.y, NRC_MAX_QUERY_PIXELS_PER_TRAINING_PIXEL_PER_AXIS) };
+
+    const nrc_uint2& maxTrainingDimensions = m_nrcCtxSettings->trainingDimensions;
+
+    if (minTrainingDimensions.x > maxTrainingDimensions.x || minTrainingDimensions.y > maxTrainingDimensions.y) {
+      ONCE(Logger::warn(str::format("[RTX Neural Radiance Cache] NRC cannot train at (", minTrainingDimensions.x,
+                                    ", ", minTrainingDimensions.y, ") for sparse rendering to address a training "
+                                    "cell, so oversized cells lose their training path. Raise "
+                                    "rtx.neuralRadianceCache.targetNumTrainingIterations or lower "
+                                    "averageTrainingBouncesPerPath.")));
+    } else if (trainingDimensions.x < minTrainingDimensions.x || trainingDimensions.y < minTrainingDimensions.y) {
+      ONCE(Logger::warn(str::format("[RTX Neural Radiance Cache] NRC training dimensions raised to (",
+                                    minTrainingDimensions.x, ", ", minTrainingDimensions.y,
+                                    ") so sparse rendering can address a training cell. NRC trains more than its "
+                                    "target as a result. Raise rtx.neuralRadianceCache.targetNumTrainingIterations "
+                                    "or lower averageTrainingBouncesPerPath to avoid it.")));
+    }
+
+    // Never above what the training buffers are sized for. Going over would index out of them, whereas a cell
+    // left too large only loses its training path.
+    trainingDimensions.x = std::min(std::max(trainingDimensions.x, minTrainingDimensions.x), maxTrainingDimensions.x);
+    trainingDimensions.y = std::min(std::max(trainingDimensions.y, minTrainingDimensions.y), maxTrainingDimensions.y);
   }
 
   uint32_t NeuralRadianceCache::calculateNumTrainingIterations() {

@@ -22,6 +22,7 @@
 #pragma once
 
 #include "rtx/algorithm/geometry_resolver_state.slangh"
+#include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/utility/noise.slangh"
 #include "rtx/utility/procedural_noise.slangh"
 #include "rtx/utility/packing.slangh"
@@ -102,8 +103,7 @@ GeometryResolverState geometryResolverStateCreateEmpty(u16vec2 pixelCoordinate)
   geometryResolverState.accumulatedRotation = getIdentityQuaternion();
 
   geometryResolverState.continueResolving = true;
-  // Note: Inside medium assumed to start as false for the camera ray, this assumption will break down if the camera is ever intended
-  // to work properly from within a translucent object (for example, underwater).
+  // Camera medium state is applied by preprocessPrimaryRayState before tracing.
   geometryResolverState.insideMedium = false;
   geometryResolverState.performPSRR = false;
   geometryResolverState.performPSTR = false;
@@ -125,10 +125,15 @@ vec2 calcMotionVectorForRayMiss(const uvec2 pixelCoordinate)
   prevNDC /= prevNDC.w;
 
   const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
-  const vec2 motionVectorNDC = prevNDC.xy - ndc.xy;
-  const vec2 motionVectorUVOffset = motionVectorNDC * vec2(0.5, -0.5);
 
-  return motionVectorUVOffset * cb.camera.resolution;
+  return cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC.xy);
+}
+
+void geometryResolverStoreDlssNrControlMask(
+  uvec2 pixelCoordinate,
+  vec4 dlssControlMask)
+{
+  DlssNrControlMask[pixelCoordinate] = dlssControlMask;
 }
 
 // Geometry Resolver Vertex Functions
@@ -148,6 +153,11 @@ void geometryResolverOutputMiss<
     PrimaryDisocclusionThresholdMix[pixelCoordinate] = 0;
     PrimaryDepth[pixelCoordinate] = cb.clearColorDepth;
 
+    if (cb.enableDlssNrControlMask)
+    {
+      geometryResolverStoreDlssNrControlMask(pixelCoordinate, 1.0f.rrrr);
+    }
+
     // RR requires zeroed out input guide buffers for misses
     if (GBUFFER_FEATURE_DLSSRR && cb.enableDLSSRR)
     {
@@ -156,7 +166,8 @@ void geometryResolverOutputMiss<
 
     // Note: Always write to stochastic buffers in the primary surface case.
     writeMissToGBuffer(
-      pixelCoordinate, true, true, cb.primaryDirectNrd.missLinearViewZ,
+      pixelCoordinate, true,
+      cb.writePrimaryDenoisingNormal, cb.writePrimaryVirtualMotionVector, cb.primaryDirectNrd.missLinearViewZ,
       PrimaryConeRadius, PrimaryLinearViewZ,
       PrimaryVirtualMotionVector,
       PrimaryVirtualWorldShadingNormalPerceptualRoughness,
@@ -176,7 +187,8 @@ void geometryResolverOutputMiss<
 
     // Note: Only write to stochastic buffers if this is the selected surface in the secondary surface case.
     writeMissToGBuffer(
-      pixelCoordinate, SELECTED_INTEGRATION_SURFACE, !cb.enableDLSSRR, cb.secondaryCombinedNrd.missLinearViewZ,
+      pixelCoordinate, SELECTED_INTEGRATION_SURFACE,
+      cb.writeSecondaryDenoisingGuides, cb.writeSecondaryDenoisingGuides, cb.secondaryCombinedNrd.missLinearViewZ,
       SecondaryConeRadius, SecondaryLinearViewZ,
       SecondaryVirtualMotionVector,
       SecondaryVirtualWorldShadingNormalPerceptualRoughness,
@@ -216,6 +228,23 @@ void geometryResolverOutputMissDynamic(
   }
 }
 
+void geometryResolverWriteDlssNrControlMask(
+  uvec2 pixelCoordinate,
+  PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction)
+{
+  vec4 dlssControlMask = 1.0f.rrrr;
+
+  if (polymorphicSurfaceMaterialInteractionGetTypeHelper(polymorphicSurfaceMaterialInteraction) == surfaceMaterialTypeOpaque)
+  {
+    const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
+      opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction);
+
+    dlssControlMask = unorm4x8ToFloat4x32(opaqueSurfaceMaterialInteraction.dlssControlMask);
+  }
+
+  geometryResolverStoreDlssNrControlMask(pixelCoordinate, dlssControlMask);
+}
+
 void geometryResolverOutputSurface<
   let PRIMARY_SURFACE : bool,
   let SELECTED_INTEGRATION_SURFACE : bool>(
@@ -250,6 +279,7 @@ void geometryResolverOutputSurface<
   // Note: Using virtual hit distance accumulated through PSR and Ray Portals used to calculate a virtual hit position
   const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, virtualHitDistance);
   const float linearViewZ = cameraWorldPosToLinearViewZ(cb.camera, virtualHitPosition);
+  float primaryDepth = 0.0f;
 
   if (PRIMARY_SURFACE)
   {
@@ -257,9 +287,9 @@ void geometryResolverOutputSurface<
     // Note: This division will result in -infinity when the hit point is equal to the camera's position (z is negative assuming a non-zero near plane and w = 0).
     // This is "fine" though as in theory things should be able to handle this value properly (as it's not a NaN, though it could be if the near plane was 0). If
     // this causes problems in the future though, simply clamp this to some very negative value (e.g. negative float 16 or 32 max).
-    const float depth = projectionSpacePosition.z / projectionSpacePosition.w;
+    primaryDepth = projectionSpacePosition.z / projectionSpacePosition.w;
 
-    imageStore(PrimaryDepth, pixelCoordinate, depth);
+    imageStore(PrimaryDepth, pixelCoordinate, primaryDepth);
     imageStore(PrimaryLinearViewZ, pixelCoordinate, linearViewZ);
     imageStore(PrimaryHitDistance, pixelCoordinate, virtualHitDistance);
 
@@ -300,28 +330,23 @@ void geometryResolverOutputSurface<
   
   if (PRIMARY_SURFACE)
   {
-    imageStore(PrimaryVirtualMotionVector, ivec2(pixelCoordinate), vec4(virtualMotion, 0));
-
-    const vec4 prevWorldPosition = vec4(virtualHitPosition + virtualMotion, 1);
-    const vec4 prevClip = mul(cb.camera.prevWorldToProjection, prevWorldPosition);
-    vec2 prevNDC;
-
-    if (prevClip.w == 0.0f) {
-      // Note: This is a bit of an odd case, when w = 0 the point is the same as the camera's position, and this is represented by a Z value of
-      // -infinity (as Z values are negative when behind the near plane at Z = 0 before wrapping to positive infinity for all w values less than 0).
-      // Since Z is not needed in this NDC value currently though we can just set the X/Y to be 0. This doesn't make a ton of sense as really the
-      // camera's central point should only be a single pixel on the screen rather than stretched across the whole thing, but floating point quantization
-      // will essentially cause much of the screen intersecting with geometry to map to a single point anyways, so this is probably fine.
-      prevNDC = vec2(0.0f, 0.0f);
-    } else {
-      // Note: Typical perspective divide.
-      prevNDC = prevClip.xy / prevClip.w;
+    if (cb.writePrimaryVirtualMotionVector)
+    {
+      imageStore(PrimaryVirtualMotionVector, ivec2(pixelCoordinate), vec4(virtualMotion, 0));
     }
 
+    const vec2 prevNDC = cameraWorldPosToPrevNDC(cb.camera, virtualHitPosition + virtualMotion);
+
     const vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
-    const vec2 motionVectorNDC = prevNDC - ndc;
-    const vec2 motionVectorUVOffset = motionVectorNDC * vec2(0.5, -0.5);
-    const vec2 motionVectorPixel = motionVectorUVOffset * cb.camera.resolution;
+    vec2 motionVectorPixel = cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC);
+
+    // When forcing static-scene motion vectors, reproject the precise current NDC + depth into the
+    // previous frame (camera motion accounted for) instead of reprojecting the imprecise absolute
+    // world position (see cameraCalcStaticSceneMotionVectorPixel).
+    if (cb.forceStaticSceneMotionVectors)
+    {
+      motionVectorPixel = cameraCalcStaticSceneMotionVectorPixel(cb.camera, ndc, primaryDepth);
+    }
 
     // Write out screen-space motion.
     PrimaryScreenSpaceMotionVector[pixelCoordinate] = motionVectorPixel;
@@ -339,7 +364,7 @@ void geometryResolverOutputSurface<
     motionBlurSurfaceFlags.isMaskOut = surface.isMotionBlurMaskOut;
     motionBlurSurfaceFlagsWriteToGBuffer(motionBlurSurfaceFlags, ivec2(pixelCoordinate), PrimarySurfaceFlags);
   }
-  else
+  else if (cb.writeSecondaryDenoisingGuides)
   {
     imageStore(SecondaryVirtualMotionVector, ivec2(pixelCoordinate), vec4(virtualMotion, 0));
   }
@@ -397,9 +422,14 @@ void geometryResolverOutputSurface<
 
   if (PRIMARY_SURFACE)
   {
+    if (cb.enableDlssNrControlMask)
+    {
+      geometryResolverWriteDlssNrControlMask(pixelCoordinate, polymorphicSurfaceMaterialInteraction);
+    }
+
     // Note: Always write to stochastic buffers in the primary surface case.
     polymorphicSurfaceMaterialInteractionWriteToGBuffer(
-      polymorphicSurfaceMaterialInteraction, ivec2(pixelCoordinate), true, true,
+      polymorphicSurfaceMaterialInteraction, ivec2(pixelCoordinate), true, cb.writePrimaryDenoisingNormal,
       surface, surfaceInteraction, rayInteraction.surfaceIndex,
       directionAltered, accumulatedRotation,
       PrimaryWorldShadingNormal, PrimaryPerceptualRoughness,
@@ -411,7 +441,7 @@ void geometryResolverOutputSurface<
   {
     // Note: Only write to stochastic buffers if this is the selected surface in the secondary surface case.
     polymorphicSurfaceMaterialInteractionWriteToGBuffer(
-      polymorphicSurfaceMaterialInteraction, ivec2(pixelCoordinate), SELECTED_INTEGRATION_SURFACE, !cb.enableDLSSRR,
+      polymorphicSurfaceMaterialInteraction, ivec2(pixelCoordinate), SELECTED_INTEGRATION_SURFACE, cb.writeSecondaryDenoisingGuides,
       surface, surfaceInteraction, rayInteraction.surfaceIndex,
       directionAltered, accumulatedRotation,
       SecondaryWorldShadingNormal, SecondaryPerceptualRoughness,
@@ -507,14 +537,15 @@ void geometryResolverDLSSRROutputSurface(
   // Note: Virtual motion used to account for the ray traversing ray portals and through PSR interactions.
   const vec3 virtualMotion = quaternionTransformVector(accumulatedRotation, surfaceInteraction.motion, true);
   
-  vec4 prevWorldPosition = vec4(virtualHitPosition + virtualMotion, 1);
-  vec4 prevNDC = mul(cb.camera.prevWorldToProjection, prevWorldPosition);
-  prevNDC /= prevNDC.w;
+  const vec2 prevNDC = cameraWorldPosToPrevNDC(cb.camera, virtualHitPosition + virtualMotion);
 
   vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
-  vec2 motionVectorNDC = prevNDC.xy - ndc.xy;
-  vec2 motionVectorUVOffset = motionVectorNDC * vec2(0.5, -0.5);
-  vec2 motionVectorPixel = motionVectorUVOffset * cb.camera.resolution;
+  vec2 motionVectorPixel = cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC);
+
+  if (cb.forceStaticSceneMotionVectors)
+  {
+    motionVectorPixel = cameraCalcStaticSceneMotionVectorPixel(cb.camera, ndc, depth);
+  }
 
   // Write out screen-space motion.
   PrimaryScreenSpaceMotionVectorDLSSRR[pixelCoordinate] = motionVectorPixel;
@@ -1592,8 +1623,12 @@ void updateNrcOnGBufferMiss(
     Nrc::updateNrcOnPrimaryMiss(queryPixelCoordinate);
   }
 
+  g_nrcMode = NrcMode::Disabled;
+
   // Update NRC Training Path
-  if (cb.allowNrcTraining)
+  // Note: skipped entirely when the setup is deferred - Integrate Direct registers the miss from the same
+  // GBuffer miss flag it already reads.
+  if (cb.allowNrcTraining && !shouldDeferNrcTrainingSetup(cb.sparseRenderingArgs))
   {
     uvec2 trainingPixelCoordinateInTrainingSpace;
     const bool hasTrainingPath = Nrc::calculateIfPixelHasActiveNrcTrainingPath(
@@ -1602,13 +1637,9 @@ void updateNrcOnGBufferMiss(
     // Training paths are more sparse than Query paths, so filter the updates to pixels that have a training path
     if (hasTrainingPath)
     {
-      g_nrcMode = NrcMode::Update;
-
-      Nrc::updateNrcOnPrimaryMiss(trainingPixelCoordinateInTrainingSpace);
+      Nrc::registerNrcTrainingPathPrimaryMiss(trainingPixelCoordinateInTrainingSpace);
     }
   }
-
-  g_nrcMode = NrcMode::Disabled;
 #endif
 }
 
@@ -1634,46 +1665,50 @@ void updateNrcOnGBufferHitTrainingAndQueryPaths(
     const float rand01 = getNextSampleBlueNoise(randomState);
 
     Nrc::updateNrcOnPrimaryHit(queryPixelCoordinate,
-      surfaceInteraction, polymorphicSurfaceMaterialInteraction, -rayDirection,
+      surfaceInteraction.position, polymorphicSurfaceMaterialInteraction, -rayDirection,
       primaryPathHitDistance, rand01, NrcQueryPathData0, NrcQueryPathData1);
   }
 
+  g_nrcMode = NrcMode::Disabled;
+
   // Update NRC Training Path
+  // Note: the radiance is what Integrate Indirect attaches to vertex 0 once the path continues; the coordinate
+  // it lives at follows nrcTrainingSurfaceRadianceCoordinate, which is where Integrate Indirect reads it back.
   if (cb.allowNrcTraining)
   {
-    uvec2 trainingPixelCoordinateInTrainingSpace;
-    const bool hasTrainingPath = Nrc::calculateIfPixelHasActiveNrcTrainingPath(
-      queryPixelCoordinate, cb.nrcArgs, trainingPixelCoordinateInTrainingSpace);
-
-    // Training paths are more sparse than Query paths, so filter the updates to pixels that have a training path
-    if (hasTrainingPath)
+    if (shouldDeferNrcTrainingSetup(cb.sparseRenderingArgs))
     {
-      g_nrcMode = NrcMode::Update;
-
-      // Create a custom random state using training pixel coordinate for Update path
-      // since their query pixel coordinates counter parts are more spare
-      // making the random samples worse distributed
-      RNG randomStateNrcUpdate = createRNG(trainingPixelCoordinateInTrainingSpace, cb.frameIdx);
-      const float rand01 = getNextSampleBlueNoise(randomStateNrcUpdate);
-
-      Nrc::updateNrcOnPrimaryHit(trainingPixelCoordinateInTrainingSpace,
-        surfaceInteraction, polymorphicSurfaceMaterialInteraction, -rayDirection,
-        // Note: NrcQueryPathData0 is unused for Update path
-        primaryPathHitDistance, rand01, NrcQueryPathData0, NrcTrainingPathData1);
-
-      // Store radiance accumulated on the surface during GBuffer pass, this will be added to accumulated radiance
-      // between vertex 0 and vertex 1 for training paths in the indirect integrate pass
-      NrcTrainingGBufferSurfaceRadianceRG[trainingPixelCoordinateInTrainingSpace] = gbufferSurfaceRadiance.rg;
-      NrcTrainingGBufferSurfaceRadianceB[trainingPixelCoordinateInTrainingSpace] = gbufferSurfaceRadiance.b;
+      // The cell winner is not resolved yet, so every pixel parks its radiance and Integrate Direct registers
+      // vertex 0 for whichever one won - including the debug view, since only it knows the winner.
+      NrcTrainingGBufferSurfaceRadianceRG[pixelCoordinate] = gbufferSurfaceRadiance.rg;
+      NrcTrainingGBufferSurfaceRadianceB[pixelCoordinate] = gbufferSurfaceRadiance.b;
     }
-
-    if (cb.debugView == DEBUG_VIEW_NRC_UPDATE_PIXEL)
+    else
     {
-      storeInDebugView(queryPixelCoordinate, hasTrainingPath);
+      uvec2 trainingPixelCoordinateInTrainingSpace;
+      const bool hasTrainingPath = Nrc::calculateIfPixelHasActiveNrcTrainingPath(
+        queryPixelCoordinate, cb.nrcArgs, trainingPixelCoordinateInTrainingSpace);
+
+      // Training paths are more sparse than Query paths, so filter the updates to pixels that have a training path
+      if (hasTrainingPath)
+      {
+        Nrc::registerNrcTrainingPathPrimaryHit(
+          trainingPixelCoordinateInTrainingSpace,
+          surfaceInteraction.position, polymorphicSurfaceMaterialInteraction, -rayDirection,
+          primaryPathHitDistance, NrcQueryPathData0, NrcTrainingPathData1);
+
+        // Store radiance accumulated on the surface during GBuffer pass, this will be added to accumulated radiance
+        // between vertex 0 and vertex 1 for training paths in the indirect integrate pass
+        NrcTrainingGBufferSurfaceRadianceRG[trainingPixelCoordinateInTrainingSpace] = gbufferSurfaceRadiance.rg;
+        NrcTrainingGBufferSurfaceRadianceB[trainingPixelCoordinateInTrainingSpace] = gbufferSurfaceRadiance.b;
+      }
+
+      if (cb.debugView == DEBUG_VIEW_NRC_UPDATE_PIXEL)
+      {
+        storeInDebugView(queryPixelCoordinate, hasTrainingPath);
+      }
     }
   }
-
-  g_nrcMode = NrcMode::Disabled;
 #else
   unused(randomState);
 #endif
@@ -2151,7 +2186,8 @@ void geometryResolverVertex(
 
       vec4 vectorTransform = quaternionMultiply(geometryResolverState.accumulatedRotation, surfaceMaterialInteractionReflectionPSRSample.vectorTransform, true);
       
-      const GbufferPSRData psrData = packPSRData(sampledRay, SURFACE_INDEX_INVALID,
+      // Reflections retain the camera medium; unpackPSRData also derives insideMedium from this index.
+      const GbufferPSRData psrData = packPSRData(sampledRay, cb.startInMediumMaterialIndex,
         geometryResolverState.attenuation * surfaceMaterialInteractionReflectionPSRSample.attenuation,
         vectorTransform,
         packedGeometryFlags);
@@ -2775,14 +2811,15 @@ void geometryPSRResolverVertex(
       // Note: Virtual motion used to account for the ray traversing ray portals and through PSR interactions.
       vec3 virtualMotion = quaternionTransformVector(geometryPSRResolverState.accumulatedRotation, surfaceInteraction.motion, true);
       
-      vec4 prevWorldPosition = vec4(virtualHitPosition + virtualMotion, 1);
-      vec4 prevNDC = mul(cb.camera.prevWorldToProjection, prevWorldPosition);
-      prevNDC /= prevNDC.w;
+      const vec2 prevNDC = cameraWorldPosToPrevNDC(cb.camera, virtualHitPosition + virtualMotion);
 
       vec2 ndc = cameraPixelCoordinateToNDC(cb.camera, pixelCoordinate);
-      vec2 motionVectorNDC = prevNDC.xy - ndc.xy;
-      vec2 motionVectorUVOffset = motionVectorNDC * vec2(0.5, -0.5);
-      vec2 motionVectorPixel = motionVectorUVOffset * cb.camera.resolution;
+      vec2 motionVectorPixel = cameraCalcMotionVectorPixel(cb.camera, ndc, prevNDC);
+
+      if (cb.forceStaticSceneMotionVectors)
+      {
+        motionVectorPixel = cameraCalcStaticSceneMotionVectorPixel(cb.camera, ndc, depth);
+      }
 
       // Write out screen-space motion.
       PrimaryScreenSpaceMotionVectorDLSSRR[pixelCoordinate] = motionVectorPixel;
@@ -3041,8 +3078,11 @@ void geometryResolverWritePrimaryMaterialInteraction(ivec2 pixelCoordinate, Poly
   PrimaryVirtualWorldShadingNormalPerceptualRoughness[pixelCoordinate] = vec4(
     virtualShadingNormal * 0.5f + 0.5f,
     materialMemory.perceptualRoughness);
-  PrimaryVirtualWorldShadingNormalPerceptualRoughnessDenoising[pixelCoordinate] =
-    NRD_FrontEnd_PackNormalAndRoughness(virtualShadingNormal, materialMemory.perceptualRoughness, MATERIAL_ID_DEFAULT);
+  if (cb.writePrimaryDenoisingNormal)
+  {
+    PrimaryVirtualWorldShadingNormalPerceptualRoughnessDenoising[pixelCoordinate] =
+      NRD_FrontEnd_PackNormalAndRoughness(virtualShadingNormal, materialMemory.perceptualRoughness, MATERIAL_ID_DEFAULT);
+  }
 
   if (GBUFFER_FEATURE_DLSSRR && cb.enableDLSSRR)
   {
@@ -3477,8 +3517,9 @@ void geometryPSRPreparePass(ivec2 pixelCoordinate) {
       reflectionPSRSample.inputDirection, false);
     const vec4 vectorTransform =
       quaternionMultiply(accumulatedRotation, reflectionPSRSample.vectorTransform, true);
+    // Reflections retain the camera medium; unpackPSRData also derives insideMedium from this index.
     const GbufferPSRData psrData = packPSRData(
-      sampledRay, SURFACE_INDEX_INVALID,
+      sampledRay, cb.startInMediumMaterialIndex,
       attenuation * reflectionPSRSample.attenuation,
       vectorTransform,
       packedGeometryFlags);

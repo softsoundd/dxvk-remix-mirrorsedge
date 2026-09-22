@@ -50,6 +50,7 @@
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_terrain_baker.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
+#include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
@@ -69,6 +70,7 @@
 #include "dxvk_imgui_splash.h"
 #include "dxvk_imgui_capture.h"
 #include "rtx_render/rtx_option_layer_gui.h"
+#include "rtx_render/rtx_mod_usd.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
 #include "../../d3d9/d3d9_rtx.h"
@@ -450,6 +452,7 @@ namespace dxvk {
       { RtxFramePassStage::Composition, "Composition" },
       { RtxFramePassStage::DLSS, "DLSS" },
       { RtxFramePassStage::DLSSRR, "DLSSRR" },
+      { RtxFramePassStage::DLSSNR, "DLSSNR" },
       { RtxFramePassStage::NIS, "NIS" },
       { RtxFramePassStage::XeSS, "XeSS" },
       { RtxFramePassStage::TAA, "TAA" },
@@ -1016,13 +1019,13 @@ namespace dxvk {
     };
 
     auto common = ctx->getCommonObjects();
-    static RtxQuickAction sQuickAction = common->getSceneManager().areAllReplacementsLoaded() ? RtxQuickAction::kRtxOnEnhanced : RtxQuickAction::kRtxOn;
+    static RtxQuickAction sQuickAction = common->getSceneManager().hasAnyMods() ? RtxQuickAction::kRtxOnEnhanced : RtxQuickAction::kRtxOn;
 
     if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_KeypadAdd))) {
       sQuickAction = (RtxQuickAction) ((sQuickAction + 1) % RtxQuickAction::kCount);
 
-      // Skip over the enhancements quick option if no replacements are loaded
-      if(!common->getSceneManager().areAllReplacementsLoaded() && sQuickAction == RtxQuickAction::kRtxOnEnhanced)
+      // Skip "RTX On Enhanced" if no mods are present — the mode would be identical to plain RTX On
+      if(!common->getSceneManager().hasAnyMods() && sQuickAction == RtxQuickAction::kRtxOnEnhanced)
         sQuickAction = (RtxQuickAction) ((sQuickAction + 1) % RtxQuickAction::kCount);
 
       switch (sQuickAction) {
@@ -1497,6 +1500,37 @@ namespace dxvk {
     RemixGui::Checkbox("Include G-Buffer", &RtxOptions::captureDebugImageObject());
 
     RemixGui::Separator();
+
+    if (RemixGui::CollapsingHeader("Nsight Graphics Capture", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+
+#if DXVK_ENABLE_NSIGHT_GRAPHICS_CAPTURE
+      RemixGui::Checkbox("Enable Nsight Graphics Capture On Launch", &NsightGraphicsCapture::graphicsCaptureEnabledObject());
+      RemixGui::InputText("Nsight Graphics Install Path", &NsightGraphicsCapture::graphicsCaptureInstallPathObject());
+      RemixGui::InputText("Capture Output Directory", &NsightGraphicsCapture::graphicsCaptureOutputDirObject());
+      RemixGui::InputText("Capture Output File", &NsightGraphicsCapture::graphicsCaptureOutputFileObject());
+
+      RemixGui::DragInt("Capture Frames", &NsightGraphicsCapture::graphicsCaptureFramesToCaptureObject(), 1.0f,
+                        NsightGraphicsCapture::kMinFramesToCapture, NsightGraphicsCapture::kMaxFramesToCapture, "%d",
+                        ImGuiSliderFlags_AlwaysClamp);
+      RemixGui::Checkbox("Show Nsight HUD", &NsightGraphicsCapture::graphicsCaptureShowHudObject());
+
+      ImGui::TextWrapped("Status: %s", NsightGraphicsCapture::statusText().c_str());
+      ImGui::TextWrapped("Last Result: %s", NsightGraphicsCapture::lastResultText().c_str());
+
+      ImGui::BeginDisabled(!NsightGraphicsCapture::isAvailable());
+      if (ImGui::Button("Trigger Nsight Graphics Capture")) {
+        NsightGraphicsCapture::requestGraphicsCapture(NsightGraphicsCapture::graphicsCaptureFramesToCapture());
+      }
+      ImGui::EndDisabled();
+#else
+      ImGui::TextWrapped("Nsight Graphics capture is supported only by x64 builds. See the build instructions in README.md.");
+#endif
+
+      ImGui::Unindent();
+    }
+
+    RemixGui::Separator();
         
 #ifdef REMIX_DEVELOPMENT
     { // Recompile Shaders button and its status information (Only available for Development Remix builds)
@@ -1716,6 +1750,7 @@ namespace dxvk {
       RemixGui::Checkbox("Break into Debugger On Press of Key 'B'", &RtxOptions::enableBreakIntoDebuggerOnPressingBObject());
       RemixGui::Checkbox("Block Input to Game in UI", &RtxOptions::blockInputToGameInUIObject());
       RemixGui::Checkbox("Force Camera Jitter", &RtxOptions::forceCameraJitterObject());
+      RemixGui::Checkbox("Force Static Scene Motion Vectors", &RtxOptions::forceStaticSceneMotionVectorsObject());
       RemixGui::DragInt("Camera Jitter Sequence Length", &RtxOptions::cameraJitterSequenceLengthObject());
       
       RemixGui::DragIntRange2("Draw Call Range Filter", &RtxOptions::drawCallRangeObject(), 1.f, 0, INT32_MAX, nullptr, nullptr, ImGuiSliderFlags_AlwaysClamp);
@@ -2711,11 +2746,27 @@ namespace dxvk {
   }
   
   void ImGUI::showEnhancementsTab(const Rc<DxvkContext>& ctx) {
-    if (!ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded()) {
-      ImGui::Text("No USD enhancements detected, the following options have been disabled.  See documentation for how to use enhancements with Remix.");
+    auto& replacer = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
+    const auto states = replacer->getReplacementStates();
+    if (states.empty()) {
+      ImGui::Text("No USD enhancement mods detected. See documentation for how to use enhancements with Remix.");
+    } else {
+      const bool anyLoading = std::any_of(states.begin(), states.end(),
+          [](const Mod::State& s) { return s.progressState != Mod::ProgressState::Unloaded
+                                        && s.progressState != Mod::ProgressState::Loaded; });
+      if (anyLoading) {
+        ImGui::Text("Enhancement assets are loading...");
+      } else {
+        ImGui::Text("Mods Discovered: %zu", states.size());
+      }
     }
 
-    ImGui::BeginDisabled(!ctx->getCommonObjects()->getSceneManager().areAllReplacementsLoaded());
+    ImGui::BeginDisabled(replacer->isReloadPending());
+    if (ImGui::Button("Reload Enhancements")) {
+      replacer->requestReload();
+    }
+    ImGui::EndDisabled();
+
     RemixGui::Checkbox("Enable Enhanced Assets", &RtxOptions::enableReplacementAssetsObject());
     {
       ImGui::Indent();
@@ -2728,7 +2779,12 @@ namespace dxvk {
       ImGui::EndDisabled();
       ImGui::Unindent();
     }
+
+    RemixGui::Checkbox("Reload Enhancements on mod.usda change", &UsdMod::reloadOnChangedObject());
+    ImGui::BeginDisabled(!UsdMod::reloadOnChanged());
+    RemixGui::Checkbox("  Reload on any usd file change", &UsdMod::watchDependenciesObject());
     ImGui::EndDisabled();
+
     RemixGui::Separator();
     RemixGui::Checkbox("Highlight Legacy Materials (flash red)", &RtxOptions::useHighlightLegacyModeObject());
 
@@ -3808,6 +3864,19 @@ namespace dxvk {
       RemixGui::Separator();
 
       RemixGui::Checkbox("Allow Full Screen Exclusive?", &RtxOptions::allowFSEObject());
+
+      auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
+      if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
+        RemixGui::Separator();
+
+        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::PushID("DLSS 3D-Guided Neural Generation");
+          dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
+          ImGui::PopID();
+          ImGui::Unindent();
+        }
+      }
 
       ImGui::Unindent();
     }

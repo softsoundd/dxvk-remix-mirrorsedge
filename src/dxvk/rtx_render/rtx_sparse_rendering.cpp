@@ -23,6 +23,8 @@
 
 #include "dxvk_device.h"
 #include "rtx_context.h"
+#include "rtx_scene_manager.h"
+#include "rtx_light_manager.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_options.h"
@@ -75,6 +77,11 @@ namespace dxvk {
 
         // Inputs
         TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_SHARED_FLAGS_INPUT)
+        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PRIMARY_CONE_RADIUS_INPUT)
+        TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT)
+
+        // Input-Outputs
+        RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT)
 
         // Outputs
         RW_TEXTURE2D(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT)
@@ -231,6 +238,17 @@ namespace dxvk {
     return true;
   }
 
+  bool SparseRendering::resamplesNrcTrainingPaths(const bool nrcIsActive) const {
+    // Deliberately not gated on NrcOptions::trainCache(): update rows are dispatched regardless of it, and they
+    // rely on this staying true to resolve their GBuffer pixel through the query-pixel map.
+    return nrcIsActive && isActive();
+  }
+
+  // Resampling needs the per-pixel sampling rate, which only exists after the GBuffer pass has run.
+  bool SparseRendering::shouldDeferNrcTrainingSetup(const SparseRenderingArgs& args) {
+    return args.resampledNrcTrainingPaths;
+  }
+
   void SparseRendering::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
     if (!isEnabledByOptions()) {
       return;
@@ -262,6 +280,17 @@ namespace dxvk {
 
     // Inputs
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT, rtOutput.m_secondaryConeRadius.view(Resources::AccessType::Read), nullptr);
+
+    // Input-Outputs
+    // NRC training query-pixel reservoir, accumulated over active pixels. Only allocated while training-path
+    // resampling is on, which is also the only case the shader touches it.
+    Rc<DxvkImageView> trainingQueryReservoirView = nullptr;
+    if (rtOutput.m_raytraceArgs.sparseRenderingArgs.resampledNrcTrainingPaths) {
+      trainingQueryReservoirView = ctx.getCommonObjects()->metaNeuralRadianceCache().getTrainingQueryReservoir().view;
+    }
+    ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT, trainingQueryReservoirView, nullptr);
 
     // Outputs
     ctx.bindResourceView(ACTIVE_PIXEL_MASK_BINDING_PIXEL_SAMPLING_RATE_OUTPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
@@ -319,9 +348,10 @@ namespace dxvk {
     args.enableSparseVolumetricsPrimaryHit = Options::enableSparseVolumetricsPrimaryHit();
     args.enableSparseVolumetricsPrimaryMiss = Options::enableSparseVolumetricsPrimaryMiss();
     args.enableSparsePrimarySpecularAlbedo = Options::enableSparsePrimarySpecularAlbedo();
+    args.enableLightIdentityResolution = ctx.getSceneManager().getLightManager().isLightIdentityTableBuilt() ? 1u : 0u;
 
     NeuralRadianceCache& nrc = ctx.getCommonObjects()->metaNeuralRadianceCache();
-    args.forceNrcTrainingPixelsActive = nrc.isActive() && Options::forceNrcTrainingPixelsActive();
+    args.resampledNrcTrainingPaths = resamplesNrcTrainingPaths(nrc.isActive());
 
     args.pixelSamplingRate = Options::samplingRate();
 
@@ -350,7 +380,6 @@ namespace dxvk {
       ImGui::BeginDisabled(true);
       RemixGui::Checkbox("Sparse Secondary Surface Lighting", &Options::enableSparseSecondaryLightingObject());
       ImGui::EndDisabled();
-      RemixGui::Checkbox("Force NRC Training Pixels Active", &Options::forceNrcTrainingPixelsActiveObject());
       RemixGui::Checkbox("Sparse Volumetrics (Primary Hit)", &Options::enableSparseVolumetricsPrimaryHitObject());
       RemixGui::Checkbox("Sparse Volumetrics (Primary Miss)", &Options::enableSparseVolumetricsPrimaryMissObject());
       RemixGui::Checkbox("Sparse Primary Specular Albedo", &Options::enableSparsePrimarySpecularAlbedoObject());

@@ -25,6 +25,14 @@
 //!variant integrate_direct_rayquery_raygen.rgen
 //!>       RAY_PIPELINE
 
+// Note: these carry the deferred NRC training-path setup. It is a variant rather than a runtime branch so the
+// variants above, selected whenever the setup stays in the GBuffer, compile without any of the NRC code.
+//!variant integrate_direct_nrc_rayquery.comp
+//!>       ENABLE_NRC=1
+
+//!variant integrate_direct_nrc_rayquery_raygen.rgen
+//!>       RAY_PIPELINE ENABLE_NRC=1
+
 //!end-variants
 
 #define USE_32BIT_RAY_DIRECTION 1
@@ -41,6 +49,7 @@
 #include "rtx/pass/integrate/integrate_direct_bindings.slangh"
 // Note: Needed for declaration of integration ray payload structure
 #include "rtx/algorithm/integrator.slangh"
+#include "rtx/pass/nrc/nrc_integrator_utilities.slangh"
 
 #include "rtx/pass/integrate/integrate_direct.slangh"
 
@@ -53,8 +62,8 @@ void main()
 #else
 [shader("compute")]
 [numthreads(INTEGRATE_DIRECT_THREADS_DISPATCH_WIDTH, INTEGRATE_DIRECT_THREADS_DISPATCH_HEIGHT, 1)]
-void main(uint2 ipos : SV_DispatchThreadID)
+void main(uint2 dispatchThreadId : SV_DispatchThreadID)
 {
-  integrate_direct_pass(ipos);
+  integrate_direct_pass(dispatchThreadId);
 }
 #endif

@@ -554,6 +554,7 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe2(device, DenoiserType::Reference),
     m_dlss(device),
     m_rayReconstruction(device),
+    m_dlssNeuralRendering(device),
     m_nis(device),
     m_taa(device),
     m_xess(device),
@@ -590,8 +591,13 @@ namespace dxvk {
     m_referenceDenoiserSecondLobe1.get().onDestroy();
     m_referenceDenoiserSecondLobe2.get().onDestroy();
     m_rayReconstruction.get().onDestroy();
+    m_dlssNeuralRendering.get().onDestroy();
     m_dlss.get().onDestroy();
     m_dlfg.get().onDestroy();
     m_ngxPassthrough.get().onDestroy();
+    // NV-DXVK start: Shut down NGX after releasing its features
+    m_device->waitForIdle();
+    m_ngxContext.get().shutdown();
+    // NV-DXVK end
   }
 }

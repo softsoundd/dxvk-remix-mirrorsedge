@@ -1067,7 +1067,8 @@ namespace dxvk {
 
     ctx->pushConstants(0, sizeof(args), &args);
 
-    const Resources::Resource* lastOutput = &rtOutput.m_postFxIntermediateTexture;
+    const Resources::Resource* lastOutput =
+      &rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
 
     ctx->bindResourceView(POST_FX_HIGHLIGHT_INPUT, inOutColorTexture.view, nullptr);
     ctx->bindResourceView(POST_FX_HIGHLIGHT_OBJECT_PICKING_INPUT, rtOutput.m_primaryObjectPicking.view, nullptr);
@@ -1084,7 +1085,7 @@ namespace dxvk {
         inOutColorTexture.image,
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
-        rtOutput.m_postFxIntermediateTexture.image,
+        rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
         { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         { 0, 0, 0 },
         inputSize);
