@@ -28,6 +28,7 @@ parser.add_argument('-slangc', required=True, type=str, dest='slangc')
 parser.add_argument('-spirvval', required=True, type=str, dest='spirvval')
 parser.add_argument('-input', required=False, type=str, dest='input', default='.')
 parser.add_argument('-I', '-include', action='append', type=str, dest='includes', default=[])
+parser.add_argument('-exclude', action='append', type=str, dest='excludes', default=[])
 parser.add_argument('-output', required=True, type=str, dest='output')
 parser.add_argument('-force', action='store_true', dest='force')
 parser.add_argument('-parallel', action='store_true', dest='parallel')
@@ -604,6 +605,10 @@ def parseShaderVariants(inputFile):
 tasks = []
 
 for root, dirs, files in os.walk(args.input):
+    rel = os.path.normpath(os.path.relpath(root, args.input))
+    if any(rel == os.path.normpath(ex) or rel.startswith(os.path.normpath(ex) + os.sep) for ex in args.excludes):
+        dirs[:] = []
+        continue
     for name in files:
         task = None
         inputFile = os.path.join(root, name)

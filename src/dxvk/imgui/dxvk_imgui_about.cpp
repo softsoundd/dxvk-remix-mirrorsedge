@@ -212,71 +212,12 @@ namespace dxvk {
   }
 
   void ImGuiAbout::Secrets::update(const Rc<DxvkContext>& ctx) {
-    auto& iAssetReplacer =
-      ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
-    if (iAssetReplacer->hasNewSecretReplacementInfo()) {
-      const auto& secretReplacements = iAssetReplacer->getSecretReplacementInfo();
-      m_organizedSecrets.clear();
-      m_codeHashesToSecretPtrs.clear();
-      m_assetHashesToSecretPtrs.clear();
-      m_visibleHeaders.clear();
-      m_validCodeHashesEntered.clear();
-      for(auto [hash, secretReplacements] : secretReplacements) {
-        for(auto& secretReplacement : secretReplacements) {
-          const bool bUnlocked = 
-            (m_validCodeHashesEntered.count(secretReplacement.unlockHash) > 0) ||
-            (secretReplacement.unlockHash == 0x0);
-          m_organizedSecrets[secretReplacement.header].push_back(Secret{
-            secretReplacement, false, bUnlocked });
-        }
-      }
-      for (auto& [header, secrets] : m_organizedSecrets) {
-        m_visibleHeaders[header] = false;
-        for (auto& secret : secrets) {
-          if (secret.bUnlocked || secret.replacement.bDisplayBeforeUnlocked) {
-            m_visibleHeaders[header] = true;
-          }
-          m_codeHashesToSecretPtrs[secret.replacement.unlockHash].push_back(&secret);
-          m_assetHashesToSecretPtrs[secret.replacement.assetHash].push_back(&secret);
-        }
-      }
-    }
-    for(const auto validCodeHash : m_validCodeHashesEntered) {
-      for(const auto* pSecret : m_codeHashesToSecretPtrs[validCodeHash]) {
-      }
-    }
+    (void)ctx;
   }
 
   void ImGuiAbout::Secrets::show(const Rc<DxvkContext>& ctx) {
-    auto& iAssetReplacer =
-      ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
+    (void)ctx;
     showCodeHashEntry();
-    for (auto& [header, secrets] : m_organizedSecrets) {
-      if (m_visibleHeaders[header]) {
-        ImGui::Indent();
-        if (RemixGui::CollapsingHeader(header.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
-          for (auto& secret : secrets) {
-            if (secret.bUnlocked) {
-              if(RemixGui::Checkbox(secret.replacement.name.c_str(), &secret.bEnabled)) {
-                if(secret.bEnabled && secret.replacement.bExclusiveReplacement) {
-                  for(auto* const pOtherSecret : m_assetHashesToSecretPtrs[secret.replacement.assetHash]) {
-                    pOtherSecret->bEnabled = (&secret == pOtherSecret);
-                  }
-                }
-                iAssetReplacer->markVariantStatus(secret.replacement.assetHash,
-                                                  secret.replacement.variantId,
-                                                  secret.bEnabled);
-              }
-            } else if (secret.replacement.bDisplayBeforeUnlocked) {
-              ImGui::Indent();
-              ImGui::TextUnformatted(secret.replacement.name.c_str());
-              ImGui::Unindent();
-            }
-          }
-        }
-        ImGui::Unindent();
-      }
-    }
   }
 
   void ImGuiAbout::Secrets::showCodeHashEntry() {

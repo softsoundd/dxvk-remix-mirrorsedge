@@ -311,159 +311,21 @@ namespace dxvk {
   }
 
   void GameCapturer::captureLights() {
-    auto captureLight = [&](const RtLight& rtLight) {
-      assert(rtLight.getInitialHash() != 0);
-      switch (rtLight.getType()) {
-      default:
-      case RtLightType::Sphere:
-        captureSphereLight(rtLight.getSphereLight());
-        break;
-      case RtLightType::Rect:
-        // Todo: Handle Rect lights
-        Logger::err("[GameCapturer][" + m_pCap->idStr + "] RectLight not implemented");
-        assert(false);
-        break;
-      case RtLightType::Disk:
-        // Todo: Handle Disk lights
-        Logger::err("[GameCapturer][" + m_pCap->idStr + "] DiskLight not implemented");
-        assert(false);
-        break;
-      case RtLightType::Cylinder:
-        // Todo: Handle Cylinder lights
-        Logger::err("[GameCapturer][" + m_pCap->idStr + "] CylinderLight not implemented");
-        assert(false);
-        break;
-      case RtLightType::Distant:
-        captureDistantLight(rtLight.getDistantLight());
-        break;
-      }
-    };
-
-    for (auto&& pair : m_sceneManager.getLightManager().getLightTable()) {
-      captureLight(pair.second);
-    }
-    for (auto&& pair : m_sceneManager.getLightManager().getExternallyTrackedLightTable()) {
-      captureLight(pair.second);
-    }
   }
 
-  void GameCapturer::captureSphereLight(const dxvk::RtSphereLight& rtLight) {
-    const auto hash = rtLight.getHash();
-    pxr::GfRotation  rotation;
-    rotation.SetIdentity();
-    if (m_pCap->sphereLights.count(hash) == 0) {
-      const std::string name = dxvk::hashToString(hash);
-      lss::SphereLight& sphereLight = m_pCap->sphereLights[hash];
-      sphereLight.lightName = name;
-      const auto colorAndIntensity = rtLight.getColorAndIntensity();
-      sphereLight.color[0] = colorAndIntensity.r;
-      sphereLight.color[1] = colorAndIntensity.g;
-      sphereLight.color[2] = colorAndIntensity.b;
-      sphereLight.intensity = colorAndIntensity.w;
-      sphereLight.radius = rtLight.getRadius();
-      sphereLight.xforms.reserve(m_options.numFrames - m_pCap->numFramesCaptured);
-      sphereLight.firstTime = m_pCap->currentFrameNum;
-      const dxvk::RtLightShaping& shaping = rtLight.getShaping();
-      if (shaping.getEnabled()) {
-        sphereLight.shapingEnabled = true;
-        sphereLight.coneAngleDegrees = std::acos(shaping.getCosConeAngle()) * kRadiansToDegrees;
-        sphereLight.coneSoftness = shaping.getConeSoftness();
-        sphereLight.focusExponent = shaping.getFocusExponent();
-        rotation = pxr::GfRotation(-pxr::GfVec3d::ZAxis(), pxr::GfVec3f(&shaping.getDirection()[0]));
-      }
-      Logger::debug("[GameCapturer][" + m_pCap->idStr + "][SphereLight:" + name + "] New");
-    }
 
-    lss::SphereLight& sphereLight = m_pCap->sphereLights[hash];
-    const auto position = rtLight.getPosition();
-    pxr::GfMatrix4d usdXform(rotation, pxr::GfVec3f(&position[0]));
-    sphereLight.xforms.push_back({ m_pCap->currentFrameNum, usdXform });
-    sphereLight.finalTime = m_pCap->currentFrameNum;
+  void GameCapturer::captureSphereLight(const dxvk::RtSphereLight& rtLight)  {
+    (void)rtLight;
   }
 
-  void GameCapturer::captureDistantLight(const RtDistantLight& rtLight) {
-    const auto hash = rtLight.getHash();
-    if (m_pCap->sphereLights.count(hash) == 0) {
-      const std::string name = dxvk::hashToString(hash);
-      lss::DistantLight& distantLight = m_pCap->distantLights[hash];
-      distantLight.lightName = name;
-      const auto colorAndIntensity = rtLight.getColorAndIntensity();
-      distantLight.color[0] = colorAndIntensity.r;
-      distantLight.color[1] = colorAndIntensity.g;
-      distantLight.color[2] = colorAndIntensity.b;
-      distantLight.intensity = colorAndIntensity.w;
-      distantLight.angleDegrees = rtLight.getHalfAngle() * 2.0 * kRadiansToDegrees;
-      distantLight.direction = pxr::GfVec3f(rtLight.getDirection().data);
-      distantLight.firstTime = m_pCap->currentFrameNum;
-      Logger::debug("[GameCapturer][" + m_pCap->idStr + "][DistantLight:" + name + "] New");
-    }
-    lss::DistantLight& distantLight = m_pCap->distantLights[hash];
-    distantLight.finalTime = m_pCap->currentFrameNum;
+  void GameCapturer::captureDistantLight(const RtDistantLight& rtLight)  {
+    (void)rtLight;
   }
 
   void GameCapturer::captureInstances(const Rc<DxvkContext> ctx) {
-    for (const RtInstance* pRtInstance : m_sceneManager.getInstanceTable()) {
-      assert(pRtInstance->getBlas() != nullptr);
-
-      const XXH64_hash_t instanceId = pRtInstance->getId();
-      if (instanceId == UINT64_MAX) {
-        // Ignore "virtual" instances, as they are used primarily for special render
-        // passes, rather than representing real entities that we want captured
-        continue;
-      }
-      assert(instanceId != UINT64_MAX);
-
-      if (pRtInstance->getBlas()->input.cameraType == CameraType::Sky) {
-        if (!m_pCap->bSkyProbeBaked) {
-          const std::string skyProbeFilename = getBakedSkyProbeName(m_pCap->instance.stageName);
-          m_exporter.bakeSkyProbe(ctx, BASE_DIR + lss::commonDirName::texDir, skyProbeFilename);
-          m_pCap->bSkyProbeBaked = true;
-          Logger::debug("[GameCapturer][" + m_pCap->idStr + "][SkyProbe] Bake scheduled to " + skyProbeFilename);
-        }
-      }
-
-      const uint8_t instanceFlags = m_pCap->instanceFlags[instanceId];
-      const bool bIsNew = m_pCap->instances.count(instanceId) == 0;
-      const bool bPointsUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::PositionsUpdate);
-      const bool bNormalsUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::NormalsUpdate);
-      const bool bIndexUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::IndexUpdate);
-      const bool bXformUpdate = checkInstanceUpdateFlag(instanceFlags, InstFlag::XformUpdate);
-      Instance& instance = m_pCap->instances[instanceId];
-      if (bIsNew) {
-        newInstance(ctx, *pRtInstance);
-      }
-      if (m_pCap->bCaptureInstances && !bIsNew && (bPointsUpdate || bNormalsUpdate || bIndexUpdate)) {
-        const BlasEntry* pBlas = pRtInstance->getBlas();
-        assert(pBlas != nullptr);
-
-        captureMesh(ctx, instance.meshHash, *pBlas, pRtInstance->getCategoryFlags(), false, bPointsUpdate, bNormalsUpdate, bIndexUpdate, pRtInstance->isFrontFaceFlipped,
-                    pRtInstance->surface.textureTransform);
-      }
-      if (m_pCap->bCaptureInstances && (bIsNew || bXformUpdate)) {
-        pxr::GfMatrix4d xform { 1.0 };
-        if (m_pCap->camera.proj.bInv && !m_pCap->camera.view.bInv) {
-          // Add flip transformation for games that render world upside down
-          xform[0][0] = xform[1][1] = -1.0;
-        } else {
-          // Add mirror transformation for games that need additional basis changing because view and projection transformation have different handedness.
-          // Note1: Don't do this transformation if the view and projection have same handedness, they will automatically cancel out.
-          // Note2: Don't do this transformation if the game also flip the up vector in view matrix.
-          //        Because it will automatically cancel out the basis changing and we only need to send an identity matrix here.
-          if (m_pCap->camera.isLHS() && !m_pCap->camera.view.bInv) {
-            xform[0][0] = -1.0;
-          }
-        }
-        instance.lssData.xforms.push_back({ m_pCap->currentFrameNum, matrix4ToGfMatrix4d(pRtInstance->getTransform()) * xform });
-        const SkinningData& skinData = pRtInstance->getBlas()->input.getSkinningState();
-        if (skinData.numBones > 0) {
-          instance.lssData.boneXForms.push_back({ m_pCap->currentFrameNum, matrix4VecToGfMatrix4dVec(skinData.pBoneMatrices) });
-        }
-      }
-      instance.lssData.finalTime = m_pCap->currentFrameNum;
-      instance.lssData.isSky = (pRtInstance->getBlas()->input.cameraType == CameraType::Sky);
-      instance.lssData.metadata = createDrawCallMetadata(*pRtInstance);
-    }
+    (void)ctx;
   }
+
 
   void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance) {
     const BlasEntry* pBlas = rtInstance.getBlas();

@@ -194,9 +194,20 @@ namespace dxvk {
     // Vertex related:
     static void processGeometryBuffers(const InterleavedGeometryDescriptor& desc, RaytraceGeometry& output);
     static void processGeometryBuffers(const RasterGeometry& input, RaytraceGeometry& output);
-    static size_t computeOptimalVertexStride(const RasterGeometry& input, bool forceNormals = false);
-    // deferGpuInterleave queues the GPU interleave for flushInterleaveGeometry instead of recording it inline;
-    // only safe when nothing reads the output before scene preparation (see SceneManager::processGeometryInfo).
+    static size_t computeOptimalVertexStride(const RasterGeometry& input, bool forceNormals = false) {
+      size_t stride = sizeof(float) * 3;
+      if (input.normalBuffer.defined() || forceNormals) {
+        stride += sizeof(float) * 3;
+      }
+      if (input.texcoordBuffer.defined()) {
+        stride += sizeof(float) * 2;
+      }
+      if (input.color0Buffer.defined()) {
+        stride += sizeof(uint32_t);
+      }
+      return stride;
+    }
+    // deferGpuInterleave queues the GPU interleave for flushInterleaveGeometry instead of recording it inline.
     static void cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals = false, bool deferGpuInterleave = false);
     
     // Calculate the maximum UV tile size (i.e. minimum UV density) of a draw call.

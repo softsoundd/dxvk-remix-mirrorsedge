@@ -848,14 +848,6 @@ namespace dxvk {
       const VkExtent3D& target = common->getResources().getTargetDimensions();
       out << "render=" << internal.width << "x" << internal.height
           << " output=" << target.width << "x" << target.height;
-
-      SceneManager& sceneManager = common->getSceneManager();
-      const AccelManager& accelManager = sceneManager.getAccelManager();
-      out << " instances=" << sceneManager.getInstanceTable().size()
-          << " surfaces=" << accelManager.getSurfaceCount()
-          << " blas=" << AccelManager::getBlasCount()
-          << " activePOM=" << sceneManager.getActivePOMCount()
-          << " shadowBackfaceSkip=" << (accelManager.hasShadowBackfaceSkipInstances() ? 1 : 0);
     }
 
     out << " | upscaler=" << static_cast<int>(RtxOptions::upscalerType())

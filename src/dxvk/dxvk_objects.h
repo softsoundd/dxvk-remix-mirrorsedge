@@ -33,13 +33,7 @@
 #include "dxvk_pipemanager.h"
 #include "dxvk_renderpass.h"
 #include "dxvk_unbound.h"
-#include "rtx_render/rtx_global_volumetrics.h"
-#include "rtx_render/rtx_pathtracer_gbuffer.h"
-#include "rtx_render/rtx_pathtracer_integrate_direct.h"
-#include "rtx_render/rtx_pathtracer_integrate_indirect.h"
-#include "rtx_render/rtx_demodulate.h"
-#include "rtx_render/rtx_nee_cache.h"
-#include "rtx_render/rtx_denoise.h"
+#include "rtx_render/rtx_resources.h"
 #include "rtx_render/rtx_ngx_wrapper.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_dlfg.h"
@@ -48,9 +42,7 @@
 #include "rtx_render/rtx_taa.h"
 #include "rtx_render/rtx_auto_exposure.h"
 #include "rtx_render/rtx_tone_mapping.h"
-#include "rtx_render/rtx_local_tone_mapping.h"
 #include "rtx_render/rtx_bloom.h"
-#include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_image_utils.h"
 #include "rtx_render/rtx_postFx.h"
 #include "rtx_render/rtx_srgb_dither.h"
@@ -58,9 +50,6 @@
 #include "rtx_render/rtx_scene_manager.h"
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_game_capturer.h"
-#include "rtx_render/rtx_dust_particles.h"
-#include "rtx_render/rtx_particle_system.h"
-#include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_gpu_crash.h"
 #include "rtx_render/rtx_dlss_neural_rendering.h"
 #include "rtx_render/rtx_gpu_pass_timer.h"
@@ -142,80 +131,12 @@ namespace dxvk {
       return m_metaPack.get(m_device);
     }
 
-    RtxGlobalVolumetrics& metaGlobalVolumetrics() {
-      return m_globalVolumetrics.get();
-    }
-
-    SparseRendering& metaSparseRendering() {
-      return m_sparseRendering.get();
-    }
-
-    DxvkPathtracerGbuffer& metaPathtracerGbuffer() {
-      return m_pathtracerGbuffer.get();
-    }
-
-    DxvkRtxdiRayQuery& metaRtxdiRayQuery() {
-      return m_rtxdiRayQuery.get();
-    }
-
-    DxvkReSTIRGIRayQuery& metaReSTIRGIRayQuery() {
-      return m_restirgiRayQuery.get();
-    }
-
-    DxvkPathtracerIntegrateDirect& metaPathtracerIntegrateDirect() {
-      return m_pathtracerIntegrateDirect.get();
-    }
-
-    DxvkPathtracerIntegrateIndirect& metaPathtracerIntegrateIndirect() {
-      return m_pathtracerIntegrateIndirect.get();
-    }
-
-    DemodulatePass& metaDemodulate() {
-      return m_demodulate.get();
-    }
-
-    NeeCachePass& metaNeeCache() {
-      return m_neeCache.get();
-    }
-
-    NeuralRadianceCache& metaNeuralRadianceCache() {
-      return m_neuralRadianceCache.get();
-    }
-
-    DxvkDenoise& metaPrimaryDirectLightDenoiser() {
-      return m_primaryDirectLightDenoiser.get();
-    }
-
-    DxvkDenoise& metaPrimaryIndirectLightDenoiser() {
-      return m_primaryIndirectLightDenoiser.get();
-    }
-
-    DxvkDenoise& metaPrimaryCombinedLightDenoiser() {
-      return m_primaryCombinedLightDenoiser.get();
-    }
-
-    DxvkDenoise& metaSecondaryCombinedLightDenoiser() {
-      return m_secondaryCombinedLightDenoiser.get();
-    }
-
     NGXContext& metaNGXContext() {
       return m_ngxContext.get();
     }
 
     RtxNgxPassthrough& metaNgxPassthrough() {
       return m_ngxPassthrough.get();
-    }
-
-    DxvkDenoise& metaReferenceDenoiserSecondLobe0() {
-      return m_referenceDenoiserSecondLobe0.get();
-    }
-    
-    DxvkDenoise& metaReferenceDenoiserSecondLobe1() {
-      return m_referenceDenoiserSecondLobe1.get();
-    }
-
-    DxvkDenoise& metaReferenceDenoiserSecondLobe2() {
-      return m_referenceDenoiserSecondLobe2.get();
     }
 
     DxvkDLSS& metaDLSS() {
@@ -246,10 +167,6 @@ namespace dxvk {
       return m_xess.get();
     }
 
-    CompositePass& metaComposite() {
-      return m_composite.get();
-    }
-
     GpuCrashPass& metaGpuCrash() {
       return m_gpuCrash.get();
     }
@@ -266,16 +183,8 @@ namespace dxvk {
       return m_toneMapping.get();
     }
 
-    DxvkLocalToneMapping& metaLocalToneMapping() {
-      return m_localToneMapping.get();
-    }
-
     DxvkBloom& metaBloom() {
       return m_bloom.get();
-    }
-
-    RtxGeometryUtils& metaGeometryUtils() {
-      return m_geometryUtils.get();
     }
 
     RtxImageUtils& metaImageUtils() {
@@ -312,32 +221,12 @@ namespace dxvk {
       return m_imgui;
     }
 
-    const OpacityMicromapManager* getOpacityMicromapManager() {
-      return m_sceneManager.getOpacityMicromapManager();
-    }
-
-    const TerrainBaker& getTerrainBaker() {
-      return m_sceneManager.getTerrainBaker();
-    }
-
     AssetExporter& metaExporter() {
       return m_exporter.get();
     }
 
     Rc<GameCapturer> capturer() {
       return m_capturer;
-    }
-
-    RtxDustParticles& metaDustParticles() {
-      return m_dustParticles.get(m_device);
-    }
-
-    RtxParticleSystemManager& metaParticleSystem() {
-      return m_particleSystem.get(m_device);
-    }
-
-    RtxPointInstancerSystem& metaPointInstancerSystem() {
-      return m_pointInstancerSystem.get(m_device);
     }
 
     RtxGpuPassTimer& metaGpuPassTimer() {
@@ -385,48 +274,24 @@ namespace dxvk {
     Rc<GameCapturer>   m_capturer;
 
     // RTX Shaders
-    Active<RtxGlobalVolumetrics>            m_globalVolumetrics;
-    Active<SparseRendering>                 m_sparseRendering;
-    Active<DxvkPathtracerGbuffer>           m_pathtracerGbuffer;
-    Active<DxvkRtxdiRayQuery>               m_rtxdiRayQuery;
-    Active<DxvkReSTIRGIRayQuery>            m_restirgiRayQuery;
-    Active<DxvkPathtracerIntegrateDirect>   m_pathtracerIntegrateDirect;
-    Active<DxvkPathtracerIntegrateIndirect> m_pathtracerIntegrateIndirect;
-    Active<DemodulatePass>                  m_demodulate;
-    Active<NeeCachePass>                    m_neeCache;
-    Active<NeuralRadianceCache>             m_neuralRadianceCache;
-    Active<DxvkDenoise>                     m_primaryDirectLightDenoiser;
-    Active<DxvkDenoise>                     m_primaryIndirectLightDenoiser;
-    Active<DxvkDenoise>                     m_primaryCombinedLightDenoiser;
-    Active<DxvkDenoise>                     m_secondaryCombinedLightDenoiser;
     Active<NGXContext>                      m_ngxContext;
     Active<RtxNgxPassthrough>               m_ngxPassthrough;
     Active<DxvkDLFG>                        m_dlfg;
-    // Secondary reference denoisers used for a second lobe when non-combined signal reference denoising is enabled
-    Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe0;
-    Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe1;
-    Active<DxvkDenoise>                     m_referenceDenoiserSecondLobe2;
     Active<DxvkDLSS>                        m_dlss;
     Active<DxvkRayReconstruction>           m_rayReconstruction;
     Active<DlssNeuralRendering>             m_dlssNeuralRendering;
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
-    Active<CompositePass>                   m_composite;
     Active<GpuCrashPass>                    m_gpuCrash;
     Active<DebugView>                       m_debug_view;
     Active<DxvkAutoExposure>                m_autoExposure;
     Active<DxvkToneMapping>                 m_toneMapping;
-    Active<DxvkLocalToneMapping>            m_localToneMapping;
     Active<DxvkBloom>                       m_bloom;
-    Active<RtxGeometryUtils>                m_geometryUtils;
     Active<RtxImageUtils>                   m_imageUtils;
     Active<DxvkPostFx>                      m_postFx;
     Active<DxvkSRGBDither>                  m_srgbDither;
     Lazy<RtxReflex>                         m_reflex;
-    Lazy<RtxDustParticles>                  m_dustParticles;
-    Lazy<RtxParticleSystemManager>          m_particleSystem;
-    Lazy<RtxPointInstancerSystem>            m_pointInstancerSystem;
     Lazy<RtxGpuPassTimer>                   m_gpuPassTimer;
 
     std::atomic<HWND>                       m_lastKnownWindowHandle;

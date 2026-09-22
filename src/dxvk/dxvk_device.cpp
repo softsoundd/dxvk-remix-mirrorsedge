@@ -532,40 +532,20 @@ namespace dxvk {
     m_textureManager { std::make_unique<RtxTextureManager>(device) },
     m_imgui(device),
     m_dummyResources(device),
-    m_globalVolumetrics(device),
-    m_sparseRendering(device),
-    m_pathtracerGbuffer(device),
-    m_rtxdiRayQuery(device),
-    m_restirgiRayQuery(device),
-    m_pathtracerIntegrateDirect(device),
-    m_pathtracerIntegrateIndirect(device),
-    m_demodulate(device),
-    m_neeCache(device),
-    m_neuralRadianceCache(device),
-    m_primaryDirectLightDenoiser(device, DenoiserType::DirectLight),
-    m_primaryIndirectLightDenoiser(device, DenoiserType::IndirectLight),
-    m_primaryCombinedLightDenoiser(device, DenoiserType::DirectAndIndirectLight),
-    m_secondaryCombinedLightDenoiser(device, DenoiserType::Secondaries),
     m_ngxContext(device),
     m_ngxPassthrough(device),
     m_dlfg(device),
-    m_referenceDenoiserSecondLobe0(device, DenoiserType::Reference),
-    m_referenceDenoiserSecondLobe1(device, DenoiserType::Reference),
-    m_referenceDenoiserSecondLobe2(device, DenoiserType::Reference),
     m_dlss(device),
     m_rayReconstruction(device),
     m_dlssNeuralRendering(device),
     m_nis(device),
     m_taa(device),
     m_xess(device),
-    m_composite(device),
     m_gpuCrash(device),
     m_debug_view(device),
     m_autoExposure(device),
     m_toneMapping(device),
-    m_localToneMapping(device),
     m_bloom(device),
-    m_geometryUtils(device),
     m_imageUtils(device),
     m_postFx(device),
     m_srgbDither(device),
@@ -579,16 +559,8 @@ namespace dxvk {
   void DxvkObjects::onDestroy() {
     getRtxInitializer().onDestroy();
 
-    metaGeometryUtils().onDestroy();
     getSceneManager().onDestroy();
 
-    m_primaryDirectLightDenoiser.get().onDestroy();
-    m_primaryIndirectLightDenoiser.get().onDestroy();
-    m_primaryCombinedLightDenoiser.get().onDestroy();
-    m_secondaryCombinedLightDenoiser.get().onDestroy();
-    m_referenceDenoiserSecondLobe0.get().onDestroy();
-    m_referenceDenoiserSecondLobe1.get().onDestroy();
-    m_referenceDenoiserSecondLobe2.get().onDestroy();
     m_rayReconstruction.get().onDestroy();
     m_dlssNeuralRendering.get().onDestroy();
     m_dlss.get().onDestroy();

@@ -37,7 +37,6 @@
 #include "rtx_context.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_neural_radiance_cache.h"
-#include "rtx_nrd_context.h"
 
 #include <rtx_shaders/debug_view.h>
 #include <rtx_shaders/debug_view_using_optional_extensions.h>
@@ -760,31 +759,6 @@ namespace dxvk {
     // between debug and the resolution of underlying data embedded in it
 
     Vector4& outputStatistics = reinterpret_cast<Vector4&>(m_outputStatistics);
-    NeuralRadianceCache& nrc = ctx->getCommonObjects()->metaNeuralRadianceCache();
-
-    switch (debugViewIdx()) {
-      default:
-        break;
-      case DEBUG_VIEW_NRC_RESOLVE:
-        if (m_outputStatisticsMode == DebugViewOutputStatisticsMode::Sum
-            && nrc.isUpdateResolveModeActive()) {
-          // NRC resolve loads training pixels numerous times for all query pixels,
-          // so we need to divide by number of query pixels per training pixel to get the sum
-          outputStatistics /=
-            static_cast<float>(nrc.getNumQueryPixelsPerTrainingPixel().x * nrc.getNumQueryPixelsPerTrainingPixel().y);
-        }
-        break;
-      case DEBUG_VIEW_NRC_UPDATE_RADIANCE:
-      case DEBUG_VIEW_NRC_UPDATE_THROUGHPUT:
-      case DEBUG_VIEW_NRC_UPDATE_RADIANCE_MULTIPLIED_BY_THROUGHPUT:
-      case DEBUG_VIEW_NRC_UPDATE_NUMBER_OF_BOUNCES:
-      case DEBUG_VIEW_NRC_UPDATE_NUMBER_OF_PATH_SEGMENTS:
-        [[fallthrough]];
-      case DEBUG_VIEW_NRC_UPDATE_NUMBER_OF_INDIRECT_PATH_SEGMENTS:
-        outputStatistics *=
-          static_cast<float>(nrc.getNumQueryPixelsPerTrainingPixel().x * nrc.getNumQueryPixelsPerTrainingPixel().y);
-        break;
-    }
 
     if (m_outputStatisticsMode == DebugViewOutputStatisticsMode::Mean) {
       const VkExtent3D& debugViewExtent = m_debugView.view->imageInfo().extent;
@@ -1230,32 +1204,8 @@ namespace dxvk {
 
     debugViewArgs.isRTXDIConfidenceValid = rtOutput.getCurrentRtxdiConfidence().matchesWriteFrameIdx(frameIdx);
 
-    RayPortalManager::SceneData portalData = common.getSceneManager().getRayPortalManager().getRayPortalInfoSceneData();
-    debugViewArgs.numActiveRayPortals = portalData.numActiveRayPortals;
-    memcpy(&debugViewArgs.rayPortalHitInfos[0], &portalData.rayPortalHitInfos, sizeof(portalData.rayPortalHitInfos));
-    memcpy(&debugViewArgs.rayPortalHitInfos[maxRayPortalCount], &portalData.previousRayPortalHitInfos, sizeof(portalData.previousRayPortalHitInfos));
+    debugViewArgs.numActiveRayPortals = 0;
 
-
-    // Todo: Add cases for secondary denoiser.
-    if (RtxOptions::denoiseDirectAndIndirectLightingSeparately()) {
-      switch (debugViewIdx()) {
-      case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_DIFFUSE_RADIANCE:
-      case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_SPECULAR_RADIANCE:
-      case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_DIFFUSE_HIT_T:
-      case DEBUG_VIEW_DENOISED_PRIMARY_DIRECT_SPECULAR_HIT_T:
-        debugViewArgs.nrd = common.metaPrimaryDirectLightDenoiser().getNrdArgs();
-        break;
-      case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_DIFFUSE_RADIANCE:
-      case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_SPECULAR_RADIANCE:
-      case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_DIFFUSE_HIT_T:
-      case DEBUG_VIEW_DENOISED_PRIMARY_INDIRECT_SPECULAR_HIT_T:
-        debugViewArgs.nrd = common.metaPrimaryIndirectLightDenoiser().getNrdArgs();
-        break;
-      default: break;
-      }
-    } else {
-      debugViewArgs.nrd = common.metaPrimaryCombinedLightDenoiser().getNrdArgs();
-    }
 
     // Fill in accumulation args
     m_accumulation.initAccumulationArgs(Accumulation::blendMode(), debugViewArgs.accumulationArgs);
@@ -1320,7 +1270,6 @@ namespace dxvk {
 
     ctx->bindResourceBuffer(DEBUG_VIEW_BINDING_CONSTANTS_INPUT, DxvkBufferSlice(debugViewConstantBuffer, 0, debugViewConstantBuffer->info().size));
 
-    const RtxGlobalVolumetrics& globalVolumetrics = ctx->getCommonObjects()->metaGlobalVolumetrics();
     ctx->bindResourceView(DEBUG_VIEW_BINDING_DENOISED_PRIMARY_DIRECT_DIFFUSE_RADIANCE_HIT_T_INPUT, rtOutput.m_primaryDirectDiffuseRadiance.view(Resources::AccessType::Read), nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_DENOISED_PRIMARY_DIRECT_SPECULAR_RADIANCE_HIT_T_INPUT, rtOutput.m_primaryDirectSpecularRadiance.view(Resources::AccessType::Read), nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_DENOISED_SECONDARY_COMBINED_DIFFUSE_RADIANCE_HIT_T_INPUT, rtOutput.m_secondaryCombinedDiffuseRadiance.view(Resources::AccessType::Read), nullptr);
@@ -1337,19 +1286,14 @@ namespace dxvk {
     ctx->bindResourceView(DEBUG_VIEW_BINDING_RENDER_OUTPUT_INPUT, renderOutput, nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_INSTRUMENTATION_INPUT, m_instrumentation.view, nullptr);
     
-    const ReplacementMaterialTextureType::Enum terrainTextureType = static_cast<ReplacementMaterialTextureType::Enum>(
-      clamp<uint32_t>(static_cast<uint32_t>(m_debugKnob.x),
-                      ReplacementMaterialTextureType::AlbedoOpacity,
-                      ReplacementMaterialTextureType::Count - 1));
-    Resources::Resource terrain = common.getSceneManager().getTerrainBaker().getTerrainTexture(terrainTextureType);
-    ctx->bindResourceView(DEBUG_VIEW_BINDING_TERRAIN_INPUT, terrain.view, nullptr);
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_TERRAIN_INPUT, m_debugView.view, nullptr);
 
-    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RESERVOIRS_INPUT, globalVolumetrics.getPreviousVolumeReservoirs().view, nullptr);
-    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_AGE_INPUT, globalVolumetrics.getCurrentVolumeAccumulatedRadianceAge().view, nullptr);
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RESERVOIRS_INPUT, m_debugView.view, nullptr);
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_AGE_INPUT, m_debugView.view, nullptr);
     ctx->bindResourceSampler(DEBUG_VIEW_BINDING_VOLUME_AGE_INPUT, linearSampler);
-    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RADIANCE_Y_INPUT, globalVolumetrics.getCurrentVolumeAccumulatedRadianceY().view, nullptr);
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RADIANCE_Y_INPUT, m_debugView.view, nullptr);
     ctx->bindResourceSampler(DEBUG_VIEW_BINDING_VOLUME_RADIANCE_Y_INPUT, linearSampler);
-    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RADIANCE_COCG_INPUT, globalVolumetrics.getCurrentVolumeAccumulatedRadianceCoCg().view, nullptr);
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_VOLUME_RADIANCE_COCG_INPUT, m_debugView.view, nullptr);
     ctx->bindResourceSampler(DEBUG_VIEW_BINDING_VOLUME_RADIANCE_COCG_INPUT, linearSampler);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_VALUE_NOISE_SAMPLER, common.getResources().getValueNoiseLut(ctx), nullptr);
     Rc<DxvkSampler> valueNoiseSampler = common.getResources().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
@@ -1357,29 +1301,7 @@ namespace dxvk {
     ctx->bindResourceView(DEBUG_VIEW_BINDING_BLUE_NOISE_TEXTURE, common.getResources().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindResourceView(DEBUG_VIEW_BINDING_DEBUG_VIEW_INPUT, m_debugView.view, nullptr);
 
-    // NRD Validation Layer bindings
-    {
-      DxvkDenoise& denoiser0 = RtxOptions::denoiseDirectAndIndirectLightingSeparately() 
-        ? ctx->getCommonObjects()->metaPrimaryDirectLightDenoiser() 
-        : ctx->getCommonObjects()->metaPrimaryCombinedLightDenoiser();
-      DxvkDenoise& denoiser1 = ctx->getCommonObjects()->metaPrimaryIndirectLightDenoiser();
-      DxvkDenoise& denoiser2 = ctx->getCommonObjects()->metaSecondaryCombinedLightDenoiser();
-
-      switch (debugViewIdx()) {
-      case DEBUG_VIEW_NRD_INSTANCE_0_VALIDATION_LAYER:
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_NRD_VALIDATION_LAYER_INPUT, denoiser0.getNrdContext().getValidationTexture().view, nullptr);
-        break;
-      case DEBUG_VIEW_NRD_INSTANCE_1_VALIDATION_LAYER:
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_NRD_VALIDATION_LAYER_INPUT, denoiser1.getNrdContext().getValidationTexture().view, nullptr);
-        break;
-      case DEBUG_VIEW_NRD_INSTANCE_2_VALIDATION_LAYER:
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_NRD_VALIDATION_LAYER_INPUT, denoiser2.getNrdContext().getValidationTexture().view, nullptr);
-        break;
-      default:
-        ctx->bindResourceView(DEBUG_VIEW_BINDING_NRD_VALIDATION_LAYER_INPUT, m_debugView.view, nullptr);
-        break;
-      }
-    }
+    ctx->bindResourceView(DEBUG_VIEW_BINDING_NRD_VALIDATION_LAYER_INPUT, m_debugView.view, nullptr);
     
     const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
     

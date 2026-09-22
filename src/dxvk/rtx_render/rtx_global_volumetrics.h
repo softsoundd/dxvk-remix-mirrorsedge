@@ -75,7 +75,7 @@ namespace dxvk {
         anisotropy(aniso) { }
     };
 
-    static void onFroxelResourceOptionsChanged(DxvkDevice* device);
+    static void onFroxelResourceOptionsChanged(DxvkDevice*) {}
 
     // Froxel Radiance Cache/Volumetric Lighting ptions
     // Note: The effective froxel grid resolution (based on the resolution scale) and froxelDepthSlices when multiplied together give the number of froxel cells, and this should be greater than the maximum number of

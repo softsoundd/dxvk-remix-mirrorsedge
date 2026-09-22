@@ -58,7 +58,7 @@ namespace dxvk {
         args.maxValue = 1.0f);
 
       // Deprecated per-signal rates - these are migrated to samplingRate via an onChange callback.
-      static void deprecatedSamplingRateOnChange(DxvkDevice* device);
+      static void deprecatedSamplingRateOnChange(DxvkDevice*) {}
       RTX_OPTION_ARGS("rtx.sparseRendering", float, directLightingSamplingRate, 1.0f,
         "Warning: This option is deprecated, please use rtx.sparseRendering.samplingRate instead.\n"
         "Direct and indirect lighting use a single shared rate. A value set here migrates to that option unless it\n"
@@ -110,7 +110,7 @@ namespace dxvk {
     // (SR option, DLSS-RR, NRC indirect mode) are configured to be enabled. Safe to call at
     // startup before NRC/RR have finished initialising. Use this for shader prewarming;
     // use isActive() for per-frame dispatch decisions.
-    static bool isEnabledByOptions();
+    static bool isEnabledByOptions() { return false; }
 
     bool resamplesNrcTrainingPaths(bool nrcIsActive) const;
     static bool shouldDeferNrcTrainingSetup(const SparseRenderingArgs& args);

@@ -153,13 +153,10 @@ namespace dxvk {
 
   // NV-DXVK start: GPU crash diagnostics
   void DxvkSubmissionQueue::onGpuCrash(const char* reason) {
+    (void)reason;
     if (m_gpuCrashHandled.exchange(true)) {
       return;
     }
-
-    // The submission queue is destroyed and its threads are joined before the
-    // device's common objects, so the scene manager and recorder are alive here.
-    m_device->getCommon()->getSceneManager().getAccelManager().dumpCrashState(reason);
 
     if (m_device->config().enableAftermath) {
       // Stall the pending exception until Aftermath has finished writing or reports an error.

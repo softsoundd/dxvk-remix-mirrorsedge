@@ -234,12 +234,8 @@ namespace dxvk {
     void showReflexOptions(const Rc<DxvkContext>& ctx, bool displayStatsWindowToggle);
     void showReflexLatencyStats();
 
-    void showSetupWindow(const Rc<DxvkContext>& ctx);
-
     void showMaterialOptions();
 
-    void showEnhancementsWindow(const Rc<DxvkContext>& ctx);
-    void showEnhancementsTab(const Rc<DxvkContext>& ctx);
     void showDevelopmentSettings(const Rc<DxvkContext>& ctx);
 
     // helper to display a configurable grid of all textures currently hooked to ImGUI

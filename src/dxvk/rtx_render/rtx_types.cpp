@@ -115,18 +115,6 @@ namespace dxvk {
     // cached aggregate bounding boxes so the RI is in a clean "no replacement
     // attached" state. setup() is the matching re-init.
     for (size_t i = 0; i < prims.size(); i++) {
-      RtInstance* subInstance = prims[i].getInstance();
-      if (subInstance) {
-        subInstance->markForGarbageCollection();
-      }
-      GraphInstance* graphInstance = prims[i].getGraph();
-      if (graphInstance) {
-        graphInstance->removeInstance();
-      }
-      RtLight* light = prims[i].getLight();
-      if (light) {
-        light->markForGarbageCollection();
-      }
       prims[i].setReplacementInstance(nullptr, kInvalidReplacementIndex);
     }
     prims.clear();
@@ -174,7 +162,6 @@ namespace dxvk {
     }
 
     AxisAlignedBoundingBox geoBBox;
-    AxisAlignedBoundingBox litBBox;
 
     if (activeReplacements == nullptr) {
       geoBBox = *originalGeometryBBox;
@@ -201,26 +188,12 @@ namespace dxvk {
               }
             }
           }
-        } else if (replacement.type == AssetReplacement::eLight && replacement.lightData.has_value()) {
-          RtLight objectSpaceLight = replacement.lightData->toRtLight();
-          const Vector3 pos = objectSpaceLight.getPosition();
-          float lightRadius = 0.f;
-          if (objectSpaceLight.getType() == RtLightType::Sphere) {
-            lightRadius = objectSpaceLight.getSphereLight().getRadius();
-          }
-          for (uint32_t j = 0; j < 3; j++) {
-            litBBox.minPos[j] = std::min(litBBox.minPos[j], pos[j] - lightRadius);
-            litBBox.maxPos[j] = std::max(litBBox.maxPos[j], pos[j] + lightRadius);
-          }
         }
       }
     }
 
     if (geoBBox.isValid()) {
       geometryBoundingBox = geoBBox;
-    }
-    if (litBBox.isValid()) {
-      lightBoundingBox = litBBox;
     }
     boundingBoxDirty = false;
   }

@@ -69,6 +69,7 @@ std::optional<std::pair<dxvk::Vector2i, dxvk::HighlightColor>> dxvk::Highlightin
 
 std::pair<std::vector<dxvk::ObjectPickingValue>, dxvk::HighlightColor>
 dxvk::Highlighting::accessObjectPickingValueToHighlight(SceneManager& sceneManager, uint32_t frameId) {
+  (void)sceneManager;
   std::lock_guard lock { m_mutex };
   if (!keepHighlightRequest(m_lastUpdateFrameId, frameId)) {
     return {};
@@ -85,7 +86,7 @@ dxvk::Highlighting::accessObjectPickingValueToHighlight(SceneManager& sceneManag
     if (*texHashToFind == kEmptyHash) {
       return std::make_pair(std::vector<ObjectPickingValue>{}, m_color);
     }
-    return std::make_pair(sceneManager.gatherObjectPickingValuesByTextureHash(*texHashToFind), m_color);
+    return std::make_pair(std::vector<ObjectPickingValue>{}, m_color);
   }
   return {};
 }

@@ -37,12 +37,11 @@
 #include "rtx/utility/geometry_flags.slangh"
 #include "rtx/utility/noise.slangh"
 #include "rtx/utility/procedural_noise.slangh"
-#include "rtx/algorithm/volume_composite_helpers.slangh"
 
-#include "rtxdi/Reservoir.slangh"
 #include "rtx/pass/nrc/nrc_utilities.slangh"
 #include "rtx/algorithm/accumulate.slangh"
 
+#include "rtx/concept/surface/surface.h"
 #include "rtx/concept/surface/minimal_surface_interaction.slangh"
 
 uint32_t RAB_EncodeNormal(float3 normal)
@@ -407,78 +406,10 @@ vec4 loadInput(inout RNG randomState, ivec2 threadId)
       value.a = 1.0;
     }
     break;
-  case DEBUG_VIEW_VOLUME_RESERVOIR_DEPTH_LAYERS: {
-    const Camera camera = cb.camera;
-    VolumeArgs volumeArgs = cb.volumeArgs;
-    const uvec3 froxelDimensions = uvec3(volumeArgs.restirFroxelGridDimensions, volumeArgs.restirFroxelDepthSlices);
-      
-    vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, threadId.xy);
-    screenUV.x *= cb.volumeArgs.numFroxelVolumes;
-    const float froxelVolume = floor(screenUV.x);
-    screenUV.x = frac(screenUV.x);
-    const uint widthTiles = ceil(sqrt(float(volumeArgs.restirFroxelDepthSlices)));
-    const uint heightTiles = ceil(float(volumeArgs.restirFroxelDepthSlices) / widthTiles);
-    const uint previewLevel = uint(screenUV.x * widthTiles) + uint(screenUV.y * heightTiles) * widthTiles;
-
-    VolumeReSTIR_Reservoir reservoir = VolumeReSTIR_Reservoir::createEmpty();
-
-    if (previewLevel < volumeArgs.restirFroxelDepthSlices)
-    {
-      vec2 previewUV = mod(screenUV, vec2(1.0f / widthTiles, 1.0f / heightTiles)) * vec2(widthTiles, heightTiles);
-      previewUV.x = clamp(previewUV.x, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU);
-      previewUV.x = (previewUV.x + froxelVolume) * volumeArgs.inverseNumFroxelVolumes;
-      const float previewW = float(previewLevel) / float(volumeArgs.restirFroxelDepthSlices);
-
-      VolumeReSTIR_PackedReservoir packedReservoir;
-      packedReservoir.data0 = VolumeReservoirs[uint3(vec3(previewUV, previewW) * froxelDimensions)];
-      reservoir = VolumeReSTIR_Reservoir::createFromPacked(packedReservoir);
-      if(cb.debugKnob.x <= 1.f)
-      {
-        value = reservoir.sampleCount;
-      }
-      else if(cb.debugKnob.x <= 2.f)
-      {
-        value = reservoir.lightSample.lightIndex;
-      }
-      else if(cb.debugKnob.x <= 3.f)
-      {
-        value = reservoir.weightSum;
-      }
-      else if(cb.debugKnob.x <= 4.f)
-      {
-        value = reservoir.lightSample.targetPdf;
-      }
-      else if(cb.debugKnob.x <= 5.f)
-      {
-        value = reservoir.knownVisible ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);
-      }
-      else 
-      {
-        value.xy = float2(reservoir.lightSample.lightSampleCoordinates);
-      }
-    }
-
+  case DEBUG_VIEW_VOLUME_RESERVOIR_DEPTH_LAYERS:
     break;
-  }
-  case DEBUG_VIEW_VOLUME_PREINTEGRATION: {
-    const Camera camera = cb.camera;
-    const VolumeArgs volumeArgs = cb.volumeArgs;
-      
-    const vec2 screenUV = cameraPixelCoordinateToScreenUV(camera, threadId.xy);
-    const CameraDirections primaryRayDirections = cameraPixelCoordinateToDirection(camera, threadId.xy);
-    
-    // Calculate volumetric radiance and attenuation if volumetric lighting is enabled
-
-    vec3 volumetricPreintegratedRadiance = vec3(0.0f, 0.0f, 0.0f);
-    vec3 volumeAttenuation = vec3(1.0f, 1.0f, 1.0f);
-    float volumetricIntegrationOffset = 0.f;
-    integrateVolumetricNEE(
-      randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
-      volumeArgs, cb.animationTimeSec * 1000, threadId.xy, screenUV, false, cameraGetWorldPosition(camera), volumeArgs.froxelMaxDistance, primaryRayDirections.worldDirection,
-      volumetricPreintegratedRadiance, volumeAttenuation);
-    value.xyz = volumetricPreintegratedRadiance;
+  case DEBUG_VIEW_VOLUME_PREINTEGRATION:
     break;
-  }
   case DEBUG_VIEW_SCROLLING_LINE:
     value = RenderOutput[upscaledPixelCoordinate];
     if (threadId.x == (cb.frameIdx + 10) % cb.debugViewResolution.x)

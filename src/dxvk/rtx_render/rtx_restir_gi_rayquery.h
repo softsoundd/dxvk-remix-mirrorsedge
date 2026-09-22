@@ -79,9 +79,9 @@ namespace dxvk {
     const Resources::Resource& getBsdfFactor2() const;
     const Resources::AliasedResource& getLastCompositeOutput() const;
 
-    static void setToNRDPreset();
+    static void setToNRDPreset() {}
 
-    static void setToRayReconstructionPreset();
+    static void setToRayReconstructionPreset() {}
 
   private:
     virtual bool isEnabled() const override;

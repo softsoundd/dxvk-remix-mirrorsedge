@@ -213,7 +213,6 @@ namespace dxvk {
 
     void takeScreenshot(std::string imageName, Rc<DxvkImage> image);
 
-    void checkOpacityMicromapSupport();
     void checkShaderExecutionReorderingSupport();
     void checkNeuralRadianceCacheSupport();
 
@@ -223,17 +222,6 @@ namespace dxvk {
 
     void dispatchNgxPassthrough(Rc<DxvkImage> targetImage);
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
-    void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
-    void initSkyProbe();
-    void rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState);
-    void rasterizeSky(const DrawParameters& params, const DrawCallState& drawCallState);
-    enum class TryHandleSkyResult {
-      Default,
-      SkipSubmit,
-    };
-    TryHandleSkyResult tryHandleSky(const DrawParameters* originalParams, DrawCallState* originalDrawCallState /* can be std::move-d */);
-
-    void bakeTerrain(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData** outOverrideMaterialData);
 
     InternalUpscaler getCurrentFrameUpscaler();
 

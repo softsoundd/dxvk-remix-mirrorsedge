@@ -24,7 +24,6 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "../util/util_blueNoise_128x128x64.h"
-#include <rtxdi/RtxdiParameters.h>
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
 #include "rtx/pass/post_fx/post_fx.h"
@@ -430,6 +429,7 @@ namespace dxvk {
     const VkExtent3D& targetExtent,
     bool resetHistory,
     bool isCameraCut) {
+    (void)sceneManager;
 
     FrameBeginContext frameBeginCtx;
     frameBeginCtx.downscaledExtent = downscaledExtent;
@@ -507,23 +507,8 @@ namespace dxvk {
       isConditionalAliasingsShareSameView &&
       "New view for an aliased resource was created on the fly. Avoid doing that or ensure it has no negative side effects.");
 
-    // Only create SSS Textures when there're SSS materials in the scene
-    {
-      if (sceneManager.isSssMaterialExist() || sceneManager.isThinOpaqueMaterialExist()) {
-        if (!m_raytracingOutput.m_sharedSubsurfaceData.isValid() ||
-            m_raytracingOutput.m_sharedSubsurfaceData.image->info().extent != m_downscaledExtent) {
-          m_raytracingOutput.m_sharedSubsurfaceData = createImageResource(ctx, "primary subsurface material buffer", m_downscaledExtent, VK_FORMAT_R16G16_UINT);
-        }
-        if (!m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.isValid() ||
-            m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.image->info().extent != m_downscaledExtent) {
-          // The single scattering is also stored in diffusion profile texture which is used in thin opaque. So we need to create this texture for thin opaque as well.
-          m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData = createImageResource(ctx, "primary subsurface material diffusion profile data buffer", m_downscaledExtent, VK_FORMAT_R32G32_UINT);
-        }
-      } else {
-        m_raytracingOutput.m_sharedSubsurfaceData.reset();
-        m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.reset();
-      }
-    }
+    m_raytracingOutput.m_sharedSubsurfaceData.reset();
+    m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.reset();
 
     // Alloc / free images based on RtxOption
     if (RtxOptions::ShadowTerminator::enableOffset()) {
@@ -1203,26 +1188,10 @@ namespace dxvk {
     m_raytracingOutput.m_rtxdiConfidence[0] = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16_SFLOAT, "RTXDI Confidence 0");
     m_raytracingOutput.m_rtxdiConfidence[1] = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16_SFLOAT, "RTXDI Confidence 1");
 
-    // RTXDI Gradients
-    const VkExtent3D rtxDiGradientExtents = { (m_downscaledExtent.width + RTXDI_GRAD_FACTOR - 1) / RTXDI_GRAD_FACTOR, (m_downscaledExtent.height + RTXDI_GRAD_FACTOR - 1) / RTXDI_GRAD_FACTOR, 1 };
-    m_raytracingOutput.m_rtxdiGradients = createImageResource(ctx, "rtxdi gradients", rtxDiGradientExtents, VK_FORMAT_R16G16_SFLOAT, 2);
-
-    // RTXDI Best Lights - using the same downscaling factor as Gradients
-    m_raytracingOutput.m_rtxdiBestLights = AliasedResource(ctx, rtxDiGradientExtents, VK_FORMAT_R16G16_UINT, "RTXDI Best Lights");
-
-    int numReservoirBuffer = 3;
-    int reservoirSize = sizeof(RTXDI_PackedReservoir);
-    int renderWidthBlocks = (m_downscaledExtent.width + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
-    int renderHeightBlocks = (m_downscaledExtent.height + RTXDI_RESERVOIR_BLOCK_SIZE - 1) / RTXDI_RESERVOIR_BLOCK_SIZE;
-    int reservoirBufferPixels = renderWidthBlocks * renderHeightBlocks * RTXDI_RESERVOIR_BLOCK_SIZE * RTXDI_RESERVOIR_BLOCK_SIZE;
-    DxvkBufferCreateInfo rtxdiBufferInfo;
-    rtxdiBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    rtxdiBufferInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    rtxdiBufferInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    rtxdiBufferInfo.size = reservoirBufferPixels * numReservoirBuffer * reservoirSize;
-    m_raytracingOutput.m_rtxdiReservoirBuffer = m_device->createBuffer(rtxdiBufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "RTXDI reservoir buffer");
-    
-    DxvkBufferCreateInfo neeCacheInfo = rtxdiBufferInfo;
+    DxvkBufferCreateInfo neeCacheInfo;
+    neeCacheInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    neeCacheInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    neeCacheInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     int cellCount = NEE_CACHE_PROBE_RESOLUTION * NEE_CACHE_PROBE_RESOLUTION * NEE_CACHE_PROBE_RESOLUTION;
     neeCacheInfo.size = cellCount * NEE_CACHE_CELL_CANDIDATE_TOTAL_SIZE;
     m_raytracingOutput.m_neeCache = m_device->createBuffer(neeCacheInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "NEE Cache Buffer");

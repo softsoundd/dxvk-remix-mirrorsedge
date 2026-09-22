@@ -490,113 +490,19 @@ namespace dxvk {
       }
     }
 
-    auto common = device->getCommon();
-    DxvkPostFx& postFx = common->metaPostFx();
-    DxvkRtxdiRayQuery& rtxdiRayQuery = common->metaRtxdiRayQuery();
-    DxvkReSTIRGIRayQuery& restirGiRayQuery = common->metaReSTIRGIRayQuery();
+    DxvkPostFx& postFx = device->getCommon()->metaPostFx();
 
-    // Handle Graphics Presets
-    bool isRayReconstruction = RtxOptions::isRayReconstructionEnabled();
-
-    auto lowGraphicsPresetCommonSettings = [&]() {
-      pathMinBounces.setDeferred(0);
-      pathMaxBounces.setDeferred(2);
-      enableTransmissionApproximationInIndirectRays.setDeferred(true);
-      enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(false);
-      denoiseDirectAndIndirectLightingSeparately.setDeferred(false);
-      enableUnorderedResolveInIndirectRays.setDeferred(false);
-      NeeCachePass::enable.setDeferred(isRayReconstruction);
-      rtxdiRayQuery.enableRayTracedBiasCorrection.setDeferred(false);
-      restirGiRayQuery.biasCorrectionMode.setDeferred(ReSTIRGIBiasCorrection::BRDF);
-      restirGiRayQuery.useReflectionReprojection.setDeferred(false);
-      common->metaComposite().enableStochasticAlphaBlend.setDeferred(false);
+    if (graphicsPreset() == GraphicsPreset::Ultra || graphicsPreset() == GraphicsPreset::High) {
+      postFx.enable.setDeferred(true);
+    } else if (graphicsPreset() == GraphicsPreset::Medium || graphicsPreset() == GraphicsPreset::Low) {
       postFx.enable.setDeferred(false);
-    };
-
-    auto enableNrcPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
-      NeuralRadianceCache& nrc = device->getCommon()->metaNeuralRadianceCache();
-      // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
-      // Should refactor this to use a separate global for the final state, and indicate user preference with the option. 
-      if (nrc.checkIsSupported(device)) {
-        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::NeuralRadianceCache);
-        nrc.setQualityPreset(nrcPreset);
-      } else {
-        RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI);
-      }
-    };
-
-    assert(graphicsPreset() != GraphicsPreset::Auto);
-
-    RtxGlobalVolumetrics& volumetrics = device->getCommon()->metaGlobalVolumetrics();
-
-    if (graphicsPreset() == GraphicsPreset::Ultra) {
-      pathMinBounces.setDeferred(1);
-      pathMaxBounces.setDeferred(4);
-      enableTransmissionApproximationInIndirectRays.setDeferred(false);
-      enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(true);
-      denoiseDirectAndIndirectLightingSeparately.setDeferred(true);
-      enableUnorderedResolveInIndirectRays.setDeferred(true);
-      NeeCachePass::enable.setDeferred(true);
-
-      russianRouletteMaxContinueProbability.setDeferred(0.9f);
-      russianRoulette1stBounceMinContinueProbability.setDeferred(0.6f);
-
-      rtxdiRayQuery.enableRayTracedBiasCorrection.setDeferred(true);
-      restirGiRayQuery.biasCorrectionMode.setDeferred(ReSTIRGIBiasCorrection::PairwiseRaytrace);
-      restirGiRayQuery.useReflectionReprojection.setDeferred(true);
-      common->metaComposite().enableStochasticAlphaBlend.setDeferred(true);
-      postFx.enable.setDeferred(true);
-
-      volumetrics.setQualityLevel(RtxGlobalVolumetrics::Ultra);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Ultra);
-
-    } else if (graphicsPreset() == GraphicsPreset::High) {
-      pathMinBounces.setDeferred(0);
-      pathMaxBounces.setDeferred(2);
-      enableTransmissionApproximationInIndirectRays.setDeferred(true);
-      enableUnorderedEmissiveParticlesInIndirectRays.setDeferred(false);
-      denoiseDirectAndIndirectLightingSeparately.setDeferred(false);
-      enableUnorderedResolveInIndirectRays.setDeferred(true);
-      NeeCachePass::enable.setDeferred(isRayReconstruction);
-
-      rtxdiRayQuery.enableRayTracedBiasCorrection.setDeferred(true);
-      restirGiRayQuery.biasCorrectionMode.setDeferred(ReSTIRGIBiasCorrection::PairwiseRaytrace);
-      restirGiRayQuery.useReflectionReprojection.setDeferred(true);
-      common->metaComposite().enableStochasticAlphaBlend.setDeferred(true);
-      postFx.enable.setDeferred(true);
-
-      russianRouletteMaxContinueProbability.setDeferred(0.9f);
-      russianRoulette1stBounceMinContinueProbability.setDeferred(0.6f);
-
-      volumetrics.setQualityLevel(RtxGlobalVolumetrics::High);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::High);
-
-    } else if (graphicsPreset() == GraphicsPreset::Medium) {
-      lowGraphicsPresetCommonSettings();
-
-      russianRouletteMaxContinueProbability.setDeferred(0.7f);
-      russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
-
-      volumetrics.setQualityLevel(RtxGlobalVolumetrics::Medium);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
-    } else if (graphicsPreset() == GraphicsPreset::Low) {
-      lowGraphicsPresetCommonSettings();
-
-      russianRouletteMaxContinueProbability.setDeferred(0.7f);
-      russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
-
-      volumetrics.setQualityLevel(RtxGlobalVolumetrics::Low);
-      enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
-      
     }
 
-    // Ensure we are using auto DLSS profile since we will be relying on quality downgrades for Medium/Low settings
-    //  and if the user has specified a custom DLSS override, we should respect that.
+    // Respect a user DLSS override. Otherwise stay on the auto profile.
     if (dlssPreset() != DlssPreset::Custom) {
       qualityDLSS.setDeferred(DLSSProfile::Auto);
     }
 
-    // else Graphics Preset == Custom
     updateLightingSetting();
   }
 
@@ -655,7 +561,6 @@ namespace dxvk {
   bool RtxOptions::needsMeshBoundingBox() {
     return AntiCulling::isObjectAntiCullingEnabled() ||
            AntiCulling::isLightAntiCullingEnabled() ||
-           TerrainBaker::needsTerrainBaking() ||
            enableAlwaysCalculateAABB() ||
            NeeCachePass::enable();
   }

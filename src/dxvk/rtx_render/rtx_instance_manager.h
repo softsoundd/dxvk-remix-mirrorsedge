@@ -133,7 +133,7 @@ public:
   uint32_t getFrameLastUpdated() const { return m_frameLastUpdated; } 
   uint32_t getFrameAge() const { return m_frameLastUpdated - m_frameCreated; }
   // Signal this object should be collected on the next GC pass
-  void markForGarbageCollection() const;
+  void markForGarbageCollection() const { m_isMarkedForGC = true; }
   // Returns true if a new camera type was registered
   bool registerCamera(CameraType::Enum cameraType, uint32_t frameIndex);
   bool isCameraRegistered(CameraType::Enum cameraType) const;

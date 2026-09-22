@@ -70,7 +70,7 @@ namespace dxvk {
                  "in the the NRC update path tracing pass. For example, 4 training iterations results in 64K training records.\n"
                  "Higher number results in more responsive NRC cache at the cost of increased workload.\n",
                  args.flags = RtxOptionFlags::UserSetting);
-      public: static void onMaxNumTrainingIterationsChanged(DxvkDevice* device);
+      public: static void onMaxNumTrainingIterationsChanged(DxvkDevice*) {}
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", uint32_t, maxNumTrainingIterations, 16,
                  "This controls the max number of training iterations to perform in a frame.\n"
                  "When the pathtracer generates more training records than the ideal number of training records\n"
@@ -91,9 +91,9 @@ namespace dxvk {
                  "Set to negative value to lower the max number of training bounces and to a higher value to increase it in each quality preset.");
       RTX_OPTION("rtx.neuralRadianceCache", uint32_t, numFramesToSmoothOutTrainingDimensions, 16, "");
       RTX_OPTION("rtx.neuralRadianceCache", bool, trainCache, true, "");
-      static void onEnableDebugResolveModeChanged(DxvkDevice* device);
+      static void onEnableDebugResolveModeChanged(DxvkDevice*) {}
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", bool, enableDebugResolveMode, false, "", args.environment="RTX_NRC_ENABLE_DEBUG_RESOLVE_MODE", args.onChangeCallback = &onEnableDebugResolveModeChanged);
-      static void onDebugResolveModeChanged(DxvkDevice* device);
+      static void onDebugResolveModeChanged(DxvkDevice*) {}
       inline static bool s_nrcPrevDebugResolveIsEnabled = false;
       inline static bool s_nrcDebugBufferIsRequired { false };
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", NrcResolveMode, debugResolveMode, NrcResolveMode::AddQueryResultToOutput, "Debug Visualization Mode.", args.environment="RTX_NRC_DEBUG_RESOLVE_MODE", args.onChangeCallback = &onDebugResolveModeChanged);
@@ -137,7 +137,7 @@ namespace dxvk {
       RTX_OPTION("rtx.neuralRadianceCache", bool, enableCalculateTrainingLoss, false, "Enables calculation of a training loss. Imposes a performance penalty.");
       RTX_OPTION("rtx.neuralRadianceCache", bool, enableAdaptiveTrainingDimensions, true, "Enables adaptive training dimensions that scale based off pathtracer's execution behavior on a given scene.");
 
-      static void onQualityPresetChanged(DxvkDevice* device);
+      static void onQualityPresetChanged(DxvkDevice*) {}
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", QualityPreset, qualityPreset, QualityPreset::Ultra,
                       "Quality Preset: Medium (0), High (1), Ultra (2).\n"
                       "Adjusts quality of RTX Neural Radiance Cache (NRC):\n"
@@ -176,7 +176,7 @@ namespace dxvk {
     ~NeuralRadianceCache();
 
     // Returns if NRC is supported
-    static bool checkIsSupported(const DxvkDevice* device);
+    static bool checkIsSupported(const DxvkDevice*) { return false; }
 
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 

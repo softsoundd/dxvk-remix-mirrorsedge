@@ -21,7 +21,7 @@
 */
 #pragma once
 
-#include "dxvk_context.h"
+#include "../dxvk_context.h"
 #include "rtx_resources.h"
 
 #include "rtx/pass/image_utils/generate_mipmap.h"

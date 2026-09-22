@@ -949,8 +949,19 @@ struct PooledBlas : public RcObject {
   // unchanged, the GPU build can be skipped entirely.
   XXH64_hash_t contentHash = kEmptyHash;
 
-  explicit PooledBlas();
-  ~PooledBlas();
+  explicit PooledBlas() {
+    buildInfo.geometryCount = 0;
+    buildInfo.pGeometries = nullptr;
+  }
+
+  ~PooledBlas() {
+    if (buildInfo.pGeometries) {
+      delete[] buildInfo.pGeometries;
+      buildInfo.pGeometries = nullptr;
+    }
+    accelerationStructureReference = 0;
+    accelStructure = nullptr;
+  }
 };
 
 // Information about a geometry, such as vertex buffers, and possibly a static BLAS for that geometry

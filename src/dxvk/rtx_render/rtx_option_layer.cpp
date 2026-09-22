@@ -27,6 +27,10 @@
 
 #include <iomanip>
 #include <sstream>
+#include <algorithm>
+#include <regex>
+
+#include <windows.h>
 
 namespace {
   // Helper to split comma-separated paths into a vector
@@ -61,6 +65,22 @@ namespace {
 }
 
 namespace dxvk {
+
+  std::string ModManager::getBaseGameModPath(std::string baseGameModRegexStr, std::string baseGameModPathRegexStr) {
+    std::string commandLine = GetCommandLineA();
+    std::smatch match;
+    std::string baseGameModPath;
+
+    if (baseGameModRegexStr != "" && std::regex_search(commandLine, match, std::regex(baseGameModRegexStr, std::regex::icase))) {
+      std::regex baseGameModPathRegex(baseGameModPathRegexStr, std::regex::icase);
+      if (std::regex_search(commandLine, match, baseGameModPathRegex)) {
+        baseGameModPath = match.str(1);
+        std::replace(baseGameModPath.begin(), baseGameModPath.end(), '\\', '/');
+      }
+    }
+    return baseGameModPath;
+  }
+
 
   // ============================================================================
   // RtxOptionLayer implementation

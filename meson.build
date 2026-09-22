@@ -346,12 +346,6 @@ rtx_shader_source_directory = join_paths(global_src_root_norm, 'src/dxvk/shaders
 # directory, this is just the best way currently for organizing it into the respective project it is outputting data for.
 rtx_shader_output_directory = join_paths(current_build_dir_norm, 'src/dxvk/rtx_shaders')
 
-rtxdi_include_path = include_directories('submodules/rtxdi/rtxdi-sdk/include')
-# Need to use the include path as an argument to the shader build string,
-# and I couldn't find how to convert the IncludeDirs thing to a string... Meson.
-rtxdi_include_path_string = join_paths(global_src_root_norm, 'submodules/rtxdi/rtxdi-sdk/include')
-volumetrics_include_path_string = join_paths(global_src_root_norm, 'submodules/rtxdi/rtxdi-sdk/include/volumetrics')
-
 rtxcr_include_path = include_directories('submodules/rtxcr/shaders/include')
 rtxcr_include_path_string = join_paths(global_src_root_norm, 'submodules/rtxcr/shaders/include')
 
@@ -372,10 +366,16 @@ rtx_shaders_command_arguments = [
   '-spirvval', fs.as_posix(spirv_val.full_path()),
   '-input', rtx_shader_source_directory,
   '-include', shader_directory,
-  '-include', rtxdi_include_path_string,
   '-include', rtxcr_include_path_string,
   '-include', submodules_include_path_string,
-  '-include', volumetrics_include_path_string,
+  # Lighting, G-buffer, and volumetrics passes include the RTXDI SDK and are not dispatched.
+  '-exclude', 'pass/rtxdi',
+  '-exclude', 'pass/integrate',
+  '-exclude', 'pass/volumetrics',
+  '-exclude', 'pass/gbuffer',
+  '-exclude', 'pass/composite',
+  '-exclude', 'pass/particles',
+  '-exclude', 'pass/nee_cache',
   '-output', rtx_shader_output_directory,
   '-parallel',
 ]
@@ -751,27 +751,13 @@ if dxvk_is_ninja or dxvk_is_woa_ec
     install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'), install_dir : output_path, install_tag: target_suffix)
     install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbb12_debug.dll' : 'tbb12.dll'), install_dir : output_path, install_tag: target_suffix)
     # Python DLL not needed for nopy USD build
-    install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix) 
-
-    # install USD plugins
+    install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix)
     meson.add_install_script(
       join_paths(global_src_root_norm, 'scripts-common/install_usd_plugins.bat'),
       output_path,
       install_tag: target_suffix 
     )
 
-    install_data(join_paths(nrc_dll_path, nrc_dll_name), install_dir : output_path, install_tag: target_suffix)
-    install_data(join_paths(nrc_dll_path, 'cudart64_13.dll'), install_dir : output_path, install_tag: target_suffix)
-    install_data(join_paths(nrc_dll_path, 'nvrtc64_130_0.dll'), install_dir : output_path, install_tag: target_suffix)
-
-    if dxvk_is_woa
-      install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_134.dll'), install_dir : output_path, install_tag: target_suffix)
-    else
-      install_data(join_paths(nrc_dll_path, 'nvrtc-builtins64_133.dll'), install_dir : output_path, install_tag: target_suffix)
-    endif
-
-    install_data(join_paths(nrd_lib_path, 'NRD.dll'), install_dir : output_path, install_tag: target_suffix) 
-    
     if not dxvk_is_woa
       install_data(join_paths(xess_dll_path, 'libxess.dll'), install_dir : output_path, install_tag: target_suffix)
     endif

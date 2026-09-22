@@ -49,10 +49,6 @@ namespace dxvk {
   }
 
   void RtxInitializer::onDestroy() {
-    if (auto& replacer = m_device->getCommon()->getSceneManager().getAssetReplacer()) {
-      replacer->cancelLoading();
-    }
-
     waitForShaderPrewarm();
   }
 
@@ -99,12 +95,7 @@ namespace dxvk {
       }
     }
 
-    // Configure shader manager to understand bindless layouts
-    ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Buffers));
-    ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Textures));
-    ShaderManager::getInstance()->addGlobalExtraLayout(pCommon->getSceneManager().getBindlessResourceManager().getGlobalBindlessTableLayout(BindlessResourceManager::Samplers));
-
-    // Need to promote all of the hardware support Options before prewarming shaders.
+    // Configure shader manager, then promote hardware-support options before prewarming.
     RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ true);
 
     // Sync upscaler presets from rtx.upscalerType at launch (otherwise preset-dependent
@@ -160,7 +151,6 @@ namespace dxvk {
 
     DxvkObjects* pCommon = m_device->getCommon();
 
-    // Passthrough is the only frame path. There is no path-tracer shader set to prewarm.
     pCommon->metaNgxPassthrough().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaPostFx().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaTAA().prewarmShaders(pCommon->pipelineManager());

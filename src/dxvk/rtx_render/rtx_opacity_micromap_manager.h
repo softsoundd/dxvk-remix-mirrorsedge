@@ -416,7 +416,7 @@ namespace dxvk {
     void showImguiSettings() const;
     void logStatistics() const;
 
-    static bool checkIsOpacityMicromapSupported(DxvkDevice& device);
+    static bool checkIsOpacityMicromapSupported(DxvkDevice&) { return false; }
 
     static bool calculateInstanceUsesOpacityMicromap(const RtInstance& instance);
 
