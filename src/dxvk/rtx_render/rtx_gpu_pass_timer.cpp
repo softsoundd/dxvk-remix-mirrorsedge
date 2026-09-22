@@ -865,8 +865,6 @@ namespace dxvk {
         << " integrateIndirectMode=" << static_cast<int>(RtxOptions::integrateIndirectMode())
         << " nrcPreset=" << static_cast<int>(NeuralRadianceCache::NrcOptions::qualityPreset())
         << " pathMaxBounces=" << static_cast<int>(RtxOptions::pathMaxBounces())
-        << " skyMode=" << static_cast<int>(RtxOptions::skyMode())
-        << " aerialPerspective=" << (RtxOptions::aerialPerspective() ? 1 : 0)
         << " psrMaxDistanceMeters=" << RtxOptions::psrMaxDistanceMeters()
         << " displacementMode=" << static_cast<int>(RtxOptions::Displacement::mode())
         << " tonemappingMode=" << static_cast<int>(RtxOptions::tonemappingMode())
@@ -875,11 +873,7 @@ namespace dxvk {
         << " | volumetrics=" << (RtxGlobalVolumetrics::enable() ? 1 : 0)
         << " froxelScale=" << RtxGlobalVolumetrics::froxelGridResolutionScale()
         << " froxelSlices=" << RtxGlobalVolumetrics::froxelDepthSlices()
-        << " atmosphereShell=" << (RtxGlobalVolumetrics::enableAtmosphere() ? 1 : 0)
-        << " skyAmbientVisibility=" << (RtxGlobalVolumetrics::skyAmbientVisibility() ? 1 : 0)
-        << " skyVisibilitySamples=" << RtxGlobalVolumetrics::skyVisibilitySampleCount()
-        << " skyAmbientStrength=" << RtxGlobalVolumetrics::atmosphereVolumeAmbientScale()
-        << " fogDensityScaleHeightMeters=" << RtxGlobalVolumetrics::fogDensityScaleHeightMeters();
+        << " atmosphereShell=" << (RtxGlobalVolumetrics::enableAtmosphere() ? 1 : 0);
 
     return out.str();
   }

@@ -663,7 +663,7 @@ namespace dxvk {
   {
     MotionBlurInputs inputs = {};
     inputs.inOutColor = &rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
-    inputs.intermediateColor = &rtOutput.m_postFxIntermediateTexture;
+    inputs.intermediateColor = &rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
     inputs.screenSpaceMotionVector = &rtOutput.m_primaryScreenSpaceMotionVector;
     inputs.surfaceFlags = &rtOutput.m_primarySurfaceFlags;
     inputs.surfaceFlagsScratch1 = &rtOutput.m_primarySurfaceFlagsIntermediateTexture1;
@@ -909,7 +909,7 @@ namespace dxvk {
   {
     dispatchLensEffects(ctx, linearSampler, mainCameraResolution, frameIdx,
                         rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite),
-                        rtOutput.m_postFxIntermediateTexture);
+                        rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write));
   }
 
   void DxvkPostFx::dispatchLensEffects(
