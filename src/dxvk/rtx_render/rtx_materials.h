@@ -1885,11 +1885,6 @@ struct LegacyMaterialData {
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
   bool colorTextureIsSrgb = false;
-  // UE3 constant-color materials: shaders with no material texture samplers carry their
-  // color in UniformVector_* constants. Captured at draw time so the legacy->opaque
-  // conversion can use it as the albedo constant instead of rendering white.
-  Vector4 ue3ConstantAlbedo = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
-  bool hasUe3ConstantAlbedo = false;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

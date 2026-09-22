@@ -1636,7 +1636,6 @@ namespace dxvk {
     // NV-DXVK start: [NGX passthrough] snapshot world depth before mid-scene depth clears
     m_rtx.NotifyClear(Flags);
     // NV-DXVK end
-    m_rtx.OnClear(Flags);
 
     const auto& vp = m_state.viewport;
     const auto& sc = m_state.scissorRect;

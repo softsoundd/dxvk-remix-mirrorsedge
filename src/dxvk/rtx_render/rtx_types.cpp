@@ -295,20 +295,6 @@ namespace dxvk {
       // Update any categories that require geometry hash
       setupCategoriesForGeometry();
 
-      // UE3 SDPG_Foreground draws are first-person overlay geometry. Runs after texture and
-      // geometry tagging so it wins (FP/TP weapon components share one mesh, so player-model
-      // tags must only bind the world-DPG copy). On external cameras the override is
-      // suspended and the overlay renders as world geometry.
-      if (isUe3ForegroundDpg) {
-        if (!g_ue3ForegroundDemoteToWorld) {
-          setCategory(InstanceCategories::ViewModel, true);
-          removeCategory(InstanceCategories::ThirdPersonPlayerModel);
-          removeCategory(InstanceCategories::ThirdPersonPlayerBody);
-        } else {
-          ++g_ue3ForegroundDemotedDrawCount;
-        }
-      }
-
       return true;
     }
 
@@ -380,9 +366,6 @@ namespace dxvk {
       geometryData.numBonesPerVertex = skinningData.numBonesPerVertex;
     }
   }
-
-  bool g_ue3ForegroundDemoteToWorld = false;
-  uint32_t g_ue3ForegroundDemotedDrawCount = 0;
 
   void DrawCallState::setCategory(InstanceCategories category, bool doSet) {
     if (doSet) {
@@ -479,16 +462,10 @@ namespace dxvk {
       refreshCategoryLookupTable();
     }
 
-    // support tagging at every UE3 MaterialInstanceConstant identity tier:
-    //   child (materialHash), shader+texture-set group (textureSetShaderHash), parent (textureHash)
     const XXH64_hash_t textureHash = materialData.getColorTexture().getImageHash();
     const XXH64_hash_t materialHash = materialData.getHash();
-    const XXH64_hash_t textureSetShaderHash = materialData.getTextureSetAndShaderHash();
 
-    uint32_t matchedBits = s_categoryLookupTable.lookup(materialHash) | s_categoryLookupTable.lookup(textureHash);
-    if (textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {
-      matchedBits |= s_categoryLookupTable.lookup(textureSetShaderHash);
-    }
+    const uint32_t matchedBits = s_categoryLookupTable.lookup(materialHash) | s_categoryLookupTable.lookup(textureHash);
 
     auto matched = [matchedBits](const InstanceCategories category) {
       return (matchedBits & categoryBit(category)) != 0;

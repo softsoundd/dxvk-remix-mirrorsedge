@@ -364,7 +364,7 @@ private:
   void createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance);
 
   // Logs the external-camera regime decision when its inputs change (rtx.playerModel.logCameraRegime).
-  void logCameraRegimeChange(bool externalCameraRegime, bool viewModelCameraValid, bool demotedForeground,
+  void logCameraRegimeChange(bool externalCameraRegime, bool viewModelCameraValid,
                              bool distanceExternal, bool noViewModelExternal, float playerDistance,
                              bool viewModelHidden, float viewModelFovDegrees);
 

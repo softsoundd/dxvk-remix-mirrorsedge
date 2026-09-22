@@ -672,16 +672,6 @@ enum class InstanceCategories : uint32_t {
 
 using CategoryFlags = Flags<InstanceCategories>;
 
-// External-camera regime flag written by SceneManager::prepareSceneData: while true, UE3
-// foreground-DPG draws skip the ViewModel category override and render as world geometry
-// (first-person overlay meshes like the held weapon show normally on external cameras).
-extern bool g_ue3ForegroundDemoteToWorld;
-
-// Number of foreground draws demoted since the last scene preparation; sampled and reset
-// there. Distinguishes self-inflicted ViewModel-camera absence (we demoted the overlay)
-// from genuine absence (the game drew no first-person overlay at all).
-extern uint32_t g_ue3ForegroundDemotedDrawCount;
-
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
 struct DrawCallState {
@@ -689,11 +679,7 @@ struct DrawCallState {
   DrawCallState(const DrawCallState& _input) = default;
   DrawCallState& operator=(const DrawCallState& drawCallState) = default;
 
-  // Non-zero identifies one hardware instance of a draw that was decomposed into an instance per
-  // hardware instance (D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates). Such an instance stays
-  // the same object while its transform changes every frame, so DrawCallTracker::computeIdentityHash
-  // keys on this instead of the transform; otherwise it would miss the exact-identity lookup every
-  // frame and fall back to a spatial search costing O(batch size) per instance.
+  // Per-hardware-instance identity. Stays empty, so DrawCallTracker keys instances on their transform.
   XXH64_hash_t decomposedInstanceId = kEmptyHash;
 
   // Note: This uses the original material for the hash, not the replaced material
@@ -791,11 +777,6 @@ struct DrawCallState {
 
   // UE3 pass classification for diagnostics (points to a static string)
   const char* ue3PassDescription = "Unknown";
-
-  // Draw happened in UE3's SDPG_Foreground segment (after the mid-scene depth-only clear):
-  // first-person overlay geometry such as arms, held weapon, muzzle flash.
-  // See rtx.d3d9.ue3ForegroundDpgIsViewModel.
-  bool isUe3ForegroundDpg = false;
 
   float minZ = 0.0f;
   float maxZ = 1.0f;

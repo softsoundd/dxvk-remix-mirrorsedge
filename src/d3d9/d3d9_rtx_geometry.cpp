@@ -134,14 +134,6 @@ namespace dxvk {
       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
         vertexShaderHash = m_activeStableVsHash;
 
-        // Captured positions from different sources are not interchangeable, so a source
-        // change has to mint a new geometry hash rather than refit the previous geometry.
-        const uint64_t positionSourceHashMode = uint64_t(m_activeCapturePositionSource);
-        vertexShaderHash = XXH3_64bits_withSeed(
-          &positionSourceHashMode,
-          sizeof(positionSourceHashMode),
-          vertexShaderHash);
-
         if (m_forceIaTexcoordForOutlier) {
           // compat cache key - outlier draws force IA texcoords in vertex capture
           // include this mode bit in the VS hash so cache entries built with VS TEXCOORD output
@@ -158,8 +150,7 @@ namespace dxvk {
     return vertexShaderHash;
   }
 
-  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue,
-                                              const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
+  Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue) {
     ScopedCpuProfileZone();
 
     if (m_pGeometryWorkers == nullptr) {
@@ -219,7 +210,7 @@ namespace dxvk {
     return m_pGeometryWorkers->Schedule([vertexRegions, indexBufferRef = indexBufferRef.ptr(),
                                  pIndexData, indexStride, indexDataSize, indexCount,
                                  maxIndexValue, vertexShaderHash, geometryDescriptorHash,
-                                 vertexLayoutHash, publishTo]() -> GeometryHashes {
+                                 vertexLayoutHash]() -> GeometryHashes {
       ScopedCpuProfileZone();
 
       GeometryHashes hashes;
@@ -246,24 +237,11 @@ namespace dxvk {
 
       hashes.precombine();
 
-      // Publish into the static-geometry memo entry so later frames can reuse the
-      // result without recomputing (entry storage is heap-pinned via shared_ptr).
-      // The VertexShader component is per-draw (stable VS-constant hash, position source)
-      // and is recombined live by the memo consumer, so it is not stored.
-      if (publishTo != nullptr) {
-        for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {
-          publishTo->componentHashes[i] = hashes[HashComponents(i)];
-        }
-        publishTo->componentHashes[uint32_t(HashComponents::VertexShader)] = kEmptyHash;
-        publishTo->hashesReady.store(true, std::memory_order_release);
-      }
-
       return hashes;
     });
   }
 
-  Future<AxisAlignedBoundingBox> D3D9Rtx::computeAxisAlignedBoundingBox(const RasterGeometry& geoData,
-                                                                        const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
+  Future<AxisAlignedBoundingBox> D3D9Rtx::computeAxisAlignedBoundingBox(const RasterGeometry& geoData) {
     ScopedCpuProfileZone();
 
     if (m_pGeometryWorkers == nullptr || !m_frameOptions.needsMeshBoundingBox) {
@@ -281,7 +259,7 @@ namespace dxvk {
     auto vertexBuffer = geoData.positionBuffer.buffer().ptr();
     vertexBuffer->incRef();
 
-    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer, publishTo]()->AxisAlignedBoundingBox {
+    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer]()->AxisAlignedBoundingBox {
       ScopedCpuProfileZone();
 
 #if defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -327,12 +305,6 @@ namespace dxvk {
 #endif
 
       vertexBuffer->decRef();
-
-      // Publish into the static-geometry memo entry for cross-frame reuse
-      if (publishTo != nullptr) {
-        publishTo->boundingBox = boundingBox;
-        publishTo->aabbReady.store(true, std::memory_order_release);
-      }
 
       return boundingBox;
     });

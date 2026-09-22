@@ -578,14 +578,6 @@ namespace dxvk {
       lssMat.sampler.addrModeV = samplerCreateInfo.addressModeV;
       lssMat.sampler.filter = samplerCreateInfo.magFilter;
       lssMat.sampler.borderColor = samplerCreateInfo.borderColor;
-    } else if (materialData.hasUe3ConstantAlbedo) {
-      // texture-less (constant-color) materials export their color so the Toolkit
-      // shows the material's real appearance instead of an unbound white material
-      lssMat.hasAlbedoConstant = true;
-      lssMat.albedoConstant = pxr::GfVec3f(
-        std::clamp(materialData.ue3ConstantAlbedo.x, 0.0f, 1.0f),
-        std::clamp(materialData.ue3ConstantAlbedo.y, 0.0f, 1.0f),
-        std::clamp(materialData.ue3ConstantAlbedo.z, 0.0f, 1.0f));
     } else {
       // Nothing bound and no constant to fall back on: export the albedo the runtime renders such a
       // material with, so the captured stage matches the game.

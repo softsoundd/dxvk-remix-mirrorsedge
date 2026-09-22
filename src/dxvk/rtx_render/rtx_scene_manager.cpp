@@ -789,8 +789,7 @@ namespace dxvk {
       const XXH64_hash_t geometryHash = geometry.getHashForRule(RtxOptions::geometryAssetHashRule());
       const XXH64_hash_t materialHash = input.getMaterialData().getHash();
       const XXH64_hash_t textureHash = input.getMaterialData().getColorTexture().getImageHash();
-      const bool tracked = isTracked({ geometryHash, meshReplacementKey, materialHash, textureHash,
-                                       input.getMaterialData().getTextureSetAndShaderHash() });
+      const bool tracked = isTracked({ geometryHash, meshReplacementKey, materialHash, textureHash });
       if (!logAll && !tracked) {
         return;
       }
@@ -1077,52 +1076,24 @@ namespace dxvk {
     } 
 
     // test if any direct material replacements exist
-    //
-    // UE3 MaterialInstanceConstant tiered lookup - every tier is a pure function of the
-    // current draw (no session history), so the same surface always resolves to the same
-    // replacement:
-    //   1. materialHash          - exact child identity (PS + material texture set + constants)
-    //   2. textureSetShaderHash  - all MIC siblings sharing the shader and texture set (constants
-    //                              ignored; stable even for shaders with frame-varying constants)
-    //   3. textureHash           - parent-level tag on the primary color texture
-    // The exact identity comes before the family and parent fallbacks so a specifically
-    // authored replacement always wins over a broader one. For non-UE3 games the tiers
-    // collapse into the legacy single texture-hash lookup.
     const LegacyMaterialData& inputMaterial = input.getMaterialData();
     const XXH64_hash_t materialHash = inputMaterial.getHash();
     const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
-    const XXH64_hash_t textureSetShaderHash = inputMaterial.getTextureSetAndShaderHash();
 
     const char* matchedTier = "material";
     std::shared_ptr<MaterialData> pReplacementMaterial = m_pReplacer->getReplacementMaterial(materialHash);
 
     if (pReplacementMaterial == nullptr &&
-        textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {
-      pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureSetShaderHash);
-      matchedTier = "textureSet+shader";
-    }
-
-    if (pReplacementMaterial == nullptr &&
-        textureHash != kEmptyHash && textureHash != materialHash && textureHash != textureSetShaderHash) {
+        textureHash != kEmptyHash && textureHash != materialHash) {
       pReplacementMaterial = m_pReplacer->getReplacementMaterial(textureHash);
       matchedTier = "texture";
     }
 
-    replacement_diag::logMaterialResolution(materialHash, textureSetShaderHash, textureHash,
-                                            inputMaterial.m_pixelShaderHashForMaterialInstance,
+    replacement_diag::logMaterialResolution(materialHash, kEmptyHash, textureHash,
+                                            kEmptyHash,
                                             pReplacementMaterial != nullptr, matchedTier);
 
     if (pReplacementMaterial != nullptr) {
-      if (Logger::logLevel() <= LogLevel::Debug && materialHash != textureHash) {
-        static fast_unordered_set s_loggedReplacementTierMaterials;
-        if (s_loggedReplacementTierMaterials.insert(materialHash).second) {
-          Logger::debug(str::format(
-            "[RTX-Compatibility][UE3-MIC] Replacement matched at tier '", matchedTier,
-            "' for materialHash=0x", std::hex, materialHash,
-            " (textureSetShader=0x", textureSetShaderHash, ", texture=0x", textureHash, ")", std::dec));
-        }
-      }
-
       // Make a copy - dont modify the replacement data.
       MaterialData renderMaterialData = *pReplacementMaterial;
       // merge in the input material from game
@@ -2630,7 +2601,7 @@ namespace dxvk {
   }
 
   void SceneManager::logCameraRegimeChange(const bool externalCameraRegime, const bool viewModelCameraValid,
-                                           const bool demotedForeground, const bool distanceExternal,
+                                           const bool distanceExternal,
                                            const bool noViewModelExternal, const float playerDistance,
                                            const bool viewModelHidden, const float viewModelFovDegrees) {
     const size_t playerModelInstances = m_instanceManager.getPlayerModelInstanceCount();
@@ -2639,7 +2610,6 @@ namespace dxvk {
     const uint32_t state =
       (externalCameraRegime ? 1u : 0u) |
       (viewModelCameraValid ? 2u : 0u) |
-      (demotedForeground ? 4u : 0u) |
       (distanceExternal ? 8u : 0u) |
       (noViewModelExternal ? 16u : 0u) |
       (playerModelInstances > 0 ? 32u : 0u) |
@@ -2668,7 +2638,6 @@ namespace dxvk {
       "[RTX-CameraRegime] external=", externalCameraRegime ? 1 : 0,
       " rule=", rule,
       " viewModelCamera=", viewModelCameraValid ? 1 : 0,
-      " demotedForeground=", demotedForeground ? 1 : 0,
       " viewModelHidden=", viewModelHidden ? 1 : 0,
       " viewModelFov=", viewModelFovDegrees,
       " playerModelInstances=", playerModelInstances,
@@ -2835,23 +2804,14 @@ namespace dxvk {
 
     // Single per-frame camera-regime decision consumed by the raytrace constants
     // (player model on primary rays), view-model instance creation (hide view-model
-    // copies), held-equipment detection (suspend classification), and the UE3
-    // foreground-DPG category override (demote first-person overlay draws to world
-    // geometry so e.g. the held weapon renders normally on external cameras).
+    // copies), and held-equipment detection (suspend classification).
     {
       const bool viewModelCameraValid = m_cameraManager.isCameraValid(CameraType::ViewModel);
       const float playerDistance = m_instanceManager.getPlayerModelBodyCameraDistance();
       const float maxDistance = RtxOptions::PlayerModel::autoEnableInPrimarySpaceBodyDistance();
       const bool distanceExternal = maxDistance > 0.f && playerDistance > maxDistance;
-      // The no-ViewModel rule must not read back the regime's own effect: while external,
-      // foreground draws are demoted to world, which itself invalidates the ViewModel
-      // camera. Suppress the rule only when the absence is self-inflicted (we demoted
-      // overlay draws since the last scene prep); a genuine absence - the game drew no
-      // first-person overlay at all - fires it stably every frame.
-      const bool demotedForeground = g_ue3ForegroundDemotedDrawCount > 0;
-      g_ue3ForegroundDemotedDrawCount = 0;
       const bool noViewModelExternal = RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModel() &&
-                                       !viewModelCameraValid && !demotedForeground;
+                                       !viewModelCameraValid;
 
       // A single frame of agreement is not enough to move the player model into primary space:
       // a camera cut can cost a frame of overlay geometry, and the player's own draws can leave
@@ -2864,7 +2824,6 @@ namespace dxvk {
 
       const bool externalCameraRegime = RtxOptions::PlayerModel::enableInPrimarySpace() || autoExternalEngaged;
       m_instanceManager.setExternalCameraRegime(externalCameraRegime);
-      g_ue3ForegroundDemoteToWorld = externalCameraRegime;
 
       // Scoped-zoom view-model hiding (see rtx.viewModel.hideBelowFovDegrees / maxNearPlane).
       // Computed here so held-equipment detection can freeze its classification while the
@@ -2884,7 +2843,7 @@ namespace dxvk {
       // Logged last so it can report the view-model hiding decision alongside the regime: both
       // remove the first-person overlay, and only the reported state distinguishes them.
       if (RtxOptions::PlayerModel::logCameraRegime()) {
-        logCameraRegimeChange(externalCameraRegime, viewModelCameraValid, demotedForeground,
+        logCameraRegimeChange(externalCameraRegime, viewModelCameraValid,
                               distanceExternal, noViewModelExternal, playerDistance,
                               viewModelHidden, viewModelFovDegrees);
       }
