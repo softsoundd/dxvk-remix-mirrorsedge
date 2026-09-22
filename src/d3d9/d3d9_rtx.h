@@ -1433,8 +1433,6 @@ namespace dxvk {
     };
 
 
-    // Per-draw vertex-shader hash folded into the geometry hash.
-    XXH64_hash_t m_activeStableVsHash = 0;
     XXH64_hash_t computeLiveGeometryVertexShaderHashComponent();
 
     // Frame counter used by NGX velocity pairing and the settings probe.

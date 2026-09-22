@@ -7319,7 +7319,6 @@ namespace dxvk {
       }
     }
 
-    m_activeStableVsHash = kEmptyHash;
     geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex);
     geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
 

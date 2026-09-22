@@ -980,7 +980,7 @@ namespace dxvk {
     ImGui::Separator();
     ImGui::TextUnformatted("Automated A/B sweep");
     RemixGui::InputText("Sweep Steps", &sweepStepsObject());
-    RemixGui::SetTooltipToLastWidgetOnHover("Steps separated by ';', assignments within a step by '&', e.g. rtx.skyMode=0;rtx.volumetrics.enable=False. "
+    RemixGui::SetTooltipToLastWidgetOnHover("Steps separated by ';', assignments within a step by '&', e.g. rtx.volumetrics.enable=False;rtx.bloom.enable=False. "
                                             "Each step is held, logged, then restored. Baseline tables are logged before and after.");
     RemixGui::DragFloat("Hold Seconds Per Step", &sweepHoldSecondsObject(), 1.0f, 1.0f, 600.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
 

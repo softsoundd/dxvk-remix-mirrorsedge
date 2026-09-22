@@ -141,7 +141,7 @@ namespace dxvk {
     RTX_OPTION("rtx.gpuPassTimings", std::string, sweepSteps, "",
                "Steps for the automated GPU pass timing A/B sweep. Steps are separated by ';'. Each step is one or more 'option=value' "
                "assignments separated by '&', applied together while the step is held (an empty step measures the unmodified baseline). "
-               "Example: 'rtx.volumetrics.enable=False;rtx.skyMode=0&rtx.atmosphere.aerialPerspective=False'. "
+               "Example: 'rtx.volumetrics.enable=False;rtx.bloom.enable=False&rtx.postfx.enable=False'. "
                "Values are written to the user option layer for the duration of the step and restored afterwards; options that the active "
                "graphics preset controls cannot be overridden this way.");
     RTX_OPTION_ARGS("rtx.gpuPassTimings", float, sweepHoldSeconds, 25.0f,

@@ -132,8 +132,6 @@ namespace dxvk {
 
     if (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture) {
       if (RtxOptions::geometryHashGenerationRule().test(HashComponents::GeometryDescriptor)) {
-        vertexShaderHash = m_activeStableVsHash;
-
         if (m_forceIaTexcoordForOutlier) {
           // compat cache key - outlier draws force IA texcoords in vertex capture
           // include this mode bit in the VS hash so cache entries built with VS TEXCOORD output
@@ -185,11 +183,6 @@ namespace dxvk {
     const size_t indexStride = geoData.indexBuffer.stride();
     const size_t indexDataSize = indexCount * indexStride;
 
-    // Assume the GPU changed the data via shaders, include the constant buffer data in hash.
-    // The bytecode + constant hashing (with UE3 camera-register exclusions) is computed once
-    // per draw in internalPrepareDraw (m_activeStableVsHash) and shared with the static
-    // vertex-capture cache key; only the geometry-hash-specific folds happen here. Shared
-    // with the geometry memo hit path so served hashes recombine to identical values.
     const XXH64_hash_t vertexShaderHash = computeLiveGeometryVertexShaderHashComponent();
 
     // Calculate this based on the RasterGeometry input data
