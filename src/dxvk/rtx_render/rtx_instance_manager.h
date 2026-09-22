@@ -76,6 +76,14 @@ public:
   const Vector3& getPrevWorldPosition() const { return surface.prevObjectToWorld.data[3].xyz(); }
 
   bool isCreatedThisFrame(uint32_t frameIndex) const { return frameIndex == m_frameCreated; }
+  // NV-DXVK start: churn-aware bucketing
+  // Instances that were only just created (short-lived particles, streamed-in geometry) have no
+  // motion history yet; keeping them with the churning set for a while avoids dirtying the static
+  // buckets once per spawn.
+  bool isCreatedRecently(uint32_t frameIndex, uint32_t holdFrames) const {
+    return m_frameCreated != kInvalidFrameIndex && frameIndex - m_frameCreated <= holdFrames;
+  }
+  // NV-DXVK end
 
   // Particle-emitter spawn-discontinuity guard state (rtx.particles.enableDiscontinuityGuard).
   // velocityMovingAverage tracks the emitter's per-frame world translation. A one-frame motion that
@@ -183,6 +191,26 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   // (transform, material, or geometry change).  New instances default to dirty.
   bool isBlasDirty() const { return m_blasDirty; }
   void clearBlasDirty() { m_blasDirty = false; }
+
+  // NV-DXVK start: transform churn tracking for merged-BLAS bucketing
+  // Records a transform change so AccelManager can keep instances that move every frame out of
+  // the buckets holding static geometry (a moving instance forces its whole bucket to be re-routed
+  // and its merged BLAS refitted each frame).
+  void noteTransformChanged(uint32_t frame) {
+    if (m_frameLastTransformChanged != frame) {
+      m_framePrevTransformChanged = m_frameLastTransformChanged;
+      m_frameLastTransformChanged = frame;
+    }
+  }
+  uint32_t getFrameLastTransformChanged() const { return m_frameLastTransformChanged; }
+  // Same hold behaviour as BlasEntry::isGeometryChurning.
+  bool isTransformChurning(uint32_t currentFrame) const {
+    return m_frameLastTransformChanged != kInvalidFrameIndex &&
+           m_framePrevTransformChanged != kInvalidFrameIndex &&
+           currentFrame - m_frameLastTransformChanged <= BlasEntry::kChurnHoldFrames &&
+           m_frameLastTransformChanged - m_framePrevTransformChanged <= 2;
+  }
+  // NV-DXVK end
   bool isBillboardGeometryDirty() const { return m_billboardGeometryDirty; }
   void clearBillboardGeometryDirty() { m_billboardGeometryDirty = false; }
 
@@ -213,6 +241,10 @@ private:
 
   mutable uint32_t m_frameLastUpdated = kInvalidFrameIndex;
   mutable uint32_t m_frameCreated = kInvalidFrameIndex;
+  // NV-DXVK start: transform churn tracking for merged-BLAS bucketing
+  uint32_t m_frameLastTransformChanged = kInvalidFrameIndex;
+  uint32_t m_framePrevTransformChanged = kInvalidFrameIndex;
+  // NV-DXVK end
 
   // Particle-emitter spawn-discontinuity guard state, lazily allocated (null for non-emitter instances).
   // Persistent lifecycle state, intentionally not synced in copyInstanceDataFrom.

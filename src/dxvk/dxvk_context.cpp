@@ -25,6 +25,10 @@
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+// NV-DXVK start: built-in pass timer - whole command list timestamps
+#include "dxvk_objects.h"
+#include "rtx_render/rtx_gpu_pass_timer.h"
+// NV-DXVK end
 #include "../d3d9/d3d9_state.h"
 #include "../d3d9/d3d9_spec_constants.h"
 
@@ -79,6 +83,12 @@ namespace dxvk {
     m_vbTracked.clear();
     m_rcTracked.clear();
 
+    // NV-DXVK start: built-in pass timer - whole command list timestamps
+    if (RtxGpuPassTimer::isEnabled() && m_common != nullptr) {
+      m_common->metaGpuPassTimer().onCommandListBegin(this);
+    }
+    // NV-DXVK end
+
     // The current state of the internal command buffer is
     // undefined, so we have to bind and set up everything
     // before any draw or dispatch command is recorded.
@@ -114,6 +124,13 @@ namespace dxvk {
     ScopedCpuProfileZone();
     this->spillRenderPass(true);
     this->flushSharedImages();
+
+    // NV-DXVK start: built-in pass timer - whole command list timestamps (before the barriers
+    // so the end timestamp lands after all of the list's work, inside the same command buffer)
+    if (RtxGpuPassTimer::isEnabled() && m_common != nullptr) {
+      m_common->metaGpuPassTimer().onCommandListEnd(this);
+    }
+    // NV-DXVK end
 
     m_sdmaBarriers.recordCommands(m_cmd);
     m_initBarriers.recordCommands(m_cmd);
@@ -373,7 +390,9 @@ namespace dxvk {
     const VkComponentMapping&   srcMapping,
     const VkImageBlit&          region,
           VkFilter              filter) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::blitImage");
+    // NV-DXVK end
     this->spillRenderPass(true);
     this->prepareImage(m_execBarriers, dstImage, vk::makeSubresourceRange(region.dstSubresource));
     this->prepareImage(m_execBarriers, srcImage, vk::makeSubresourceRange(region.srcSubresource));
@@ -437,7 +456,9 @@ namespace dxvk {
           VkDeviceSize          offset,
           VkDeviceSize          length,
           uint32_t              value) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::clearBuffer");
+    // NV-DXVK end
     this->spillRenderPass(true);
     
     length = align(length, sizeof(uint32_t));
@@ -552,7 +573,9 @@ namespace dxvk {
     const Rc<DxvkImage>&            image,
     const VkClearColorValue&        value,
     const VkImageSubresourceRange&  subresources) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::clearColorImage");
+    // NV-DXVK end
     this->spillRenderPass(false);
 
     VkImageLayout imageLayoutClear = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -583,7 +606,9 @@ namespace dxvk {
     const Rc<DxvkImage>& image,
     const VkClearDepthStencilValue& value,
     const VkImageSubresourceRange&  subresources) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::clearDepthStencilImage");
+    // NV-DXVK end
     this->spillRenderPass(false);
     
     m_execBarriers.recordCommands(m_cmd);
@@ -772,6 +797,9 @@ namespace dxvk {
     const Rc<DxvkBuffer>&       srcBuffer,
           VkDeviceSize          srcOffset,
           VkDeviceSize          numBytes) {
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::copyBuffer");
+    // NV-DXVK end
     // When overwriting small buffers, we can allocate a new slice in order to
     // avoid suspending the current render pass or inserting barriers. The source
     // buffer must be read-only since otherwise we cannot schedule the copy early.
@@ -836,7 +864,9 @@ namespace dxvk {
     VkDeviceSize          dstOffset,
     VkDeviceSize          srcOffset,
     VkDeviceSize          numBytes) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::copyBufferRegion");
+    // NV-DXVK end
     VkDeviceSize loOvl = std::max(dstOffset, srcOffset);
     VkDeviceSize hiOvl = std::min(dstOffset, srcOffset) + numBytes;
 
@@ -876,7 +906,9 @@ namespace dxvk {
           VkDeviceSize          srcOffset,
           VkDeviceSize          rowAlignment,
           VkDeviceSize          sliceAlignment) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::copyBufferToImage");
+    // NV-DXVK end
     this->spillRenderPass(true);
     this->prepareImage(m_execBarriers, dstImage, vk::makeSubresourceRange(dstSubresource));
 
@@ -947,7 +979,9 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::copyImage");
+    // NV-DXVK end
     this->spillRenderPass(true);
 
     if (this->copyImageClear(dstImage, dstSubresource, dstOffset, extent, srcImage, srcSubresource))
@@ -989,7 +1023,9 @@ namespace dxvk {
     VkOffset3D            dstOffset,
     VkOffset3D            srcOffset,
     VkExtent3D            extent) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::copyImageRegion");
+    // NV-DXVK end
     VkOffset3D loOvl = {
       std::max(dstOffset.x, srcOffset.x),
       std::max(dstOffset.y, srcOffset.y),
@@ -1066,7 +1102,9 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            srcExtent) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::copyImageToBuffer");
+    // NV-DXVK end
     this->spillRenderPass(true);
     this->prepareImage(m_execBarriers, srcImage, vk::makeSubresourceRange(srcSubresource));
 
@@ -1848,7 +1886,9 @@ namespace dxvk {
   void DxvkContext::generateMipmaps(
     const Rc<DxvkImageView>& imageView,
     VkFilter                  filter) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::generateMipmaps");
+    // NV-DXVK end
     if (imageView->info().numLevels <= 1)
       return;
     
@@ -2041,7 +2081,9 @@ namespace dxvk {
     const Rc<DxvkImage>&            srcImage,
     const VkImageResolve&           region,
           VkFormat                  format) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::resolveImage");
+    // NV-DXVK end
     this->spillRenderPass(true);
     this->prepareImage(m_execBarriers, dstImage, vk::makeSubresourceRange(region.dstSubresource));
     this->prepareImage(m_execBarriers, srcImage, vk::makeSubresourceRange(region.srcSubresource));
@@ -2369,7 +2411,9 @@ namespace dxvk {
           VkDeviceSize              offset,
           VkDeviceSize              size,
     const void*                     data) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::updateBuffer");
+    // NV-DXVK end
     bool replaceBuffer = this->tryInvalidateDeviceLocalBuffer(buffer, size);
     auto bufferSlice = buffer->getSliceHandle(offset, size);
 
@@ -2462,7 +2506,9 @@ namespace dxvk {
     const void*                     data,
           VkDeviceSize              pitchPerRow,
           VkDeviceSize              pitchPerLayer) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::updateImage");
+    // NV-DXVK end
     this->spillRenderPass(true);
 
     // Upload data through a staging buffer. Special care needs to
@@ -2589,7 +2635,9 @@ namespace dxvk {
     const Rc<DxvkBuffer>& buffer,
     const void* data,
     uint32_t length) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::uploadBuffer");
+    // NV-DXVK end
     auto bufferSlice = buffer->getSliceHandle();
 
     if (length == 0)
@@ -2630,7 +2678,9 @@ namespace dxvk {
     const void*               data,
     VkDeviceSize              pitchPerRow,
     VkDeviceSize              pitchPerLayer) {
-    ScopedCpuProfileZone();
+    // NV-DXVK start: built-in pass timer - attribute GPU work recorded outside the RTX passes
+    ScopedGpuProfileZone(this, "DxvkContext::uploadImage");
+    // NV-DXVK end
     const DxvkFormatInfo* formatInfo = image->formatInfo();
 
     VkOffset3D imageOffset = { 0, 0, 0 };

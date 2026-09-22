@@ -677,9 +677,18 @@ namespace dxvk {
     const DxvkFormatInfo* UnsupportedFormatInfo(
       D3D9Format            Format) const;
 
+    // NV-DXVK start: sequence-tracked lock waits
+    // SequenceNumber is the resource's tracked mapping-buffer sequence number (the last CS chunk that
+    // touched it); the CS thread is drained only up to that chunk. See rtx.d3d9.sequenceTrackedLockWaits.
     bool WaitForResource(
       const Rc<DxvkResource>&                 Resource,
+            uint64_t                          SequenceNumber,
             DWORD                             MapFlags);
+
+    // Records the current chunk as the last CS-side user of every bound vertex/index buffer's
+    // mapping buffer; called after a draw has been emitted, since the RT commit reads mapping slices.
+    void TrackDrawBufferSequenceNumbers();
+    // NV-DXVK end
 
     /**
      * \brief Locks a subresource of an image
@@ -749,6 +758,11 @@ namespace dxvk {
     void CreateConstantBuffers();
 
     void SynchronizeCsThread();
+
+    // NV-DXVK start: sequence-tracked lock waits
+    // Waits until the CS thread has executed the chunk with the given sequence number.
+    void SynchronizeCsThread(uint64_t SequenceNumber);
+    // NV-DXVK end
 
     void Flush();
 

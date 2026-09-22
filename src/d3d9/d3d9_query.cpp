@@ -1,6 +1,10 @@
 #include "d3d9_query.h"
 
 #include "d3d9_device.h"
+// NV-DXVK start: CPU frame breakdown
+#include "../dxvk/dxvk_objects.h"
+#include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
+// NV-DXVK end
 
 namespace dxvk {
 
@@ -167,6 +171,24 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK start: CPU frame breakdown - measure how long the game polls a pending EVENT query.
+    // The first S_FALSE starts the clock, the D3D_OK that ends the poll loop stops it.
+    if (m_queryType == D3DQUERYTYPE_EVENT && m_state != D3D9_VK_QUERY_BEGUN && RtxGpuPassTimer::isEnabled()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (hr == S_FALSE) {
+        if (!m_eventPending) {
+          m_eventPending = true;
+          m_eventPendingSince = now;
+        }
+      } else if (m_eventPending) {
+        m_eventPending = false;
+        m_parent->GetDXVKDevice()->getCommon()->metaGpuPassTimer().addCpuSample(
+          RtxGpuPassTimer::CpuCounter::AppEventQueryWait,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_eventPendingSince).count());
+      }
+    }
+    // NV-DXVK end
+
     bool flush = dwGetDataFlags & D3DGETDATA_FLUSH;
 
     // If we get S_FALSE and it's not from the fact
@@ -198,6 +220,18 @@ namespace dxvk {
       return S_FALSE;
 
     if (m_queryType == D3DQUERYTYPE_EVENT) {
+      // NV-DXVK start: event query completion on command stream consumption
+      // m_resetCtr == 0 here, i.e. the CS thread has executed this event's End and with it every
+      // draw the game issued before it: Remix has captured them. See rtx.d3d9.eventQueryCsCompletion.
+      if (m_parent->RTX().EventQueryCsCompletionEnabled()) {
+        if (pData != nullptr)
+          *static_cast<BOOL*>(pData) = TRUE;
+
+        m_state = D3D9_VK_QUERY_CACHED;
+        return D3D_OK;
+      }
+      // NV-DXVK end
+
       DxvkGpuEventStatus status = m_event[0]->test();
 
       if (status == DxvkGpuEventStatus::Invalid)

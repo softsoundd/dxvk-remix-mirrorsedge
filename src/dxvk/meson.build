@@ -238,6 +238,8 @@ dxvk_src = files([
   'rtx_render/rtx_global_volumetrics.h',
   'rtx_render/rtx_gpu_crash_recorder.cpp',
   'rtx_render/rtx_gpu_crash_recorder.h',
+  'rtx_render/rtx_gpu_pass_timer.cpp',
+  'rtx_render/rtx_gpu_pass_timer.h',
   'rtx_render/rtx_hashing.cpp',
   'rtx_render/rtx_hashing.h',
   'rtx_render/rtx_hash_collision_detection.cpp',

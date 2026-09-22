@@ -470,6 +470,34 @@ private:
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
 
   DrawCallTracker m_drawCallTracker;
+
+  // rtx.logDynamicGeometryStats: per-BLAS tally of BVH build/refit events and their causes over a
+  // reporting window, so per-frame geometry re-processing can be traced back to the draws behind it.
+  struct DynamicGeometryStat {
+    uint32_t builds = 0;
+    uint32_t updates = 0;
+    uint32_t positionChanges = 0;
+    uint32_t vertexShaderChanges = 0;
+    uint32_t boneChanges = 0;
+    uint32_t indexChanges = 0;
+    uint32_t vertexCount = 0;
+    uint32_t indexCount = 0;
+    uint32_t numBones = 0;
+    bool smoothNormals = false;
+    bool decomposedInstance = false;
+    const char* passDescription = "";
+    XXH64_hash_t materialHash = 0;
+    XXH64_hash_t vertexShaderHash = 0;
+    XXH64_hash_t indexHash = 0;
+    CategoryFlags categories;
+  };
+  std::unordered_map<const BlasEntry*, DynamicGeometryStat> m_dynamicGeometryStats;
+  uint32_t m_dynamicGeometryStatsFirstFrame = 0;
+  uint32_t m_dynamicGeometryStatsTotalBuilds = 0;
+  uint32_t m_dynamicGeometryStatsTotalUpdates = 0;
+  void recordDynamicGeometry(const DrawCallState& drawCallState, const BlasEntry* pBlas, ObjectCacheState result,
+                             const GeometryHashes& previousHashes, XXH64_hash_t previousBoneHash, bool isNew);
+  void reportDynamicGeometryStats();
 };
 
 }  // namespace nvvk

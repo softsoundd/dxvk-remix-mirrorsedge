@@ -238,6 +238,17 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK start: batched geometry interleaving
+  struct RtxGeometryUtils::InterleaveJob {
+    RasterBuffer positionBuffer;
+    RasterBuffer normalBuffer;
+    RasterBuffer texcoordBuffer;
+    RasterBuffer color0Buffer;
+    Rc<DxvkBuffer> outputBuffer;
+    InterleaveGeometryArgs args = {};
+  };
+  // NV-DXVK end
+
   RtxGeometryUtils::RtxGeometryUtils(DxvkDevice* device) : CommonDeviceObject(device) {
     m_pCbData = std::make_unique<RtxStagingDataAlloc>(
       device,
@@ -259,6 +270,8 @@ namespace dxvk {
   RtxGeometryUtils::~RtxGeometryUtils() { }
 
   void RtxGeometryUtils::onDestroy() {
+    m_pendingInterleaveJobs.clear();
+    m_pendingSmoothNormalsJobs.clear();
     m_pCbData = nullptr;
     m_pSmoothNormalsHashData = nullptr;
     m_skinningContext = nullptr;
@@ -695,6 +708,7 @@ namespace dxvk {
     ScopedCpuProfileZone();
     // Handle index buffer replacement - since the BVH builder does not support legacy primitive topology
     if (input.isTopologyRaytraceReady()) {
+      ScopedGpuProfileZone(ctx, "RT geometry copy");
       ctx->copyBuffer(output.indexCacheBuffer, 0, input.indexBuffer.buffer(), input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice(), input.indexCount * input.indexBuffer.stride());
     } else {
       return RtxGeometryUtils::generateTriangleList(ctx, input, output.indexCacheBuffer);
@@ -825,20 +839,23 @@ namespace dxvk {
     return stride;
   }
 
-  void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals) {
+  void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals, bool deferGpuInterleave) {
     ScopedCpuProfileZone();
     // When forceNormals is set, we can't use the fast interleaved copy path because
     // we need to change the vertex layout to include normal space.
     if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals) {
       const size_t vertexBufferSize = input.vertexCount * input.positionBuffer.stride();
-      ctx->copyBuffer(output.historyBuffer[0], 0, input.positionBuffer.buffer(), input.positionBuffer.offset(), vertexBufferSize);
+      {
+        ScopedGpuProfileZone(ctx, "RT geometry copy");
+        ctx->copyBuffer(output.historyBuffer[0], 0, input.positionBuffer.buffer(), input.positionBuffer.offset(), vertexBufferSize);
+      }
 
       processGeometryBuffers(input, output);
     } else {
       RtxGeometryUtils::InterleavedGeometryDescriptor interleaveResult;
       interleaveResult.buffer = output.historyBuffer[0];
 
-      ctx->getCommonObjects()->metaGeometryUtils().interleaveGeometry(ctx, input, interleaveResult, forceNormals);
+      ctx->getCommonObjects()->metaGeometryUtils().interleaveGeometry(ctx, input, interleaveResult, forceNormals, deferGpuInterleave);
 
       processGeometryBuffers(interleaveResult, output);
     }
@@ -848,8 +865,9 @@ namespace dxvk {
     const Rc<DxvkContext>& ctx,
     const RasterGeometry& input,
     InterleavedGeometryDescriptor& output,
-    bool forceNormals) const {
-    ScopedGpuProfileZone(ctx, "interleaveGeometry");
+    bool forceNormals,
+    bool deferGpuDispatch) {
+    ScopedCpuProfileZone();
     // Required
     assert(input.positionBuffer.defined());
 
@@ -916,7 +934,26 @@ namespace dxvk {
     const uint32_t kNumVerticesToProcessOnCPU = 1024;
     const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
 
-    if (useGPU) {
+    // NV-DXVK start: batched geometry interleaving
+    if (useGPU && deferGpuDispatch) {
+      InterleaveJob job;
+      job.positionBuffer = input.positionBuffer;
+      if (args.hasNormals) {
+        job.normalBuffer = input.normalBuffer;
+      }
+      if (args.hasTexcoord) {
+        job.texcoordBuffer = input.texcoordBuffer;
+      }
+      if (args.hasColor0) {
+        job.color0Buffer = input.color0Buffer;
+      }
+      job.outputBuffer = output.buffer;
+      job.args = args;
+      m_pendingInterleaveJobs.push_back(std::move(job));
+    } else if (useGPU) {
+    // NV-DXVK end
+      ScopedGpuProfileZone(ctx, "interleaveGeometry");
+
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
@@ -1029,7 +1066,8 @@ namespace dxvk {
   }
 
   void RtxGeometryUtils::dispatchSmoothNormals(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& geo) {
-    ScopedGpuProfileZone(ctx, "smoothNormals");
+    // GPU work is recorded in flushSmoothNormals under its own GPU zone.
+    ScopedCpuProfileZone();
 
     if (!geo.positionBuffer.defined() || !geo.indexBuffer.defined() || !geo.normalBuffer.defined()) {
       ONCE(Logger::warn("dispatchSmoothNormals: geometry missing required buffers (position, index, or normal)"));
@@ -1071,6 +1109,10 @@ namespace dxvk {
 
     if (useCPU) {
       // --- CPU path: uses the same shared functions as the GPU shader ---
+      // The normals are written straight into the interleaved vertex buffer, so a queued GPU
+      // interleave of this geometry must be recorded first or it would overwrite them.
+      flushInterleaveGeometry(ctx);
+
       const float* srcPosition = reinterpret_cast<const float*>(input.positionBuffer.mapPtr(0));
       const uint32_t* srcIndex = reinterpret_cast<const uint32_t*>(input.indexBuffer.mapPtr(0));
 
@@ -1096,40 +1138,21 @@ namespace dxvk {
         ctx->writeToBuffer(geo.normalBuffer.buffer(), geo.normalBuffer.offsetFromSlice() + v * geo.normalBuffer.stride(), sizeof(dstNormal),  &dstNormal);
       }
     } else {
-      // --- GPU path ---
+      // --- GPU path: queued, recorded in flushSmoothNormals ---
       params.positionOffset = geo.positionBuffer.offsetFromSlice();
       params.positionStride = geo.positionBuffer.stride();
       params.normalOffset = geo.normalBuffer.offsetFromSlice();
       params.normalStride = geo.normalBuffer.stride();
       params.indexOffset = geo.indexBuffer.offsetFromSlice();
 
-      // Sub-allocate from a pooled device-local buffer for the hash table (4 ints per entry: tag + 3 normal components)
-      const VkDeviceSize hashBufSize = hashTableSize * 4 * sizeof(int);
-      DxvkBufferSlice hashTableSlice = m_pSmoothNormalsHashData->alloc(16, hashBufSize);
-
-      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_POSITION_RO, DxvkBufferSlice(geo.positionBuffer.buffer()));
-      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_NORMAL_RW, DxvkBufferSlice(geo.normalBuffer.buffer()));
-      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_INDEX_INPUT, DxvkBufferSlice(geo.indexBuffer.buffer()));
-      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_HASH_TABLE, hashTableSlice);
-
-      ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SmoothNormalsShader::getShader());
-      ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
-
-      const VkExtent3D vertexWorkgroups = util::computeBlockCount(VkExtent3D { params.numVertices, 1, 1 }, VkExtent3D { 128, 1, 1 });
-      const VkExtent3D triangleWorkgroups = util::computeBlockCount(VkExtent3D { params.numTriangles, 1, 1 }, VkExtent3D { 128, 1, 1 });
-
-      // Clear the hash table slice to zero using vkCmdFillBuffer
-      ctx->clearBuffer(hashTableSlice.buffer(), hashTableSlice.offset(), hashBufSize, 0);
-
-      // Phase 1: Accumulate area-weighted face normals into hash table by position
-      params.phase = 1;
-      ctx->pushConstants(0, sizeof(SmoothNormalsArgs), &params);
-      ctx->dispatch(triangleWorkgroups.width, triangleWorkgroups.height, triangleWorkgroups.depth);
-
-      // Phase 2: Each vertex reads its smoothed normal from hash table, normalizes, writes encoded output
-      params.phase = 2;
-      ctx->pushConstants(0, sizeof(SmoothNormalsArgs), &params);
-      ctx->dispatch(vertexWorkgroups.width, vertexWorkgroups.height, vertexWorkgroups.depth);
+      SmoothNormalsJob job;
+      job.positionBuffer = geo.positionBuffer;
+      job.normalBuffer = geo.normalBuffer;
+      job.indexBuffer = geo.indexBuffer;
+      job.params = params;
+      // 4 ints per entry: tag + 3 normal components
+      job.hashBufferSize = static_cast<VkDeviceSize>(hashTableSize) * 4 * sizeof(int);
+      m_pendingSmoothNormalsJobs.push_back(std::move(job));
     }
 
     // Smooth normals always outputs octahedral-encoded normals (single R32_UINT per vertex).
@@ -1137,4 +1160,98 @@ namespace dxvk {
     // correctly decode the normals.
     geo.normalBuffer.setVertexFormat(VK_FORMAT_R32_UINT);
   }
+
+  // NV-DXVK start: batched geometry interleaving
+  void RtxGeometryUtils::flushInterleaveGeometry(const Rc<DxvkContext>& ctx) {
+    if (m_pendingInterleaveJobs.empty()) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "interleaveGeometry");
+
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, InterleaveGeometryShader::getShader());
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+
+    for (const InterleaveJob& job : m_pendingInterleaveJobs) {
+      ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(job.outputBuffer));
+
+      ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, job.positionBuffer);
+      if (job.args.hasNormals)
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, job.normalBuffer);
+      if (job.args.hasTexcoord)
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, job.texcoordBuffer);
+      if (job.args.hasColor0)
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, job.color0Buffer);
+
+      ctx->pushConstants(0, sizeof(InterleaveGeometryArgs), &job.args);
+
+      const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { job.args.vertexCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
+      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    }
+
+    m_pendingInterleaveJobs.clear();
+  }
+  // NV-DXVK end
+
+  // NV-DXVK start: batched smooth normals
+  void RtxGeometryUtils::flushSmoothNormals(const Rc<DxvkContext>& ctx) {
+    // Smooth normals read interleaved positions, so any queued interleave has to land first.
+    flushInterleaveGeometry(ctx);
+
+    if (m_pendingSmoothNormalsJobs.empty()) {
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "smoothNormals");
+
+    // Hash table scratch for every job. Slices come out of the pool back to back, so DXVK's barrier
+    // tracking merges the adjacent same-access ranges instead of treating each job as a new hazard.
+    std::vector<DxvkBufferSlice> hashTableSlices;
+    hashTableSlices.reserve(m_pendingSmoothNormalsJobs.size());
+    for (const SmoothNormalsJob& job : m_pendingSmoothNormalsJobs) {
+      hashTableSlices.push_back(m_pSmoothNormalsHashData->alloc(16, job.hashBufferSize));
+      const DxvkBufferSlice& slice = hashTableSlices.back();
+      ctx->clearBuffer(slice.buffer(), slice.offset(), job.hashBufferSize, 0);
+    }
+
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SmoothNormalsShader::getShader());
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+
+    // Phase 1 for every job: accumulate area-weighted face normals into the hash table by position.
+    // The jobs touch disjoint buffers, so only the first dispatch waits for the clears.
+    for (size_t i = 0; i < m_pendingSmoothNormalsJobs.size(); ++i) {
+      SmoothNormalsJob& job = m_pendingSmoothNormalsJobs[i];
+
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_POSITION_RO, DxvkBufferSlice(job.positionBuffer.buffer()));
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_NORMAL_RW, DxvkBufferSlice(job.normalBuffer.buffer()));
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_INDEX_INPUT, DxvkBufferSlice(job.indexBuffer.buffer()));
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_HASH_TABLE, hashTableSlices[i]);
+
+      job.params.phase = 1;
+      ctx->pushConstants(0, sizeof(SmoothNormalsArgs), &job.params);
+
+      const VkExtent3D triangleWorkgroups = util::computeBlockCount(VkExtent3D { job.params.numTriangles, 1, 1 }, VkExtent3D { 128, 1, 1 });
+      ctx->dispatch(triangleWorkgroups.width, triangleWorkgroups.height, triangleWorkgroups.depth);
+    }
+
+    // Phase 2 for every job: each vertex reads its smoothed normal, normalizes and writes the encoded
+    // output. One drain separates the phases for all jobs.
+    for (size_t i = 0; i < m_pendingSmoothNormalsJobs.size(); ++i) {
+      SmoothNormalsJob& job = m_pendingSmoothNormalsJobs[i];
+
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_POSITION_RO, DxvkBufferSlice(job.positionBuffer.buffer()));
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_NORMAL_RW, DxvkBufferSlice(job.normalBuffer.buffer()));
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_INDEX_INPUT, DxvkBufferSlice(job.indexBuffer.buffer()));
+      ctx->bindResourceBuffer(SMOOTH_NORMALS_BINDING_HASH_TABLE, hashTableSlices[i]);
+
+      job.params.phase = 2;
+      ctx->pushConstants(0, sizeof(SmoothNormalsArgs), &job.params);
+
+      const VkExtent3D vertexWorkgroups = util::computeBlockCount(VkExtent3D { job.params.numVertices, 1, 1 }, VkExtent3D { 128, 1, 1 });
+      ctx->dispatch(vertexWorkgroups.width, vertexWorkgroups.height, vertexWorkgroups.depth);
+    }
+
+    m_pendingSmoothNormalsJobs.clear();
+  }
+  // NV-DXVK end
 }

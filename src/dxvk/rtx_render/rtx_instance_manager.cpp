@@ -177,7 +177,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 776, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 784, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -245,6 +245,7 @@ namespace dxvk {
     // Intentionally NOT synced (identity / lifecycle / per-build state):
     //   m_id, m_instanceVectorId, m_cacheIdentity, m_isMarkedForGC, m_isUnlinkedForGC,
     //   m_isInsideFrustum, m_frameLastUpdated, m_frameCreated,
+    //   m_frameLastTransformChanged, m_framePrevTransformChanged,
     //   m_isCreatedByRenderer, m_spatialCacheHash,
     //   OMM request registration state,
     //   m_primInstanceOwner, buildGeometries, buildRanges,
@@ -1214,6 +1215,9 @@ namespace dxvk {
         if (hasTransformChanged) {
           notifySceneChanged();
           currentInstance.m_blasDirty = true;
+          // NV-DXVK start: transform churn tracking for merged-BLAS bucketing
+          currentInstance.noteTransformChanged(m_device->getCurrentFrameId());
+          // NV-DXVK end
         }
 
         currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;

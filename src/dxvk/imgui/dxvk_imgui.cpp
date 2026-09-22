@@ -1531,6 +1531,16 @@ namespace dxvk {
     }
 
     RemixGui::Separator();
+
+    // NV-DXVK start: built-in GPU pass timings
+    if (RemixGui::CollapsingHeader("GPU Pass Timings", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ctx->getCommonObjects()->metaGpuPassTimer().showImguiSettings();
+      ImGui::Unindent();
+    }
+
+    RemixGui::Separator();
+    // NV-DXVK end
         
 #ifdef REMIX_DEVELOPMENT
     { // Recompile Shaders button and its status information (Only available for Development Remix builds)

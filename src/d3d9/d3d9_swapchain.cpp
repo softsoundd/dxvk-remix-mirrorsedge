@@ -32,6 +32,7 @@
 #include "../util/util_string.h"
 #include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
 #include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
+#include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
 
 // NV-DXVK start: DLFG integration
@@ -357,8 +358,14 @@ namespace dxvk {
 
     // NV-DXVK start: DLFG integration
     if (RtxOptions::enableVsync() == EnableVsync::WaitingForImplicitSwapchain) {
-      // save the vsync state when the first swapchain is created, to act as the default
-      RtxOptions::enableVsyncState = m_presentParams.PresentationInterval ? EnableVsync::On : EnableVsync::Off;
+      // save the vsync state when the first swapchain is created, to act as the default.
+      // D3DPRESENT_INTERVAL_IMMEDIATE (0x80000000) is a non-zero interval that means vsync off (UE3 passes it
+      // when its V-Sync setting is disabled); interval 0 (DEFAULT) keeps the upstream reading of "off".
+      const bool gameWantsVsync = m_presentParams.PresentationInterval != 0 &&
+                                  m_presentParams.PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE;
+      RtxOptions::enableVsyncState = gameWantsVsync ? EnableVsync::On : EnableVsync::Off;
+      Logger::info(str::format("V-Sync latched from the game's present interval 0x", std::hex, m_presentParams.PresentationInterval, std::dec,
+                               ": ", gameWantsVsync ? "on" : "off", " (override with rtx.enableVsync)"));
     }
     // NV-DXVK end
 
@@ -478,6 +485,10 @@ namespace dxvk {
     const RGNDATA* pDirtyRegion,
           DWORD    dwFlags) {
     ScopedCpuProfileZone();
+    // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+    RtxGpuPassTimer::CpuScope presentCpuScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
+                                              RtxGpuPassTimer::CpuCounter::AppPresent);
+    // NV-DXVK end
 
     HWND window = m_presentParams.hDeviceWindow;
     if (hDestWindowOverride != nullptr)
@@ -768,6 +779,9 @@ namespace dxvk {
     });
     
     dstTexInfo->SetWrittenByGPU(dst->GetSubresource(), true);
+    // NV-DXVK start: sequence-tracked lock waits - the readback writes the destination's mapping buffer
+    m_parent->TrackTextureMappingBufferSequenceNumber(dstTexInfo, dst->GetSubresource());
+    // NV-DXVK end
 
     return D3D_OK;
   }
@@ -1218,10 +1232,21 @@ namespace dxvk {
 
     // Bump our frame id.
     ++m_frameId;
-    SyncFrameLatency();
+    // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+    RtxGpuPassTimer* passTimer = RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr;
+    {
+      RtxGpuPassTimer::CpuScope latencyWaitScope(passTimer, RtxGpuPassTimer::CpuCounter::AppPresentWait);
+      SyncFrameLatency();
+    }
+    // NV-DXVK end
 
     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
-      SynchronizePresent();
+      // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+      {
+        RtxGpuPassTimer::CpuScope prevPresentWaitScope(passTimer, RtxGpuPassTimer::CpuCounter::AppPrevPresentWait);
+        SynchronizePresent();
+      }
+      // NV-DXVK end
 
       // NV-DXVK start: DLFG integration
       vk::Presenter* presenter = GetPresenter();
@@ -1235,20 +1260,27 @@ namespace dxvk {
 
       uint32_t imageIndex = 0;
 
-      // NV-DXVK start: DLFG integration
-      VkResult status = presenter->acquireNextImage(sync, imageIndex);
-      // NV-DXVK end
+      VkResult status = VK_NOT_READY;
+      {
+        // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+        RtxGpuPassTimer::CpuScope acquireWaitScope(passTimer, RtxGpuPassTimer::CpuCounter::AppAcquireWait);
+        // NV-DXVK end
 
-      while (status != VK_SUCCESS) {
-        RecreateSwapChain(m_vsync);
-        
         // NV-DXVK start: DLFG integration
-        info = presenter->info();
         status = presenter->acquireNextImage(sync, imageIndex);
         // NV-DXVK end
 
-        if (status == VK_SUBOPTIMAL_KHR)
-          break;
+        while (status != VK_SUCCESS) {
+          RecreateSwapChain(m_vsync);
+          
+          // NV-DXVK start: DLFG integration
+          info = presenter->info();
+          status = presenter->acquireNextImage(sync, imageIndex);
+          // NV-DXVK end
+
+          if (status == VK_SUBOPTIMAL_KHR)
+            break;
+        }
       }
 
       m_context->beginRecording(
@@ -1298,7 +1330,10 @@ namespace dxvk {
     // NV-DXVK start: Reflex integration
     // Note: Sleeping here in the present function essentially makes it so when the application calls into a D3D Present function it will block for the desired amount of time Reflex indicates.
     // This helps accomplish what Reflex desires by delaying the point at which the application does input sampling likely near the start of its simulation on the next frame, thus reducing latency.
-    reflex.sleep();
+    {
+      RtxGpuPassTimer::CpuScope reflexSleepScope(passTimer, RtxGpuPassTimer::CpuCounter::AppReflexSleep);
+      reflex.sleep();
+    }
 
     // Note: Increment the Reflex Frame ID to prepare for the next frame, now that this Reflex frame has ended.
     // Take care to ensure this happens after all other application thread operations call GetReflexFrameId for this frame

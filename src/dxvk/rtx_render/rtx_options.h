@@ -644,6 +644,11 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableDirectLighting, true, "Enables direct lighting (lighting directly from lights on to a surface) on surfaces when set to true, otherwise disables it.");
     RTX_OPTION("rtx", bool, enableSecondaryBounces, true, "Enables indirect lighting (lighting from diffuse/specular bounces to one or more other surfaces) on surfaces when set to true, otherwise disables it.");
       
+    RTX_OPTION("rtx", bool, logDynamicGeometryStats, false,
+               "Diagnostics: log roughly every 5 seconds which geometries required a BLAS build or refit per frame "
+               "(vertex/index counts, skinning, smooth-normals tagging, UE3 pass, shader and material hashes) and why "
+               "(new object, vertex positions, vertex shader constants, bones or indices changed). Per-frame BLAS refits, "
+               "geometry re-interleaving and smooth normal regeneration all follow from these events.");
     RTX_OPTION("rtx", bool, logInstanceIdentityStats, false,
                "Diagnostics: log roughly once a second where instance lookups land - exact-identity hits, "
                "exact-transform hits, spatial nearest-neighbour hits, instances created - and how many candidates "

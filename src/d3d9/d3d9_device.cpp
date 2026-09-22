@@ -47,6 +47,11 @@
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+// NV-DXVK start: CPU frame breakdown
+#include "../dxvk/dxvk_objects.h"
+#include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
+#include "../util/util_once.h"
+// NV-DXVK end
 
 #include "d3d9_initializer.h"
 
@@ -54,6 +59,8 @@
 #include <cfloat>
 #include <thread>
 #include <future>
+#include <unordered_map>
+#include <unordered_set>
 #include <xutility>
 #include "../dxvk/dxvk_scoped_annotation.h"
 #ifdef MSC_VER
@@ -1169,6 +1176,39 @@ namespace dxvk {
       uint32_t(blitInfo.srcOffsets[1].y - blitInfo.srcOffsets[0].y),
       uint32_t(blitInfo.srcOffsets[1].z - blitInfo.srcOffsets[0].z) };
 
+    // NV-DXVK start: StretchRect diagnostics (pass timer enabled): calls per frame per distinct
+    // copy signature, reported every 300 frames.
+    if (RtxGpuPassTimer::isEnabled()) {
+      static std::unordered_map<uint64_t, std::pair<std::string, uint32_t>> s_stretchRects;
+      static uint32_t s_stretchRectFrames = 0;
+      static uint32_t s_lastFrameId = UINT32_MAX;
+      const uint32_t frameId = m_dxvkDevice->getCurrentFrameId();
+      if (frameId != s_lastFrameId) {
+        s_lastFrameId = frameId;
+        if (++s_stretchRectFrames >= 300) {
+          for (const auto& entry : s_stretchRects) {
+            Logger::info(str::format("[RTX-StretchRect] ", static_cast<double>(entry.second.second) / static_cast<double>(s_stretchRectFrames), " per frame: ", entry.second.first));
+          }
+          s_stretchRects.clear();
+          s_stretchRectFrames = 0;
+        }
+      }
+      const bool dstIsBackBuffer = m_implicitSwapchain != nullptr && m_implicitSwapchain->GetBackBuffer(0) == dst;
+      const uint64_t signature = (uint64_t(srcExtent.width) << 48) ^ (uint64_t(srcExtent.height) << 32) ^ (uint64_t(uint32_t(srcFormat)) << 16) ^
+                                 uint64_t(uint32_t(dstFormat)) ^ (uint64_t(srcImage->info().sampleCount) << 60) ^ (dstIsBackBuffer ? 0x8000000000000000ull : 0ull) ^
+                                 (uint64_t(m_rtx.IsRtxInjectTriggered()) << 59) ^ (uint64_t(srcCopyExtent.width) << 24) ^ (uint64_t(srcCopyExtent.height) << 8);
+      auto& record = s_stretchRects[signature];
+      if (record.second++ == 0) {
+        record.first = str::format("src ", srcExtent.width, "x", srcExtent.height, " fmt ", srcFormat, " samples ", uint32_t(srcImage->info().sampleCount),
+                                   " -> dst ", dstExtent.width, "x", dstExtent.height, " fmt ", dstFormat, dstIsBackBuffer ? " (back buffer)" : "",
+                                   " copy ", srcCopyExtent.width, "x", srcCopyExtent.height,
+                                   " -> ", uint32_t(blitInfo.dstOffsets[1].x - blitInfo.dstOffsets[0].x), "x", uint32_t(blitInfo.dstOffsets[1].y - blitInfo.dstOffsets[0].y),
+                                   m_rtx.IsRtxInjectTriggered() ? " after injectRTX" : " before injectRTX", " filter ", uint32_t(Filter),
+                                   " fastPath ", fastPath ? 1 : 0, " resolve ", needsResolve ? 1 : 0);
+      }
+    }
+    // NV-DXVK end
+
     VkExtent3D dstCopyExtent =
     { uint32_t(blitInfo.dstOffsets[1].x - blitInfo.dstOffsets[0].x),
       uint32_t(blitInfo.dstOffsets[1].y - blitInfo.dstOffsets[0].y),
@@ -1183,6 +1223,17 @@ namespace dxvk {
       if (dstFormatInfo->flags.test(DxvkFormatFlag::BlockCompressed))
         return D3DERR_INVALIDCALL;
     }
+
+    // NV-DXVK start: skip scene render target copies while ray tracing (rtx.d3d9.skipRenderTargetCopies)
+    {
+      const bool dstIsBackBuffer = m_implicitSwapchain != nullptr && m_implicitSwapchain->GetBackBuffer(0) == dst;
+      const bool srcIsRenderTarget = (srcTextureInfo->Desc()->Usage & D3DUSAGE_RENDERTARGET) != 0;
+      if (m_rtx.ShouldSkipRenderTargetCopy(srcExtent, srcIsRenderTarget, dstIsBackBuffer)) {
+        m_rtx.NoteRenderTargetCopySkipped();
+        return D3D_OK;
+      }
+    }
+    // NV-DXVK end
 
     auto EmitResolveCS = [&](const Rc<DxvkImage>& resolveDst, bool intermediate) {
       VkImageResolve region;
@@ -1224,6 +1275,7 @@ namespace dxvk {
           cSrcOffset = blitInfo.srcOffsets[0],
           cExtent    = srcCopyExtent
         ] (DxvkContext* ctx) {
+          ScopedGpuProfileZone(ctx, "StretchRect copy");
           ctx->copyImage(
             cDstImage, cDstLayers, cDstOffset,
             cSrcImage, cSrcLayers, cSrcOffset,
@@ -1669,6 +1721,7 @@ namespace dxvk {
           cAspectMask = aspectMask,
           cImageView  = imageView
         ] (DxvkContext* ctx) {
+          ScopedGpuProfileZone(ctx, "D3D9 clear");
           ctx->clearRenderTarget(
             cImageView,
             cAspectMask,
@@ -1683,6 +1736,7 @@ namespace dxvk {
           cOffset     = offset,
           cExtent     = extent
         ] (DxvkContext* ctx) {
+          ScopedGpuProfileZone(ctx, "D3D9 clear");
           ctx->clearImageView(
             cImageView,
             cOffset, cExtent,
@@ -2645,6 +2699,7 @@ namespace dxvk {
 
         ctx->setPushConstantBank(DxvkPushConstantBank::D3D9);
         if (cDrawCall) {
+          ScopedGpuProfileZone(ctx, "D3D9 draw");
           ctx->draw(
             drawInfo.vertexCount, drawInfo.instanceCount,
             cStartVertex, 0);
@@ -2655,6 +2710,8 @@ namespace dxvk {
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
       m_rtx.CommitGeometryToRT(drawContext);
     }
+
+    TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
     return D3D_OK;
@@ -2700,6 +2757,7 @@ namespace dxvk {
 
         ctx->setPushConstantBank(DxvkPushConstantBank::D3D9);
         if (cDrawCall) {
+          ScopedGpuProfileZone(ctx, "D3D9 draw");
           ctx->drawIndexed(
             drawInfo.vertexCount, drawInfo.instanceCount,
             cStartIndex,
@@ -2711,6 +2769,8 @@ namespace dxvk {
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
       m_rtx.CommitGeometryToRT(drawContext);
     }
+
+    TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
     return D3D_OK;
@@ -2763,6 +2823,7 @@ namespace dxvk {
         ctx->setPushConstantBank(DxvkPushConstantBank::D3D9);
         ctx->bindVertexBuffer(0, cBufferSlice, cStride);
         if (cDrawCall) {
+          ScopedGpuProfileZone(ctx, "D3D9 draw");
           ctx->draw(drawInfo.vertexCount, drawInfo.instanceCount, 0, 0);
         }
         ctx->bindVertexBuffer(0, DxvkBufferSlice(), 0);
@@ -2776,6 +2837,8 @@ namespace dxvk {
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
       m_rtx.CommitGeometryToRT(drawContext);
     }
+
+    TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
     return D3D_OK;
@@ -2841,6 +2904,7 @@ namespace dxvk {
         ctx->bindVertexBuffer(0, cBufferSlice.subSlice(0, cVertexSize), cStride);
         ctx->bindIndexBuffer(cBufferSlice.subSlice(cVertexSize, cBufferSlice.length() - cVertexSize), cIndexType);
         if (cDrawCall) {
+          ScopedGpuProfileZone(ctx, "D3D9 draw");
           ctx->drawIndexed(drawInfo.vertexCount, drawInfo.instanceCount, 0, 0, 0);
         }
         ctx->bindVertexBuffer(0, DxvkBufferSlice(), 0);
@@ -2857,6 +2921,8 @@ namespace dxvk {
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
       m_rtx.CommitGeometryToRT(drawContext);
     }
+
+    TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
     return D3D_OK;
@@ -2970,6 +3036,9 @@ namespace dxvk {
 
     dst->SetWrittenByGPU(true);
     TrackBufferMappingBufferSequenceNumber(dst);
+    // NV-DXVK start: sequence-tracked lock waits - the source streams were read by this draw
+    TrackDrawBufferSequenceNumbers();
+    // NV-DXVK end
 
     return D3D_OK;
   }
@@ -4515,8 +4584,20 @@ namespace dxvk {
 
   bool D3D9DeviceEx::WaitForResource(
   const Rc<DxvkResource>&                 Resource,
+        uint64_t                          SequenceNumber,
         DWORD                             MapFlags) {
     ScopedCpuProfileZone();
+    // NV-DXVK start: sequence-tracked lock waits
+    RtxGpuPassTimer::CpuScope resourceWaitScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                                RtxGpuPassTimer::CpuCounter::AppResourceWait);
+
+    // isInUse() is only accurate once the CS thread has executed the last chunk that touched the
+    // resource; draining beyond that chunk (everything queued, including a pending injectRTX) is
+    // wasted waiting. See rtx.d3d9.sequenceTrackedLockWaits.
+    if (!m_rtx.SequenceTrackedLockWaitsEnabled())
+      SequenceNumber = DxvkCsThread::SynchronizeAll;
+    // NV-DXVK end
+
     // Wait for the any pending D3D9 command to be executed
     // on the CS thread so that we can determine whether the
     // resource is currently in use or not.
@@ -4527,7 +4608,7 @@ namespace dxvk {
       : DxvkAccess::Read;
 
     if (!Resource->isInUse(access))
-      SynchronizeCsThread();
+      SynchronizeCsThread(SequenceNumber);
 
     if (Resource->isInUse(access)) {
       if (MapFlags & D3DLOCK_DONOTWAIT) {
@@ -4541,7 +4622,7 @@ namespace dxvk {
         // Make sure pending commands using the resource get
         // executed on the the GPU if we have to wait for it
         Flush();
-        SynchronizeCsThread();
+        SynchronizeCsThread(SequenceNumber);
 
         m_dxvkDevice->waitForResource(Resource, access);
       }
@@ -4549,6 +4630,23 @@ namespace dxvk {
 
     return true;
   }
+
+
+  // NV-DXVK start: sequence-tracked lock waits
+  void D3D9DeviceEx::TrackDrawBufferSequenceNumbers() {
+    const uint64_t sequenceNumber = GetCurrentSequenceNumber();
+
+    for (uint32_t i = 0; i < caps::MaxStreams; i++) {
+      auto* vbo = GetCommonBuffer(m_state.vertexBuffers[i].vertexBuffer);
+      if (vbo != nullptr)
+        vbo->TrackMappingBufferSequenceNumber(sequenceNumber);
+    }
+
+    auto* ibo = GetCommonBuffer(m_state.indices);
+    if (ibo != nullptr)
+      ibo->TrackMappingBufferSequenceNumber(sequenceNumber);
+  }
+  // NV-DXVK end
 
 
   uint32_t D3D9DeviceEx::CalcImageLockOffset(
@@ -4713,11 +4811,14 @@ namespace dxvk {
         std::memset(physSlice.mapPtr, 0, physSlice.length);
       }
       else if (!skipWait) {
-        if (!(Flags & D3DLOCK_DONOTWAIT) && !WaitForResource(mappedBuffer, D3DLOCK_DONOTWAIT))
+        // NV-DXVK start: sequence-tracked lock waits
+        const uint64_t sequenceNumber = pResource->GetMappingBufferSequenceNumber(Subresource);
+        if (!(Flags & D3DLOCK_DONOTWAIT) && !WaitForResource(mappedBuffer, sequenceNumber, D3DLOCK_DONOTWAIT))
           pResource->EnableStagingBufferUploads(Subresource);
 
-        if (!WaitForResource(mappedBuffer, Flags))
+        if (!WaitForResource(mappedBuffer, sequenceNumber, Flags))
           return D3DERR_WASSTILLDRAWING;
+        // NV-DXVK end
       }
     }
     else {
@@ -4793,10 +4894,16 @@ namespace dxvk {
                 cPackedFormat);
             }
           });
+
+          // NV-DXVK start: sequence-tracked lock waits - the readback above is the newest CS-side use
+          TrackTextureMappingBufferSequenceNumber(pResource, Subresource);
+          // NV-DXVK end
         }
 
-        if (!WaitForResource(mappedBuffer, Flags))
+        // NV-DXVK start: sequence-tracked lock waits
+        if (!WaitForResource(mappedBuffer, pResource->GetMappingBufferSequenceNumber(Subresource), Flags))
           return D3DERR_WASSTILLDRAWING;
+        // NV-DXVK end
       } else {
         // If we are a new alloc, and we weren't written by the GPU
         // that means that we are a newly initialized
@@ -5090,6 +5197,22 @@ namespace dxvk {
     if (desc.Usage & D3DUSAGE_DYNAMIC)
       Flags &= ~D3DLOCK_DONOTWAIT;
 
+    // NV-DXVK start: lock-mode diagnostics (pass timer enabled): first lock of each mode. NOOVERWRITE
+    // is the mode whose safety rests on the game's own GPU sync, which rtx.d3d9.eventQueryCsCompletion
+    // relaxes, so whether a game uses it should be on record.
+    if (RtxGpuPassTimer::isEnabled()) {
+      if (Flags & D3DLOCK_NOOVERWRITE) {
+        ONCE(Logger::info(str::format("[RTX-LockDiag] First D3DLOCK_NOOVERWRITE buffer lock: size=", desc.Size, " usage=0x", std::hex, desc.Usage, " pool=", uint32_t(desc.Pool), std::dec)));
+      } else if (Flags & D3DLOCK_DISCARD) {
+        ONCE(Logger::info(str::format("[RTX-LockDiag] First D3DLOCK_DISCARD buffer lock: size=", desc.Size, " usage=0x", std::hex, desc.Usage, " pool=", uint32_t(desc.Pool), std::dec)));
+      } else if (Flags & D3DLOCK_READONLY) {
+        ONCE(Logger::info(str::format("[RTX-LockDiag] First read-only buffer lock: size=", desc.Size, " usage=0x", std::hex, desc.Usage, " pool=", uint32_t(desc.Pool), std::dec)));
+      } else {
+        ONCE(Logger::info(str::format("[RTX-LockDiag] First plain (waiting) buffer lock: size=", desc.Size, " usage=0x", std::hex, desc.Usage, " pool=", uint32_t(desc.Pool), std::dec)));
+      }
+    }
+    // NV-DXVK end
+
     // We only bounds check for MANAGED.
     // (TODO: Apparently this is meant to happen for DYNAMIC too but I am not sure
     //  how that works given it is meant to be a DIRECT access..?)
@@ -5150,11 +5273,14 @@ namespace dxvk {
       const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
       const bool skipWait = (!wasWrittenByGPU && (usesStagingBuffer || readOnly || (noOverlap && !directMapping))) || noOverwrite;
       if (!skipWait) {
-        if (!(Flags & D3DLOCK_DONOTWAIT) && !WaitForResource(mappingBuffer, D3DLOCK_DONOTWAIT))
+        // NV-DXVK start: sequence-tracked lock waits
+        const uint64_t sequenceNumber = pResource->GetMappingBufferSequenceNumber();
+        if (!(Flags & D3DLOCK_DONOTWAIT) && !WaitForResource(mappingBuffer, sequenceNumber, D3DLOCK_DONOTWAIT))
           pResource->EnableStagingBufferUploads();
 
-        if (!WaitForResource(mappingBuffer, Flags))
+        if (!WaitForResource(mappingBuffer, sequenceNumber, Flags))
           return D3DERR_WASSTILLDRAWING;
+        // NV-DXVK end
 
         pResource->SetWrittenByGPU(false);
         pResource->GPUReadingRange().Clear();
@@ -5223,6 +5349,10 @@ namespace dxvk {
     pResource->GPUReadingRange().Conjoin(pResource->DirtyRange());
     pResource->DirtyRange().Clear();
 
+    // NV-DXVK start: sequence-tracked lock waits - the upload copy reads the mapping buffer
+    TrackBufferMappingBufferSequenceNumber(pResource);
+    // NV-DXVK end
+
     ConsiderFlush(GpuFlushType::ImplicitWeakHint);
 
     return D3D_OK;
@@ -5288,6 +5418,20 @@ namespace dxvk {
 
     m_csThread.synchronize(DxvkCsThread::SynchronizeAll);
   }
+
+
+  // NV-DXVK start: sequence-tracked lock waits
+  void D3D9DeviceEx::SynchronizeCsThread(uint64_t SequenceNumber) {
+    ScopedCpuProfileZone();
+    D3D9DeviceLock lock = LockDevice();
+
+    // The pending chunk (GetCurrentSequenceNumber() == m_csSeqNum + 1) only needs dispatching if it is the one waited for.
+    if (SequenceNumber == DxvkCsThread::SynchronizeAll || SequenceNumber > m_csSeqNum)
+      FlushCsChunk();
+
+    m_csThread.synchronize(SequenceNumber);
+  }
+  // NV-DXVK end
 
 
   void D3D9DeviceEx::SetupFPU() {
@@ -6936,6 +7080,14 @@ namespace dxvk {
     if (pQuery->GetType() == D3DQUERYTYPE_OCCLUSION) {
       m_rtx.BeginOcclusionQuery();
       pQuery->SetRtxOcclusionBracketId(m_rtx.GetCurrentOcclusionBracketId());
+
+      // Conservative occlusion queries synthesise the readback and ignore the bracketed test draws,
+      // so the Vulkan query would measure an empty scope.
+      const bool skipGpuQuery = m_rtx.ConservativeOcclusionQueriesEnabled();
+      pQuery->SetGpuQuerySkipped(skipGpuQuery);
+      if (skipGpuQuery) {
+        return;
+      }
     }
     // NV-DXVK end
 
@@ -6953,11 +7105,15 @@ namespace dxvk {
     if (pQuery->GetType() == D3DQUERYTYPE_OCCLUSION) {
       m_rtx.EndOcclusionQuery();
     }
-    // NV-DXVK end
 
-    EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
-      cQuery->End(ctx);
-    });
+    if (pQuery->IsGpuQuerySkipped()) {
+      pQuery->SkipGpuEnd();
+    } else {
+      EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
+        cQuery->End(ctx);
+      });
+    }
+    // NV-DXVK end
 
     pQuery->NotifyEnd();
     if (unlikely(pQuery->IsEvent())) {
@@ -7637,6 +7793,7 @@ namespace dxvk {
         cDstLayers = dstSubresourceLayers,
         cSrcLayers = srcSubresourceLayers
       ] (DxvkContext* ctx) {
+        ScopedGpuProfileZone(ctx, "ResolveZ copy");
         ctx->copyImage(
           cDstImage, cDstLayers, VkOffset3D { 0, 0, 0 },
           cSrcImage, cSrcLayers, VkOffset3D { 0, 0, 0 },

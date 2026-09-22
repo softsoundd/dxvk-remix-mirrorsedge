@@ -22,6 +22,10 @@
 #include "dxvk_device.h"
 #include "dxvk_queue.h"
 #include "dxvk_scoped_annotation.h"
+// NV-DXVK start: CPU frame breakdown for the built-in pass timer
+#include "dxvk_objects.h"
+#include "rtx_render/rtx_gpu_pass_timer.h"
+// NV-DXVK end
 
 // NV-DXVK start: Nsight Graphics capture
 #include "rtx_render/rtx_nsight_capture.h"
@@ -63,9 +67,17 @@ namespace dxvk {
     ScopedCpuProfileZone();
     std::unique_lock<dxvk::mutex> lock(m_mutex);
 
-    m_finishCond.wait(lock, [this] {
-      return m_submitQueue.size() + m_finishQueue.size() <= MaxNumQueuedCommandBuffers;
-    });
+    {
+      // NV-DXVK start: CPU frame breakdown for the built-in pass timer - back-pressure from the
+      // command buffer queue: the recording thread (CS) stalls here while MaxNumQueuedCommandBuffers
+      // command lists are still queued or executing on the GPU.
+      RtxGpuPassTimer::CpuScope backpressureScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
+                                                  RtxGpuPassTimer::CpuCounter::CsSubmitBackpressure);
+      // NV-DXVK end
+      m_finishCond.wait(lock, [this] {
+        return m_submitQueue.size() + m_finishQueue.size() <= MaxNumQueuedCommandBuffers;
+      });
+    }
 
     DxvkSubmitEntry entry = { };
     entry.submit = std::move(submitInfo);
@@ -212,9 +224,15 @@ namespace dxvk {
             reflex.beginRendering(entry.submit.cachedReflexFrameId);
           }
 
-          status = entry.submit.cmdList->submit(
-            entry.submit.waitSync,
-            entry.submit.wakeSync);
+          {
+            // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+            RtxGpuPassTimer::CpuScope submitScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
+                                                  RtxGpuPassTimer::CpuCounter::SubmitQueueSubmit);
+            // NV-DXVK end
+            status = entry.submit.cmdList->submit(
+              entry.submit.waitSync,
+              entry.submit.wakeSync);
+          }
 
           if (entry.submit.insertReflexRenderMarkers) {
             reflex.endRendering(entry.submit.cachedReflexFrameId);
@@ -244,7 +262,13 @@ namespace dxvk {
           // NV-DXVK end
 
           // m_device->vkd()->vkQueueWaitIdle(m_device->queues().graphics.queueHandle);
-          status = entry.present.presenter->presentImage(&entry.status->result, entry.present, m_currentFrameInterpolationData, cachedAcquiredImageIndex);
+          {
+            // NV-DXVK start: CPU frame breakdown for the built-in pass timer
+            RtxGpuPassTimer::CpuScope presentScope(RtxGpuPassTimer::isEnabled() ? &m_device->getCommon()->metaGpuPassTimer() : nullptr,
+                                                   RtxGpuPassTimer::CpuCounter::SubmitQueuePresent);
+            // NV-DXVK end
+            status = entry.present.presenter->presentImage(&entry.status->result, entry.present, m_currentFrameInterpolationData, cachedAcquiredImageIndex);
+          }
           // if both submit and DLFG+present run on the same queue, then we need to wait for present to avoid racing on the queue
 #if __DLFG_USE_GRAPHICS_QUEUE
           entry.present.presenter->synchronize();

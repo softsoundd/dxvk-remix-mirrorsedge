@@ -22,6 +22,10 @@
 #include <limits>
 #include <mutex>
 #include <vector>
+#include <algorithm>
+#include <iomanip>
+#include <iterator>
+#include <sstream>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -472,6 +476,13 @@ namespace dxvk {
       ? input.positionBuffer.stride()
       : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
 
+    // NV-DXVK start: batched geometry interleaving
+    // The GPU interleave can be deferred to scene preparation unless something consumes the output
+    // earlier in the frame: the skinning dispatch (recorded right after this on its own context) reads it.
+    const bool deferGpuInterleave =
+      !(drawCallState.getSkinningState().numBones > 0 && input.numBonesPerVertex > 0);
+    // NV-DXVK end
+
     switch (result) {
       case ObjectCacheState::KBuildBVH: {
         // Set up the ideal vertex params, if input vertices are interleaved, it's safe to assume the positionBuffer stride is the vertex stride
@@ -506,7 +517,7 @@ namespace dxvk {
         info.size = align(vertexBufferSize, CACHE_LINE_SIZE);
         output.historyBuffer[0] = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
 
-        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
+        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals, deferGpuInterleave);
 
         break;
       }
@@ -534,7 +545,8 @@ namespace dxvk {
           output.historyBuffer[0] = m_device->createBuffer(output.historyBuffer[1]->info(), memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
         } 
 
-        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
+        // The history invalidation below copies the freshly written buffer, so it cannot be deferred then.
+        RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals, deferGpuInterleave && !invalidateHistory);
 
         // Sometimes, we need to invalidate history, do that here by copying the current buffer to the previous..
         if (invalidateHistory) {
@@ -568,6 +580,12 @@ namespace dxvk {
 
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK start: batched smooth normals
+    // Normally drained by prepareSceneData; frames that skipped scene preparation (no valid camera,
+    // shaders still compiling) must not leave a geometry with its normals never smoothed.
+    m_device->getCommon()->metaGeometryUtils().flushSmoothNormals(ctx);
+    // NV-DXVK end
 
     // NGX: no RT scene - keep camera onFrameEnd for DLSS/MV history only.
     if (!raytracedThisFrame && RtxNgxPassthrough::ngxPassthroughMode()) {
@@ -1553,7 +1571,7 @@ namespace dxvk {
     
     assert(result == ObjectCacheState::KBuildBVH);
 
-    pBlas->frameLastUpdated = m_device->getCurrentFrameId();
+    pBlas->markUpdated(m_device->getCurrentFrameId());
     m_instanceManager.notifySceneChanged();
 
     return result;
@@ -1572,7 +1590,7 @@ namespace dxvk {
     assert(result != ObjectCacheState::KBuildBVH);
 
     if (result == ObjectCacheState::kUpdateBVH) {
-      pBlas->frameLastUpdated = m_device->getCurrentFrameId();
+      pBlas->markUpdated(m_device->getCurrentFrameId());
       m_instanceManager.notifySceneChanged();
     }
     
@@ -1747,6 +1765,134 @@ namespace dxvk {
     textureManager.addTexture(inputTexture, stamp, async, textureIndex);
   }
 
+  // NV-DXVK start: dynamic geometry diagnostics
+  void SceneManager::recordDynamicGeometry(const DrawCallState& drawCallState, const BlasEntry* pBlas, ObjectCacheState result,
+                                           const GeometryHashes& previousHashes, XXH64_hash_t previousBoneHash, bool isNew) {
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (m_dynamicGeometryStats.empty() && m_dynamicGeometryStatsTotalBuilds == 0 && m_dynamicGeometryStatsTotalUpdates == 0) {
+      m_dynamicGeometryStatsFirstFrame = frameId;
+    }
+
+    if (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) {
+      const RasterGeometry& geometry = drawCallState.getGeometryData();
+      DynamicGeometryStat& stat = m_dynamicGeometryStats[pBlas];
+      stat.vertexCount = geometry.vertexCount;
+      stat.indexCount = geometry.indexCount;
+      stat.numBones = drawCallState.getSkinningState().numBones;
+      stat.smoothNormals = drawCallState.getCategoryFlags().test(InstanceCategories::SmoothNormals);
+      stat.decomposedInstance = drawCallState.decomposedInstanceId != kEmptyHash;
+      stat.passDescription = drawCallState.ue3PassDescription != nullptr ? drawCallState.ue3PassDescription : "";
+      stat.materialHash = drawCallState.getMaterialData().getHash();
+      stat.vertexShaderHash = drawCallState.programmableVertexShaderBytecodeHash;
+      stat.indexHash = geometry.hashes[HashComponents::Indices];
+      stat.categories = drawCallState.getCategoryFlags();
+
+      if (result == ObjectCacheState::KBuildBVH) {
+        ++stat.builds;
+        ++m_dynamicGeometryStatsTotalBuilds;
+      } else {
+        ++stat.updates;
+        ++m_dynamicGeometryStatsTotalUpdates;
+      }
+
+      if (!isNew) {
+        if (previousHashes[HashComponents::VertexPosition] != geometry.hashes[HashComponents::VertexPosition]) {
+          ++stat.positionChanges;
+        }
+        if (previousHashes[HashComponents::VertexShader] != geometry.hashes[HashComponents::VertexShader]) {
+          ++stat.vertexShaderChanges;
+        }
+        if (previousHashes[HashComponents::Indices] != geometry.hashes[HashComponents::Indices]) {
+          ++stat.indexChanges;
+        }
+        if (previousBoneHash != drawCallState.getSkinningState().boneHash) {
+          ++stat.boneChanges;
+        }
+      }
+    }
+
+    constexpr uint32_t kReportIntervalFrames = 300;
+    if (frameId - m_dynamicGeometryStatsFirstFrame >= kReportIntervalFrames) {
+      reportDynamicGeometryStats();
+      m_dynamicGeometryStatsFirstFrame = frameId;
+    }
+  }
+
+  void SceneManager::reportDynamicGeometryStats() {
+    const uint32_t frames = std::max(m_device->getCurrentFrameId() - m_dynamicGeometryStatsFirstFrame, 1u);
+
+    std::vector<std::pair<const BlasEntry*, const DynamicGeometryStat*>> ordered;
+    ordered.reserve(m_dynamicGeometryStats.size());
+    for (const auto& entry : m_dynamicGeometryStats) {
+      ordered.emplace_back(entry.first, &entry.second);
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+      const uint32_t ea = a.second->builds + a.second->updates;
+      const uint32_t eb = b.second->builds + b.second->updates;
+      if (ea != eb) {
+        return ea > eb;
+      }
+      return a.second->vertexCount > b.second->vertexCount;
+    });
+
+    std::ostringstream out;
+    out << "[RTX-DynamicGeometry] " << frames << " frames: " << m_dynamicGeometryStatsTotalBuilds << " BLAS builds, "
+        << m_dynamicGeometryStatsTotalUpdates << " BLAS refits ("
+        << std::fixed << std::setprecision(1)
+        << (static_cast<float>(m_dynamicGeometryStatsTotalBuilds + m_dynamicGeometryStatsTotalUpdates) / static_cast<float>(frames))
+        << " per frame) across " << ordered.size() << " geometries. Top entries (events per frame):\n";
+    out << "  per-frm  bld  upd |  pos   vs bone  idx |    vtx    idx bones smth dcmp  pass                   vs hash            material           indices\n";
+
+    constexpr size_t kMaxRows = 40;
+    for (size_t i = 0; i < std::min(ordered.size(), kMaxRows); ++i) {
+      const DynamicGeometryStat& s = *ordered[i].second;
+      out << "  " << std::setw(7) << std::setprecision(2) << (static_cast<float>(s.builds + s.updates) / static_cast<float>(frames))
+          << ' ' << std::setw(4) << s.builds << ' ' << std::setw(4) << s.updates
+          << " | " << std::setw(4) << s.positionChanges << ' ' << std::setw(4) << s.vertexShaderChanges
+          << ' ' << std::setw(4) << s.boneChanges << ' ' << std::setw(4) << s.indexChanges
+          << " | " << std::setw(6) << s.vertexCount << ' ' << std::setw(6) << s.indexCount
+          << ' ' << std::setw(5) << s.numBones << ' ' << std::setw(4) << (s.smoothNormals ? 'y' : '.')
+          << ' ' << std::setw(4) << (s.decomposedInstance ? 'y' : '.')
+          << "  " << std::left << std::setw(22) << s.passDescription << std::right
+          << " 0x" << std::hex << std::setw(16) << std::setfill('0') << s.vertexShaderHash
+          << " 0x" << std::setw(16) << s.materialHash
+          << " 0x" << std::setw(16) << s.indexHash << std::dec << std::setfill(' ');
+
+      // Note the categories that usually explain per-frame motion.
+      constexpr size_t kFlagCount = 9;
+      const char* flagNames[kFlagCount] = { "Particle", "ViewModel", "PlayerModel", "PlayerBody", "Decal", "Sky", "Hidden", "Beam", "Terrain" };
+      const bool flags[kFlagCount] = {
+        s.categories.test(InstanceCategories::Particle),
+        s.categories.test(InstanceCategories::ViewModel),
+        s.categories.test(InstanceCategories::ThirdPersonPlayerModel),
+        s.categories.test(InstanceCategories::ThirdPersonPlayerBody),
+        s.categories.any(DECAL_CATEGORY_FLAGS),
+        s.categories.test(InstanceCategories::Sky),
+        s.categories.test(InstanceCategories::Hidden),
+        s.categories.test(InstanceCategories::Beam),
+        s.categories.test(InstanceCategories::Terrain),
+      };
+      bool first = true;
+      for (size_t f = 0; f < kFlagCount; ++f) {
+        if (flags[f]) {
+          out << (first ? "  [" : ",") << flagNames[f];
+          first = false;
+        }
+      }
+      if (!first) {
+        out << ']';
+      }
+      out << '\n';
+    }
+
+    Logger::info(out.str());
+
+    m_dynamicGeometryStats.clear();
+    m_dynamicGeometryStatsTotalBuilds = 0;
+    m_dynamicGeometryStatsTotalUpdates = 0;
+  }
+  // NV-DXVK end
+
   RtInstance* SceneManager::processDrawCallState(const Rc<DxvkContext>& ctx, const DrawCallState& drawCallState, const MaterialData& renderMaterialData, ReplacementInstance& replacementInstance, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
@@ -1761,14 +1907,33 @@ namespace dxvk {
 
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
+    // NV-DXVK start: dynamic geometry diagnostics
+    const bool logDynamicGeometry = RtxOptions::logDynamicGeometryStats();
+    GeometryHashes previousHashes;
+    XXH64_hash_t previousBoneHash = kEmptyHash;
+    bool isNewObject = false;
+    // NV-DXVK end
     if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
+      // NV-DXVK start: dynamic geometry diagnostics
+      if (logDynamicGeometry) {
+        previousHashes = pBlas->modifiedGeometryData.hashes;
+        previousBoneHash = pBlas->modifiedGeometryData.lastBoneHash;
+      }
+      // NV-DXVK end
       result = onSceneObjectUpdated(ctx, drawCallState, pBlas);
     } else {
+      isNewObject = true;
       result = onSceneObjectAdded(ctx, drawCallState, pBlas);
     }
     
     assert(pBlas != nullptr);
     assert(result != ObjectCacheState::kInvalid);
+
+    // NV-DXVK start: dynamic geometry diagnostics
+    if (logDynamicGeometry) {
+      recordDynamicGeometry(drawCallState, pBlas, result, previousHashes, previousBoneHash, isNewObject);
+    }
+    // NV-DXVK end
 
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
@@ -1785,7 +1950,7 @@ namespace dxvk {
       pBlas->modifiedGeometryData.smoothNormalsApplied = true;
       // dispatchSmoothNormals() changes the vertex buffers, which need to be re-synced.
       syncLinkedInstances(pBlas);
-      pBlas->frameLastUpdated = pBlas->frameLastTouched;
+      pBlas->markUpdated(pBlas->frameLastTouched);
       m_instanceManager.notifySceneChanged();
     }
 
@@ -1793,7 +1958,7 @@ namespace dxvk {
         drawCallState.getGeometryData().numBonesPerVertex > 0 &&
         (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
       m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
-      pBlas->frameLastUpdated = pBlas->frameLastTouched;
+      pBlas->markUpdated(pBlas->frameLastTouched);
       m_instanceManager.notifySceneChanged();
     }
 
@@ -2514,6 +2679,11 @@ namespace dxvk {
 
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
+
+    // NV-DXVK start: batched smooth normals
+    // All draw calls of the frame have been processed; record their smooth-normal passes in one batch.
+    m_device->getCommon()->metaGeometryUtils().flushSmoothNormals(ctx);
+    // NV-DXVK end
 
   #ifdef REMIX_DEVELOPMENT
     if (m_device->getCurrentFrameId() == RtxOptions::dumpAllInstancesOnFrame()) {

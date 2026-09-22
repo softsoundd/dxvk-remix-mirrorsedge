@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <algorithm>
 #include <assert.h>
 #include <cstring>
 #include <mutex>
@@ -86,12 +87,19 @@ namespace dxvk {
   }
 
   void AccelManager::removeInstanceFromBucketCache(RtInstance* instance) {
-    if (m_instanceBucketIndex.erase(instance) == 0) {
+    auto it = m_instanceBucketIndex.find(instance);
+    if (it == m_instanceBucketIndex.end()) {
       return;
     }
 
-    m_cachedBuckets.clear();
-    m_instanceBucketIndex.clear();
+    // Only the bucket that held the instance needs rebuilding; dropping the whole cache made any
+    // instance destruction (an expiring particle is enough) re-route every instance next frame. The
+    // bucket is flagged rather than edited so its now-dangling pointer is never read.
+    const uint32_t bucketIndex = it->second;
+    m_instanceBucketIndex.erase(it);
+    if (bucketIndex < m_cachedBuckets.size()) {
+      m_cachedBuckets[bucketIndex].forceDirty = true;
+    }
     m_lastProcessedGeneration = UINT64_MAX;
   }
 
@@ -157,7 +165,116 @@ namespace dxvk {
     return uint32_t(std::max(g_blasCount, 0));
   }
 
-  bool AccelManager::BlasBucket::tryAddInstance(RtInstance* instance) {
+  // NV-DXVK start: churn-aware bucketing
+  bool AccelManager::isInstanceChurning(const RtInstance* instance, uint32_t currentFrame) {
+    return instance->isTransformChurning(currentFrame) ||
+           instance->getBlas()->isGeometryChurning(currentFrame) ||
+           instance->isCreatedRecently(currentFrame, BlasEntry::kChurnHoldFrames);
+  }
+
+  AccelManager::BlasBucketKey AccelManager::cachedBucketKey(const CachedBucketState& bucket) {
+    BlasBucketKey key = {};
+    key.instanceMask = bucket.tlasInstance.mask;
+    key.instanceShaderBindingTableRecordOffset = bucket.tlasInstance.instanceShaderBindingTableRecordOffset;
+    key.customIndexFlags = bucket.tlasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
+    key.instanceFlags = bucket.tlasInstance.flags;
+    key.usesUnorderedApproximations = bucket.isUnordered;
+    key.isSubsurface = bucket.hasSssInstances;
+    key.churning = bucket.churning;
+    return key;
+  }
+
+  void AccelManager::noteBucketDirty(const CachedBucketState& bucket, BucketDirtyReason reason, const RtInstance* inst, uint32_t currentFrame) {
+    if (!RtxOptions::logDynamicGeometryStats()) {
+      return;
+    }
+
+    m_bucketStats.bucketsDirty++;
+    m_bucketStats.instancesInDirtyBuckets += bucket.instances.size();
+    if (!bucket.churning) {
+      m_bucketStats.staticBucketsDirty++;
+    }
+    m_bucketStats.reasons[static_cast<size_t>(reason)]++;
+
+    if (inst != nullptr) {
+      // Key offenders by material + geometry so repeated hits from the same object aggregate.
+      const XXH64_hash_t key = inst->getMaterialHash() ^ (inst->getBlas()->modifiedGeometryData.hashes[HashComponents::VertexPosition] * 0x9E3779B97F4A7C15ull);
+      BucketDirtyOffender& offender = m_bucketStats.offenders[key];
+      offender.prims = inst->getBlas()->modifiedGeometryData.calculatePrimitiveCount();
+      offender.hits++;
+      if (inst->getFrameLastTransformChanged() == currentFrame) {
+        offender.transformHits++;
+      }
+      offender.bucketInstances = std::max<uint32_t>(offender.bucketInstances, static_cast<uint32_t>(bucket.instances.size()));
+      offender.churnBucket = bucket.churning;
+    }
+  }
+
+  void AccelManager::reportBucketStats(uint32_t currentFrame) {
+    if (!RtxOptions::logDynamicGeometryStats()) {
+      if (m_bucketStats.frames != 0) {
+        m_bucketStats = BucketStats {};
+      }
+      return;
+    }
+
+    BucketStats& s = m_bucketStats;
+    if (s.firstFrame == kInvalidFrameIndex) {
+      s.firstFrame = currentFrame;
+    }
+    s.frames++;
+    s.bucketsScanned += m_cachedBuckets.size();
+
+    constexpr uint32_t kReportIntervalFrames = 300;
+    if (s.frames < kReportIntervalFrames) {
+      return;
+    }
+
+    uint32_t churnBuckets = 0;
+    uint64_t churnInstances = 0;
+    uint64_t staticInstances = 0;
+    for (const CachedBucketState& cached : m_cachedBuckets) {
+      if (cached.churning) {
+        churnBuckets++;
+        churnInstances += cached.instances.size();
+      } else {
+        staticInstances += cached.instances.size();
+      }
+    }
+
+    const double invFrames = 1.0 / static_cast<double>(s.frames);
+    Logger::info(str::format(
+      "[BLAS-Buckets] frames ", s.firstFrame, "-", currentFrame,
+      ": buckets/frame=", static_cast<double>(s.bucketsScanned) * invFrames,
+      " (now ", m_cachedBuckets.size(), ", churn ", churnBuckets, " holding ", churnInstances, " inst, static holding ", staticInstances, " inst)",
+      " dirty/frame=", static_cast<double>(s.bucketsDirty) * invFrames,
+      " staticDirty/frame=", static_cast<double>(s.staticBucketsDirty) * invFrames,
+      " instRerouted/frame=", static_cast<double>(s.instancesInDirtyBuckets) * invFrames,
+      " reasons[removed=", s.reasons[0], " identity=", s.reasons[1], " instDirty=", s.reasons[2], " geomUpdated=", s.reasons[3], " keyChanged=", s.reasons[4], " consolidation=", s.reasons[5], "]"));
+
+    // Top offenders by hits, static buckets first since those are the expensive ones.
+    std::vector<std::pair<XXH64_hash_t, BucketDirtyOffender>> sorted(s.offenders.begin(), s.offenders.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+      if (a.second.churnBucket != b.second.churnBucket) {
+        return !a.second.churnBucket;
+      }
+      return a.second.hits > b.second.hits;
+    });
+    const size_t shown = std::min<size_t>(sorted.size(), 12);
+    for (size_t i = 0; i < shown; ++i) {
+      const BucketDirtyOffender& o = sorted[i].second;
+      Logger::info(str::format(
+        "[BLAS-Buckets]   key=", std::hex, sorted[i].first, std::dec,
+        " hits=", o.hits, " transformHits=", o.transformHits,
+        " prims=", o.prims, " bucketInst=", o.bucketInstances,
+        o.churnBucket ? " (churn bucket)" : " (STATIC bucket)"));
+    }
+
+    m_bucketStats = BucketStats {};
+  }
+  // NV-DXVK end
+
+  bool AccelManager::BlasBucket::tryAddInstance(RtInstance* instance, bool instanceChurning) {
     const uint8_t geometryInstanceMask = instance->getVkInstance().mask;
     const uint32_t geometryCustomIndexFlags = instance->getVkInstance().instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
     const bool geometryUsesUnorderedApproximations = instance->usesUnorderedApproximations();
@@ -183,6 +300,9 @@ namespace dxvk {
       if (hasSssInstances != instance->isSubsurface()) {
         return false;
       }
+      if (churning != instanceChurning) {
+        return false;
+      }
     }
 
     BlasEntry* blasEntry = instance->getBlas();
@@ -203,6 +323,7 @@ namespace dxvk {
     instanceFlags = geometryInstanceFlags;
     usesUnorderedApproximations = geometryUsesUnorderedApproximations;
     hasSssInstances = instance->isSubsurface();
+    churning = instanceChurning;
     return true;
   }
 
@@ -515,6 +636,7 @@ namespace dxvk {
     bool anyBucketDirty = false;
 
     if (hasValidBucketCache) {
+      ScopedCpuProfileZoneN("BLAS: bucket dirty scan");
       // When newly built OMMs need binding, force all buckets dirty so that
       // tryBindOpacityMicromap runs on every instance's BLAS rebuild.
       if (m_ommBindPending) {
@@ -528,9 +650,13 @@ namespace dxvk {
         for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
           const auto& cachedBucket = m_cachedBuckets[bi];
 
-          if (cachedBucket.instances.size() != cachedBucket.instanceCacheIdentities.size()) {
+          // Checked before anything else: a bucket flagged by removeInstanceFromBucketCache holds
+          // a pointer to a destroyed instance.
+          if (cachedBucket.forceDirty ||
+              cachedBucket.instances.size() != cachedBucket.instanceCacheIdentities.size()) {
             bucketDirty[bi] = true;
             anyBucketDirty = true;
+            noteBucketDirty(cachedBucket, BucketDirtyReason::InstanceRemoved, nullptr, currentFrame);
             continue;
           }
 
@@ -545,12 +671,14 @@ namespace dxvk {
             if (currentInstanceSet.find(inst) == currentInstanceSet.end()) {
               bucketDirty[bi] = true;
               anyBucketDirty = true;
+              noteBucketDirty(cachedBucket, BucketDirtyReason::InstanceRemoved, nullptr, currentFrame);
               break;
             }
 
             if (inst->getCacheIdentity() != cachedBucket.instanceCacheIdentities[ii]) {
               bucketDirty[bi] = true;
               anyBucketDirty = true;
+              noteBucketDirty(cachedBucket, BucketDirtyReason::IdentityChanged, nullptr, currentFrame);
               break;
             }
 
@@ -561,18 +689,50 @@ namespace dxvk {
               inst->getVkInstance().flags != cachedBucket.tlasInstance.flags ||
               customIndexFlags != cachedBucket.tlasInstance.instanceCustomIndex ||
               inst->usesUnorderedApproximations() != cachedBucket.isUnordered ||
-              inst->isSubsurface() != cachedBucket.hasSssInstances;
+              inst->isSubsurface() != cachedBucket.hasSssInstances ||
+              isInstanceChurning(inst, currentFrame) != cachedBucket.churning;
 
             if (inst->isBlasDirty() ||
                 inst->getBlas()->frameLastUpdated == currentFrame ||
                 bucketKeyChanged) {
               bucketDirty[bi] = true;
               anyBucketDirty = true;
+              noteBucketDirty(cachedBucket,
+                              inst->isBlasDirty() ? BucketDirtyReason::InstanceDirty :
+                              bucketKeyChanged ? BucketDirtyReason::KeyChanged : BucketDirtyReason::GeometryUpdated,
+                              inst, currentFrame);
               break;
             }
           }
         }
+
+        // NV-DXVK start: bucket consolidation
+        // Instances that appear, or whose key changes, are routed into a fresh bucket rather than
+        // merged into a clean cached one, so buckets sharing a key accumulate over time and each
+        // costs a TLAS instance and a BLAS. Once a key has too many clean buckets, dirty them all
+        // for one frame so they merge back into a single bucket.
+        {
+          constexpr size_t kMaxCleanBucketsPerKey = 16;
+          std::unordered_map<BlasBucketKey, std::vector<uint32_t>, BlasBucketKeyHash> cleanBucketsPerKey;
+          for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
+            if (!bucketDirty[bi]) {
+              cleanBucketsPerKey[cachedBucketKey(m_cachedBuckets[bi])].push_back(bi);
+            }
+          }
+          for (const auto& [key, bucketIndices] : cleanBucketsPerKey) {
+            if (bucketIndices.size() > kMaxCleanBucketsPerKey) {
+              for (const uint32_t bi : bucketIndices) {
+                bucketDirty[bi] = true;
+                noteBucketDirty(m_cachedBuckets[bi], BucketDirtyReason::Consolidation, nullptr, currentFrame);
+              }
+              anyBucketDirty = true;
+            }
+          }
+        }
+        // NV-DXVK end
       }
+
+      reportBucketStats(currentFrame);
     } else {
       // With no cached buckets, every bucket is built from scratch below, so
       // pending OMM binding invalidation is naturally consumed by the full pass.
@@ -652,6 +812,8 @@ namespace dxvk {
     // Hash map for O(1) bucket lookup instead of O(buckets) linear search per instance
     std::unordered_map<BlasBucketKey, BlasBucket*, BlasBucketKeyHash> bucketMap;
 
+    { // profiling scope
+    ScopedCpuProfileZoneN("BLAS: route instances");
     for (RtInstance* instance : instances) {
       if (instance->isHidden()) {
         continue;
@@ -724,16 +886,29 @@ namespace dxvk {
       const uint32_t maxPrimsForMergedBLAS = RtxOptions::maxPrimsInMergedBLAS();
       const uint32_t blasPrims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
 
+      // NV-DXVK start: per-frame dynamic geometry routing
+      // Geometry whose vertex data changed on consecutive frames is animating (UE3 GPU-skinned meshes
+      // arrive with numBones == 0 because vertex capture bakes the bones in). In a merged bucket it
+      // would force the bucket, static neighbours included, to be rebuilt every frame; a dynamic BLAS
+      // is refitted instead. Very small meshes stay merged, where the per-BLAS overhead would outweigh
+      // their share of a bucket rebuild.
+      const uint32_t minPrimsForPerFrameDynamicBLAS = 64u;
+      const bool animatesEveryFrame = blasEntry->updatedOnConsecutiveFrames(currentFrame) &&
+                                      blasEntry->buildGeometries.size() == 1 &&
+                                      blasPrims >= minPrimsForPerFrameDynamicBLAS;
+      // NV-DXVK end
+
       // Figure out if this blas should be a dynamic one
       const bool requestDynamicBlas = instance->surface.instancesToObject != nullptr ||    // Point instancer geometry is replicated many times in a scene, we want to reuse the BLAS memory for these objects
                                       blasEntry->input.getSkinningState().numBones != 0 || // Skinned meshes are always desirable to give a dynamic BLAS, since we'll want to make use of BVH update for performance reasons
                                       blasEntry->getLinkedInstances().size() > 1  ||       // Meshes that are used in instances multiple times should benefit from BLAS reuse
                                       blasEntry->dynamicBlas != nullptr ||                 // If we already have a dynamic BLAS, keep using it.
                                       blasPrims > maxPrimsForMergedBLAS ||                 // Avoid large meshes ending up in the merged BLAS which is built every frame.  # prims is proportional to build cost.
+                                      animatesEveryFrame ||                                // Per-frame animated geometry is refitted in its own BLAS instead of churning a merged bucket.
                                       RtxOptions::minimizeBlasMerging();                   // Option to attempt putting as many objects into dynamic BLAS as possible.
 
       const bool forceMergedBlas = (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
-                                    (!RtxOptions::minimizeBlasMerging() && blasPrims < minPrimsInDynamicBLAS) ||   // Avoid creating lots of small dynamic BLAS
+                                    (!RtxOptions::minimizeBlasMerging() && blasPrims < minPrimsInDynamicBLAS && !animatesEveryFrame) ||   // Avoid creating lots of small dynamic BLAS
                                     RtxOptions::forceMergeAllMeshes()) &&                                          // Setting to force all meshes into the merged BLAS
                                       instance->surface.instancesToObject == nullptr;                              // Never merge point instancer geometry
 
@@ -781,17 +956,18 @@ namespace dxvk {
         bucketKey.instanceFlags = instance->getVkInstance().flags;
         bucketKey.usesUnorderedApproximations = instance->usesUnorderedApproximations();
         bucketKey.isSubsurface = instance->isSubsurface();
+        bucketKey.churning = isInstanceChurning(instance, currentFrame);
 
         bool merged = false;
         auto bucketIt = bucketMap.find(bucketKey);
         if (bucketIt != bucketMap.end()) {
-          merged = bucketIt->second->tryAddInstance(instance);
+          merged = bucketIt->second->tryAddInstance(instance, bucketKey.churning);
         }
 
         // The instance couldn't be merged into any bucket - make a new one
         if (!merged) {
           auto newBucket = std::make_unique<BlasBucket>();
-          merged = newBucket->tryAddInstance(instance);
+          merged = newBucket->tryAddInstance(instance, bucketKey.churning);
           assert(merged);
 
           bucketMap[bucketKey] = newBucket.get();
@@ -802,8 +978,11 @@ namespace dxvk {
         trackBlasBuildResources(ctx, execBarriers, blasEntry);
       }
     }
+    }
 
     // Build/Update the dynamic BLAS
+    { // profiling scope
+    ScopedCpuProfileZoneN("BLAS: dynamic BLAS setup");
     for (uint32_t uniqueBlasIdx = 0; uniqueBlasIdx < m_uniqueDynamicBlasCount; ++uniqueBlasIdx) {
       const UniqueBlasInstances& uniqueBlasEntry = m_uniqueDynamicBlas[uniqueBlasIdx];
       BlasEntry* blasEntry = uniqueBlasEntry.blasEntry;
@@ -936,6 +1115,7 @@ namespace dxvk {
       // Track the lifetime and states of the source geometry buffers
       trackBlasBuildResources(ctx, execBarriers, blasEntry);
     }
+    }
 
     // Copy the instance transform data to the device (only needed on full rebuild path;
     // dynamics-only path doesn't populate instanceTransforms for merged instances)
@@ -960,6 +1140,8 @@ namespace dxvk {
     // Clean cached buckets: restore surfaces + TLAS instances directly, touch BLAS.
     // Dirty/new buckets: their surfaces were already added by the main loop via
     // the bucket pipeline; their TLAS instances will be emitted by createBlasBuffersAndInstances.
+    { // profiling scope
+    ScopedCpuProfileZoneN("BLAS: restore buckets + prefix sums");
     if (hasValidBucketCache) {
       for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
         if (bucketDirty[bi]) {
@@ -1031,6 +1213,7 @@ namespace dxvk {
         ") representable in ", PRIMITIVE_INDEX_BIT_COUNT, " bits. "
         "Downstream systems (NEE cache, prefix-sum lookups) may produce incorrect results.")));
     }
+    }
 
     buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager, 
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild,
@@ -1054,6 +1237,7 @@ namespace dxvk {
     // Rebuild the cached bucket list: keep clean buckets as-is, replace dirty
     // buckets with fresh data from this frame's blasBuckets.
     {
+      ScopedCpuProfileZoneN("BLAS: cache buckets");
       // Start with clean buckets from the previous cache
       std::vector<CachedBucketState> newCachedBuckets;
       m_instanceBucketIndex.clear();
@@ -1087,6 +1271,7 @@ namespace dxvk {
         cached.indexOffsets = bucket->indexOffsets;
         cached.isUnordered = bucket->usesUnorderedApproximations;
         cached.hasSssInstances = bucket->hasSssInstances;
+        cached.churning = bucket->churning;
 
         // Capture the assigned BLAS (stored on bucket by createBlasBuffersAndInstances)
         if (bucket->assignedBlas) {
