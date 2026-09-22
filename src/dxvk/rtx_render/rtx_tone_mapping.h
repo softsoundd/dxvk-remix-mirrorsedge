@@ -40,32 +40,11 @@ namespace dxvk {
     explicit DxvkToneMapping(DxvkDevice* device);
     ~DxvkToneMapping();
 
-    void dispatch(
-      Rc<RtxContext> ctx,
-      Rc<DxvkSampler> linearSampler,
-      Rc<DxvkImageView> exposureView,
-      const Resources::RaytracingOutput& rtOutput,
-      const float frameTimeMilliseconds,
-      bool resetHistory = false,
-      bool autoExposureEnabled = true);
-
-    void dispatchFastToneMapping(
-      Rc<RtxContext> ctx,
-      Rc<DxvkImageView> exposureView,
-      const Resources::RaytracingOutput& rtOutput,
-      bool autoExposureEnabled);
-
     void dispatchFastToneMapping(
       Rc<RtxContext> ctx,
       Rc<DxvkImageView> exposureView,
       const Resources::Resource& hdrColor,
       const Resources::Resource& ldrOutput,
-      bool autoExposureEnabled);
-
-    void dispatchInverseToneMapping(
-      Rc<RtxContext> ctx,
-      Rc<DxvkImageView> exposureView,
-      const Resources::RaytracingOutput& rtOutput,
       bool autoExposureEnabled);
 
     void dispatchInverseToneMapping(

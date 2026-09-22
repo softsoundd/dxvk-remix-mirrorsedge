@@ -2,7 +2,7 @@
 
 [![Build Status](https://github.com/softsoundd/dxvk-remix-mirrorsedge/actions/workflows/build.yml/badge.svg?branch=mirrors-edge)](https://github.com/softsoundd/dxvk-remix-mirrorsedge/actions/workflows/build.yml)
 
-dxvk-remix is a fork of the [DXVK](https://github.com/doitsujin/dxvk) project, which overhauls the fixed-function graphics pipeline implementation in order to remaster games with path tracing.
+dxvk-remix is a fork of the [DXVK](https://github.com/doitsujin/dxvk) project. On this branch, Mirror's Edge is presented as the game's own raster frame, with DLSS, frame generation, Reflex, and Remix post effects on top.
 
 Thanks to all the contributors to DXVK for creating this foundational piece of software, on top of which we were able to build the RTX Remix Runtime.
 

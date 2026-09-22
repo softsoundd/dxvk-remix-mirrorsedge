@@ -49,21 +49,11 @@ namespace dxvk {
   }
 
   void RtxInitializer::onDestroy() {
-    // Raised before the joins below so the asset loaders abandon their prim walks rather
-    // than running the stage to completion - otherwise quitting while enhancements load
-    // blocks for the whole remaining load and looks like a hang.
     if (auto& replacer = m_device->getCommon()->getSceneManager().getAssetReplacer()) {
       replacer->cancelLoading();
     }
 
     waitForShaderPrewarm();
-
-    if (m_asyncAssetLoadThread.joinable()) {
-      if (!m_assetsLoaded) {
-        Logger::warn("Async asset loading thread is running while device is being destroyed! Attempting to join...");
-      }
-      m_asyncAssetLoadThread.join();
-    }
   }
 
   void RtxInitializer::initialize() {
@@ -138,19 +128,6 @@ namespace dxvk {
     // Kick off shader prewarming
     startPrewarmShaders();
 
-    // Load assets (if any) as early as possible. Passthrough has no replacement scene.
-    if (RtxNgxPassthrough::ngxPassthroughMode()) {
-      Logger::info("[RTX NGX Passthrough] Skipping enhancement asset loading.");
-      m_assetsLoaded = true;
-    } else if (RtxOptions::asyncAssetLoading()) {
-      // Async asset loading (USD)
-      m_asyncAssetLoadThread = dxvk::thread([this] {
-        env::setThreadName("rtx-initialize-assets");
-        loadAssets();
-      });
-    } else {
-      loadAssets();
-    }
     pCommon->metaDLSS(); // Lazy allocator triggers init in ctor
     pCommon->metaDLFG();
 
@@ -172,21 +149,6 @@ namespace dxvk {
 #endif
   }
 
-  void RtxInitializer::loadAssets() {
-    m_assetsLoaded = false;
-
-    Rc<DxvkContext> ctx = m_device->createContext();
-
-    ctx->beginRecording(m_device->createCommandList());
-
-    DxvkObjects* pCommon = m_device->getCommon();
-    pCommon->getSceneManager().initialize(ctx);
-
-    ctx->flushCommandList();
-
-    m_assetsLoaded = true;
-  }
-
   void RtxInitializer::startPrewarmShaders() {
     // If we want to run without shader prewarming, then pipelines will be built inline with other GPU work on first use (typically means
     // long stutters whenever a yet to be compiled pipeline comes into use).
@@ -198,45 +160,11 @@ namespace dxvk {
 
     DxvkObjects* pCommon = m_device->getCommon();
 
-    // NGX passthrough mode: path tracing never runs (rtx.enableRaytracing is forced off), so
-    // only prewarm the shaders the passthrough frame path actually dispatches instead of
-    // spending minutes of background CPU on the path traced frame's pipelines. If the mode
-    // is disabled at runtime the full set is prewarmed then (see ngxPassthroughModeOnChange).
-    if (RtxNgxPassthrough::ngxPassthroughMode()) {
-      pCommon->metaNgxPassthrough().prewarmShaders(pCommon->pipelineManager());
-      pCommon->metaPostFx().prewarmShaders(pCommon->pipelineManager());
-
-      // Non-DLSS upscaler options for the passthrough mode (self-gated on rtx.upscalerType)
-      pCommon->metaTAA().prewarmShaders(pCommon->pipelineManager());
-      pCommon->metaNIS().prewarmShaders(pCommon->pipelineManager());
-
-      return;
-    }
-
-    // Runs once; repeat requests come from a runtime NGX passthrough mode disable and from
-    // the forced onChange replay during initialization.
-    if (m_fullPrewarmStarted) {
-      return;
-    }
-    m_fullPrewarmStarted = true;
-
-    // Prewarm all the shaders we'll need for RT by registering them (per-pass) with the driver
-    pCommon->metaPathtracerGbuffer().prewarmShaders(pCommon->pipelineManager());
-    pCommon->metaPathtracerIntegrateDirect().prewarmShaders(pCommon->pipelineManager());
-    pCommon->metaPathtracerIntegrateIndirect().prewarmShaders(pCommon->pipelineManager());
-
-    pCommon->metaDebugView().prewarmShaders(pCommon->pipelineManager());
-
-    pCommon->metaSparseRendering().prewarmShaders(pCommon->pipelineManager());
-    pCommon->metaReSTIRGIRayQuery().prewarmShaders(pCommon->pipelineManager());
+    // Passthrough is the only frame path. There is no path-tracer shader set to prewarm.
+    pCommon->metaNgxPassthrough().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaPostFx().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaTAA().prewarmShaders(pCommon->pipelineManager());
     pCommon->metaNIS().prewarmShaders(pCommon->pipelineManager());
-    pCommon->metaToneMapping().prewarmShaders(pCommon->pipelineManager());
-    pCommon->metaNeuralRadianceCache().prewarmShaders(pCommon->pipelineManager());
-    pCommon->metaRayReconstruction().prewarmShaders(pCommon->pipelineManager());
-
-    // Prewarm the rest of the pipelines that can be done automatically
-    AutoShaderPipelinePrewarmer::prewarmComputePipelines(pCommon->pipelineManager());
   }
 
   void RtxInitializer::waitForShaderPrewarm() {

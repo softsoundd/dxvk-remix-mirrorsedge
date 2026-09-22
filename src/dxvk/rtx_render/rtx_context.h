@@ -219,31 +219,8 @@ namespace dxvk {
 
     VkExtent3D setDownscaleExtent(const VkExtent3D& upscaleExtent);
 
-    VkExtent3D onInjectRtxFrameBegin(const VkExtent3D& upscaleExtent);
     void onInjectRtxFrameEnd(bool raytracedThisFrame);
 
-    void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
-    void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
-    void dispatchPathTracing(const Resources::RaytracingOutput& rtOutput);
-    void dispatchDemodulate(const Resources::RaytracingOutput& rtOutput);
-    void dispatchNeeCache(const Resources::RaytracingOutput& rtOutput);
-    void dispatchDLSS(const Resources::RaytracingOutput& rtOutput);
-    void dispatchRayReconstruction(const Resources::RaytracingOutput& rtOutput);
-    void dispatchDenoise(const Resources::RaytracingOutput& rtOutput);
-    void dispatchComposite(const Resources::RaytracingOutput& rtOutput);
-    void dispatchReplaceCompositeWithDebugView(const Resources::RaytracingOutput& rtOutput);
-    void dispatchNIS(const Resources::RaytracingOutput& rtOutput);
-    void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
-    void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
-    bool dispatchDlssNR(const Resources::RaytracingOutput& rtOutput);
-    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure = true);
-    void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
-    void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
-    void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
-    void dispatchSRGBDither(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
-    void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
-    void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
-    void dispatchDLFG();
     void dispatchNgxPassthrough(Rc<DxvkImage> targetImage);
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);

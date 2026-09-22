@@ -850,12 +850,6 @@ namespace dxvk {
 
     Rc<DxvkImage>  dstImage  = dstTextureInfo->GetImage();
 
-    // Set up the destination texture from the source texture for RTX use,
-    // but only if the entire texture is updated.
-    if (copyExtent == dstImage->info().extent) {
-      dstTextureInfo->SetupForRtxFrom(srcTextureInfo);
-    }
-
     EmitCs([
       cDstImage   = std::move(dstImage),
       cSrcSlice   = slice.slice,
@@ -902,9 +896,6 @@ namespace dxvk {
 
     if (dstTexInfo->IsAutomaticMip())
       mipLevels = 1;
-
-    // Set up the destination texture from the source texture for RTX use
-    dstTexInfo->SetupForRtxFrom(srcTexInfo);
 
     for (uint32_t a = 0; a < arraySlices; a++) {
       const D3DBOX& box = srcTexInfo->GetDirtyBox(a);
@@ -2695,10 +2686,6 @@ namespace dxvk {
       });
     }
 
-    if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
-      m_rtx.CommitGeometryToRT(drawContext);
-    }
-
     TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
@@ -2752,10 +2739,6 @@ namespace dxvk {
             cBaseVertexIndex, 0);
         }
       });
-    }
-
-    if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
-      m_rtx.CommitGeometryToRT(drawContext);
     }
 
     TrackDrawBufferSequenceNumbers();
@@ -2820,10 +2803,6 @@ namespace dxvk {
       m_state.vertexBuffers[0].vertexBuffer = nullptr;
       m_state.vertexBuffers[0].offset = 0;
       m_state.vertexBuffers[0].stride = 0;
-    }
-
-    if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
-      m_rtx.CommitGeometryToRT(drawContext);
     }
 
     TrackDrawBufferSequenceNumbers();
@@ -2904,10 +2883,6 @@ namespace dxvk {
       m_state.vertexBuffers[0].stride = 0;
 
       m_state.indices = nullptr;
-    }
-
-    if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
-      m_rtx.CommitGeometryToRT(drawContext);
     }
 
     TrackDrawBufferSequenceNumbers();
@@ -5031,10 +5006,6 @@ namespace dxvk {
       subresource.arrayLayer, 1 };
 
     auto convertFormat = pResource->GetFormatMapping().ConversionFormatInfo;
-
-    if (Subresource == 0) {
-      pResource->SetupForRtx();
-    }
 
     if (likely(convertFormat.FormatType == D3D9ConversionFormat_None)) {
       VkImageSubresourceLayers dstLayers = { VK_IMAGE_ASPECT_COLOR_BIT, subresource.mipLevel, subresource.arrayLayer, 1 };

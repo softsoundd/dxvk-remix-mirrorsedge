@@ -4278,11 +4278,6 @@ namespace dxvk {
 
         RemixGui::Checkbox("Enable Triangle Culling (Globally)", &RtxOptions::enableCullingObject());
         RemixGui::Checkbox("Enable Triangle Culling (Override Secondary Rays)", &RtxOptions::enableCullingInSecondaryRaysObject());
-        RemixGui::Checkbox("UE3 Auto Cull Enclosing Mesh Shadow Backfaces", &D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfacesObject());
-        if (D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfaces()) {
-          RemixGui::DragFloat("UE3 Auto Cull Min Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMinExtentMetersObject(), 0.1f, 0.0f, 1000.0f, "%.2f");
-          RemixGui::DragFloat("UE3 Auto Cull Max Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMaxExtentMetersObject(), 1.0f, 1.0f, 10000.0f, "%.1f");
-        }
         RemixGui::Separator();
         RemixGui::DragInt("Min Prims in Dynamic BLAS", &RtxOptions::minPrimsInDynamicBLASObject(), 1.f, 100, 0);
         RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);

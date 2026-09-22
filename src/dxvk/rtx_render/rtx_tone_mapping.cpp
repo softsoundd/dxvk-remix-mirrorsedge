@@ -313,47 +313,6 @@ namespace dxvk {
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
-  void DxvkToneMapping::dispatch(
-    Rc<RtxContext> ctx,
-    Rc<DxvkSampler> linearSampler,
-    Rc<DxvkImageView> exposureView,
-    const Resources::RaytracingOutput& rtOutput,
-    const float frameTimeMilliseconds,
-    bool resetHistory,
-    bool autoExposureEnabled) {
-
-    ScopedGpuProfileZone(ctx, "Tone Mapping");
-
-    m_resetState |= resetHistory;
-
-    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
-
-    if (m_toneHistogram.image.ptr() == nullptr) {
-      createResources(ctx);
-      m_resetState = true;
-    }
-
-    const Resources::Resource& inputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Read);
-    if (tonemappingEnabled()) {
-      dispatchHistogram(ctx, exposureView, inputColorBuffer, autoExposureEnabled);
-      dispatchToneCurve(ctx);
-    }
-
-    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), autoExposureEnabled);
-
-    m_resetState = false;
-  }
-
-  void DxvkToneMapping::dispatchFastToneMapping(
-    Rc<RtxContext> ctx,
-    Rc<DxvkImageView> exposureView,
-    const Resources::RaytracingOutput& rtOutput,
-    bool autoExposureEnabled) {
-    dispatchFastToneMapping(ctx, exposureView,
-      rtOutput.m_finalOutput.resource(Resources::AccessType::Read),
-      rtOutput.m_neuralRenderingInput.resource(Resources::AccessType::Write),
-      autoExposureEnabled);
-  }
 
   void DxvkToneMapping::dispatchFastToneMapping(
     Rc<RtxContext> ctx,
@@ -378,16 +337,6 @@ namespace dxvk {
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
-  void DxvkToneMapping::dispatchInverseToneMapping(
-    Rc<RtxContext> ctx,
-    Rc<DxvkImageView> exposureView,
-    const Resources::RaytracingOutput& rtOutput,
-    bool autoExposureEnabled) {
-    dispatchInverseToneMapping(ctx, exposureView,
-      rtOutput.m_neuralRenderingOutput.resource(Resources::AccessType::Read),
-      rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite),
-      autoExposureEnabled);
-  }
 
   void DxvkToneMapping::dispatchInverseToneMapping(
     Rc<RtxContext> ctx,

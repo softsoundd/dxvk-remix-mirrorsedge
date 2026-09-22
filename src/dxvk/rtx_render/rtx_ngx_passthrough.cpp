@@ -63,14 +63,8 @@ namespace dxvk {
   }
 
   void RtxNgxPassthrough::ngxPassthroughModeOnChange(DxvkDevice* device) {
+    (void)device;
     enforceRaytracingDisabledForPassthrough();
-
-    // Only the passthrough shader set is prewarmed while the mode is active, so a runtime
-    // disable kicks off the full prewarm; the async compilation gate in RtxContext::injectRTX
-    // holds path tracing back until it completes. device is null during initial config parsing.
-    if (device != nullptr && !ngxPassthroughMode()) {
-      device->getCommon()->getRtxInitializer().startPrewarmShaders();
-    }
   }
 
   void RtxNgxPassthrough::dlssRenderPresetOnChange(DxvkDevice* device) {

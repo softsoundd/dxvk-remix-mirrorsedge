@@ -580,94 +580,12 @@ namespace dxvk {
 
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame) {
     ScopedCpuProfileZone();
+    (void)ctx;
+    (void)raytracedThisFrame;
 
-    // NV-DXVK start: batched smooth normals
-    // Normally drained by prepareSceneData; frames that skipped scene preparation (no valid camera,
-    // shaders still compiling) must not leave a geometry with its normals never smoothed.
-    m_device->getCommon()->metaGeometryUtils().flushSmoothNormals(ctx);
-    // NV-DXVK end
-
-    // NGX: no RT scene - keep camera onFrameEnd for DLSS/MV history only.
-    if (!raytracedThisFrame && RtxNgxPassthrough::ngxPassthroughMode()) {
-      m_cameraManager.onFrameEnd();
-      m_previousFrameSceneAvailable = false;
-      RtxOptionManager::clearDrawcallTranslationInvalid();
-      return;
-    }
-
-    // Commit this frame's texture registrations for preserve next frame. Must run before
-    // manageTextureVram(), which may clear the cache and bump the generation so the
-    // following frame takes the dynamic path for every draw call.
-    m_textureCacheGenerationValidForPreserve =
-        m_device->getCommon()->getTextureManager().getTextureCacheGeneration();
-
-    manageTextureVram();
-
-    // Update graphs before applying any hot-reload: invalidateChangedReplacements runs
-    // below and marks GraphInstances for GC in the same frame-end, but garbageCollection
-    // only runs at the start of the next frame (in prepareSceneData). Running update here
-    // ensures it always operates on fully valid instances with live backing data.
-    // RtxOptions will still be pending, so any changes to them will apply next frame.
-    if (raytracedThisFrame) {
-      m_graphManager.update(ctx);
-    }
-
-    AssetChanges changes;
-    const bool changedSync = m_pReplacer->checkForChanges(ctx);
-    const bool appliedRebuild = m_pReplacer->applyPendingRebuilds(ctx, changes);
-    if (m_enqueueDelayedClear || changedSync) {
-      clear(ctx, true);
-      m_enqueueDelayedClear = false;
-    } else if (appliedRebuild) {
-      invalidateChangedReplacements(changes);
-    }
-
+    // Camera history is what DLSS and motion vectors read. There is no ray-traced scene to commit.
     m_cameraManager.onFrameEnd();
-    m_instanceManager.onFrameEnd();
-    m_previousFrameSceneAvailable = raytracedThisFrame && RtxOptions::enablePreviousTLAS();
-
-    if (raytracedThisFrame) {
-      std::lock_guard lock { m_drawCallMeta.mutex };
-      const uint8_t curTick = m_drawCallMeta.ticker;
-      const uint8_t nextTick = (m_drawCallMeta.ticker + 1) % m_drawCallMeta.MaxTicks;
-
-      m_drawCallMeta.ready[curTick] = true;
-
-      m_drawCallMeta.infos[nextTick].clear();
-      m_drawCallMeta.ready[nextTick] = false;
-      m_drawCallMeta.ticker = nextTick;
-    }
-
-    m_terrainBaker->onFrameEnd(ctx);
-
-    if (m_opacityMicromapManager) {
-      m_opacityMicromapManager->onFrameEnd();
-    }
-
-    m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
-    m_fogStartInMediumMaterialIndex_inCache = UINT32_MAX;
-    m_startInMediumMaterialIndex_inCache = UINT32_MAX;
-
-    if (m_uniqueObjectSearchDistance != RtxOptions::uniqueObjectDistance()) {
-      m_uniqueObjectSearchDistance = RtxOptions::uniqueObjectDistance();
-      m_drawCallTracker.rebuildSpatialMaps(m_uniqueObjectSearchDistance * 2.f);
-    }
-
-    // Not currently safe to cache these across frames (due to texture indices and rtx options potentially changing)
-    m_preCreationSurfaceMaterialMap.clear();
-
-    // Clear replacement material hashes before the next frame.  These are used by components, so must clear after graphManager updates.
-    clearFrameReplacementMaterialHashes();
-    
-    // Clear mesh hashes before the next frame.  These are used by components, so must clear after graphManager updates.
-    clearFrameMeshHashes();
-    
-    // Reset the fog state to get it re-discovered on the next frame
-    ImGUI::SetFogStates(m_fogStates, m_fog.getHash());
-    m_fog = FogState();
-    m_fogStates.clear();
-    
-    // Any drawcall translation invalidation has been consumed by this point. Clear the flag before new dirty options are processed.
+    m_previousFrameSceneAvailable = false;
     RtxOptionManager::clearDrawcallTranslationInvalid();
   }
 

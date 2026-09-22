@@ -145,15 +145,6 @@ namespace dxvk {
                "UE3 multi-pass compat: skip draw calls targeting small square render targets (typical of shadow depth maps). "
                "Prevents shadow-pass geometry from being incorrectly captured as scene geometry. "
                "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3AutoCullEnclosingMeshShadowBackfaces, false,
-               "UE3 compat: on shadow/NEE visibility rays, ignore inward backfaces of one-sided opaque meshes whose object AABB contains the camera.\n"
-               "For wrapping building shells around BSP interiors. Gated by rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters / MaxExtentMeters. Requires rtx.d3d9.ue3EngineMode. Off by default; geometry tagging is more precise.");
-    RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMinExtentMeters, 2.0f,
-               "Minimum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
-               "Keeps thin floor slabs and billboard cards from being treated as enclosing shells.");
-    RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMaxExtentMeters, 150.0f,
-               "Maximum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
-               "Keeps whole-level BSP models from being treated as enclosing shells.");
     RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthTestDisabledTranslucency, false,
                "UE3 translucency compat: skip alpha-blended draw calls that have depth test and depth write both disabled. "
                "These are typically UE3 NeedsDepthTestDisabled materials (e.g. fullscreen overlays, fog volume composites) "
@@ -493,13 +484,6 @@ namespace dxvk {
                                                 const DrawContext& context);
 
     /**
-      * \brief: Sends the pending drawcall geometry/state for raytracing, if nothing pending, does nothing.
-      *
-      * \param [in] drawContext : An object of type Draw that contains the context for the draw call.
-      */
-    void CommitGeometryToRT(const DrawContext& drawContext);
-
-    /**
       * \brief: Signal that a swapchain has been resized or reconfigured.
       * 
       * \param [in] presentationParameters: A reference to the D3D present params.
@@ -510,21 +494,6 @@ namespace dxvk {
       * \brief: Signal that we've reached the end of the frame.
       */
     void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
-
-    /**
-      * \brief: Signal a device Clear call. Used to detect the UE3 foreground DPG boundary
-      * (mid-scene depth-only clear before first-person arms/weapon draws).
-      */
-
-    /**
-      * \brief: Called from texture upload/unlock paths with the sysmem source
-      * of the data; stashes 16x1 float RGBA payloads (the game's baked tonemap
-      * colour curve LUTs) for the Mirror's Edge tonemapping mode's live
-      * capture. Partial-rect updates are merged; offsets/counts are in texels.
-      */
-    void onUe3CurveTextureUpload(const D3D9CommonTexture* dstTexture, D3D9CommonTexture* srcTexture, uint32_t srcSubresource,
-                                 uint32_t srcTexelOffsetX, uint32_t dstTexelOffsetX,
-                                 uint32_t texelWidth, uint32_t texelHeight);
 
     /**
       * \brief: Signal that we're about to present the image.
@@ -605,32 +574,6 @@ namespace dxvk {
     }
 
   private:
-
-    // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
-    // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap
-    // Block objects and their `m_matrices` array storage stay pinned. The write cursor
-    // rewinds each frame; old blocks are retained to avoid per-frame allocs.
-    struct SkinningMatrixPool {
-      static constexpr size_t kMatricesPerBlock = 256 * 256;
-      struct Block {
-        std::array<Matrix4, kMatricesPerBlock> m_matrices;
-      };
-      std::vector<std::unique_ptr<Block>> m_blocks;
-      size_t m_blockIndex = 0;          // which block the next write will use
-      size_t m_nextIndexInBlock = 0;    // next free slot in m_blocks[m_blockIndex]
-
-      void clear();
-      const Matrix4* stageBones(const Matrix4* source, size_t matrixCount);
-    } m_stagedBones;
-
-    inline static const uint32_t kMaxConcurrentDraws = 6 * 1024; // some games issuing >3000 draw calls per frame...  account for some consumer thread lag with x2
-    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
-    const std::unique_ptr<GeometryProcessor> m_pGeometryWorkers;
-    AtomicQueue<DrawCallState, kMaxConcurrentDraws> m_drawCallStateQueue;
-
-    DrawCallState m_activeDrawCallState;
-
-    RtxStagingDataAlloc m_rtStagingData;
     D3D9DeviceEx* m_parent;
 
     std::optional<D3DPRESENT_PARAMETERS> m_activePresentParams;
@@ -647,8 +590,6 @@ namespace dxvk {
 
     const bool m_enableDrawCallConversion;
     bool m_rtxInjectTriggered = false;
-    bool m_forceGeometryCopy = false;
-    bool m_forceIaTexcoordForOutlier = false;
     DWORD m_texcoordIndex = 0;
     DWORD m_iaTexcoordIndex = 0;
     uint8_t m_texcoordCompU = 0;
@@ -1145,8 +1086,7 @@ namespace dxvk {
 
     void tryCaptureNgxVelocityDraw(const DrawContext& drawContext);
 
-    // Shared UE3 LocalToWorld extraction (transpose/packing disambiguation + memo cache);
-    // used by the ray traced path's transform setup and the NGX velocity capture
+    // UE3 LocalToWorld extraction (transpose/packing disambiguation + memo cache), used by velocity capture.
     Matrix4 extractUe3ObjectToWorld(uint32_t reg, bool hasWorldToLocal, uint32_t w2lReg, bool cameraUsedTranspose);
 
     // NGX passthrough mode: ScreenPositionScaleBias register per shader (UE3's shared
@@ -1293,9 +1233,7 @@ namespace dxvk {
     Matrix4 m_ngxFrameViewToProjection;
     bool m_ngxFrameCameraMatricesValid = false;
 
-    // Cache-backed UE3 camera extraction from the current vertex shader constants (shares
-    // m_ue3CameraConstantsCache with the ray traced path; entries are keyed by the raw
-    // register contents so both modes derive identical values).
+    // Cache of the current vertex-shader camera constants so repeated draws skip re-extraction.
     bool tryGetUe3CameraFromConstantsCached(uint32_t viewProjReg,
                                             uint32_t viewOriginReg,
                                             Matrix4& outWorldToView,
@@ -1375,47 +1313,6 @@ namespace dxvk {
       // set has to subtract them or it varies with a setting Remix does not care about.
       uint32_t lightmapSamplerMask = 0;
     };
-    fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
-    fast_unordered_set m_loggedUvResolutions;
-
-
-    // rtx.d3d9.ue3LogUvAffineDetail state: per-shader one-shot sampler dump, per distinct
-    // resolved transform dedup, and a per (shader, stage) cap so panner/frame-varying
-    // transforms cannot flood the log
-    fast_unordered_set m_loggedUvAffineShaderDumps;
-    fast_unordered_set m_loggedUvAffineDetails;
-    fast_unordered_cache<uint16_t> m_uvAffineDetailLogCounts;
-
-
-    struct Ue3VsTexcoordTraceEntry {
-      bool initialized = false;
-      Ue3VsUvTraceKind kind = Ue3VsUvTraceKind::Invalid;
-      uint8_t iaTexcoordIndex = 0;
-      uint8_t inputReg = 0;
-      UvComponentAffine affineU;
-      UvComponentAffine affineV;
-    };
-    fast_unordered_cache<Ue3VsTexcoordTraceEntry> m_ue3VsTexcoordTraceCache;
-    fast_unordered_set m_autoRaytracedRenderTargetDescHashes;
-    fast_unordered_set m_ue3MovieTextureDescHashes;
-
-    // True if the image is tagged in rtx.raytracedRenderTargetTextures (and optionally
-    // present in the auto-detected set).
-    bool isTaggedRaytracedRenderTarget(const Rc<DxvkImage>& image, bool includeAutoDetected) const;
-
-    // Authored render-target tags accept the aspect-normalized descriptor hash (registered by
-    // the texture picker, stable across resolution changes) or the absolute one. Returns the
-    // hash that matched, so diagnostics can name the identity the author actually tagged.
-    static XXH64_hash_t matchAuthoredRenderTargetTag(const fast_unordered_set& tags,
-                                                     XXH64_hash_t descriptorHash,
-                                                     XXH64_hash_t resolutionAgnosticDescriptorHash);
-    bool isBackBufferSizedImage(const Rc<DxvkImage>& image) const;
-
-    // NOTE: to avoid calculating matrix inverse,
-    //       m_seenCameraPositions doesn't contain the actual positions,
-    //       but only relative values, see USE_TRUE_CAMERA_POSITION_FOR_COMPARISON
-    std::vector<Vector3> m_seenCameraPositions;
-    std::vector<Vector3> m_seenCameraPositionsPrev;
 
     struct IndexContext {
       VkIndexType indexType = VK_INDEX_TYPE_NONE_KHR;
@@ -1433,13 +1330,11 @@ namespace dxvk {
     };
 
 
-    XXH64_hash_t computeLiveGeometryVertexShaderHashComponent();
 
     // Frame counter used by NGX velocity pairing and the settings probe.
     uint32_t m_ue3FrameCounter = 0;
     const char* m_ue3LastDrawDecision = "";
 
-    // NV-DXVK start: draw disposition statistics (logged every 300 frames while the pass timer is on)
     struct DrawDispositionStats {
       uint32_t frames = 0;
       uint64_t draws = 0;
@@ -1453,8 +1348,6 @@ namespace dxvk {
       uint64_t renderTargetCopiesSkipped = 0; // StretchRects dropped by rtx.d3d9.skipRenderTargetCopies
     };
     DrawDispositionStats m_drawDispositionStats;
-    void reportDrawDispositionStats();
-    // NV-DXVK end
 
     static bool isPrimitiveSupported(const D3DPRIMITIVETYPE PrimitiveType) {
       return (PrimitiveType == D3DPT_TRIANGLELIST || PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_TRIANGLESTRIP);
@@ -1462,129 +1355,9 @@ namespace dxvk {
 
     const Direct3DState9& d3d9State() const;
 
-    template<typename T>
-    static void copyIndices(const uint32_t indexCount, T*& pIndicesDst, T* pIndices, uint32_t& minIndex, uint32_t& maxIndex);
-
-    template<typename T>
-    DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
-
-    void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
-
-    bool processRenderState(const DrawContext& drawContext);
-
-    template<bool FixedFunction>
-    bool processTextures();
-
-    PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
-
-    void recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
-                                           const DrawContext& drawContext);
-
     void flushOcclusionQueryDiagnostics();
 
     void triggerInjectRTX();
-
-    // rtx.deferredUiTextures support: self-contained snapshots of overlay draws captured
-    // mid-scene and replayed on top of the ray-traced image once RTX injection has fired.
-    // The snapshot copies the referenced vertex/index ranges to CPU memory (immune to the
-    // game re-locking its dynamic buffers between capture and replay) and is re-issued
-    // through the regular D3D9 UP draw path.
-    static constexpr std::array<D3DRENDERSTATETYPE, 25> kDeferredUiRenderStates = {
-      D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP,
-      D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA, D3DRS_DESTBLENDALPHA, D3DRS_BLENDOPALPHA,
-      D3DRS_BLENDFACTOR,
-      D3DRS_ALPHATESTENABLE, D3DRS_ALPHAREF, D3DRS_ALPHAFUNC,
-      D3DRS_CULLMODE, D3DRS_FILLMODE, D3DRS_SHADEMODE,
-      D3DRS_COLORWRITEENABLE,
-      D3DRS_FOGENABLE,
-      D3DRS_SRGBWRITEENABLE,
-      D3DRS_SCISSORTESTENABLE,
-      D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE,
-      // captured for save/restore symmetry; forced off while replaying (overlays composite
-      // over the final image, depth/stencil contents at replay time are meaningless)
-      D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_STENCILENABLE,
-    };
-
-    static constexpr uint32_t kMaxDeferredUiDrawsPerFrame = 16;
-    static constexpr uint32_t kMaxDeferredUiVertexBytes = 1024 * 1024;      // per draw, across all streams
-    static constexpr uint32_t kMaxDeferredUiFrameVertexBytes = 8 * 1024 * 1024; // per frame, across all draws
-    static constexpr uint32_t kMaxDeferredUiIndices = 256 * 1024;
-
-    struct DeferredUiDraw {
-      D3DPRIMITIVETYPE primitiveType = D3DPT_TRIANGLELIST;
-      UINT primitiveCount = 0;
-      bool indexed = false;
-      uint32_t vertexCount = 0;
-
-      // vertex data for the window [firstVertex, firstVertex + vertexCount), with all
-      // referenced streams interleaved into a single stream-0 layout for UP replay
-      uint32_t vertexStride = 0;
-      std::vector<uint8_t> vertexData;
-
-      // rebased onto the copied vertex window, widened to 32-bit
-      std::vector<uint32_t> indexData;
-
-      // the declaration to replay with: the original when it only references stream 0,
-      // otherwise an internally created remap of every element onto the interleaved stream 0
-      Com<IDirect3DVertexDeclaration9> replayDecl;
-      Com<D3D9VertexShader, false> vertexShader;
-      Com<D3D9PixelShader, false> pixelShader;
-
-      std::vector<Vector4> vsFloatConsts;
-      std::vector<Vector4> psFloatConsts;
-      std::vector<Vector4i> vsIntConsts;
-      std::vector<Vector4i> psIntConsts;
-      std::vector<uint32_t> vsBoolConsts;
-      std::vector<uint32_t> psBoolConsts;
-
-      struct TextureBinding {
-        uint32_t slot = 0;
-        Com<IDirect3DBaseTexture9> texture;
-        std::array<DWORD, SamplerStateCount> samplerStates = {};
-        // non-null when the bound texture is a render target (scene color candidate for
-        // the rtx.d3d9.deferredUiRefreshSceneColor blit)
-        Rc<DxvkImage> renderTargetImage;
-      };
-      std::vector<TextureBinding> textures;
-
-      std::array<DWORD, kDeferredUiRenderStates.size()> renderStates = {};
-      D3DVIEWPORT9 viewport = {};
-      RECT scissorRect = {};
-      uint32_t sourceRenderTargetWidth = 0;
-      uint32_t sourceRenderTargetHeight = 0;
-    };
-
-    std::vector<DeferredUiDraw> m_deferredUiDraws;
-    uint32_t m_deferredUiFrameVertexBytes = 0;
-    bool m_replayingDeferredUiDraws = false;
-
-    // one-shot log keys (pixel shader hash mixed with the defer/refuse decision) for the
-    // [RTX-DeferredUI] tag diagnostics
-    fast_unordered_set m_deferredUiLoggedDecisions;
-
-    // Checks whether the draw matches rtx.deferredUiTextures (image hash for non-RTs, or
-    // resolution-agnostic RT descriptor hash) or rtx.d3d9.deferredUiPixelShaders.
-    bool isDeferredUiTaggedDraw(XXH64_hash_t* pMatchedTextureHash = nullptr) const;
-
-    bool captureDeferredUiDraw(const IndexContext& indexContext,
-                               const VertexContext vertexContext[caps::MaxStreams],
-                               const DrawContext& drawContext);
-    // pOverrideRenderTarget: bind this surface as RT0 for the replay (EndFrame fallback path,
-    // where the app's current RT0 is unrelated); nullptr replays onto the currently bound RT0
-    // (mid-frame injection path). injectionTargetImage: the image the ray-traced result was
-    // blitted to, used as the source for the scene-color refresh blit (may be null to skip).
-    void replayDeferredUiDraws(IDirect3DSurface9* pOverrideRenderTarget,
-                               const Rc<DxvkImage>& injectionTargetImage);
-    Rc<DxvkImage> getCurrentRenderTargetImage() const;
-
-    struct DrawCallType {
-      RtxGeometryStatus status;
-      bool triggerRtxInjection;
-      // rtx.deferredUiTextures: rasterize on top of the ray-traced image without triggering
-      // injection - the draw is captured and replayed after injection fires later in the frame
-      bool deferUntilInjection = false;
-    };
-    DrawCallType makeDrawCallType(const DrawContext& drawContext);
 
     bool checkBoundTextureCategory(const fast_unordered_set& textureCategory) const;
 
@@ -1706,12 +1479,8 @@ namespace dxvk {
                                           uint32_t backBufferWidth, uint32_t backBufferHeight);
     static bool ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo);
 
-    // Per-draw snapshot of the bound texture slots (common texture pointer, cached image
-    // hash, render-target descriptor hash), lazily built and shared by the per-draw
-    // consumers that would otherwise each re-walk the texture stages: UI/deferred-UI tag
-    // checks, the MIC texture-set hash, the diffuse-selection cache key and the
-    // two-sided-translucency dedup.
-    // Invalidated at the top of internalPrepareDraw; bindings cannot change within a draw.
+    // Per-draw snapshot of the bound texture slots, used by UI classification.
+    // Invalidated when the bound set changes; bindings cannot change within a draw.
     struct BoundTextureSnapshotEntry {
       D3D9CommonTexture* texture = nullptr;
       XXH64_hash_t imageHash = kEmptyHash;
@@ -1735,48 +1504,20 @@ namespace dxvk {
     mutable bool m_boundTextureSnapshotValid = false;
     const BoundTextureSnapshot& ensureBoundTextureSnapshot() const;
 
-    // Per-frame snapshot of the scalar options read on the per-draw hot path. Every
-    // RtxOption read acquires the global option update mutex; the per-draw pipeline
-    // (makeDrawCallType, classifyUe3Pass, processRenderState, processTextures, the
-    // geometry identity keys) reads dozens of options per draw, which at UE3 draw
-    // counts (~2400/frame) is >100k mutex acquisitions per frame. Option values only
-    // resolve once per frame anyway, so a per-frame value snapshot is exactly as fresh
-    // as the underlying resolution model. Refreshed in EndFrame (the same cadence as
-    // DrawCallState::refreshCategoryLookupTable) and lazily on the first frame's draw.
-    // Set-typed options are intentionally not snapshotted: their accessors return
-    // references to stable storage and are read far less often per draw.
-    // Field names mirror the option accessors they cache.
+    // Per-frame snapshot of the scalar options read on the passthrough draw path.
+    // Refreshed in EndFrame and lazily on the first frame's draw.
     struct FrameOptionCache {
       bool valid = false;
 
-      // D3D9Rtx options
       bool orthographicIsUI = false;
       bool preTransformedVerticesIsUI = false;
-      bool allowCubemaps = false;
-      bool useVertexCapture = false;
-      bool useVertexCapturedNormals = false;
-      bool useWorldMatricesForShaders = false;
       bool ue3EngineMode = false;
-      bool ue3CameraFromShaderConstants = false;
-      bool ue3ObjectToWorldFromShaderConstants = false;
-      bool autoRaytracedRenderTargetFromFullscreenComposite = false;
-      bool rasterizeFullscreenCompositeToPrimary = false;
-      bool shaderPathTexcoordIndexFromPixelShader = false;
-      bool ue3SkipDepthPrepass = false;
-      bool ue3SkipShadowDepthPasses = false;
-      bool ue3SkipDepthTestDisabledTranslucency = false;
       bool ue3SkipSceneCapturePasses = false;
       bool conservativeOcclusionQueries = false;
       bool eventQueryCsCompletion = false;
       bool sequenceTrackedLockWaits = true;
       bool skipRenderTargetCopies = true;
-      bool ue3RequireCtabCameraConstants = false;
-      bool ue3LogUvResolution = false;
-      bool ue3LogUvAffineDetail = false;
       bool ue3LogOcclusionQueries = false;
-      bool deferredUiReplay = false;
-      bool deferredUiRefreshSceneColor = false;
-      bool enableIndexBufferMemoization = false;
       bool ngxPassthroughMode = false;
       bool ngxPassthroughJitter = false;
       bool ngxPrePostProcess = false;
@@ -1784,61 +1525,15 @@ namespace dxvk {
       bool ngxObjectVelocities = false;
       int ngxDebugVisualization = 0;
 
-      // upstream RtxOptions (raytracedRenderTargetEnable caches
-      // RtxOptions::RaytracedRenderTarget::enable, needsMeshBoundingBox the
-      // derived RtxOptions::needsMeshBoundingBox result)
       bool enableRaytracing = false;
-      bool enableAlphaTest = false;
-      bool enableAlphaBlend = false;
-      bool raytracedRenderTargetEnable = false;
-      bool skipDrawCallsPostRTXInjection = false;
-      bool useBuffersDirectly = false;
-      bool fogIgnoreSky = false;
-      bool needsMeshBoundingBox = false;
-      bool validateCPUIndexData = false;
-      bool alwaysCopyDecalGeometries = false;
-      bool terrainAsDecalsEnabledIfNoBaker = false;
-      bool terrainAsDecalsAllowOverModulate = false;
-      bool enableMultiStageTextureFactorBlending = false;
-      bool ignoreAllVertexColorBakedLighting = false;
-      bool vertexColorIsBakedLighting = false;
       bool logReplacementResolution = false;
-      Vector2i drawCallRange = Vector2i(0, 0);
 
-      // Set-typed options, cached as pointers: each option's resolved hash set is
-      // allocated once at construction and only mutated in place during option
-      // resolution, so a per-frame pointer is exactly as safe as the per-call
-      // reference the locked accessor hands out - both are read outside the option
-      // mutex between resolution points.
       const fast_unordered_set* uiTextures = nullptr;
-      const fast_unordered_set* deferredUiTextures = nullptr;
-      const fast_unordered_set* deferredUiPixelShaders = nullptr;
-      const fast_unordered_set* lightmapTextures = nullptr;
-      const fast_unordered_set* neverAlbedoTextures = nullptr;
-      const fast_unordered_set* preferredAlbedoTextures = nullptr;
-      const fast_unordered_set* smoothNormalsTextures = nullptr;
-      const fast_unordered_set* ignoreBakedLightingTextures = nullptr;
-      const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
-      const fast_unordered_set* vsTexcoordCaptureOutlierTextures = nullptr;
-      const fast_unordered_set* replacementDebugHashes = nullptr;
     };
     FrameOptionCache m_frameOptions;
     void refreshFrameOptionCache();
 
-    // Material hashes tracked this frame for SceneManager::trackReplacementMaterialHash,
-    // flushed as one CS command in EndFrame instead of one EmitCs per draw. The only
-    // consumers (graph components via getReplacementMaterialHashUsageCount) read the
-    // per-frame map during SceneManager::onFrameEnd, which executes after the flush on
-    // the CS timeline, so batching is invisible to them.
-    std::vector<XXH64_hash_t> m_pendingReplacementMaterialHashes;
-
     bool isRenderingUI();
-
-    Future<SkinningData> processSkinning(const RasterGeometry& geoData);
-
-    Future<AxisAlignedBoundingBox> computeAxisAlignedBoundingBox(const RasterGeometry& geoData);
-
-    Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue);
 
     void submitActiveDrawCallState();
   };

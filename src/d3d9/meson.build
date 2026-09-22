@@ -87,7 +87,6 @@ d3d9_src = [
   'd3d9_rtx.h',
   'd3d9_rtx_utils.cpp',
   'd3d9_rtx_utils.h',
-  'd3d9_rtx_geometry.cpp',
   'd3d9_swapchain_external.cpp',
 ]
 

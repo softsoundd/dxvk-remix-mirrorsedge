@@ -42,13 +42,6 @@ namespace dxvk {
     void dispatch(
       Rc<DxvkContext> ctx,
       Rc<DxvkSampler> linearSampler,
-      const Resources::RaytracingOutput& rtOutput,
-      const float frameTimeMilliseconds,
-      bool resetHistory = false);
-
-    void dispatch(
-      Rc<DxvkContext> ctx,
-      Rc<DxvkSampler> linearSampler,
       const Resources::Resource& colorInput,
       const VkExtent3D& colorExtent,
       const float frameTimeMilliseconds,

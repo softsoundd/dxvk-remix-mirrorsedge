@@ -42,19 +42,11 @@ namespace dxvk {
       return m_warmupComplete;
     }
 
-    // Kicks off shader prewarming: the passthrough set while NGX passthrough mode is active,
-    // the full path tracing set otherwise. Called on initialization and again when the
-    // passthrough mode is disabled at runtime; the full prewarm only ever runs once.
+    // Kicks off shader prewarming for the passthrough frame path.
     void startPrewarmShaders();
 
   private:
     bool m_warmupComplete = false;
-    bool m_assetsLoaded = false;
-    bool m_fullPrewarmStarted = false;
-
-    void loadAssets();
-
-    dxvk::thread m_asyncAssetLoadThread;
 
     RTX_OPTION_ENV("rtx.initializer", bool, asyncShaderPrewarming, true, "RTX_ASYNC_SHADER_PREWARMING",
                    "When set to true, shader prewarming will be enabled, allowing for Remix to start compiling shaders before their first use.\n"

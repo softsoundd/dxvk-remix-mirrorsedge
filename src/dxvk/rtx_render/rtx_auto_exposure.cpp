@@ -323,19 +323,6 @@ namespace dxvk {
   void DxvkAutoExposure::dispatch(
     Rc<DxvkContext> ctx,
     Rc<DxvkSampler> linearSampler,
-    const Resources::RaytracingOutput& rtOutput,
-    const float frameTimeMilliseconds,
-    bool resetHistory) {
-    dispatch(ctx, linearSampler,
-             rtOutput.m_finalOutput.resource(Resources::AccessType::Read),
-             rtOutput.m_finalOutputExtent,
-             frameTimeMilliseconds,
-             resetHistory);
-  }
-
-  void DxvkAutoExposure::dispatch(
-    Rc<DxvkContext> ctx,
-    Rc<DxvkSampler> linearSampler,
     const Resources::Resource& colorInput,
     const VkExtent3D& colorExtent,
     const float frameTimeMilliseconds,

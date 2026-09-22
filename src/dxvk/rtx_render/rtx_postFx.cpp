@@ -652,45 +652,6 @@ namespace dxvk {
     }
   }
 
-  void DxvkPostFx::dispatchMotionBlur(
-    Rc<RtxContext> ctx,
-    Rc<DxvkSampler> nearestSampler,
-    Rc<DxvkSampler> linearSampler,
-    const uvec2& mainCameraResolution,
-    const uint32_t frameIdx,
-    const Resources::RaytracingOutput& rtOutput,
-    const bool cameraCutDetected)
-  {
-    MotionBlurInputs inputs = {};
-    inputs.inOutColor = &rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
-    inputs.intermediateColor = &rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
-    inputs.screenSpaceMotionVector = &rtOutput.m_primaryScreenSpaceMotionVector;
-    inputs.surfaceFlags = &rtOutput.m_primarySurfaceFlags;
-    inputs.surfaceFlagsScratch1 = &rtOutput.m_primarySurfaceFlagsIntermediateTexture1;
-    inputs.surfaceFlagsScratch2 = &rtOutput.m_primarySurfaceFlagsIntermediateTexture2;
-    inputs.linearViewZ = &rtOutput.m_primaryLinearViewZ;
-    inputs.cineVelocityDepth = &rtOutput.m_motionBlurCineVelocityDepth;
-    inputs.cineCurvature = &rtOutput.m_motionBlurCineCurvature;
-    inputs.cineTileMaxX = &rtOutput.m_motionBlurCineTileMaxX;
-    inputs.cineTileMax = &rtOutput.m_motionBlurCineTileMax;
-    inputs.cineNeighborMax = &rtOutput.m_motionBlurCineNeighborMax;
-    inputs.previousScreenSpaceMotionVector =
-      rtOutput.m_primaryScreenSpaceMotionVectorQueue.hasDistinctPrevious()
-        ? &rtOutput.m_primaryScreenSpaceMotionVectorQueue.getPrevious()
-        : nullptr;
-
-    // Only the cinematic filter consumes these, and fitting the curve costs a handful of
-    // double precision inversions.
-    if (motionBlurMode() == MotionBlurMode::Cinematic) {
-      const RtCamera& camera = ctx->getSceneManager().getCamera();
-      const auto nearFarPlanes = camera.calculateNearFarPlanes();
-      inputs.nearPlane = nearFarPlanes.first;
-      inputs.farPlane = nearFarPlanes.second;
-      inputs.curves = buildMotionBlurCurveMatrices(camera);
-    }
-
-    dispatchMotionBlur(ctx, nearestSampler, linearSampler, mainCameraResolution, frameIdx, inputs, cameraCutDetected);
-  }
 
   void DxvkPostFx::dispatchMotionBlurCinematic(
     Rc<RtxContext> ctx,
@@ -900,17 +861,6 @@ namespace dxvk {
       inputSize);
   }
 
-  void DxvkPostFx::dispatchLensEffects(
-    Rc<RtxContext> ctx,
-    Rc<DxvkSampler> linearSampler,
-    const uvec2& mainCameraResolution,
-    const uint32_t frameIdx,
-    const Resources::RaytracingOutput& rtOutput)
-  {
-    dispatchLensEffects(ctx, linearSampler, mainCameraResolution, frameIdx,
-                        rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite),
-                        rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write));
-  }
 
   void DxvkPostFx::dispatchLensEffects(
     Rc<RtxContext> ctx,
@@ -990,105 +940,4 @@ namespace dxvk {
     }
   }
 
-  void DxvkPostFx::dispatchHighlighting(
-    Rc<RtxContext> ctx,
-    const Resources::RaytracingOutput& rtOutput,
-    std::vector<uint32_t>&& objectPickingValuesToHighlight,
-    const std::optional<Vector2i>& pixelToHighlight,
-    HighlightColor color) {
-    static_assert(sizeof(ObjectPickingValue) == sizeof(objectPickingValuesToHighlight[0]));
-    if (!rtOutput.m_primaryObjectPicking.isValid()) {
-      return;
-    }
-    if (objectPickingValuesToHighlight.empty() && !pixelToHighlight) {
-      return;
-    }
-    ScopedGpuProfileZone(ctx, "PostFx Highlight");
-
-    const Resources::Resource& inOutColorTexture = rtOutput.m_compositeOutput.resource(Resources::AccessType::ReadWrite);
-    const VkExtent3D& inputSize = inOutColorTexture.image->info().extent;
-
-    const auto workgroups = util::computeBlockCount(inputSize, VkExtent3D { POST_FX_TILE_SIZE , POST_FX_TILE_SIZE, 1 });
-
-    uint32_t valuesToHighlightCountPow;
-    {
-      // deduplicate and sort to perform binary search in the shader
-      std::vector<uint32_t>& sorted = objectPickingValuesToHighlight;
-      {
-        if (sorted.size() > POST_FX_HIGHLIGHTING_MAX_VALUES) {
-          sorted.resize(POST_FX_HIGHLIGHTING_MAX_VALUES);
-          ONCE(Logger::warn("Too many values to highlight, some objects will be omitted."));
-        }
-        auto newEnd = std::unique(sorted.begin(), sorted.end());
-        sorted.erase(newEnd, sorted.end());
-        std::sort(sorted.begin(), sorted.end());
-      }
-
-      valuesToHighlightCountPow = bitCeilPow2(static_cast<uint32_t>(sorted.size()));
-
-      // fill invalid values as POST_FX_HIGHLIGHTING_INVALID_VALUE
-      {
-        const size_t validCount = sorted.size();
-        sorted.resize(1 << valuesToHighlightCountPow);
-        for (size_t i = validCount; i < sorted.size(); i++) {
-          sorted[i] = POST_FX_HIGHLIGHTING_INVALID_VALUE;
-        }
-      }
-
-      if (m_highlightingValues == nullptr) {
-        auto info = DxvkBufferCreateInfo {};
-        {
-          info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-          info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-          info.size = align(POST_FX_HIGHLIGHTING_MAX_VALUES * sizeof(ObjectPickingValue), kBufferAlignment);
-        }
-        m_highlightingValues = ctx->getDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Highlight Buffer");
-      }
-
-      if (!sorted.empty()) {
-        ctx->writeToBuffer(m_highlightingValues, 0, sorted.size() * sizeof(ObjectPickingValue), sorted.data());
-      }
-    }
-
-    auto args = PostFxHighlightingArgs {};
-    {
-      args.imageSize = { inputSize.width, inputSize.height };
-      args.desaturateNonHighlighted = desaturateOthersOnHighlight() ? 1 : 0;
-      args.timeSinceStartMS = (float)GlobalTime::get().absoluteTimeMs();
-      args.pixel = pixelToHighlight ? int2 { pixelToHighlight->x, pixelToHighlight->y } : int2 { -1, -1 };
-      args.highlightColorPacked =
-        color == HighlightColor::World ? packColor(118, 185, 0) :
-        color == HighlightColor::UI ? packColor(66, 150, 250) :
-        color == HighlightColor::FromVariable ? packColor(g_customHighlightColor[0], g_customHighlightColor[1], g_customHighlightColor[2]) :
-        packColor(255, 255, 255);
-      args.valuesToHighlightCountPow = valuesToHighlightCountPow;
-    }
-
-    ctx->pushConstants(0, sizeof(args), &args);
-
-    const Resources::Resource* lastOutput =
-      &rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Write);
-
-    ctx->bindResourceView(POST_FX_HIGHLIGHT_INPUT, inOutColorTexture.view, nullptr);
-    ctx->bindResourceView(POST_FX_HIGHLIGHT_OBJECT_PICKING_INPUT, rtOutput.m_primaryObjectPicking.view, nullptr);
-    ctx->bindResourceView(POST_FX_HIGHLIGHT_PRIMARY_CONE_RADIUS_INPUT, rtOutput.m_primaryConeRadius.view, nullptr);
-    ctx->bindResourceView(POST_FX_HIGHLIGHT_OUTPUT, lastOutput->view, nullptr);
-    ctx->bindResourceBuffer(POST_FX_HIGHLIGHT_VALUES, DxvkBufferSlice(m_highlightingValues, 0, m_highlightingValues->info().size));
-
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PostFxHighlightShader::getShader());
-    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-
-    // Copy to the output texture if the final output is not the input texture
-    if (lastOutput->image != inOutColorTexture.image) {
-      ctx->copyImage(
-        inOutColorTexture.image,
-        { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        { 0, 0, 0 },
-        rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
-        { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        { 0, 0, 0 },
-        inputSize);
-    }
-  }
 }

@@ -107,17 +107,6 @@ namespace dxvk {
       float farPlane = 0.0f;
     };
 
-    // Motion blur phase. Runs before tonemapping while the image is still in linear HDR space.
-    // Reads m_finalOutput, writes back to m_finalOutput (via intermediate texture).
-    void dispatchMotionBlur(
-      Rc<RtxContext> ctx,
-      Rc<DxvkSampler> nearestSampler,
-      Rc<DxvkSampler> linearSampler,
-      const uvec2& mainCameraResolution,
-      const uint32_t frameIdx,
-      const Resources::RaytracingOutput& rtOutput,
-      const bool cameraCutDetected);
-
     // Motion blur on explicitly provided inputs (see MotionBlurInputs)
     void dispatchMotionBlur(
       Rc<RtxContext> ctx,
@@ -128,16 +117,6 @@ namespace dxvk {
       const MotionBlurInputs& inputs,
       const bool cameraCutDetected);
 
-    // Lens effects phase (chromatic aberration + vignette). Runs after tonemapping
-    // so it operates on post-tonemap LDR data — these are display-space lens artifacts.
-    // Reads and writes m_finalOutput in place.
-    void dispatchLensEffects(
-      Rc<RtxContext> ctx,
-      Rc<DxvkSampler> linearSampler,
-      const uvec2& mainCameraResolution,
-      const uint32_t frameIdx,
-      const Resources::RaytracingOutput& rtOutput);
-
     // Lens effects on an explicitly provided color (blurred in place via the intermediate)
     void dispatchLensEffects(
       Rc<RtxContext> ctx,
@@ -146,13 +125,6 @@ namespace dxvk {
       const uint32_t frameIdx,
       const Resources::Resource& inOutColor,
       const Resources::Resource& intermediateColor);
-
-    void dispatchHighlighting(
-      Rc<RtxContext> ctx,
-      const Resources::RaytracingOutput& rtOutput,
-      std::vector<uint32_t>&& objectPickingValuesToHighlight,
-      const std::optional<Vector2i>& pixelToHighlight,
-      HighlightColor color);
 
     void showImguiSettings();
 
