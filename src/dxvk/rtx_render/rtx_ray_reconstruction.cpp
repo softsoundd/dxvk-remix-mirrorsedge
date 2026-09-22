@@ -33,7 +33,6 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_ngx_wrapper.h"
 #include "rtx_shader_manager.h"
-#include "rtx_imgui.h"
 #include "rtx_debug_view.h"
 
 #include "rtx_matrix_helpers.h"
@@ -82,9 +81,6 @@ namespace dxvk {
     };
   }
 
-  // Combo box shared with dxvk_imgui.cpp
-  extern RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionPreset> rayReconstructionPresetCombo;
-
   DxvkRayReconstruction::DxvkRayReconstruction(DxvkDevice* device)
     : DxvkDLSS(device)
     , m_prevPreset(preset()) {
@@ -95,14 +91,6 @@ namespace dxvk {
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
     info.size = sizeof(RayReconstructionArgs);
     m_constants = device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "DLSS-RR constant buffer");
-  }
-
-  void DxvkRayReconstruction::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
-    if (!RtxOptions::enableRayReconstruction()) {
-      return;
-    }
-
-    PrepareRayReconstructionShader::getShader();
   }
 
   bool DxvkRayReconstruction::supportsRayReconstruction() const {
@@ -344,39 +332,6 @@ namespace dxvk {
         ctx->getCommandList()->trackResource<DxvkAccess::Write>(output->image());
       }
       barriers.recordCommands(ctx->getCommandList());
-    }
-  }
-
-  void DxvkRayReconstruction::showRayReconstructionImguiSettings(bool showAdvancedSettings) {
-    RemixGui::Checkbox("Anti-Ghost", &m_biasCurrentColorEnabled);
-
-    if (showAdvancedSettings) {
-      bool presetChanged = RemixGui::Combo("DLSS-RR Preset", &pathTracerPresetObject(), "Default\0ReSTIR Finetuned\0");
-      if (presetChanged) {
-        RtxOptions::updatePathTracerPreset(pathTracerPreset());
-      }
-
-      constexpr ImGuiSliderFlags sliderFlags = ImGuiSliderFlags_AlwaysClamp;
-
-      RemixGui::Checkbox("Use Specular Hit Distance", &useSpecularHitDistanceObject());
-      RemixGui::Checkbox("Preserve Settings in Native Mode", &preserveSettingsInNativeModeObject());
-      RemixGui::Checkbox("Combine Specular Albedo", &combineSpecularAlbedoObject());
-      RemixGui::Checkbox("DLSS-RR Detail Enhancement", &enableDetailEnhancementObject());
-      RemixGui::Checkbox("DLSS-RR Demodulate Roughness", &demodulateRoughnessObject());
-      RemixGui::DragFloat("DLSS-RR Roughness Sensitivity", &upscalerRoughnessDemodulationOffsetObject(), 0.01f, 0.0f, 2.0f, "%.3f");
-      RemixGui::DragFloat("DLSS-RR Roughness Multiplier", &upscalerRoughnessDemodulationMultiplierObject(), 0.01f, 0.0f, 20.0f, "%.3f");
-      rayReconstructionPresetCombo.getKey(&presetObject());
-
-      if (RemixGui::CollapsingHeader("Disocclusion Mask")) {
-        ImGui::Indent();
-
-        RemixGui::Checkbox("Blur", &enableDisocclusionMaskBlurObject());
-        RemixGui::DragInt("Blur Radius", &disocclusionMaskBlurRadiusObject(), 1.f, 1, 64, "%d", sliderFlags);
-        RemixGui::DragFloat("Blur Normalized Gaussian Weight Sigma", &disocclusionMaskBlurNormalizedGaussianWeightSigmaObject(), 0.01f, 0.0f, 3.0f, "%.3f", sliderFlags);
-        RemixGui::Checkbox("Invalidate History for Animated Water", &invalidateHistoryForAnimatedWaterObject());
-
-        ImGui::Unindent();
-      }
     }
   }
 

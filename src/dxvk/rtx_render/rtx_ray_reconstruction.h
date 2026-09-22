@@ -25,7 +25,6 @@
 
 namespace dxvk {
   class NGXRayReconstructionContext;
-  class DxvkPipelineManager;
   class DxvkRayReconstruction : public DxvkDLSS {
   public:
     // Note: Values must match NVSDK_NGX_RayReconstruction_Hint_Render_Preset in nvsdk_ngx_defs_dlssd.h.
@@ -40,10 +39,6 @@ namespace dxvk {
     explicit DxvkRayReconstruction(DxvkDevice* device);
 
     bool supportsRayReconstruction() const;
-
-    void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
-
-    void showRayReconstructionImguiSettings(bool showAdvancedSettings);
 
     void dispatch(
       Rc<RtxContext> ctx,

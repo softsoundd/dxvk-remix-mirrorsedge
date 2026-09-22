@@ -852,7 +852,6 @@ namespace dxvk {
 
     out << " | upscaler=" << static_cast<int>(RtxOptions::upscalerType())
         << " dlssProfile=" << static_cast<int>(RtxOptions::qualityDLSS())
-        << " rayReconstruction=" << (RtxOptions::enableRayReconstruction() ? 1 : 0)
         << " graphicsPreset=" << static_cast<int>(RtxOptions::graphicsPreset())
         << " integrateIndirectMode=" << static_cast<int>(RtxOptions::integrateIndirectMode())
         << " nrcPreset=" << static_cast<int>(NeuralRadianceCache::NrcOptions::qualityPreset())

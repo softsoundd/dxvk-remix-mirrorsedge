@@ -88,8 +88,8 @@ namespace dxvk {
         RtxOptions::graphicsPreset.setDeferred(GraphicsPreset::Custom);
       }
 
-      // Need to initialize DLSS-RR settings in test cases.
-      // Warning: this will override multiple global options, including any values set by the test workflow.
+      // Applies the active upscaler's path-tracer preset unless DXVK_RAY_RECONSTRUCTION=0.
+      // This overrides multiple global options, including values set by the test workflow.
       if (env::getEnvVar("DXVK_RAY_RECONSTRUCTION") != "0") {
         RtxOptions::updateLightingSetting();
       }
@@ -102,11 +102,6 @@ namespace dxvk {
     // options are not applied until the Remix UI first opens).
     if (RtxNgxPassthrough::ngxPassthroughMode()) {
       RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough();
-      // RR is path-traced only; leaving it on blocks DLSS-SR via isDLSSEnabled() in other
-      // code paths even though passthrough dispatch ignores it.
-      if (RtxOptions::upscalerType() == UpscalerType::DLSS && RtxOptions::enableRayReconstruction()) {
-        RtxOptions::enableRayReconstruction.setImmediately(false);
-      }
       RtxOptions::dlssPreset.setImmediately(DlssPreset::Custom);
       RtxOptions::updatePresetFromUpscaler();
       // Enhancements are path-traced replacements. Loading them in passthrough leaves the

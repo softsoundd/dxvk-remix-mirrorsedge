@@ -31,7 +31,6 @@
 #include "rtx_render/rtx_dlfg.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_reflex.h"
-#include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_postFx.h"
 #include "rtx_render/rtx_option_layer_gui.h"
@@ -46,7 +45,6 @@ namespace dxvk {
 
   // Combo boxes shared with dxvk_imgui.cpp
   extern RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo;
-  extern RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset> dlssRenderPresetCombo;
   extern RemixGui::ComboWithKey<XeSSPreset> xessPresetCombo;
 
   // Combo boxes used only by the user menu
@@ -81,7 +79,7 @@ namespace dxvk {
   };
 
   // Helper functions defined in dxvk_imgui.cpp
-  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkRayReconstruction& rayReconstruction);
+  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss);
 
   void ImGUI::showUserMenu(const Rc<DxvkContext>& ctx) {
     // Target user.conf layer for user menu changes
@@ -145,7 +143,7 @@ namespace dxvk {
 
 
       if (ImGui::BeginTabBar("Settings Tabs", tab_bar_flags)) {
-        if (ImGui::BeginTabItem("General", nullptr, tab_item_flags)) {
+        if (RtxNgxPassthrough::ngxPassthroughMode() && ImGui::BeginTabItem("General", nullptr, tab_item_flags)) {
           beginTabChild("##tab_child_general");
           showUserGeneralSettings(ctx, subItemWidth, subItemIndent);
           endTabChild();
@@ -246,9 +244,12 @@ namespace dxvk {
     const Rc<DxvkContext>& ctx,
     const int subItemWidth,
     const int subItemIndent) {
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      return;
+    }
+
     auto common = ctx->getCommonObjects();
     DxvkDLSS& dlss = common->metaDLSS();
-    DxvkRayReconstruction& rayReconstruction = common->metaRayReconstruction();
     DxvkDLFG& dlfg = common->metaDLFG();
     const RtxReflex& reflex = m_device->getCommon()->metaReflex();
 
@@ -306,14 +307,14 @@ namespace dxvk {
       auto oldUpscalerType = RtxOptions::upscalerType();
 
       if (dlss.supportsDLSS()) {
-        getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
+        getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
       }
       
       ImGui::PushItemWidth(static_cast<float>(subItemWidth));
       ImGui::Indent(static_cast<float>(subItemIndent));
 
       if (!dlss.supportsDLSS()) {
-        getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
+        getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
       }
 
       if (oldUpscalerType != RtxOptions::upscalerType()) {
@@ -325,38 +326,13 @@ namespace dxvk {
 
       switch (RtxOptions::upscalerType()) {
         case UpscalerType::DLSS: {
-          // In NGX passthrough mode the DLSS mode selector maps to the game's ScreenPercentage
-          // (see rtx.ngxPassthrough.driveGameScreenPercentage). Keep it live even when a
-          // non-Custom DLSS preset would gray the section out (End/BeginDisabled), then show
-          // the passthrough status instead of the stock DLSS object's (meaningless) state.
-          if (RtxNgxPassthrough::ngxPassthroughMode()) {
-            ImGui::EndDisabled();
-            dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-            common->metaNgxPassthrough().showImguiStatusLine(false);
-            ImGui::BeginDisabled(disableNonPresetSettings);
-            break;
-          }
-          // Preset is shown before the mode. Ray Reconstruction has its own preset selector
-          // (rendered by showRayReconstructionEnable above), so only show the SR preset here.
-          if (!RtxOptions::enableRayReconstruction()) {
-            dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
-          }
-
+          // The DLSS mode selector maps to the game's ScreenPercentage
+          // (rtx.ngxPassthrough.driveGameScreenPercentage). Keep it live even when a
+          // non-Custom DLSS preset would gray the section out.
+          ImGui::EndDisabled();
           dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-
-          // Display DLSS Upscaling Information
-
-          const auto currentDLSSProfile = RtxOptions::enableRayReconstruction() ? rayReconstruction.getCurrentProfile() : dlss.getCurrentProfile();
-          uint32_t dlssInputWidth, dlssInputHeight;
-
-          if (RtxOptions::enableRayReconstruction()) {
-            rayReconstruction.getInputSize(dlssInputWidth, dlssInputHeight);
-          } else {
-            dlss.getInputSize(dlssInputWidth, dlssInputHeight);
-          }
-
-          ImGui::TextWrapped(str::format("Computed DLSS Mode: ", dlssProfileToString(currentDLSSProfile), ", Render Resolution: ", dlssInputWidth, "x", dlssInputHeight).c_str());
-
+          common->metaNgxPassthrough().showImguiStatusLine(false);
+          ImGui::BeginDisabled(disableNonPresetSettings);
           break;
         }
         case UpscalerType::NIS: {
@@ -444,43 +420,42 @@ namespace dxvk {
     const int subItemWidth,
     const int subItemIndent) {
     auto common = ctx->getCommonObjects();
-    DxvkPostFx& postFx = common->metaPostFx();
 
-    ImGui::TextWrapped("Post-processing and display settings for the NGX passthrough pipeline.");
+    if (RtxNgxPassthrough::ngxPassthroughMode()) {
+      DxvkPostFx& postFx = common->metaPostFx();
 
-    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+      ImGui::TextWrapped("Post-processing and display settings for the NGX passthrough pipeline.");
 
-    // Post Effect Settings
+      ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
-    ImGui::TextSeparator("Post Effect Settings");
+      ImGui::TextSeparator("Post Effect Settings");
 
-    {
-      RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
+      {
+        RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
 
-      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
-      ImGui::Indent(static_cast<float>(subItemIndent));
-
-      ImGui::BeginDisabled(!postFx.enable());
-
-      RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
-      if (postFx.enableMotionBlur()) {
+        ImGui::PushItemWidth(static_cast<float>(subItemWidth));
         ImGui::Indent(static_cast<float>(subItemIndent));
-        RemixGui::Combo("Motion Blur Quality", &postFx.motionBlurModeObject(), "Legacy\0Cinematic\0");
-        if (postFx.motionBlurMode() == MotionBlurMode::Cinematic) {
-          RemixGui::DragFloat("Shutter Angle", &postFx.motionBlurShutterAngleObject(), 1.0f, 0.0f, 360.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
+
+        ImGui::BeginDisabled(!postFx.enable());
+
+        RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
+        if (postFx.enableMotionBlur()) {
+          ImGui::Indent(static_cast<float>(subItemIndent));
+          RemixGui::Combo("Motion Blur Quality", &postFx.motionBlurModeObject(), "Legacy\0Cinematic\0");
+          if (postFx.motionBlurMode() == MotionBlurMode::Cinematic) {
+            RemixGui::DragFloat("Shutter Angle", &postFx.motionBlurShutterAngleObject(), 1.0f, 0.0f, 360.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
+          }
+          ImGui::Unindent(static_cast<float>(subItemIndent));
         }
+        RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
+        RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
+
+        ImGui::EndDisabled();
+
         ImGui::Unindent(static_cast<float>(subItemIndent));
+        ImGui::PopItemWidth();
       }
-      RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
-      RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
-
-      ImGui::EndDisabled();
-
-      ImGui::Unindent(static_cast<float>(subItemIndent));
-      ImGui::PopItemWidth();
     }
-
-    // Other Settings
 
     ImGui::Dummy(ImVec2(0.0f, 3.0f));
     ImGui::TextSeparator("Other Settings");

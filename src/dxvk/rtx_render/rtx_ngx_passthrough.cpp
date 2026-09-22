@@ -2142,9 +2142,6 @@ namespace dxvk {
 
     bool wroteOutputToTarget = false;
 
-    // The render resolution is still driven from the selected upscaler's preset; only the
-    // reconstruction is withheld, so the frame shows what that same input looks like without it.
-    // Reported as an inactive upscaler, which is what it is.
     if (canRunUpscaler && bypassUpscaler()) {
       wroteOutputToTarget = evaluateUpscalerBypass(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                                                    writebackOffset, preserveTargetAlpha, resetHistory);
@@ -2157,8 +2154,6 @@ namespace dxvk {
     } else if (!canRunUpscaler) {
       if (RtxOptions::upscalerType() == UpscalerType::None) {
         m_statusReason = "rtx.upscalerType is None";
-      } else if (RtxOptions::isRayReconstructionEnabled()) {
-        m_statusReason = "Ray Reconstruction is not available in NGX passthrough mode";
       } else if (RtxOptions::isNISEnabled()) {
         m_statusReason = "NIS upscaler inactive";
       } else if (!haveDepthMvInputs) {

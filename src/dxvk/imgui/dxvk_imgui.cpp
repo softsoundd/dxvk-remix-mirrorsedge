@@ -51,7 +51,6 @@
 #include "rtx_render/rtx_terrain_baker.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
 #include "rtx_render/rtx_nsight_capture.h"
-#include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_rtxdi_rayquery.h"
@@ -220,32 +219,6 @@ namespace dxvk {
     {"cullbackfacesinshadowgeometries", "Cull Backfaces in Shadows Geometry (optional)", &RtxOptions::cullBackfacesInShadowGeometriesObject()},
   };
 
-  RemixGui::ComboWithKey<RenderPassGBufferRaytraceMode> renderPassGBufferRaytraceModeCombo {
-    "GBuffer Raytracing Mode",
-    RemixGui::ComboWithKey<RenderPassGBufferRaytraceMode>::ComboEntries { {
-        {RenderPassGBufferRaytraceMode::RayQuery, "RayQuery (CS)"},
-        {RenderPassGBufferRaytraceMode::RayQueryRayGen, "RayQuery (RGS)"},
-        {RenderPassGBufferRaytraceMode::TraceRay, "TraceRay (RGS)"}
-    } }
-  };
-
-  RemixGui::ComboWithKey<RenderPassIntegrateDirectRaytraceMode> renderPassIntegrateDirectRaytraceModeCombo {
-    "Integrate Direct Raytracing Mode",
-    RemixGui::ComboWithKey<RenderPassIntegrateDirectRaytraceMode>::ComboEntries { {
-        {RenderPassIntegrateDirectRaytraceMode::RayQuery, "RayQuery (CS)"},
-        {RenderPassIntegrateDirectRaytraceMode::RayQueryRayGen, "RayQuery (RGS)"}
-    } }
-  };
-
-  RemixGui::ComboWithKey<RenderPassIntegrateIndirectRaytraceMode> renderPassIntegrateIndirectRaytraceModeCombo {
-    "Integrate Indirect Raytracing Mode",
-    RemixGui::ComboWithKey<RenderPassIntegrateIndirectRaytraceMode>::ComboEntries { {
-        {RenderPassIntegrateIndirectRaytraceMode::RayQuery, "RayQuery (CS)"},
-        {RenderPassIntegrateIndirectRaytraceMode::RayQueryRayGen, "RayQuery (RGS)"},
-        {RenderPassIntegrateIndirectRaytraceMode::TraceRay, "TraceRay (RGS)"}
-    } }
-  };
-
   RemixGui::ComboWithKey<CameraAnimationMode> cameraAnimationModeCombo {
     "Camera Animation Mode",
     RemixGui::ComboWithKey<CameraAnimationMode>::ComboEntries { {
@@ -377,16 +350,6 @@ namespace dxvk {
           "and allows paths to terminate early by looking up the cached value and saving performance.\n"
           "NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
           "while increasing performance in scenarios where ray paths have 2 or more bounces on average."}
-    } }
-  };
-
-  RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionPreset> rayReconstructionPresetCombo {
-    "DLSS RR Preset",
-    { {
-      { DxvkRayReconstruction::RayReconstructionPreset::Default, "Default", "Let DLSS pick the best preset per quality mode." },
-      { DxvkRayReconstruction::RayReconstructionPreset::D,       "D",       "Transformer model." },
-      { DxvkRayReconstruction::RayReconstructionPreset::E,       "E",       "Latest transformer model." },
-      { DxvkRayReconstruction::RayReconstructionPreset::F,       "F",       "Default RR2 model." },
     } }
   };
 
@@ -534,35 +497,13 @@ namespace dxvk {
   constexpr ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysVerticalScrollbar;
   constexpr ImGuiWindowFlags popupWindowFlags = ImGuiWindowFlags_NoSavedSettings;
 
-  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkRayReconstruction& rayReconstruction) {
+  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss) {
     if (dlss.supportsDLSS()) {
       return upscalerDLSSCombo;
     } else {
       // Drop DLSS item if unsupported.
       return upscalerNoDLSSCombo;
     }
-  }
-
-  bool ImGUI::showRayReconstructionEnable(bool supportsRR) {
-    // Only show DLSS-RR option if "showRayReconstructionOption" is set to true.
-    bool changed = false;
-    bool rayReconstruction = RtxOptions::enableRayReconstruction();
-    if (RtxOptions::showRayReconstructionOption()) {
-      ImGui::BeginDisabled(!supportsRR);
-      changed = RemixGui::Checkbox("Ray Reconstruction", &RtxOptions::enableRayReconstructionObject());
-
-      if (RtxOptions::enableRayReconstruction()) {
-        rayReconstructionPresetCombo.getKey(&DxvkRayReconstruction::presetObject());
-      }
-      ImGui::EndDisabled();
-    }
-
-    // Disable DLSS-RR if it's unsupported.
-    if (!supportsRR && RtxOptions::enableRayReconstruction()) {
-      RtxOptions::enableRayReconstruction.setDeferred(false);
-      changed = true;
-    }
-    return changed;
   }
 
   ImGUI::ImGUI(DxvkDevice* device)
@@ -1021,17 +962,11 @@ namespace dxvk {
         RtxOptions::enableReplacementMeshes.setDeferred(false);
         break;
       case RtxQuickAction::kRtxOnEnhanced:
-        if (!RtxNgxPassthrough::ngxPassthroughMode()) {
-          RtxOptions::enableRaytracing.setDeferred(true);
-        }
         RtxOptions::enableReplacementLights.setDeferred(true);
         RtxOptions::enableReplacementMaterials.setDeferred(true);
         RtxOptions::enableReplacementMeshes.setDeferred(true);
         break;
       case RtxQuickAction::kRtxOn:
-        if (!RtxNgxPassthrough::ngxPassthroughMode()) {
-          RtxOptions::enableRaytracing.setDeferred(true);
-        }
         RtxOptions::enableReplacementLights.setDeferred(false);
         RtxOptions::enableReplacementMaterials.setDeferred(false);
         RtxOptions::enableReplacementMeshes.setDeferred(false);
@@ -1682,12 +1617,7 @@ namespace dxvk {
         } else {
           Resources::s_queryAliasing = false;
         }
-        std::string resourceAliasingQueryText = "Resource Aliasing Query Result: (";
-        if (RtxOptions::enableRayReconstruction()) {
-          resourceAliasingQueryText += "DLSS-RR, ";
-        } else {
-          resourceAliasingQueryText += "NRD, ";
-        }
+        std::string resourceAliasingQueryText = "Resource Aliasing Query Result: (NRD, ";
         if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
           resourceAliasingQueryText += "NRC)";
         } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
@@ -3110,21 +3040,7 @@ namespace dxvk {
 
     if (RemixGui::CollapsingHeader("General", collapsingHeaderFlags)) {
       auto& dlss = common->metaDLSS();
-      auto& rayReconstruction = common->metaRayReconstruction();
       ImGui::Indent();
-
-      if (RtxOptions::showRaytracingOption() && !RtxNgxPassthrough::ngxPassthroughMode()) {
-        RemixGui::Checkbox("Raytracing Enabled", &RtxOptions::enableRaytracingObject());
-
-        renderPassGBufferRaytraceModeCombo.getKey(&RtxOptions::renderPassGBufferRaytraceModeObject());
-        renderPassIntegrateDirectRaytraceModeCombo.getKey(&RtxOptions::renderPassIntegrateDirectRaytraceModeObject());
-        renderPassIntegrateIndirectRaytraceModeCombo.getKey(&RtxOptions::renderPassIntegrateIndirectRaytraceModeObject());
-
-        RemixGui::Separator();
-      } else if (RtxOptions::showRaytracingOption() && RtxNgxPassthrough::ngxPassthroughMode()) {
-        ImGui::TextDisabled("Raytracing is disabled in NGX passthrough mode.");
-        RemixGui::Separator();
-      }
 
       {
         IMGUI_ADD_TOOLTIP(
@@ -3140,54 +3056,47 @@ namespace dxvk {
         RemixGui::Separator();
       }
 
-      showDLFGOptions(ctx);
+      if (RtxNgxPassthrough::ngxPassthroughMode()) {
+        showDLFGOptions(ctx);
 
-      RemixGui::Separator();
+        RemixGui::Separator();
 
-      showReflexOptions(ctx, true);
+        showReflexOptions(ctx, true);
 
-      RemixGui::Separator();
+        RemixGui::Separator();
 
-      if (ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
-        // Show upscaler and DLSS-RR option (RR is path-traced only; hidden in NGX passthrough mode).
-        auto oldUpscalerType = RtxOptions::upscalerType();
-        bool oldDLSSRREnabled = RtxOptions::enableRayReconstruction();
-        getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
+        if (ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+          auto oldUpscalerType = RtxOptions::upscalerType();
+          getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
 
-        // Update path tracer settings when upscaler is changed or DLSS-RR is toggled.
-        if (oldUpscalerType != RtxOptions::upscalerType() || oldDLSSRREnabled != RtxOptions::enableRayReconstruction()) {
-          RtxOptions::updateLightingSetting();
+          if (oldUpscalerType != RtxOptions::upscalerType()) {
+            RtxOptions::updateLightingSetting();
+          }
+        } else {
+          getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
         }
-      } else {
-        getUpscalerCombo(dlss, rayReconstruction).getKey(&RtxOptions::upscalerTypeObject());
-      }
 
-      RtxOptions::updatePresetFromUpscaler();
+        RtxOptions::updatePresetFromUpscaler();
 
-      if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
-        RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
-      }
+        if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+          RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
+        }
 
-      if (RtxOptions::isRayReconstructionEnabled() && !RtxNgxPassthrough::ngxPassthroughMode()) {
-        dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-        rayReconstruction.showRayReconstructionImguiSettings(false);
-      } else if (RtxOptions::upscalerType() == UpscalerType::DLSS) {
-        dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
-        dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-        dlss.showImguiSettings();
-      } else if (RtxOptions::upscalerType() == UpscalerType::NIS) {
-        RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
-        RemixGui::SliderFloat("Sharpness", &ctx->getCommonObjects()->metaNIS().m_sharpness, 0.1f, 1.0f);
-        RemixGui::Checkbox("Use FP16", &ctx->getCommonObjects()->metaNIS().m_useFp16);
-      } else if (RtxOptions::upscalerType() == UpscalerType::XeSS) {
+        if (RtxOptions::upscalerType() == UpscalerType::DLSS) {
+          dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
+          dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
+          dlss.showImguiSettings();
+        } else if (RtxOptions::upscalerType() == UpscalerType::NIS) {
+          RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+          RemixGui::SliderFloat("Sharpness", &ctx->getCommonObjects()->metaNIS().m_sharpness, 0.1f, 1.0f);
+          RemixGui::Checkbox("Use FP16", &ctx->getCommonObjects()->metaNIS().m_useFp16);
+        } else if (RtxOptions::upscalerType() == UpscalerType::XeSS) {
           xessPresetCombo.getKey(&DxvkXeSS::XessOptions::presetObject());
 
-          // Show resolution slider only for Custom preset
           if (DxvkXeSS::XessOptions::preset() == XeSSPreset::Custom) {
             RemixGui::SliderFloat("Resolution Scale", &RtxOptions::resolutionScaleObject(), 0.1f, 1.0f, "%.2f");
           }
 
-          // Display XeSS internal resolution
           uint32_t inputWidth;
           uint32_t inputHeight;
           ctx->getCommonObjects()->metaNgxPassthrough().getXeSSInputResolution(
@@ -3196,31 +3105,32 @@ namespace dxvk {
             inputWidth, inputHeight);
           ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
         } else if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
-        RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+          RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+        }
+
+        auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
+        if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
+          RemixGui::Separator();
+
+          if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+            ImGui::PushID("DLSS 3D-Guided Neural Generation");
+            dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
+            ImGui::PopID();
+            ImGui::Unindent();
+          }
+        }
       }
 
       RemixGui::Separator();
 
       RemixGui::Checkbox("Allow Full Screen Exclusive?", &RtxOptions::allowFSEObject());
 
-      auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
-      if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
-        RemixGui::Separator();
-
-        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
-          ImGui::Indent();
-          ImGui::PushID("DLSS 3D-Guided Neural Generation");
-          dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
-          ImGui::PopID();
-          ImGui::Unindent();
-        }
-      }
-
       ImGui::Unindent();
     }
 
 
-    if (RemixGui::CollapsingHeader("Post-Processing", collapsingHeaderClosedFlags)) {
+    if (RtxNgxPassthrough::ngxPassthroughMode() && RemixGui::CollapsingHeader("Post-Processing", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 
 
