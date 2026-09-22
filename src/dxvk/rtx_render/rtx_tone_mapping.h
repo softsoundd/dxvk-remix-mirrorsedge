@@ -55,10 +55,24 @@ namespace dxvk {
       const Resources::RaytracingOutput& rtOutput,
       bool autoExposureEnabled);
 
+    void dispatchFastToneMapping(
+      Rc<RtxContext> ctx,
+      Rc<DxvkImageView> exposureView,
+      const Resources::Resource& hdrColor,
+      const Resources::Resource& ldrOutput,
+      bool autoExposureEnabled);
+
     void dispatchInverseToneMapping(
       Rc<RtxContext> ctx,
       Rc<DxvkImageView> exposureView,
       const Resources::RaytracingOutput& rtOutput,
+      bool autoExposureEnabled);
+
+    void dispatchInverseToneMapping(
+      Rc<RtxContext> ctx,
+      Rc<DxvkImageView> exposureView,
+      const Resources::Resource& ldrColor,
+      const Resources::Resource& hdrOutput,
       bool autoExposureEnabled);
 
     bool isEnabled() const { return tonemappingEnabled(); }

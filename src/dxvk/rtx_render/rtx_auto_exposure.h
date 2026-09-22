@@ -46,6 +46,14 @@ namespace dxvk {
       const float frameTimeMilliseconds,
       bool resetHistory = false);
 
+    void dispatch(
+      Rc<DxvkContext> ctx,
+      Rc<DxvkSampler> linearSampler,
+      const Resources::Resource& colorInput,
+      const VkExtent3D& colorExtent,
+      const float frameTimeMilliseconds,
+      bool resetHistory = false);
+
     void showImguiSettings();
 
     void createResources(Rc<DxvkContext> ctx);
@@ -56,7 +64,8 @@ namespace dxvk {
     void dispatchAutoExposure(
       Rc<DxvkContext> ctx,
       Rc<DxvkSampler> linearSampler,
-      const Resources::RaytracingOutput& rtOutput,
+      const Resources::Resource& colorInput,
+      const VkExtent3D& colorExtent,
       const float frameTimeMilliseconds);
 
     Rc<vk::DeviceFn> m_vkd;

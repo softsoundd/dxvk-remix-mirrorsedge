@@ -134,6 +134,8 @@ namespace dxvk {
       { "rtx.d3d9.eventQueryCsCompletion",                           "True" },
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },
       { "rtx.fallbackLightMode",                                     "0" },
+      // The game blooms after the pre-post writeback. Leave Remix bloom off so it does not stack.
+      { "rtx.bloom.enable",                                          "False" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

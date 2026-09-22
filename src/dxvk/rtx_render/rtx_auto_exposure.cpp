@@ -220,7 +220,8 @@ namespace dxvk {
   void DxvkAutoExposure::dispatchAutoExposure(
     Rc<DxvkContext> ctx,
     Rc<DxvkSampler> linearSampler,
-    const Resources::RaytracingOutput& rtOutput,
+    const Resources::Resource& colorInput,
+    const VkExtent3D& colorExtent,
     const float frameTimeMilliseconds) {
 
     if (m_resetState || !enabled()) {
@@ -277,7 +278,7 @@ namespace dxvk {
         static_cast<RtxContext*>(ctx.ptr())->setFramePassStage(RtxFramePassStage::AutoExposure_Histogram);
         // Prepare shader arguments
         ToneMappingAutoExposureArgs pushArgs = {};
-        pushArgs.numPixels = rtOutput.m_finalOutputExtent.width * rtOutput.m_finalOutputExtent.height;
+        pushArgs.numPixels = colorExtent.width * colorExtent.height;
         // Note: Autoexposure speed is in units per second, so convert from milliseconds to seconds here.
         // Fall back to the configured constant frame time (or 60 FPS) when the per-frame delta is 0,
         // so eye adaptation still progresses on frame 0 in deterministic mode and when advanceTime is off.
@@ -295,10 +296,10 @@ namespace dxvk {
 
         // Calculate histogram
         ctx->bindResourceView(AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT, m_exposureHistogram.view, nullptr);
-        ctx->bindResourceView(AUTO_EXPOSURE_COLOR_INPUT, rtOutput.m_finalOutput.view(Resources::AccessType::Read), nullptr);
+        ctx->bindResourceView(AUTO_EXPOSURE_COLOR_INPUT, colorInput.view, nullptr);
 
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AutoExposureHistogramShader::getShader());
-        const VkExtent3D workgroups = util::computeBlockCount(rtOutput.m_finalOutputExtent, VkExtent3D { 16, 16, 1 });
+        const VkExtent3D workgroups = util::computeBlockCount(colorExtent, VkExtent3D { 16, 16, 1 });
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
 
@@ -325,6 +326,20 @@ namespace dxvk {
     const Resources::RaytracingOutput& rtOutput,
     const float frameTimeMilliseconds,
     bool resetHistory) {
+    dispatch(ctx, linearSampler,
+             rtOutput.m_finalOutput.resource(Resources::AccessType::Read),
+             rtOutput.m_finalOutputExtent,
+             frameTimeMilliseconds,
+             resetHistory);
+  }
+
+  void DxvkAutoExposure::dispatch(
+    Rc<DxvkContext> ctx,
+    Rc<DxvkSampler> linearSampler,
+    const Resources::Resource& colorInput,
+    const VkExtent3D& colorExtent,
+    const float frameTimeMilliseconds,
+    bool resetHistory) {
 
     ScopedGpuProfileZone(ctx, "Auto Exposure");
 
@@ -338,7 +353,7 @@ namespace dxvk {
       m_resetState = true;
     }
 
-    dispatchAutoExposure(ctx, linearSampler, rtOutput, frameTimeMilliseconds);
+    dispatchAutoExposure(ctx, linearSampler, colorInput, colorExtent, frameTimeMilliseconds);
 
     m_resetState = false;
   }

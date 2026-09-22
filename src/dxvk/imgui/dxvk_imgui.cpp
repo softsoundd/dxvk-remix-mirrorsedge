@@ -1081,6 +1081,14 @@ namespace dxvk {
       // Tab Bar
       if (ImGui::BeginTabBar("Developer Tabs", tab_bar_flags)) {
         for (int n = 0; n < kTab_Count; n++) {
+          // Game Setup and Enhancements author a ray-traced scene this mode does not build.
+          if (RtxNgxPassthrough::ngxPassthroughMode() &&
+              (n == kTab_Setup || n == kTab_Enhancements)) {
+            if (n == m_triggerTab) {
+              m_triggerTab = kTab_Count;
+            }
+            continue;
+          }
           auto tabItemFlags = tab_item_flags;
           if(n == m_triggerTab) {
             tabItemFlags |= ImGuiTabItemFlags_SetSelected;
@@ -1481,8 +1489,10 @@ namespace dxvk {
 
     RemixGui::SetTooltipToLastWidgetOnHover("Screenshot will be dumped to, '<exe-dir>/Screenshots'");
 
-    ImGui::SameLine(200.f);
-    RemixGui::Checkbox("Include G-Buffer", &RtxOptions::captureDebugImageObject());
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      ImGui::SameLine(200.f);
+      RemixGui::Checkbox("Include G-Buffer", &RtxOptions::captureDebugImageObject());
+    }
 
     RemixGui::Separator();
 
@@ -1638,7 +1648,8 @@ namespace dxvk {
     // Render GUI for memory profiler here
     GpuMemoryTracker::renderGui();
 
-    if (RemixGui::CollapsingHeader("Camera", collapsingHeaderFlags)) {
+    if (!RtxNgxPassthrough::ngxPassthroughMode() &&
+        RemixGui::CollapsingHeader("Camera", collapsingHeaderFlags)) {
       ImGui::Indent();
 
       RtCamera::showImguiSettings();
@@ -1731,7 +1742,8 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    if (RemixGui::CollapsingHeader("Camera Sequence", collapsingHeaderClosedFlags)) {
+    if (!RtxNgxPassthrough::ngxPassthroughMode() &&
+        RemixGui::CollapsingHeader("Camera Sequence", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       RtCameraSequence::getInstance()->showImguiSettings();
       ImGui::Unindent();
@@ -1739,20 +1751,21 @@ namespace dxvk {
 
     if (RemixGui::CollapsingHeader("Developer Options", collapsingHeaderFlags)) {
       ImGui::Indent();
-      RemixGui::Checkbox("Enable Preserve Path", &RtxOptions::enablePreservePathObject());
-      RemixGui::Checkbox("Enable Instance Debugging", &RtxOptions::enableInstanceDebuggingToolsObject());
-      RemixGui::Checkbox("Disable Draw Calls Post RTX Injection", &RtxOptions::skipDrawCallsPostRTXInjectionObject());
+      if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+        RemixGui::Checkbox("Enable Preserve Path", &RtxOptions::enablePreservePathObject());
+        RemixGui::Checkbox("Enable Instance Debugging", &RtxOptions::enableInstanceDebuggingToolsObject());
+        RemixGui::Checkbox("Disable Draw Calls Post RTX Injection", &RtxOptions::skipDrawCallsPostRTXInjectionObject());
+        RemixGui::Checkbox("Force Camera Jitter", &RtxOptions::forceCameraJitterObject());
+        RemixGui::Checkbox("Force Static Scene Motion Vectors", &RtxOptions::forceStaticSceneMotionVectorsObject());
+        RemixGui::DragInt("Camera Jitter Sequence Length", &RtxOptions::cameraJitterSequenceLengthObject());
+        RemixGui::DragIntRange2("Draw Call Range Filter", &RtxOptions::drawCallRangeObject(), 1.f, 0, INT32_MAX, nullptr, nullptr, ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::InputInt("Instance Index Start", &RtxOptions::instanceOverrideInstanceIdxObject());
+        RemixGui::InputInt("Instance Index Range", &RtxOptions::instanceOverrideInstanceIdxRangeObject());
+        RemixGui::DragFloat3("Instance World Offset", &RtxOptions::instanceOverrideWorldOffsetObject(), 0.1f, -100.f, 100.f, "%.3f", sliderFlags);
+        RemixGui::Checkbox("Instance - Print Hash", &RtxOptions::instanceOverrideSelectedInstancePrintMaterialHashObject());
+      }
       RemixGui::Checkbox("Break into Debugger On Press of Key 'B'", &RtxOptions::enableBreakIntoDebuggerOnPressingBObject());
       RemixGui::Checkbox("Block Input to Game in UI", &RtxOptions::blockInputToGameInUIObject());
-      RemixGui::Checkbox("Force Camera Jitter", &RtxOptions::forceCameraJitterObject());
-      RemixGui::Checkbox("Force Static Scene Motion Vectors", &RtxOptions::forceStaticSceneMotionVectorsObject());
-      RemixGui::DragInt("Camera Jitter Sequence Length", &RtxOptions::cameraJitterSequenceLengthObject());
-      
-      RemixGui::DragIntRange2("Draw Call Range Filter", &RtxOptions::drawCallRangeObject(), 1.f, 0, INT32_MAX, nullptr, nullptr, ImGuiSliderFlags_AlwaysClamp);
-      RemixGui::InputInt("Instance Index Start", &RtxOptions::instanceOverrideInstanceIdxObject());
-      RemixGui::InputInt("Instance Index Range", &RtxOptions::instanceOverrideInstanceIdxRangeObject());
-      RemixGui::DragFloat3("Instance World Offset", &RtxOptions::instanceOverrideWorldOffsetObject(), 0.1f, -100.f, 100.f, "%.3f", sliderFlags);
-      RemixGui::Checkbox("Instance - Print Hash", &RtxOptions::instanceOverrideSelectedInstancePrintMaterialHashObject());
 
       ImGui::Unindent();
       RemixGui::Checkbox("Throttle presents", &RtxOptions::enablePresentThrottleObject());
@@ -3863,374 +3876,377 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    if (RemixGui::CollapsingHeader("Pathtracing", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("RNG: seed with frame index", &RtxOptions::rngSeedWithFrameIndexObject());
-      RemixGui::Checkbox("Advance time", &RtxOptions::advanceTimeObject());
-
-      if (RemixGui::CollapsingHeader("Resolver", collapsingHeaderClosedFlags)) {
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      if (RemixGui::CollapsingHeader("Pathtracing", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
 
-        RemixGui::DragInt("Max Primary Interactions", &RtxOptions::primaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
-        RemixGui::DragInt("Max PSR Interactions", &RtxOptions::psrRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
-        RemixGui::DragInt("Max Secondary Interactions", &RtxOptions::secondaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
-        RemixGui::Checkbox("Separate Unordered Approximations", &RtxOptions::enableSeparateUnorderedApproximationsObject());
-        RemixGui::Checkbox("Direct Translucent Shadows", &RtxOptions::enableDirectTranslucentShadowsObject());
-        RemixGui::Checkbox("Direct Alpha Blended Shadows", &RtxOptions::enableDirectAlphaBlendShadowsObject());
-        RemixGui::Checkbox("Indirect Translucent Shadows", &RtxOptions::enableIndirectTranslucentShadowsObject());
-        RemixGui::Checkbox("Indirect Alpha Blended Shadows", &RtxOptions::enableIndirectAlphaBlendShadowsObject());
-        RemixGui::Checkbox("Decal Material Blending", &RtxOptions::enableDecalMaterialBlendingObject());
-        RemixGui::Checkbox("Billboard Orientation Correction", &RtxOptions::enableBillboardOrientationCorrectionObject());
-        if (RtxOptions::enableBillboardOrientationCorrection()) {
-          ImGui::Indent();
-          RemixGui::Checkbox("Dev: Use i-prims on primary rays", &RtxOptions::useIntersectionBillboardsOnPrimaryRaysObject());
-          ImGui::Unindent();
-        }
-        RemixGui::Checkbox("Track Particle Object", &RtxOptions::trackParticleObjectsObject());
+        RemixGui::Checkbox("RNG: seed with frame index", &RtxOptions::rngSeedWithFrameIndexObject());
+        RemixGui::Checkbox("Advance time", &RtxOptions::advanceTimeObject());
 
-        RemixGui::SliderFloat("Resolve Transparency Threshold", &RtxOptions::resolveTransparencyThresholdObject(), 0.0f, 1.0f);
-        RemixGui::SliderFloat("Resolve Opaqueness Threshold", &RtxOptions::resolveOpaquenessThresholdObject(), 0.0f, 1.0f);
-
-        ImGui::Unindent();
-      }
-
-      if (RemixGui::CollapsingHeader("PSR", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-
-        RemixGui::Checkbox("Reflection PSR Enabled", &RtxOptions::enablePSRRObject());
-        RemixGui::Checkbox("Transmission PSR Enabled", &RtxOptions::enablePSTRObject());
-        // # bounces limitted by 8b allocation in payload
-        // Note: value of 255 effectively means unlimited bounces, and we don't want to allow that
-        RemixGui::DragInt("Max Reflection PSR Bounces", &RtxOptions::psrrMaxBouncesObject(), 1.0f, 1, 254, "%d", sliderFlags);
-        RemixGui::DragInt("Max Transmission PSR Bounces", &RtxOptions::pstrMaxBouncesObject(), 1.0f, 1, 254, "%d", sliderFlags);
-        RemixGui::Checkbox("Outgoing Transmission Approx Enabled", &RtxOptions::enablePSTROutgoingSplitApproximationObject());
-        RemixGui::Checkbox("Incident Transmission Approx Enabled", &RtxOptions::enablePSTRSecondaryIncidentSplitApproximationObject());
-        RemixGui::DragFloat("Reflection PSR Normal Detail Threshold", &RtxOptions::psrrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
-        RemixGui::DragFloat("Transmission PSR Normal Detail Threshold", &RtxOptions::pstrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
-        RemixGui::DragFloat("PSR Max Distance (m)", &RtxOptions::psrMaxDistanceMetersObject(), 0.5f, 0.f, FLT_MAX, "%.1f", sliderFlags);
-        ImGui::BeginDisabled(RtxOptions::psrMaxDistanceMeters() <= 0.0f);
-        RemixGui::DragFloat("PSR Max Distance Fade (m)", &RtxOptions::psrMaxDistanceFadeMetersObject(), 0.5f, 0.f, FLT_MAX, "%.1f", sliderFlags);
-        ImGui::EndDisabled();
-
-        ImGui::Unindent();
-      }
-
-      if (RemixGui::CollapsingHeader("Integrator", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-
-        RemixGui::Checkbox("Enable Secondary Bounces", &RtxOptions::enableSecondaryBouncesObject());
-        RemixGui::Checkbox("Enable Russian Roulette", &RtxOptions::enableRussianRouletteObject());
-        RemixGui::Checkbox("Enable Probability Dithering Filtering for Primary Bounce", &RtxOptions::enableFirstBounceLobeProbabilityDitheringObject());
-        RemixGui::Checkbox("Unordered Resolve in Indirect Rays", &RtxOptions::enableUnorderedResolveInIndirectRaysObject());
-        ImGui::BeginDisabled(!RtxOptions::enableUnorderedResolveInIndirectRays());
-        RemixGui::Checkbox("Probabilistic Unordered Resolve in Indirect Rays", &RtxOptions::enableProbabilisticUnorderedResolveInIndirectRaysObject());
-        ImGui::EndDisabled();
-        RemixGui::Checkbox("Unordered Emissive Particles in Indirect Rays", &RtxOptions::enableUnorderedEmissiveParticlesInIndirectRaysObject());
-        RemixGui::Checkbox("Transmission Approximation in Indirect Rays", &RtxOptions::enableTransmissionApproximationInIndirectRaysObject());
-        // # bounces limitted by 4b allocation in payload
-        // Note: It's possible get up to 16 bounces => will require logic adjustment
-        RemixGui::DragInt("Minimum Path Bounces", &RtxOptions::pathMinBouncesObject(), 1.0f, 0, 15, "%d", sliderFlags);
-        RemixGui::DragInt("Maximum Path Bounces", &RtxOptions::pathMaxBouncesObject(), 1.0f, RtxOptions::pathMinBounces(), 15, "%d", sliderFlags);
-        RemixGui::DragFloat("Firefly Filtering Luminance Threshold", &RtxOptions::fireflyFilteringLuminanceThresholdObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Secondary Specular Firefly Filtering Threshold", &RtxOptions::secondarySpecularFireflyFilteringThresholdObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Opaque Diffuse Lobe Probability Zero Threshold", &RtxOptions::opaqueDiffuseLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Min Opaque Diffuse Lobe Probability", &RtxOptions::minOpaqueDiffuseLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Opaque Specular Lobe Probability Zero Threshold", &RtxOptions::opaqueSpecularLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Min Opaque Specular Lobe Probability", &RtxOptions::minOpaqueSpecularLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Opaque Opacity Transmission Lobe Probability Zero Threshold", &RtxOptions::opaqueOpacityTransmissionLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Min Opaque Opacity Transmission Lobe Probability", &RtxOptions::minOpaqueOpacityTransmissionLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Diffuse Transmission Lobe Probability Zero Threshold", &RtxOptions::opaqueDiffuseTransmissionLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Min Diffuse Transmission Lobe Probability", &RtxOptions::minOpaqueDiffuseTransmissionLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Translucent Specular Lobe Probability Zero Threshold", &RtxOptions::translucentSpecularLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Min Translucent Specular Lobe Probability", &RtxOptions::minTranslucentSpecularLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Translucent Transmission Lobe Probability Zero Threshold", &RtxOptions::translucentTransmissionLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Min Translucent Transmission Lobe Probability", &RtxOptions::minTranslucentTransmissionLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Indirect Ray Spread Angle Factor", &RtxOptions::indirectRaySpreadAngleFactorObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
-
-        if (RtxOptions::enableRussianRoulette() && RemixGui::CollapsingHeader("Russian Roulette", collapsingHeaderClosedFlags)) {
+        if (RemixGui::CollapsingHeader("Resolver", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
 
-          RemixGui::DragFloat("1st bounce: Min Continue Probability", &RtxOptions::russianRoulette1stBounceMinContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
-          RemixGui::DragFloat("1st bounce: Max Continue Probability", &RtxOptions::russianRoulette1stBounceMaxContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
-          
-          secondPlusBounceRussianRouletteModeCombo.getKey(&RtxOptions::russianRouletteModeObject());
-          if (RtxOptions::russianRouletteMode() == RussianRouletteMode::ThroughputBased)
-          {
-            RemixGui::DragFloat("2nd+ bounce: Max Continue Probability", &RtxOptions::russianRouletteMaxContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragInt("Max Primary Interactions", &RtxOptions::primaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
+          RemixGui::DragInt("Max PSR Interactions", &RtxOptions::psrRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
+          RemixGui::DragInt("Max Secondary Interactions", &RtxOptions::secondaryRayMaxInteractionsObject(), 1.0f, 1, 255, "%d", sliderFlags);
+          RemixGui::Checkbox("Separate Unordered Approximations", &RtxOptions::enableSeparateUnorderedApproximationsObject());
+          RemixGui::Checkbox("Direct Translucent Shadows", &RtxOptions::enableDirectTranslucentShadowsObject());
+          RemixGui::Checkbox("Direct Alpha Blended Shadows", &RtxOptions::enableDirectAlphaBlendShadowsObject());
+          RemixGui::Checkbox("Indirect Translucent Shadows", &RtxOptions::enableIndirectTranslucentShadowsObject());
+          RemixGui::Checkbox("Indirect Alpha Blended Shadows", &RtxOptions::enableIndirectAlphaBlendShadowsObject());
+          RemixGui::Checkbox("Decal Material Blending", &RtxOptions::enableDecalMaterialBlendingObject());
+          RemixGui::Checkbox("Billboard Orientation Correction", &RtxOptions::enableBillboardOrientationCorrectionObject());
+          if (RtxOptions::enableBillboardOrientationCorrection()) {
+            ImGui::Indent();
+            RemixGui::Checkbox("Dev: Use i-prims on primary rays", &RtxOptions::useIntersectionBillboardsOnPrimaryRaysObject());
+            ImGui::Unindent();
           }
-          else
-          {
-            RemixGui::DragFloat("2nd+ bounce: Diffuse Continue Probability", &RtxOptions::russianRouletteDiffuseContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
-            RemixGui::DragFloat("2nd+ bounce: Specular Continue Probability", &RtxOptions::russianRouletteSpecularContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
-            RemixGui::DragFloat("2nd+ bounce: Distance Factor", &RtxOptions::russianRouletteDistanceFactorObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
-          }
-          
+          RemixGui::Checkbox("Track Particle Object", &RtxOptions::trackParticleObjectsObject());
+
+          RemixGui::SliderFloat("Resolve Transparency Threshold", &RtxOptions::resolveTransparencyThresholdObject(), 0.0f, 1.0f);
+          RemixGui::SliderFloat("Resolve Opaqueness Threshold", &RtxOptions::resolveOpaquenessThresholdObject(), 0.0f, 1.0f);
+
           ImGui::Unindent();
         }
-        ImGui::Unindent();
-      }
 
-      if (RtxOptions::getIsOpacityMicromapSupported() && 
-          RemixGui::CollapsingHeader("Opacity Micromap", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
+        if (RemixGui::CollapsingHeader("PSR", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
 
-        RemixGui::Checkbox("Enable Opacity Micromap", &RtxOptions::OpacityMicromap::enableObject());
+          RemixGui::Checkbox("Reflection PSR Enabled", &RtxOptions::enablePSRRObject());
+          RemixGui::Checkbox("Transmission PSR Enabled", &RtxOptions::enablePSTRObject());
+          // # bounces limitted by 8b allocation in payload
+          // Note: value of 255 effectively means unlimited bounces, and we don't want to allow that
+          RemixGui::DragInt("Max Reflection PSR Bounces", &RtxOptions::psrrMaxBouncesObject(), 1.0f, 1, 254, "%d", sliderFlags);
+          RemixGui::DragInt("Max Transmission PSR Bounces", &RtxOptions::pstrMaxBouncesObject(), 1.0f, 1, 254, "%d", sliderFlags);
+          RemixGui::Checkbox("Outgoing Transmission Approx Enabled", &RtxOptions::enablePSTROutgoingSplitApproximationObject());
+          RemixGui::Checkbox("Incident Transmission Approx Enabled", &RtxOptions::enablePSTRSecondaryIncidentSplitApproximationObject());
+          RemixGui::DragFloat("Reflection PSR Normal Detail Threshold", &RtxOptions::psrrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
+          RemixGui::DragFloat("Transmission PSR Normal Detail Threshold", &RtxOptions::pstrNormalDetailThresholdObject(), 0.001f, 0.f, 1.f);
+          RemixGui::DragFloat("PSR Max Distance (m)", &RtxOptions::psrMaxDistanceMetersObject(), 0.5f, 0.f, FLT_MAX, "%.1f", sliderFlags);
+          ImGui::BeginDisabled(RtxOptions::psrMaxDistanceMeters() <= 0.0f);
+          RemixGui::DragFloat("PSR Max Distance Fade (m)", &RtxOptions::psrMaxDistanceFadeMetersObject(), 0.5f, 0.f, FLT_MAX, "%.1f", sliderFlags);
+          ImGui::EndDisabled();
+
+          ImGui::Unindent();
+        }
+
+        if (RemixGui::CollapsingHeader("Integrator", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+
+          RemixGui::Checkbox("Enable Secondary Bounces", &RtxOptions::enableSecondaryBouncesObject());
+          RemixGui::Checkbox("Enable Russian Roulette", &RtxOptions::enableRussianRouletteObject());
+          RemixGui::Checkbox("Enable Probability Dithering Filtering for Primary Bounce", &RtxOptions::enableFirstBounceLobeProbabilityDitheringObject());
+          RemixGui::Checkbox("Unordered Resolve in Indirect Rays", &RtxOptions::enableUnorderedResolveInIndirectRaysObject());
+          ImGui::BeginDisabled(!RtxOptions::enableUnorderedResolveInIndirectRays());
+          RemixGui::Checkbox("Probabilistic Unordered Resolve in Indirect Rays", &RtxOptions::enableProbabilisticUnorderedResolveInIndirectRaysObject());
+          ImGui::EndDisabled();
+          RemixGui::Checkbox("Unordered Emissive Particles in Indirect Rays", &RtxOptions::enableUnorderedEmissiveParticlesInIndirectRaysObject());
+          RemixGui::Checkbox("Transmission Approximation in Indirect Rays", &RtxOptions::enableTransmissionApproximationInIndirectRaysObject());
+          // # bounces limitted by 4b allocation in payload
+          // Note: It's possible get up to 16 bounces => will require logic adjustment
+          RemixGui::DragInt("Minimum Path Bounces", &RtxOptions::pathMinBouncesObject(), 1.0f, 0, 15, "%d", sliderFlags);
+          RemixGui::DragInt("Maximum Path Bounces", &RtxOptions::pathMaxBouncesObject(), 1.0f, RtxOptions::pathMinBounces(), 15, "%d", sliderFlags);
+          RemixGui::DragFloat("Firefly Filtering Luminance Threshold", &RtxOptions::fireflyFilteringLuminanceThresholdObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Secondary Specular Firefly Filtering Threshold", &RtxOptions::secondarySpecularFireflyFilteringThresholdObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Opaque Diffuse Lobe Probability Zero Threshold", &RtxOptions::opaqueDiffuseLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Min Opaque Diffuse Lobe Probability", &RtxOptions::minOpaqueDiffuseLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Opaque Specular Lobe Probability Zero Threshold", &RtxOptions::opaqueSpecularLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Min Opaque Specular Lobe Probability", &RtxOptions::minOpaqueSpecularLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Opaque Opacity Transmission Lobe Probability Zero Threshold", &RtxOptions::opaqueOpacityTransmissionLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Min Opaque Opacity Transmission Lobe Probability", &RtxOptions::minOpaqueOpacityTransmissionLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Diffuse Transmission Lobe Probability Zero Threshold", &RtxOptions::opaqueDiffuseTransmissionLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Min Diffuse Transmission Lobe Probability", &RtxOptions::minOpaqueDiffuseTransmissionLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Translucent Specular Lobe Probability Zero Threshold", &RtxOptions::translucentSpecularLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Min Translucent Specular Lobe Probability", &RtxOptions::minTranslucentSpecularLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Translucent Transmission Lobe Probability Zero Threshold", &RtxOptions::translucentTransmissionLobeSamplingProbabilityZeroThresholdObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Min Translucent Transmission Lobe Probability", &RtxOptions::minTranslucentTransmissionLobeSamplingProbabilityObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Indirect Ray Spread Angle Factor", &RtxOptions::indirectRaySpreadAngleFactorObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+
+          if (RtxOptions::enableRussianRoulette() && RemixGui::CollapsingHeader("Russian Roulette", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+
+            RemixGui::DragFloat("1st bounce: Min Continue Probability", &RtxOptions::russianRoulette1stBounceMinContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+            RemixGui::DragFloat("1st bounce: Max Continue Probability", &RtxOptions::russianRoulette1stBounceMaxContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+          
+            secondPlusBounceRussianRouletteModeCombo.getKey(&RtxOptions::russianRouletteModeObject());
+            if (RtxOptions::russianRouletteMode() == RussianRouletteMode::ThroughputBased)
+            {
+              RemixGui::DragFloat("2nd+ bounce: Max Continue Probability", &RtxOptions::russianRouletteMaxContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+            }
+            else
+            {
+              RemixGui::DragFloat("2nd+ bounce: Diffuse Continue Probability", &RtxOptions::russianRouletteDiffuseContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+              RemixGui::DragFloat("2nd+ bounce: Specular Continue Probability", &RtxOptions::russianRouletteSpecularContinueProbabilityObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+              RemixGui::DragFloat("2nd+ bounce: Distance Factor", &RtxOptions::russianRouletteDistanceFactorObject(), 0.01f, 0.0f, 1.0f, "%.3f", sliderFlags);
+            }
+          
+            ImGui::Unindent();
+          }
+          ImGui::Unindent();
+        }
+
+        if (RtxOptions::getIsOpacityMicromapSupported() && 
+            RemixGui::CollapsingHeader("Opacity Micromap", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+
+          RemixGui::Checkbox("Enable Opacity Micromap", &RtxOptions::OpacityMicromap::enableObject());
         
-        if (common->getOpacityMicromapManager()) {
-          common->getOpacityMicromapManager()->showImguiSettings();
+          if (common->getOpacityMicromapManager()) {
+            common->getOpacityMicromapManager()->showImguiSettings();
+          }
+          ImGui::Unindent();
         }
+
+        const VkPhysicalDeviceProperties& props = m_device->adapter()->deviceProperties();
+        const NV_GPU_ARCHITECTURE_ID archId = RtxOptions::getNvidiaArch();
+
+        // Shader Execution Reordering
+        if (RtxOptions::isShaderExecutionReorderingSupported()) {
+          if (RemixGui::CollapsingHeader("Shader Execution Reordering", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+
+            if (RtxOptions::renderPassIntegrateIndirectRaytraceMode() == DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay)
+              RemixGui::Checkbox("Enable In Integrate Indirect Pass", &RtxOptions::enableShaderExecutionReorderingInPathtracerIntegrateIndirectObject());
+
+            ImGui::Unindent();
+          }
+        }
+
         ImGui::Unindent();
       }
 
-      const VkPhysicalDeviceProperties& props = m_device->adapter()->deviceProperties();
-      const NV_GPU_ARCHITECTURE_ID archId = RtxOptions::getNvidiaArch();
+      if (RemixGui::CollapsingHeader("Lighting", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
 
-      // Shader Execution Reordering
-      if (RtxOptions::isShaderExecutionReorderingSupported()) {
-        if (RemixGui::CollapsingHeader("Shader Execution Reordering", collapsingHeaderClosedFlags)) {
+        common->getSceneManager().getLightManager().showImguiLightOverview();
+
+        if (RemixGui::CollapsingHeader("Effect Light", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
 
-          if (RtxOptions::renderPassIntegrateIndirectRaytraceMode() == DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay)
-            RemixGui::Checkbox("Enable In Integrate Indirect Pass", &RtxOptions::enableShaderExecutionReorderingInPathtracerIntegrateIndirectObject());
+          ImGui::TextWrapped("These settings control the effect lights, which are created by Remix, and attached to objects tagged using the rtx.lightConverter option (found in the texture tagging menu as 'Add Light to Texture').");
+
+          RemixGui::DragFloat("Light Intensity", &RtxOptions::effectLightIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Light Radius", &RtxOptions::effectLightRadiusObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
+          // Plasma ball has first priority
+          RemixGui::Checkbox("Plasma Ball Effect", &RtxOptions::effectLightPlasmaBallObject());
+          ImGui::BeginDisabled(RtxOptions::effectLightPlasmaBall());
+          RemixGui::ColorPicker3("Light Color", &RtxOptions::effectLightColorObject());
+          ImGui::EndDisabled();
+          ImGui::Unindent();
+        }
+
+        RemixGui::DragFloat("Emissive Intensity", &RtxOptions::emissiveIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+        RemixGui::Separator();
+        RemixGui::SliderInt("RIS Light Sample Count", &RtxOptions::risLightSampleCountObject(), 0, 64);
+        RemixGui::Separator();
+        RemixGui::Checkbox("Direct Lighting Enabled", &RtxOptions::enableDirectLightingObject());
+        RemixGui::Checkbox("Indirect Lighting Enabled", &RtxOptions::enableSecondaryBouncesObject());
+
+        if (RemixGui::CollapsingHeader("RTXDI", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+
+          RemixGui::Checkbox("Enable RTXDI", &RtxOptions::useRTXDIObject());
+
+          auto& rtxdi = common->metaRtxdiRayQuery();
+          rtxdi.showImguiSettings();
+          ImGui::Unindent();
+        }
+
+        // Indirect Illumination Integration Mode
+        if (RemixGui::CollapsingHeader("Indirect Illumination", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          integrateIndirectModeCombo.getKey(&RtxOptions::integrateIndirectModeObject());
+
+          if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
+            if (RemixGui::CollapsingHeader("ReSTIR GI", collapsingHeaderClosedFlags)) {
+              ImGui::Indent();
+              ImGui::PushID("ReSTIR GI");
+              auto& restirGI = common->metaReSTIRGIRayQuery();
+              restirGI.showImguiSettings();
+              ImGui::PopID();
+              ImGui::Unindent();
+            }
+          } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
+            if (RemixGui::CollapsingHeader("RTX Neural Radiance Cache", collapsingHeaderClosedFlags)) {
+
+              ImGui::Indent();
+              ImGui::PushID("Neural Radiance Cache");
+              NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
+              nrc.showImguiSettings(*ctx);
+              ImGui::PopID();
+              ImGui::Unindent();
+            }
+          }
 
           ImGui::Unindent();
         }
-      }
 
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Lighting", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      common->getSceneManager().getLightManager().showImguiLightOverview();
-
-      if (RemixGui::CollapsingHeader("Effect Light", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-
-        ImGui::TextWrapped("These settings control the effect lights, which are created by Remix, and attached to objects tagged using the rtx.lightConverter option (found in the texture tagging menu as 'Add Light to Texture').");
-
-        RemixGui::DragFloat("Light Intensity", &RtxOptions::effectLightIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Light Radius", &RtxOptions::effectLightRadiusObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
-        // Plasma ball has first priority
-        RemixGui::Checkbox("Plasma Ball Effect", &RtxOptions::effectLightPlasmaBallObject());
-        ImGui::BeginDisabled(RtxOptions::effectLightPlasmaBall());
-        RemixGui::ColorPicker3("Light Color", &RtxOptions::effectLightColorObject());
-        ImGui::EndDisabled();
-        ImGui::Unindent();
-      }
-
-      RemixGui::DragFloat("Emissive Intensity", &RtxOptions::emissiveIntensityObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
-      RemixGui::Separator();
-      RemixGui::SliderInt("RIS Light Sample Count", &RtxOptions::risLightSampleCountObject(), 0, 64);
-      RemixGui::Separator();
-      RemixGui::Checkbox("Direct Lighting Enabled", &RtxOptions::enableDirectLightingObject());
-      RemixGui::Checkbox("Indirect Lighting Enabled", &RtxOptions::enableSecondaryBouncesObject());
-
-      if (RemixGui::CollapsingHeader("RTXDI", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-
-        RemixGui::Checkbox("Enable RTXDI", &RtxOptions::useRTXDIObject());
-
-        auto& rtxdi = common->metaRtxdiRayQuery();
-        rtxdi.showImguiSettings();
-        ImGui::Unindent();
-      }
-
-      // Indirect Illumination Integration Mode
-      if (RemixGui::CollapsingHeader("Indirect Illumination", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        integrateIndirectModeCombo.getKey(&RtxOptions::integrateIndirectModeObject());
-
-        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
-          if (RemixGui::CollapsingHeader("ReSTIR GI", collapsingHeaderClosedFlags)) {
-            ImGui::Indent();
-            ImGui::PushID("ReSTIR GI");
-            auto& restirGI = common->metaReSTIRGIRayQuery();
-            restirGI.showImguiSettings();
-            ImGui::PopID();
-            ImGui::Unindent();
-          }
-        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
-          if (RemixGui::CollapsingHeader("RTX Neural Radiance Cache", collapsingHeaderClosedFlags)) {
-
-            ImGui::Indent();
-            ImGui::PushID("Neural Radiance Cache");
-            NeuralRadianceCache& nrc = common->metaNeuralRadianceCache();
-            nrc.showImguiSettings(*ctx);
-            ImGui::PopID();
-            ImGui::Unindent();
-          }
-        }
-
-        ImGui::Unindent();
-      }
-
-      if (RemixGui::CollapsingHeader("NEE Cache", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        ImGui::PushID("NEE Cache");
-        auto& neeCache = common->metaNeeCache();
-        neeCache.showImguiSettings();
-        ImGui::PopID();
-        ImGui::Unindent();
-      }
-
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Sparse Rendering", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      common->metaSparseRendering().showImguiSettings();
-      ImGui::Unindent();
-    }
-
-    RtxParticleSystemManager::showImguiSettings();
-
-    RtxPointInstancerSystem::showImguiSettings();
-
-    if (RemixGui::CollapsingHeader("RTX Volumetrics (Global)", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      common->metaGlobalVolumetrics().showImguiSettings();
-
-      common->metaDustParticles().showImguiSettings();
-
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Subsurface Scattering", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Enable Thin Opaque", &RtxOptions::SubsurfaceScattering::enableThinOpaqueObject());
-      RemixGui::Checkbox("Enable Texture Maps", &RtxOptions::SubsurfaceScattering::enableTextureMapsObject());
-
-      RemixGui::Checkbox("Enable Diffusion Profile SSS", &RtxOptions::SubsurfaceScattering::enableDiffusionProfileObject());
-
-      if (RtxOptions::SubsurfaceScattering::enableDiffusionProfile()) {
-        RemixGui::SliderFloat("SSS Scale", &RtxOptions::SubsurfaceScattering::diffusionProfileScaleObject(), 0.0f, 100.0f);
-
-        RemixGui::Checkbox("Enable SSS Transmission", &RtxOptions::SubsurfaceScattering::enableTransmissionObject());
-        if (RtxOptions::SubsurfaceScattering::enableTransmission()) {
-          RemixGui::Checkbox("Enable SSS Transmission Single Scattering", &RtxOptions::SubsurfaceScattering::enableTransmissionSingleScatteringObject());
-          RemixGui::Checkbox("Enable Transmission Diffusion Profile Correction [Experimental]", &RtxOptions::SubsurfaceScattering::enableTransmissionDiffusionProfileCorrectionObject());
-          RemixGui::DragInt("SSS Transmission BSDF Sample Count", &RtxOptions::SubsurfaceScattering::transmissionBsdfSampleCountObject(), 0.1f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragInt("SSS Transmission Single Scattering Sample Count", &RtxOptions::SubsurfaceScattering::transmissionSingleScatteringSampleCountObject(), 0.1f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
-        }
-      }
-
-      RemixGui::DragInt2("Diffusion Profile Sampling Debugging Pixel Position", &RtxOptions::SubsurfaceScattering::diffusionProfileDebugPixelPositionObject(), 0.1f, 0, INT32_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
-
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Alpha Test/Blending", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Render Alpha Blended", &RtxOptions::enableAlphaBlendObject());
-      RemixGui::Checkbox("Render Alpha Tested", &RtxOptions::enableAlphaTestObject());
-      RemixGui::Separator();
-
-      RemixGui::Checkbox("Emissive Blend Translation", &RtxOptions::enableEmissiveBlendModeTranslationObject());
-
-      RemixGui::Checkbox("Emissive Blend Override", &RtxOptions::enableEmissiveBlendEmissiveOverrideObject());
-      RemixGui::DragFloat("Emissive Blend Override Intensity", &RtxOptions::emissiveBlendOverrideEmissiveIntensityObject(), 0.001f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
-
-      RemixGui::Separator();
-      RemixGui::SliderFloat("Particle Softness", &RtxOptions::particleSoftnessFactorObject(), 0.f, 0.5f);
-      RemixGui::Separator();
-      if (RemixGui::CollapsingHeader("Weighted Blended OIT", collapsingHeaderClosedFlags)) {
-        RemixGui::Checkbox("Enable", &RtxOptions::wboitEnabledObject());
-        ImGui::BeginDisabled(!RtxOptions::wboitEnabled());
-        RemixGui::SliderFloat("Energy Compensation", &RtxOptions::wboitEnergyLossCompensationObject(), 1.f, 10.f);
-        RemixGui::SliderFloat("Depth Weight Tuning", &RtxOptions::wboitDepthWeightTuningObject(), 0.01f, 10.f);
-        ImGui::EndDisabled();
-      }
-      common->metaComposite().showStochasticAlphaBlendImguiSettings();
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Denoising", collapsingHeaderClosedFlags)) {
-      bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
-      const bool useNRD = !isRayReconstructionEnabled;
-      ImGui::Indent();
-      ImGui::BeginDisabled(!useNRD);
-      RemixGui::Checkbox("Denoising Enabled", &RtxOptions::useDenoiserObject());
-      RemixGui::Checkbox("Reference Mode | Accumulation", &RtxOptions::useDenoiserReferenceModeObject());
-
-      if (RtxOptions::useDenoiserReferenceMode()) {
-        common->metaComposite().showAccumulationImguiSettings();
-      }
-
-      ImGui::EndDisabled();
-
-      if(RemixGui::CollapsingHeader("Settings", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        RemixGui::Checkbox("Separate Primary Direct/Indirect Denoiser", &RtxOptions::denoiseDirectAndIndirectLightingSeparatelyObject());
-        RemixGui::Checkbox("Reset History On Settings Change", &RtxOptions::resetDenoiserHistoryOnSettingsChangeObject());
-        RemixGui::Checkbox("Replace Direct Specular HitT with Indirect Specular HitT", &RtxOptions::replaceDirectSpecularHitTWithIndirectSpecularHitTObject());
-        RemixGui::Checkbox("Use Virtual Shading Normals", &RtxOptions::useVirtualShadingNormalsForDenoisingObject());
-        RemixGui::Checkbox("Adaptive Resolution Denoising", &RtxOptions::adaptiveResolutionDenoisingObject());
-        RemixGui::Checkbox("Adaptive Accumulation", &RtxOptions::adaptiveAccumulationObject());
-        common->metaDemodulate().showImguiSettings();
-        common->metaComposite().showDenoiseImguiSettings();
-        ImGui::Unindent();
-      }
-      bool useDoubleDenoisers = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
-      if (isRayReconstructionEnabled) {
-        if (RemixGui::CollapsingHeader("DLSS-RR", collapsingHeaderClosedFlags)) {
+        if (RemixGui::CollapsingHeader("NEE Cache", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
-          ImGui::PushID("DLSS-RR");
-          common->metaRayReconstruction().showRayReconstructionImguiSettings(true);
+          ImGui::PushID("NEE Cache");
+          auto& neeCache = common->metaNeeCache();
+          neeCache.showImguiSettings();
           ImGui::PopID();
           ImGui::Unindent();
         }
+
+        ImGui::Unindent();
       }
+
+      if (RemixGui::CollapsingHeader("Sparse Rendering", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        common->metaSparseRendering().showImguiSettings();
+        ImGui::Unindent();
+      }
+
+      RtxParticleSystemManager::showImguiSettings();
+
+      RtxPointInstancerSystem::showImguiSettings();
+
+      if (RemixGui::CollapsingHeader("RTX Volumetrics (Global)", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+
+        common->metaGlobalVolumetrics().showImguiSettings();
+
+        common->metaDustParticles().showImguiSettings();
+
+        ImGui::Unindent();
+      }
+
+      if (RemixGui::CollapsingHeader("Subsurface Scattering", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+
+        RemixGui::Checkbox("Enable Thin Opaque", &RtxOptions::SubsurfaceScattering::enableThinOpaqueObject());
+        RemixGui::Checkbox("Enable Texture Maps", &RtxOptions::SubsurfaceScattering::enableTextureMapsObject());
+
+        RemixGui::Checkbox("Enable Diffusion Profile SSS", &RtxOptions::SubsurfaceScattering::enableDiffusionProfileObject());
+
+        if (RtxOptions::SubsurfaceScattering::enableDiffusionProfile()) {
+          RemixGui::SliderFloat("SSS Scale", &RtxOptions::SubsurfaceScattering::diffusionProfileScaleObject(), 0.0f, 100.0f);
+
+          RemixGui::Checkbox("Enable SSS Transmission", &RtxOptions::SubsurfaceScattering::enableTransmissionObject());
+          if (RtxOptions::SubsurfaceScattering::enableTransmission()) {
+            RemixGui::Checkbox("Enable SSS Transmission Single Scattering", &RtxOptions::SubsurfaceScattering::enableTransmissionSingleScatteringObject());
+            RemixGui::Checkbox("Enable Transmission Diffusion Profile Correction [Experimental]", &RtxOptions::SubsurfaceScattering::enableTransmissionDiffusionProfileCorrectionObject());
+            RemixGui::DragInt("SSS Transmission BSDF Sample Count", &RtxOptions::SubsurfaceScattering::transmissionBsdfSampleCountObject(), 0.1f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+            RemixGui::DragInt("SSS Transmission Single Scattering Sample Count", &RtxOptions::SubsurfaceScattering::transmissionSingleScatteringSampleCountObject(), 0.1f, 1, 64, "%d", ImGuiSliderFlags_AlwaysClamp);
+          }
+        }
+
+        RemixGui::DragInt2("Diffusion Profile Sampling Debugging Pixel Position", &RtxOptions::SubsurfaceScattering::diffusionProfileDebugPixelPositionObject(), 0.1f, 0, INT32_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+
+        ImGui::Unindent();
+      }
+
+      if (RemixGui::CollapsingHeader("Alpha Test/Blending", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+
+        RemixGui::Checkbox("Render Alpha Blended", &RtxOptions::enableAlphaBlendObject());
+        RemixGui::Checkbox("Render Alpha Tested", &RtxOptions::enableAlphaTestObject());
+        RemixGui::Separator();
+
+        RemixGui::Checkbox("Emissive Blend Translation", &RtxOptions::enableEmissiveBlendModeTranslationObject());
+
+        RemixGui::Checkbox("Emissive Blend Override", &RtxOptions::enableEmissiveBlendEmissiveOverrideObject());
+        RemixGui::DragFloat("Emissive Blend Override Intensity", &RtxOptions::emissiveBlendOverrideEmissiveIntensityObject(), 0.001f, 0.0f, FLT_MAX, "%.3f", sliderFlags);
+
+        RemixGui::Separator();
+        RemixGui::SliderFloat("Particle Softness", &RtxOptions::particleSoftnessFactorObject(), 0.f, 0.5f);
+        RemixGui::Separator();
+        if (RemixGui::CollapsingHeader("Weighted Blended OIT", collapsingHeaderClosedFlags)) {
+          RemixGui::Checkbox("Enable", &RtxOptions::wboitEnabledObject());
+          ImGui::BeginDisabled(!RtxOptions::wboitEnabled());
+          RemixGui::SliderFloat("Energy Compensation", &RtxOptions::wboitEnergyLossCompensationObject(), 1.f, 10.f);
+          RemixGui::SliderFloat("Depth Weight Tuning", &RtxOptions::wboitDepthWeightTuningObject(), 0.01f, 10.f);
+          ImGui::EndDisabled();
+        }
+        common->metaComposite().showStochasticAlphaBlendImguiSettings();
+        ImGui::Unindent();
+      }
+
+      if (RemixGui::CollapsingHeader("Denoising", collapsingHeaderClosedFlags)) {
+        bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
+        const bool useNRD = !isRayReconstructionEnabled;
+        ImGui::Indent();
+        ImGui::BeginDisabled(!useNRD);
+        RemixGui::Checkbox("Denoising Enabled", &RtxOptions::useDenoiserObject());
+        RemixGui::Checkbox("Reference Mode | Accumulation", &RtxOptions::useDenoiserReferenceModeObject());
+
+        if (RtxOptions::useDenoiserReferenceMode()) {
+          common->metaComposite().showAccumulationImguiSettings();
+        }
+
+        ImGui::EndDisabled();
+
+        if(RemixGui::CollapsingHeader("Settings", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          RemixGui::Checkbox("Separate Primary Direct/Indirect Denoiser", &RtxOptions::denoiseDirectAndIndirectLightingSeparatelyObject());
+          RemixGui::Checkbox("Reset History On Settings Change", &RtxOptions::resetDenoiserHistoryOnSettingsChangeObject());
+          RemixGui::Checkbox("Replace Direct Specular HitT with Indirect Specular HitT", &RtxOptions::replaceDirectSpecularHitTWithIndirectSpecularHitTObject());
+          RemixGui::Checkbox("Use Virtual Shading Normals", &RtxOptions::useVirtualShadingNormalsForDenoisingObject());
+          RemixGui::Checkbox("Adaptive Resolution Denoising", &RtxOptions::adaptiveResolutionDenoisingObject());
+          RemixGui::Checkbox("Adaptive Accumulation", &RtxOptions::adaptiveAccumulationObject());
+          common->metaDemodulate().showImguiSettings();
+          common->metaComposite().showDenoiseImguiSettings();
+          ImGui::Unindent();
+        }
+        bool useDoubleDenoisers = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
+        if (isRayReconstructionEnabled) {
+          if (RemixGui::CollapsingHeader("DLSS-RR", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+            ImGui::PushID("DLSS-RR");
+            common->metaRayReconstruction().showRayReconstructionImguiSettings(true);
+            ImGui::PopID();
+            ImGui::Unindent();
+          }
+        }
       
-      if (useNRD)
-      {
-        if (useDoubleDenoisers) {
-          if (RemixGui::CollapsingHeader("Primary Direct Light Denoiser", collapsingHeaderClosedFlags)) {
-            ImGui::Indent();
-            ImGui::PushID("Primary Direct Light Denoiser");
-            common->metaPrimaryDirectLightDenoiser().showImguiSettings();
-            ImGui::PopID();
-            ImGui::Unindent();
+        if (useNRD)
+        {
+          if (useDoubleDenoisers) {
+            if (RemixGui::CollapsingHeader("Primary Direct Light Denoiser", collapsingHeaderClosedFlags)) {
+              ImGui::Indent();
+              ImGui::PushID("Primary Direct Light Denoiser");
+              common->metaPrimaryDirectLightDenoiser().showImguiSettings();
+              ImGui::PopID();
+              ImGui::Unindent();
+            }
+
+            if (RemixGui::CollapsingHeader("Primary Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
+              ImGui::Indent();
+              ImGui::PushID("Primary Indirect Light Denoiser");
+              common->metaPrimaryIndirectLightDenoiser().showImguiSettings();
+              ImGui::PopID();
+              ImGui::Unindent();
+            }
+          } else {
+            if (RemixGui::CollapsingHeader("Primary Direct/Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
+              ImGui::Indent();
+              ImGui::PushID("Primary Direct/Indirect Light Denoiser");
+              common->metaPrimaryCombinedLightDenoiser().showImguiSettings();
+              ImGui::PopID();
+              ImGui::Unindent();
+            }
           }
 
-          if (RemixGui::CollapsingHeader("Primary Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
+          if (RemixGui::CollapsingHeader("Secondary Direct/Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
             ImGui::Indent();
-            ImGui::PushID("Primary Indirect Light Denoiser");
-            common->metaPrimaryIndirectLightDenoiser().showImguiSettings();
-            ImGui::PopID();
-            ImGui::Unindent();
-          }
-        } else {
-          if (RemixGui::CollapsingHeader("Primary Direct/Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
-            ImGui::Indent();
-            ImGui::PushID("Primary Direct/Indirect Light Denoiser");
-            common->metaPrimaryCombinedLightDenoiser().showImguiSettings();
+            ImGui::PushID("Secondary Direct/Indirect Light Denoiser");
+            common->metaSecondaryCombinedLightDenoiser().showImguiSettings();
             ImGui::PopID();
             ImGui::Unindent();
           }
         }
 
-        if (RemixGui::CollapsingHeader("Secondary Direct/Indirect Light Denoiser", collapsingHeaderClosedFlags)) {
-          ImGui::Indent();
-          ImGui::PushID("Secondary Direct/Indirect Light Denoiser");
-          common->metaSecondaryCombinedLightDenoiser().showImguiSettings();
-          ImGui::PopID();
-          ImGui::Unindent();
-        }
+        ImGui::Unindent();
       }
-
-      ImGui::Unindent();
     }
 
     if (RemixGui::CollapsingHeader("Post-Processing", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 
-      if (RemixGui::CollapsingHeader("Composition", collapsingHeaderClosedFlags))
+      if (!RtxNgxPassthrough::ngxPassthroughMode() &&
+          RemixGui::CollapsingHeader("Composition", collapsingHeaderClosedFlags))
         common->metaComposite().showImguiSettings();
 
       if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
@@ -4241,31 +4257,6 @@ namespace dxvk {
       if (RemixGui::CollapsingHeader("Bloom", collapsingHeaderClosedFlags))
         common->metaBloom().showImguiSettings();
 
-      if (RemixGui::CollapsingHeader("Auto Exposure", collapsingHeaderClosedFlags))
-        common->metaAutoExposure().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("Tonemapping", collapsingHeaderClosedFlags))
-      {
-        RemixGui::SliderInt("User Brightness", &RtxOptions::userBrightnessObject(), 0, 100, "%d");
-        RemixGui::DragFloat("User Brightness EV Range", &RtxOptions::userBrightnessEVRangeObject(), 0.5f, 0.f, 10.f, "%.1f");
-        RemixGui::Separator();
-        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0");
-        if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
-          common->metaToneMapping().showImguiSettings();
-        } else {
-          common->metaLocalToneMapping().showImguiSettings();
-        }
-        if (RtxOptions::showLegacyACESOption()) {
-          RemixGui::Separator();
-          RemixGui::Checkbox("Use Legacy ACES", &RtxOptions::useLegacyACESObject());
-          if (!RtxOptions::useLegacyACES()) {
-            ImGui::Indent();
-            ImGui::TextWrapped("WARNING: Non-legacy ACES is currently experimental and the implementation is a subject to change.");
-            ImGui::Unindent();
-          }
-        }
-      }
-
       if (RemixGui::CollapsingHeader("Post FX", collapsingHeaderClosedFlags))
         common->metaPostFx().showImguiSettings();
 
@@ -4275,320 +4266,322 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    if (RemixGui::CollapsingHeader("Debug", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      common->metaDebugView().showImguiSettings();
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Geometry", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Enable Triangle Culling (Globally)", &RtxOptions::enableCullingObject());
-      RemixGui::Checkbox("Enable Triangle Culling (Override Secondary Rays)", &RtxOptions::enableCullingInSecondaryRaysObject());
-      RemixGui::Checkbox("UE3 Auto Cull Enclosing Mesh Shadow Backfaces", &D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfacesObject());
-      if (D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfaces()) {
-        RemixGui::DragFloat("UE3 Auto Cull Min Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMinExtentMetersObject(), 0.1f, 0.0f, 1000.0f, "%.2f");
-        RemixGui::DragFloat("UE3 Auto Cull Max Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMaxExtentMetersObject(), 1.0f, 1.0f, 10000.0f, "%.1f");
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      if (RemixGui::CollapsingHeader("Debug", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        common->metaDebugView().showImguiSettings();
+        ImGui::Unindent();
       }
-      RemixGui::Separator();
-      RemixGui::DragInt("Min Prims in Dynamic BLAS", &RtxOptions::minPrimsInDynamicBLASObject(), 1.f, 100, 0);
-      RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);
-      RemixGui::Checkbox("Force Merge All Meshes", &RtxOptions::forceMergeAllMeshesObject());
-      RemixGui::Checkbox("Minimize BLAS Merging", &RtxOptions::minimizeBlasMergingObject());
-      RemixGui::Separator();
-      RemixGui::Checkbox("Portals: Virtual Instance Matching", &RtxOptions::useRayPortalVirtualInstanceMatchingObject());
-      RemixGui::Checkbox("Portals: Fade In Effect", &RtxOptions::enablePortalFadeInEffectObject());
-      ImGui::Unindent();
-    }
 
-    if (RemixGui::CollapsingHeader("Shadow Terminator Fix", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      RemixGui::Checkbox("Enable Terminator Offset", &RtxOptions::ShadowTerminator::enableOffsetObject());
-      ImGui::Indent();
-      ImGui::BeginDisabled(!RtxOptions::ShadowTerminator::enableOffset());
-      ImGui::TextWrapped("NOTE: The options below are metric (ensure a correct scene scale).");
-      RemixGui::DragFloat("Area Threshold (in meters^2)", &RtxOptions::ShadowTerminator::maxAreaObject(), 0.01f, 0.f, 100.f);
-      RemixGui::DragFloat("Max Offset Length (in meters)", &RtxOptions::ShadowTerminator::maxLengthObject(), 0.01f, 0.f, 1.f);
-      ImGui::EndDisabled();
-      ImGui::Unindent();
+      if (RemixGui::CollapsingHeader("Geometry", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
 
-      RemixGui::Separator();
-      RemixGui::Checkbox("Terminator Transition Softening", &RtxOptions::ShadowTerminator::softenObject());
-
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Texture Streaming [Experimental]", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      if (RtxOptions::TextureManager::hotReload()) {
-        ImGui::TextColored(ImVec4{ 250 / 255.F, 176 / 255.F, 50 / 255.F, 1.F }, "Hot-reloading active.");
-        ImGui::Dummy({ 0, 2 });
+        RemixGui::Checkbox("Enable Triangle Culling (Globally)", &RtxOptions::enableCullingObject());
+        RemixGui::Checkbox("Enable Triangle Culling (Override Secondary Rays)", &RtxOptions::enableCullingInSecondaryRaysObject());
+        RemixGui::Checkbox("UE3 Auto Cull Enclosing Mesh Shadow Backfaces", &D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfacesObject());
+        if (D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfaces()) {
+          RemixGui::DragFloat("UE3 Auto Cull Min Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMinExtentMetersObject(), 0.1f, 0.0f, 1000.0f, "%.2f");
+          RemixGui::DragFloat("UE3 Auto Cull Max Extent (m)", &D3D9Rtx::ue3AutoCullEnclosingMeshMaxExtentMetersObject(), 1.0f, 1.0f, 10000.0f, "%.1f");
+        }
+        RemixGui::Separator();
+        RemixGui::DragInt("Min Prims in Dynamic BLAS", &RtxOptions::minPrimsInDynamicBLASObject(), 1.f, 100, 0);
+        RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);
+        RemixGui::Checkbox("Force Merge All Meshes", &RtxOptions::forceMergeAllMeshesObject());
+        RemixGui::Checkbox("Minimize BLAS Merging", &RtxOptions::minimizeBlasMergingObject());
+        RemixGui::Separator();
+        RemixGui::Checkbox("Portals: Virtual Instance Matching", &RtxOptions::useRayPortalVirtualInstanceMatchingObject());
+        RemixGui::Checkbox("Portals: Fade In Effect", &RtxOptions::enablePortalFadeInEffectObject());
+        ImGui::Unindent();
       }
-      ImGui::BeginDisabled(!RtxOptions::TextureManager::samplerFeedbackEnable());
-      {
-        if (RtxOptions::TextureManager::fixedBudgetEnable() && RtxOptions::TextureManager::samplerFeedbackEnable()) {
-          if (RemixGui::DragFloatMB_showGB("Texture Budget##1",
-                                        &RtxOptions::TextureManager::fixedBudgetMiBObject(),
-                                        0.5f, 1.f, 32.f, "%.1f GB", ImGuiSliderFlags_NoRoundToFormat)) {
+
+      if (RemixGui::CollapsingHeader("Shadow Terminator Fix", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        RemixGui::Checkbox("Enable Terminator Offset", &RtxOptions::ShadowTerminator::enableOffsetObject());
+        ImGui::Indent();
+        ImGui::BeginDisabled(!RtxOptions::ShadowTerminator::enableOffset());
+        ImGui::TextWrapped("NOTE: The options below are metric (ensure a correct scene scale).");
+        RemixGui::DragFloat("Area Threshold (in meters^2)", &RtxOptions::ShadowTerminator::maxAreaObject(), 0.01f, 0.f, 100.f);
+        RemixGui::DragFloat("Max Offset Length (in meters)", &RtxOptions::ShadowTerminator::maxLengthObject(), 0.01f, 0.f, 1.f);
+        ImGui::EndDisabled();
+        ImGui::Unindent();
+
+        RemixGui::Separator();
+        RemixGui::Checkbox("Terminator Transition Softening", &RtxOptions::ShadowTerminator::softenObject());
+
+        ImGui::Unindent();
+      }
+
+      if (RemixGui::CollapsingHeader("Texture Streaming [Experimental]", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        if (RtxOptions::TextureManager::hotReload()) {
+          ImGui::TextColored(ImVec4{ 250 / 255.F, 176 / 255.F, 50 / 255.F, 1.F }, "Hot-reloading active.");
+          ImGui::Dummy({ 0, 2 });
+        }
+        ImGui::BeginDisabled(!RtxOptions::TextureManager::samplerFeedbackEnable());
+        {
+          if (RtxOptions::TextureManager::fixedBudgetEnable() && RtxOptions::TextureManager::samplerFeedbackEnable()) {
+            if (RemixGui::DragFloatMB_showGB("Texture Budget##1",
+                                          &RtxOptions::TextureManager::fixedBudgetMiBObject(),
+                                          0.5f, 1.f, 32.f, "%.1f GB", ImGuiSliderFlags_NoRoundToFormat)) {
+              ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
+            }
+          } else {
+            // always disabled drag float just to show the available texture cache budget
+            ImGui::BeginDisabled(true);
+            const char* formatstr = RtxOptions::TextureManager::samplerFeedbackEnable()
+              ? "%.1f GB"
+              : "UNB%0.0fUND";
+            static float s_dummy{};
+            s_dummy = RtxOptions::TextureManager::samplerFeedbackEnable()
+              ? float(g_streamedTextures_budgetBytes) / 1024.F / 1024.F / 1024.F
+              : 0.F;
+            RemixGui::DragFloat("Texture Cache##2", &s_dummy, 0.5f, 1.f, 32.f, formatstr, ImGuiSliderFlags_NoRoundToFormat);
+            ImGui::EndDisabled();
+          }
+        }
+        {
+          ImGui::BeginDisabled(RtxOptions::TextureManager::fixedBudgetEnable());
+          if (RemixGui::DragInt("of VRAM is dedicated to Textures",
+                              &RtxOptions::TextureManager::budgetPercentageOfAvailableVramObject(),
+                              10.F,
+                              10,
+                              100,
+                              "%d%%")) {
             ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
           }
-        } else {
-          // always disabled drag float just to show the available texture cache budget
-          ImGui::BeginDisabled(true);
-          const char* formatstr = RtxOptions::TextureManager::samplerFeedbackEnable()
-            ? "%.1f GB"
-            : "UNB%0.0fUND";
-          static float s_dummy{};
-          s_dummy = RtxOptions::TextureManager::samplerFeedbackEnable()
-            ? float(g_streamedTextures_budgetBytes) / 1024.F / 1024.F / 1024.F
-            : 0.F;
-          RemixGui::DragFloat("Texture Cache##2", &s_dummy, 0.5f, 1.f, 32.f, formatstr, ImGuiSliderFlags_NoRoundToFormat);
           ImGui::EndDisabled();
         }
-      }
-      {
-        ImGui::BeginDisabled(RtxOptions::TextureManager::fixedBudgetEnable());
-        if (RemixGui::DragInt("of VRAM is dedicated to Textures",
-                            &RtxOptions::TextureManager::budgetPercentageOfAvailableVramObject(),
-                            10.F,
-                            10,
-                            100,
-                            "%d%%")) {
+        if (RemixGui::Checkbox("Force Fixed Texture Budget", &RtxOptions::TextureManager::fixedBudgetEnableObject())) {
+          // budgeting technique changed => ask DXVK to return unused VRAM chunks to OS to better represent consumption
           ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
         }
         ImGui::EndDisabled();
-      }
-      if (RemixGui::Checkbox("Force Fixed Texture Budget", &RtxOptions::TextureManager::fixedBudgetEnableObject())) {
-        // budgeting technique changed => ask DXVK to return unused VRAM chunks to OS to better represent consumption
-        ctx->getCommonObjects()->getSceneManager().requestVramCompaction();
-      }
-      ImGui::EndDisabled();
 
-      ImGui::Dummy({ 0, 2 });
-      if (RemixGui::CollapsingHeader("Advanced##texstream", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        ImGui::Text("Streamed Texture VRAM usage: %.1f GB", float(g_streamedTextures_usedBytes) / 1024.F / 1024.F / 1024.F);
         ImGui::Dummy({ 0, 2 });
-        RemixGui::Separator();
-        ImGui::Dummy({ 0, 2 });
-        ImGui::TextUnformatted("Warning: toggling this option will enforce a full texture reload.");
-        if (RemixGui::Checkbox("Sampler Feedback", &RtxOptions::TextureManager::samplerFeedbackEnableObject())) {
-          // sampler feedback ON/OFF changed => free all to refit textures in VRAM
-          ctx->getCommonObjects()->getSceneManager().requestTextureVramFree();
+        if (RemixGui::CollapsingHeader("Advanced##texstream", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::Text("Streamed Texture VRAM usage: %.1f GB", float(g_streamedTextures_usedBytes) / 1024.F / 1024.F / 1024.F);
+          ImGui::Dummy({ 0, 2 });
+          RemixGui::Separator();
+          ImGui::Dummy({ 0, 2 });
+          ImGui::TextUnformatted("Warning: toggling this option will enforce a full texture reload.");
+          if (RemixGui::Checkbox("Sampler Feedback", &RtxOptions::TextureManager::samplerFeedbackEnableObject())) {
+            // sampler feedback ON/OFF changed => free all to refit textures in VRAM
+            ctx->getCommonObjects()->getSceneManager().requestTextureVramFree();
+          }
+          ImGui::Dummy({ 0, 2 });
+          RemixGui::Separator();
+          ImGui::Dummy({ 0, 2 });
+          if (ImGui::Button("Demote All Textures")) {
+            ctx->getCommonObjects()->getSceneManager().requestTextureVramFree();
+          }
+          RemixGui::Checkbox("Reload Textures on Window Resize", &RtxOptions::reloadTextureWhenResolutionChangedObject());
+          ImGui::Unindent();
         }
-        ImGui::Dummy({ 0, 2 });
-        RemixGui::Separator();
-        ImGui::Dummy({ 0, 2 });
-        if (ImGui::Button("Demote All Textures")) {
-          ctx->getCommonObjects()->getSceneManager().requestTextureVramFree();
-        }
-        RemixGui::Checkbox("Reload Textures on Window Resize", &RtxOptions::reloadTextureWhenResolutionChangedObject());
         ImGui::Unindent();
       }
-      ImGui::Unindent();
-    }
 
-    if (RemixGui::CollapsingHeader("Terrain [Experimental]")) {
-      ImGui::Indent();
+      if (RemixGui::CollapsingHeader("Terrain [Experimental]")) {
+        ImGui::Indent();
 
-      {
-        TerrainMode mode = TerrainMode::None;
+        {
+          TerrainMode mode = TerrainMode::None;
+          if (TerrainBaker::enableBaking()) {
+            mode = TerrainMode::TerrainBaker;
+          } else {
+            if (RtxOptions::terrainAsDecalsEnabledIfNoBaker()) {
+              mode = TerrainMode::AsDecals;
+            }
+          }
+
+          bool terrainModeChanged = IMGUI_ADD_TOOLTIP(
+            terrainModeCombo.getKey(&mode),
+            "\'Terrain Baker\': rasterize the draw calls marked as \'Terrain\' into a single mesh that would be used for ray tracing.\n"
+            "\n"
+            "\'Terrain-as-Decals\': draw calls marked as 'Terrain' are ray traced as decals.");
+
+          if (terrainModeChanged) {
+            if (mode == TerrainMode::TerrainBaker) {
+              RemixGui::CheckRtxOptionPopups(&TerrainBaker::enableBakingObject());
+            } else if (mode == TerrainMode::AsDecals) {
+              RemixGui::CheckRtxOptionPopups(&RtxOptions::terrainAsDecalsEnabledIfNoBakerObject());
+            }
+          }
+
+          switch (mode) {
+          case TerrainMode::None: {
+            TerrainBaker::enableBaking.setDeferred(false);
+            RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(false);
+            break;
+          }
+          case TerrainMode::TerrainBaker: {
+            TerrainBaker::enableBaking.setDeferred(true);
+            RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(false);
+            break;
+          }
+          case TerrainMode::AsDecals: {
+            TerrainBaker::enableBaking.setDeferred(false);
+            RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(true);
+            break;
+          }
+          default: break;
+          }
+        }
+
+        RemixGui::Separator();
+
         if (TerrainBaker::enableBaking()) {
-          mode = TerrainMode::TerrainBaker;
-        } else {
-          if (RtxOptions::terrainAsDecalsEnabledIfNoBaker()) {
-            mode = TerrainMode::AsDecals;
-          }
+          common->getTerrainBaker().showImguiSettings();
+        } else if (RtxOptions::terrainAsDecalsEnabledIfNoBaker()) {
+          RemixGui::Checkbox("Over-modulate Blending", &RtxOptions::terrainAsDecalsAllowOverModulateObject());
         }
 
-        bool terrainModeChanged = IMGUI_ADD_TOOLTIP(
-          terrainModeCombo.getKey(&mode),
-          "\'Terrain Baker\': rasterize the draw calls marked as \'Terrain\' into a single mesh that would be used for ray tracing.\n"
-          "\n"
-          "\'Terrain-as-Decals\': draw calls marked as 'Terrain' are ray traced as decals.");
-
-        if (terrainModeChanged) {
-          if (mode == TerrainMode::TerrainBaker) {
-            RemixGui::CheckRtxOptionPopups(&TerrainBaker::enableBakingObject());
-          } else if (mode == TerrainMode::AsDecals) {
-            RemixGui::CheckRtxOptionPopups(&RtxOptions::terrainAsDecalsEnabledIfNoBakerObject());
-          }
-        }
-
-        switch (mode) {
-        case TerrainMode::None: {
-          TerrainBaker::enableBaking.setDeferred(false);
-          RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(false);
-          break;
-        }
-        case TerrainMode::TerrainBaker: {
-          TerrainBaker::enableBaking.setDeferred(true);
-          RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(false);
-          break;
-        }
-        case TerrainMode::AsDecals: {
-          TerrainBaker::enableBaking.setDeferred(false);
-          RtxOptions::terrainAsDecalsEnabledIfNoBaker.setDeferred(true);
-          break;
-        }
-        default: break;
-        }
+        ImGui::Unindent();
       }
 
-      RemixGui::Separator();
-
-      if (TerrainBaker::enableBaking()) {
-        common->getTerrainBaker().showImguiSettings();
-      } else if (RtxOptions::terrainAsDecalsEnabledIfNoBaker()) {
-        RemixGui::Checkbox("Over-modulate Blending", &RtxOptions::terrainAsDecalsAllowOverModulateObject());
-      }
-
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Player Model", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      RemixGui::Checkbox("Primary Shadows", &RtxOptions::PlayerModel::enablePrimaryShadowsObject());
-      RemixGui::Checkbox("Show in Primary Space", &RtxOptions::PlayerModel::enableInPrimarySpaceObject());
-      RemixGui::Checkbox("Auto Show in Primary Space (No View Model)",
-                        &RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModelObject());
-      if (ImGui::IsItemHovered()) {
-        RemixGui::SetTooltipUnformatted(
-          "Shows player-model geometry on primary rays when no ViewModel camera was submitted this frame,\n"
-          "provided the camera has also moved clear of the player. Games stop drawing first-person overlay\n"
-          "geometry during scripted first-person sequences without moving the camera off the player's head.");
-      }
-      RemixGui::Checkbox("Create Virtual Instances", &RtxOptions::PlayerModel::enableVirtualInstancesObject());
-      if (RemixGui::CollapsingHeader("Calibration", collapsingHeaderClosedFlags)) {
+      if (RemixGui::CollapsingHeader("Player Model", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
-        RemixGui::DragFloat("Backward Offset", &RtxOptions::PlayerModel::backwardOffsetObject(), 0.01f, 0.f, 100.f);
-        RemixGui::DragFloat("Horizontal Detection Distance", &RtxOptions::PlayerModel::horizontalDetectionDistanceObject(), 0.01f, 0.f, 100.f);
-        RemixGui::DragFloat("Vertical Detection Distance", &RtxOptions::PlayerModel::verticalDetectionDistanceObject(), 0.01f, 0.f, 100.f);
-        RemixGui::DragFloat("Auto Primary Space Body Distance", &RtxOptions::PlayerModel::autoEnableInPrimarySpaceBodyDistanceObject(), 0.1f, 0.f, 1000.f);
+        RemixGui::Checkbox("Primary Shadows", &RtxOptions::PlayerModel::enablePrimaryShadowsObject());
+        RemixGui::Checkbox("Show in Primary Space", &RtxOptions::PlayerModel::enableInPrimarySpaceObject());
+        RemixGui::Checkbox("Auto Show in Primary Space (No View Model)",
+                          &RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModelObject());
         if (ImGui::IsItemHovered()) {
           RemixGui::SetTooltipUnformatted(
-            "Camera-to-player distance past which the player model always shows on primary rays. 0 disables.");
+            "Shows player-model geometry on primary rays when no ViewModel camera was submitted this frame,\n"
+            "provided the camera has also moved clear of the player. Games stop drawing first-person overlay\n"
+            "geometry during scripted first-person sequences without moving the camera off the player's head.");
         }
-        RemixGui::DragFloat("First Person Max Distance", &RtxOptions::PlayerModel::firstPersonMaxDistanceObject(), 0.1f, 0.f, 2000.f);
-        if (ImGui::IsItemHovered()) {
-          RemixGui::SetTooltipUnformatted(
-            "In the first-person view, player-model instances farther than this are dropped entirely,\n"
-            "shadows included, so a body parked elsewhere in the level cannot cast one. 0 disables.");
-        }
-        RemixGui::DragInt("Auto Primary Space Delay Frames", &RtxOptions::PlayerModel::autoEnableInPrimarySpaceDelayFramesObject(), 1.f, 0, 60, "%d", sliderFlags);
-        if (ImGui::IsItemHovered()) {
-          RemixGui::SetTooltipUnformatted(
-            "Consecutive frames the automatic rules must agree before the player model shows on primary rays.\n"
-            "Leaving the external-camera state is always immediate.");
-        }
-        RemixGui::Checkbox("Log Camera Regime", &RtxOptions::PlayerModel::logCameraRegimeObject());
+        RemixGui::Checkbox("Create Virtual Instances", &RtxOptions::PlayerModel::enableVirtualInstancesObject());
+        if (RemixGui::CollapsingHeader("Calibration", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          RemixGui::DragFloat("Backward Offset", &RtxOptions::PlayerModel::backwardOffsetObject(), 0.01f, 0.f, 100.f);
+          RemixGui::DragFloat("Horizontal Detection Distance", &RtxOptions::PlayerModel::horizontalDetectionDistanceObject(), 0.01f, 0.f, 100.f);
+          RemixGui::DragFloat("Vertical Detection Distance", &RtxOptions::PlayerModel::verticalDetectionDistanceObject(), 0.01f, 0.f, 100.f);
+          RemixGui::DragFloat("Auto Primary Space Body Distance", &RtxOptions::PlayerModel::autoEnableInPrimarySpaceBodyDistanceObject(), 0.1f, 0.f, 1000.f);
+          if (ImGui::IsItemHovered()) {
+            RemixGui::SetTooltipUnformatted(
+              "Camera-to-player distance past which the player model always shows on primary rays. 0 disables.");
+          }
+          RemixGui::DragFloat("First Person Max Distance", &RtxOptions::PlayerModel::firstPersonMaxDistanceObject(), 0.1f, 0.f, 2000.f);
+          if (ImGui::IsItemHovered()) {
+            RemixGui::SetTooltipUnformatted(
+              "In the first-person view, player-model instances farther than this are dropped entirely,\n"
+              "shadows included, so a body parked elsewhere in the level cannot cast one. 0 disables.");
+          }
+          RemixGui::DragInt("Auto Primary Space Delay Frames", &RtxOptions::PlayerModel::autoEnableInPrimarySpaceDelayFramesObject(), 1.f, 0, 60, "%d", sliderFlags);
+          if (ImGui::IsItemHovered()) {
+            RemixGui::SetTooltipUnformatted(
+              "Consecutive frames the automatic rules must agree before the player model shows on primary rays.\n"
+              "Leaving the external-camera state is always immediate.");
+          }
+          RemixGui::Checkbox("Log Camera Regime", &RtxOptions::PlayerModel::logCameraRegimeObject());
 
-        const InstanceManager& instanceManager = common->getSceneManager().getInstanceManager();
-        const float playerDistance = instanceManager.getPlayerModelBodyCameraDistance();
-        ImGui::Text("Camera: %s", instanceManager.isExternalCameraRegime() ? "external" : "first person");
-        ImGui::Text("Player model instances: %zu", instanceManager.getPlayerModelInstanceCount());
-        if (playerDistance < 0.f) {
-          ImGui::TextUnformatted("Camera to player: no player model drawn");
-        } else {
-          ImGui::Text("Camera to player: %.2f", playerDistance);
+          const InstanceManager& instanceManager = common->getSceneManager().getInstanceManager();
+          const float playerDistance = instanceManager.getPlayerModelBodyCameraDistance();
+          ImGui::Text("Camera: %s", instanceManager.isExternalCameraRegime() ? "external" : "first person");
+          ImGui::Text("Player model instances: %zu", instanceManager.getPlayerModelInstanceCount());
+          if (playerDistance < 0.f) {
+            ImGui::TextUnformatted("Camera to player: no player model drawn");
+          } else {
+            ImGui::Text("Camera to player: %.2f", playerDistance);
+          }
+          ImGui::Unindent();
         }
         ImGui::Unindent();
       }
-      ImGui::Unindent();
-    }
 
-    if (RemixGui::CollapsingHeader("Displacement [Experimental]", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      ImGui::TextWrapped("Warning: This is currently implemented using POM with a simple height map, displacing inwards.  The implementation may change in the future, which could include changes to the texture format or displacing outwards.\nRaymarched POM will use a simple raymarch algorithm, and will show artifacts on thin features and at oblique angles.\nQuadtree POM depends on custom mipmaps with maximums instead of averages, which can be generated using `generate_max_mip.py`.");
-      RemixGui::Combo("Mode", &RtxOptions::Displacement::modeObject(), "Off\0Raymarched POM\0Quadtree POM\0");
-      RemixGui::Checkbox("Enable Direct Lighting", &RtxOptions::Displacement::enableDirectLightingObject());
-      RemixGui::Checkbox("Enable Indirect Lighting", &RtxOptions::Displacement::enableIndirectLightingObject());
-      RemixGui::Checkbox("Enable Indirect Hit", &RtxOptions::Displacement::enableIndirectHitObject());
-      RemixGui::Checkbox("Enable NEE Cache", &RtxOptions::Displacement::enableNEECacheObject());
-      RemixGui::Checkbox("Enable ReSTIR_GI", &RtxOptions::Displacement::enableReSTIRGIObject());
-      RemixGui::Checkbox("Enable PSR", &RtxOptions::Displacement::enablePSRObject());
-      RemixGui::DragFloat("Global Displacement Factor", &RtxOptions::Displacement::displacementFactorObject(), 0.01f, 0.0f, 20.0f);
-      RemixGui::DragFloat("Displacement In Factor", &RtxOptions::Displacement::displacementInFactorObject(), 0.01f, 0.0f, 20.0f);
-      RemixGui::DragFloat("Displacement Out Factor", &RtxOptions::Displacement::displacementOutFactorObject(), 0.01f, 0.0f, 20.0f);
-      RemixGui::DragInt("Max Iterations", &RtxOptions::Displacement::maxIterationsObject(), 1.f, 1, 256, "%d", sliderFlags);
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("Raytraced Render Target [Experimental]", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-      ImGui::TextWrapped("When a screen in-game is displaying the rasterized results of another camera, this can be used to raytrace that scene.\nNote that the render target texture containing the rasterized results needs to be set to `raytracedRenderTargetTextures` in the texture selection menu.");
-
-      RemixGui::Checkbox("Enable Raytraced Render Targets", &RtxOptions::RaytracedRenderTarget::enableObject());
-      ImGui::Unindent();
-    }
-
-    if (RemixGui::CollapsingHeader("View Distance", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      viewDistanceModeCombo.getKey(&ViewDistanceOptions::distanceModeObject());
-
-      if (ViewDistanceOptions::distanceMode() != ViewDistanceMode::None) {
-        viewDistanceFunctionCombo.getKey(&ViewDistanceOptions::distanceFunctionObject());
-
-        if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::HardCutoff) {
-          RemixGui::DragFloat("Distance Threshold", &ViewDistanceOptions::distanceThresholdObject(), 0.1f, 0.0f, 0.0f, "%.2f", sliderFlags);
-        } else if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::CoherentNoise) {
-          RemixGui::DragFloat("Distance Fade Min", &ViewDistanceOptions::distanceFadeMinObject(), 0.1f, 0.0f, ViewDistanceOptions::distanceFadeMax(), "%.2f", sliderFlags);
-          RemixGui::DragFloat("Distance Fade Max", &ViewDistanceOptions::distanceFadeMaxObject(), 0.1f, ViewDistanceOptions::distanceFadeMin(), 0.0f, "%.2f", sliderFlags);
-          RemixGui::DragFloat("Noise Scale", &ViewDistanceOptions::noiseScaleObject(), 0.1f, 0.0f, 0.0f, "%.2f", sliderFlags);
-        }
+      if (RemixGui::CollapsingHeader("Displacement [Experimental]", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        ImGui::TextWrapped("Warning: This is currently implemented using POM with a simple height map, displacing inwards.  The implementation may change in the future, which could include changes to the texture format or displacing outwards.\nRaymarched POM will use a simple raymarch algorithm, and will show artifacts on thin features and at oblique angles.\nQuadtree POM depends on custom mipmaps with maximums instead of averages, which can be generated using `generate_max_mip.py`.");
+        RemixGui::Combo("Mode", &RtxOptions::Displacement::modeObject(), "Off\0Raymarched POM\0Quadtree POM\0");
+        RemixGui::Checkbox("Enable Direct Lighting", &RtxOptions::Displacement::enableDirectLightingObject());
+        RemixGui::Checkbox("Enable Indirect Lighting", &RtxOptions::Displacement::enableIndirectLightingObject());
+        RemixGui::Checkbox("Enable Indirect Hit", &RtxOptions::Displacement::enableIndirectHitObject());
+        RemixGui::Checkbox("Enable NEE Cache", &RtxOptions::Displacement::enableNEECacheObject());
+        RemixGui::Checkbox("Enable ReSTIR_GI", &RtxOptions::Displacement::enableReSTIRGIObject());
+        RemixGui::Checkbox("Enable PSR", &RtxOptions::Displacement::enablePSRObject());
+        RemixGui::DragFloat("Global Displacement Factor", &RtxOptions::Displacement::displacementFactorObject(), 0.01f, 0.0f, 20.0f);
+        RemixGui::DragFloat("Displacement In Factor", &RtxOptions::Displacement::displacementInFactorObject(), 0.01f, 0.0f, 20.0f);
+        RemixGui::DragFloat("Displacement Out Factor", &RtxOptions::Displacement::displacementOutFactorObject(), 0.01f, 0.0f, 20.0f);
+        RemixGui::DragInt("Max Iterations", &RtxOptions::Displacement::maxIterationsObject(), 1.f, 1, 256, "%d", sliderFlags);
+        ImGui::Unindent();
       }
 
-      ImGui::Unindent();
-    }
+      if (RemixGui::CollapsingHeader("Raytraced Render Target [Experimental]", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        ImGui::TextWrapped("When a screen in-game is displaying the rasterized results of another camera, this can be used to raytrace that scene.\nNote that the render target texture containing the rasterized results needs to be set to `raytracedRenderTargetTextures` in the texture selection menu.");
 
-    if (RemixGui::CollapsingHeader("Material Filtering", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      RemixGui::Checkbox("Use White Material Textures", &RtxOptions::useWhiteMaterialModeObject());
-      RemixGui::Separator();
-      constexpr float kMipBiasRange = 32;
-      RemixGui::DragFloat("Mip LOD Bias", &RtxOptions::nativeMipBiasObject(), 0.01f, -kMipBiasRange, kMipBiasRange, "%.2f", sliderFlags);
-      RemixGui::DragFloat("Upscaling LOD Bias", &RtxOptions::upscalingMipBiasObject(), 0.01f, -kMipBiasRange, kMipBiasRange, "%.2f", sliderFlags);
-      RemixGui::Separator();
-      RemixGui::Checkbox("Use Anisotropic Filtering", &RtxOptions::useAnisotropicFilteringObject());
-      if (RtxOptions::useAnisotropicFiltering()) {
-        RemixGui::DragFloat("Max Anisotropy Samples", &RtxOptions::maxAnisotropySamplesObject(), 0.5f, 1.0f, 16.f, "%.3f", sliderFlags);
+        RemixGui::Checkbox("Enable Raytraced Render Targets", &RtxOptions::RaytracedRenderTarget::enableObject());
+        ImGui::Unindent();
       }
-      RemixGui::DragFloat("Translucent Decal Albedo Factor", &RtxOptions::translucentDecalAlbedoFactorObject(), 0.01f);
-      ImGui::Unindent();
-    }
 
-    if (!RtCamera::enableFreeCamera() &&
-        RemixGui::CollapsingHeader("Anti-Culling", collapsingHeaderClosedFlags)) {
+      if (RemixGui::CollapsingHeader("View Distance", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
 
-      ImGui::Indent();
+        viewDistanceModeCombo.getKey(&ViewDistanceOptions::distanceModeObject());
 
-      if (ctx->getCommonObjects()->getSceneManager().isAntiCullingSupported()) {
-        RemixGui::Checkbox("Anti-Culling Objects", &RtxOptions::AntiCulling::Object::enableObject());
-        if (RtxOptions::AntiCulling::Object::enable()) {
-          RemixGui::Checkbox("High precision Anti-Culling", &RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCullingObject());
-          if (RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling()) {
-            RemixGui::Checkbox("Infinity Far Frustum", &RtxOptions::AntiCulling::Object::enableInfinityFarFrustumObject());
+        if (ViewDistanceOptions::distanceMode() != ViewDistanceMode::None) {
+          viewDistanceFunctionCombo.getKey(&ViewDistanceOptions::distanceFunctionObject());
+
+          if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::HardCutoff) {
+            RemixGui::DragFloat("Distance Threshold", &ViewDistanceOptions::distanceThresholdObject(), 0.1f, 0.0f, 0.0f, "%.2f", sliderFlags);
+          } else if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::CoherentNoise) {
+            RemixGui::DragFloat("Distance Fade Min", &ViewDistanceOptions::distanceFadeMinObject(), 0.1f, 0.0f, ViewDistanceOptions::distanceFadeMax(), "%.2f", sliderFlags);
+            RemixGui::DragFloat("Distance Fade Max", &ViewDistanceOptions::distanceFadeMaxObject(), 0.1f, ViewDistanceOptions::distanceFadeMin(), 0.0f, "%.2f", sliderFlags);
+            RemixGui::DragFloat("Noise Scale", &ViewDistanceOptions::noiseScaleObject(), 0.1f, 0.0f, 0.0f, "%.2f", sliderFlags);
           }
-          RemixGui::Checkbox("Enable Bounding Box Hash For Duplication Check", &RtxOptions::AntiCulling::Object::hashInstanceWithBoundingBoxHashObject());
-          RemixGui::InputInt("Instance Max Size", &RtxOptions::AntiCulling::Object::numObjectsToKeepObject(), 1, 1, 0);
-          RemixGui::DragFloat("Anti-Culling Fov Scale", &RtxOptions::AntiCulling::Object::fovScaleObject(), 0.01f, 0.1f, 2.0f);
-          RemixGui::DragFloat("Anti-Culling Far Plane Scale", &RtxOptions::AntiCulling::Object::farPlaneScaleObject(), 0.1f, 0.1f, 10000.0f);
         }
-        RemixGui::Separator();
-        RemixGui::Checkbox("Anti-Culling Lights", &RtxOptions::AntiCulling::Light::enableObject());
-        if (RtxOptions::AntiCulling::Light::enable()) {
-          RemixGui::InputInt("Max Number Of Lights", &RtxOptions::AntiCulling::Light::numLightsToKeepObject(), 1, 1, 0);
-          RemixGui::InputInt("Max Number of Frames to keep lights", &RtxOptions::AntiCulling::Light::numFramesToExtendLightLifetimeObject(), 1, 1, 0);
-          RemixGui::DragFloat("Anti-Culling Lights Fov Scale", &RtxOptions::AntiCulling::Light::fovScaleObject(), 0.01f, 0.1f, 2.0f);
-        }
-      } else {
-        ImGui::Text("The game doesn't set up the View Matrix, \nAnti-Culling is disabled to prevent visual corruption.");
+
+        ImGui::Unindent();
       }
 
-      ImGui::Unindent();
+      if (RemixGui::CollapsingHeader("Material Filtering", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+
+        RemixGui::Checkbox("Use White Material Textures", &RtxOptions::useWhiteMaterialModeObject());
+        RemixGui::Separator();
+        constexpr float kMipBiasRange = 32;
+        RemixGui::DragFloat("Mip LOD Bias", &RtxOptions::nativeMipBiasObject(), 0.01f, -kMipBiasRange, kMipBiasRange, "%.2f", sliderFlags);
+        RemixGui::DragFloat("Upscaling LOD Bias", &RtxOptions::upscalingMipBiasObject(), 0.01f, -kMipBiasRange, kMipBiasRange, "%.2f", sliderFlags);
+        RemixGui::Separator();
+        RemixGui::Checkbox("Use Anisotropic Filtering", &RtxOptions::useAnisotropicFilteringObject());
+        if (RtxOptions::useAnisotropicFiltering()) {
+          RemixGui::DragFloat("Max Anisotropy Samples", &RtxOptions::maxAnisotropySamplesObject(), 0.5f, 1.0f, 16.f, "%.3f", sliderFlags);
+        }
+        RemixGui::DragFloat("Translucent Decal Albedo Factor", &RtxOptions::translucentDecalAlbedoFactorObject(), 0.01f);
+        ImGui::Unindent();
+      }
+
+      if (!RtCamera::enableFreeCamera() &&
+          RemixGui::CollapsingHeader("Anti-Culling", collapsingHeaderClosedFlags)) {
+
+        ImGui::Indent();
+
+        if (ctx->getCommonObjects()->getSceneManager().isAntiCullingSupported()) {
+          RemixGui::Checkbox("Anti-Culling Objects", &RtxOptions::AntiCulling::Object::enableObject());
+          if (RtxOptions::AntiCulling::Object::enable()) {
+            RemixGui::Checkbox("High precision Anti-Culling", &RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCullingObject());
+            if (RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling()) {
+              RemixGui::Checkbox("Infinity Far Frustum", &RtxOptions::AntiCulling::Object::enableInfinityFarFrustumObject());
+            }
+            RemixGui::Checkbox("Enable Bounding Box Hash For Duplication Check", &RtxOptions::AntiCulling::Object::hashInstanceWithBoundingBoxHashObject());
+            RemixGui::InputInt("Instance Max Size", &RtxOptions::AntiCulling::Object::numObjectsToKeepObject(), 1, 1, 0);
+            RemixGui::DragFloat("Anti-Culling Fov Scale", &RtxOptions::AntiCulling::Object::fovScaleObject(), 0.01f, 0.1f, 2.0f);
+            RemixGui::DragFloat("Anti-Culling Far Plane Scale", &RtxOptions::AntiCulling::Object::farPlaneScaleObject(), 0.1f, 0.1f, 10000.0f);
+          }
+          RemixGui::Separator();
+          RemixGui::Checkbox("Anti-Culling Lights", &RtxOptions::AntiCulling::Light::enableObject());
+          if (RtxOptions::AntiCulling::Light::enable()) {
+            RemixGui::InputInt("Max Number Of Lights", &RtxOptions::AntiCulling::Light::numLightsToKeepObject(), 1, 1, 0);
+            RemixGui::InputInt("Max Number of Frames to keep lights", &RtxOptions::AntiCulling::Light::numFramesToExtendLightLifetimeObject(), 1, 1, 0);
+            RemixGui::DragFloat("Anti-Culling Lights Fov Scale", &RtxOptions::AntiCulling::Light::fovScaleObject(), 0.01f, 0.1f, 2.0f);
+          }
+        } else {
+          ImGui::Text("The game doesn't set up the View Matrix, \nAnti-Culling is disabled to prevent visual corruption.");
+        }
+
+        ImGui::Unindent();
+      }
     }
 
     ImGui::PopItemWidth();

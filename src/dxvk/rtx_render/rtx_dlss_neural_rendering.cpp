@@ -78,13 +78,18 @@ namespace dxvk {
   bool DlssNeuralRendering::dispatch(
       Rc<RtxContext> ctx,
       DxvkBarrierSet& barriers,
-      const Resources::RaytracingOutput& rtOutput,
+      const Resources::Resource& inColor,
+      const Resources::Resource& outColor,
+      const Resources::Resource& motionVectors,
+      const Resources::Resource& depth,
+      const Resources::Resource& controlMask,
       bool resetHistory,
-      bool useRayReconstructionGuides) {
+      float motionVectorScaleX,
+      float motionVectorScaleY) {
     ScopedGpuProfileZone(ctx, "DlssNeuralRendering");
     ctx->setFramePassStage(RtxFramePassStage::DLSSNR);
 
-    if (!useDlssNeuralRendering()) {
+    if (!isEnabled()) {
       return false;
     }
 
@@ -103,28 +108,23 @@ namespace dxvk {
       return false;
     }
 
-    const Resources::Resource* pMotionVectorInput = useRayReconstructionGuides
-      ? &rtOutput.m_primaryScreenSpaceMotionVectorDLSSRR
-      : &rtOutput.m_primaryScreenSpaceMotionVector;
-    const Resources::Resource* pDepthInput = useRayReconstructionGuides
-      ? &rtOutput.m_primaryDepthDLSSRR.resource(Resources::AccessType::Read)
-      : &rtOutput.m_primaryDepth;
+    const Resources::Resource* pMotionVectorInput = &motionVectors;
+    const Resources::Resource* pDepthInput = &depth;
     {
       float jitterOffset[2];
       device()->getCommon()->getSceneManager().getCamera().getJittering(jitterOffset);
 
-      // Screen-space motion vectors are expressed in render-pixel units.
-      float motionVectorScale[2] = { 1.f, 1.f };
+      float motionVectorScale[2] = { motionVectorScaleX, motionVectorScaleY };
 
       std::vector<Rc<DxvkImageView>> pInputs = {
-        rtOutput.m_neuralRenderingInput.view(Resources::AccessType::Read),
+        inColor.view,
         pMotionVectorInput->view,
         pDepthInput->view,
-        rtOutput.m_controlMask.view,
+        controlMask.view,
       };
 
       std::vector<Rc<DxvkImageView>> pOutputs = {
-        rtOutput.m_neuralRenderingOutput.view(Resources::AccessType::Write)
+        outColor.view
       };
 
       for (auto input : pInputs) {
@@ -167,11 +167,11 @@ namespace dxvk {
 
       // Note: Add texture inputs added here to the pInputs array above to properly access the images.
       NGXNeuralRenderingContext::NGXNeuralRenderingBuffers buffers;
-      buffers.pInColor = &rtOutput.m_neuralRenderingInput.resource(Resources::AccessType::Read);
-      buffers.pOutColor = &rtOutput.m_neuralRenderingOutput.resource(Resources::AccessType::Write);
+      buffers.pInColor = &inColor;
+      buffers.pOutColor = &outColor;
       buffers.pMotionVectors = pMotionVectorInput;
       buffers.pDepth = pDepthInput;
-      buffers.pControlMask = &rtOutput.m_controlMask;
+      buffers.pControlMask = &controlMask;
 
       NGXNeuralRenderingContext::NGXNeuralRenderingSettings settings = {};
       settings.jitterOffset[0] = jitterOffset[0];

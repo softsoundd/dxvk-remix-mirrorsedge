@@ -566,6 +566,9 @@ namespace dxvk {
                             const Rc<DxvkImage>& colorSourceImage,
                             const VkOffset2D& colorSourceOffset);
 
+    void scaleResourceToDisplay(RtxContext* ctx, const Resources::Resource& source, Resources::Resource& destination);
+    void applyNeuralRenderingAndBloom(RtxContext* ctx, DxvkBarrierSet& barriers, bool resetHistory);
+
     bool applyPostFxAndWriteback(RtxContext* ctx,
                                  DxvkBarrierSet& barriers,
                                  const Rc<DxvkImage>& targetImage,
@@ -645,6 +648,15 @@ namespace dxvk {
 
     Resources::Resource m_colorInput;                 // copy of the game color target fed to DLSS
     Resources::Resource m_dlssOutput;                 // DLSS output, blitted back onto the game target
+    // Display-sized scratch for DLSS neural generation. Depth and motion vectors are
+    // scaled up from the render-sized queues before the call.
+    Resources::Resource m_nrInput;
+    Resources::Resource m_nrOutput;
+    Resources::Resource m_nrDepth;
+    Resources::Resource m_nrMotionVectors;
+    Resources::Resource m_nrControlMask;
+    VkExtent2D m_nrConfiguredExtent = { 0, 0 };
+    bool m_depthMvInputsValid = false;
     Resources::Resource m_mergedOutput;               // DLSS RGB + the game's original alpha (pre-post
                                                       // injection: UE3 D3D9 stores scene depth in alpha)
     Resources::Resource m_debugPresentImage;          // debug view held back for the present-time overlay

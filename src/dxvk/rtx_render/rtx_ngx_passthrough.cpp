@@ -37,6 +37,10 @@
 #endif
 #include "rtx_postFx.h"
 #include "rtx_auto_exposure.h"
+#include "rtx_bloom.h"
+#include "rtx_dlss_neural_rendering.h"
+#include "rtx_tone_mapping.h"
+#include "../util/util_global_time.h"
 #include "rtx_imgui.h"
 #include "rtx_initializer.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -1545,12 +1549,97 @@ namespace dxvk {
     return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
   }
 
+  void RtxNgxPassthrough::scaleResourceToDisplay(RtxContext* ctx,
+                                                 const Resources::Resource& source,
+                                                 Resources::Resource& destination) {
+    const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(source.image->info().format);
+    const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(destination.image->info().format);
+    VkImageBlit blitInfo = {};
+    blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.srcOffsets[0] = { 0, 0, 0 };
+    blitInfo.srcOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
+    blitInfo.dstOffsets[0] = { 0, 0, 0 };
+    blitInfo.dstOffsets[1] = { int32_t(m_displayExtent.width), int32_t(m_displayExtent.height), 1 };
+    const VkComponentMapping identityMap = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+    ctx->blitImage(destination.image, identityMap, source.image, identityMap, blitInfo, VK_FILTER_NEAREST);
+  }
+
+  void RtxNgxPassthrough::applyNeuralRenderingAndBloom(RtxContext* ctx, DxvkBarrierSet& barriers, bool resetHistory) {
+    if (m_dlssOutput.image == nullptr) {
+      return;
+    }
+
+    Rc<DxvkContext> dxvkCtx = ctx;
+    const VkExtent3D displayExtent = { m_displayExtent.width, m_displayExtent.height, 1 };
+
+    DlssNeuralRendering& neuralRendering = m_device->getCommon()->metaDlssNeuralRendering();
+    if (m_depthMvInputsValid &&
+        neuralRendering.supportsDlssNeuralRendering() &&
+        DlssNeuralRendering::enable() &&
+        m_depthQueue.get().image != nullptr &&
+        m_motionVectorQueue.get().image != nullptr) {
+      const bool extentChanged = m_nrInput.image == nullptr ||
+        m_nrInput.image->info().extent.width != displayExtent.width ||
+        m_nrInput.image->info().extent.height != displayExtent.height;
+      if (extentChanged) {
+        m_nrInput = Resources::createImageResource(dxvkCtx, "NGX passthrough NR input", displayExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+        m_nrOutput = Resources::createImageResource(dxvkCtx, "NGX passthrough NR output", displayExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+        m_nrDepth = Resources::createImageResource(dxvkCtx, "NGX passthrough NR depth", displayExtent, VK_FORMAT_R32_SFLOAT);
+        m_nrMotionVectors = Resources::createImageResource(dxvkCtx, "NGX passthrough NR motion vectors", displayExtent, VK_FORMAT_R16G16_SFLOAT);
+        // White: no material IDs, so the effect covers the frame. Auto mask replaces this.
+        const VkClearColorValue fullMask = { 1.f, 1.f, 1.f, 1.f };
+        m_nrControlMask = Resources::createImageResource(
+          dxvkCtx, "NGX passthrough NR control mask", displayExtent, VK_FORMAT_R8G8B8A8_UNORM,
+          1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_STORAGE_BIT, fullMask);
+      }
+
+      if (m_nrConfiguredExtent.width != displayExtent.width || m_nrConfiguredExtent.height != displayExtent.height) {
+        uint32_t displaySize[2] = { displayExtent.width, displayExtent.height };
+        neuralRendering.setDlssNeuralRenderingSettings(displaySize);
+        m_nrConfiguredExtent = { displayExtent.width, displayExtent.height };
+      }
+
+      scaleResourceToDisplay(ctx, m_depthQueue.get(), m_nrDepth);
+      scaleResourceToDisplay(ctx, m_motionVectorQueue.get(), m_nrMotionVectors);
+
+      Rc<DxvkSampler> linearSampler =
+        ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
+      DxvkAutoExposure& autoExposure = m_device->getCommon()->metaAutoExposure();
+      autoExposure.dispatch(dxvkCtx, linearSampler, m_dlssOutput, displayExtent, GlobalTime::get().deltaTimeMs(), resetHistory);
+
+      DxvkToneMapping& toneMapper = m_device->getCommon()->metaToneMapping();
+      toneMapper.dispatchFastToneMapping(ctx, autoExposure.getExposureTexture().view, m_dlssOutput, m_nrInput, autoExposure.enabled());
+
+      const float motionScaleX = m_renderExtent.width > 0
+        ? float(m_displayExtent.width) / float(m_renderExtent.width) : 1.0f;
+      const float motionScaleY = m_renderExtent.height > 0
+        ? float(m_displayExtent.height) / float(m_renderExtent.height) : 1.0f;
+      if (neuralRendering.dispatch(ctx, barriers, m_nrInput, m_nrOutput, m_nrMotionVectors, m_nrDepth, m_nrControlMask,
+                                   resetHistory, motionScaleX, motionScaleY)) {
+        toneMapper.dispatchInverseToneMapping(ctx, autoExposure.getExposureTexture().view, m_nrOutput, m_dlssOutput, autoExposure.enabled());
+      }
+    }
+
+    DxvkBloom& bloom = m_device->getCommon()->metaBloom();
+    if (bloom.enabled()) {
+      bloom.ensureResources(dxvkCtx, displayExtent);
+      Rc<DxvkSampler> linearSampler =
+        ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+      bloom.dispatch(ctx, linearSampler, m_dlssOutput);
+    }
+  }
+
   bool RtxNgxPassthrough::applyPostFxAndWriteback(RtxContext* ctx,
                                                   DxvkBarrierSet& barriers,
                                                   const Rc<DxvkImage>& targetImage,
                                                   const VkOffset2D& targetOffset,
                                                   bool preserveTargetAlpha,
                                                   bool resetHistory) {
+    applyNeuralRenderingAndBloom(ctx, barriers, resetHistory);
     {
       DxvkPostFx& postFx = m_device->getCommon()->metaPostFx();
 
@@ -2006,6 +2095,7 @@ namespace dxvk {
     const bool haveDepthMvInputs = generateMotionVectorsAndDepth(ctx, dxvkCtxState, barriers, sceneDepthImage, subrectOffset, camera,
                                                                  objectVelocities() ? velocityDraws : std::vector<NgxVelocityDraw>(),
                                                                  jitter);
+    m_depthMvInputsValid = haveDepthMvInputs;
 
     // Computed into a local and stored once at the end: the imgui panel reads m_upscalerActive
     // from the application thread while this dispatch runs on the CS thread, so a

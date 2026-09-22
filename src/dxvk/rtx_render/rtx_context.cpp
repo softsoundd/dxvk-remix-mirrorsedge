@@ -1893,7 +1893,17 @@ namespace dxvk {
       autoExposure.enabled());
 
     const bool useRayReconstructionGuides = m_currentUpscaler == InternalUpscaler::DLSS_RR;
-    if (dlssNr.dispatch(this, m_execBarriers, rtOutput, m_resetHistory, useRayReconstructionGuides)) {
+    const Resources::Resource& motionVectors = useRayReconstructionGuides
+      ? rtOutput.m_primaryScreenSpaceMotionVectorDLSSRR
+      : rtOutput.m_primaryScreenSpaceMotionVector;
+    const Resources::Resource& depth = useRayReconstructionGuides
+      ? rtOutput.m_primaryDepthDLSSRR.resource(Resources::AccessType::Read)
+      : rtOutput.m_primaryDepth;
+    if (dlssNr.dispatch(this, m_execBarriers,
+                        rtOutput.m_neuralRenderingInput.resource(Resources::AccessType::Read),
+                        rtOutput.m_neuralRenderingOutput.resource(Resources::AccessType::Write),
+                        motionVectors, depth, rtOutput.m_controlMask,
+                        m_resetHistory, 1.0f, 1.0f)) {
       toneMapper.dispatchInverseToneMapping(
         this,
         autoExposure.getExposureTexture().view,

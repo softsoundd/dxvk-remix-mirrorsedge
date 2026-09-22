@@ -209,6 +209,20 @@ namespace dxvk {
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
+  void DxvkBloom::ensureResources(Rc<DxvkContext>& ctx, const VkExtent3D& targetExtent) {
+    const VkExtent3D firstExtent = {
+      util::ceilDivide(targetExtent.width, 2u),
+      util::ceilDivide(targetExtent.height, 2u),
+      1
+    };
+    if (m_bloomBuffer[0].image != nullptr &&
+        m_bloomBuffer[0].image->info().extent.width == firstExtent.width &&
+        m_bloomBuffer[0].image->info().extent.height == firstExtent.height) {
+      return;
+    }
+    createTargetResource(ctx, targetExtent);
+  }
+
   void DxvkBloom::createTargetResource(Rc<DxvkContext>& ctx, const VkExtent3D& targetExtent) {
     for (uint32_t i = 0; i < std::size(m_bloomBuffer); i++) {
       const uint32_t divisor = (1U << (i + 1));

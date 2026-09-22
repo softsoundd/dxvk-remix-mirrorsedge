@@ -45,6 +45,10 @@ namespace dxvk {
       Rc<DxvkSampler> linearSampler,
       const Resources::Resource& inOutColorBuffer);
 
+    // Passthrough does not run the ray-tracing frame-begin that normally allocates these.
+    void ensureResources(Rc<DxvkContext>& ctx, const VkExtent3D& targetExtent);
+    bool enabled() const { return isEnabled(); }
+
     void showImguiSettings();
 
   private:

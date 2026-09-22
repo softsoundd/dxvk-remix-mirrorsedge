@@ -36,12 +36,19 @@ namespace dxvk {
     void showDlssNeuralRenderingImguiSettings();
 
     // Returns true when NGX produced a valid output image.
+    // Color, depth, and motion vectors must share the output resolution. motionVectorScale
+    // converts stored motion-vector units into that resolution's pixels.
     bool dispatch(
       Rc<RtxContext> ctx,
       DxvkBarrierSet& barriers,
-      const Resources::RaytracingOutput& rtOutput,
+      const Resources::Resource& inColor,
+      const Resources::Resource& outColor,
+      const Resources::Resource& motionVectors,
+      const Resources::Resource& depth,
+      const Resources::Resource& controlMask,
       bool resetHistory,
-      bool useRayReconstructionGuides);
+      float motionVectorScaleX,
+      float motionVectorScaleY);
 
     void release();
 
