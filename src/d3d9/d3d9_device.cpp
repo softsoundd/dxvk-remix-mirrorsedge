@@ -46,7 +46,6 @@
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
-#include "../dxvk/rtx_render/rtx_terrain_baker.h"
 // NV-DXVK start: CPU frame breakdown
 #include "../dxvk/dxvk_objects.h"
 #include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"

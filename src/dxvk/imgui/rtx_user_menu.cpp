@@ -304,8 +304,6 @@ namespace dxvk {
       // Upscaler Type
 
       // Note: Use a different combo box without DLSS's upscaler listed if DLSS overall is unsupported.
-      auto oldUpscalerType = RtxOptions::upscalerType();
-
       if (dlss.supportsDLSS()) {
         getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
       }
@@ -315,10 +313,6 @@ namespace dxvk {
 
       if (!dlss.supportsDLSS()) {
         getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
-      }
-
-      if (oldUpscalerType != RtxOptions::upscalerType()) {
-        RtxOptions::updateLightingSetting();
       }
 
       // Upscaler Preset

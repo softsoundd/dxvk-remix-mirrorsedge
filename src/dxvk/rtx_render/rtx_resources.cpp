@@ -31,7 +31,6 @@
 #include <assert.h>
 #include "rtx_options.h"
 #include "rtx/utility/gpu_printing.h"
-#include "rtx_terrain_baker.h"
 #include "rtx_scene_manager.h"
 #include "rtx_texture_manager.h"
 #include "rtx_debug_view.h"

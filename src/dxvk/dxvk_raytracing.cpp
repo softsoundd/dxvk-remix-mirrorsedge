@@ -6,7 +6,6 @@
 #include "dxvk_pipemanager.h"
 #include "rtx_render/rtx.h"
 #include "rtx_render/rtx_options.h"
-#include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "../util/util_threadpool.h"
 #include "../util/util_singleton.h"
 
@@ -23,31 +22,7 @@ namespace dxvk {
     static dxvk::mutex s_setMutex;
     static dxvk::condition_variable s_setOnAdd;
 
-    bool shouldApply(const Rc<DxvkDevice>& device) {
-      static int result = 0;
-
-      if (!RtxOptions::getEnableOpacityMicromap()) {
-        // Disable the WAR when OMM is not enabled
-        return false;
-      }
-
-      if (result != 0) {
-        return result == 1;
-      }
-
-      if (!OpacityMicromapManager::checkIsOpacityMicromapSupported(*device)) {
-        result = 2;
-        return false;
-      }
-
-      const uint32_t driverVersion = device->adapter()->deviceProperties().driverVersion;
-      if (VK_VERSION_MAJOR(driverVersion) <= 528 && VK_VERSION_MINOR(driverVersion) < 75) {
-        ONCE(Logger::warn(str::format("NVIDIA driver version < 528.75 detected. Applying OMM pipeline compilation workaround.")));
-        result = 1;
-        return true;
-      }
-
-      result = 2;
+    bool shouldApply(const Rc<DxvkDevice>&) {
       return false;
     }
 

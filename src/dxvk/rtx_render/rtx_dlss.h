@@ -42,11 +42,6 @@ namespace dxvk {
     Invalid
   };
 
-  enum class PathTracerPreset : int {
-    Default,
-    RayReconstruction,
-  };
-
   const char* dlssProfileToString(DLSSProfile dlssProfile);
 
   class DxvkDLSS : public CommonDeviceObject, public RtxPass {

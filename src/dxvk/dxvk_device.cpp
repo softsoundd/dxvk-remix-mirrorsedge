@@ -25,14 +25,8 @@
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_texture_manager.h"
-#include "rtx_render/rtx_neural_radiance_cache.h"
-#include "rtx_render/rtx_rtxdi_rayquery.h"
-#include "rtx_render/rtx_restir_gi_rayquery.h"
-#include "rtx_render/rtx_composite.h"
 #include "rtx_render/rtx_debug_view.h"
 #include "rtx_render/rtx_xess.h"
-
-#include "rtx_render/rtx_sparse_rendering.h"
 
 namespace dxvk {
 

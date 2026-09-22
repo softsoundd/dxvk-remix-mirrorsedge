@@ -62,21 +62,14 @@ namespace dxvk {
 
   class DxvkDevice;
   class DxvkRayReconstruction;
-  class DxvkRtxdiRayQuery;
-  class DxvkReSTIRGIRayQuery;
   class DxvkToneMapping;
   class DxvkBloom;
-  class RtxGeometryUtils;
-  class CompositePass;
   class DebugView;
   class DxvkPostFx;
   class DxvkSRGBDither;
-  class OpacityMicromapManager;
   class ImGUI;
   class RtxTextureManager;
-  class NeuralRadianceCache;
   class DxvkXeSS;
-  class SparseRendering;
 
   class NGXContext;
 

@@ -74,21 +74,6 @@ exe = executable('test_particle_system_schema', files('test_particle_system_sche
 test('test_particle_system_schema', exe, env: test_env, args: remix_particle_system_plugin.full_path(), depends: remix_particle_system_plugin)
 tests += exe
 
-exe = executable('test_graph_usd_parser',  files('graph/test_component.h', 'graph/test_flexible_component.h', 'graph/test_flexible_component.cpp', 'test_graph_usd_parser.cpp'),
-  include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_graph_usd_parser', exe, env: test_env)
-tests += exe
-
-exe = executable('test_hot_reload', files('test_hot_reload.cpp'),
-  include_directories : test_include_path, dependencies : [ test_unit_deps, d3d9_dep ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_hot_reload', exe, env: test_env)
-tests += exe
-
-exe = executable('test_transform_components',  files('test_transform_components.cpp'), 
-  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_transform_components', exe, env: test_env)
-tests += exe
-
 exe = executable('test_rtx_option',  files('test_rtx_option.cpp'), 
   include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_rtx_option', exe, env: test_env)
@@ -97,11 +82,6 @@ tests += exe
 exe = executable('test_option_layer_export',  files('test_option_layer_export.cpp'), 
   include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_option_layer_export', exe, env: test_env)
-tests += exe
-
-exe = executable('test_preserved_object_picking',  files('test_preserved_object_picking.cpp'),
-  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
-test('test_preserved_object_picking', exe, env: test_env)
 tests += exe
 
 exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])

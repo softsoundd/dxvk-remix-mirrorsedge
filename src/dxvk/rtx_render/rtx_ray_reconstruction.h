@@ -55,10 +55,7 @@ namespace dxvk {
 
     virtual void onDestroy();
 
-    RTX_OPTION("rtx.rayreconstruction", PathTracerPreset, pathTracerPreset, PathTracerPreset::RayReconstruction, 
-               "Path tracer preset to use when Ray Reconstruction is enabled.");
     RTX_OPTION("rtx.rayreconstruction", bool, useSpecularHitDistance, true, "Use specular hit distance to reduce ghosting.\n");
-    RTX_OPTION("rtx.rayreconstruction", bool, preserveSettingsInNativeMode, false, "Preserve settings when switched to native mode, otherwise the default preset will be applied.\n");
     RTX_OPTION("rtx.rayreconstruction", bool, combineSpecularAlbedo, true, "Combine primary and secondary specular albedo to improve DLSS-RR reflection quality.\n");
     RTX_OPTION("rtx.rayreconstruction", bool, enableDetailEnhancement, true, "Enable detail enhancement filter to enhance normal map details.\n");
     RTX_OPTION("rtx.rayreconstruction", bool, demodulateRoughness, true, "Demodulate roughness to enhance roughness details.\n");

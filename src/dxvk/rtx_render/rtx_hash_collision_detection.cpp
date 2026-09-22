@@ -21,10 +21,11 @@
 */
 #include "rtx_hash_collision_detection.h"
 
-#include "rtx_opacity_micromap_manager.h"
 #include "dxvk_device.h"
 
 namespace dxvk {
+
+  static constexpr uint32_t kOpacityMicromapHashSourceDataSize = 128;
 
   static constexpr const char* HashSourceDataCategoryName[] = {
     "OpacityMicromap",
@@ -54,7 +55,7 @@ namespace dxvk {
 
   uint32_t HashCollisionDetection::getHashSourceDataSize(HashSourceDataCategory category) {
     switch (category) {
-    case HashSourceDataCategory::OpacityMicromap: return sizeof(OpacityMicromapHashSourceData);
+    case HashSourceDataCategory::OpacityMicromap: return kOpacityMicromapHashSourceDataSize;
     default:
       assert(!"Invalid category specified.");
       return 0;

@@ -41,41 +41,30 @@
 #include "dxvk_imgui.h"
 #include "rtx_render/rtx_imgui.h"
 #include "dxvk_device.h"
-#include "rtx_render/graph/rtx_graph_gui.h"
 #include "rtx_render/rtx_utils.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_render/rtx_camera.h"
 #include "rtx_render/rtx_context.h"
 #include "rtx_render/rtx_hash_collision_detection.h"
 #include "rtx_render/rtx_options.h"
-#include "rtx_render/rtx_terrain_baker.h"
-#include "rtx_render/rtx_neural_radiance_cache.h"
 #include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
-#include "rtx_render/rtx_rtxdi_rayquery.h"
-#include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_debug_view.h"
-#include "rtx_render/rtx_composite.h"
-#include "rtx_render/rtx_sparse_rendering.h"
 #include "dxvk_image.h"
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
 #include "../util/util_global_time.h"
-#include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
 #include "dxvk_imgui_first_use_guide.h"
 #include "dxvk_imgui_splash.h"
 #include "dxvk_imgui_capture.h"
 #include "rtx_render/rtx_option_layer_gui.h"
-#include "rtx_render/rtx_mod_usd.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
 #include "../../d3d9/d3d9_rtx.h"
 #include "dxvk_memory_tracker.h"
-#include "rtx_render/rtx_particle_system.h"
-#include "rtx_render/rtx_point_instancer_system.h"
 #include "rtx_render/rtx_overlay_window.h"
 
 
@@ -511,8 +500,7 @@ namespace dxvk {
   , m_gameHwnd   (nullptr)
   , m_about  (new ImGuiAbout)
   , m_firstUseGuide (new ImGuiFirstUseGuide)
-  , m_splash  (new ImGuiSplash)
-  , m_graphGUI  (new RtxGraphGUI) {
+  , m_splash  (new ImGuiSplash) {
     // Set up constant state
     m_rsState.polygonMode       = VK_POLYGON_MODE_FILL;
     m_rsState.cullMode          = VK_CULL_MODE_BACK_BIT;
@@ -560,10 +548,7 @@ namespace dxvk {
     pool_info.poolSizeCount = std::size(pool_sizes);
     pool_info.pPoolSizes = pool_sizes;
 
-    if (!NeuralRadianceCache::checkIsSupported(device)) {
-      // Remove unsupported option
-      integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::NeuralRadianceCache);
-    }
+    integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::NeuralRadianceCache);
 
     m_device->vkd()->vkCreateDescriptorPool(m_device->handle(), &pool_info, nullptr, &m_imguiPool);
 
@@ -1647,13 +1632,6 @@ namespace dxvk {
       // Filter for option layer contents
       IMGUI_ADD_TOOLTIP(ImGui::InputText("RtxOption Display Filter", optionLayerFilter, IM_ARRAYSIZE(optionLayerFilter)), 
           "Filter options displayed in the Contents sections. Only options containing this text will be shown.");
-
-          RemixGui::Checkbox("Pause Graph Execution", &GraphManager::pauseGraphUpdatesObject());
-      if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip(
-          "Many graphs set `enable`, `blendStrength`, and `blendThreshold` every frame.\n"
-          "Pausing the graph execution will allow controlling these values without interference.");
-      }
 
         // Pre-compute lowercased filter once for efficiency
       std::string filterLower = optionLayerFilter;
@@ -3066,12 +3044,7 @@ namespace dxvk {
         RemixGui::Separator();
 
         if (ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
-          auto oldUpscalerType = RtxOptions::upscalerType();
           getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
-
-          if (oldUpscalerType != RtxOptions::upscalerType()) {
-            RtxOptions::updateLightingSetting();
-          }
         } else {
           getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
         }

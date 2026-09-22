@@ -25,3 +25,4 @@
 #include "d3d9_device.h"
 #include "d3d9_util.h"
 #include "../dxvk/dxvk_device.h"
+#include "../dxvk/dxvk_scoped_annotation.h"

@@ -23,7 +23,6 @@
 
 #include "rtx_initializer.h"
 #include "rtx_scene_manager.h"
-#include "rtx_asset_replacer.h"
 #include "rtx_options.h"
 #include "../../util/thread.h"
 #include "dxvk_context.h"
@@ -33,12 +32,9 @@
 #include "rtx_io.h"
 #include "dxvk_raytracing.h"
 #include "rtx_debug_view.h"
-#include "rtx_sparse_rendering.h"
-#include "rtx_restir_gi_rayquery.h"
 #include "rtx_taa.h"
 #include "rtx_nis.h"
 #include "rtx_tone_mapping.h"
-#include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_ngx_passthrough.h"
 #include "rtx_postFx.h"
@@ -75,23 +71,14 @@ namespace dxvk {
     // to be disabled if this is changed).
     if (env::getEnvVar("DXVK_TERMINATE_APP_FRAME") == "" ||
         env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0") {
-      const DxvkDeviceInfo& deviceInfo = m_device->adapter()->devicePropertiesExt();
-
       if (!RtxNgxPassthrough::ngxPassthroughMode()) {
         RtxOptions::updateUpscalerFromDlssPreset();
       }
       RtxOptions::updateGraphicsPresets(m_device);
-      RtxOptions::updateRaytraceModePresets(deviceInfo.core.properties.vendorID, deviceInfo.khrDeviceDriverProperties.driverID);
     } else {
       // Default, init to custom unless otherwise specified
       if (RtxOptions::graphicsPreset() == GraphicsPreset::Auto) {
         RtxOptions::graphicsPreset.setDeferred(GraphicsPreset::Custom);
-      }
-
-      // Applies the active upscaler's path-tracer preset unless DXVK_RAY_RECONSTRUCTION=0.
-      // This overrides multiple global options, including values set by the test workflow.
-      if (env::getEnvVar("DXVK_RAY_RECONSTRUCTION") != "0") {
-        RtxOptions::updateLightingSetting();
       }
     }
 

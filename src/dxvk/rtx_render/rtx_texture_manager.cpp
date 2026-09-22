@@ -29,7 +29,6 @@
 #include <chrono>
 
 #include "rtx_asset_data_manager.h"
-#include "rtx_bindless_resource_manager.h"
 #include "rtx_file_watch.h"
 #include "rtx_texture.h"
 #include "rtx_io.h"

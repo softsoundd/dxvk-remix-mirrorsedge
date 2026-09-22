@@ -26,18 +26,9 @@
 #include "../imgui/imgui.h"
 #include "rtx_bridge_message_channel.h"
 #include "rtx_ngx_passthrough.h"
-#include "rtx_terrain_baker.h"
-#include "rtx_nee_cache.h"
-#include "rtx_rtxdi_rayquery.h"
-#include "rtx_restir_gi_rayquery.h"
-#include "rtx_composite.h"
-#include "rtx_demodulate.h"
-#include "rtx_neural_radiance_cache.h"
-#include "rtx_ray_reconstruction.h"
 #include "../util/util_global_time.h"
 
 #include "dxvk_device.h"
-#include "rtx_global_volumetrics.h"
 #include "rtx_scene_manager.h"
 
 namespace dxvk {
@@ -317,95 +308,6 @@ namespace dxvk {
     return archInfo.implementation_id;
   }
 
-  void RtxOptions::updatePathTracerPreset(PathTracerPreset preset) {
-    // Code-driven changes for path tracer preset (automatically routes to User layer when preset is Custom)
-    RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
-
-    if (preset == PathTracerPreset::RayReconstruction) {
-      // RTXDI
-      DxvkRtxdiRayQuery::stealBoundaryPixelSamplesWhenOutsideOfScreen.setDeferred(false);
-      DxvkRtxdiRayQuery::permutationSamplingNthFrame.setDeferred(1);
-      DxvkRtxdiRayQuery::enableDenoiserConfidence.setDeferred(false);
-      DxvkRtxdiRayQuery::enableBestLightSampling.setDeferred(false);
-      DxvkRtxdiRayQuery::initialSampleCount.setDeferred(3);
-      DxvkRtxdiRayQuery::spatialSamples.setDeferred(2);
-      DxvkRtxdiRayQuery::disocclusionSamples.setDeferred(2);
-      DxvkRtxdiRayQuery::enableSampleStealing.setDeferred(false);
-
-      // ReSTIR GI
-      if (RtxOptions::useReSTIRGI()) {
-        DxvkReSTIRGIRayQuery::setToRayReconstructionPreset();
-      }
-
-      // Integrator
-      minOpaqueDiffuseLobeSamplingProbability.setDeferred(0.05f);
-      minOpaqueSpecularLobeSamplingProbability.setDeferred(0.05f);
-      enableFirstBounceLobeProbabilityDithering.setDeferred(false);
-      russianRouletteMode.setDeferred(RussianRouletteMode::SpecularBased);
-
-      // NEE Cache
-      NeeCachePass::enableModeAfterFirstBounce.setDeferred(NeeEnableMode::All);
-
-      // Demodulate
-      DemodulatePass::enableDirectLightBoilingFilter.setDeferred(false);
-
-      // Composite
-      CompositePass::postFilterThreshold.setDeferred(10.0f);
-      CompositePass::usePostFilter.setDeferred(false);
-
-    } else if (preset == PathTracerPreset::Default) {
-      // This is the default setting used by NRD
-      // RTXDI
-      DxvkRtxdiRayQuery::stealBoundaryPixelSamplesWhenOutsideOfScreenObject().resetToDefault();
-      DxvkRtxdiRayQuery::permutationSamplingNthFrameObject().resetToDefault();
-      DxvkRtxdiRayQuery::enableDenoiserConfidenceObject().resetToDefault();
-      DxvkRtxdiRayQuery::enableBestLightSamplingObject().resetToDefault();
-      DxvkRtxdiRayQuery::initialSampleCountObject().resetToDefault();
-      DxvkRtxdiRayQuery::spatialSamplesObject().resetToDefault();
-      DxvkRtxdiRayQuery::disocclusionSamplesObject().resetToDefault();
-      DxvkRtxdiRayQuery::enableSampleStealingObject().resetToDefault();
-
-      // ReSTIR GI
-      if (RtxOptions::useReSTIRGI()) {
-        DxvkReSTIRGIRayQuery::setToNRDPreset();
-      }
-
-      // Integrator
-      minOpaqueDiffuseLobeSamplingProbabilityObject().resetToDefault();
-      minOpaqueSpecularLobeSamplingProbabilityObject().resetToDefault();
-      enableFirstBounceLobeProbabilityDitheringObject().resetToDefault();
-      russianRouletteModeObject().resetToDefault();
-
-      // NEE Cache
-      NeeCachePass::enableModeAfterFirstBounceObject().resetToDefault();
-
-      // Demodulate
-      DemodulatePass::enableDirectLightBoilingFilterObject().resetToDefault();
-
-      // Composite
-      CompositePass::postFilterThresholdObject().resetToDefault();
-      CompositePass::usePostFilterObject().resetToDefault();
-    }
-  }
-
-  void RtxOptions::updateLightingSetting() {
-    // Code-driven changes for lighting setting (automatically routes to User layer when preset is Custom)
-    RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
-
-    bool isRayReconstruction = RtxOptions::isRayReconstructionEnabled();
-    bool isDLSS = RtxOptions::isDLSSEnabled();
-    bool isNative = RtxOptions::upscalerType() == UpscalerType::None;
-    if (isRayReconstruction) {
-      updatePathTracerPreset(DxvkRayReconstruction::pathTracerPreset());
-    } else if (isDLSS) {
-      updatePathTracerPreset(PathTracerPreset::Default);
-    } else if (isNative) {
-      if (!DxvkRayReconstruction::preserveSettingsInNativeMode()) {
-        updatePathTracerPreset(PathTracerPreset::Default);
-      }
-    }
-  }
-    
   void RtxOptions::updateGraphicsPresets(DxvkDevice* device) {
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
@@ -502,48 +404,6 @@ namespace dxvk {
     if (dlssPreset() != DlssPreset::Custom) {
       qualityDLSS.setDeferred(DLSSProfile::Auto);
     }
-
-    updateLightingSetting();
-  }
-
-  void RtxOptions::updateRaytraceModePresets(const uint32_t vendorID, const VkDriverId driverID) {
-    // Handle Automatic Raytrace Mode Preset (From configuration/default)
-
-    if (RtxOptions::raytraceModePreset() == RaytraceModePreset::Auto) {
-      Logger::info("Automatic Raytrace Mode Preset in use (Set rtx.raytraceModePreset to something other than Auto use a non-automatic preset)");
-
-      // Note: Left undefined as these values are initialized in all paths.
-      DxvkPathtracerGbuffer::RaytraceMode preferredGBufferRaytraceMode;
-      DxvkPathtracerIntegrateDirect::RaytraceMode preferredIntegrateDirectRaytraceMode;
-      DxvkPathtracerIntegrateIndirect::RaytraceMode preferredIntegrateIndirectRaytraceMode;
-
-      preferredGBufferRaytraceMode = DxvkPathtracerGbuffer::RaytraceMode::RayQuery;
-      preferredIntegrateDirectRaytraceMode = DxvkPathtracerIntegrateDirect::RaytraceMode::RayQuery;
-
-      if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia)
-        || driverID == VK_DRIVER_ID_MESA_RADV
-        || driverID == VK_DRIVER_ID_AMD_PROPRIETARY) {
-        // Default to a mixture of Trace Ray and Ray Query on NVIDIA, RADV, and AMD proprietary
-        if (driverID == VK_DRIVER_ID_MESA_RADV) {
-          Logger::info("RADV driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
-        } else if (driverID == VK_DRIVER_ID_AMD_PROPRIETARY) {
-          Logger::info("AMD driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
-        } else {
-          Logger::info("NVIDIA architecture detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
-        }
-
-        preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay;
-      } else {
-        // Default to Ray Query on Unknown
-        Logger::info("Non-NVIDIA architecture detected, setting default raytrace modes to Ray Query");
-
-        preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::RayQuery;
-      }
-
-      RtxOptions::renderPassGBufferRaytraceMode.setDeferred(preferredGBufferRaytraceMode);
-      RtxOptions::renderPassIntegrateDirectRaytraceMode.setDeferred(preferredIntegrateDirectRaytraceMode);
-      RtxOptions::renderPassIntegrateIndirectRaytraceMode.setDeferred(preferredIntegrateIndirectRaytraceMode);
-    }
   }
 
   void RtxOptions::resetUpscaler() {
@@ -561,8 +421,7 @@ namespace dxvk {
   bool RtxOptions::needsMeshBoundingBox() {
     return AntiCulling::isObjectAntiCullingEnabled() ||
            AntiCulling::isLightAntiCullingEnabled() ||
-           enableAlwaysCalculateAABB() ||
-           NeeCachePass::enable();
+           enableAlwaysCalculateAABB();
   }
 
   void RtxOptions::resolveTransparencyThresholdOnChange(DxvkDevice* device) {

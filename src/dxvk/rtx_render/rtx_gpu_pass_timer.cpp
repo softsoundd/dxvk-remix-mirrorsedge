@@ -33,10 +33,7 @@
 #include "rtx_imgui.h"
 #include "rtx_options.h"
 #include "rtx_option_layer.h"
-#include "rtx_global_volumetrics.h"
-#include "rtx_neural_radiance_cache.h"
 #include "rtx_scene_manager.h"
-#include "rtx_accel_manager.h"
 #include "../imgui/dxvk_imgui.h"
 #include "../../util/config/config.h"
 #include "../../util/log/log.h"
@@ -854,17 +851,12 @@ namespace dxvk {
         << " dlssProfile=" << static_cast<int>(RtxOptions::qualityDLSS())
         << " graphicsPreset=" << static_cast<int>(RtxOptions::graphicsPreset())
         << " integrateIndirectMode=" << static_cast<int>(RtxOptions::integrateIndirectMode())
-        << " nrcPreset=" << static_cast<int>(NeuralRadianceCache::NrcOptions::qualityPreset())
         << " pathMaxBounces=" << static_cast<int>(RtxOptions::pathMaxBounces())
         << " psrMaxDistanceMeters=" << RtxOptions::psrMaxDistanceMeters()
         << " displacementMode=" << static_cast<int>(RtxOptions::Displacement::mode())
         << " tonemappingMode=" << static_cast<int>(RtxOptions::tonemappingMode())
         << " cullBackfacesInShadowGeometries=" << RtxOptions::cullBackfacesInShadowGeometries().size()
-        << " cullBackfacesInShadowTextures=" << RtxOptions::cullBackfacesInShadowTextures().size()
-        << " | volumetrics=" << (RtxGlobalVolumetrics::enable() ? 1 : 0)
-        << " froxelScale=" << RtxGlobalVolumetrics::froxelGridResolutionScale()
-        << " froxelSlices=" << RtxGlobalVolumetrics::froxelDepthSlices()
-        << " atmosphereShell=" << (RtxGlobalVolumetrics::enableAtmosphere() ? 1 : 0);
+        << " cullBackfacesInShadowTextures=" << RtxOptions::cullBackfacesInShadowTextures().size();
 
     return out.str();
   }

@@ -36,10 +36,6 @@
 #include "rtx/algorithm/accumulate.h"
 #include "rtx_utils.h"
 #include "rtx/concept/ray_portal/ray_portal.h"
-#include "rtx_global_volumetrics.h"
-#include "rtx_pathtracer_gbuffer.h"
-#include "rtx_pathtracer_integrate_direct.h"
-#include "rtx_pathtracer_integrate_indirect.h"
 #include "rtx_dlss.h"
 #include "rtx_materials.h"
 #include "rtx/pass/material_args.h"
@@ -57,11 +53,6 @@ typedef enum _NV_GPU_ARCH_IMPLEMENTATION_ID NV_GPU_ARCH_IMPLEMENTATION_ID;
 
 namespace dxvk {
   class DxvkDevice;
-
-  using RenderPassVolumeIntegrateRaytraceMode = RtxGlobalVolumetrics::RaytraceMode;
-  using RenderPassGBufferRaytraceMode = DxvkPathtracerGbuffer::RaytraceMode;
-  using RenderPassIntegrateDirectRaytraceMode = DxvkPathtracerIntegrateDirect::RaytraceMode;
-  using RenderPassIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode;
 
   // DLSS-RR is not listed here, because it's considered as a special mode of DLSS
   enum class UpscalerType : int {
@@ -81,11 +72,6 @@ namespace dxvk {
     // Note: Used to automatically have the graphics preset set on initialization, not used beyond this case
     // as it should be overridden by one of the other values by the time any other code uses it.
     Auto
-  };
-
-  enum class RaytraceModePreset {
-    Custom = 0,
-    Auto = 1
   };
 
   enum class DlssPreset : int {
@@ -385,7 +371,6 @@ namespace dxvk {
                     args.environment = "DXVK_GRAPHICS_PRESET_TYPE",
                     args.onChangeCallback = &graphicsPresetOnChange,
                     args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ENV("rtx", RaytraceModePreset, raytraceModePreset, RaytraceModePreset::Auto, "DXVK_RAYTRACE_MODE_PRESET_TYPE", "");
     RTX_OPTION_FLAG("rtx", bool, lowMemoryGpu, false, RtxOptionFlags::NoSave | RtxOptionFlags::UserSetting, "Enables low memory mode, where we aggressively detune caches and streaming systems to accomodate the lower memory available.");
     RTX_OPTION_ARGS("rtx", float, emissiveIntensity, 1.0f, "A general scale factor on all emissive intensity values globally. Generally per-material emissive intensities should be used, but this option may be useful for debugging without needing to author materials.",
                     args.minValue = 0.0f);
@@ -668,24 +653,6 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx", DLSSProfile, qualityDLSS, DLSSProfile::Auto, "Adjusts internal DLSS scaling factor, trades quality for performance.",
                     args.environment = "RTX_QUALITY_DLSS",
                     args.flags = RtxOptionFlags::UserSetting);
-    // Note: All ray tracing modes depend on the rtx.raytraceModePreset option as they may be overridden by automatic defaults for a specific vendor if the preset is set to Auto. Set
-    // to Custom to ensure these settings are not overridden.
-    //RenderPassVolumeIntegrateRaytraceMode renderPassVolumeIntegrateRaytraceMode = RenderPassVolumeIntegrateRaytraceMode::RayQuery;
-    RTX_OPTION_ARGS("rtx", RenderPassGBufferRaytraceMode, renderPassGBufferRaytraceMode, RenderPassGBufferRaytraceMode::RayQuery,
-                   "The ray tracing mode to use for the G-Buffer pass which resolves the initial primary and secondary surfaces to apply lighting to.",
-                   args.environment = "DXVK_RENDER_PASS_GBUFFER_RAYTRACE_MODE",
-                   args.maxValue = RenderPassGBufferRaytraceMode(uint32_t(RenderPassGBufferRaytraceMode::Count) - 1),
-                   args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx", RenderPassIntegrateDirectRaytraceMode, renderPassIntegrateDirectRaytraceMode, RenderPassIntegrateDirectRaytraceMode::RayQuery,
-                   "The ray tracing mode to use for the Direct Lighting pass which applies lighting to the primary/secondary surfaces.",
-                   args.environment = "DXVK_RENDER_PASS_INTEGRATE_DIRECT_RAYTRACE_MODE",
-                   args.maxValue = RenderPassIntegrateDirectRaytraceMode(uint32_t(RenderPassIntegrateDirectRaytraceMode::Count) - 1),
-                   args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx", RenderPassIntegrateIndirectRaytraceMode, renderPassIntegrateIndirectRaytraceMode, RenderPassIntegrateIndirectRaytraceMode::TraceRay,
-                   "The ray tracing mode to use for the Indirect Lighting pass which applies lighting to the primary/secondary surfaces.",
-                   args.environment = "DXVK_RENDER_PASS_INTEGRATE_INDIRECT_RAYTRACE_MODE",
-                   args.maxValue = RenderPassIntegrateIndirectRaytraceMode(uint32_t(RenderPassIntegrateIndirectRaytraceMode::Count) - 1),
-                   args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, captureDebugImage, false, "");
 
     // Denoiser Options
@@ -1474,9 +1441,6 @@ namespace dxvk {
     static NV_GPU_ARCHITECTURE_ID getNvidiaArch();
     static NV_GPU_ARCH_IMPLEMENTATION_ID getNvidiaChipId();
     static void updateGraphicsPresets(DxvkDevice* device);
-    static void updateLightingSetting();
-    static void updatePathTracerPreset(PathTracerPreset preset);
-    static void updateRaytraceModePresets(const uint32_t vendorID, const VkDriverId driverID);
 
     static void resetUpscaler();
 

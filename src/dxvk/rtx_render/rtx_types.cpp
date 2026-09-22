@@ -24,10 +24,8 @@
 #include "rtx_types.h"
 #include "rtx_asset_replacer.h"
 #include "rtx_options.h"
-#include "rtx_terrain_baker.h"
 #include "rtx_instance_manager.h"
-#include "rtx_light_manager.h"
-#include "graph/rtx_graph_instance.h"
+#include "rtx_lights.h"
 #include "dxvk_scoped_annotation.h"
 
 namespace dxvk {
@@ -86,8 +84,6 @@ namespace dxvk {
       prim = &m_ptr.instance->getPrimInstanceOwner();
     } else if (m_type == Type::Light) {
       prim = &m_ptr.light->getPrimInstanceOwner();
-    } else if (m_type == Type::Graph) {
-      prim = &m_ptr.graph->getPrimInstanceOwner();
     }
 
     if (prim) {
@@ -662,13 +658,6 @@ namespace dxvk {
     return SkyDetectionSource::None;
   }
 
-  bool shouldBakeTerrain(const DrawCallState& drawCallState) {
-    if (!TerrainBaker::needsTerrainBaking())
-      return false;
-
-    return lookupHash(RtxOptions::terrainTextures(), drawCallState.getMaterialData().getHash());
-  }
-
   void DrawCallState::setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
                                                    std::vector<Vector3>& seenCameraPositions) {
     ScopedCpuProfileZone();
@@ -679,7 +668,7 @@ namespace dxvk {
     setCategory(InstanceCategories::Sky, skySource != SkyDetectionSource::None);
     skyAutoDetected = (skySource == SkyDetectionSource::AutoDetect);
 
-    setCategory(InstanceCategories::Terrain, shouldBakeTerrain(*this));
+    setCategory(InstanceCategories::Terrain, false);
   }
 
   BlasEntry::BlasEntry(const DrawCallState& input_)

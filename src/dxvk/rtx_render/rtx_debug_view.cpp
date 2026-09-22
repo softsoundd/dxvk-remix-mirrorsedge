@@ -35,8 +35,6 @@
 #include "rtx_imgui.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
-#include "rtx_terrain_baker.h"
-#include "rtx_neural_radiance_cache.h"
 
 #include <rtx_shaders/debug_view.h>
 #include <rtx_shaders/debug_view_using_optional_extensions.h>

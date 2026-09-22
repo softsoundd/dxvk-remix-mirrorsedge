@@ -41,8 +41,8 @@
 
 #include "dxvk_device.h"
 #include "dxvk_objects.h"
+#include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_types.h"
 #include "rtx_render/rtx_materials.h"
 #include "rtx_render/rtx_material_data.h"
-#include "rtx_render/rtx_global_volumetrics.h"

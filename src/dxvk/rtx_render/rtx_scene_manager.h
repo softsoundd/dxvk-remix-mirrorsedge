@@ -40,28 +40,14 @@
 #include "rtx_types.h"
 #include "rtx_common_object.h"
 #include "rtx_camera_manager.h"
-#include "rtx_draw_call_cache.h"
-#include "rtx_draw_call_tracker.h"
 #include "rtx_sparse_unique_cache.h"
-#include "rtx_light_manager.h"
-#include "rtx_instance_manager.h"
-#include "rtx_accel_manager.h"
-#include "rtx_ray_portal_manager.h"
-#include "rtx_bindless_resource_manager.h"
-#include "rtx_objectpicking.h"
 #include "rtx_mod_manager.h"
-#include "graph/rtx_graph_manager.h"
-#include "rtx_particle_system.h"
 #include <d3d9types.h>
 
 namespace dxvk 
 {
 class DxvkContext;
 class DxvkDevice;
-struct AssetReplacement;
-struct AssetReplacer;
-class OpacityMicromapManager;
-class TerrainBaker;
 
 // The resource cache can be *searched* by other users
 class ResourceCache {

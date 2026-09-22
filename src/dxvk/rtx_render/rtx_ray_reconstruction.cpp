@@ -42,7 +42,6 @@
 #include "rtx_shaders/prepare_ray_reconstruction.h"
 #include "rtx_shader_manager.h"
 #include "rtx_ray_reconstruction.h"
-#include "rtx_restir_gi_rayquery.h"
 
 namespace dxvk {
 

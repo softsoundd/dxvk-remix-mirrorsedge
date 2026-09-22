@@ -31,17 +31,9 @@
 #include "rtx_context.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_options.h"
-#include "rtx_bindless_resource_manager.h"
-#include "rtx_opacity_micromap_manager.h"
-#include "rtx_asset_replacer.h"
-#include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
-#include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_xess.h"
-#include "rtx_rtxdi_rayquery.h"
-#include "rtx_restir_gi_rayquery.h"
-#include "rtx_composite.h"
 #include "rtx_debug_view.h"
 #include "rtx_ngx_passthrough.h"
 
@@ -53,7 +45,6 @@
 #include "rtx/utility/debug_view_indices.h"
 #include "rtx/utility/gpu_printing.h"
 #include "rtx_scene_manager.h"
-#include "rtx_sparse_rendering.h"
 
 #include "../d3d9/d3d9_state.h"
 #include "../d3d9/d3d9_spec_constants.h"
@@ -652,14 +643,8 @@ namespace dxvk {
 
   void RtxContext::checkNeuralRadianceCacheSupport() {
     // Update RtxOption selection if Neural Radiance Cache was selected but it's not supported
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
-        !NeuralRadianceCache::checkIsSupported(m_device.ptr())) {
-
-      // Fallback to ReSTIRGI
+    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
       Logger::warn(str::format("[RTX] Neural Radiance Cache is not supported. Switching indirect illumination mode to ReSTIR GI."));
-      // TODO[REMIX-4105] trying to use NRC for a frame when it isn't supported will cause a crash, so this needs to be setImmediately.
-      // Should refactor this to use a separate global for the final state, and indicate user preference with the option.
-      // Use Quality layer to ensure this overrides the Environment layer (where env vars are stored).
       RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
     }
   }

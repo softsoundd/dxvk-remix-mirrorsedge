@@ -29,7 +29,6 @@
 #include "rtx_utils.h"
 #include "rtx/pass/raytrace_args.h"
 #include "rtx_common_object.h"
-#include "rtx_geometry_utils.h"
 
 namespace dxvk 
 {
