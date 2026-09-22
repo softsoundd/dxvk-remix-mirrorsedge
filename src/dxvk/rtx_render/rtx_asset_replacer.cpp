@@ -27,6 +27,7 @@
 #include "rtx_context.h"
 #include "rtx_initializer.h"
 #include "rtx_options.h"
+#include "rtx_ngx_passthrough.h"
 #include "rtx_utils.h"
 #include "rtx_asset_data_manager.h"
 
@@ -114,6 +115,9 @@ std::shared_ptr<MaterialData> AssetReplacer::getReplacementMaterial(XXH64_hash_t
 }
 
 void AssetReplacer::initialize(const Rc<DxvkContext>& context) {
+  if (RtxNgxPassthrough::ngxPassthroughMode()) {
+    return;
+  }
   for (auto& mod : m_modManager.mods()) {
     // Each mod cancels internally too; this stops us starting the next one. Returning
     // rather than breaking skips the secret-replacement pass, which has nothing to do

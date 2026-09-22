@@ -128,14 +128,21 @@ namespace dxvk {
       }
       RtxOptions::dlssPreset.setImmediately(DlssPreset::Custom);
       RtxOptions::updatePresetFromUpscaler();
+      // Enhancements are path-traced replacements. Loading them in passthrough leaves the
+      // mods stuck in OpeningUSD: the frame-end path that finishes the load does not run,
+      // so the "Loading enhancements" indicator never clears.
+      RtxOptions::enableReplacementAssets.setImmediately(false);
       RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ false);
     }
 
     // Kick off shader prewarming
     startPrewarmShaders();
 
-    // Load assets (if any) as early as possible
-    if (RtxOptions::asyncAssetLoading()) {
+    // Load assets (if any) as early as possible. Passthrough has no replacement scene.
+    if (RtxNgxPassthrough::ngxPassthroughMode()) {
+      Logger::info("[RTX NGX Passthrough] Skipping enhancement asset loading.");
+      m_assetsLoaded = true;
+    } else if (RtxOptions::asyncAssetLoading()) {
       // Async asset loading (USD)
       m_asyncAssetLoadThread = dxvk::thread([this] {
         env::setThreadName("rtx-initialize-assets");
