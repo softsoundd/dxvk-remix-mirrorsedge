@@ -129,9 +129,6 @@ namespace dxvk {
       { "rtx.sceneScale",                                            "1.0" },
       { "rtx.d3d9.autoRaytracedRenderTargetFromFullscreenComposite", "True" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",            "True" },
-      { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
-      { "rtx.d3d9.ue3ExactVertexCapture",                            "True" },
-      { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
       // UE3's per-frame FrameSyncEvent otherwise serialises the GPU frame behind injectRTX's CPU time.
       { "rtx.d3d9.eventQueryCsCompletion",                           "True" },
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },

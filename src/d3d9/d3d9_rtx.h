@@ -964,25 +964,11 @@ namespace dxvk {
       */
     void bootstrapNgxPassthroughUpscaler(uint32_t displayWidth, uint32_t displayHeight);
 
-    /**
-      * \brief: Whether a texture hash is a UE3 lightmap discovered this session from a pixel
-      * shader's CTAB sampler names (rtx.d3d9.ue3AutoDetectLightmapTextures). Process-wide and
-      * append-only, so the texture paths outside the draw-call setup - which have no D3D9Rtx
-      * to hand - can honour the discovery the same way they honour rtx.lightmapTextures.
-      */
-    static bool isAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
-
-    /**
-      * \brief: Whether a texture is baked lighting Remix must leave alone - either tagged in
-      * rtx.lightmapTextures or auto-detected this session.
-      */
     static bool isLightmapTexture(XXH64_hash_t textureHash) {
-      return lookupHash(RtxOptions::lightmapTextures(), textureHash) ||
-             isAutoDetectedLightmapTexture(textureHash);
+      return lookupHash(RtxOptions::lightmapTextures(), textureHash);
     }
 
-  private: 
-    static void registerAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
+  private:
 
     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
     // skinning can keep raw Matrix4* into a prior copy. m_blocks can grow, but the heap

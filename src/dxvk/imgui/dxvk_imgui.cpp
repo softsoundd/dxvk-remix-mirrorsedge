@@ -3122,11 +3122,6 @@ namespace dxvk {
         RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
         RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
         RemixGui::Separator();
-        RemixGui::Checkbox("Exact Position Capture (UE3)", &D3D9Rtx::ue3ExactVertexCaptureObject());
-        RemixGui::Checkbox("Require Exact Position Capture (UE3)", &D3D9Rtx::ue3RequireExactVertexCaptureObject());
-        RemixGui::Combo("Position Source Override (UE3)", &D3D9Rtx::ue3VertexCaptureSourceOverrideObject(),
-                        "Auto\0Pre-Projection Register\0Input Assembler\0Clip Reconstruction\0");
-        RemixGui::Separator();
         RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
         ImGui::Unindent();
       }
@@ -4277,11 +4272,9 @@ namespace dxvk {
         RemixGui::SliderInt("User Brightness", &RtxOptions::userBrightnessObject(), 0, 100, "%d");
         RemixGui::DragFloat("User Brightness EV Range", &RtxOptions::userBrightnessEVRangeObject(), 0.5f, 0.f, 10.f, "%.1f");
         RemixGui::Separator();
-        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0Mirror's Edge (UE3)\0");
+        RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0");
         if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
           common->metaToneMapping().showImguiSettings();
-        } else if (RtxOptions::tonemappingMode() == TonemappingMode::MirrorsEdge) {
-          common->metaUe3ToneMapping().showImguiSettings();
         } else {
           common->metaLocalToneMapping().showImguiSettings();
         }

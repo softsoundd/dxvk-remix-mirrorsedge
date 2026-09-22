@@ -38,8 +38,6 @@ Notes and limitations:
 - Ghosting issues with particles and textures on transparent planes (chain link fences). Will investigate solutions for this in the future.
 - Separate existing issue with Mirror's Edge where sub-native render resolutions offsets the position of some effects like sun haze and first person self-shadowing. This is not Remix's doing.
 
-Implementation notes for the unused UE3 path-tracing capture path live in [documentation/UE3Compatibility.md](documentation/UE3Compatibility.md).
-
 ## Build instructions
 
 ### Requirements:
