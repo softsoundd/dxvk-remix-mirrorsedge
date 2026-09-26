@@ -37,6 +37,7 @@
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
+#include "rtx_opacity_micromap_manager.h"
 #include "../imgui/dxvk_imgui.h"
 #include "../../util/config/config.h"
 #include "../../util/log/log.h"
@@ -856,6 +857,10 @@ namespace dxvk {
           << " blas=" << AccelManager::getBlasCount()
           << " activePOM=" << sceneManager.getActivePOMCount()
           << " shadowBackfaceSkip=" << (accelManager.hasShadowBackfaceSkipInstances() ? 1 : 0);
+
+      if (const OpacityMicromapManager* ommManager = sceneManager.getOpacityMicromapManager()) {
+        out << " ommBound=" << ommManager->getNumBoundOmms() << "/" << ommManager->getNumRequestedOmmBindings();
+      }
     }
 
     out << " | upscaler=" << static_cast<int>(RtxOptions::upscalerType())
@@ -941,6 +946,13 @@ namespace dxvk {
           << "; cs sync=" << avg(CpuCounter::AppCsSync)
           << "; event query wait=" << avg(CpuCounter::AppEventQueryWait)
           << "; resource wait=" << avg(CpuCounter::AppResourceWait) << ")"
+          << ", d3d9 draws=" << avg(CpuCounter::AppDraw) << " ms (prepare " << avg(CpuCounter::AppDrawPrepare)
+          << ": classify " << avg(CpuCounter::AppPrepClassify)
+          << ", indices " << avg(CpuCounter::AppPrepIndices)
+          << ", render state " << avg(CpuCounter::AppPrepRenderState)
+          << ", vertices " << avg(CpuCounter::AppPrepVertices)
+          << ", identity " << avg(CpuCounter::AppPrepIdentity)
+          << ", capture " << avg(CpuCounter::AppPrepCapture) << ")"
           << " | cs thread busy=" << avg(CpuCounter::CsBusy) << " ms"
           << " (injectRTX " << avg(CpuCounter::CsInjectRtx)
           << ", submit back-pressure " << avg(CpuCounter::CsSubmitBackpressure) << ")"
@@ -1057,14 +1069,16 @@ namespace dxvk {
     {
       const CpuSummary cpu = computeCpuSummary();
       const auto avg = [&cpu](CpuCounter c) { return cpu.avgMs[static_cast<std::size_t>(c)]; };
-      ImGui::Text("Frame %.3f ms (%.1f fps) | app thread: work %.3f, Present %.3f (latency %.3f, prev present %.3f, acquire %.3f, Reflex sleep %.3f), CS sync %.3f, event query wait %.3f, resource wait %.3f | CS thread: busy %.3f (injectRTX %.3f, submit back-pressure %.3f), idle %.3f | submit thread: vkQueueSubmit %.3f, vkQueuePresent %.3f",
+      ImGui::Text("Frame %.3f ms (%.1f fps) | app thread: work %.3f, Present %.3f (latency %.3f, prev present %.3f, acquire %.3f, Reflex sleep %.3f), CS sync %.3f, event query wait %.3f, resource wait %.3f, D3D9 draws %.3f (prepare %.3f) | CS thread: busy %.3f (injectRTX %.3f, submit back-pressure %.3f), idle %.3f | submit thread: vkQueueSubmit %.3f, vkQueuePresent %.3f",
                   cpu.frameIntervalMs, cpu.frameIntervalMs > 0.0f ? 1000.0f / cpu.frameIntervalMs : 0.0f,
                   cpu.appWorkMs, avg(CpuCounter::AppPresent), avg(CpuCounter::AppPresentWait), avg(CpuCounter::AppPrevPresentWait), avg(CpuCounter::AppAcquireWait), avg(CpuCounter::AppReflexSleep), avg(CpuCounter::AppCsSync),
-                  avg(CpuCounter::AppEventQueryWait), avg(CpuCounter::AppResourceWait),
+                  avg(CpuCounter::AppEventQueryWait), avg(CpuCounter::AppResourceWait), avg(CpuCounter::AppDraw), avg(CpuCounter::AppDrawPrepare),
                   avg(CpuCounter::CsBusy), avg(CpuCounter::CsInjectRtx), avg(CpuCounter::CsSubmitBackpressure), cpu.csIdleMs,
                   avg(CpuCounter::SubmitQueueSubmit), avg(CpuCounter::SubmitQueuePresent));
       RemixGui::SetTooltipToLastWidgetOnHover("CPU frame breakdown over the same window. 'work' is the application's own time between Presents including the D3D9 -> Remix "
                                               "draw processing; a frame that is longer than the GPU busy time with a small Present wait is bound by that thread. "
+                                              "'D3D9 draws' is the part of that work spent inside the Draw* calls (classification, geometry hashing, capture setup, "
+                                              "state binding, CS enqueue); the rest is the game's own frame and its other D3D9 calls. "
                                               "CS thread 'busy' is the time spent executing the command stream (injectRTX included).");
     }
 

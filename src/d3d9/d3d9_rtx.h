@@ -370,6 +370,14 @@ namespace dxvk {
                     "frame's injectRTX recording once the game runs ahead of the GPU. Same model as current upstream "
                     "DXVK. Disable to fall back to the full drain.",
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.d3d9", bool, discardCaptureOnlyDrawFragments, true,
+                    "Draws that are ray traced keep their original draw call only when the vertex shader has to run for "
+                    "vertex capture; nothing reads what they rasterize, since the ray-traced image replaces the scene "
+                    "render target and occlusion queries are answered conservatively. With this on those draws run with "
+                    "an empty scissor rectangle, so the vertex shader (and the capture) runs but no fragments are shaded "
+                    "or blended. Saves the fill cost of large dynamic geometry, e.g. particle sprites covering the screen "
+                    "at the output resolution.",
+                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
                "UE3 compat: for static draws captured through an exact position source, reuse the vertex shader "
                "output captured on an earlier frame rather than preserving a new vertex-capture draw. Only exact "
@@ -588,9 +596,9 @@ namespace dxvk {
                "rtx.logReplacementResolution it is on by default. Only active when material instance hashing "
                "is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
-               "UE3 compat: log pass/vertex-factory classification decisions for draw routing. "
-               "Also emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
-               "for Particle / ParticleBeamTrail / LensFlare draws.");
+               "UE3 compat: emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
+               "for Particle / ParticleBeamTrail / LensFlare draws. The per-draw pass/vertex-factory classification "
+               "decisions are logged at debug level, so they additionally need DXVK_LOG_LEVEL=debug.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
@@ -764,6 +772,11 @@ namespace dxvk {
     // rtx.d3d9.sequenceTrackedLockWaits
     bool SequenceTrackedLockWaitsEnabled() const {
       return m_frameOptions.sequenceTrackedLockWaits;
+    }
+
+    // rtx.d3d9.discardCaptureOnlyDrawFragments
+    bool DiscardCaptureOnlyDrawFragmentsEnabled() const {
+      return m_frameOptions.enableRaytracing && m_frameOptions.discardCaptureOnlyDrawFragments;
     }
 
     // True once this frame's ray tracing has been injected; later draws are UI / post work.
@@ -2059,6 +2072,7 @@ namespace dxvk {
       bool conservativeOcclusionQueries = false;
       bool eventQueryCsCompletion = false;
       bool sequenceTrackedLockWaits = true;
+      bool discardCaptureOnlyDrawFragments = true;
       bool skipRenderTargetCopies = true;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;

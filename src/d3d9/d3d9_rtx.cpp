@@ -6050,7 +6050,10 @@ namespace dxvk {
     // remember the routing decision for the draw-status flap probe regardless of log level
     m_ue3LastDrawDecision = reason;
 
-    if (!m_frameOptions.ue3LogClassification && Logger::logLevel() > LogLevel::Debug)
+    // The line below is a debug-level message: when the logger would drop it, return before
+    // formatting it. This runs for every ray-traced draw, and formatting alone costs a few
+    // microseconds each, which at thousands of draws per frame is several milliseconds.
+    if (Logger::logLevel() > LogLevel::Debug)
       return;
 
     XXH64_hash_t vsHash = 0;
@@ -6284,6 +6287,7 @@ namespace dxvk {
     o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
     o.eventQueryCsCompletion = eventQueryCsCompletionObject().get();
     o.sequenceTrackedLockWaits = sequenceTrackedLockWaitsObject().get();
+    o.discardCaptureOnlyDrawFragments = discardCaptureOnlyDrawFragmentsObject().get();
     o.skipRenderTargetCopies = skipRenderTargetCopiesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
@@ -11055,6 +11059,9 @@ namespace dxvk {
     // first use per draw (UI/deferred-UI tag checks, MIC texture-set hash, diffuse key).
     m_boundTextureSnapshotValid = false;
 
+    // Per-phase CPU attribution of this function (pass timer only)
+    RtxGpuPassTimer::CpuPhaseTimer phaseTimer(RtxGpuPassTimer::isEnabled() ? &m_parent->GetDXVKDevice()->getCommon()->metaGpuPassTimer() : nullptr);
+
     // Diagnostics: record every draw issued inside an occlusion query bracket, whichever path
     // routes it below, so its query's eventual result can be correlated with the drawn geometry.
     if (m_activeOcclusionQueries > 0 && m_frameOptions.ue3LogOcclusionQueries) {
@@ -11159,6 +11166,7 @@ namespace dxvk {
     }
 
     const auto [status, triggerRtxInjection, deferUntilInjection] = makeDrawCallType(drawContext);
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepClassify);
 
     // When raytracing is enabled we want to completely remove the ignored drawcalls from further processing as early as possible
     const PrepareDrawFlags prepareFlagsForIgnoredDraws = m_frameOptions.enableRaytracing
@@ -11244,6 +11252,7 @@ namespace dxvk {
       ONCE(Logger::info("[RTX-Compatibility-Info] Skipped invalid drawcall, no vertices detected."));
       return finishPrepare(prepareFlagsForIgnoredDraws);
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepIndices);
 
     if (m_frameOptions.raytracedRenderTargetEnable) {
       // If this draw call has an RT texture bound
@@ -11277,6 +11286,7 @@ namespace dxvk {
     if (!processRenderState(drawContext)) {
       return finishPrepare(prepareFlagsForIgnoredDraws);
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepRenderState);
 
     // Max offseted index value within a buffer slice that geoData contains
     const uint32_t maxOffsetedIndex = maxIndex - minIndex;
@@ -11408,6 +11418,7 @@ namespace dxvk {
         return finishPrepare(prepareFlagsForIgnoredDraws);
       }
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepVertices);
 
     bool canUseCachedVertexCapture = false;
     XXH64_hash_t vertexCaptureCacheKey = kEmptyHash;
@@ -11494,6 +11505,7 @@ namespace dxvk {
         }
       }
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepIdentity);
 
     // Process skinning data
     m_activeDrawCallState.futureSkinningData = processSkinning(geoData);
@@ -11536,6 +11548,8 @@ namespace dxvk {
       ++m_ue3VertexCaptureCacheFrameCaptures;
       updateUe3StaticVertexCaptureCache(vertexCaptureCacheKey, geoData);
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepCapture);
+
     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
     m_activeDrawCallState.usesPixelShader = m_parent->UseProgrammablePS();
 

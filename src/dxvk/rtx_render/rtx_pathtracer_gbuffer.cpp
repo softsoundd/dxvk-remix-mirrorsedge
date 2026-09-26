@@ -603,6 +603,14 @@ namespace dxvk {
             }
           }
         }
+
+        // Debug-view frames run the RayQuery compute path instead (see dispatch).
+        if (RtxOptions::renderPassGBufferRaytraceMode() == RaytraceMode::TraceRay) {
+          for (int32_t isPSRPass = 1; isPSRPass >= 0; isPSRPass--) {
+            getGbufferRayQueryComputeShader(getGbufferRayQueryVariantKey(
+              RTX_SHADER_VARIANT_MATRIX_GBUFFER_RAYQUERY_FEATURES_DEBUG, isPSRPass, nrcEnabled, wboitEnabled));
+          }
+        }
         break;
       case RaytraceMode::Count:
         assert(false && "Invalid RaytraceMode in DxvkPathtracerGbuffer::prewarmShaders");
@@ -799,7 +807,15 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     };
 
-    switch (RtxOptions::renderPassGBufferRaytraceMode()) {
+    // TraceRay runs geometryResolverVertex in the closest-hit/miss shaders, which have no
+    // GBUFFER_FEATURE_DEBUG_VIEW variant, so the per-hit debug views would stay black there.
+    // Debug-view frames take the RayQuery compute path, whose debug variant covers the whole resolver.
+    RaytraceMode raytraceMode = RtxOptions::renderPassGBufferRaytraceMode();
+    if (debugViewEnabled && raytraceMode == RaytraceMode::TraceRay) {
+      raytraceMode = RaytraceMode::RayQuery;
+    }
+
+    switch (raytraceMode) {
     case RaytraceMode::RayQuery:
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");

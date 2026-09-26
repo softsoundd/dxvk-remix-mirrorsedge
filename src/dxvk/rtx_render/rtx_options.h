@@ -704,7 +704,8 @@ namespace dxvk {
     // to Custom to ensure these settings are not overridden.
     //RenderPassVolumeIntegrateRaytraceMode renderPassVolumeIntegrateRaytraceMode = RenderPassVolumeIntegrateRaytraceMode::RayQuery;
     RTX_OPTION_ARGS("rtx", RenderPassGBufferRaytraceMode, renderPassGBufferRaytraceMode, RenderPassGBufferRaytraceMode::RayQuery,
-                   "The ray tracing mode to use for the G-Buffer pass which resolves the initial primary and secondary surfaces to apply lighting to.",
+                   "The ray tracing mode to use for the G-Buffer pass which resolves the initial primary and secondary surfaces to apply lighting to.\n"
+                   "While a debug view is active, Trace Ray falls back to Ray Query (compute) since its hit shaders carry no debug view output.",
                    args.environment = "DXVK_RENDER_PASS_GBUFFER_RAYTRACE_MODE",
                    args.maxValue = RenderPassGBufferRaytraceMode(uint32_t(RenderPassGBufferRaytraceMode::Count) - 1),
                    args.flags = RtxOptionFlags::UserSetting);
@@ -836,6 +837,21 @@ namespace dxvk {
                "This improves performance typically in how particles or decals are rendered and should usually always be enabled.\n"
                "Do note however the unordered nature of this resolving method may result in visual artifacts with large numbers of stacked particles due to difficulty in determining the intended order.\n"
                "Additionally, unordered approximations will only be done on the first indirect ray bounce (as particles matter less in higher bounces), and only if enabled by its corresponding setting.");
+    RTX_OPTION_ARGS("rtx", uint32_t, unorderedResolveMaxPrimaryCandidates, 128,
+               "The maximum number of unordered candidates (particles, decals) a primary ray evaluates when separate unordered approximations are enabled.\n"
+               "Every candidate costs a material evaluation, so this bounds the cost of a pixel that looks through many stacked particles. "
+               "Candidates beyond the limit are dropped in traversal order, which is not depth order, so lower values are only safe where fewer layers overlap.",
+               args.minValue = 1u, args.maxValue = 1024u);
+    RTX_OPTION_ARGS("rtx", uint32_t, unorderedResolveMaxSecondaryCandidates, 32,
+               "The maximum number of unordered candidates (particles, decals) a secondary (indirect) ray evaluates when unordered resolve is enabled for indirect rays.\n"
+               "See rtx.unorderedResolveMaxPrimaryCandidates.",
+               args.minValue = 1u, args.maxValue = 1024u);
+    RTX_OPTION_ARGS("rtx", float, unorderedResolveSkipOpacityThreshold, 0.0f,
+               "Unordered particle candidates whose opacity resolves at or below this value are skipped before the rest of their material and the lighting approximation are evaluated.\n"
+               "0 skips only fully transparent hits (the corners of a sprite outside its shape, alpha-tested texels), which contribute nothing to the weighted blend, so the image is unchanged. "
+               "Raising it to rtx.resolveTransparencyThreshold matches what the ordered resolve already drops, at a small cost in stacks of very faint layers. A negative value disables the skip. "
+               "Only applies with rtx.wboitEnabled.",
+               args.minValue = -1.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx", bool, trackParticleObjects, true, "Track last frame's corresponding particle object.");
     RTX_OPTION_ENV("rtx", bool, enableDirectTranslucentShadows, false, "RTX_ENABLE_DIRECT_TRANSLUCENT_SHADOWS", "Calculate coloured shadows for translucent materials (i.e. glass, water) in direct lighting. In engineering terms: include OBJECT_MASK_TRANSLUCENT into primary visibility rays.");
     RTX_OPTION_ENV("rtx", bool, enableDirectAlphaBlendShadows, true, "RTX_ENABLE_DIRECT_ALPHABLEND_SHADOWS", "Calculate shadows for semi-transparent materials (alpha blended) in direct lighting. In engineering terms: include OBJECT_MASK_ALPHA_BLEND into primary visibility rays.");

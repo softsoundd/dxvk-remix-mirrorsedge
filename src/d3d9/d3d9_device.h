@@ -799,6 +799,22 @@ namespace dxvk {
 
     void BindViewportAndScissor();
 
+    // NV-DXVK start: capture-only draws
+    // Binds the current viewport with an empty scissor rectangle for the next draw, so that its
+    // vertex shader runs (vertex capture) but no fragment is produced; the game's viewport and
+    // scissor are re-bound by the draw after it. See rtx.d3d9.discardCaptureOnlyDrawFragments.
+    void BindEmptyScissorForCaptureOnlyDraw();
+
+    // Called after PrepareDraw for a draw that is about to be issued: applies the above when the
+    // original draw call is kept only for vertex capture.
+    void PrepareCaptureOnlyDraw(PrepareDrawFlags drawPrepare) {
+      constexpr PrepareDrawFlags captureOnly = PrepareDrawFlag::CommitToRayTracing | PrepareDrawFlag::OriginalDrawCall;
+      if ((drawPrepare & captureOnly) == captureOnly && m_rtx.DiscardCaptureOnlyDrawFragmentsEnabled()) {
+        BindEmptyScissorForCaptureOnlyDraw();
+      }
+    }
+    // NV-DXVK end
+
     inline bool IsAlphaToCoverageEnabled() {
       const bool alphaTest = m_state.renderStates[D3DRS_ALPHATESTENABLE] != 0;
 

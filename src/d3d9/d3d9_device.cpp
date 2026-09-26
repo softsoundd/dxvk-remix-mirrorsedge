@@ -2672,12 +2672,18 @@ namespace dxvk {
       return S_OK;
 
     // NV-DXVK start: geometry processing
+    RtxGpuPassTimer::CpuScope drawScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppDraw);
     const D3D9Rtx::DrawContext drawContext { PrimitiveType, (INT) StartVertex, 0, 0, 0, PrimitiveCount, FALSE };
-    const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(false, drawContext);
+    const PrepareDrawFlags drawPrepare = [&] {
+      RtxGpuPassTimer::CpuScope prepareScope(drawScope.timer(), RtxGpuPassTimer::CpuCounter::AppDrawPrepare);
+      return m_rtx.PrepareDrawGeometryForRT(false, drawContext);
+    }();
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
+      PrepareCaptureOnlyDraw(drawPrepare);
 
       EmitCs([this,
         cPrimType = PrimitiveType,
@@ -2729,12 +2735,18 @@ namespace dxvk {
       return S_OK;
 
     // NV-DXVK start: geometry processing
+    RtxGpuPassTimer::CpuScope drawScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppDraw);
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount, TRUE };
-    const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(true, drawContext);
+    const PrepareDrawFlags drawPrepare = [&] {
+      RtxGpuPassTimer::CpuScope prepareScope(drawScope.timer(), RtxGpuPassTimer::CpuCounter::AppDrawPrepare);
+      return m_rtx.PrepareDrawGeometryForRT(true, drawContext);
+    }();
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
+      PrepareCaptureOnlyDraw(drawPrepare);
 
       EmitCs([this,
         cPrimType = PrimitiveType,
@@ -2785,6 +2797,9 @@ namespace dxvk {
     if (unlikely(!PrimitiveCount))
       return S_OK;
 
+    RtxGpuPassTimer::CpuScope drawScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppDraw);
+
     auto drawInfo = GenerateDrawInfo(PrimitiveType, PrimitiveCount, 0);
 
     const uint32_t dataSize = GetUPDataSize(drawInfo.vertexCount, VertexStreamZeroStride);
@@ -2795,11 +2810,15 @@ namespace dxvk {
 
     // NV-DXVK start: geometry processing
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, 0, 0, 0, 0, PrimitiveCount, FALSE };
-    const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawUPGeometryForRT(false, upSlice, D3DFMT_UNKNOWN, 0, 0, dataSize, VertexStreamZeroStride, drawContext);
+    const PrepareDrawFlags drawPrepare = [&] {
+      RtxGpuPassTimer::CpuScope prepareScope(drawScope.timer(), RtxGpuPassTimer::CpuCounter::AppDrawPrepare);
+      return m_rtx.PrepareDrawUPGeometryForRT(false, upSlice, D3DFMT_UNKNOWN, 0, 0, dataSize, VertexStreamZeroStride, drawContext);
+    }();
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
+      PrepareCaptureOnlyDraw(drawPrepare);
 
       EmitCs([this,
         cBufferSlice = std::move(upSlice.slice),
@@ -2857,6 +2876,9 @@ namespace dxvk {
     if (unlikely(!PrimitiveCount))
       return S_OK;
 
+    RtxGpuPassTimer::CpuScope drawScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppDraw);
+
     auto drawInfo = GenerateDrawInfo(PrimitiveType, PrimitiveCount, 0);
 
     const uint32_t vertexDataSize = GetUPDataSize(MinVertexIndex + NumVertices, VertexStreamZeroStride);
@@ -2874,11 +2896,15 @@ namespace dxvk {
 
     // NV-DXVK start: geometry processing
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, 0, MinVertexIndex, NumVertices, 0, PrimitiveCount, TRUE };
-    const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawUPGeometryForRT(true, upSlice, IndexDataFormat, indicesSize, vertexDataSize, vertexDataSize, VertexStreamZeroStride, drawContext);
+    const PrepareDrawFlags drawPrepare = [&] {
+      RtxGpuPassTimer::CpuScope prepareScope(drawScope.timer(), RtxGpuPassTimer::CpuCounter::AppDrawPrepare);
+      return m_rtx.PrepareDrawUPGeometryForRT(true, upSlice, IndexDataFormat, indicesSize, vertexDataSize, vertexDataSize, VertexStreamZeroStride, drawContext);
+    }();
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
+      PrepareCaptureOnlyDraw(drawPrepare);
 
       EmitCs([this,
         cVertexSize = vertexBufferSize,
@@ -6328,6 +6354,38 @@ namespace dxvk {
         &cScissor);
     });
   }
+
+
+  // NV-DXVK start: capture-only draws
+  void D3D9DeviceEx::BindEmptyScissorForCaptureOnlyDraw() {
+    const D3DVIEWPORT9& vp = m_state.viewport;
+
+    // Same viewport as BindViewportAndScissor (including its half-texel correction) so the
+    // vertex shader's view of the draw is unchanged; only the scissor test rejects everything.
+    const float cf = 0.5f - (1.0f / 128.0f);
+    const VkViewport viewport = VkViewport{
+      float(vp.X)     + cf,    float(vp.Height + vp.Y) + cf,
+      float(vp.Width),        -float(vp.Height),
+      vp.MinZ,                 vp.MaxZ,
+    };
+    const VkRect2D scissor = VkRect2D{
+      VkOffset2D { int32_t(vp.X), int32_t(vp.Y) },
+      VkExtent2D { 0u, 0u } };
+
+    EmitCs([
+      cViewport = viewport,
+      cScissor = scissor
+    ] (DxvkContext* ctx) {
+      ctx->setViewports(
+        1,
+        &cViewport,
+        &cScissor);
+    });
+
+    // The next draw that binds state restores the game's viewport and scissor
+    m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
+  }
+  // NV-DXVK end
 
 
   void D3D9DeviceEx::BindMultiSampleState() {

@@ -101,6 +101,15 @@ namespace dxvk {
       AppCsSync,        // application thread: blocked in DxvkCsThread::synchronize (resource readbacks, CS back-pressure)
       AppEventQueryWait,// application thread: polling a pending D3DQUERYTYPE_EVENT (the game's own GPU throttle)
       AppResourceWait,  // application thread: D3D9DeviceEx::WaitForResource (Lock on a GPU-busy resource)
+      AppDraw,          // application thread: inside the D3D9 Draw* entry points (classification, geometry hashing, capture setup, state binding, CS enqueue)
+      AppDrawPrepare,   // application thread: of which D3D9Rtx::PrepareDraw*GeometryForRT (draw classification and geometry processing)
+      // Phases of D3D9Rtx::internalPrepareDraw, in order; their sum is the bulk of AppDrawPrepare.
+      AppPrepClassify,  //   vertex factory and instancing classification, makeDrawCallType
+      AppPrepIndices,   //   index buffer processing (min/max scan or memoized lookup)
+      AppPrepRenderState,//  legacy material, fog and render state (textures, transforms, material hash)
+      AppPrepVertices,  //   vertex stream processing, UE3 instance transforms, skinning anchor, capture position source
+      AppPrepIdentity,  //   geometry identity keys (stable VS hash, cache keys, geometry hash and bounding box scheduling)
+      AppPrepCapture,   //   skinning data, static vertex-capture cache reuse and capture setup
       CsBusy,           // CS thread: executing command stream chunks (includes injectRTX)
       CsInjectRtx,      // CS thread: RtxContext::injectRTX
       CsSubmitBackpressure, // CS thread: blocked in DxvkSubmissionQueue::submit because MaxNumQueuedCommandBuffers lists are in flight
@@ -132,10 +141,33 @@ namespace dxvk {
       }
       CpuScope(const CpuScope&) = delete;
       CpuScope& operator=(const CpuScope&) = delete;
+      // The timer this scope reports to, or null when timings are disabled; lets nested scopes skip the enable check.
+      RtxGpuPassTimer* timer() const { return m_timer; }
     private:
       RtxGpuPassTimer* m_timer;
       CpuCounter m_counter;
       std::chrono::steady_clock::time_point m_start;
+    };
+
+    // Attributes consecutive phases of one code path to counters with a single timestamp per boundary:
+    // lap() adds the time since the previous lap (or construction) to the given counter.
+    class CpuPhaseTimer {
+    public:
+      explicit CpuPhaseTimer(RtxGpuPassTimer* timer) : m_timer(timer) {
+        if (m_timer != nullptr) {
+          m_last = std::chrono::steady_clock::now();
+        }
+      }
+      void lap(CpuCounter counter) {
+        if (m_timer != nullptr) {
+          const auto now = std::chrono::steady_clock::now();
+          m_timer->addCpuSample(counter, std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_last).count());
+          m_last = now;
+        }
+      }
+    private:
+      RtxGpuPassTimer* m_timer;
+      std::chrono::steady_clock::time_point m_last;
     };
 
     RTX_OPTION("rtx.gpuPassTimings", std::string, sweepSteps, "",

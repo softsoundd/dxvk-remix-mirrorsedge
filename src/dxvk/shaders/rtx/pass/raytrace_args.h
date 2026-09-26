@@ -436,6 +436,12 @@ struct RaytraceArgs {
   uint writeSecondaryDenoisingGuides;
   uint writePrimaryVirtualMotionVector;
 
+  // Candidate limits of the unordered (particle/decal) resolve loops for primary and secondary rays.
+  uint unorderedResolveMaxPrimaryCandidates;
+  uint unorderedResolveMaxSecondaryCandidates;
+  // Unordered particle candidates resolving to an opacity at or below this are skipped before material evaluation (WBOIT only).
+  float unorderedResolveSkipOpacityThreshold;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
