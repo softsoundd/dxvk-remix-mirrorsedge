@@ -312,6 +312,7 @@ namespace dxvk {
     if (!m_wasEnabled) {
       m_wasEnabled = true;
       m_lastLogTime = std::chrono::steady_clock::now();
+      m_enabledTime = m_lastLogTime;
       m_lastFrameBeginId = UINT32_MAX;
     }
 
@@ -342,6 +343,13 @@ namespace dxvk {
     }
 
     resolvePendingFrames(currentFrameId);
+
+    const float autoStartSeconds = sweepAutoStartSeconds();
+    if (autoStartSeconds > 0.0f && !m_sweepAutoStarted &&
+        std::chrono::duration<float>(now - m_enabledTime).count() >= autoStartSeconds) {
+      m_sweepAutoStarted = true;
+      startSweepLocked();
+    }
 
     if (m_sweep.active) {
       advanceSweepLocked();
@@ -436,6 +444,15 @@ namespace dxvk {
   }
 
   void RtxGpuPassTimer::startSweep() {
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    startSweepLocked();
+  }
+
+  void RtxGpuPassTimer::startSweepLocked() {
+    if (m_sweep.active) {
+      return;
+    }
+
     std::vector<SweepStep> steps;
     if (!parseSweepSteps(sweepSteps(), steps)) {
       Logger::warn("[GPU Pass Timings] Sweep not started: rtx.gpuPassTimings.sweepSteps has no valid steps.");
@@ -449,12 +466,6 @@ namespace dxvk {
     baselineEnd.label = "baseline (end)";
     steps.insert(steps.begin(), std::move(baselineStart));
     steps.push_back(std::move(baselineEnd));
-
-    std::lock_guard<dxvk::mutex> lock(m_mutex);
-
-    if (m_sweep.active) {
-      return;
-    }
 
     if (!enable()) {
       enable.setDeferred(true);
@@ -946,6 +957,7 @@ namespace dxvk {
           << "; cs sync=" << avg(CpuCounter::AppCsSync)
           << "; event query wait=" << avg(CpuCounter::AppEventQueryWait)
           << "; resource wait=" << avg(CpuCounter::AppResourceWait) << ")"
+          << ", d3d9 lock/unlock=" << avg(CpuCounter::AppLock) << " ms"
           << ", d3d9 draws=" << avg(CpuCounter::AppDraw) << " ms (prepare " << avg(CpuCounter::AppDrawPrepare)
           << ": classify " << avg(CpuCounter::AppPrepClassify)
           << ", indices " << avg(CpuCounter::AppPrepIndices)
@@ -1069,16 +1081,17 @@ namespace dxvk {
     {
       const CpuSummary cpu = computeCpuSummary();
       const auto avg = [&cpu](CpuCounter c) { return cpu.avgMs[static_cast<std::size_t>(c)]; };
-      ImGui::Text("Frame %.3f ms (%.1f fps) | app thread: work %.3f, Present %.3f (latency %.3f, prev present %.3f, acquire %.3f, Reflex sleep %.3f), CS sync %.3f, event query wait %.3f, resource wait %.3f, D3D9 draws %.3f (prepare %.3f) | CS thread: busy %.3f (injectRTX %.3f, submit back-pressure %.3f), idle %.3f | submit thread: vkQueueSubmit %.3f, vkQueuePresent %.3f",
+      ImGui::Text("Frame %.3f ms (%.1f fps) | app thread: work %.3f, Present %.3f (latency %.3f, prev present %.3f, acquire %.3f, Reflex sleep %.3f), CS sync %.3f, event query wait %.3f, resource wait %.3f, D3D9 lock/unlock %.3f, D3D9 draws %.3f (prepare %.3f) | CS thread: busy %.3f (injectRTX %.3f, submit back-pressure %.3f), idle %.3f | submit thread: vkQueueSubmit %.3f, vkQueuePresent %.3f",
                   cpu.frameIntervalMs, cpu.frameIntervalMs > 0.0f ? 1000.0f / cpu.frameIntervalMs : 0.0f,
                   cpu.appWorkMs, avg(CpuCounter::AppPresent), avg(CpuCounter::AppPresentWait), avg(CpuCounter::AppPrevPresentWait), avg(CpuCounter::AppAcquireWait), avg(CpuCounter::AppReflexSleep), avg(CpuCounter::AppCsSync),
-                  avg(CpuCounter::AppEventQueryWait), avg(CpuCounter::AppResourceWait), avg(CpuCounter::AppDraw), avg(CpuCounter::AppDrawPrepare),
+                  avg(CpuCounter::AppEventQueryWait), avg(CpuCounter::AppResourceWait), avg(CpuCounter::AppLock), avg(CpuCounter::AppDraw), avg(CpuCounter::AppDrawPrepare),
                   avg(CpuCounter::CsBusy), avg(CpuCounter::CsInjectRtx), avg(CpuCounter::CsSubmitBackpressure), cpu.csIdleMs,
                   avg(CpuCounter::SubmitQueueSubmit), avg(CpuCounter::SubmitQueuePresent));
       RemixGui::SetTooltipToLastWidgetOnHover("CPU frame breakdown over the same window. 'work' is the application's own time between Presents including the D3D9 -> Remix "
                                               "draw processing; a frame that is longer than the GPU busy time with a small Present wait is bound by that thread. "
                                               "'D3D9 draws' is the part of that work spent inside the Draw* calls (classification, geometry hashing, capture setup, "
-                                              "state binding, CS enqueue); the rest is the game's own frame and its other D3D9 calls. "
+                                              "state binding, CS enqueue) and 'lock/unlock' the part inside buffer and texture Lock/Unlock (data uploads); "
+                                              "the rest is the game's own frame and its other D3D9 calls. "
                                               "CS thread 'busy' is the time spent executing the command stream (injectRTX included).");
     }
 

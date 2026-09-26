@@ -4704,6 +4704,8 @@ namespace dxvk {
             DWORD                   Flags) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+    RtxGpuPassTimer::CpuScope lockScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppLock);
 
     UINT Subresource = pResource->CalcSubresource(Face, MipLevel);
 
@@ -5001,6 +5003,8 @@ namespace dxvk {
         UINT                    MipLevel) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+    RtxGpuPassTimer::CpuScope lockScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppLock);
 
     UINT Subresource = pResource->CalcSubresource(Face, MipLevel);
 
@@ -5193,6 +5197,8 @@ namespace dxvk {
           DWORD                   Flags) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+    RtxGpuPassTimer::CpuScope lockScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppLock);
 
     if (unlikely(ppbData == nullptr))
       return D3DERR_INVALIDCALL;
@@ -5383,6 +5389,8 @@ namespace dxvk {
         D3D9CommonBuffer*       pResource) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+    RtxGpuPassTimer::CpuScope lockScope(RtxGpuPassTimer::isEnabled() ? &m_dxvkDevice->getCommon()->metaGpuPassTimer() : nullptr,
+                                        RtxGpuPassTimer::CpuCounter::AppLock);
 
     if (pResource->DecrementLockCount() != 0)
       return D3D_OK;
