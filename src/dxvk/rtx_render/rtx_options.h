@@ -236,7 +236,8 @@ namespace dxvk {
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
     RTX_OPTION("rtx", fast_unordered_set, deferredUiTextures, {},
                   "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
-                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
+                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback). "
+                  "Draws the game rendered into a floating-point target (linear scene colour, e.g. UE3 MaterialEffects) replay on the linear HDR image before tone mapping instead (rtx.d3d9.deferredUiHdrReplay).\n"
                   "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
                   "Non-RT textures match by image hash. Render targets match either descriptor hash the texture picker "
                   "registers for them: the resolution-agnostic one (aspect ratio in place of Width/Height) survives "

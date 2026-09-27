@@ -681,6 +681,12 @@ namespace dxvk {
                "that read the scene (fade lerps, scope distortion, damage effects) then composite over the ray-traced "
                "image instead of the stale rasterized scene. The copy runs before each replayed draw, so chained "
                "effects see the previous overlay's output. Disable if a replayed overlay shows artifacts.");
+    RTX_OPTION("rtx.d3d9", bool, deferredUiHdrReplay, true,
+               "Replay deferred UI overlays the game drew into a floating-point render target (e.g. UE3 MaterialEffects, "
+               "drawn into the HDR scene colour before the game's display transform) on Remix's linear HDR image, in the "
+               "game's scene units, before tone mapping. Overlays drawn into 8-bit targets replay on the tone-mapped output "
+               "either way. When disabled, every overlay replays on the tone-mapped output, where linear overlay maths runs "
+               "on display-encoded colour: tints brighten the image and clip highlights.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -1895,7 +1901,9 @@ namespace dxvk {
 
     void flushOcclusionQueryDiagnostics();
 
-    void triggerInjectRTX();
+    // A null targetImage injects into the backend's bound RT0. An hdrCanvas stages the injection
+    // (see RtxContext::injectRTX), and finishInjectRTX must follow.
+    void triggerInjectRTX(const Rc<DxvkImage>& targetImage = nullptr, const Rc<DxvkImage>& hdrCanvas = nullptr);
 
     // rtx.deferredUiTextures support: self-contained snapshots of overlay draws captured
     // mid-scene and replayed on top of the ray-traced image once RTX injection has fired.
@@ -1965,11 +1973,16 @@ namespace dxvk {
       RECT scissorRect = {};
       uint32_t sourceRenderTargetWidth = 0;
       uint32_t sourceRenderTargetHeight = 0;
+      bool sceneLinear = false;
     };
 
     std::vector<DeferredUiDraw> m_deferredUiDraws;
     uint32_t m_deferredUiFrameVertexBytes = 0;
     bool m_replayingDeferredUiDraws = false;
+
+    // The injection target's size; scene-linear overlays replay onto it before tone mapping.
+    // Private ref: a public one would keep the device alive.
+    Com<D3D9Surface, false> m_deferredUiHdrCanvas;
 
     // one-shot log keys (pixel shader hash mixed with the defer/refuse decision) for the
     // [RTX-DeferredUI] tag diagnostics
@@ -1982,13 +1995,22 @@ namespace dxvk {
     bool captureDeferredUiDraw(const IndexContext& indexContext,
                                const VertexContext vertexContext[caps::MaxStreams],
                                const DrawContext& drawContext);
-    // pOverrideRenderTarget: bind this surface as RT0 for the replay (EndFrame fallback path,
-    // where the app's current RT0 is unrelated); nullptr replays onto the currently bound RT0
-    // (mid-frame injection path). injectionTargetImage: the image the ray-traced result was
-    // blitted to, used as the source for the scene-color refresh blit (may be null to skip).
-    void replayDeferredUiDraws(IDirect3DSurface9* pOverrideRenderTarget,
-                               const Rc<DxvkImage>& injectionTargetImage);
+    // pOverrideRenderTarget: bind this surface as RT0 for the replay (the EndFrame backbuffer, or
+    // the HDR canvas); nullptr replays onto the currently bound RT0 (mid-frame injection path).
+    // sceneSourceImage: the image the overlays composite over, used as the source for the
+    // scene-color refresh blit (may be null to skip).
+    void replayDeferredUiDraws(std::vector<DeferredUiDraw> draws,
+                               IDirect3DSurface9* pOverrideRenderTarget,
+                               const Rc<DxvkImage>& sceneSourceImage);
+    // Injects RTX into targetImage and replays the captured deferred overlays: scene-linear ones
+    // onto the HDR canvas between the two injection stages, the rest afterwards onto
+    // pDisplayOverlayTarget (the bound RT0 when null).
+    void injectRtxWithOverlays(const Rc<DxvkImage>& targetImage, IDirect3DSurface9* pDisplayOverlayTarget);
+    bool ensureDeferredUiHdrCanvas(const VkExtent3D& extent);
     Rc<DxvkImage> getCurrentRenderTargetImage() const;
+    D3D9Format getCurrentRenderTargetFormat() const;
+    // RT0 has a floating-point format: the game draws linear scene colour into it
+    bool isSceneLinearRenderTarget() const;
 
     struct DrawCallType {
       RtxGeometryStatus status;
@@ -2109,6 +2131,7 @@ namespace dxvk {
       bool ue3LogOcclusionQueries = false;
       bool deferredUiReplay = false;
       bool deferredUiRefreshSceneColor = false;
+      bool deferredUiHdrReplay = false;
       bool enableIndexBufferMemoization = false;
 
       // upstream RtxOptions (raytracedRenderTargetEnable caches

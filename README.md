@@ -22,7 +22,7 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 - Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level.
 - Sampler UVs (tiling, panning, rotation, atlas tiles, etc.) are resolved.
 - Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
-- Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed on top after RTX injection (`rtx.deferredUiTextures`).
+- Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed after RTX injection (`rtx.deferredUiTextures`). See [Deferred overlays](documentation/UE3Compatibility.md#deferred-overlays).
 - First person geometry (arms, held weapon) is detected via UE3's `SDPG_Foreground` boundary (mid-scene depth-only clear) and classified as ViewModel, overriding player-model tags (`rtx.d3d9.ue3ForegroundDpgIsViewModel`).
 - A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`, the game profile's default) reproduces the game's display transform in Remix, which includes the game's own exposure model, the per-channel highlights/shadows/midtones grade, and the per-map colour grading curves. See [Mirror's Edge tonemapper and colour curves](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves).
 

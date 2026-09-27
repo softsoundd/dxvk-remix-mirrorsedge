@@ -107,6 +107,12 @@ namespace dxvk {
     // Called on the CS thread (via RtxContext::setUe3ToneMapCapture).
     void onCapture(const Ue3ToneMapCapture& capture, uint32_t frameId);
 
+    // Factor taking Remix's linear radiance into the game's scene units (rtx.tonemap.ue3.exposureBias)
+    static float sceneUnitScale();
+
+    // Multiplies the colour of a linear HDR image in place, clamped to the float16 range
+    void dispatchSceneUnitScale(Rc<RtxContext> ctx, const Resources::Resource& color, float scale);
+
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
     void showImguiSettings();
