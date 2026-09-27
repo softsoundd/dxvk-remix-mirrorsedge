@@ -925,6 +925,13 @@ namespace dxvk {
     void OnPresent(const Rc<DxvkImage>& targetImage);
 
     /**
+      * \brief: While suspended, draws take the raster-only path and nothing is captured for ray tracing.
+      */
+    void SetSceneCaptureSuspended(bool suspended) {
+      m_sceneCaptureSuspended = suspended;
+    }
+
+    /**
       * \brief: Increments the Reflex frame ID. Should be called after presentation and only after every Reflex related marker
       * call for the current frame (this typically means other threads running in parallel will need to cache this value from the
       * frame they were dispatched on).
@@ -1001,6 +1008,7 @@ namespace dxvk {
     uint32_t m_maxBone = 0;
 
     const bool m_enableDrawCallConversion;
+    bool m_sceneCaptureSuspended = false;
     bool m_rtxInjectTriggered = false;
     bool m_forceGeometryCopy = false;
     bool m_forceIaTexcoordForOutlier = false;

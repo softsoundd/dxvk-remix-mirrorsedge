@@ -279,25 +279,14 @@ namespace dxvk {
     }
 
     // Safe from bSkipSwapchainActions as we're just getting a handle that shouldn't
-    // be invalidated. Skip focus/size ImGui traffic under Bridge (wrong thread vs Present).
+    // be invalidated
     auto& gui = windowData.swapchain->getDxvkDevice()->getCommon()->getImgui();
     if (gui.isInit()) {
-      const bool skipImguiFocusMsgs = bridgeOwnsWindowMgmt && (
-           message == WM_ACTIVATEAPP
-        || message == WM_ACTIVATE
-        || message == WM_NCACTIVATE
-        || message == WM_SETFOCUS
-        || message == WM_KILLFOCUS
-        || message == WM_SIZE
-        || message == WM_MOVE
-        || message == WM_WINDOWPOSCHANGING
-        || message == WM_WINDOWPOSCHANGED);
-      if (!skipImguiFocusMsgs)
-        gui.wndProcHandler(window, message, wParam, lParam);
+      gui.wndProcHandler(window, message, wParam, lParam);
     }
 
     if (!bSkipSwapchainActions) {
-      // Skip unless APPLICATION_CONTROLLED FSE (default off).
+      // Only application-controlled fullscreen exclusive needs these messages (see PickFullscreenMode).
       if (!present_parms.Windowed && env::isRemixBridgeActive() && RtxOptions::allowFSE()) {
         FSEState state = ProcessFullscreenExclusiveMessages(window, message, wParam, lParam);
 
@@ -493,23 +482,10 @@ namespace dxvk {
     if (hDestWindowOverride != nullptr)
       window = hDestWindowOverride;
 
-    // Skip Present while iconic. One EndFrame on the transition (not every call).
-    if (window && IsIconic(window)) {
-      D3D9DeviceLock lock = m_parent->LockDevice();
-      m_window = window;
-      if (!m_skippedPresentWhileIconic) {
-        m_skippedPresentWhileIconic = true;
-        if (!m_backBuffers.empty() && m_backBuffers[0] != nullptr) {
-          m_parent->m_rtx.EndFrame(
-            m_backBuffers[0]->GetCommonTexture()->GetImage(), false);
-          m_parent->EmitCs([](DxvkContext* ctx) {
-            ctx->getDevice()->incrementPresentCount();
-          });
-        }
-      }
+    // NV-DXVK start: minimized window handling
+    if (SkipPresentForMinimizedWindow(window))
       return D3D_OK;
-    }
-    m_skippedPresentWhileIconic = false;
+    // NV-DXVK end
 
     // NV-DXVK start: Restart RTX capture on the new frame
     m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
@@ -591,9 +567,11 @@ namespace dxvk {
       // just end up crashing (like with alt-tab loss)
       
       // NV-DXVK start: DLFG integration
-      if (!GetPresenter()->hasSwapChain())
-      // NV-DXVK end
+      if (!GetPresenter()->hasSwapChain()) {
+        AdvanceFrameIdWithoutPresent();
         return D3D_OK;
+      }
+      // NV-DXVK end
 
       PresentImage(presentInterval);
       return D3D_OK;
@@ -1232,6 +1210,11 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK start: surfaces without a swap chain
+    bool noSwapChain = false;
+    bool presented = false;
+    // NV-DXVK end
+
     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
       // NV-DXVK start: CPU frame breakdown for the built-in pass timer
       {
@@ -1242,6 +1225,14 @@ namespace dxvk {
 
       // NV-DXVK start: DLFG integration
       vk::Presenter* presenter = GetPresenter();
+      // NV-DXVK end
+
+      // NV-DXVK start: surfaces without a swap chain
+      // Recreating the swap chain for a 0x0 surface (e.g. a window being minimized) leaves none behind.
+      if (!presenter->hasSwapChain()) {
+        noSwapChain = true;
+        break;
+      }
       // NV-DXVK end
       
       // Presentation semaphores and WSI swap chain image
@@ -1264,6 +1255,11 @@ namespace dxvk {
 
         while (status != VK_SUCCESS) {
           RecreateSwapChain(m_vsync);
+
+          // NV-DXVK start: surfaces without a swap chain
+          if (!presenter->hasSwapChain())
+            break;
+          // NV-DXVK end
           
           // NV-DXVK start: DLFG integration
           info = presenter->info();
@@ -1274,6 +1270,13 @@ namespace dxvk {
             break;
         }
       }
+
+      // NV-DXVK start: surfaces without a swap chain
+      if (!presenter->hasSwapChain()) {
+        noSwapChain = true;
+        break;
+      }
+      // NV-DXVK end
 
       m_context->beginRecording(
         m_device->createCommandList());
@@ -1305,14 +1308,30 @@ namespace dxvk {
         m_context->signal(m_frameLatencySignal, m_frameId);
 
       SubmitPresent(sync, i, imageIndex);
+
+      // NV-DXVK start: surfaces without a swap chain
+      presented = true;
+      // NV-DXVK end
     }
 
-    // Rotate swap chain buffers so that the back
-    // buffer at index 0 becomes the front buffer.
-    for (uint32_t i = 1; i < m_backBuffers.size(); i++)
-      m_backBuffers[i]->Swap(m_backBuffers[i - 1].ptr());
+    // NV-DXVK start: surfaces without a swap chain
+    if (noSwapChain) {
+      // Only the loop's last present signals the frame latency fence, so this id was never signalled.
+      --m_frameId;
 
-    m_parent->m_flags.set(D3D9DeviceFlag::DirtyFramebuffer);
+      if (!presented)
+        AdvanceFrameIdWithoutPresent();
+    }
+
+    if (presented) {
+      // Rotate swap chain buffers so that the back
+      // buffer at index 0 becomes the front buffer.
+      for (uint32_t i = 1; i < m_backBuffers.size(); i++)
+        m_backBuffers[i]->Swap(m_backBuffers[i - 1].ptr());
+
+      m_parent->m_flags.set(D3D9DeviceFlag::DirtyFramebuffer);
+    }
+    // NV-DXVK end
 
     // NV-DXVK start: Reflex integration
     // Note: Sleeping here in the present function essentially makes it so when the application calls into a D3D Present function it will block for the desired amount of time Reflex indicates.
@@ -1885,7 +1904,6 @@ namespace dxvk {
   void D3D9SwapChainEx::onWindowMessageEvent(UINT message, WPARAM wParam) {
   
     // Present may not run while unfocused; EndFrame here keeps RTX state coherent.
-    // Omit SIZE_RESTORED — it races restore-time draws on the message thread.
     const bool triggerRtxEndOfFrameEvents =
       (message == WM_ACTIVATE && wParam == WA_INACTIVE) ||
       (message == WM_ACTIVATEAPP && wParam == FALSE) ||
@@ -1894,16 +1912,67 @@ namespace dxvk {
     if (!triggerRtxEndOfFrameEvents)
       return;
 
-    // Bridge delivers WndProc off the D3D thread; Present handles EndFrame on resume.
+    // Bridge delivers WndProc off the D3D thread; Present ends minimized frames itself.
     if (env::isRemixBridgeActive())
       return;
 
+    EndFrameWithoutPresent(/* advanceFrameId = */ true);
+  }
+
+  bool D3D9SwapChainEx::SkipPresentForMinimizedWindow(HWND window) {
+    // Some engines (UE3 included) keep drawing and presenting full frames while minimized, so every call
+    // still has to end a frame. Capture suspension is device-wide, so only the implicit swapchain drives it.
+    const bool isImplicitSwapchain = m_parent->m_implicitSwapchain.ptr() == this;
+
+    if (window && IsIconic(window)) {
+      D3D9DeviceLock lock = m_parent->LockDevice();
+
+      const bool entering = !m_minimized;
+
+      if (entering) {
+        m_minimized = true;
+
+        if (isImplicitSwapchain) {
+          Logger::info("D3D9SwapChainEx: Window minimized, suspending RTX scene capture");
+          m_parent->m_rtx.SetSceneCaptureSuspended(true);
+        }
+      }
+
+      // Freezing the frame id after entry keeps frame-based cache and instance lifetimes from aging while minimized.
+      EndFrameWithoutPresent(/* advanceFrameId = */ entering);
+      return true;
+    }
+
+    if (!m_minimized)
+      return false;
+
+    D3D9DeviceLock lock = m_parent->LockDevice();
+
+    m_minimized = false;
+
+    if (!isImplicitSwapchain)
+      return false;
+
+    m_parent->m_rtx.SetSceneCaptureSuspended(false);
+    Logger::info("D3D9SwapChainEx: Window restored, resuming RTX scene capture");
+
+    // This frame was drawn with capture suspended, so presenting it would flash the raster image.
+    EndFrameWithoutPresent(/* advanceFrameId = */ false);
+    return true;
+  }
+
+  void D3D9SwapChainEx::EndFrameWithoutPresent(bool advanceFrameId) {
     if (m_backBuffers.empty() || m_backBuffers[0] == nullptr)
       return;
 
-    m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage(), /*callInjectRtx=*/false);
+    m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage(), /* callInjectRtx = */ false);
 
-    // Present counter gates injectRtx; bump it even when we skip injection.
+    if (advanceFrameId)
+      AdvanceFrameIdWithoutPresent();
+  }
+
+  void D3D9SwapChainEx::AdvanceFrameIdWithoutPresent() {
+    // The present count is the frame id, and injectRTX rejects a second injection under the same id.
     m_parent->EmitCs([](DxvkContext* ctx) {
       ctx->getDevice()->incrementPresentCount();
     });

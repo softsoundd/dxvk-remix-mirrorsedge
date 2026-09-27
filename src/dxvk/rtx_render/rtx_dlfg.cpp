@@ -280,13 +280,19 @@ namespace dxvk {
     // during the next present instead of returning a stale error value.
     m_lastPresentStatus = VK_SUCCESS;
 
+    // A 0x0 surface (e.g. a minimized window) leaves no swapchain, and zero-sized backbuffers are invalid.
+    if (!hasSwapChain()) {
+      return res;
+    }
+
     createBackbuffers();
     return res;
   }
 
   vk::PresenterInfo DxvkDLFGPresenter::info() const {
     vk::PresenterInfo ret = vk::Presenter::info();
-    ret.imageCount = m_appRequestedImageCount;
+    // Backbuffers only exist alongside a swapchain.
+    ret.imageCount = hasSwapChain() ? m_appRequestedImageCount : 0;
     return ret;
   }
 

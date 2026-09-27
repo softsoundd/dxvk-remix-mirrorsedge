@@ -14636,7 +14636,7 @@ namespace dxvk {
       refreshFrameOptionCache();
     }
 
-    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion) {
+    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
@@ -14696,7 +14696,7 @@ namespace dxvk {
       refreshFrameOptionCache();
     }
 
-    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion) {
+    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 

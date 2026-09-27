@@ -695,6 +695,9 @@ namespace dxvk {
   }
 
   ImGUI::~ImGUI() {
+    // Joins the overlay thread, which feeds input into the ImGui context torn down below.
+    m_overlayWin = nullptr;
+
     g_imguiTextureMap.clear();
 
     ImGui::SetCurrentContext(m_context);
@@ -762,7 +765,9 @@ namespace dxvk {
       //  the wndproc from the original game, and sending that data across the x86 -> x64 bridge.  
       //  We see compatibilities in older applications with this approach that are tricky to resolve.
       //  Favour the new approach `useNewGuiInputMethod` when possible.
-      ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+      withInputLock([&] {
+        ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+      });
     }
   }
 
@@ -5014,38 +5019,38 @@ namespace dxvk {
     ImGui::SetCurrentContext(m_context);
     ImPlot::SetCurrentContext(m_plotContext);
 
-    // Sometimes games can change windows on us, so we need to check that here and tell ImGUI
-    if (m_gameHwnd != gameHwnd) {
-      m_gameHwnd = gameHwnd;
+    {
+      // Pairs with withInputLock(): covers the Win32 backend data and the input queue ImGui::NewFrame() drains.
+      std::lock_guard<dxvk::recursive_mutex> inputLock(m_inputMutex);
 
-      if (m_init) {
-        ImGui_ImplWin32_Shutdown();
+      // Sometimes games can change windows on us, so we need to check that here and tell ImGUI
+      if (m_gameHwnd != gameHwnd) {
+        m_gameHwnd = gameHwnd;
+
+        if (m_init) {
+          ImGui_ImplWin32_Shutdown();
+        }
+
+        ImGui_ImplWin32_Init(gameHwnd);
       }
 
-      ImGui_ImplWin32_Init(gameHwnd);
+      if (!m_init) {
+        ImGui_ImplDxvk::Init(m_device);
+
+        //execute a gpu command to upload imgui font textures
+        createFontsTexture(ctx);
+
+        m_init = true;
+      }
+
+      ImGui_ImplDxvk::NewFrame();
+      ImGui_ImplWin32_NewFrame();
+
+      ImGuiIO& io = ImGui::GetIO();
+      io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
+
+      ImGui::NewFrame();
     }
-
-    if (!m_init) {
-      ImGui_ImplDxvk::Init(m_device);
-
-      //execute a gpu command to upload imgui font textures
-      createFontsTexture(ctx);
-
-      m_init = true;
-    }
-
-    ImGui_ImplDxvk::NewFrame();
-    ImGui_ImplWin32_NewFrame(); 
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
-
-    // Ordering: DisplaySize must be set before flushing deferred overlay ImGui events.
-    if (m_overlayWin.ptr() != nullptr) {
-      m_overlayWin->flushPendingImGuiEvents();
-    }
-
-    ImGui::NewFrame();
 
     update(ctx);
 
