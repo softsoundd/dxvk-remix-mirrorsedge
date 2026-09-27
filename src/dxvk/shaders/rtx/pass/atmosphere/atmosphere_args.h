@@ -71,7 +71,7 @@ struct AtmosphereArgs {
   // Illuminance driving the light scattered by aerosol, whose spectral weights follow the aerosol's own
   // wavelength dependence rather than the Rayleigh sky's. Equal to sunIlluminance in the Manual mode.
   vec3 sunIlluminanceAerosol;
-  float pad0;
+  uint skyViewStepCount;  // Ray march steps of the sky-view LUT bake and the inline sky
 
   // Hestroffer-Magnan limb darkening exponents per channel, I(mu) = mu^alpha. 0 = uniform disc.
   vec3 sunLimbDarkeningExponent;
@@ -90,6 +90,13 @@ struct AtmosphereArgs {
   float mieForwardPeakG;       // Asymmetry of that forward lobe
   uint multiscatteringSqrtDirectionCount;  // Directions per axis of the multiscattering LUT integral
   uint multiscatteringStepCount;           // Ray march steps per direction in that integral
+
+  // Tabulated aerosol phase function (OPAC Mie / T-matrix data), sampled by miePhase() instead of the
+  // analytic lobes when enabled. The type and humidity identify the LUT's contents for the bake check.
+  uint miePhaseTabulated;
+  uint aerosolPhaseLutSize;       // Texel count of the phase LUT, parameterised by sqrt(theta / pi)
+  uint aerosolTypeId;
+  float aerosolRelativeHumidity;  // Percent
 
   // Aerial perspective froxel volume (camera frustum fitted, rebuilt every frame).
   // Note: RtxAtmosphere::kBakeInvariantArgsSize assumes every field from here on is camera dependent,

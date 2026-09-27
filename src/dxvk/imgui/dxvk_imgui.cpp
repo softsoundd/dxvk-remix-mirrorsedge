@@ -2900,6 +2900,7 @@ namespace dxvk {
       AtmosphereAerosolModel aerosolModel;
       float visibilityKm;          // Visibility aerosol model
       AtmosphereAerosolType aerosolType;
+      float relativeHumidityPercent;
       float boundaryLayerHeightKm;
       Vector3 mieScattering;       // km^-1, Manual aerosol model
       Vector3 mieAbsorption;       // km^-1, Manual aerosol model
@@ -2920,21 +2921,22 @@ namespace dxvk {
         "the sky stays deep blue and only the far skyline hazes. The hazy days below add real aerosol loads.",
         kEarthRadiusKm, 100.0f, 0.3f, kSunWhite,
         AtmosphereCoefficientMode::Manual, kEarthRayleigh, kEarthOzone, 25.0f, 15.0f,
-        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::ContinentalAverage, 1.5f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::ContinentalAverage, 80.0f, 1.5f,
         kEarthMieScattering, kEarthMieAbsorption, 0.8f },
       { "Hazy Day",
-        "An average continental day: 40 km visibility with the continental average aerosol in a 1.5 km boundary\n"
-        "layer. The horizon whitens, the sunlight warms and distant blocks haze over; the sky above stays blue.",
+        "An average continental day: 40 km visibility with the continental average aerosol at 80% humidity in a\n"
+        "1.5 km boundary layer. The horizon whitens, the sunlight warms and distant blocks haze over; the sky above\n"
+        "stays blue.",
         kEarthRadiusKm, 100.0f, 0.3f, kSunWhite,
         AtmosphereCoefficientMode::Manual, kEarthRayleigh, kEarthOzone, 25.0f, 15.0f,
-        AtmosphereAerosolModel::Visibility, 40.0f, AtmosphereAerosolType::ContinentalAverage, 1.5f,
+        AtmosphereAerosolModel::Visibility, 40.0f, AtmosphereAerosolType::ContinentalAverage, 80.0f, 1.5f,
         kEarthMieScattering, kEarthMieAbsorption, 0.8f },
       { "Polluted",
         "Urban smog trapped under a 1 km inversion: 8 km visibility with the urban aerosol, whose soot absorbs\n"
         "about a fifth of the light it intercepts, so the haze is grey and the sun dims and warms.",
         kEarthRadiusKm, 100.0f, 0.3f, kSunWhite,
         AtmosphereCoefficientMode::Manual, kEarthRayleigh, kEarthOzone, 25.0f, 15.0f,
-        AtmosphereAerosolModel::Visibility, 8.0f, AtmosphereAerosolType::Urban, 1.0f,
+        AtmosphereAerosolModel::Visibility, 8.0f, AtmosphereAerosolType::Urban, 80.0f, 1.0f,
         kEarthMieScattering, kEarthMieAbsorption, 0.8f },
       { "Mars",
         "A thin carbon dioxide atmosphere (Rayleigh scattering about 2% of Earth's) under suspended iron oxide\n"
@@ -2943,19 +2945,19 @@ namespace dxvk {
         "function, which the single asymmetry parameter cannot express.",
         3389.5f, 80.0f, 0.25f, Vector3(8.6f, 8.6f, 8.6f),
         AtmosphereCoefficientMode::Manual, Vector3(0.12e-3f, 0.29e-3f, 0.71e-3f), Vector3(0.0f, 0.0f, 0.0f), 25.0f, 15.0f,
-        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::DesertDust, 1.5f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::DesertDust, 0.0f, 1.5f,
         Vector3(0.320f, 0.304f, 0.2475f), Vector3(0.010f, 0.026f, 0.0825f), 0.7f },
       { "Alien World",
         "Fictional: an atmosphere whose molecules scatter green most strongly, under a slightly green star.",
         5000.0f, 120.0f, 0.3f, Vector3(15.0f, 22.0f, 18.0f),
         AtmosphereCoefficientMode::Manual, Vector3(4.0e-3f, 18.0e-3f, 10.0e-3f), Vector3(1.0e-3f, 0.5e-3f, 3.0e-3f), 30.0f, 20.0f,
-        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::ContinentalAverage, 1.5f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::ContinentalAverage, 80.0f, 1.5f,
         Vector3(5.0e-3f, 5.0e-3f, 5.0e-3f), Vector3(5.5e-3f, 5.5e-3f, 5.5e-3f), 0.75f },
       { "Desert Planet",
         "Fictional: a hot, arid world with a warm star and sandy dust that scatters red and absorbs blue.",
         6000.0f, 90.0f, 0.4f, Vector3(28.0f, 24.0f, 18.0f),
         AtmosphereCoefficientMode::Manual, Vector3(7.0e-3f, 11.0e-3f, 18.0e-3f), Vector3(0.5e-3f, 1.0e-3f, 0.1e-3f), 20.0f, 10.0f,
-        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::DesertDust, 1.5f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::DesertDust, 0.0f, 1.5f,
         Vector3(15.0e-3f, 12.0e-3f, 8.0e-3f), Vector3(8.0e-3f, 10.0e-3f, 16.0e-3f), 0.6f },
     };
 
@@ -2974,6 +2976,8 @@ namespace dxvk {
       RtxOptions::aerosolModelObject().setImmediately(preset.aerosolModel);
       RtxOptions::visibilityKmObject().setImmediately(preset.visibilityKm);
       RtxOptions::aerosolTypeObject().setImmediately(preset.aerosolType);
+      RtxOptions::aerosolRelativeHumidityObject().setImmediately(preset.relativeHumidityPercent);
+      RtxOptions::aerosolMiePhaseObject().setImmediately(true);
       RtxOptions::boundaryLayerHeightKmObject().setImmediately(preset.boundaryLayerHeightKm);
       RtxOptions::boundaryLayerTransitionKmObject().setImmediately(0.25f);
       RtxOptions::freeTroposphereAerosolFractionObject().setImmediately(0.15f);
@@ -3403,7 +3407,29 @@ namespace dxvk {
             RemixGui::SetTooltipToLastWidgetOnHover("Meteorological visibility at ground level. 20-30 km is a typical city day, 60 km clean continental air,\n130 km the clearest continental conditions.");
 
             atmosphereAerosolTypeCombo.getKey(&RtxOptions::aerosolTypeObject());
-            RemixGui::SetTooltipToLastWidgetOnHover("Real world aerosol mixtures: each sets how dark the haze is (single scattering albedo), how much bluer\nthan white it scatters (Angstrom exponent) and its phase asymmetry. Custom exposes those directly.");
+            RemixGui::SetTooltipToLastWidgetOnHover("Real world aerosol mixtures from the OPAC database: each sets how dark the haze is (single scattering\nalbedo), how much bluer than white it scatters and how it scatters around the sun (its phase function),\nper colour channel and humidity. Custom exposes simplified controls directly.");
+
+            if (RtxOptions::aerosolType() != AtmosphereAerosolType::Custom) {
+              ImGui::Indent();
+              RemixGui::DragFloat("Relative Humidity", &RtxOptions::aerosolRelativeHumidityObject(), 0.5f, 0.0f, 99.0f, "%.0f %%", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Humidity the haze particles sit in. Water soluble particles swell as it rises, which brightens the haze,\nwhitens its colour and pulls its scattering forward. The amount of haze still follows the visibility.");
+
+              RemixGui::Checkbox("Mie Phase Function", &RtxOptions::aerosolMiePhaseObject());
+              RemixGui::SetTooltipToLastWidgetOnHover("Scatter with the aerosol type's own phase function from Mie theory (spheroids for dust): a tight bright glow\naround the sun and a darker aureole beyond it than the analytic lobe can express.");
+
+              // What the type and humidity amount to, so the effect of the sliders can be read off.
+              {
+                const RtxAtmosphere::AerosolOptics optics = RtxAtmosphere::getAerosolOptics(RtxOptions::aerosolType(), RtxOptions::aerosolRelativeHumidity());
+                const float angstrom = (optics.extinctionRatio.x > 0.0f && optics.extinctionRatio.z > 0.0f)
+                  ? -std::log(optics.extinctionRatio.x / optics.extinctionRatio.z) / std::log(680.0f / 440.0f)
+                  : 0.0f;
+                ImGui::Text("Albedo %.3f / %.3f / %.3f, asymmetry %.2f, Angstrom %.2f",
+                  optics.singleScatteringAlbedo.x, optics.singleScatteringAlbedo.y, optics.singleScatteringAlbedo.z,
+                  optics.asymmetry.y, angstrom);
+                RemixGui::SetTooltipToLastWidgetOnHover("Single scattering albedo per channel (the fraction of intercepted light the haze scatters rather than\nabsorbs), phase asymmetry at 550 nm and the Angstrom exponent (0 = grey, 1.3 = fine haze that scatters blue).");
+              }
+              ImGui::Unindent();
+            }
 
             if (RtxOptions::aerosolType() == AtmosphereAerosolType::Custom) {
               ImGui::Indent();
@@ -3480,8 +3506,9 @@ namespace dxvk {
 
             RemixGui::DragFloat("Planet Radius", &RtxOptions::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
             RemixGui::DragFloat("Atmosphere Thickness", &RtxOptions::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
+            ImGui::Text("Analytic aerosol phase (Manual model, Custom type, or Mie Phase Function off):");
             RemixGui::DragFloat("Mie Anisotropy", &RtxOptions::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("How strongly the haze scatters light forward. 0.8 suits Earth's aerosols; approaching 1 concentrates\nnearly all of it into a tight halo around the sun. The Visibility aerosol model takes it from the aerosol\ntype unless that is Custom.");
+            RemixGui::SetTooltipToLastWidgetOnHover("How strongly the haze scatters light forward. 0.8 suits Earth's aerosols; approaching 1 concentrates\nnearly all of it into a tight halo around the sun. The Visibility aerosol model's real world types take it\nfrom the database instead.");
             RemixGui::DragFloat("Mie Phase Shape", &RtxOptions::miePhaseAlphaObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
             RemixGui::SetTooltipToLastWidgetOnHover("Shape of the haze's scattering lobe: 0 is the classic Henyey-Greenstein lobe, 1 is Cornette-Shanks,\nwhich scatters more light sideways and backwards, brightening the sky away from the sun.");
             RemixGui::DragFloat("Mie Forward Peak Weight", &RtxOptions::mieForwardPeakWeightObject(), 0.005f, 0.0f, 0.5f, "%.3f", sliderFlags);
@@ -3503,6 +3530,8 @@ namespace dxvk {
             RemixGui::DragInt("Multiscattering Directions", &RtxOptions::multiscatteringDirectionsObject(), 1.0f, 2, 32, "%d", sliderFlags);
             RemixGui::SetTooltipToLastWidgetOnHover("Quality of the sky's multiple scattering: directions per axis integrated for each lookup table entry (squared for the total).\nOnly rebuilt when the atmosphere changes, so raising it is cheap.");
             RemixGui::DragInt("Multiscattering Steps", &RtxOptions::multiscatteringStepsObject(), 1.0f, 4, 128, "%d", sliderFlags);
+            RemixGui::DragInt("Sky View Steps", &RtxOptions::skyViewStepsObject(), 1.0f, 16, 512, "%d", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Ray march steps of the sky lookup table (and of the inline sky when the table is off). 32 leaves a few percent\nof error around the sun in hazy air; 128 is converged to within 0.3%. Only rebuilt when the atmosphere changes.");
 
             ImGui::Unindent();
           }

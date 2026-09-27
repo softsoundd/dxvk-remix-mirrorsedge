@@ -745,7 +745,7 @@ void evalReflectedSegmentAerialPerspective(
 
   inScatter = evalAtmosphereRadianceSegment(
     origin, direction, args.sunDirection, args, AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut,
-    8, endDistanceKm, startDistanceKm, transmittance);
+    AtmosphereAerosolPhaseLut, 8, endDistanceKm, startDistanceKm, transmittance);
 }
 
 // Aerial perspective (paper Section 5.4): atmospheric extinction and in-scatter between the camera

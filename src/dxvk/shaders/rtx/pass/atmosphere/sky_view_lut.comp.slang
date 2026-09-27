@@ -37,6 +37,9 @@ Texture2D<float4> multiscatteringLutInput;
 layout(binding = 3, rgba16f)
 RWTexture2D<float4> skyViewLutOutput;
 
+layout(binding = 4)
+Texture2D<float4> aerosolPhaseLutInput;
+
 // Compute sky color for a given view direction
 vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
   // Camera on the local vertical at the configured altitude, matching evalSkyRadiance().
@@ -62,7 +65,8 @@ vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
     args,
     transmittanceLutInput,
     multiscatteringLutInput,
-    32  // numSamples
+    aerosolPhaseLutInput,
+    int(args.skyViewStepCount)
   );
 }
 

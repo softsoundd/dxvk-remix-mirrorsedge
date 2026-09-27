@@ -407,7 +407,7 @@ void integratePathVertex(
       skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
         ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, pathState.direction, cb.atmosphereArgs, cb.isZUp != 0)
         : evalSkyRadiance(pathState.direction, cb.atmosphereArgs,
-                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, cb.isZUp != 0);
+                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, AtmosphereAerosolPhaseLut, cb.isZUp != 0);
     }
 #endif
     else

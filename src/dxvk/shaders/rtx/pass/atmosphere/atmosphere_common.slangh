@@ -74,9 +74,9 @@ float drainePhase(float cosTheta, float g, float alpha) {
   return normalization * (1.0f + alpha * cosTheta * cosTheta) / max(denominator, kAtmosphereEpsilon);
 }
 
-// Aerosol phase function: a Draine bulk lobe, optionally blended with a narrow HG lobe for the sharp
-// forward peak (the sun's aureole) that the bulk lobe alone lacks.
-float miePhase(float cosTheta, AtmosphereArgs args) {
+// Analytic aerosol phase function: a Draine bulk lobe, optionally blended with a narrow HG lobe for the
+// sharp forward peak (the sun's aureole) that the bulk lobe alone lacks.
+float mieAnalyticPhase(float cosTheta, AtmosphereArgs args) {
   const float bulk = drainePhase(cosTheta, args.mieAnisotropy, args.miePhaseAlpha);
   if (args.mieForwardPeakWeight <= 0.0f) {
     return bulk;
@@ -84,6 +84,32 @@ float miePhase(float cosTheta, AtmosphereArgs args) {
 
   const float peak = hgPhase(cosTheta, args.mieForwardPeakG);
   return lerp(bulk, peak, saturate(args.mieForwardPeakWeight));
+}
+
+// Tabulated aerosol phase function (Mie / T-matrix data of the selected aerosol type, per channel
+// wavelength), a 1D LUT over u = sqrt(theta / pi) so the forward peak gets most of the texels. Linear
+// between texel centres and clamped beyond them, which is how the CPU normalised it.
+vec3 sampleAerosolPhaseLut(Texture2D phaseLut, float cosTheta, AtmosphereArgs args) {
+  const float theta = acos(clamp(cosTheta, -1.0f, 1.0f));
+  const float u = sqrt(theta / kPi);
+
+  const int size = int(max(args.aerosolPhaseLutSize, 1u));
+  const float coord = clamp(u * float(size) - 0.5f, 0.0f, float(size - 1));
+  const int x0 = int(coord);
+  const int x1 = min(x0 + 1, size - 1);
+  const float weight = coord - float(x0);
+
+  return max(mix(phaseLut.Load(int3(x0, 0, 0)).rgb, phaseLut.Load(int3(x1, 0, 0)).rgb, weight), vec3(0.0f));
+}
+
+// Aerosol phase function per channel wavelength: the tabulated one when the aerosol type provides it,
+// otherwise the analytic lobe.
+vec3 miePhase(float cosTheta, AtmosphereArgs args, Texture2D phaseLut) {
+  if (args.miePhaseTabulated != 0) {
+    return sampleAerosolPhaseLut(phaseLut, cosTheta, args);
+  }
+
+  return vec3(mieAnalyticPhase(cosTheta, args));
 }
 
 // Returns normalized density in [0, 1] for an altitude in km.
@@ -409,7 +435,7 @@ vec3 integrateAtmosphereStep(
   float dt,
   vec3 sunDir,
   float phaseR,
-  float phaseM,
+  vec3 phaseM,
   vec3 sunShadowing,
   vec3 skyVisibility,
   AtmosphereArgs args,
@@ -453,6 +479,7 @@ vec3 evalAtmosphereRadianceSegment(
   AtmosphereArgs args,
   Texture2D transmittanceLut,
   Texture2D multiscatteringLut,
+  Texture2D aerosolPhaseLut,
   int numSamples,
   float maxDistance,
   float startDistance,
@@ -465,7 +492,7 @@ vec3 evalAtmosphereRadianceSegment(
     return vec3(0.0f);
   }
 
-  const int actualSamples = clamp(numSamples, 1, 64);
+  const int actualSamples = clamp(numSamples, 1, 512);
   const float span = segment.t1 - segment.t0;
   const float invSamples = 1.0f / float(actualSamples);
 
@@ -474,7 +501,7 @@ vec3 evalAtmosphereRadianceSegment(
   
   const float cosTheta = dot(rayDir, sunDir);
   const float phaseR = rayleighPhase(cosTheta, args.rayleighPhaseGamma);
-  const float phaseM = miePhase(cosTheta, args);
+  const vec3 phaseM = miePhase(cosTheta, args, aerosolPhaseLut);
   
   float segmentStart = 0.0f;
   for (int i = 0; i < actualSamples; ++i) {
@@ -543,11 +570,12 @@ vec3 evalAtmosphereRadiance(
   AtmosphereArgs args,
   Texture2D transmittanceLut,
   Texture2D multiscatteringLut,
-  int numSamples = 32
+  Texture2D aerosolPhaseLut,
+  int numSamples
 ) {
   vec3 unusedTransmittance;
   return evalAtmosphereRadianceSegment(
-    rayOrigin, rayDir, sunDir, args, transmittanceLut, multiscatteringLut,
+    rayOrigin, rayDir, sunDir, args, transmittanceLut, multiscatteringLut, aerosolPhaseLut,
     numSamples, 0.0f, 0.0f, unusedTransmittance);
 }
 
@@ -612,6 +640,7 @@ vec3 evalSkyRadiance(
   AtmosphereArgs args,
   Texture2D transmittanceLut,
   Texture2D multiscatteringLut,
+  Texture2D aerosolPhaseLut,
   bool isZUp = false
 ) {
   const vec3 viewDirYUp = normalize(isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir);
@@ -620,7 +649,8 @@ vec3 evalSkyRadiance(
   const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, kPlanetRadiusOffset), 0.0f);
 
   const vec3 radiance = evalAtmosphereRadiance(
-    cameraPos, viewDirYUp, args.sunDirection, args, transmittanceLut, multiscatteringLut, 32);
+    cameraPos, viewDirYUp, args.sunDirection, args, transmittanceLut, multiscatteringLut, aerosolPhaseLut,
+    int(args.skyViewStepCount));
 
   // The sun disc is left to the caller, so paths that already sampled the sun through next event
   // estimation do not double count it.

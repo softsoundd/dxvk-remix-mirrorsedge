@@ -366,6 +366,16 @@ namespace dxvk {
     return lut.isValid() ? lut.view : nullptr;
   }
 
+  Rc<DxvkImageView> RtxContext::getAtmosphereAerosolPhaseLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getAerosolPhaseLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
   RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
     if (shouldUseDLSS() && m_common->metaDLSS().isActive()) {
       return InternalUpscaler::DLSS;
@@ -1658,6 +1668,11 @@ namespace dxvk {
 
     if (skyViewLut.isValid()) {
       bindResourceView(BINDING_ATMOSPHERE_SKY_VIEW_LUT, skyViewLut.view, nullptr);
+    }
+
+    auto aerosolPhaseLut = m_atmosphere->getAerosolPhaseLut();
+    if (aerosolPhaseLut.isValid()) {
+      bindResourceView(BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT, aerosolPhaseLut.view, nullptr);
     }
   }
 

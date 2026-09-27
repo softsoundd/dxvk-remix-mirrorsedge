@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_atmosphere.h"
+#include "rtx_atmosphere_aerosol_tables.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "rtx_options.h"
@@ -43,6 +44,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace dxvk {
   // Shader definitions for atmosphere LUT generation. The transmittance and multiscattering LUTs
@@ -78,6 +80,7 @@ namespace dxvk {
         TEXTURE2D(1)
         TEXTURE2D(2)
         RW_TEXTURE2D(3)
+        TEXTURE2D(4)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(SkyViewLutShader);
@@ -113,6 +116,7 @@ namespace dxvk {
         TEXTURE2D(2)
         RW_TEXTURE3D(3)
         TEXTURE2D(4)
+        TEXTURE2D(5)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
@@ -263,33 +267,29 @@ namespace dxvk {
         std::exp(-std::min(opticalDepth.z, 1e3f)));
     }
 
-    // OPAC style aerosol mixtures (Hess et al. 1998), approximate values at 550 nm and 80% relative
-    // humidity: single scattering albedo per channel, Angstrom exponent and phase asymmetry.
-    struct AerosolTypePreset {
-      Vector3 singleScatteringAlbedo;
-      float angstromExponent;
-      float asymmetry;
-    };
+    // The OPAC tables follow the enum order; Custom is the one type without an entry.
+    static_assert(aerosol_tables::kTypeCount == uint32_t(AtmosphereAerosolType::Custom), "aerosol tables out of step with AtmosphereAerosolType");
+    static_assert(aerosol_tables::kChannelCount == 3, "aerosol tables are per RGB channel");
 
-    AerosolTypePreset getAerosolTypePreset(AtmosphereAerosolType type) {
-      switch (type) {
-      case AtmosphereAerosolType::ContinentalClean:
-        return { Vector3(0.97f, 0.97f, 0.97f), 1.4f, 0.65f };
-      case AtmosphereAerosolType::ContinentalPolluted:
-        return { Vector3(0.89f, 0.89f, 0.89f), 1.2f, 0.70f };
-      case AtmosphereAerosolType::Urban:
-        return { Vector3(0.82f, 0.82f, 0.82f), 1.1f, 0.70f };
-      case AtmosphereAerosolType::MaritimeClean:
-        return { Vector3(0.99f, 0.99f, 0.99f), 0.4f, 0.76f };
-      case AtmosphereAerosolType::DesertDust:
-        // Iron oxides absorb toward the blue, which is what makes dust haze yellow-brown.
-        return { Vector3(0.95f, 0.91f, 0.84f), 0.2f, 0.73f };
-      case AtmosphereAerosolType::Custom:
-        return { RtxOptions::aerosolSingleScatteringAlbedo(), RtxOptions::aerosolAngstromExponent(), RtxOptions::mieAnisotropy() };
-      case AtmosphereAerosolType::ContinentalAverage:
-      default:
-        return { Vector3(0.93f, 0.93f, 0.93f), 1.3f, 0.68f };
+    // Humidity classes bracketing a relative humidity, and the blend between them.
+    void aerosolHumidityClasses(float relativeHumidityPercent, uint32_t& lower, uint32_t& upper, float& blend) {
+      using namespace aerosol_tables;
+      const float rh = std::min(std::max(relativeHumidityPercent, kHumidityPercent[0]), kHumidityPercent[kHumidityCount - 1]);
+      lower = 0;
+      while (lower + 2 < kHumidityCount && rh >= kHumidityPercent[lower + 1]) {
+        ++lower;
       }
+      upper = lower + 1;
+      blend = (rh - kHumidityPercent[lower]) / (kHumidityPercent[upper] - kHumidityPercent[lower]);
+      blend = std::min(std::max(blend, 0.0f), 1.0f);
+    }
+
+    Vector3 atmLerp(const Vector3& a, const Vector3& b, float t) {
+      return a + (b - a) * t;
+    }
+
+    Vector3 atmLoad3(const float* v) {
+      return Vector3(v[0], v[1], v[2]);
     }
 
     // Spectral derivation of the RGB coefficients and the sun colour (Bruneton 2017, Section 14.3): the
@@ -492,31 +492,31 @@ namespace dxvk {
         return;
       }
 
-      AerosolTypePreset preset = getAerosolTypePreset(RtxOptions::aerosolType());
-
-      const float lowSunBlend = RtxAtmosphere::computeAerosolLowSunBlend();
-      if (lowSunBlend > 0.0f) {
-        const Vector3 lowSunAlbedo = RtxOptions::aerosolLowSunSingleScatteringAlbedo();
-        preset.singleScatteringAlbedo = preset.singleScatteringAlbedo + (lowSunAlbedo - preset.singleScatteringAlbedo) * lowSunBlend;
-        preset.angstromExponent += (RtxOptions::aerosolLowSunAngstromExponent() - preset.angstromExponent) * lowSunBlend;
-      }
+      const AtmosphereAerosolType type = RtxOptions::aerosolType();
+      const float relativeHumidity = RtxOptions::aerosolRelativeHumidity();
+      const RtxAtmosphere::AerosolOptics optics = RtxAtmosphere::getAerosolOptics(type, relativeHumidity);
 
       // Koschmieder gives the total ground level extinction at 550 nm; the green channel stands for
-      // 550 nm, so whatever the molecules do not account for is aerosol.
+      // 550 nm, so whatever the molecules do not account for is aerosol. The type's spectral extinction
+      // spreads it over the channels' wavelengths.
       const float totalExtinction550 = kKoschmiederConstant / std::max(RtxOptions::visibilityKm(), 0.5f);
       const float aerosolExtinction550 = std::max(totalExtinction550 - args.rayleighScattering.y, 0.0f);
-
-      // Angstrom's law spreads the 550 nm value over the channels' wavelengths.
-      const Vector3 wavelengthRatio(float(kLambdaR / kLambdaG), 1.0f, float(kLambdaB / kLambdaG));
-      const Vector3 aerosolExtinction = atmPow(wavelengthRatio, -preset.angstromExponent) * aerosolExtinction550;
+      const Vector3 aerosolExtinction = optics.extinctionRatio * aerosolExtinction550;
 
       const Vector3 ssa(
-        std::min(std::max(preset.singleScatteringAlbedo.x, 0.0f), 1.0f),
-        std::min(std::max(preset.singleScatteringAlbedo.y, 0.0f), 1.0f),
-        std::min(std::max(preset.singleScatteringAlbedo.z, 0.0f), 1.0f));
+        std::min(std::max(optics.singleScatteringAlbedo.x, 0.0f), 1.0f),
+        std::min(std::max(optics.singleScatteringAlbedo.y, 0.0f), 1.0f),
+        std::min(std::max(optics.singleScatteringAlbedo.z, 0.0f), 1.0f));
       args.mieScattering = atmMul(aerosolExtinction, ssa);
       args.mieAbsorption = atmMul(aerosolExtinction, Vector3(1.0f, 1.0f, 1.0f) - ssa);
-      args.mieAnisotropy = preset.asymmetry;
+      // The analytic lobe, when it applies, uses the 550 nm asymmetry.
+      args.mieAnisotropy = optics.asymmetry.y;
+
+      if (optics.tabulated && RtxOptions::aerosolMiePhase()) {
+        args.miePhaseTabulated = 1u;
+        args.aerosolTypeId = uint32_t(type);
+        args.aerosolRelativeHumidity = relativeHumidity;
+      }
 
       args.mieBoundaryLayerHeight = RtxOptions::boundaryLayerHeightKm();
       args.mieBoundaryLayerTransition = RtxOptions::boundaryLayerTransitionKm();
@@ -619,8 +619,10 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   args.multiscatteringLutSize = kMultiscatteringLutSize;
   args.skyViewLutWidth = kSkyViewLutWidth;
   args.skyViewLutHeight = kSkyViewLutHeight;
+  args.aerosolPhaseLutSize = kAerosolPhaseLutSize;
   args.multiscatteringSqrtDirectionCount = uint32_t(std::max(RtxOptions::multiscatteringDirections(), 2));
   args.multiscatteringStepCount = uint32_t(std::max(RtxOptions::multiscatteringSteps(), 4));
+  args.skyViewStepCount = uint32_t(std::min(std::max(RtxOptions::skyViewSteps(), 16), 512));
 
   // Derived parameters
   args.atmosphereRadius = args.planetRadius + args.atmosphereThickness;
@@ -706,6 +708,43 @@ float RtxAtmosphere::computeAerosolLowSunBlend() {
   return 1.0f - atmSmoothstep(end, start, RtxOptions::sunElevation());
 }
 
+RtxAtmosphere::AerosolOptics RtxAtmosphere::getAerosolOptics(AtmosphereAerosolType type, float relativeHumidityPercent) {
+  AerosolOptics optics;
+
+  if (type == AtmosphereAerosolType::Custom) {
+    Vector3 albedo = RtxOptions::aerosolSingleScatteringAlbedo();
+    float angstrom = RtxOptions::aerosolAngstromExponent();
+
+    const float lowSunBlend = computeAerosolLowSunBlend();
+    if (lowSunBlend > 0.0f) {
+      albedo = atmLerp(albedo, RtxOptions::aerosolLowSunSingleScatteringAlbedo(), lowSunBlend);
+      angstrom += (RtxOptions::aerosolLowSunAngstromExponent() - angstrom) * lowSunBlend;
+    }
+
+    // Angstrom's law relative to 550 nm.
+    const Vector3 wavelengthRatio(float(kLambdaR / kLambdaG), 1.0f, float(kLambdaB / kLambdaG));
+    optics.singleScatteringAlbedo = albedo;
+    optics.extinctionRatio = atmPow(wavelengthRatio, -angstrom);
+    optics.asymmetry = Vector3(RtxOptions::mieAnisotropy(), RtxOptions::mieAnisotropy(), RtxOptions::mieAnisotropy());
+    return optics;
+  }
+
+  using namespace aerosol_tables;
+  const uint32_t typeIndex = std::min(uint32_t(type), kTypeCount - 1);
+  uint32_t lower, upper;
+  float blend;
+  aerosolHumidityClasses(relativeHumidityPercent, lower, upper, blend);
+  const TypeOptics& a = kOptics[typeIndex][lower];
+  const TypeOptics& b = kOptics[typeIndex][upper];
+
+  optics.singleScatteringAlbedo = atmLerp(atmLoad3(a.singleScatteringAlbedo), atmLoad3(b.singleScatteringAlbedo), blend);
+  optics.extinctionRatio = atmLerp(atmLoad3(a.extinctionRatio), atmLoad3(b.extinctionRatio), blend);
+  optics.asymmetry = atmLerp(atmLoad3(a.asymmetry), atmLoad3(b.asymmetry), blend);
+  optics.extinction550 = a.extinction550 + (b.extinction550 - a.extinction550) * blend;
+  optics.tabulated = true;
+  return optics;
+}
+
 bool RtxAtmosphere::needsLutRecompute(const AtmosphereArgs& args) const {
   if (!m_initialized || m_lutsNeedRecompute) {
     return true;
@@ -780,7 +819,89 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     1 // mipLevels
   );
 
+  // Tabulated aerosol phase function, uploaded from the CPU when its type or humidity changes.
+  VkExtent3D aerosolPhaseExtent = { kAerosolPhaseLutSize, 1, 1 };
+  m_aerosolPhaseLut = Resources::createImageResource(
+    ctx,
+    "Atmosphere Aerosol Phase LUT",
+    aerosolPhaseExtent,
+    VK_FORMAT_R32G32B32A32_SFLOAT,
+    1, // numLayers
+    VK_IMAGE_TYPE_2D,
+    VK_IMAGE_VIEW_TYPE_2D,
+    0, // imageCreateFlags
+    0, // extraUsageFlags
+    VkClearColorValue{}, // clearValue
+    1 // mipLevels
+  );
+
   // The aerial perspective volumes are sized from options, so they are created on first use.
+}
+
+void RtxAtmosphere::updateAerosolPhaseLut(Rc<DxvkContext> ctx, const AtmosphereArgs& args) {
+  if (args.miePhaseTabulated == 0 ||
+      (args.aerosolTypeId == m_aerosolPhaseLutType && args.aerosolRelativeHumidity == m_aerosolPhaseLutHumidity)) {
+    return;
+  }
+
+  using namespace aerosol_tables;
+  const uint32_t typeIndex = std::min(args.aerosolTypeId, kTypeCount - 1);
+  uint32_t lower, upper;
+  float blend;
+  aerosolHumidityClasses(args.aerosolRelativeHumidity, lower, upper, blend);
+
+  // Texel i holds p(theta) at u = (i + 0.5) / size, theta = pi u^2, so the forward peak gets most of
+  // the texels. The tables are log-linearly interpolated in angle between OPAC's samples.
+  constexpr uint32_t size = kAerosolPhaseLutSize;
+  std::vector<float> texels(size_t(size) * 4, 0.0f);
+  for (uint32_t channel = 0; channel < kChannelCount; ++channel) {
+    const float* p0 = kPhase[typeIndex][lower][channel];
+    const float* p1 = kPhase[typeIndex][upper][channel];
+
+    uint32_t segment = 0;
+    for (uint32_t i = 0; i < size; ++i) {
+      const float u = (float(i) + 0.5f) / float(size);
+      const float thetaDegrees = 180.0f * u * u;
+      while (segment + 2 < kAngleCount && thetaDegrees > kAngleDegrees[segment + 1]) {
+        ++segment;
+      }
+      const float t = std::min(std::max(
+        (thetaDegrees - kAngleDegrees[segment]) / (kAngleDegrees[segment + 1] - kAngleDegrees[segment]), 0.0f), 1.0f);
+      const float lowerValue = std::exp(std::log(p0[segment]) * (1.0f - t) + std::log(p0[segment + 1]) * t);
+      const float upperValue = std::exp(std::log(p1[segment]) * (1.0f - t) + std::log(p1[segment + 1]) * t);
+      texels[size_t(i) * 4 + channel] = lowerValue + (upperValue - lowerValue) * blend;
+    }
+
+    // Normalise the phase function as the shader reconstructs it (linear between texel centres,
+    // clamped beyond them) to a unit integral over the sphere: 2 pi Int p(theta) sin(theta) dtheta with
+    // theta = pi u^2.
+    double integral = 0.0;
+    constexpr int kSubSamples = 8;
+    const int sampleCount = int(size) * kSubSamples;
+    for (int s = 0; s < sampleCount; ++s) {
+      const double u = (double(s) + 0.5) / double(sampleCount);
+      const double coord = std::min(std::max(u * size - 0.5, 0.0), double(size - 1));
+      const uint32_t i0 = uint32_t(coord);
+      const uint32_t i1 = std::min(i0 + 1, size - 1);
+      const double f = coord - double(i0);
+      const double p = double(texels[size_t(i0) * 4 + channel]) * (1.0 - f) + double(texels[size_t(i1) * 4 + channel]) * f;
+      const double theta = kAtmPi * u * u;
+      integral += p * std::sin(theta) * (2.0 * kAtmPi * u) * (1.0 / double(sampleCount));
+    }
+    integral *= 2.0 * kAtmPi;
+
+    const float scale = integral > 0.0 ? float(1.0 / integral) : 1.0f;
+    for (uint32_t i = 0; i < size; ++i) {
+      texels[size_t(i) * 4 + channel] *= scale;
+    }
+  }
+
+  const VkImageSubresourceLayers subresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+  ctx->updateImage(m_aerosolPhaseLut.image, subresource, VkOffset3D { 0, 0, 0 }, VkExtent3D { size, 1, 1 },
+    texels.data(), size * 4 * sizeof(float), size * 4 * sizeof(float));
+
+  m_aerosolPhaseLutType = args.aerosolTypeId;
+  m_aerosolPhaseLutHumidity = args.aerosolRelativeHumidity;
 }
 
 void RtxAtmosphere::ensureAerialPerspectiveLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args) {
@@ -835,6 +956,9 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args)
   // One upload serves every pass below.
   ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+
+  // Before the bakes, which sample it.
+  updateAerosolPhaseLut(ctx, args);
 
   if (needsLutRecompute(args)) {
     m_cachedArgs = args;
@@ -910,10 +1034,12 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
   ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
   ctx->bindResourceView(3, m_skyViewLut.view, nullptr);
+  ctx->bindResourceView(4, m_aerosolPhaseLut.view, nullptr);
   
   // Track resources
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerosolPhaseLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_skyViewLut.image);
   
   // Bind shader and dispatch
@@ -1006,10 +1132,12 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(RtxContext& ctx, const Atmosphe
   ctx.bindResourceView(2, m_multiscatteringLut.view, nullptr);
   ctx.bindResourceView(3, output.view, nullptr);
   ctx.bindResourceView(4, tileDepth.view, nullptr);
+  ctx.bindResourceView(5, m_aerosolPhaseLut.view, nullptr);
 
   ctx.getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
   ctx.getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
   ctx.getCommandList()->trackResource<DxvkAccess::Read>(tileDepth.image);
+  ctx.getCommandList()->trackResource<DxvkAccess::Read>(m_aerosolPhaseLut.image);
   ctx.getCommandList()->trackResource<DxvkAccess::Write>(output.image);
 
   ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, AerialPerspectiveLutShader::getShader());

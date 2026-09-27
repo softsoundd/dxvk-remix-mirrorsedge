@@ -47,6 +47,9 @@ RWTexture3D<float4> aerialPerspectiveLutOutput;
 layout(binding = 4)
 Texture2D<float> aerialPerspectiveTileDepthInput;
 
+layout(binding = 5)
+Texture2D<float4> aerosolPhaseLutInput;
+
 [shader("compute")]
 [numthreads(4, 4, 4)]
 void main(uint3 threadId : SV_DispatchThreadID) {
@@ -86,7 +89,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     // are filtered together on lookup.
     inScatter = evalAtmosphereRadianceSegment(
       rayOrigin, rayDir, args.sunDirection, args,
-      transmittanceLutInput, multiscatteringLutInput,
+      transmittanceLutInput, multiscatteringLutInput, aerosolPhaseLutInput,
       12, endDistanceKm, startDistanceKm, transmittance);
   }
 

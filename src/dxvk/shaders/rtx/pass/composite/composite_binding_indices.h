@@ -73,6 +73,7 @@
 // Atmosphere LUTs for marching the aerial perspective of the segment a mirror (PSR) pixel reflects.
 #define COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT                    63
 #define COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT                  64
+#define COMPOSITE_ATMOSPHERE_AEROSOL_PHASE_INPUT                    65
 
 // Inputs/Outputs
 

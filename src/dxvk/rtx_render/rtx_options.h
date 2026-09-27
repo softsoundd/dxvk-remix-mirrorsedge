@@ -1542,11 +1542,23 @@ namespace dxvk {
                "typical city day, 60 km clean continental air, 130 km the clearest continental conditions.",
                args.minValue = 0.5f, args.maxValue = 400.0f);
     RTX_OPTION("rtx.atmosphere", AtmosphereAerosolType, aerosolType, AtmosphereAerosolType::ContinentalAverage,
-               "Aerosol mixture for the Visibility aerosol model, after the OPAC types of Hess et al. 1998. Sets the single "
-               "scattering albedo (how dark the haze is), the Angstrom exponent (how much bluer than white it scatters) and "
-               "the phase asymmetry. 0: Continental Clean, 1: Continental Average, 2: Continental Polluted, 3: Urban, "
-               "4: Maritime Clean, 5: Desert Dust, 6: Custom (aerosolSingleScatteringAlbedo, aerosolAngstromExponent, "
-               "mieAnisotropy).");
+               "Aerosol mixture for the Visibility aerosol model, one of the OPAC database types (Hess et al. 1998, Koepke et "
+               "al. 2015). Its single scattering albedo (how dark the haze is), spectral extinction (how much bluer than white "
+               "it scatters) and scattering phase function are tabulated per channel wavelength and relative humidity from "
+               "Mie theory, with mineral dust as spheroids. 0: Continental Clean, 1: Continental Average, 2: Continental "
+               "Polluted, 3: Urban, 4: Maritime Clean, 5: Desert Dust, 6: Custom (aerosolSingleScatteringAlbedo, "
+               "aerosolAngstromExponent, mieAnisotropy).");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolRelativeHumidity, 80.0f,
+               "Relative humidity the Visibility model's aerosol sits in, percent. Its water soluble particles swell as this "
+               "rises, which brightens the haze (less absorption per unit of extinction), whitens its colour and pulls its "
+               "scattering forward; the amount of haze still follows visibilityKm. Tabulated for OPAC's 0, 50, 70, 80, 90, "
+               "95, 98 and 99% classes and interpolated between them. Not used by the Custom type.",
+               args.minValue = 0.0f, args.maxValue = 99.0f);
+    RTX_OPTION("rtx.atmosphere", bool, aerosolMiePhase, true,
+               "Scatter the Visibility model's aerosol with its type's own phase function from the OPAC database (Mie theory, "
+               "T-matrix spheroids for mineral dust), per channel wavelength and humidity. Off falls back to the analytic "
+               "lobe of mieAnisotropy / miePhaseAlpha with the type's asymmetry. The Custom type and the Manual aerosol model "
+               "always use the analytic lobe.");
     RTX_OPTION("rtx.atmosphere", Vector3, aerosolSingleScatteringAlbedo, Vector3(0.93f, 0.93f, 0.93f),
                "Custom aerosol type: fraction of aerosol extinction that is scattering rather than absorption, per channel. "
                "Soot lowers it, and making it fall toward blue tints the haze warm like desert dust.");
@@ -1602,20 +1614,22 @@ namespace dxvk {
     // Advanced/Internal Atmosphere Parameters
     RTX_OPTION("rtx.atmosphere", float, planetRadius, 6371.0f, "Planet radius in kilometers.");
     RTX_OPTION("rtx.atmosphere", float, atmosphereThickness, 100.0f, "Atmosphere thickness in kilometers.");
+    // The analytic aerosol phase function applies to the Manual aerosol model, the Custom type and OPAC
+    // types with aerosolMiePhase off; otherwise the type's tabulated phase function is used.
     RTX_OPTION("rtx.atmosphere", float, mieAnisotropy, 0.8f,
-               "Aerosol phase asymmetry (g parameter, -1 to 1). 0.8 is the paper's default for Earth's aerosols; the "
-               "Visibility aerosol model takes it from aerosolType instead unless that is Custom.");
+               "Aerosol phase asymmetry (g parameter, -1 to 1) of the analytic phase function. 0.8 is the paper's default for "
+               "Earth's aerosols; the Visibility aerosol model's OPAC types take their asymmetry from the database instead.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, miePhaseAlpha, 1.0f,
-               "Shape of the aerosol phase function's bulk lobe (Draine 2003): 0 is Henyey-Greenstein, the paper's choice; "
-               "1 is Cornette-Shanks, whose cos^2 term restores the side and back scattering HG underestimates.",
+               "Shape of the analytic aerosol phase function's bulk lobe (Draine 2003): 0 is Henyey-Greenstein, the paper's "
+               "choice; 1 is Cornette-Shanks, whose cos^2 term restores the side and back scattering HG underestimates.",
                args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION_ARGS("rtx.atmosphere", float, mieForwardPeakWeight, 0.0f,
-               "Weight of a narrow Henyey-Greenstein forward lobe blended into the aerosol phase function for the "
+               "Weight of a narrow Henyey-Greenstein forward lobe blended into the analytic aerosol phase function for the "
                "aureole around the sun, which Cornette-Shanks alone lacks. 0.1-0.2 is realistic; the aureole is not "
                "sampled by next event estimation, so glossy surfaces may see more noise.",
                args.minValue = 0.0f, args.maxValue = 0.5f);
     RTX_OPTION_ARGS("rtx.atmosphere", float, mieForwardPeakG, 0.97f,
-               "Asymmetry of the aerosol forward lobe.",
+               "Asymmetry of the analytic aerosol forward lobe.",
                args.minValue = 0.8f, args.maxValue = 0.999f);
     RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringDirections, 8,
                "Directions per axis integrated for each multiscattering LUT entry (squared for the total). The paper "
@@ -1624,6 +1638,12 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringSteps, 20,
                "Ray march steps per direction of the multiscattering LUT integral. The paper reports 20 as sufficient.",
                args.minValue = 4, args.maxValue = 128);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, skyViewSteps, 128,
+               "Ray march steps of the sky-view LUT bake, and of the inline sky when useSkyViewLut is off. The steps are "
+               "packed toward the viewer, where the boundary layer haze is: 32 leaves a few percent of error around the "
+               "sun in hazy air, 128 is within 0.3% of a converged march. The bake only runs when the atmosphere or "
+               "sun changes.",
+               args.minValue = 16, args.maxValue = 512);
 
     // Base coefficients (can be used for non-Earth atmospheres, scaled by density sliders)
     // Note: defaults follow Table 1 of Hillaire's EGSR 2020 paper, converted from m^-1 to km^-1. The table

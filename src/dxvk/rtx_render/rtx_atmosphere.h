@@ -97,6 +97,25 @@ public:
   Resources::Resource getAerialPerspectiveLut() const { return m_aerialPerspectiveLut[m_aerialPerspectiveLutIndex]; }
 
   /**
+   * \brief Tabulated aerosol phase function, 1D over sqrt(theta / pi), RGB per channel wavelength.
+   * Filled when the tabulated phase is in use; miePhase() only samples it then.
+   */
+  Resources::Resource getAerosolPhaseLut() const { return m_aerosolPhaseLut; }
+
+  /**
+   * \brief Optics of an aerosol type of the Visibility model, per RGB channel wavelength.
+   * OPAC types come from the tables at the given relative humidity; the Custom type from its options.
+   */
+  struct AerosolOptics {
+    Vector3 singleScatteringAlbedo;
+    Vector3 extinctionRatio;  // Extinction relative to 550 nm
+    Vector3 asymmetry;        // Phase asymmetry g
+    float extinction550 = 0.0f;  // km^-1 at the database's own number density, 0 for the Custom type
+    bool tabulated = false;      // Phase function and spectral data come from the tables
+  };
+  static AerosolOptics getAerosolOptics(AtmosphereAerosolType type, float relativeHumidityPercent);
+
+  /**
    * \brief Build atmosphere parameters from current RtxOptions (no GPU state).
    *
    * The aerial perspective camera fields are left zeroed; fillAerialPerspectiveArgs supplies them
@@ -170,6 +189,7 @@ public:
 private:
   void createLutResources(Rc<DxvkContext> ctx);
   void ensureAerialPerspectiveLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
+  void updateAerosolPhaseLut(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
@@ -184,6 +204,8 @@ private:
   static constexpr uint32_t kMultiscatteringLutSize = 32;
   static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
   static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
+  // Over sqrt(theta / pi): 0.07 degree texels at the forward peak, 1.4 degrees at back-scatter.
+  static constexpr uint32_t kAerosolPhaseLutSize = 512;
 
   // Scale heights for exponential density profiles (in km)
   static constexpr float kRayleighScaleHeight = 8.0f;
@@ -205,6 +227,11 @@ private:
   VkExtent3D m_aerialPerspectiveLutExtent = { 0, 0, 0 };
   bool m_aerialPerspectiveHistoryValid = false;
   uint32_t m_aerialPerspectiveFrameIndex = 0;
+
+  Resources::Resource m_aerosolPhaseLut;
+  // Type and humidity the phase LUT currently holds; re-uploaded when they change.
+  uint32_t m_aerosolPhaseLutType = ~0u;
+  float m_aerosolPhaseLutHumidity = -1.0f;
 
   Rc<DxvkBuffer> m_constantsBuffer;
 

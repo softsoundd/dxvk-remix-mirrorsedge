@@ -131,3 +131,6 @@ Texture2D AtmosphereMultiscatteringLut;
 
 layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_LUT)
 Texture2D AtmosphereSkyViewLut;
+
+layout(binding = BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT)
+Texture2D AtmosphereAerosolPhaseLut;

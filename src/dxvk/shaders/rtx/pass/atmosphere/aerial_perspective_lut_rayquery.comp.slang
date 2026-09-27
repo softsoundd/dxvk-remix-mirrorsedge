@@ -162,7 +162,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 
     const float cosTheta = dot(rayDir, args.sunDirection);
     const float phaseR = rayleighPhase(cosTheta, args.rayleighPhaseGamma);
-    const float phaseM = miePhase(cosTheta, args);
+    const vec3 phaseM = miePhase(cosTheta, args, AtmosphereAerosolPhaseLut);
 
     // One jitter per froxel and frame, shared by its steps so the march stays monotonic.
     const float jitter = randomFloat(uint4(threadId, args.aerialPerspectiveFrameIndex));
