@@ -416,6 +416,10 @@ namespace dxvk {
     void showImguiSettings() const;
     void logStatistics() const;
 
+    // Last frame's instance bindings: how many instances requested an Opacity Micromap and how many had one bound.
+    uint32_t getNumRequestedOmmBindings() const { return m_numRequestedOMMBindings; }
+    uint32_t getNumBoundOmms() const { return m_numBoundOMMs; }
+
     static bool checkIsOpacityMicromapSupported(DxvkDevice& device);
 
     static bool calculateInstanceUsesOpacityMicromap(const RtInstance& instance);

@@ -370,6 +370,14 @@ namespace dxvk {
                     "frame's injectRTX recording once the game runs ahead of the GPU. Same model as current upstream "
                     "DXVK. Disable to fall back to the full drain.",
                     args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.d3d9", bool, discardCaptureOnlyDrawFragments, true,
+                    "Draws that are ray traced keep their original draw call only when the vertex shader has to run for "
+                    "vertex capture; nothing reads what they rasterize, since the ray-traced image replaces the scene "
+                    "render target and occlusion queries are answered conservatively. With this on those draws run with "
+                    "an empty scissor rectangle, so the vertex shader (and the capture) runs but no fragments are shaded "
+                    "or blended. Saves the fill cost of large dynamic geometry, e.g. particle sprites covering the screen "
+                    "at the output resolution.",
+                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.d3d9", bool, ue3StaticLocalMeshVertexCaptureCache, false,
                "UE3 compat: for static draws captured through an exact position source, reuse the vertex shader "
                "output captured on an earlier frame rather than preserving a new vertex-capture draw. Only exact "
@@ -588,9 +596,9 @@ namespace dxvk {
                "rtx.logReplacementResolution it is on by default. Only active when material instance hashing "
                "is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
     RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
-               "UE3 compat: log pass/vertex-factory classification decisions for draw routing. "
-               "Also emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
-               "for Particle / ParticleBeamTrail / LensFlare draws.");
+               "UE3 compat: emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
+               "for Particle / ParticleBeamTrail / LensFlare draws. The per-draw pass/vertex-factory classification "
+               "decisions are logged at debug level, so they additionally need DXVK_LOG_LEVEL=debug.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
@@ -673,6 +681,12 @@ namespace dxvk {
                "that read the scene (fade lerps, scope distortion, damage effects) then composite over the ray-traced "
                "image instead of the stale rasterized scene. The copy runs before each replayed draw, so chained "
                "effects see the previous overlay's output. Disable if a replayed overlay shows artifacts.");
+    RTX_OPTION("rtx.d3d9", bool, deferredUiHdrReplay, true,
+               "Replay deferred UI overlays the game drew into a floating-point render target (e.g. UE3 MaterialEffects, "
+               "drawn into the HDR scene colour before the game's display transform) on Remix's linear HDR image, in the "
+               "game's scene units, before tone mapping. Overlays drawn into 8-bit targets replay on the tone-mapped output "
+               "either way. When disabled, every overlay replays on the tone-mapped output, where linear overlay maths runs "
+               "on display-encoded colour: tints brighten the image and clip highlights.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
@@ -764,6 +778,11 @@ namespace dxvk {
     // rtx.d3d9.sequenceTrackedLockWaits
     bool SequenceTrackedLockWaitsEnabled() const {
       return m_frameOptions.sequenceTrackedLockWaits;
+    }
+
+    // rtx.d3d9.discardCaptureOnlyDrawFragments
+    bool DiscardCaptureOnlyDrawFragmentsEnabled() const {
+      return m_frameOptions.enableRaytracing && m_frameOptions.discardCaptureOnlyDrawFragments;
     }
 
     // True once this frame's ray tracing has been injected; later draws are UI / post work.
@@ -906,6 +925,13 @@ namespace dxvk {
     void OnPresent(const Rc<DxvkImage>& targetImage);
 
     /**
+      * \brief: While suspended, draws take the raster-only path and nothing is captured for ray tracing.
+      */
+    void SetSceneCaptureSuspended(bool suspended) {
+      m_sceneCaptureSuspended = suspended;
+    }
+
+    /**
       * \brief: Increments the Reflex frame ID. Should be called after presentation and only after every Reflex related marker
       * call for the current frame (this typically means other threads running in parallel will need to cache this value from the
       * frame they were dispatched on).
@@ -982,6 +1008,7 @@ namespace dxvk {
     uint32_t m_maxBone = 0;
 
     const bool m_enableDrawCallConversion;
+    bool m_sceneCaptureSuspended = false;
     bool m_rtxInjectTriggered = false;
     bool m_forceGeometryCopy = false;
     bool m_forceIaTexcoordForOutlier = false;
@@ -1882,7 +1909,9 @@ namespace dxvk {
 
     void flushOcclusionQueryDiagnostics();
 
-    void triggerInjectRTX();
+    // A null targetImage injects into the backend's bound RT0. An hdrCanvas stages the injection
+    // (see RtxContext::injectRTX), and finishInjectRTX must follow.
+    void triggerInjectRTX(const Rc<DxvkImage>& targetImage = nullptr, const Rc<DxvkImage>& hdrCanvas = nullptr);
 
     // rtx.deferredUiTextures support: self-contained snapshots of overlay draws captured
     // mid-scene and replayed on top of the ray-traced image once RTX injection has fired.
@@ -1952,11 +1981,16 @@ namespace dxvk {
       RECT scissorRect = {};
       uint32_t sourceRenderTargetWidth = 0;
       uint32_t sourceRenderTargetHeight = 0;
+      bool sceneLinear = false;
     };
 
     std::vector<DeferredUiDraw> m_deferredUiDraws;
     uint32_t m_deferredUiFrameVertexBytes = 0;
     bool m_replayingDeferredUiDraws = false;
+
+    // The injection target's size; scene-linear overlays replay onto it before tone mapping.
+    // Private ref: a public one would keep the device alive.
+    Com<D3D9Surface, false> m_deferredUiHdrCanvas;
 
     // one-shot log keys (pixel shader hash mixed with the defer/refuse decision) for the
     // [RTX-DeferredUI] tag diagnostics
@@ -1969,13 +2003,22 @@ namespace dxvk {
     bool captureDeferredUiDraw(const IndexContext& indexContext,
                                const VertexContext vertexContext[caps::MaxStreams],
                                const DrawContext& drawContext);
-    // pOverrideRenderTarget: bind this surface as RT0 for the replay (EndFrame fallback path,
-    // where the app's current RT0 is unrelated); nullptr replays onto the currently bound RT0
-    // (mid-frame injection path). injectionTargetImage: the image the ray-traced result was
-    // blitted to, used as the source for the scene-color refresh blit (may be null to skip).
-    void replayDeferredUiDraws(IDirect3DSurface9* pOverrideRenderTarget,
-                               const Rc<DxvkImage>& injectionTargetImage);
+    // pOverrideRenderTarget: bind this surface as RT0 for the replay (the EndFrame backbuffer, or
+    // the HDR canvas); nullptr replays onto the currently bound RT0 (mid-frame injection path).
+    // sceneSourceImage: the image the overlays composite over, used as the source for the
+    // scene-color refresh blit (may be null to skip).
+    void replayDeferredUiDraws(std::vector<DeferredUiDraw> draws,
+                               IDirect3DSurface9* pOverrideRenderTarget,
+                               const Rc<DxvkImage>& sceneSourceImage);
+    // Injects RTX into targetImage and replays the captured deferred overlays: scene-linear ones
+    // onto the HDR canvas between the two injection stages, the rest afterwards onto
+    // pDisplayOverlayTarget (the bound RT0 when null).
+    void injectRtxWithOverlays(const Rc<DxvkImage>& targetImage, IDirect3DSurface9* pDisplayOverlayTarget);
+    bool ensureDeferredUiHdrCanvas(const VkExtent3D& extent);
     Rc<DxvkImage> getCurrentRenderTargetImage() const;
+    D3D9Format getCurrentRenderTargetFormat() const;
+    // RT0 has a floating-point format: the game draws linear scene colour into it
+    bool isSceneLinearRenderTarget() const;
 
     struct DrawCallType {
       RtxGeometryStatus status;
@@ -2059,6 +2102,7 @@ namespace dxvk {
       bool conservativeOcclusionQueries = false;
       bool eventQueryCsCompletion = false;
       bool sequenceTrackedLockWaits = true;
+      bool discardCaptureOnlyDrawFragments = true;
       bool skipRenderTargetCopies = true;
       bool ue3StaticLocalMeshVertexCaptureCache = false;
       uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
@@ -2095,6 +2139,7 @@ namespace dxvk {
       bool ue3LogOcclusionQueries = false;
       bool deferredUiReplay = false;
       bool deferredUiRefreshSceneColor = false;
+      bool deferredUiHdrReplay = false;
       bool enableIndexBufferMemoization = false;
 
       // upstream RtxOptions (raytracedRenderTargetEnable caches

@@ -108,6 +108,12 @@ layout(binding = COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
 Texture3D AtmosphereAerialPerspectiveLut;
 layout(binding = COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT)
 Texture2D SkyHemisphereMean;
+layout(binding = COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT)
+Texture2D AtmosphereTransmittanceLut;
+layout(binding = COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT)
+Texture2D AtmosphereMultiscatteringLut;
+layout(binding = COMPOSITE_ATMOSPHERE_AEROSOL_PHASE_INPUT)
+Texture2D AtmosphereAerosolPhaseLut;
 
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;

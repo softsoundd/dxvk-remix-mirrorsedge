@@ -28,9 +28,11 @@
 #include "rtx_imgui.h"
 #include "rtx/pass/tonemap/tonemapping_ue3.h"
 #include "rtx/pass/tonemap/tonemapping_ue3_exposure.h"
+#include "rtx/pass/tonemap/scene_unit_scale.h"
 
 #include <rtx_shaders/tonemapping_ue3.h>
 #include <rtx_shaders/tonemapping_ue3_exposure.h>
+#include <rtx_shaders/scene_unit_scale.h>
 
 #include <algorithm>
 #include <cmath>
@@ -60,6 +62,16 @@ namespace dxvk {
       BEGIN_PARAMETER()
         RW_TEXTURE2D(TONEMAPPING_UE3_EXPOSURE_COLOR_INPUT)
         RW_TEXTURE1D(TONEMAPPING_UE3_EXPOSURE_OUTPUT)
+      END_PARAMETER()
+    };
+
+    class SceneUnitScaleShader : public ManagedShader {
+      SHADER_SOURCE(SceneUnitScaleShader, VK_SHADER_STAGE_COMPUTE_BIT, scene_unit_scale)
+
+      PUSH_CONSTANTS(SceneUnitScaleArgs)
+
+      BEGIN_PARAMETER()
+        RW_TEXTURE2D(SCENE_UNIT_SCALE_COLOR)
       END_PARAMETER()
     };
 
@@ -108,6 +120,7 @@ namespace dxvk {
 
     Ue3ToneMappingShader::getShader();
     Ue3ExposureMeterShader::getShader();
+    SceneUnitScaleShader::getShader();
   }
 
   void DxvkUe3ToneMapping::createResources(Rc<RtxContext> ctx) {
@@ -129,6 +142,25 @@ namespace dxvk {
     m_capture = capture;
     m_hasCapture = true;
     m_captureFrameId = frameId;
+  }
+
+  float DxvkUe3ToneMapping::sceneUnitScale() {
+    return exp2f(exposureBias());
+  }
+
+  void DxvkUe3ToneMapping::dispatchSceneUnitScale(Rc<RtxContext> ctx, const Resources::Resource& color, float scale) {
+    ScopedGpuProfileZone(ctx, "Scene Unit Scale");
+
+    SceneUnitScaleArgs args = {};
+    args.scale = scale;
+
+    const VkExtent3D workgroups = util::computeBlockCount(color.view->imageInfo().extent, VkExtent3D { 16, 16, 1 });
+
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->pushConstants(0, sizeof(args), &args);
+    ctx->bindResourceView(SCENE_UNIT_SCALE_COLOR, color.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SceneUnitScaleShader::getShader());
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }
 
   void DxvkUe3ToneMapping::uploadMsBsTexels(Rc<RtxContext> ctx,
@@ -216,7 +248,7 @@ namespace dxvk {
     const Resources::Resource& outputColorBuffer = rtOutput.m_finalOutput.resource(Resources::AccessType::Write);
 
     // Scene calibration: Remix radiance times this is in the game's scene units
-    const float sceneScale = exp2f(exposureBias());
+    const float sceneScale = sceneUnitScale();
     const float userBrightness = exp2f(RtxOptions::calcUserEVBias());
 
     // --- Exposure: the game's meter on Remix's radiance, or Remix's auto exposure ---

@@ -8,6 +8,7 @@
 
 #include "d3d9_rtx.h"
 #include "d3d9_device.h"
+#include "d3d9_initializer.h"
 
 #include "../util/util_fastops.h"
 #include "../util/util_math.h"
@@ -6050,7 +6051,10 @@ namespace dxvk {
     // remember the routing decision for the draw-status flap probe regardless of log level
     m_ue3LastDrawDecision = reason;
 
-    if (!m_frameOptions.ue3LogClassification && Logger::logLevel() > LogLevel::Debug)
+    // The line below is a debug-level message: when the logger would drop it, return before
+    // formatting it. This runs for every ray-traced draw, and formatting alone costs a few
+    // microseconds each, which at thousands of draws per frame is several milliseconds.
+    if (Logger::logLevel() > LogLevel::Debug)
       return;
 
     XXH64_hash_t vsHash = 0;
@@ -6284,6 +6288,7 @@ namespace dxvk {
     o.conservativeOcclusionQueries = conservativeOcclusionQueriesObject().get();
     o.eventQueryCsCompletion = eventQueryCsCompletionObject().get();
     o.sequenceTrackedLockWaits = sequenceTrackedLockWaitsObject().get();
+    o.discardCaptureOnlyDrawFragments = discardCaptureOnlyDrawFragmentsObject().get();
     o.skipRenderTargetCopies = skipRenderTargetCopiesObject().get();
     o.ue3StaticLocalMeshVertexCaptureCache = ue3StaticLocalMeshVertexCaptureCacheObject().get();
     o.ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = ue3StaticLocalMeshVertexCaptureCacheWarmupFramesObject().get();
@@ -6320,6 +6325,7 @@ namespace dxvk {
     o.ue3LogOcclusionQueries = ue3LogOcclusionQueriesObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
     o.deferredUiRefreshSceneColor = deferredUiRefreshSceneColorObject().get();
+    o.deferredUiHdrReplay = deferredUiHdrReplayObject().get();
     o.enableIndexBufferMemoization = enableIndexBufferMemoizationObject().get();
 
     o.enableRaytracing = RtxOptions::enableRaytracingObject().get();
@@ -9527,6 +9533,8 @@ namespace dxvk {
             " prims=", drawContext.PrimitiveCount,
             " ztest=", depthTestDisabled ? 0 : 1,
             " zwrite=", zWriteEnabled ? 1 : 0,
+            " target=", getCurrentRenderTargetFormat(),
+            " domain=", isSceneLinearRenderTarget() ? "sceneLinear" : "display",
             matchedDescription));
         }
 
@@ -9933,6 +9941,29 @@ namespace dxvk {
     return texInfo->GetImage();
   }
 
+  D3D9Format D3D9Rtx::getCurrentRenderTargetFormat() const {
+    if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr) {
+      return D3D9Format::Unknown;
+    }
+
+    const D3D9CommonTexture* texInfo = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    return texInfo != nullptr ? texInfo->Desc()->Format : D3D9Format::Unknown;
+  }
+
+  bool D3D9Rtx::isSceneLinearRenderTarget() const {
+    switch (getCurrentRenderTargetFormat()) {
+    case D3D9Format::R16F:
+    case D3D9Format::G16R16F:
+    case D3D9Format::A16B16G16R16F:
+    case D3D9Format::R32F:
+    case D3D9Format::G32R32F:
+    case D3D9Format::A32B32G32R32F:
+      return true;
+    default:
+      return false;
+    }
+  }
+
   // Snapshots a draw tagged via rtx.deferredUiTextures so it can be replayed on top of the
   // ray-traced image after RTX injection. The referenced vertex/index ranges are copied to CPU
   // memory (the game may re-lock its dynamic buffers between capture and replay) and the draw
@@ -10173,6 +10204,7 @@ namespace dxvk {
       draw.sourceRenderTargetWidth = rtExtent.width;
       draw.sourceRenderTargetHeight = rtExtent.height;
     }
+    draw.sceneLinear = isSceneLinearRenderTarget();
 
     m_deferredUiDraws.push_back(std::move(draw));
 
@@ -10180,19 +10212,15 @@ namespace dxvk {
     return true;
   }
 
-  // Replays the deferred UI overlay draws captured this frame on top of the ray-traced image.
-  // Called right after RTX injection is queued (mid-frame UI trigger, or the EndFrame fallback)
-  // so the overlays land between the ray-traced blit and the game's UI rasterization.
-  void D3D9Rtx::replayDeferredUiDraws(IDirect3DSurface9* pOverrideRenderTarget,
-                                      const Rc<DxvkImage>& injectionTargetImage) {
-    if (m_deferredUiDraws.empty()) {
+  // Replays captured deferred UI overlay draws on top of the ray-traced image. Called right
+  // after RTX injection is queued (at the first UI draw, or at EndFrame) so the overlays land
+  // between the ray-traced image and the game's UI rasterization.
+  void D3D9Rtx::replayDeferredUiDraws(std::vector<DeferredUiDraw> draws,
+                                      IDirect3DSurface9* pOverrideRenderTarget,
+                                      const Rc<DxvkImage>& sceneSourceImage) {
+    if (draws.empty()) {
       return;
     }
-
-    // Take ownership up front: every early-out below must drop the captured draws rather
-    // than leave them queued for a later, incorrectly ordered replay point
-    std::vector<DeferredUiDraw> draws = std::move(m_deferredUiDraws);
-    m_deferredUiDraws.clear();
 
     if (!m_frameOptions.deferredUiReplay) {
       return;
@@ -10207,25 +10235,25 @@ namespace dxvk {
     ScopedCpuProfileZone();
 
     // Refreshes the scene-color textures a replayed overlay samples with the current content
-    // of the injection target, so scene-reading overlay materials (fade lerps, scope warps,
+    // of sceneSourceImage, so scene-reading overlay materials (fade lerps, scope warps,
     // damage effects) composite over the ray-traced image instead of the stale rasterized
     // scene. Invoked before every replayed draw: an overlay's output on the target is picked
     // up by the next overlay's scene input, matching the game's own effect chaining.
     auto refreshSampledSceneTargets = [&](const DeferredUiDraw& draw) {
-      if (!m_frameOptions.deferredUiRefreshSceneColor || injectionTargetImage == nullptr) {
+      if (!m_frameOptions.deferredUiRefreshSceneColor || sceneSourceImage == nullptr) {
         return;
       }
 
       for (const auto& binding : draw.textures) {
         const Rc<DxvkImage>& sceneImage = binding.renderTargetImage;
-        if (sceneImage == nullptr || sceneImage == injectionTargetImage) {
+        if (sceneImage == nullptr || sceneImage == sceneSourceImage) {
           continue;
         }
 
         // Only refresh plausible scene-color targets (aspect ratio matching the final
         // image); small utility render targets keep their game-rendered content.
         const VkExtent3D dstExtent = sceneImage->info().extent;
-        const VkExtent3D srcExtent = injectionTargetImage->info().extent;
+        const VkExtent3D srcExtent = sceneSourceImage->info().extent;
         const double a = double(dstExtent.width) * double(srcExtent.height);
         const double b = double(dstExtent.height) * double(srcExtent.width);
         const double denom = std::max(a, b);
@@ -10233,7 +10261,7 @@ namespace dxvk {
           continue;
         }
 
-        m_parent->EmitCs([cSrcImage = injectionTargetImage, cDstImage = sceneImage](DxvkContext* ctx) {
+        m_parent->EmitCs([cSrcImage = sceneSourceImage, cDstImage = sceneImage](DxvkContext* ctx) {
           RtxContext::blitImageHelper(ctx, cSrcImage, cDstImage, VkFilter::VK_FILTER_NEAREST);
         });
       }
@@ -10439,6 +10467,89 @@ namespace dxvk {
     m_replayingDeferredUiDraws = false;
 
     ONCE(Logger::info(str::format("[RTX-DeferredUI] Replayed ", draws.size(), " deferred UI overlay draw(s) after RTX injection.")));
+  }
+
+  void D3D9Rtx::injectRtxWithOverlays(const Rc<DxvkImage>& targetImage, IDirect3DSurface9* pDisplayOverlayTarget) {
+    const bool hasSceneLinearDraws = std::any_of(m_deferredUiDraws.begin(), m_deferredUiDraws.end(),
+                                                 [](const DeferredUiDraw& draw) { return draw.sceneLinear; });
+    const bool staged = hasSceneLinearDraws && m_frameOptions.deferredUiReplay && m_frameOptions.deferredUiHdrReplay &&
+                        targetImage != nullptr && !m_parent->ShouldRecord() &&
+                        ensureDeferredUiHdrCanvas(targetImage->info().extent);
+
+    // Take the draws up front: every path must drop them rather than leave them queued for a
+    // later, incorrectly ordered replay point
+    std::vector<DeferredUiDraw> draws = std::move(m_deferredUiDraws);
+    m_deferredUiDraws.clear();
+
+    if (!staged) {
+      triggerInjectRTX(targetImage);
+      replayDeferredUiDraws(std::move(draws), pDisplayOverlayTarget, targetImage);
+      return;
+    }
+
+    // See UE3Compatibility.md, "Deferred overlays"
+    std::vector<DeferredUiDraw> sceneLinearDraws;
+    std::vector<DeferredUiDraw> displayDraws;
+    for (DeferredUiDraw& draw : draws) {
+      if (draw.sceneLinear) {
+        sceneLinearDraws.push_back(std::move(draw));
+      } else {
+        displayDraws.push_back(std::move(draw));
+      }
+    }
+
+    ONCE(Logger::info(str::format("[RTX-DeferredUI] Staging RTX injection: ", sceneLinearDraws.size(),
+                                  " scene-linear overlay draw(s) replay on the HDR image before tone mapping.")));
+
+    const Rc<DxvkImage> canvasImage = m_deferredUiHdrCanvas->GetCommonTexture()->GetImage();
+
+    triggerInjectRTX(targetImage, canvasImage);
+    replayDeferredUiDraws(std::move(sceneLinearDraws), m_deferredUiHdrCanvas.ptr(), canvasImage);
+    m_parent->EmitCs([](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->finishInjectRTX();
+    });
+    replayDeferredUiDraws(std::move(displayDraws), pDisplayOverlayTarget, targetImage);
+  }
+
+  bool D3D9Rtx::ensureDeferredUiHdrCanvas(const VkExtent3D& extent) {
+    if (m_deferredUiHdrCanvas != nullptr) {
+      const VkExtent2D canvasExtent = m_deferredUiHdrCanvas->GetSurfaceExtent();
+      if (canvasExtent.width == extent.width && canvasExtent.height == extent.height) {
+        return true;
+      }
+      m_deferredUiHdrCanvas = nullptr;
+    }
+
+    D3D9_COMMON_TEXTURE_DESC desc;
+    desc.Width              = extent.width;
+    desc.Height             = extent.height;
+    desc.Depth              = 1;
+    desc.ArraySize          = 1;
+    desc.MipLevels          = 1;
+    desc.Usage              = D3DUSAGE_RENDERTARGET;
+    desc.Format             = EnumerateFormat(D3DFMT_A16B16G16R16F);
+    desc.Pool               = D3DPOOL_DEFAULT;
+    desc.Discard            = FALSE;
+    desc.MultiSample        = D3DMULTISAMPLE_NONE;
+    desc.MultisampleQuality = 0;
+    desc.IsBackBuffer       = FALSE;
+    desc.IsAttachmentOnly   = TRUE;
+
+    if (SUCCEEDED(D3D9CommonTexture::NormalizeTextureProperties(m_parent, &desc))) {
+      try {
+        m_deferredUiHdrCanvas = new D3D9Surface(m_parent, &desc, nullptr, nullptr);
+        m_parent->m_initializer->InitTexture(m_deferredUiHdrCanvas->GetCommonTexture());
+      } catch (const DxvkError& e) {
+        Logger::err(e.message());
+        m_deferredUiHdrCanvas = nullptr;
+      }
+    }
+
+    if (m_deferredUiHdrCanvas == nullptr) {
+      ONCE(Logger::warn("[RTX-DeferredUI] Could not create the HDR overlay canvas; scene-linear overlays replay on the tone-mapped output."));
+      return false;
+    }
+    return true;
   }
 
   // Folds the per-instance VS transform constants (LocalToWorld, or the leading bone
@@ -11055,6 +11166,9 @@ namespace dxvk {
     // first use per draw (UI/deferred-UI tag checks, MIC texture-set hash, diffuse key).
     m_boundTextureSnapshotValid = false;
 
+    // Per-phase CPU attribution of this function (pass timer only)
+    RtxGpuPassTimer::CpuPhaseTimer phaseTimer(RtxGpuPassTimer::isEnabled() ? &m_parent->GetDXVKDevice()->getCommon()->metaGpuPassTimer() : nullptr);
+
     // Diagnostics: record every draw issued inside an occlusion query bracket, whichever path
     // routes it below, so its query's eventual result can be correlated with the drawn geometry.
     if (m_activeOcclusionQueries > 0 && m_frameOptions.ue3LogOcclusionQueries) {
@@ -11159,6 +11273,7 @@ namespace dxvk {
     }
 
     const auto [status, triggerRtxInjection, deferUntilInjection] = makeDrawCallType(drawContext);
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepClassify);
 
     // When raytracing is enabled we want to completely remove the ignored drawcalls from further processing as early as possible
     const PrepareDrawFlags prepareFlagsForIgnoredDraws = m_frameOptions.enableRaytracing
@@ -11187,16 +11302,12 @@ namespace dxvk {
       // Bind all resources required for this drawcall to context first (i.e. render targets)
       m_parent->PrepareDraw(drawContext.PrimitiveType);
 
-      triggerInjectRTX();
-
       m_rtxInjectTriggered = true;
 
-      // Replay deferred overlays now, before this triggering UI draw executes: the required
-      // order is ray-traced blit, then deferred overlays, then the game's genuine UI on top.
+      // Deferred overlays replay now, before this triggering UI draw executes: the required
+      // order is ray-traced image, then deferred overlays, then the game's genuine UI on top.
       // Replaying any later would put overlays above draws tagged via rtx.uiTextures.
-      if (!m_deferredUiDraws.empty()) {
-        replayDeferredUiDraws(nullptr, getCurrentRenderTargetImage());
-      }
+      injectRtxWithOverlays(getCurrentRenderTargetImage(), nullptr);
 
       return finishPrepare(PrepareDrawFlag::PreserveDrawCallAndItsState);
     }
@@ -11244,6 +11355,7 @@ namespace dxvk {
       ONCE(Logger::info("[RTX-Compatibility-Info] Skipped invalid drawcall, no vertices detected."));
       return finishPrepare(prepareFlagsForIgnoredDraws);
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepIndices);
 
     if (m_frameOptions.raytracedRenderTargetEnable) {
       // If this draw call has an RT texture bound
@@ -11277,6 +11389,7 @@ namespace dxvk {
     if (!processRenderState(drawContext)) {
       return finishPrepare(prepareFlagsForIgnoredDraws);
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepRenderState);
 
     // Max offseted index value within a buffer slice that geoData contains
     const uint32_t maxOffsetedIndex = maxIndex - minIndex;
@@ -11408,6 +11521,7 @@ namespace dxvk {
         return finishPrepare(prepareFlagsForIgnoredDraws);
       }
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepVertices);
 
     bool canUseCachedVertexCapture = false;
     XXH64_hash_t vertexCaptureCacheKey = kEmptyHash;
@@ -11494,6 +11608,7 @@ namespace dxvk {
         }
       }
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepIdentity);
 
     // Process skinning data
     m_activeDrawCallState.futureSkinningData = processSkinning(geoData);
@@ -11536,6 +11651,8 @@ namespace dxvk {
       ++m_ue3VertexCaptureCacheFrameCaptures;
       updateUe3StaticVertexCaptureCache(vertexCaptureCacheKey, geoData);
     }
+    phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepCapture);
+
     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
     m_activeDrawCallState.usesPixelShader = m_parent->UseProgrammablePS();
 
@@ -11582,13 +11699,13 @@ namespace dxvk {
       (preserveOriginalDraw ? PrepareDrawFlag::PreserveDrawCallAndItsState : 0));
   }
 
-  void D3D9Rtx::triggerInjectRTX() {
+  void D3D9Rtx::triggerInjectRTX(const Rc<DxvkImage>& targetImage, const Rc<DxvkImage>& hdrCanvas) {
     // Flush any pending game and RTX work
     m_parent->Flush();
 
     // Send command to inject RTX
-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId()](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
+    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), cTargetImage = targetImage, cHdrCanvas = hdrCanvas](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId, cTargetImage, cHdrCanvas);
     });
   }
 
@@ -14519,7 +14636,7 @@ namespace dxvk {
       refreshFrameOptionCache();
     }
 
-    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion) {
+    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
@@ -14579,7 +14696,7 @@ namespace dxvk {
       refreshFrameOptionCache();
     }
 
-    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion) {
+    if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
@@ -14629,6 +14746,9 @@ namespace dxvk {
 
     // Cache the present parameters
     m_activePresentParams = presentationParameters;
+
+    // Recreated at the new size on the next staged injection
+    m_deferredUiHdrCanvas = nullptr;
 
     // Inform the backend about potential presenter update
     m_parent->EmitCs([cWidth = m_activePresentParams->BackBufferWidth,
@@ -15115,31 +15235,28 @@ namespace dxvk {
     }
 
 
+    // Deferred overlays still pending mean no trigger draw fired this frame: inject here rather
+    // than in endFrame's fallback, so they replay onto this frame's image. Frames not presenting
+    // normally (e.g. alt-tab end-of-frame events) drop them.
+    bool injected = false;
+    if (!m_deferredUiDraws.empty() && callInjectRtx) {
+      Com<IDirect3DSurface9> backBuffer;
+      m_parent->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer);
+      if (backBuffer != nullptr) {
+        injectRtxWithOverlays(targetImage, backBuffer.ptr());
+        injected = true;
+      }
+    }
+    m_deferredUiDraws.clear();
+    m_deferredUiFrameVertexBytes = 0;
+
     // Flush any pending game and RTX work
     m_parent->Flush();
 
     // Inform backend of end-frame
-    m_parent->EmitCs([currentReflexFrameId, targetImage, callInjectRtx](DxvkContext* ctx) { 
-      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
+    m_parent->EmitCs([currentReflexFrameId, targetImage, cCallInjectRtx = callInjectRtx && !injected](DxvkContext* ctx) { 
+      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, cCallInjectRtx); 
     });
-
-    // Replay any deferred overlays that no mid-frame injection flushed. Typically this means
-    // no trigger draw fired this frame and the endFrame call above performs the fallback
-    // injection onto the backbuffer; the overlays then composite on top of that blit.
-    if (!m_deferredUiDraws.empty()) {
-      if (callInjectRtx) {
-        Com<IDirect3DSurface9> backBuffer;
-        if (SUCCEEDED(m_parent->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer != nullptr) {
-          replayDeferredUiDraws(backBuffer.ptr(), targetImage);
-        } else {
-          m_deferredUiDraws.clear();
-        }
-      } else {
-        // Not presenting normally (e.g. alt-tab end-of-frame events): drop leftovers
-        m_deferredUiDraws.clear();
-      }
-    }
-    m_deferredUiFrameVertexBytes = 0;
 
     pruneUe3StaticVertexCaptureCache();
     pruneUe3GeometryMemoCache();

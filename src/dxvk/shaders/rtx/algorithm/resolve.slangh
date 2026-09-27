@@ -133,47 +133,56 @@ void updateStateOnPortalCrossing<T:IBasePayloadState>(inout T resolveVertexState
   updateStateOnPortalCrossing(resolveVertexState.portalSpace, resolveVertexState.rayMask, rayPortalIndex, hasRayOriginatedFromViewModel);
 }
 
+// Whether the opacity lighting approximation applies to a hit.
+// Note: Only performed on particles using opacity, not just every surface using opacity. Macro-gated (unfortunately)
+// due to the dependency on the volumetric radiance cache, which only the passes that define
+// RESOLVE_OPACITY_LIGHTING_APPROXIMATION bind; Slang has no compile time lazy evaluation to make this more elegant.
+bool opacityLightingApproxApplies(uint8_t resolveMode, Surface surface)
+{
+#ifdef RESOLVE_OPACITY_LIGHTING_APPROXIMATION
+  return surface.isParticle || packedFlagGet(resolveMode, resolveModeForceOpacityLightingApprox);
+#else
+  return false;
+#endif
+}
+
+// The volume radiance cache lookup of the opacity lighting approximation. Separate from applying it so a caller can
+// issue this lookup while other memory reads of the same hit are still in flight.
+vec3 evalOpacityLightingApproxRadiance(SurfaceInteraction surfaceInteraction, vec3 shadingNormal, PortalSpace2BitsType portalSpace)
+{
+#ifdef RESOLVE_OPACITY_LIGHTING_APPROXIMATION
+  const uint froxelVolumeHint = portalSpaceToVolumeHint(portalSpace);
+
+  return evalVolumetricNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, cb.volumeArgs,
+    surfaceInteraction, shadingNormal, froxelVolumeHint);
+#else
+  return vec3(0.0f);
+#endif
+}
+
+// Applies the opacity lighting, emissive and attenuation approximations of an opaque hit from the three material
+// values they consume, given the result of opacityLightingApproxApplies and, when it applies, of
+// evalOpacityLightingApproxRadiance.
 bool evaluateOpaqueApproximations(
   uint8_t resolveMode,
-  Surface surface, SurfaceInteraction surfaceInteraction,
-  OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
-  PortalSpace2BitsType portalSpace,
+  Surface surface,
+  vec3 albedo, float opacity, vec3 hitEmissiveRadiance,
+  bool opacityLightingApprox, vec3 opacityLightingRadiance,
   // Note: Radiance attenuation split into incoming/outgoing rather than having the function accumulate into it
   // to accomodate some processes optimize around the fact that opaque approximations only result in monochromatic attenuation.
   vec3 incomingRadianceAttenuation, inout float outgoingRadianceAttenuation, inout vec3 emissiveRadiance)
 {
-  const Camera camera = cb.camera;
-  const VolumeArgs volumeArgs = cb.volumeArgs;
-  const float opacity = opaqueSurfaceMaterialInteraction.opacity;
-
   // Handle lighting approximations
-  // Note: This has to be done with macros (unfortunately) due to the dependency on the volumetric radiance cache. Slang
-  // sadly does not support the compile time lazy code evaluation to make this any more elegant as far as I know. Currently this
-  // logic is only needed by the g-buffer pass which only deals with "primary" rays, but if we needed this in the integrator for
-  // some reason (like better quality particles in rough-ish reflections not covered by PSR) we'd want to find a non-macro way
-  // to do this so that this code does not run for NEE visibility rays in the same file as that would be not useful and bad for performance.
-
-#ifdef RESOLVE_OPACITY_LIGHTING_APPROXIMATION
-  // Note: Only perform the lighting approximation on particles using opacity, not just every surface using opacity.
-  const bool opacityLightingApprox = surface.isParticle || packedFlagGet(resolveMode, resolveModeForceOpacityLightingApprox);
 
   if (opacityLightingApprox)
   {
-    const uint froxelVolumeHint = portalSpaceToVolumeHint(portalSpace);
-
-    const vec3 accumulatedOutgoingRadiance = evalVolumetricNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, volumeArgs,
-      surfaceInteraction, opaqueSurfaceMaterialInteraction.shadingNormal, froxelVolumeHint);
-
     // Note: Volume radiance cache assumes isotropic scattering (no directionality), but we want something closer to a "diffuse" distribution for
     // the surface of a particle rather than a volumetric contribution, so we multiply it by 4 here (albedo * 4 * radiance / (4 * pi) = albedo / pi).
     // Secondly, in the future this should use spherical harmonics to convert to a diffuse (or perhaps some sort of directional HG phase function to allow
     // for some contribution from behind) distribution so more directionality is respected rather than this simple multiply by 4 hack (which is not super physically correct).
     // Finally, albedo has opacity baked into it already so it does not need to be multiplied in here.
-    emissiveRadiance += opaqueSurfaceMaterialInteraction.albedo * accumulatedOutgoingRadiance * incomingRadianceAttenuation;
+    emissiveRadiance += albedo * opacityLightingRadiance * incomingRadianceAttenuation;
   }
-#else
-  const bool opacityLightingApprox = false;
-#endif
 
   // Handle typical emissive and attenuation approximations
 
@@ -188,9 +197,7 @@ bool evaluateOpaqueApproximations(
   {
     // Note: Accumulate the material's emission into the radiance approximation as this can be calculated on any hit arbitarily. This factors the
     // attenuation across the resolve iterations in before emissive (to not cause self-attenuation) similar to any other path tracing loop in the project.
-    emissiveRadiance +=
-      opaqueSurfaceMaterialInteractionEvalEmissiveRadiance(opaqueSurfaceMaterialInteraction) *
-      incomingRadianceAttenuation;
+    emissiveRadiance += hitEmissiveRadiance * incomingRadianceAttenuation;
     // Note: Accumulate opacity into the radiance approximation, actually a perfect representation of the effects of
     // opacity on visibility rays. This is done for both approximation modes as this resolve hit is being skipped in either
     // case and this attenuation should give a more proper approximation for more complex emissive blending modes.
@@ -203,6 +210,29 @@ bool evaluateOpaqueApproximations(
 
   // Note: If no approximation was handled, treat as a hit where relevant.
   return false;
+}
+
+bool evaluateOpaqueApproximations(
+  uint8_t resolveMode,
+  Surface surface, SurfaceInteraction surfaceInteraction,
+  OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
+  PortalSpace2BitsType portalSpace,
+  vec3 incomingRadianceAttenuation, inout float outgoingRadianceAttenuation, inout vec3 emissiveRadiance)
+{
+  const bool opacityLightingApprox = opacityLightingApproxApplies(resolveMode, surface);
+  vec3 opacityLightingRadiance = vec3(0.0f);
+
+  if (opacityLightingApprox)
+  {
+    opacityLightingRadiance = evalOpacityLightingApproxRadiance(surfaceInteraction, opaqueSurfaceMaterialInteraction.shadingNormal, portalSpace);
+  }
+
+  return evaluateOpaqueApproximations(
+    resolveMode, surface,
+    opaqueSurfaceMaterialInteraction.albedo, opaqueSurfaceMaterialInteraction.opacity,
+    opaqueSurfaceMaterialInteractionEvalEmissiveRadiance(opaqueSurfaceMaterialInteraction),
+    opacityLightingApprox, opacityLightingRadiance,
+    incomingRadianceAttenuation, outgoingRadianceAttenuation, emissiveRadiance);
 }
 
 bool evaluateTranslucentApproximations(
@@ -788,6 +818,67 @@ float oitDepthWeight(float hitT, float tMax)
   return exp(-cb.wboitDepthWeightTuning * z);
 }
 
+// Evaluates an opaque particle candidate of the unordered resolve through the particle path of
+// opaque_surface_material_interaction.slangh and accumulates its approximations. A pixel inside a dense particle
+// system visits many candidates, each a chain of dependent memory reads, so every texture read and the lighting lookup
+// are issued before any of them is consumed.
+// On the weighted blended path, candidates whose opacity resolves at or below cb.unorderedResolveSkipOpacityThreshold
+// are dropped: a zero-opacity hit changes neither the colour weights, the coverage nor the transmittance of the blend.
+// The binned path accumulates emission independently of opacity, so it never drops. Returns whether the candidate was
+// accumulated; a dropped candidate leaves the lookup's blue noise sequence as if it had never been looked up.
+bool resolveUnorderedOpaqueParticleCandidate(
+  uint8_t resolveMode,
+  Surface surface, SurfaceInteraction surfaceInteraction,
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial, PortalSpace2BitsType portalSpace,
+#ifdef RAY_TRACING_PRIMARY_RAY
+  inout BatchedSamplerFeedback samplerFeedback,
+#endif
+  inout float outgoingRadianceAttenuation, inout vec3 emissiveRadiance)
+{
+  const OpaqueSurfaceMaterialParticleSamples samples = opaqueSurfaceMaterialParticleSamplesRead(opaqueSurfaceMaterial, surfaceInteraction);
+
+#ifdef RAY_TRACING_PRIMARY_RAY
+  samplerFeedback.add(opaqueSurfaceMaterial.samplerFeedbackStamp, surfaceInteraction);
+#endif
+
+  const bool opacityLightingApprox = opacityLightingApproxApplies(resolveMode, surface);
+  vec3 opacityLightingRadiance = vec3(0.0f);
+
+#if defined(RESOLVE_OPACITY_LIGHTING_APPROXIMATION) && !defined(VOLUME_LIGHTING_NO_JITTER)
+  const RNG volumeSamplingRngBefore = volumeSamplingRng;
+#endif
+
+  if (opacityLightingApprox)
+  {
+    // Note: The lookup ignores the direction; the geometry normal stands in for the shading normal the full path passes.
+    opacityLightingRadiance = evalOpacityLightingApproxRadiance(surfaceInteraction, surfaceInteraction.geometryNormal, portalSpace);
+  }
+
+  vec3 albedo;
+  float opacity;
+  vec3 hitEmissiveRadiance;
+  opaqueSurfaceMaterialParticleResolve(opaqueSurfaceMaterial, surface, surfaceInteraction, samples, albedo, opacity, hitEmissiveRadiance);
+
+#ifdef UNORDERED_RESOLVE_WBOIT
+  if (cb.unorderedResolveSkipOpacityThreshold >= 0.0f && opacity <= cb.unorderedResolveSkipOpacityThreshold)
+  {
+#if defined(RESOLVE_OPACITY_LIGHTING_APPROXIMATION) && !defined(VOLUME_LIGHTING_NO_JITTER)
+    volumeSamplingRng = volumeSamplingRngBefore;
+#endif
+
+    return false;
+  }
+#endif
+
+  // Note: Return value ignored, should never return false in this path unless there is a bug. Additionally, incoming radiance attenuation
+  // set to 1.0 as attenuation will be manually added in later.
+  evaluateOpaqueApproximations(
+    resolveMode, surface, albedo, opacity, hitEmissiveRadiance, opacityLightingApprox, opacityLightingRadiance,
+    vec3(1.0f), outgoingRadianceAttenuation, emissiveRadiance);
+
+  return true;
+}
+
 void resolveVertexUnorderedParticles<
   let RAY_FLAGS : uint>(
   uint8_t resolveMode, Ray ray, uint rayMask,
@@ -801,9 +892,13 @@ void resolveVertexUnorderedParticles<
   float pathSelectionProbability,
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
   out uint numInteractions,
-  out int surfaceIndex)
+  out int surfaceIndex,
+  // Set when a decal candidate was met, or when the candidate limit stopped the traversal before every candidate
+  // was seen; clear means the deferred decal pass has nothing to do along this ray.
+  out bool decalCandidatePresent)
 {
   surfaceIndex = -1;
+  decalCandidatePresent = false;
 
   const bool separateUnorderedApproximations = packedFlagGet(resolveMode, resolveModeSeparateUnorderedApproximations);
 
@@ -849,12 +944,18 @@ void resolveVertexUnorderedParticles<
 #endif
 
 #ifdef RAY_TRACING_PRIMARY_RAY
-  const uint kMaxUnorderedResolveSteps = 128;
+  const uint kMaxUnorderedResolveSteps = cb.unorderedResolveMaxPrimaryCandidates;
 #else
-  const uint kMaxUnorderedResolveSteps = 32;
+  const uint kMaxUnorderedResolveSteps = cb.unorderedResolveMaxSecondaryCandidates;
 #endif
 
-  for (uint step = 0; step < kMaxUnorderedResolveSteps && rayQuery.Proceed(); step++)
+#ifdef RAY_TRACING_PRIMARY_RAY
+  BatchedSamplerFeedback samplerFeedback = BatchedSamplerFeedback::createEmpty();
+#endif
+
+  uint step = 0;
+
+  for (; step < kMaxUnorderedResolveSteps && rayQuery.Proceed(); step++)
   {
     RayHitInfo rayHitInfo;
     RayInteraction rayInteraction;
@@ -972,15 +1073,20 @@ void resolveVertexUnorderedParticles<
     }
 
     const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
+    // Note: Read alongside the Surface rather than after the vertex fetch so the two loads overlap.
+    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
+
+    // Decals are handled by the decal resolve; skip them before paying for the vertex fetch.
+    if (isTriangle && surfaceIsDecal(surface))
+    {
+      decalCandidatePresent = true;
+
+      continue;
+    }
 
     if (isTriangle)
     {
       surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
-    }
-
-    if (isTriangle && surfaceIsDecal(surface))
-    {
-      continue;
     }
 
     if (!evalViewDistance(cb.viewDistanceArgs, cb.isZUp, cb.camera, surfaceInteraction.position) || isSurfaceClipped(surface, surfaceInteraction))
@@ -988,7 +1094,6 @@ void resolveVertexUnorderedParticles<
       continue;
     }
 
-    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
     const uint8_t polymorphicType = rayInteraction.materialType;
 
     float currentRadianceAttenuation = 1.0f;
@@ -999,13 +1104,31 @@ void resolveVertexUnorderedParticles<
     {
       const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
-      const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+      if (opaqueSurfaceMaterialParticlePathSupported(opaqueSurfaceMaterial, surface))
+      {
+        if (!resolveUnorderedOpaqueParticleCandidate(
+              resolveMode | resolveModeForceOpacityLightingApprox,
+              surface, surfaceInteraction, opaqueSurfaceMaterial, portalSpace,
+#ifdef RAY_TRACING_PRIMARY_RAY
+              samplerFeedback,
+#endif
+              currentRadianceAttenuation, currentEmissiveRadiance))
+        {
+          continue;
+        }
+      }
+      else
+      {
+        // Displacement or eye materials: the full material interaction
+        const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
+          opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
 
-      evaluateOpaqueApproximations(
-        resolveMode | resolveModeForceOpacityLightingApprox,
-        surface, surfaceInteraction, opaqueSurfaceMaterialInteraction, portalSpace,
-        vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
+        evaluateOpaqueApproximations(
+          resolveMode | resolveModeForceOpacityLightingApprox,
+          surface, surfaceInteraction, opaqueSurfaceMaterialInteraction, portalSpace,
+          vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
+      }
+
       handledInteraction = true;
     }
     else if (polymorphicType == surfaceMaterialTypeTranslucent)
@@ -1085,6 +1208,16 @@ void resolveVertexUnorderedParticles<
 
     numInteractions += 1;
   }
+
+  // The candidate limit ended the traversal: whatever remained, decals included, was never seen.
+  if (step == kMaxUnorderedResolveSteps)
+  {
+    decalCandidatePresent = true;
+  }
+
+#ifdef RAY_TRACING_PRIMARY_RAY
+  samplerFeedback.flush();
+#endif
 
   if (numInteractions == 0)
   {
@@ -1202,12 +1335,16 @@ void resolveVertexUnordered<
   uint maxSortOrder = 0;
   // TODO[REMIX-3080] Unusued for now, will be needed for normal blending
   // f16mat3 worldToDecalTangent = f16mat3(0);
-  const uint kMaxUnorderedResolveSteps = 128;
+  const uint kMaxUnorderedResolveSteps = cb.unorderedResolveMaxPrimaryCandidates;
 #else
   float minDecalSample = -1.f;
   uint maxOpaqueSortOrder = 0;
   uint sampledSortOrder = 0;
-  const uint kMaxUnorderedResolveSteps = 32;
+  const uint kMaxUnorderedResolveSteps = cb.unorderedResolveMaxSecondaryCandidates;
+#endif
+
+#ifdef RAY_TRACING_PRIMARY_RAY
+  BatchedSamplerFeedback samplerFeedback = BatchedSamplerFeedback::createEmpty();
 #endif
 
   for (uint step=0 ; step<kMaxUnorderedResolveSteps && rayQuery.Proceed() ; step++)
@@ -1341,6 +1478,18 @@ void resolveVertexUnordered<
     }
 
     const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
+    // Note: Read alongside the Surface rather than after the vertex fetch so the two loads overlap.
+    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
+
+    // Whether this instantiation handles the candidate is known from the Surface alone, so decide
+    // before the vertex fetch and the material evaluation (the decal-only pass would otherwise
+    // evaluate every particle along the ray only to discard it).
+    const bool isDecal = isTriangle && surfaceIsDecal(surface);
+
+    if ((isDecal && !ENABLE_DECALS) || (!isDecal && !ENABLE_PARTICLES))
+    {
+      continue;
+    }
 
     if (isTriangle)
       surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
@@ -1357,8 +1506,6 @@ void resolveVertexUnordered<
 
     // Create a Surface Material and Surface Material Interaction from the Surface
 
-    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
-    
     const uint8_t polymorphicType = rayInteraction.materialType;
 
     // Handle special approximation logic for specific material types
@@ -1367,77 +1514,95 @@ void resolveVertexUnordered<
     float currentRadianceAttenuation = 1.0f;
     vec3 currentEmissiveRadiance = vec3(0.0f);
 
-    const bool isDecal = isTriangle && surfaceIsDecal(surface);
     bool handledInteraction = false;
 
     if (polymorphicType == surfaceMaterialTypeOpaque)
     {
       const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
-      const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
-
-      if (ENABLE_DECALS && isDecal)
+      if (ENABLE_PARTICLES && !isDecal && opaqueSurfaceMaterialParticlePathSupported(opaqueSurfaceMaterial, surface))
       {
-        const float opacity = opaqueSurfaceMaterialInteraction.opacity;
-        if (opacity > 0.001f && rayInteraction.frontHit)
+        if (!resolveUnorderedOpaqueParticleCandidate(
+              resolveMode | resolveModeForceOpacityLightingApprox,
+              surface, surfaceInteraction, opaqueSurfaceMaterial, portalSpace,
+#ifdef RAY_TRACING_PRIMARY_RAY
+              samplerFeedback,
+#endif
+              currentRadianceAttenuation, currentEmissiveRadiance))
         {
-          uint decalSortKey = (uint(surface.decalSortOrder) << 24) + ((rayHitInfo.geometryIndex & 0xff) << 16) + (rayHitInfo.primitiveIndex & 0xffff);
-          DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionCreate(opaqueSurfaceMaterialInteraction);
+          continue;
+        }
+
+        handledInteraction = true;
+      }
+      else
+      {
+        // Decals, and the particles the particle path does not cover, through the full material interaction
+        const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
+          opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+
+        if (ENABLE_DECALS && isDecal)
+        {
+          const float opacity = opaqueSurfaceMaterialInteraction.opacity;
+          if (opacity > 0.001f && rayInteraction.frontHit)
+          {
+            uint decalSortKey = (uint(surface.decalSortOrder) << 24) + ((rayHitInfo.geometryIndex & 0xff) << 16) + (rayHitInfo.primitiveIndex & 0xffff);
+            DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionCreate(opaqueSurfaceMaterialInteraction);
 
 #ifdef RAY_TRACING_PRIMARY_RAY
-          conditionallyStoreDecal(binnedDecals, binnedDecalSortOrder, decalMaterialInteraction, decalSortKey);
-          if (decalSortKey > maxSortOrder)
-          {
-            surfaceIndex = rayInteraction.surfaceIndex;
-            maxSortOrder = decalSortKey;
-            // TODO[REMIX-3080] Unusued for now, will be needed for normal blending
-            // Note: Ideally this should be the final surface's tangent space, but in practice any decal's tangent space should work.
-            // worldToDecalTangent = f16mat3(surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent, surfaceInteraction.geometryNormal);
-          }
+            conditionallyStoreDecal(binnedDecals, binnedDecalSortOrder, decalMaterialInteraction, decalSortKey);
+            if (decalSortKey > maxSortOrder)
+            {
+              surfaceIndex = rayInteraction.surfaceIndex;
+              maxSortOrder = decalSortKey;
+              // TODO[REMIX-3080] Unusued for now, will be needed for normal blending
+              // Note: Ideally this should be the final surface's tangent space, but in practice any decal's tangent space should work.
+              // worldToDecalTangent = f16mat3(surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent, surfaceInteraction.geometryNormal);
+            }
 #else
-          // For indirect rays, use resevoir sampling (adapted to drop decals that are less than the topmost opaque decal we've seen)
+            // For indirect rays, use resevoir sampling (adapted to drop decals that are less than the topmost opaque decal we've seen)
 
-          // Use weighted reservoir sampling (A-Res) from here: https://en.wikipedia.org/wiki/Reservoir_sampling
-          float rngValue = pow(getNextSampleBlueNoise(resolveVertexUnorderedRng), 1.f / opacity);
+            // Use weighted reservoir sampling (A-Res) from here: https://en.wikipedia.org/wiki/Reservoir_sampling
+            float rngValue = pow(getNextSampleBlueNoise(resolveVertexUnorderedRng), 1.f / opacity);
 
-          // We want to apply reservoir sampling to all decals that are not underneath a mostly opaque decal.
-          // There are three cases where we want to sample the current decal:
-          // 1) it's the first decal
-          // 2) it's opaque and above the current sample
-          // 3) it's not opaque, above the highest opaque, and it's reservoir sampling value is < the current sample.
-          if (minDecalSample < 0.f || // case 1)
-              (opacity > 0.95f && decalSortKey > sampledSortOrder) ||  // case 2)
-              (decalSortKey > maxOpaqueSortOrder && rngValue < minDecalSample))  // case 3)
-          {
-            // use this decal
-            MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteraction);
-            decalMemory = memory.packed;
-            decalEmissiveRadiance = vec3(memory.emissiveRadiance);
-            surfaceIndex = rayInteraction.surfaceIndex;
-            sampledSortOrder = decalSortKey;
-            minDecalSample = rngValue;
-          }
+            // We want to apply reservoir sampling to all decals that are not underneath a mostly opaque decal.
+            // There are three cases where we want to sample the current decal:
+            // 1) it's the first decal
+            // 2) it's opaque and above the current sample
+            // 3) it's not opaque, above the highest opaque, and it's reservoir sampling value is < the current sample.
+            if (minDecalSample < 0.f || // case 1)
+                (opacity > 0.95f && decalSortKey > sampledSortOrder) ||  // case 2)
+                (decalSortKey > maxOpaqueSortOrder && rngValue < minDecalSample))  // case 3)
+            {
+              // use this decal
+              MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteraction);
+              decalMemory = memory.packed;
+              decalEmissiveRadiance = vec3(memory.emissiveRadiance);
+              surfaceIndex = rayInteraction.surfaceIndex;
+              sampledSortOrder = decalSortKey;
+              minDecalSample = rngValue;
+            }
 
-          // Track the highest opaque decal we've encountered separately, since we want to update the highest opaque even if we don't sample this decal.
-          if (opacity > 0.95f && decalSortKey > maxOpaqueSortOrder)
-          {
-            maxOpaqueSortOrder = decalSortKey;
-          }
+            // Track the highest opaque decal we've encountered separately, since we want to update the highest opaque even if we don't sample this decal.
+            if (opacity > 0.95f && decalSortKey > maxOpaqueSortOrder)
+            {
+              maxOpaqueSortOrder = decalSortKey;
+            }
 #endif
-          decalEncountered = true;
+            decalEncountered = true;
+            handledInteraction = true;
+          }
+        }
+        else if (ENABLE_PARTICLES && !isDecal)
+        {
+          // Note: Return value ignored, should never return false in this path unless there is a bug. Additionally, incoming radiance attenuation
+          // set to 1.0 as attenuation will be manually added in later.
+          evaluateOpaqueApproximations(
+            resolveMode | resolveModeForceOpacityLightingApprox,
+            surface, surfaceInteraction, opaqueSurfaceMaterialInteraction, portalSpace,
+            vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
           handledInteraction = true;
         }
-      }
-      else if (ENABLE_PARTICLES && !isDecal)
-      {
-        // Note: Return value ignored, should never return false in this path unless there is a bug. Additionally, incoming radiance attenuation
-        // set to 1.0 as attenuation will be manually added in later.
-        evaluateOpaqueApproximations(
-          resolveMode | resolveModeForceOpacityLightingApprox,
-          surface, surfaceInteraction, opaqueSurfaceMaterialInteraction, portalSpace,
-          vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
-        handledInteraction = true;
       }
     }
     else if (ENABLE_PARTICLES && polymorphicType == surfaceMaterialTypeTranslucent)
@@ -1543,6 +1708,10 @@ void resolveVertexUnordered<
 
     numInteractions += 1;
   }
+
+#ifdef RAY_TRACING_PRIMARY_RAY
+  samplerFeedback.flush();
+#endif
 
   // Early out in the special case of nothing being hit
   // Note: This is a fairly common case since often rays travel unobstructed by particles or other intermediate objects, so having

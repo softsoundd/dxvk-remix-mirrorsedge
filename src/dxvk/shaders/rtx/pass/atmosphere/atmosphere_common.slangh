@@ -35,27 +35,81 @@
 // Constants
 static const float kAtmosphereEpsilon = 1e-3f;
 static const float kPi = 3.14159265358979323846f;
+// Minimum altitude (km) of any point a march starts from. An origin exactly on the planet sphere makes
+// the ray-sphere roots collapse to zero, and a ray leaving the surface then reads as a ground hit at
+// distance zero; the multiscattering LUT's ground row, for one, would bake to nothing. Hillaire's
+// implementation applies the same 10 m offset (PLANET_RADIUS_OFFSET).
+static const float kPlanetRadiusOffset = 0.01f;
 // Isotropic phase function p_u, used for every scattering order beyond the first (paper Section 5.5.1).
 static const float kIsotropicPhase = 1.0f / (4.0f * kPi);
-// Diffuse albedo of the virtual planet ground (paper Section 4).
-static const float kGroundAlbedo = 0.3f;
 
-// Rayleigh phase function (isotropic scattering for molecules)
-float rayleighPhase(float cosTheta) {
-  float factor = 3.0f / (16.0f * kPi);
-  return factor * (1.0f + cosTheta * cosTheta);
+// Rayleigh phase function including molecular anisotropy (Chandrasekhar 1960):
+// p = 3 / (16 pi) * ((1 + 3 gamma) + (1 - gamma) cos^2) / (1 + 2 gamma), gamma = rho / (2 - rho).
+// gamma = 0 recovers the textbook 3 / (16 pi) (1 + cos^2).
+float rayleighPhase(float cosTheta, float gamma) {
+  const float factor = 3.0f / (16.0f * kPi);
+  return factor * ((1.0f + 3.0f * gamma) + (1.0f - gamma) * cosTheta * cosTheta) / (1.0f + 2.0f * gamma);
 }
 
-// Henyey-Greenstein phase function (anisotropic scattering for aerosols)
+// Henyey-Greenstein phase function
 float hgPhase(float cosTheta, float g) {
   // Clamp g to prevent numerical issues and complete extinction at g=1.0
   // At g=1.0, the phase function becomes 0 everywhere, making Mie scattering invisible
-  g = min(g, 0.999f);
+  g = clamp(g, -0.999f, 0.999f);
   
   float g2 = g * g;
   float numerator = 1.0f - g2;
   float denominator = 4.0f * kPi * pow(1.0f + g2 - 2.0f * g * cosTheta, 1.5f);
   return numerator / max(denominator, kAtmosphereEpsilon);
+}
+
+// Draine (2003) phase function, normalised over the sphere. alpha = 0 is Henyey-Greenstein, alpha = 1 is
+// Cornette-Shanks.
+float drainePhase(float cosTheta, float g, float alpha) {
+  g = clamp(g, -0.999f, 0.999f);
+
+  const float g2 = g * g;
+  const float normalization = (1.0f - g2) / (4.0f * kPi * (1.0f + alpha * (1.0f + 2.0f * g2) / 3.0f));
+  const float denominator = pow(1.0f + g2 - 2.0f * g * cosTheta, 1.5f);
+  return normalization * (1.0f + alpha * cosTheta * cosTheta) / max(denominator, kAtmosphereEpsilon);
+}
+
+// Analytic aerosol phase function: a Draine bulk lobe, optionally blended with a narrow HG lobe for the
+// sharp forward peak (the sun's aureole) that the bulk lobe alone lacks.
+float mieAnalyticPhase(float cosTheta, AtmosphereArgs args) {
+  const float bulk = drainePhase(cosTheta, args.mieAnisotropy, args.miePhaseAlpha);
+  if (args.mieForwardPeakWeight <= 0.0f) {
+    return bulk;
+  }
+
+  const float peak = hgPhase(cosTheta, args.mieForwardPeakG);
+  return lerp(bulk, peak, saturate(args.mieForwardPeakWeight));
+}
+
+// Tabulated aerosol phase function (Mie / T-matrix data of the selected aerosol type, per channel
+// wavelength), a 1D LUT over u = sqrt(theta / pi) so the forward peak gets most of the texels. Linear
+// between texel centres and clamped beyond them, which is how the CPU normalised it.
+vec3 sampleAerosolPhaseLut(Texture2D phaseLut, float cosTheta, AtmosphereArgs args) {
+  const float theta = acos(clamp(cosTheta, -1.0f, 1.0f));
+  const float u = sqrt(theta / kPi);
+
+  const int size = int(max(args.aerosolPhaseLutSize, 1u));
+  const float coord = clamp(u * float(size) - 0.5f, 0.0f, float(size - 1));
+  const int x0 = int(coord);
+  const int x1 = min(x0 + 1, size - 1);
+  const float weight = coord - float(x0);
+
+  return max(mix(phaseLut.Load(int3(x0, 0, 0)).rgb, phaseLut.Load(int3(x1, 0, 0)).rgb, weight), vec3(0.0f));
+}
+
+// Aerosol phase function per channel wavelength: the tabulated one when the aerosol type provides it,
+// otherwise the analytic lobe.
+vec3 miePhase(float cosTheta, AtmosphereArgs args, Texture2D phaseLut) {
+  if (args.miePhaseTabulated != 0) {
+    return sampleAerosolPhaseLut(phaseLut, cosTheta, args);
+  }
+
+  return vec3(mieAnalyticPhase(cosTheta, args));
 }
 
 // Returns normalized density in [0, 1] for an altitude in km.
@@ -67,8 +121,20 @@ float rayleighDensity(float altitude, AtmosphereArgs args) {
   return exponentialDensity(altitude, args.rayleighScaleHeight);
 }
 
+// Aerosol density: the paper's exponential profile, or a well mixed boundary layer of unit density with a
+// smooth top and an exponential tail above it, as in the OPAC aerosol climatology (Hess et al. 1998).
+// atmMieDensity() in rtx_atmosphere.cpp mirrors this and must stay in step with it.
 float mieDensity(float altitude, AtmosphereArgs args) {
-  return exponentialDensity(altitude, args.mieScaleHeight);
+  if (args.mieBoundaryLayerHeight <= 0.0f) {
+    return exponentialDensity(altitude, args.mieScaleHeight);
+  }
+
+  const float aboveTop = altitude - args.mieBoundaryLayerHeight;
+  const float tail = args.mieBoundaryLayerTailScale * exponentialDensity(aboveTop, args.mieScaleHeight);
+  const float transitionWidth = max(args.mieBoundaryLayerTransition, kAtmosphereEpsilon);
+  const float t = smoothstep(-transitionWidth, transitionWidth, aboveTop);
+
+  return lerp(1.0f, tail, t);
 }
 
 // Ozone density profile (paper Section 4): a tent function of total width 2*ozoneLayerWidth centred
@@ -192,14 +258,16 @@ float textureCoordToUnitRange(float u, uint textureSize) {
 // Manual bilinear fetch with clamped addressing. The ray tracing passes have no sampler bound for
 // the atmosphere LUTs, so all LUT reads go through Load to keep the bake and runtime paths identical.
 vec3 sampleLut2DBilinearClamp(Texture2D lut, vec2 uv, int width, int height) {
-  const vec2 coord = clamp(uv, vec2(0.0f), vec2(1.0f)) * vec2(width, height) - 0.5f;
+  // Clamped before the floor so an edge sample blends with its own texel, not its neighbour.
+  const vec2 dims = vec2(width, height);
+  const vec2 coord = clamp(saturate(uv) * dims - 0.5f, vec2(0.0f), dims - 1.0f);
   const vec2 coordFloor = floor(coord);
   const vec2 filterWeight = coord - coordFloor;
 
-  const int x0 = clamp(int(coordFloor.x), 0, width - 1);
-  const int x1 = clamp(x0 + 1, 0, width - 1);
-  const int y0 = clamp(int(coordFloor.y), 0, height - 1);
-  const int y1 = clamp(y0 + 1, 0, height - 1);
+  const int x0 = int(coordFloor.x);
+  const int x1 = min(x0 + 1, width - 1);
+  const int y0 = int(coordFloor.y);
+  const int y1 = min(y0 + 1, height - 1);
 
   const vec3 t00 = lut.Load(int3(x0, y0, 0)).rgb;
   const vec3 t10 = lut.Load(int3(x1, y0, 0)).rgb;
@@ -263,12 +331,21 @@ vec3 sampleTransmittanceLut(Texture2D transmittanceLut, float altitude, float vi
 
 // Psi_ms of Equation 10: the transfer function (sr^-1) that converts a directional light's illuminance
 // into the contribution of every scattering order at or above two. Parameterized by sun zenith angle
-// cosine and altitude, per paper Section 5.5.2.
+// cosine and altitude, per paper Section 5.5.2. The altitude axis is square root mapped rather than the
+// paper's linear one: it puts a quarter of the rows in the lowest 6 km, where the aerosol layer that
+// dominates the horizon's multiple scattering would otherwise fall between two rows.
+float multiscatteringLutAltitudeToV(float altitude, AtmosphereArgs args) {
+  return sqrt(saturate(altitude / max(args.atmosphereThickness, kAtmosphereEpsilon)));
+}
+
+float multiscatteringLutVToAltitude(float v, AtmosphereArgs args) {
+  return v * v * args.atmosphereThickness;
+}
+
 vec3 sampleMultiscatteringLut(Texture2D multiscatteringLut, float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
   const float u = unitRangeToTextureCoord(
     (clamp(sunZenithCosAngle, -1.0f, 1.0f) + 1.0f) * 0.5f, args.multiscatteringLutSize);
-  const float v = unitRangeToTextureCoord(
-    saturate(altitude / max(args.atmosphereThickness, kAtmosphereEpsilon)), args.multiscatteringLutSize);
+  const float v = unitRangeToTextureCoord(multiscatteringLutAltitudeToV(altitude, args), args.multiscatteringLutSize);
 
   return max(sampleLut2DBilinearClamp(
     multiscatteringLut, vec2(u, v), int(args.multiscatteringLutSize), int(args.multiscatteringLutSize)), vec3(0.0f));
@@ -298,6 +375,97 @@ float atmosphereStepFraction(float x) {
   return pow(saturate(x), kAtmosphereStepDistributionExponent);
 }
 
+// Marchable extent of a ray through the atmosphere, in km along the ray.
+struct AtmosphereMarchSegment {
+  float t0;
+  float t1;
+  bool hitsGround;  // t1 sits on the planet surface
+};
+
+// Clips a march to the atmosphere shell, the planet and the caller's window: maxDistance limits it
+// (0 for the full column) and startDistance skips the near portion. Returns false when nothing is left.
+bool clipAtmosphereMarch(
+  vec3 rayOrigin,
+  vec3 rayDir,
+  AtmosphereArgs args,
+  float maxDistance,
+  float startDistance,
+  out AtmosphereMarchSegment segment
+) {
+  segment.t0 = 0.0f;
+  segment.t1 = 0.0f;
+  segment.hitsGround = false;
+
+  const vec3 planetCenter = getPlanetCenter(args);
+
+  float t0, t1;
+  if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
+    return false;
+  }
+
+  // Inside the shell the near root lies behind the origin.
+  if (length(rayOrigin - planetCenter) < args.atmosphereRadius) {
+    t0 = 0.0f;
+  }
+
+  float tPlanet0, tPlanet1;
+  if (intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1) && tPlanet0 > 0.0f) {
+    t1 = tPlanet0;
+    segment.hitsGround = true;
+  }
+
+  if (maxDistance > 0.0f && maxDistance < t1) {
+    t1 = maxDistance;
+    segment.hitsGround = false;
+  }
+
+  segment.t0 = max(max(0.0f, t0), startDistance);
+  segment.t1 = t1;
+
+  return segment.t1 > segment.t0;
+}
+
+// Scattering of one march step of length dt at samplePos (Equation 11), integrated analytically over
+// the step against its own extinction (Equation 17): integral of exp(-sigma_t x) S dx = S (1 - T) / sigma_t.
+// sunShadowing is S(x, l) of Equation 4 times any further visibility the caller applies, and
+// skyVisibility scales the multiple scattering, which stands for the sky light reaching the step. The
+// running transmittance to the step is left to the caller; outSampleTransmittance is the step's own.
+vec3 integrateAtmosphereStep(
+  vec3 samplePos,
+  float dt,
+  vec3 sunDir,
+  float phaseR,
+  vec3 phaseM,
+  vec3 sunShadowing,
+  vec3 skyVisibility,
+  AtmosphereArgs args,
+  Texture2D multiscatteringLut,
+  out vec3 outSampleTransmittance
+) {
+  const vec3 planetCenter = getPlanetCenter(args);
+  const float altitude = clamp(length(samplePos - planetCenter) - args.planetRadius, 0.0f, args.atmosphereThickness);
+  const AtmosphereMedium medium = sampleAtmosphereMedium(altitude, args);
+
+  // Each species scatters the sun with its own spectral weights (identical outside the Physical
+  // coefficient mode), so the illuminance is applied per term rather than to their sum.
+  const vec3 rayleighLight = args.sunIlluminance * medium.rayleighScattering;
+  const vec3 mieLight = args.sunIlluminanceAerosol * medium.mieScattering;
+
+  const vec3 singleScatter = sunShadowing * (rayleighLight * phaseR + mieLight * phaseM);
+
+  // Every higher scattering order, via the paper's Psi_ms transfer function. Equation 11 applies
+  // sigma_s and the light's illuminance exactly once each, so neither is baked into the LUT.
+  const vec3 up = normalize(samplePos - planetCenter);
+  const vec3 multiScatter = skyVisibility * sampleMultiscatteringLut(multiscatteringLut, altitude, dot(up, sunDir), args) * (rayleighLight + mieLight);
+
+  const vec3 scatteredLight = max(singleScatter + multiScatter, vec3(0.0f));
+
+  outSampleTransmittance = clamp(exp(-medium.extinction * dt), vec3(0.0f), vec3(1.0f));
+  const vec3 clampedExtinction = max(medium.extinction, vec3(1e-7f));
+
+  return (scatteredLight - scatteredLight * outSampleTransmittance) / clampedExtinction;
+}
+
 // Evaluate atmosphere radiance along a ray, including every scattering order (Equation 11).
 // The transmittance and multiscattering LUTs supply the expensive terms; see paper Sections 5.2/5.5.
 //
@@ -311,6 +479,7 @@ vec3 evalAtmosphereRadianceSegment(
   AtmosphereArgs args,
   Texture2D transmittanceLut,
   Texture2D multiscatteringLut,
+  Texture2D aerosolPhaseLut,
   int numSamples,
   float maxDistance,
   float startDistance,
@@ -318,57 +487,28 @@ vec3 evalAtmosphereRadianceSegment(
 ) {
   outTransmittance = vec3(1.0f);
 
-  const vec3 planetCenter = getPlanetCenter(args);
-  float t0, t1;
-
-  // Check if we're inside or outside the atmosphere
-  float distToCenter = length(rayOrigin - planetCenter);
-  bool insideAtmosphere = distToCenter < args.atmosphereRadius;
-  
-  // Check if ray intersects atmosphere
-  if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
-    return vec3(0.0f);  // No intersection - shouldn't happen if inside
-  }
-  
-  // If inside atmosphere, start from ray origin (t0 might be negative)
-  if (insideAtmosphere) {
-    t0 = 0.0f;  // Start from camera position
-  }
-  
-  // Check if ray intersects planet
-  float tPlanet0, tPlanet1;
-  bool hitsPlanet = intersectSphere(rayOrigin, rayDir, planetCenter, args.planetRadius, tPlanet0, tPlanet1);
-  
-  // Clamp to valid range
-  t0 = max(max(0.0f, t0), startDistance);
-  if (hitsPlanet && tPlanet0 > 0.0f) {
-    t1 = tPlanet0;  // Stop at planet surface
-  }
-  if (maxDistance > 0.0f) {
-    t1 = min(t1, maxDistance);
-  }
-  
-  if (t1 <= t0) {
+  AtmosphereMarchSegment segment;
+  if (!clipAtmosphereMarch(rayOrigin, rayDir, args, maxDistance, startDistance, segment)) {
     return vec3(0.0f);
   }
 
-  const int actualSamples = clamp(numSamples, 1, 64);
-  const float span = t1 - t0;
+  const int actualSamples = clamp(numSamples, 1, 512);
+  const float span = segment.t1 - segment.t0;
   const float invSamples = 1.0f / float(actualSamples);
 
   vec3 L = vec3(0.0f);
   vec3 transmittance = vec3(1.0f);
   
-  float cosTheta = dot(rayDir, sunDir);
-  float phaseR = rayleighPhase(cosTheta);
-  float phaseM = hgPhase(cosTheta, args.mieAnisotropy);
+  const float cosTheta = dot(rayDir, sunDir);
+  const float phaseR = rayleighPhase(cosTheta, args.rayleighPhaseGamma);
+  const vec3 phaseM = miePhase(cosTheta, args, aerosolPhaseLut);
   
   float segmentStart = 0.0f;
   for (int i = 0; i < actualSamples; ++i) {
     // Non-uniform segments: dense near the origin, coarse toward the far boundary.
     const float segmentEnd = atmosphereStepFraction(float(i + 1) * invSamples);
     const float dt = (segmentEnd - segmentStart) * span;
-    const float t = t0 + (segmentStart + (segmentEnd - segmentStart) * 0.5f) * span;
+    const float t = segment.t0 + (segmentStart + (segmentEnd - segmentStart) * 0.5f) * span;
     segmentStart = segmentEnd;
 
     if (dt <= 0.0f) {
@@ -376,35 +516,13 @@ vec3 evalAtmosphereRadianceSegment(
     }
 
     const vec3 samplePos = rayOrigin + rayDir * t;
-    const float altitude = clamp(
-      length(samplePos - planetCenter) - args.planetRadius, 0.0f, args.atmosphereThickness);
-
-    const AtmosphereMedium medium = sampleAtmosphereMedium(altitude, args);
-
-    // S(x, l) of Equation 4: atmospheric transmittance toward the sun times planet visibility.
     const vec3 sunShadowing = evalSunShadowing(samplePos, sunDir, transmittanceLut, args);
 
-    // Single scattering, the phase weighted term of Equation 11.
-    const vec3 singleScatter = sunShadowing *
-      (medium.rayleighScattering * phaseR + medium.mieScattering * phaseM);
-
-    // Every higher scattering order, via the paper's Psi_ms transfer function. Equation 11 applies
-    // sigma_s and the light's illuminance exactly once each, so neither is baked into the LUT.
-    const vec3 up = normalize(samplePos - planetCenter);
-    const vec3 multiScatter = sampleMultiscatteringLut(
-      multiscatteringLut, altitude, dot(up, sunDir), args) * medium.scattering;
-
-    vec3 scatteredLight = args.sunIlluminance * (singleScatter + multiScatter);
-    scatteredLight = max(scatteredLight, vec3(0.0f));
-
-    // Energy-conserving analytical integration (paper Section 5.6.3, Equation 17):
-    // integral of exp(-sigma_t * x) * S dx == (S - S * exp(-sigma_t * d)) / sigma_t
-    const vec3 sampleTransmittance = clamp(exp(-medium.extinction * dt), vec3(0.0f), vec3(1.0f));
-    const vec3 clampedExtinction = max(medium.extinction, vec3(1e-7f));
-    const vec3 integScatt = (scatteredLight - scatteredLight * sampleTransmittance) / clampedExtinction;
+    vec3 sampleTransmittance;
+    const vec3 contribution = transmittance * integrateAtmosphereStep(
+      samplePos, dt, sunDir, phaseR, phaseM, sunShadowing, vec3(1.0f), args, multiscatteringLut, sampleTransmittance);
 
     // Skip numerical edge cases rather than letting a NaN poison the whole ray.
-    const vec3 contribution = transmittance * integScatt;
     if (any(isnan(contribution)) || any(isinf(contribution))) {
       continue;
     }
@@ -412,7 +530,6 @@ vec3 evalAtmosphereRadianceSegment(
     L += contribution;
     transmittance *= sampleTransmittance;
     
-    // Early exit if transmittance becomes negligible
     if (all(transmittance < vec3(1e-4f))) {
       break;
     }
@@ -421,14 +538,16 @@ vec3 evalAtmosphereRadianceSegment(
   // Diffuse response of the virtual planet ground, the L_o term of Equation 1. Only for the full
   // atmospheric column: this stands in for distant terrain below the horizon when shading the sky,
   // whereas a bounded march is integrating toward real scene geometry that already supplies it.
-  if (maxDistance <= 0.0f && hitsPlanet && tPlanet0 > 0.0f) {
-    const vec3 groundPos = rayOrigin + rayDir * tPlanet0;
+  if (maxDistance <= 0.0f && segment.hitsGround) {
+    const vec3 planetCenter = getPlanetCenter(args);
+    const vec3 groundPos = rayOrigin + rayDir * segment.t1;
     const vec3 groundNormal = normalize(groundPos - planetCenter);
     const float NdotL = dot(groundNormal, sunDir);
 
     if (NdotL > 0.0f) {
+      // Direct sunlight on the ground, hence the disc's spectral weights.
       const vec3 sunShadowing = evalSunShadowing(groundPos, sunDir, transmittanceLut, args);
-      L += transmittance * args.sunIlluminance * sunShadowing * NdotL * (kGroundAlbedo / kPi);
+      L += transmittance * args.sunDiscIlluminance * sunShadowing * NdotL * (args.groundAlbedo / kPi);
     }
   }
 
@@ -451,18 +570,19 @@ vec3 evalAtmosphereRadiance(
   AtmosphereArgs args,
   Texture2D transmittanceLut,
   Texture2D multiscatteringLut,
-  int numSamples = 32
+  Texture2D aerosolPhaseLut,
+  int numSamples
 ) {
   vec3 unusedTransmittance;
   return evalAtmosphereRadianceSegment(
-    rayOrigin, rayDir, sunDir, args, transmittanceLut, multiscatteringLut,
+    rayOrigin, rayDir, sunDir, args, transmittanceLut, multiscatteringLut, aerosolPhaseLut,
     numSamples, 0.0f, 0.0f, unusedTransmittance);
 }
 
 // Transmittance from an altitude (km above the ground) to the sun, including the planet's shadow.
 // Used by the volumetrics to rescale the distant sun light with froxel height.
 vec3 getTransmittanceToSunAtAltitude(float altitudeKm, Texture2D transmittanceLut, AtmosphereArgs args) {
-  const vec3 samplePos = vec3(0.0f, max(altitudeKm, 0.0f), 0.0f);
+  const vec3 samplePos = vec3(0.0f, max(altitudeKm, kPlanetRadiusOffset), 0.0f);
   return evalSunShadowing(samplePos, args.sunDirection, transmittanceLut, args);
 }
 
@@ -494,18 +614,22 @@ vec3 evalSunDisk(vec3 viewDir, Texture2D transmittanceLut, AtmosphereArgs args, 
     return vec3(0.0f);
   }
 
-  // Limb darkening across the visible disc.
-  const float normalizedAngle = saturate(acos(clamp(cosAngle, -1.0f, 1.0f)) / max(args.sunAngularRadius, 1e-6f));
-  const float limbDarkening = max(1.0f - 0.6f * normalizedAngle * normalizedAngle, 0.0f);
+  // Limb darkening (Hestroffer and Magnan 1998): I(mu) / I(1) = mu^alpha, mu = sqrt(1 - r^2) for the
+  // normalised disc radius r. The disc mean of mu^alpha is 2 / (alpha + 2); dividing by it keeps the
+  // disc's total illuminance independent of the exponent.
+  const float normalizedRadius = saturate(acos(clamp(cosAngle, -1.0f, 1.0f)) / max(args.sunAngularRadius, 1e-6f));
+  const float mu = sqrt(max(1.0f - normalizedRadius * normalizedRadius, 0.0f));
+  const vec3 alpha = max(args.sunLimbDarkeningExponent, vec3(0.0f));
+  const vec3 limbDarkening = pow(vec3(max(mu, 1e-4f)), alpha) * (alpha + 2.0f) * 0.5f;
 
   // Looking along the view ray rather than straight up, so the disc reddens correctly near the
   // horizon and disappears once the planet occludes it.
-  const vec3 viewPos = vec3(0.0f, max(args.viewAltitude, 0.0f), 0.0f);
+  const vec3 viewPos = vec3(0.0f, max(args.viewAltitude, kPlanetRadiusOffset), 0.0f);
   const vec3 transmittance = evalSunShadowing(viewPos, viewDirYUp, transmittanceLut, args);
 
   const float solidAngle = kPi * square(max(sin(args.sunAngularRadius), 1e-6f));
 
-  const vec3 radiance = args.sunIlluminance * transmittance * limbDarkening / solidAngle;
+  const vec3 radiance = args.sunDiscIlluminance * transmittance * limbDarkening / solidAngle;
 
   return min(radiance, vec3(kMaxSunDiscRadiance));
 }
@@ -516,15 +640,17 @@ vec3 evalSkyRadiance(
   AtmosphereArgs args,
   Texture2D transmittanceLut,
   Texture2D multiscatteringLut,
+  Texture2D aerosolPhaseLut,
   bool isZUp = false
 ) {
   const vec3 viewDirYUp = normalize(isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir);
 
   // Camera on the local vertical at the configured altitude, in Y-up space.
-  const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, 0.0f), 0.0f);
+  const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, kPlanetRadiusOffset), 0.0f);
 
   const vec3 radiance = evalAtmosphereRadiance(
-    cameraPos, viewDirYUp, args.sunDirection, args, transmittanceLut, multiscatteringLut, 32);
+    cameraPos, viewDirYUp, args.sunDirection, args, transmittanceLut, multiscatteringLut, aerosolPhaseLut,
+    int(args.skyViewStepCount));
 
   // The sun disc is left to the caller, so paths that already sampled the sun through next event
   // estimation do not double count it.
@@ -569,18 +695,18 @@ vec3 sampleSkyViewLutRadiance(
   const int width = int(args.skyViewLutWidth);
   const int height = int(args.skyViewLutHeight);
 
-  // Texel (i, j) stores the value for uv = ((i + 0.5) / w, (j + 0.5) / h)
-  const vec2 coord = uv * vec2(width, height) - 0.5f;
+  // Texel (i, j) stores the value for uv = ((i + 0.5) / w, (j + 0.5) / h). Azimuth wraps around;
+  // elevation clamps at the poles, before the floor so the pole texel blends with itself.
+  vec2 coord = uv * vec2(width, height) - 0.5f;
+  coord.y = clamp(coord.y, 0.0f, float(height - 1));
   const vec2 coordFloor = floor(coord);
   const vec2 filterWeight = coord - coordFloor;
 
   int x0 = int(coordFloor.x);
-  int y0 = int(coordFloor.y);
-  // Azimuth wraps around; elevation clamps at the poles
   x0 = (x0 % width + width) % width;
   const int x1 = (x0 + 1) % width;
-  y0 = clamp(y0, 0, height - 1);
-  const int y1 = clamp(y0 + 1, 0, height - 1);
+  const int y0 = int(coordFloor.y);
+  const int y1 = min(y0 + 1, height - 1);
 
   const vec3 t00 = skyViewLut.Load(int3(x0, y0, 0)).rgb;
   const vec3 t10 = skyViewLut.Load(int3(x1, y0, 0)).rgb;
@@ -613,15 +739,17 @@ vec3 aerialPerspectiveViewRayDirection(vec2 screenUv, AtmosphereArgs args) {
   return args.cameraForward + args.cameraRight * ndc.x + args.cameraUp * ndc.y;
 }
 
-// Depth slices are distributed quadratically rather than uniformly. With 32 slices over the paper's
-// 32 km range, a linear split would put everything inside a city block into the first slice; squaring
-// gives the nearest slice tens of metres while still reaching the far end of the range.
+// Depth slices are distributed as the cube of the slice coordinate. With 32 slices over the paper's
+// 32 km, a linear split would put everything inside a city block into the first slice; the cube puts
+// slice centres at roughly 0.1, 3, 15, 40 and 90 m, resolving a room's depth as well as the skyline.
+static const float kAerialPerspectiveDepthPower = 3.0f;
+
 float aerialPerspectiveSliceToForwardDistance(float w, AtmosphereArgs args) {
-  return square(saturate(w)) * args.aerialPerspectiveDepthRange;
+  return pow(saturate(w), kAerialPerspectiveDepthPower) * args.aerialPerspectiveDepthRange;
 }
 
 float aerialPerspectiveForwardDistanceToSlice(float forwardDistance, AtmosphereArgs args) {
-  return saturate(sqrt(max(forwardDistance, 0.0f) / max(args.aerialPerspectiveDepthRange, 1e-6f)));
+  return saturate(pow(max(forwardDistance, 0.0f) / max(args.aerialPerspectiveDepthRange, 1e-6f), 1.0f / kAerialPerspectiveDepthPower));
 }
 
 vec3 aerialPerspectiveUvwToWorldPosition(vec3 uvw, AtmosphereArgs args) {
@@ -641,19 +769,65 @@ vec3 aerialPerspectiveScreenUvToUvw(vec2 screenUv, float viewRayDistance, Atmosp
   return vec3(screenUv, aerialPerspectiveForwardDistanceToSlice(forwardDistance, args));
 }
 
+// Camera altitude in the Y-up atmosphere frame for the per-frame volume, i.e. the ray origin the aerial
+// perspective march starts from.
+vec3 aerialPerspectiveRayOrigin(AtmosphereArgs args) {
+  return vec3(0.0f, max(args.aerialPerspectiveViewAltitude, kPlanetRadiusOffset), 0.0f);
+}
+
+// Parameters for an aerial perspective march: the aerosol scaled by the stylisation knob. Only the
+// medium the march samples changes; the transmittance and multiscattering LUTs it reads stay those of
+// the unscaled sky, so the sun's shadowing is untouched.
+AtmosphereArgs aerialPerspectiveMediumArgs(AtmosphereArgs args) {
+  const float scale = max(args.aerialPerspectiveAerosolScale, 0.0f);
+  args.mieScattering *= scale;
+  args.mieAbsorption *= scale;
+  return args;
+}
+
+// Length along a froxel ray beyond which no pixel of its screen tile can see, from the tile's farthest
+// primary hit (a forward distance). Integrating no further keeps air behind a wall that fills the tile
+// from reaching the wall's pixels through slice interpolation. The margin keeps the slice a surface
+// sits in fully integrated.
+float aerialPerspectiveMaxRayLength(float tileMaxForwardDistance, vec2 screenUv, AtmosphereArgs args) {
+  const float directionLength = length(aerialPerspectiveViewRayDirection(screenUv, args));
+  return tileMaxForwardDistance * directionLength * 1.05f;
+}
+
+// Tile of the volume a screen UV falls in.
+int2 aerialPerspectiveTileCoordinate(vec2 screenUv, AtmosphereArgs args) {
+  const int size = int(max(args.aerialPerspectiveLutSize, 1u));
+  return clamp(int2(saturate(screenUv) * float(size)), int2(0), int2(size - 1));
+}
+
+// Atmosphere frame direction for a world direction. The frame is Y-up with its origin on the ground
+// under the camera, so only the axes need swapping for a Z-up game.
+vec3 aerialPerspectiveWorldToAtmosphereDirection(vec3 worldDirection, AtmosphereArgs args) {
+  return normalize(args.isZUp != 0
+    ? vec3(worldDirection.x, worldDirection.z, worldDirection.y)
+    : worldDirection);
+}
+
+// Trilinear clamp-to-edge fetch of the froxel volume. Each froxel holds the integral from the camera to
+// its slice centre, so inside the first slice centre the volume is extrapolated toward the identity at
+// the camera (in-scatter grows linearly with distance, transmittance as a power) rather than clamped,
+// which would hand every nearby surface the haze of the first slice's full depth.
 vec4 sampleAerialPerspectiveLut(Texture3D aerialPerspectiveLut, vec3 uvw, AtmosphereArgs args) {
   const int size = int(max(args.aerialPerspectiveLutSize, 1u));
+  const int depth = int(max(args.aerialPerspectiveLutDepth, 1u));
+  const vec3 dims = vec3(size, size, depth);
 
-  const vec3 coord = clamp(uvw, vec3(0.0f), vec3(1.0f)) * float(size) - 0.5f;
+  // Clamped before the floor so an edge sample blends with its own texel, not its neighbour.
+  const vec3 coord = clamp(saturate(uvw) * dims - 0.5f, vec3(0.0f), dims - 1.0f);
   const vec3 coordFloor = floor(coord);
   const vec3 filterWeight = coord - coordFloor;
 
-  const int x0 = clamp(int(coordFloor.x), 0, size - 1);
-  const int x1 = clamp(x0 + 1, 0, size - 1);
-  const int y0 = clamp(int(coordFloor.y), 0, size - 1);
-  const int y1 = clamp(y0 + 1, 0, size - 1);
-  const int z0 = clamp(int(coordFloor.z), 0, size - 1);
-  const int z1 = clamp(z0 + 1, 0, size - 1);
+  const int x0 = int(coordFloor.x);
+  const int x1 = min(x0 + 1, size - 1);
+  const int y0 = int(coordFloor.y);
+  const int y1 = min(y0 + 1, size - 1);
+  const int z0 = int(coordFloor.z);
+  const int z1 = min(z0 + 1, depth - 1);
 
   const vec4 t000 = aerialPerspectiveLut.Load(int4(x0, y0, z0, 0));
   const vec4 t100 = aerialPerspectiveLut.Load(int4(x1, y0, z0, 0));
@@ -666,6 +840,15 @@ vec4 sampleAerialPerspectiveLut(Texture3D aerialPerspectiveLut, vec3 uvw, Atmosp
 
   const vec4 z0Value = mix(mix(t000, t100, filterWeight.x), mix(t010, t110, filterWeight.x), filterWeight.y);
   const vec4 z1Value = mix(mix(t001, t101, filterWeight.x), mix(t011, t111, filterWeight.x), filterWeight.y);
+  vec4 result = mix(z0Value, z1Value, filterWeight.z);
 
-  return mix(z0Value, z1Value, filterWeight.z);
+  // Slice w maps to distance w^p, so the fraction of the first slice centre's depth is (w / w0)^p.
+  const float firstSliceCentre = 0.5f / float(depth);
+  if (uvw.z < firstSliceCentre) {
+    const float fraction = pow(max(uvw.z, 0.0f) / firstSliceCentre, kAerialPerspectiveDepthPower);
+    result.rgb *= fraction;
+    result.a = pow(max(result.a, 1e-6f), fraction);
+  }
+
+  return result;
 }

@@ -200,6 +200,36 @@ Path-traced radiance is unbounded where the original renderer clipped at exposed
 | `rtx.tonemap.ue3.hueReference` | ApprovedLook | Scene = the scene's hue; ApprovedLook = turned toward the clip's hue by the luminance share the clip could not show |
 | `rtx.tonemap.ue3.highlightDesaturation` | 0.0 | Desaturate over-range colours to the chroma the shipped clip left them |
 
+## Deferred overlays
+
+UE3 draws its `MaterialEffect` overlays (damage and health effects, the scope, reaction time) mid-frame, before the frame's 3D rendering has finished, so they must not trigger RTX injection. Tag the scene colour render target they sample in `rtx.deferredUiTextures`, or their pixel shaders in `rtx.d3d9.deferredUiPixelShaders`; the draws are then captured and replayed once injection fires.
+
+Where a captured overlay replays depends on the render target the game drew it into:
+
+- **Floating-point target** (the HDR `SceneColor`): the game ran the overlay on linear scene colour, before its display transform (`TdToneMapping`, or the `GammaCorrection` pass with `TdTonemapping` off). With `rtx.d3d9.deferredUiHdrReplay` it replays on Remix's linear HDR image, in the game's scene units, and the Mirror's Edge display transform runs after it, as the game's did.
+- **8-bit target**: the game drew the overlay after its own tone mapping, so it replays on Remix's tone-mapped output.
+
+The one-shot `[RTX-DeferredUI] Deferring overlay draw` log line reports each overlay's `target` format and `domain`.
+
+Replaying a linear overlay on the display-encoded image runs its maths in the wrong space. At display gamma 2.0, a colour gain `k` applied in linear light shows as about `sqrt(k)` on screen, but applied to the encoded image it shows as `k`. It also lands after the range compression, which pushes compressed highlights straight back to 1.0: a tint lifts the whole frame and clips near-white surfaces.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.deferredUiReplay` | True | Replay tagged overlays; off suppresses them while ray tracing |
+| `rtx.d3d9.deferredUiHdrReplay` | True | Replay overlays drawn into floating-point targets on the linear HDR image before tone mapping; off replays every overlay on the tone-mapped output |
+| `rtx.d3d9.deferredUiRefreshSceneColor` | True | Before each replayed draw, copy the image the overlay composites over into the scene colour textures it samples |
+
+### How the replay is staged
+
+When scene-linear overlays are pending, the injection runs in two stages with the replay between them:
+
+1. `RtxContext::injectRTX` is given an HDR canvas: an `A16B16G16R16F` D3D9 render target the size of the injection target. It renders the frame through motion blur, scales `m_finalOutput` into scene units (`exp2(rtx.tonemap.ue3.exposureBias)`, Mirror's Edge tonemapping mode only), copies it into the canvas, and stops before tone mapping.
+2. The D3D9 layer replays the scene-linear overlays onto the canvas. The scene colour refresh copies the canvas into the textures they sample, as UE3's resolve would.
+3. `RtxContext::finishInjectRTX` copies the canvas back, undoes the scale, and runs tone mapping through the blit to the target.
+4. Overlays drawn into 8-bit targets replay on the target, and the game's UI draws follow.
+
+Frames without scene-linear overlays inject in a single stage. A frame that ray traces nothing (invalid camera, shaders still compiling) passes the target through the canvas unchanged, so its overlays land where they would without staging. The exposure meter runs in the second stage, so it meters the image with the overlays applied.
+
 ## UE3 lightmaps are bypassed
 
 Remix does the lighting, so a raytraced surface has no use for UE3's baked lightmaps. Under `rtx.d3d9.ue3EngineMode` the coefficient textures are stripped from the draw before anything reads it, and material identity is independent of the lightmap policy the engine compiled: completely for the textures, and for all but a minority of materials' identities.

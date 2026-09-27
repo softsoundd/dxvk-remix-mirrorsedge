@@ -347,6 +347,36 @@ namespace dxvk {
     return mean.isValid() ? mean.view : nullptr;
   }
 
+  Rc<DxvkImageView> RtxContext::getAtmosphereTransmittanceLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getTransmittanceLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
+  Rc<DxvkImageView> RtxContext::getAtmosphereMultiscatteringLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getMultiscatteringLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
+  Rc<DxvkImageView> RtxContext::getAtmosphereAerosolPhaseLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getAerosolPhaseLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
   RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
     if (shouldUseDLSS() && m_common->metaDLSS().isActive()) {
       return InternalUpscaler::DLSS;
@@ -508,7 +538,52 @@ namespace dxvk {
 #endif
 
   // Hooked into D3D9 presentImage (same place HUD rendering is)
-  void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
+  void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, Rc<DxvkImage> hdrCanvas) {
+    m_pendingInjectFinish = PendingInjectFinish { hdrCanvas };
+
+    injectFrame(cachedReflexFrameId, targetImage);
+
+    // With no HDR image this frame, the canvas carries the target so overlays drawn into it land
+    // where they would on the target itself
+    if (hdrCanvas != nullptr && !m_pendingInjectFinish.raytraced && targetImage != nullptr) {
+      blitImageHelper(this, targetImage, hdrCanvas, VK_FILTER_NEAREST);
+      m_pendingInjectFinish.targetImage = targetImage;
+      m_pendingInjectFinish.seeded = true;
+    }
+  }
+
+  void RtxContext::finishInjectRTX() {
+    ScopedCpuProfileZone();
+
+    if (m_pendingInjectFinish.canvas == nullptr) {
+      return;
+    }
+
+    const PendingInjectFinish pending = std::exchange(m_pendingInjectFinish, {});
+
+    if (pending.raytraced) {
+      ScopedGpuProfileZone(this, "InjectRTX Finish");
+
+      Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
+      const Resources::Resource& finalOutput = rtOutput.m_finalOutput.resource(Resources::AccessType::Write);
+      blitImageHelper(this, pending.canvas, finalOutput.image, VK_FILTER_NEAREST);
+      if (pending.sceneScale != 1.f) {
+        this->spillRenderPass(false);
+        this->unbindComputePipeline();
+        m_common->metaUe3ToneMapping().dispatchSceneUnitScale(this, finalOutput, 1.f / pending.sceneScale);
+      }
+
+      outputFrame(rtOutput, pending.targetImage, pending.updateAutoExposure, pending.captureScreenImage, pending.captureDebugImage);
+    } else if (pending.seeded) {
+      blitImageHelper(this, pending.canvas, pending.targetImage, VK_FILTER_NEAREST);
+    }
+
+    if (pending.needsCompletion) {
+      completeInjection(pending.raytraced, pending.gpuIdleTimeMilliseconds);
+    }
+  }
+
+  void RtxContext::injectFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
     ScopedCpuProfileZone();
     // NV-DXVK start: CPU frame breakdown for the built-in pass timer
     RtxGpuPassTimer::CpuScope injectCpuScope(RtxGpuPassTimer::isEnabled() ? &getCommonObjects()->metaGpuPassTimer() : nullptr,
@@ -749,6 +824,12 @@ namespace dxvk {
           takeScreenshot("denoisedSpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
         }
 
+        // Aerial perspective volume, bounded by the primary hits the G-buffer pass produced; kept out of
+        // the path tracing / NRC sequence and dispatched right before its consumer.
+        if (m_atmosphere && RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+          m_atmosphere->dispatchAerialPerspective(*this, rtOutput);
+        }
+
         // Composition
         dispatchComposite(rtOutput);
 
@@ -801,55 +882,10 @@ namespace dxvk {
         // Motion blur runs before tonemapping while the image is still in linear HDR space.
         dispatchPostFxMotionBlur(rtOutput);
 
-        dispatchToneMapping(rtOutput, !dlssNrEnabled);
-
-        // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
-        // display-space artifacts so they operate on post-tonemap LDR data.
-        dispatchPostFxLensEffects(rtOutput);
-
-        // Final output pass converts the linear post-tonemap LDR image to sRGB and applies
-        // dithering as the very last step. SRGB conversion is suppressed for screenshot
-        // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
-        // for 16bit float formats), and when the Mirror's Edge (UE3) tonemapper ran: its
-        // output is already display-encoded (gamma 2.0 + colour curves), matching what the
-        // game wrote to its backbuffer, so only dithering applies.
-        const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
-        dispatchSRGBDither(rtOutput, performSRGBConversion);
-
-        if (captureScreenImage) {
-          if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
-            takeScreenshot("rtxImagePostTonemapping", rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image);
-          }
-          
-          if (captureDebugImage) {
-            takeScreenshot("albedo", rtOutput.m_primaryAlbedo.image);
-            takeScreenshot("worldNormals", rtOutput.m_primaryWorldShadingNormal.image);
-            takeScreenshot("worldMotion", rtOutput.m_primaryVirtualMotionVector.image(Resources::AccessType::Read));
-            takeScreenshot("linearZ", rtOutput.m_primaryLinearViewZ.image);
-          }
-        }
-
-        // Set up output src
-        Rc<DxvkImage> srcImage = rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image;
-
-        // Debug view
-        dispatchDebugView(srcImage, rtOutput, captureScreenImage);
-
-        dispatchDLFG();
-
-        // Blit to the game target
-        {
-          ScopedGpuProfileZone(this, "Blit to Game");
-          
-          // Note: the resolution between srcImage and dstImage always matches
-          // so we can use the same blit with nearest neighbor filtering
-          assert(srcImage->info().extent == targetImage->info().extent);
-          blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
-        }
-
-        // Log stats when an image is taken
-        if (captureScreenImage) {
-          getSceneManager().logStatistics();
+        if (m_pendingInjectFinish.canvas != nullptr) {
+          stageHdrCanvas(rtOutput, targetImage, !dlssNrEnabled, captureScreenImage, captureDebugImage);
+        } else {
+          outputFrame(rtOutput, targetImage, !dlssNrEnabled, captureScreenImage, captureDebugImage);
         }
 
         raytracedThisFrame = true;
@@ -876,6 +912,92 @@ namespace dxvk {
       }
     }
 
+    if (m_pendingInjectFinish.canvas != nullptr) {
+      m_pendingInjectFinish.needsCompletion = true;
+      m_pendingInjectFinish.gpuIdleTimeMilliseconds = gpuIdleTimeMilliseconds;
+    } else {
+      completeInjection(raytracedThisFrame, gpuIdleTimeMilliseconds);
+    }
+  }
+
+  void RtxContext::outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+                               bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage) {
+    dispatchToneMapping(rtOutput, updateAutoExposure);
+
+    // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
+    // display-space artifacts so they operate on post-tonemap LDR data.
+    dispatchPostFxLensEffects(rtOutput);
+
+    // Final output pass converts the linear post-tonemap LDR image to sRGB and applies
+    // dithering as the very last step. SRGB conversion is suppressed for screenshot
+    // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
+    // for 16bit float formats), and when the Mirror's Edge (UE3) tonemapper ran: its
+    // output is already display-encoded (gamma 2.0 + colour curves), matching what the
+    // game wrote to its backbuffer, so only dithering applies.
+    const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
+    dispatchSRGBDither(rtOutput, performSRGBConversion);
+
+    if (captureScreenImage) {
+      if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
+        takeScreenshot("rtxImagePostTonemapping", rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image);
+      }
+      
+      if (captureDebugImage) {
+        takeScreenshot("albedo", rtOutput.m_primaryAlbedo.image);
+        takeScreenshot("worldNormals", rtOutput.m_primaryWorldShadingNormal.image);
+        takeScreenshot("worldMotion", rtOutput.m_primaryVirtualMotionVector.image(Resources::AccessType::Read));
+        takeScreenshot("linearZ", rtOutput.m_primaryLinearViewZ.image);
+      }
+    }
+
+    // Set up output src
+    Rc<DxvkImage> srcImage = rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image;
+
+    // Debug view
+    dispatchDebugView(srcImage, rtOutput, captureScreenImage);
+
+    dispatchDLFG();
+
+    // Blit to the game target
+    {
+      ScopedGpuProfileZone(this, "Blit to Game");
+      
+      // Note: the resolution between srcImage and dstImage always matches
+      // so we can use the same blit with nearest neighbor filtering
+      assert(srcImage->info().extent == targetImage->info().extent);
+      blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+    }
+
+    // Log stats when an image is taken
+    if (captureScreenImage) {
+      getSceneManager().logStatistics();
+    }
+  }
+
+  void RtxContext::stageHdrCanvas(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+                                  bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage) {
+    ScopedGpuProfileZone(this, "Stage HDR Canvas");
+
+    PendingInjectFinish& pending = m_pendingInjectFinish;
+    pending.targetImage = targetImage;
+    pending.updateAutoExposure = updateAutoExposure;
+    pending.captureScreenImage = captureScreenImage;
+    pending.captureDebugImage = captureDebugImage;
+    pending.sceneScale = RtxOptions::tonemappingMode() == TonemappingMode::MirrorsEdge ? DxvkUe3ToneMapping::sceneUnitScale() : 1.f;
+
+    // Overlays expect the game's scene units; finishInjectRTX undoes the scale
+    const Resources::Resource& finalOutput = rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite);
+    if (pending.sceneScale != 1.f) {
+      this->spillRenderPass(false);
+      this->unbindComputePipeline();
+      m_common->metaUe3ToneMapping().dispatchSceneUnitScale(this, finalOutput, pending.sceneScale);
+    }
+
+    blitImageHelper(this, finalOutput.image, pending.canvas, VK_FILTER_NEAREST);
+    pending.raytraced = true;
+  }
+
+  void RtxContext::completeInjection(bool raytracedThisFrame, float gpuIdleTimeMilliseconds) {
     onInjectRtxFrameEnd(raytracedThisFrame);
 
     // apply changes to RtxOptions after the frame has ended
@@ -888,6 +1010,10 @@ namespace dxvk {
   }
 
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
+    if (m_pendingInjectFinish.canvas != nullptr) {
+      ONCE(Logger::warn("[RTX] A staged RTX injection was never finished; finishing it at the end of the frame."));
+      finishInjectRTX();
+    }
 
     if (callInjectRtx) {
       // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
@@ -1143,6 +1269,9 @@ namespace dxvk {
     constants.primaryRayMaxInteractions = RtxOptions::primaryRayMaxInteractions();
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
+    constants.unorderedResolveMaxPrimaryCandidates = RtxOptions::unorderedResolveMaxPrimaryCandidates();
+    constants.unorderedResolveMaxSecondaryCandidates = RtxOptions::unorderedResolveMaxSecondaryCandidates();
+    constants.unorderedResolveSkipOpacityThreshold = RtxOptions::unorderedResolveSkipOpacityThreshold();
 
     // Todo: Potentially move this to the volume manager in the future to be more organized.
     constants.volumeTemporalReuseMaxSampleCount = RtxGlobalVolumetrics::temporalReuseMaxSampleCount();
@@ -1487,9 +1616,12 @@ namespace dxvk {
       constants.atmosphereArgs = RtxAtmosphere::buildAtmosphereArgsFromOptions();
       // The aerial perspective volume is fitted to the camera, so its basis has to be supplied
       // before the LUTs are baked.
-      RtxAtmosphere::fillAerialPerspectiveArgs(constants.atmosphereArgs, cameraManager.getMainCamera());
+      m_atmosphere->fillAerialPerspectiveArgs(constants.atmosphereArgs, cameraManager.getMainCamera());
+      constants.atmosphereArgs.aerialPerspectiveMissLinearViewZ = constants.primaryDirectNrd.missLinearViewZ;
 
       m_atmosphere->computeLuts(this, constants.atmosphereArgs);
+      // A rebake or resize above drops the ray traced volume's history.
+      constants.atmosphereArgs.aerialPerspectiveHistoryValid = m_atmosphere->isAerialPerspectiveHistoryValid() ? 1u : 0u;
       m_atmosphere->syncDistantSunLight(*this, constants.atmosphereArgs);
     }
 
@@ -1628,6 +1760,11 @@ namespace dxvk {
 
     if (skyViewLut.isValid()) {
       bindResourceView(BINDING_ATMOSPHERE_SKY_VIEW_LUT, skyViewLut.view, nullptr);
+    }
+
+    auto aerosolPhaseLut = m_atmosphere->getAerosolPhaseLut();
+    if (aerosolPhaseLut.isValid()) {
+      bindResourceView(BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT, aerosolPhaseLut.view, nullptr);
     }
   }
 

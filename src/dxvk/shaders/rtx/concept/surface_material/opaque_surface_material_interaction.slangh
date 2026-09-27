@@ -453,17 +453,64 @@ uint8_t calcMipLevelAccessedForSamplerFeedback(SurfaceInteraction surfaceInterac
   return uint8_t(clamp(log2(sqrt(ddSq)), 0, 255));
 }
 
-void storeSamplerFeedback(uint32_t samplerFeedbackStamp, SurfaceInteraction surfaceInteraction)
+void storeSamplerFeedbackMip(uint32_t samplerFeedbackStamp, uint32_t mipLevel)
 {
   if (samplerFeedbackStamp != SAMPLER_FEEDBACK_INVALID)
   {
     uint32_t oldvalue;
-    InterlockedMin(
-      SamplerFeedbackBuffer[samplerFeedbackStamp],
-      uint32_t(calcMipLevelAccessedForSamplerFeedback(surfaceInteraction)),
-      oldvalue);
+    InterlockedMin(SamplerFeedbackBuffer[samplerFeedbackStamp], mipLevel, oldvalue);
   }
 }
+
+void storeSamplerFeedback(uint32_t samplerFeedbackStamp, SurfaceInteraction surfaceInteraction)
+{
+  if (samplerFeedbackStamp != SAMPLER_FEEDBACK_INVALID)
+  {
+    storeSamplerFeedbackMip(samplerFeedbackStamp, uint32_t(calcMipLevelAccessedForSamplerFeedback(surfaceInteraction)));
+  }
+}
+
+// Accumulates the sampler feedback of consecutive hits on the same material and stores it once, for loops that
+// visit many hits of one material per pixel (stacked particles) where an atomic per hit would all target one address.
+struct BatchedSamplerFeedback
+{
+  uint32_t stamp;
+  uint32_t minMipLevel;
+
+  static BatchedSamplerFeedback createEmpty()
+  {
+    BatchedSamplerFeedback feedback;
+    feedback.stamp = SAMPLER_FEEDBACK_INVALID;
+    feedback.minMipLevel = 0xffffffffu;
+    return feedback;
+  }
+
+  [mutating] void add(uint32_t samplerFeedbackStamp, SurfaceInteraction surfaceInteraction)
+  {
+    if (samplerFeedbackStamp == SAMPLER_FEEDBACK_INVALID)
+    {
+      return;
+    }
+
+    const uint32_t mipLevel = uint32_t(calcMipLevelAccessedForSamplerFeedback(surfaceInteraction));
+
+    if (samplerFeedbackStamp != stamp)
+    {
+      flush();
+      stamp = samplerFeedbackStamp;
+      minMipLevel = mipLevel;
+    }
+    else
+    {
+      minMipLevel = min(minMipLevel, mipLevel);
+    }
+  }
+
+  void flush()
+  {
+    storeSamplerFeedbackMip(stamp, minMipLevel);
+  }
+};
 
 void overrideMaterialInteractionForEye(
   inout OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction,
@@ -541,6 +588,179 @@ void overrideMaterialInteractionForEye(
 }
 
 // Opaque Surface Material Interaction Functions
+
+// Removes the baked lighting from a vertex colour so that only its diffuse tint remains (see the note inside).
+void opaqueSurfaceMaterialNormalizeBakedLightingVertexColor(Surface surface, inout vec4 vertexColor)
+{
+  if (surface.isVertexColorBakedLighting) {
+    // "Normalize" vertex color to remove lighting contribution in different vertices.
+    // We assume the diffuse term contributes most lighting. Therefore, vertex color = diffuseColor * (N*L).
+    // By dividing the vertex color by its largest component, the result is irrelavant to N*L, but proportional to the 
+    // original diffuse color, which is more desired.
+    // In practice, we add an adjustable blending factor to avoid extreme cases.
+    vertexColor.rgb = max(vertexColor.rgb, vec3(1.0 / 255.0));
+    float maxColor = max(vertexColor.r, max(vertexColor.g, vertexColor.b));
+    vertexColor.rgb /= maxColor;
+    vertexColor.rgb = mix(vec3(1), vertexColor.rgb, float(cb.vertexColorStrength));
+  }
+}
+
+// Applies the fixed-function texture stage colour and alpha operations to the raw albedo and opacity and derives the
+// material opacity from the surface's blend mode. Shared by the full material interaction and the particle path so
+// the two always agree on how transparent a hit is.
+void opaqueSurfaceMaterialApplyTextureStageOps(
+  Surface surface, vec4 vertexColor, vec4 tFactor,
+  inout vec3 albedo, inout float opacity, inout float emissiveBlendOverrideInfluence)
+{
+  vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
+  chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, vertexColor.rgb, tFactor.rgb, vec3(1.0));
+  chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, vertexColor.rgb, tFactor.rgb, vec3(1.0));
+  chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
+  if (surface.isTextureFactorBlend) {
+    albedo *= tFactor.rgb;
+  }
+
+  float textureAlphaArg1, textureAlphaArg2;
+  chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, vertexColor.a, tFactor.a, opacity);
+  chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, vertexColor.a, tFactor.a, float(1.0f));
+  chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
+
+  // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
+  calcOpaqueSurfaceMaterialOpacity(
+    albedo, opacity, surface, opacity, emissiveBlendOverrideInfluence, cb.wboitEnabled);
+}
+
+// The fixed-function texture stage colour operations, applied to the emissive colour.
+void opaqueSurfaceMaterialApplyEmissiveTextureStageOps(
+  Surface surface, vec4 vertexColor, vec4 tFactor,
+  inout vec3 emissiveColor)
+{
+  vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
+  chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, vertexColor.rgb, tFactor.rgb, vec3(1.0));
+  chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, vertexColor.rgb, tFactor.rgb, vec3(1.0));
+  chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
+  if (surface.isTextureFactorBlend) {
+    emissiveColor *= tFactor.rgb;
+  }
+}
+
+// Particle path
+//
+// The unordered particle resolve consumes only a hit's albedo, opacity and emissive radiance (see
+// evaluateOpaqueApproximations); the normal, roughness, tangent, subsurface and thin film inputs of the full
+// interaction never reach its output. The functions below derive those three values by the same rules as
+// opaqueSurfaceMaterialInteractionCreate, split into a read phase and a resolve phase so the caller can issue
+// other memory traffic between the texture reads and their first use.
+
+// Materials whose texture coordinates parallax occlusion mapping displaces, and eyes, need the full interaction.
+bool opaqueSurfaceMaterialParticlePathSupported(OpaqueSurfaceMaterial opaqueSurfaceMaterial, Surface surface)
+{
+  bool pomActive = false;
+#ifdef OPAQUE_MATERIAL_USE_POM
+  pomActive = cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement();
+#endif
+
+  return !pomActive && !(cb.eyeArgs.enableEyes && surface.isEye);
+}
+
+struct OpaqueSurfaceMaterialParticleSamples
+{
+  vec4 albedoOpacity;
+  vec4 emissiveColor;
+  vec4 metallic;
+  bool albedoOpacityLoaded;
+  bool emissiveColorLoaded;
+  bool metallicLoaded;
+};
+
+OpaqueSurfaceMaterialParticleSamples opaqueSurfaceMaterialParticleSamplesRead(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  SurfaceInteraction surfaceInteraction)
+{
+  const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+  const float materialLodBias = isHairCardMaterial ? cb.hairCardMipBias : 0.0f;
+
+  OpaqueSurfaceMaterialParticleSamples samples;
+  samples.albedoOpacity = vec4(0.0f);
+  samples.emissiveColor = vec4(0.0f);
+  samples.metallic = vec4(0.0f);
+  samples.albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, samples.albedoOpacity, materialLodBias);
+  samples.emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, samples.emissiveColor, materialLodBias);
+  samples.metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, samples.metallic, materialLodBias);
+
+  return samples;
+}
+
+void opaqueSurfaceMaterialParticleResolve(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  Surface surface,
+  SurfaceInteraction surfaceInteraction,
+  OpaqueSurfaceMaterialParticleSamples samples,
+  out vec3 albedo, out float opacity, out vec3 emissiveRadiance)
+{
+  vec3 emissiveColor = opaqueSurfaceMaterial.emissiveColorConstant;
+
+  if (samples.emissiveColorLoaded)
+  {
+    emissiveColor = samples.emissiveColor.xyz;
+  }
+
+  albedo = opaqueSurfaceMaterial.albedoOpacityConstant.rgb;
+  opacity = opaqueSurfaceMaterial.albedoOpacityConstant.a;
+  float emissiveBlendOverrideInfluence = float(1.0f);
+
+  if (samples.albedoOpacityLoaded)
+  {
+    albedo = samples.albedoOpacity.rgb;
+    opacity = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS) ? float(1.0f) : samples.albedoOpacity.a;
+  }
+
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO)
+  {
+    storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
+  }
+
+  if (cb.debugView == DEBUG_VIEW_OPAQUE_RAW_ALBEDO_RESOLUTION_CHECKERS)
+  {
+    storeColorOverlayedWithTextureResolutionCheckersInDebugView(albedo.xyz, opaqueSurfaceMaterial.albedoOpacityTextureIndex, surfaceInteraction);
+  }
+#endif
+
+  const vec4 tFactor = unorm4x8ToFloat4x32(surface.tFactor).bgra;
+  vec4 vertexColor = surfaceInteraction.vertexColor;
+  opaqueSurfaceMaterialNormalizeBakedLightingVertexColor(surface, vertexColor);
+  opaqueSurfaceMaterialApplyTextureStageOps(
+    surface, vertexColor, tFactor,
+    albedo, opacity, emissiveBlendOverrideInfluence);
+  opaqueSurfaceMaterialApplyEmissiveTextureStageOps(surface, vertexColor, tFactor, emissiveColor);
+
+  if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL)
+  {
+    opacity = 1.f;
+  }
+
+  if (!surface.colorTextureIsSrgb)
+  {
+    albedo = gammaToLinear(albedo);
+  }
+
+  emissiveColor = gammaToLinear(emissiveColor);
+
+  albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
+
+  float metallic = opaqueSurfaceMaterial.metallicConstant;
+
+  if (samples.metallicLoaded)
+  {
+    metallic = samples.metallic.x;
+  }
+
+  metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
+
+  albedo = surface.isMatte ? vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
+  emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+}
 
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
@@ -633,6 +853,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
   
   // Load Albedo/Opacity
+  // Note: opaqueSurfaceMaterialParticleResolve mirrors the albedo, opacity and emissive rules from here on; keep them in step.
 
   vec3 albedo = opaqueSurfaceMaterial.albedoOpacityConstant.rgb;
   float opacity = opaqueSurfaceMaterial.albedoOpacityConstant.a;
@@ -699,46 +920,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (applyTextureOperations) 
 #endif
   {
-    if (surface.isVertexColorBakedLighting) {
-      // "Normalize" vertex color to remove lighting contribution in different vertices.
-      // We assume the diffuse term contributes most lighting. Therefore, vertex color = diffuseColor * (N*L).
-      // By dividing the vertex color by its largest component, the result is irrelavant to N*L, but proportional to the 
-      // original diffuse color, which is more desired.
-      // In practice, we add an adjustable blending factor to avoid extreme cases.
-      surfaceInteraction.vertexColor.rgb = max(surfaceInteraction.vertexColor.rgb, vec3(1.0 / 255.0));
-      float maxColor = max(surfaceInteraction.vertexColor.r, max(surfaceInteraction.vertexColor.g, surfaceInteraction.vertexColor.b));
-      surfaceInteraction.vertexColor.rgb /= maxColor;
-      surfaceInteraction.vertexColor.rgb = mix(vec3(1), surfaceInteraction.vertexColor.rgb, float(cb.vertexColorStrength));
-    }
+    opaqueSurfaceMaterialNormalizeBakedLightingVertexColor(surface, surfaceInteraction.vertexColor);
 
-    // Fixed function texture stage setting
-    vec3 textureArg1 = vec3(1.0), textureArg2 = vec3(1.0);
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, albedo, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(albedo, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      albedo *= tFactor.rgb;
-    }
+    // Fixed function texture stage settings for the albedo colour and alpha channel, and the blend mode opacity rules
+    opaqueSurfaceMaterialApplyTextureStageOps(
+      surface, surfaceInteraction.vertexColor, tFactor,
+      albedo, opacity, emissiveBlendOverrideInfluence);
 
-    // Fixed function texture stage setting (emissive)
-    chooseTextureArgument(textureArg1, surface.textureColorArg1Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureArgument(textureArg2, surface.textureColorArg2Source, emissiveColor, surfaceInteraction.vertexColor.rgb, tFactor.rgb, vec3(1.0));
-    chooseTextureOperationColor(emissiveColor, surface.textureColorOperation, textureArg1, textureArg2);
-    if (surface.isTextureFactorBlend) {
-      emissiveColor *= tFactor.rgb;
-    }
-    
-    // Adjust opacity via texture operations.
-    // Fixed function texture stage state for alpha channel
-
-    float textureAlphaArg1, textureAlphaArg2;
-    chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, opacity);
-    chooseTextureArgument(textureAlphaArg2, surface.textureAlphaArg2Source, opacity, surfaceInteraction.vertexColor.a, tFactor.a, float(1.0f));
-    chooseTextureOperationAlpha(opacity, surface.textureAlphaOperation, textureAlphaArg1, textureAlphaArg2);
-    
-    // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
-    calcOpaqueSurfaceMaterialOpacity(
-      albedo, opacity, surface, opacity, emissiveBlendOverrideInfluence, cb.wboitEnabled);
+    opaqueSurfaceMaterialApplyEmissiveTextureStageOps(surface, surfaceInteraction.vertexColor, tFactor, emissiveColor);
   }
 
   if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL)

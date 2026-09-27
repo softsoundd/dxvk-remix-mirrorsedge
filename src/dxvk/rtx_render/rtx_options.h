@@ -166,6 +166,30 @@ namespace dxvk {
     PhysicalAtmosphere = 1
   };
 
+  // How the Physical Atmosphere's aerosol (haze) is specified.
+  enum class AtmosphereAerosolModel : int {
+    Manual = 0,      // Ground level Mie coefficients and an exponential profile, straight from the options
+    Visibility = 1   // Ground level meteorological visibility, an aerosol type and a boundary layer profile
+  };
+
+  // OPAC style aerosol mixtures (Hess et al. 1998), selecting single scattering albedo, Angstrom exponent
+  // and phase asymmetry for the Visibility aerosol model.
+  enum class AtmosphereAerosolType : int {
+    ContinentalClean = 0,
+    ContinentalAverage = 1,
+    ContinentalPolluted = 2,
+    Urban = 3,
+    MaritimeClean = 4,
+    DesertDust = 5,
+    Custom = 6
+  };
+
+  // How the Physical Atmosphere's Rayleigh, ozone and sun colours are obtained.
+  enum class AtmosphereCoefficientMode : int {
+    Manual = 0,    // RGB coefficients and the sun colour straight from the options
+    Physical = 1   // Derived at 680 / 550 / 440 nm from the solar spectrum and molecular cross sections
+  };
+
   enum class EnableVsync : int {
     Off = 0,
     On = 1,
@@ -213,7 +237,8 @@ namespace dxvk {
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
     RTX_OPTION("rtx", fast_unordered_set, deferredUiTextures, {},
                   "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
-                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback).\n"
+                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback). "
+                  "Draws the game rendered into a floating-point target (linear scene colour, e.g. UE3 MaterialEffects) replay on the linear HDR image before tone mapping instead (rtx.d3d9.deferredUiHdrReplay).\n"
                   "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
                   "Non-RT textures match by image hash. Render targets match either descriptor hash the texture picker "
                   "registers for them: the resolution-agnostic one (aspect ratio in place of Width/Height) survives "
@@ -708,7 +733,8 @@ namespace dxvk {
     // to Custom to ensure these settings are not overridden.
     //RenderPassVolumeIntegrateRaytraceMode renderPassVolumeIntegrateRaytraceMode = RenderPassVolumeIntegrateRaytraceMode::RayQuery;
     RTX_OPTION_ARGS("rtx", RenderPassGBufferRaytraceMode, renderPassGBufferRaytraceMode, RenderPassGBufferRaytraceMode::RayQuery,
-                   "The ray tracing mode to use for the G-Buffer pass which resolves the initial primary and secondary surfaces to apply lighting to.",
+                   "The ray tracing mode to use for the G-Buffer pass which resolves the initial primary and secondary surfaces to apply lighting to.\n"
+                   "While a debug view is active, Trace Ray falls back to Ray Query (compute) since its hit shaders carry no debug view output.",
                    args.environment = "DXVK_RENDER_PASS_GBUFFER_RAYTRACE_MODE",
                    args.maxValue = RenderPassGBufferRaytraceMode(uint32_t(RenderPassGBufferRaytraceMode::Count) - 1),
                    args.flags = RtxOptionFlags::UserSetting);
@@ -840,6 +866,21 @@ namespace dxvk {
                "This improves performance typically in how particles or decals are rendered and should usually always be enabled.\n"
                "Do note however the unordered nature of this resolving method may result in visual artifacts with large numbers of stacked particles due to difficulty in determining the intended order.\n"
                "Additionally, unordered approximations will only be done on the first indirect ray bounce (as particles matter less in higher bounces), and only if enabled by its corresponding setting.");
+    RTX_OPTION_ARGS("rtx", uint32_t, unorderedResolveMaxPrimaryCandidates, 128,
+               "The maximum number of unordered candidates (particles, decals) a primary ray evaluates when separate unordered approximations are enabled.\n"
+               "Every candidate costs a material evaluation, so this bounds the cost of a pixel that looks through many stacked particles. "
+               "Candidates beyond the limit are dropped in traversal order, which is not depth order, so lower values are only safe where fewer layers overlap.",
+               args.minValue = 1u, args.maxValue = 1024u);
+    RTX_OPTION_ARGS("rtx", uint32_t, unorderedResolveMaxSecondaryCandidates, 32,
+               "The maximum number of unordered candidates (particles, decals) a secondary (indirect) ray evaluates when unordered resolve is enabled for indirect rays.\n"
+               "See rtx.unorderedResolveMaxPrimaryCandidates.",
+               args.minValue = 1u, args.maxValue = 1024u);
+    RTX_OPTION_ARGS("rtx", float, unorderedResolveSkipOpacityThreshold, 0.0f,
+               "Unordered particle candidates whose opacity resolves at or below this value are skipped before the rest of their material and the lighting approximation are evaluated.\n"
+               "0 skips only fully transparent hits (the corners of a sprite outside its shape, alpha-tested texels), which contribute nothing to the weighted blend, so the image is unchanged. "
+               "Raising it to rtx.resolveTransparencyThreshold matches what the ordered resolve already drops, at a small cost in stacks of very faint layers. A negative value disables the skip. "
+               "Only applies with rtx.wboitEnabled.",
+               args.minValue = -1.0f, args.maxValue = 1.0f);
     RTX_OPTION("rtx", bool, trackParticleObjects, true, "Track last frame's corresponding particle object.");
     RTX_OPTION_ENV("rtx", bool, enableDirectTranslucentShadows, false, "RTX_ENABLE_DIRECT_TRANSLUCENT_SHADOWS", "Calculate coloured shadows for translucent materials (i.e. glass, water) in direct lighting. In engineering terms: include OBJECT_MASK_TRANSLUCENT into primary visibility rays.");
     RTX_OPTION_ENV("rtx", bool, enableDirectAlphaBlendShadows, true, "RTX_ENABLE_DIRECT_ALPHABLEND_SHADOWS", "Calculate shadows for semi-transparent materials (alpha blended) in direct lighting. In engineering terms: include OBJECT_MASK_ALPHA_BLEND into primary visibility rays.");
@@ -1264,7 +1305,10 @@ namespace dxvk {
       }
       // If the option is changed to WaitingForImplicitSwapchain, just leave the computed state as it was.
     }
-    RTX_OPTION_ARGS("rtx", EnableVsync, enableVsync, EnableVsync::WaitingForImplicitSwapchain, "Controls the game's V-Sync setting. Native game's V-Sync settings are ignored.", 
+    RTX_OPTION_ARGS("rtx", EnableVsync, enableVsync, EnableVsync::WaitingForImplicitSwapchain,
+                    "Controls V-Sync: 0 forces it off and 1 forces it on. The default (2) adopts the game's setting when it "
+                    "creates its device; only D3DPRESENT_INTERVAL_IMMEDIATE counts as off, and d3d9.presentInterval takes "
+                    "precedence when set. Later changes to the game's setting are ignored.",
                     args.flags = RtxOptionFlags::NoSave | RtxOptionFlags::UserSetting,
                     args.onChangeCallback = &EnableVsyncOnChange);
 
@@ -1425,9 +1469,44 @@ namespace dxvk {
                "desaturation. Where global volumetrics are enabled, the march starts past the froxel grid's range so "
                "the two do not double count.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveDepthRangeMeters, 32000.0f,
-               "Depth in meters covered by the aerial perspective volume. Bring this closer to the camera for denser "
-               "atmospheres to spend the 32 slices over a shorter, more accurate range.",
+               "Depth in meters covered by the aerial perspective volume. Slices are distributed cubically, so half of "
+               "them cover the nearest eighth of this range. Bring it closer to the camera for denser atmospheres or "
+               "smaller scenes to spend the slices over a shorter, more accurate range.",
                args.minValue = 100.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveStartDistanceMeters, 0.0f,
+               "Distance from the camera in meters before the aerial perspective starts accumulating. Air nearer than "
+               "this contributes nothing, which keeps rooms and corridors shorter than it free of haze when the "
+               "unshadowed volume cannot know it is indoors. Where global volumetrics are enabled their froxel range "
+               "applies as a minimum.",
+               args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveAerosolScale, 1.0f,
+               "Stylisation: multiplies the aerosol (haze) density inside the aerial perspective volume only, thickening "
+               "the haze on geometry and in mirror reflections while the sky and the sun stay as they are. 1 = physical.",
+               args.minValue = 0.0f, args.maxValue = 50.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, aerialPerspectiveLutSize, 32,
+               "Width and height of the aerial perspective froxel volume. 32 suits the unshadowed effect; 64 sharpens "
+               "the shafts of the ray traced sun visibility.",
+               args.minValue = 8, args.maxValue = 128);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, aerialPerspectiveLutDepth, 32,
+               "Depth slice count of the aerial perspective froxel volume.",
+               args.minValue = 8, args.maxValue = 128);
+    RTX_OPTION("rtx.atmosphere", bool, aerialPerspectiveShadows, false,
+               "Trace sun and sky visibility rays against the scene inside the aerial perspective volume, so haze in "
+               "the shadow of buildings darkens, a low sun casts crepuscular rays, and air indoors, which sees neither "
+               "sun nor sky, stays clear. Replaces the compute bake with a ray query pass that is accumulated over frames.");
+    RTX_OPTION_ARGS("rtx.atmosphere", int, aerialPerspectiveShadowSteps, 8,
+               "Samples along each froxel ray of the shadowed aerial perspective volume per frame, each tracing a sun "
+               "and a sky visibility ray. Sample positions and sky directions are jittered every frame, so the "
+               "accumulation converges toward the exact integral.",
+               args.minValue = 1, args.maxValue = 32);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveShadowMaxDistanceMeters, 3000.0f,
+               "Length in meters of the sun and sky visibility rays of the shadowed aerial perspective volume. Anything "
+               "beyond counts as unoccluded, which bounds the cost in large scenes.",
+               args.minValue = 10.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerialPerspectiveTemporalBlend, 0.9f,
+               "History weight of the shadowed aerial perspective volume. The previous frame's volume is reprojected "
+               "through the camera motion and blended with this weight; 0 disables the accumulation.",
+               args.minValue = 0.0f, args.maxValue = 0.98f);
     RTX_OPTION("rtx.atmosphere", bool, sunDisc, true,
                "Draw the sun disc into the environment on camera and mirror (PSR) rays, which cannot reach the sun "
                "through next event estimation. Rough surfaces get the sun from the distant light instead, so the disc "
@@ -1445,22 +1524,142 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f, "Sun angle from horizon in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f, "Rotation of sun around zenith in degrees.");
     RTX_OPTION("rtx.atmosphere", float, altitude, 100.0f, "Height from sea level in meters.");
+    RTX_OPTION("rtx.atmosphere", bool, altitudeFollowsCamera, false,
+               "Add the camera's height above groundLevelWorldHeight to the altitude, so climbing a tower thins the haze "
+               "seen from it and the aerial perspective toward the streets below thickens. The baked sky LUTs use a "
+               "5 m quantised altitude so vertical movement does not rebake them every frame.");
+    RTX_OPTION("rtx.atmosphere", float, groundLevelWorldHeight, 0.0f,
+               "World space height (game units, along the up axis) that corresponds to the altitude option when "
+               "altitudeFollowsCamera is enabled.");
     RTX_OPTION("rtx.atmosphere", float, airDensity, 1.0f, "Density of air molecules multiplier (1.0 = clear sky).");
-    RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.0f, "Density of aerosols/dust multiplier (1.0 = typical).");
+    RTX_OPTION("rtx.atmosphere", float, aerosolDensity, 1.0f, "Density of aerosols/dust multiplier (1.0 = typical). Manual aerosol model only.");
     RTX_OPTION("rtx.atmosphere", float, ozoneDensity, 1.0f, "Density of ozone layer multiplier (1.0 = typical).");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, groundAlbedo, 0.3f,
+               "Diffuse albedo of the virtual planet surface below the horizon, which feeds the sky's multiple "
+               "scattering and the below-horizon sky. A bright city or snow (0.5+) lifts the horizon sky noticeably.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
+
+    // Aerosol (haze) model.
+    RTX_OPTION("rtx.atmosphere", AtmosphereAerosolModel, aerosolModel, AtmosphereAerosolModel::Manual,
+               "How the aerosol (haze) is specified. 0: Manual, ground level Mie coefficients from mieScattering / "
+               "mieAbsorption with an exponential profile. 1: Visibility, the ground level extinction follows from "
+               "visibilityKm through the Koschmieder relation (extinction = 3.912 / V at 550 nm) and aerosolType sets its "
+               "colour, absorption and phase, laid out in a well mixed boundary layer.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, visibilityKm, 40.0f,
+               "Meteorological visibility at ground level in kilometers (Visibility aerosol model). 20-30 km is a "
+               "typical city day, 60 km clean continental air, 130 km the clearest continental conditions.",
+               args.minValue = 0.5f, args.maxValue = 400.0f);
+    RTX_OPTION("rtx.atmosphere", AtmosphereAerosolType, aerosolType, AtmosphereAerosolType::ContinentalAverage,
+               "Aerosol mixture for the Visibility aerosol model, one of the OPAC database types (Hess et al. 1998, Koepke et "
+               "al. 2015). Its single scattering albedo (how dark the haze is), spectral extinction (how much bluer than white "
+               "it scatters) and scattering phase function are tabulated per channel wavelength and relative humidity from "
+               "Mie theory, with mineral dust as spheroids. 0: Continental Clean, 1: Continental Average, 2: Continental "
+               "Polluted, 3: Urban, 4: Maritime Clean, 5: Desert Dust, 6: Custom (aerosolSingleScatteringAlbedo, "
+               "aerosolAngstromExponent, mieAnisotropy).");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolRelativeHumidity, 80.0f,
+               "Relative humidity the Visibility model's aerosol sits in, percent. Its water soluble particles swell as this "
+               "rises, which brightens the haze (less absorption per unit of extinction), whitens its colour and pulls its "
+               "scattering forward; the amount of haze still follows visibilityKm. Tabulated for OPAC's 0, 50, 70, 80, 90, "
+               "95, 98 and 99% classes and interpolated between them. Not used by the Custom type.",
+               args.minValue = 0.0f, args.maxValue = 99.0f);
+    RTX_OPTION("rtx.atmosphere", bool, aerosolMiePhase, true,
+               "Scatter the Visibility model's aerosol with its type's own phase function from the OPAC database (Mie theory, "
+               "T-matrix spheroids for mineral dust), per channel wavelength and humidity. Off falls back to the analytic "
+               "lobe of mieAnisotropy / miePhaseAlpha with the type's asymmetry. The Custom type and the Manual aerosol model "
+               "always use the analytic lobe.");
+    RTX_OPTION("rtx.atmosphere", Vector3, aerosolSingleScatteringAlbedo, Vector3(0.93f, 0.93f, 0.93f),
+               "Custom aerosol type: fraction of aerosol extinction that is scattering rather than absorption, per channel. "
+               "Soot lowers it, and making it fall toward blue tints the haze warm like desert dust.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolAngstromExponent, 1.3f,
+               "Custom aerosol type: wavelength dependence of the aerosol extinction, ~ lambda^-alpha. 0 for large "
+               "particles (dust, sea salt), 1-1.5 for fine continental and urban haze.",
+               args.minValue = -1.0f, args.maxValue = 4.0f);
+    RTX_OPTION("rtx.atmosphere", bool, aerosolLowSunBlend, false,
+               "Custom aerosol type only: blend aerosolSingleScatteringAlbedo and aerosolAngstromExponent toward "
+               "aerosolLowSunSingleScatteringAlbedo / aerosolLowSunAngstromExponent as the sun elevation falls from "
+               "aerosolLowSunBlendStartDegrees to aerosolLowSunBlendEndDegrees. A blue scattering, red absorbing haze "
+               "turns green under a reddened low sun; the blend lets it warm toward realistic sunset colours instead.");
+    RTX_OPTION("rtx.atmosphere", Vector3, aerosolLowSunSingleScatteringAlbedo, Vector3(1.0f, 1.0f, 1.0f),
+               "Single scattering albedo the custom aerosol blends toward at low sun (1, 1, 1 = non-absorbing, neutral).");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolLowSunAngstromExponent, 1.0f,
+               "Angstrom exponent the custom aerosol blends toward at low sun. Around 1 scatters the reddened sunlight "
+               "nearly neutrally, which is what makes real sunset haze orange.",
+               args.minValue = -1.0f, args.maxValue = 4.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolLowSunBlendStartDegrees, 30.0f,
+               "Sun elevation in degrees at and above which the custom aerosol keeps its authored optics.",
+               args.minValue = 0.0f, args.maxValue = 90.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolLowSunBlendEndDegrees, 5.0f,
+               "Sun elevation in degrees at and below which the custom aerosol has fully taken on its low sun optics.",
+               args.minValue = -10.0f, args.maxValue = 90.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, boundaryLayerHeightKm, 1.5f,
+               "Height in kilometers of the well mixed boundary layer that holds the Visibility model's aerosol at "
+               "constant density. 1-2 km on a sunny day; a thin layer under an inversion is a few hundred meters.",
+               args.minValue = 0.05f, args.maxValue = 5.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, boundaryLayerTransitionKm, 0.25f,
+               "Half-width in kilometers of the smooth top of the boundary layer.",
+               args.minValue = 0.01f, args.maxValue = 2.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, freeTroposphereAerosolFraction, 0.15f,
+               "Aerosol concentration just above the boundary layer relative to inside it, decaying exponentially above "
+               "with the 1.2 km scale height.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
+
+    RTX_OPTION("rtx.atmosphere", AtmosphereCoefficientMode, coefficientMode, AtmosphereCoefficientMode::Manual,
+               "How the Rayleigh and ozone coefficients and the sun colour are obtained. 0: Manual, the RGB options "
+               "below. 1: Physical, evaluated at 680 / 550 / 440 nm from the Rayleigh cross section, ozone cross sections "
+               "for a 300 Dobson unit column, the ASTM E-490 solar spectrum and the CIE colour matching functions "
+               "(Bruneton 2017, Section 14.3), with separate spectral weights for the light scattered by air and by "
+               "aerosol. airDensity, ozoneDensity and the luminance of sunIlluminance still apply.");
+    RTX_OPTION("rtx.atmosphere", bool, spectralWhiteBalance, true,
+               "Physical coefficient mode: divide out the extraterrestrial sun colour so the sun above the atmosphere is "
+               "white and only the atmosphere's own reddening remains.");
+    RTX_OPTION("rtx.atmosphere", bool, rayleighDepolarization, true,
+               "Use Chandrasekhar's Rayleigh phase function with the molecular anisotropy of air (depolarisation factor "
+               "0.0279), which slightly flattens the 90 degree minimum of the textbook 1 + cos^2 phase.");
+    RTX_OPTION("rtx.atmosphere", bool, sunLimbDarkening, true,
+               "Darken the sun disc toward its limb with the wavelength dependent Hestroffer-Magnan law (bluer channels "
+               "darken more, so the limb warms) while preserving the disc's total illuminance.");
 
     // Advanced/Internal Atmosphere Parameters
     RTX_OPTION("rtx.atmosphere", float, planetRadius, 6371.0f, "Planet radius in kilometers.");
     RTX_OPTION("rtx.atmosphere", float, atmosphereThickness, 100.0f, "Atmosphere thickness in kilometers.");
+    // The analytic aerosol phase function applies to the Manual aerosol model, the Custom type and OPAC
+    // types with aerosolMiePhase off; otherwise the type's tabulated phase function is used.
     RTX_OPTION("rtx.atmosphere", float, mieAnisotropy, 0.8f,
-               "Mie phase function anisotropy (g parameter, -1 to 1). 0.8 is the paper's default for Earth's aerosols; "
-               "values approaching 1 concentrate nearly all aerosol scattering into a tight forward halo.");
+               "Aerosol phase asymmetry (g parameter, -1 to 1) of the analytic phase function. 0.8 is the paper's default for "
+               "Earth's aerosols; the Visibility aerosol model's OPAC types take their asymmetry from the database instead.");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, miePhaseAlpha, 1.0f,
+               "Shape of the analytic aerosol phase function's bulk lobe (Draine 2003): 0 is Henyey-Greenstein, the paper's "
+               "choice; 1 is Cornette-Shanks, whose cos^2 term restores the side and back scattering HG underestimates.",
+               args.minValue = 0.0f, args.maxValue = 1.0f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, mieForwardPeakWeight, 0.0f,
+               "Weight of a narrow Henyey-Greenstein forward lobe blended into the analytic aerosol phase function for the "
+               "aureole around the sun, which Cornette-Shanks alone lacks. 0.1-0.2 is realistic; the aureole is not "
+               "sampled by next event estimation, so glossy surfaces may see more noise.",
+               args.minValue = 0.0f, args.maxValue = 0.5f);
+    RTX_OPTION_ARGS("rtx.atmosphere", float, mieForwardPeakG, 0.97f,
+               "Asymmetry of the analytic aerosol forward lobe.",
+               args.minValue = 0.8f, args.maxValue = 0.999f);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringDirections, 8,
+               "Directions per axis integrated for each multiscattering LUT entry (squared for the total). The paper "
+               "uses 8; the LUT only bakes on parameter change, so raising this is cheap.",
+               args.minValue = 2, args.maxValue = 32);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringSteps, 20,
+               "Ray march steps per direction of the multiscattering LUT integral. The paper reports 20 as sufficient.",
+               args.minValue = 4, args.maxValue = 128);
+    RTX_OPTION_ARGS("rtx.atmosphere", int, skyViewSteps, 128,
+               "Ray march steps of the sky-view LUT bake, and of the inline sky when useSkyViewLut is off. The steps are "
+               "packed toward the viewer, where the boundary layer haze is: 32 leaves a few percent of error around the "
+               "sun in hazy air, 128 is within 0.3% of a converged march. The bake only runs when the atmosphere or "
+               "sun changes.",
+               args.minValue = 16, args.maxValue = 512);
 
     // Base coefficients (can be used for non-Earth atmospheres, scaled by density sliders)
-    // Note: defaults follow Table 1 of Hillaire's EGSR 2020 paper, converted from m^-1 to km^-1.
+    // Note: defaults follow Table 1 of Hillaire's EGSR 2020 paper, converted from m^-1 to km^-1. The table
+    // lists Bruneton's Mie extinction (4.44e-3) in its absorption column; the paper's implementation uses
+    // extinction minus scattering, a single scattering albedo of 0.9, which is what the default is.
     RTX_OPTION("rtx.atmosphere", Vector3, rayleighScattering, Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f), "Base Rayleigh scattering coefficients (km^-1).");
     RTX_OPTION("rtx.atmosphere", Vector3, mieScattering, Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f), "Base Mie scattering coefficients (km^-1).");
-    RTX_OPTION("rtx.atmosphere", Vector3, mieAbsorption, Vector3(4.4e-3f, 4.4e-3f, 4.4e-3f),
+    RTX_OPTION("rtx.atmosphere", Vector3, mieAbsorption, Vector3(0.444e-3f, 0.444e-3f, 0.444e-3f),
                "Base Mie absorption coefficients (km^-1). Aerosols absorb as well as scatter; raising this relative to "
                "mieScattering darkens the haze, and making it chromatic tints it.");
     RTX_OPTION("rtx.atmosphere", Vector3, ozoneAbsorption, Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f), "Base Ozone absorption coefficients (km^-1).");
@@ -1511,11 +1710,11 @@ namespace dxvk {
       RTX_OPTION("rtx.eye", bool, assumeViewTexgenModeAsEye, true,
                  "Used to detect eyes and its vectors, by assuming that a draw call with D3DTSS_TCI_CAMERASPACEPOSITION and specific texture transform is an eye draw call.");
       RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.18F,
-                 "How much to offset a sphere origin when calculating the eye normals on Whites. "
+                 "Radius of the sphere used to calculate eye normals on the whites, in world units. "
                  "The larger the value, the more pronounced the ambient shadowing is on an eyeball, to better ground the eyes on a face.");
       RTX_OPTION("rtx.eye", float, corneaSphereOffset, 0.1F,
-                 "How much to offset a sphere origin when calculating the eye normals on Cornea. "
-                 "Positive values make the eye cornea appear more spherical. Negative values - more flat.");
+                 "Radius of the sphere used to calculate eye normals on the cornea, in world units. "
+                 "Larger values make the eye cornea appear more spherical.");
       RTX_OPTION("rtx.eye", float, eyeWhitesAlbedoScale, 0.5F, "Brightness multiplier for the eye whites.");
       RTX_OPTION("rtx.eye", float, irisRadius, 0.165F,
                  "Size of an iris in the iris texture. "

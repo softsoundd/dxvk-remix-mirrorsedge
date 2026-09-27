@@ -43,8 +43,6 @@ namespace dxvk {
     void gameWndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
     LRESULT overlayWndProc(HWND, UINT, WPARAM, LPARAM);
 
-    void flushPendingImGuiEvents(); // Present/render thread only
-
     void setDebugDraw(bool enable, BYTE alpha = 96) {
       m_debugDraw = enable;
       m_debugAlpha = alpha;
@@ -63,6 +61,8 @@ namespace dxvk {
 
     bool isOurForeground() const;
 
+    LRESULT forwardToImGui(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
     HWND m_gameHwnd = nullptr;
 
     std::atomic<HWND> m_hwnd { 0 };
@@ -74,13 +74,6 @@ namespace dxvk {
     UINT m_w = 1, m_h = 1;
 
     bool  m_mouseInsideOverlay = false;
-
-    // -1 = none, 0 = kill focus, 1 = set focus
-    std::atomic<int>  m_pendingImGuiFocus { -1 };
-    std::atomic<bool> m_pendingImGuiMouseLeave { false };
-    // Cached for overlay-thread reads (updated in flushPendingImGuiEvents).
-    std::atomic<float> m_displaySizeX { 0.0f };
-    std::atomic<float> m_displaySizeY { 0.0f };
 
     bool  m_debugDraw = false;
     BYTE  m_debugAlpha = 96;

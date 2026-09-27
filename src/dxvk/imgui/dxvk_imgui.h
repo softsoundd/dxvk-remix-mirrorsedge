@@ -31,6 +31,7 @@
 #include "../util/rc/util_rc.h"
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_keybind.h"
+#include "../../util/thread.h"
 
 #include "../dxvk_format.h"
 #include "../dxvk_util.h"
@@ -84,6 +85,22 @@ namespace dxvk {
      * see: https://docs.microsoft.com/en-us/previous-versions/windows/desktop/legacy/ms633573(v=vs.85)
      */
     void wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+    /**
+     * \brief Runs \p fn with ImGui's input state locked
+     *
+     * Input arrives on the overlay window thread, or on whichever thread runs
+     * the game's window procedure for the legacy input path, while render()
+     * consumes it on the render thread. \p fn is skipped until render() has
+     * initialized the backends.
+     */
+    template<typename Fn>
+    void withInputLock(Fn&& fn) {
+      std::lock_guard<dxvk::recursive_mutex> lock(m_inputMutex);
+
+      if (m_init)
+        fn();
+    }
 
     /**
      * \brief Render ImGUI
@@ -158,6 +175,9 @@ namespace dxvk {
 
     HWND                  m_gameHwnd;
     bool                  m_init = false;
+    // Recursive: the Win32 backend calls ReleaseCapture() while handling a button release, which
+    // re-enters the overlay's window procedure synchronously with WM_CAPTURECHANGED.
+    dxvk::recursive_mutex m_inputMutex;
     bool                  m_prevCursorVisible = false;
 
     int                   m_cachedGameCursorX = 0;

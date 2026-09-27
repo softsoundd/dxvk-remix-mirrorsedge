@@ -1627,7 +1627,8 @@ namespace {
         presInfo.AutoDepthStencilFormat = D3DFMT_UNKNOWN;
         presInfo.Flags = 0;
         presInfo.FullScreen_RefreshRateInHz = 0;
-        presInfo.PresentationInterval = 0;
+        // Seeds rtx.enableVsync's default, so API apps start with vsync off.
+        presInfo.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
       }
 
       HRESULT hr = d3d9->CreateDeviceEx(

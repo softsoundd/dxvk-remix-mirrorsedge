@@ -86,6 +86,15 @@ namespace dxvk {
         {DEBUG_VIEW_TEXCOORDS_GRADIENT_X, "Texture Coordinates Gradient X"},
         {DEBUG_VIEW_TEXCOORDS_GRADIENT_Y, "Texture Coordinates Gradient Y"},
         {DEBUG_VIEW_TEXCOORD_GENERATION_MODE, "Texture Coordinates Generation Mode"},
+        {DEBUG_VIEW_EYE_REGIONS, "Eye Regions (whites/cornea/iris)",
+                                "Colors the regions eye shading distinguishes, blended over the diffuse albedo:\n"
+                                "Red: iris (rtx.eye.irisRadius) - the albedo/iris texture blend region\n"
+                                "Blue: cornea (rtx.eye.irisRadius + 0.04) - eyeCalcNormalFrame's normal-bump region\n"
+                                "Green: whites - outside both of the above\n"
+                                "White dot: the computed eye center (where the projected UV is exactly 0.5, 0.5)\n"
+                                "Unblended diffuse albedo: not classified as an eye\n"
+                                "Parameterize via:\n"
+                                "Debug Knob [0]: region color overlay opacity, 0-1 [Default: 0.5]"},
         {DEBUG_VIEW_VIRTUAL_MOTION_VECTOR, "Virtual Motion Vector"},
         {DEBUG_VIEW_SCREEN_SPACE_MOTION_VECTOR, "Screen-Space Motion Vector"},
         {DEBUG_VIEW_TRIANGLE_NORMAL, "Triangle Normal"},
@@ -379,6 +388,13 @@ namespace dxvk {
                                                                  "Shows 1 / sampling probability on pixels selected by the active pixel mask." },
         {DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS,             "Sparse Rendering Active Threads",
                                                                  "Outputs 1 for pixels whose composite thread was active (or a primary miss)." },
+
+        {DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_INSCATTER,     "Atmosphere Aerial Perspective In-Scatter",
+                                                                 "Physical Atmosphere only. In-scattered radiance added between the camera and the primary hit,\n"
+                                                                 "including the reflected segment on mirror (PSR) pixels. Black on primary misses." },
+        {DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_TRANSMITTANCE, "Atmosphere Aerial Perspective Transmittance",
+                                                                 "Physical Atmosphere only. Mean transmittance applied to the primary hit radiance (1 = no haze).\n"
+                                                                 "White on primary misses." },
 
         {DEBUG_VIEW_SHADOW_TERMINATOR_OFFSET, "Shadow Terminator Offset"},
       };

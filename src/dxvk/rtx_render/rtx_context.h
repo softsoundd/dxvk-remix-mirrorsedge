@@ -88,8 +88,17 @@ namespace dxvk {
       * \param [in] cachedReflexFrameId: The Reflex frame ID at the time of calling, cached so Reflex can have
       * consistent frame IDs throughout the dispatches of an application frame.
       * \param [in] targetImage: Image to store raytraced result in
+      * \param [in] hdrCanvas: When set, stops before tone mapping and leaves the linear HDR image in this
+      *        R16G16B16A16_SFLOAT image (the target's size) for overlays to draw into; finishInjectRTX
+      *        completes the frame. See documentation/UE3Compatibility.md, "Deferred overlays".
       */
-    void injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr);
+    void injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, Rc<DxvkImage> hdrCanvas = nullptr);
+
+    /**
+      * \brief Completes an injectRTX call that was given an hdrCanvas. No-op when none is pending.
+      */
+    void finishInjectRTX();
+
     void endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, bool callInjectRtx = true);
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
@@ -161,6 +170,11 @@ namespace dxvk {
     /** 1x1 sky-view LUT hemisphere mean, or nullptr before atmosphere init. */
     Rc<DxvkImageView> getSkyHemisphereMeanView() const;
 
+    /** Atmosphere transmittance / multiscattering / aerosol phase LUTs, or nullptr before atmosphere init. */
+    Rc<DxvkImageView> getAtmosphereTransmittanceLutView() const;
+    Rc<DxvkImageView> getAtmosphereMultiscatteringLutView() const;
+    Rc<DxvkImageView> getAtmosphereAerosolPhaseLutView() const;
+
 #ifdef REMIX_DEVELOPMENT
     /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */
     bool handleCrashHotkeys();
@@ -205,6 +219,14 @@ namespace dxvk {
 
     VkExtent3D onInjectRtxFrameBegin(const VkExtent3D& upscaleExtent);
     void onInjectRtxFrameEnd(bool raytracedThisFrame);
+
+    void injectFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage);
+    // Tone mapping through the blit to the game target, on the finished linear HDR image
+    void outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+                     bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage);
+    void stageHdrCanvas(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+                        bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage);
+    void completeInjection(bool raytracedThisFrame, float gpuIdleTimeMilliseconds);
 
     void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
     void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
@@ -279,6 +301,21 @@ namespace dxvk {
     // is already display-encoded (gamma + colour curves), so the final
     // srgb_dither pass must skip its linear -> sRGB conversion.
     bool m_ue3DisplayTransformApplied = false;
+
+    // What an injectRTX call given an HDR canvas leaves for finishInjectRTX (CS thread only)
+    struct PendingInjectFinish {
+      Rc<DxvkImage> canvas;
+      Rc<DxvkImage> targetImage;
+      bool raytraced = false;        // the canvas holds the scene-unit HDR image
+      bool seeded = false;           // the canvas holds a copy of the target
+      bool needsCompletion = false;  // completeInjection is deferred to finishInjectRTX
+      bool updateAutoExposure = true;
+      bool captureScreenImage = false;
+      bool captureDebugImage = false;
+      float sceneScale = 1.f;
+      float gpuIdleTimeMilliseconds = 0.f;
+    };
+    PendingInjectFinish m_pendingInjectFinish;
 
     bool m_resetHistory = true;    // Discards use of temporal data in passes
 

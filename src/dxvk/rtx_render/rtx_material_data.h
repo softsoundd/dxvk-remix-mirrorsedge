@@ -21,6 +21,11 @@
 */
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <type_traits>
+
 #include "../../lssusd/mdl_helpers.h"
 
 #include "../../lssusd/usd_include_begin.h"
@@ -186,7 +191,7 @@
         pxr::VtValue val; \
         shader.GetAttribute(get##name##Token()).Get(&val); \
         if(!val.IsEmpty()) \
-          target.m_##name = val.UncheckedGet<type>(); \
+          target.m_##name = readMaterialConstant<type>(val, #usd_attr); \
       }
 
 #define WRITE_TEXTURE_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
@@ -314,6 +319,46 @@ private:                                                                        
 };
 
 namespace dxvk {
+  // USD holds what the MDL declares: 'int' for the enum and 8-bit count parameters and 'float' for the
+  // 0..1 alpha test reference, while the material stores uint8_t. VtValue::UncheckedGet reinterprets the
+  // held storage when the types differ (a float 0.5 read as uint8_t is its low byte, 0), so convert by
+  // the held type instead. Other types keep the direct read (Vector3 from a GfVec3f).
+  template<typename T>
+  T readMaterialConstant(const pxr::VtValue& val, const char* usdAttribute) {
+    if (val.IsHolding<T>()) {
+      return val.UncheckedGet<T>();
+    }
+
+    if constexpr (std::is_enum_v<T> || std::is_integral_v<T>) {
+      if (val.IsHolding<int>()) {
+        return static_cast<T>(val.UncheckedGet<int>());
+      }
+      if (val.IsHolding<unsigned int>()) {
+        return static_cast<T>(val.UncheckedGet<unsigned int>());
+      }
+      if (val.IsHolding<bool>()) {
+        return static_cast<T>(val.UncheckedGet<bool>());
+      }
+      if (val.IsHolding<float>() || val.IsHolding<double>()) {
+        double f = val.IsHolding<float>() ? val.UncheckedGet<float>() : val.UncheckedGet<double>();
+        // 0..1 in the MDL, 8 bits here.
+        if (std::is_same_v<T, uint8_t> && std::strcmp(usdAttribute, "alpha_test_reference_value") == 0 && f <= 1.0) {
+          f *= 255.0;
+        }
+        return static_cast<T>(std::lround(std::clamp(f, 0.0, 255.0)));
+      }
+    } else if constexpr (std::is_same_v<T, float>) {
+      if (val.IsHolding<double>()) {
+        return static_cast<float>(val.UncheckedGet<double>());
+      }
+      if (val.IsHolding<int>()) {
+        return static_cast<float>(val.UncheckedGet<int>());
+      }
+    }
+
+    return val.UncheckedGet<T>();
+  }
+
   REMIX_MATERIAL(OpaqueMaterial, LIST_OPAQUE_MATERIAL_CONSTANTS, LIST_OPAQUE_MATERIAL_TEXTURES, LIST_OPAQUE_MATERIAL_PARAMS)
   REMIX_MATERIAL(TranslucentMaterial, LIST_TRANSLUCENT_MATERIAL_CONSTANTS, LIST_TRANSLUCENT_MATERIAL_TEXTURES, LIST_TRANSLUCENT_MATERIAL_PARAMS)
   REMIX_MATERIAL(RayPortalMaterial, LIST_PORTAL_MATERIAL_CONSTANTS, LIST_PORTAL_MATERIAL_TEXTURES, LIST_PORTAL_MATERIAL_PARAMS)

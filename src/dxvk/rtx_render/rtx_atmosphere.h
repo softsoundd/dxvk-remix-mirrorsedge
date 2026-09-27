@@ -53,10 +53,18 @@ public:
    *
    * The transmittance, multiscattering and sky-view LUTs only depend on the atmosphere parameters,
    * so they are rebaked when those change. The sky-view hemisphere mean is derived from the sky-view
-   * LUT at the same time. The aerial perspective volume is fitted to the camera frustum and is
-   * therefore rebuilt every frame.
+   * LUT at the same time. The aerial perspective volume is rebuilt every frame by
+   * dispatchAerialPerspective() instead, once the primary hits it is bounded by exist.
    */
   void computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
+
+  /**
+   * \brief Build this frame's aerial perspective volume, unshadowed or ray traced per the options.
+   *
+   * Reads the primary linear view Z of rtOutput, so it must run after the G-buffer pass and before
+   * composite. computeLuts() must have run this frame.
+   */
+  void dispatchAerialPerspective(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
 
   /**
    * \brief Check if the parameter-driven LUTs need recomputation
@@ -84,9 +92,28 @@ public:
   Resources::Resource getSkyHemisphereMean() const { return m_skyHemisphereMean; }
 
   /**
-   * \brief Get aerial perspective LUT resource
+   * \brief Get this frame's aerial perspective LUT resource
    */
-  Resources::Resource getAerialPerspectiveLut() const { return m_aerialPerspectiveLut; }
+  Resources::Resource getAerialPerspectiveLut() const { return m_aerialPerspectiveLut[m_aerialPerspectiveLutIndex]; }
+
+  /**
+   * \brief Tabulated aerosol phase function, 1D over sqrt(theta / pi), RGB per channel wavelength.
+   * Filled when the tabulated phase is in use; miePhase() only samples it then.
+   */
+  Resources::Resource getAerosolPhaseLut() const { return m_aerosolPhaseLut; }
+
+  /**
+   * \brief Optics of an aerosol type of the Visibility model, per RGB channel wavelength.
+   * OPAC types come from the tables at the given relative humidity; the Custom type from its options.
+   */
+  struct AerosolOptics {
+    Vector3 singleScatteringAlbedo;
+    Vector3 extinctionRatio;  // Extinction relative to 550 nm
+    Vector3 asymmetry;        // Phase asymmetry g
+    float extinction550 = 0.0f;  // km^-1 at the database's own number density, 0 for the Custom type
+    bool tabulated = false;      // Phase function and spectral data come from the tables
+  };
+  static AerosolOptics getAerosolOptics(AtmosphereAerosolType type, float relativeHumidityPercent);
 
   /**
    * \brief Build atmosphere parameters from current RtxOptions (no GPU state).
@@ -97,9 +124,10 @@ public:
   static AtmosphereArgs buildAtmosphereArgsFromOptions();
 
   /**
-   * \brief Fill in the per-frame camera frustum basis used by the aerial perspective volume.
+   * \brief Fill in the per-frame camera fields: the frustum basis of the aerial perspective volume,
+   * the camera following altitude and the previous frame's basis for the volume's history.
    */
-  static void fillAerialPerspectiveArgs(AtmosphereArgs& args, const class RtCamera& camera);
+  void fillAerialPerspectiveArgs(AtmosphereArgs& args, const class RtCamera& camera) const;
 
   /**
    * \brief Get current atmosphere parameters
@@ -107,6 +135,23 @@ public:
   AtmosphereArgs getAtmosphereArgs() const {
     return buildAtmosphereArgsFromOptions();
   }
+
+  /**
+   * \brief Koschmieder visibility (km) implied by the ground level extinction of the given parameters.
+   */
+  static float computeEffectiveVisibilityKm(const AtmosphereArgs& args);
+
+  /**
+   * \brief Weight (0 at high sun, 1 at low sun) with which the custom aerosol takes on its low sun optics.
+   * Zero unless the Visibility model's Custom type is active with aerosolLowSunBlend enabled.
+   */
+  static float computeAerosolLowSunBlend();
+
+  /**
+   * \brief Whether the previous ray traced aerial perspective volume may be reprojected this frame.
+   * computeLuts() can clear this after fillAerialPerspectiveArgs() ran, so callers re-read it.
+   */
+  bool isAerialPerspectiveHistoryValid() const { return m_aerialPerspectiveHistoryValid; }
 
   /**
    * \brief Isotropic sky ambient estimate for volumetric multi-scatter fill.
@@ -143,11 +188,15 @@ public:
 
 private:
   void createLutResources(Rc<DxvkContext> ctx);
+  void ensureAerialPerspectiveLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
+  void updateAerosolPhaseLut(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
   void dispatchSkyHemisphereMean(Rc<DxvkContext> ctx);
-  void dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx);
+  void dispatchAerialPerspectiveTileDepth(RtxContext& ctx, const Rc<DxvkImageView>& primaryLinearViewZ);
+  void dispatchAerialPerspectiveLut(RtxContext& ctx, const AtmosphereArgs& args);
+  void dispatchShadowedAerialPerspectiveLut(RtxContext& ctx, const AtmosphereArgs& args);
 
   // LUT dimensions
   static constexpr uint32_t kTransmittanceLutWidth = 512;   // Increased from 256 for better precision
@@ -155,8 +204,8 @@ private:
   static constexpr uint32_t kMultiscatteringLutSize = 32;
   static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
   static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
-  // Paper Section 5.4 uses 32^3 over the frustum, which is enough for such a low frequency effect.
-  static constexpr uint32_t kAerialPerspectiveLutSize = 32;
+  // Over sqrt(theta / pi): 0.07 degree texels at the forward peak, 1.4 degrees at back-scatter.
+  static constexpr uint32_t kAerosolPhaseLutSize = 512;
 
   // Scale heights for exponential density profiles (in km)
   static constexpr float kRayleighScaleHeight = 8.0f;
@@ -170,7 +219,19 @@ private:
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
   Resources::Resource m_skyHemisphereMean;
-  Resources::Resource m_aerialPerspectiveLut;
+  // Two of each so the ray traced variant can reproject the previous frame while writing the current one.
+  Resources::Resource m_aerialPerspectiveLut[2];
+  // Farthest primary hit under each screen tile of the volume, which bounds the tile's march.
+  Resources::Resource m_aerialPerspectiveTileDepth[2];
+  uint32_t m_aerialPerspectiveLutIndex = 0;
+  VkExtent3D m_aerialPerspectiveLutExtent = { 0, 0, 0 };
+  bool m_aerialPerspectiveHistoryValid = false;
+  uint32_t m_aerialPerspectiveFrameIndex = 0;
+
+  Resources::Resource m_aerosolPhaseLut;
+  // Type and humidity the phase LUT currently holds; re-uploaded when they change.
+  uint32_t m_aerosolPhaseLutType = ~0u;
+  float m_aerosolPhaseLutHumidity = -1.0f;
 
   Rc<DxvkBuffer> m_constantsBuffer;
 

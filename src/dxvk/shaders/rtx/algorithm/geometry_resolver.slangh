@@ -112,6 +112,7 @@ GeometryResolverState geometryResolverStateCreateEmpty(u16vec2 pixelCoordinate)
   geometryResolverState.decalEncountered = false;
   geometryResolverState.useAlternateDisocclusionThreshold = false;
   geometryResolverState.pomOpaqueSurfaceEncountered = false;
+  geometryResolverState.unorderedDecalCandidatePresent = false;
 
   return geometryResolverState;
 }
@@ -738,6 +739,49 @@ void geometryResolverVertexOutputDebugView(
   case DEBUG_VIEW_TEXCOORD_GENERATION_MODE:
     storeInDebugView(pixelCoordinate, uint(surface.texcoordGenerationMode));
     break;
+  case DEBUG_VIEW_EYE_REGIONS:
+  {
+    // storeInDebugView(pixelCoordinate, vec3(0.0f));
+    // See the DEBUG_VIEW_EYE_REGIONS entry in rtx_debug_view.cpp for the color legend.
+    vec3 albedo = vec3(0.0f);
+
+    if (materialType == surfaceMaterialTypeOpaque)
+    {
+      albedo = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction).albedo;
+    }
+
+    vec3 color = albedo;
+
+    if (surface.isEye)
+    {
+      const float distFromCenter = length(surfaceInteraction.textureCoordinates - 0.5f);
+      vec3 regionColor;
+
+      if (distFromCenter < cb.eyeArgs.irisRadius)
+      {
+        regionColor = vec3(1.0f, 0.0f, 0.0f); // iris
+      }
+      else if (distFromCenter < cb.eyeArgs.irisRadius + 0.04f)
+      {
+        regionColor = vec3(0.0f, 0.0f, 1.0f); // cornea
+      }
+      else
+      {
+        regionColor = vec3(0.0f, 1.0f, 0.0f); // whites
+      }
+
+      if (distFromCenter < 0.01f)
+      {
+        regionColor = vec3(1.0f); // eye center marker
+      }
+
+      const float overlayOpacity = cb.debugKnob.x > 0.0f ? cb.debugKnob.x : 0.5f;
+      color = mix(albedo, regionColor, overlayOpacity);
+    }
+
+    storeInDebugView(pixelCoordinate, color);
+    break;
+  }
   case DEBUG_VIEW_TRIANGLE_NORMAL:
     storeInDebugView(pixelCoordinate, surfaceInteraction.debugTriangleNormal);
     break;
@@ -775,6 +819,14 @@ void geometryResolverVertexOutputDebugView(
   case DEBUG_VIEW_VERTEX_ALPHA:
     storeInDebugView(pixelCoordinate, surfaceInteraction.vertexColor.w);
 
+    break;
+  }
+  // Too many cases in the DEBUG_VIEW switch statement breaks transparent shading on Intel GPUs.
+  // Splitting into two statements serves as a WAR.
+  switch(cb.debugView)
+  {
+  default:
+  case DEBUG_VIEW_DISABLED:
     break;
   case DEBUG_VIEW_PORTAL_SPACE:
   {
@@ -1789,6 +1841,7 @@ void geometryResolverVertex(
   uint4 decalMemory = 0;
   vec3 decalEmissiveRadiance = vec3(0.0f);
   int surfaceIndex = -1;
+  bool decalCandidatePresent = false;
   resolveVertexUnorderedParticles<
     GBUFFER_RAY_FLAGS>(
     resolveMode, unorderedResolveRay,
@@ -1797,7 +1850,14 @@ void geometryResolverVertex(
     geometryResolverState.pixelCoordinate,
     geometryResolverState.accumulatedRotation, geometryResolverState.accumulatedHitDistance, 1.0f,
     radianceAttenuation, emissiveRadiance,
-    numUnorderedInteractions, surfaceIndex);
+    numUnorderedInteractions, surfaceIndex, decalCandidatePresent);
+
+  // Accumulated over every segment of the primary path; the deferred decal pass re-traces the same
+  // candidates and skips pixels where none of them was a decal.
+  if (decalCandidatePresent)
+  {
+    geometryResolverState.unorderedDecalCandidatePresent = true;
+  }
 
   if (GBUFFER_FEATURE_DEBUG_VIEW && cb.debugView == DEBUG_VIEW_PRIMARY_DECAL_ALBEDO)
   {
@@ -1939,7 +1999,7 @@ void geometryResolverVertex(
       vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
         ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
         : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, cb.isZUp != 0);
+                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, AtmosphereAerosolPhaseLut, cb.isZUp != 0);
 
       // The camera ray never runs NEE, so the sun disc has to come from the environment here.
       skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
@@ -2570,7 +2630,7 @@ void geometryPSRResolverVertex(
       vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
         ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
         : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, cb.isZUp != 0);
+                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, AtmosphereAerosolPhaseLut, cb.isZUp != 0);
 
       // Mirror-like PSR paths never run NEE either, so without this a mirror reflecting the sky
       // shows no sun.
@@ -3065,6 +3125,7 @@ void geometryResolver(ivec2 pixelCoordinate) {
   geometryFlags.performPSTR = geometryResolverState.performPSTR;
   geometryFlags.performPSRR = geometryResolverState.performPSRR;
   geometryFlags.pomOpaqueSurfaceEncountered = geometryResolverState.pomOpaqueSurfaceEncountered;
+  geometryFlags.unorderedDecalCandidatePresent = geometryResolverState.unorderedDecalCandidatePresent;
 
   // Output miss data for the secondary surface if it is not present
   // Note: Known to not be the selected surface in this case, hence why false is passed for this.
@@ -3209,6 +3270,14 @@ void geometryResolverApplyUnorderedDecalsPass(ivec2 pixelCoordinate) {
   }
 
   const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(pixelCoordinate, SharedFlags);
+
+  // The primary pass already walked these candidates while resolving particles; if it met no decal
+  // (and saw every candidate), re-tracing here would only visit the same particles again.
+  if (!geometryFlags.unorderedDecalCandidatePresent)
+  {
+    return;
+  }
+
   // Match the jittered primary ray used to populate the GBuffer. Non-serialized
   // view directions are reconstructed from this ray during GBuffer decode.
   const Ray primaryRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate);

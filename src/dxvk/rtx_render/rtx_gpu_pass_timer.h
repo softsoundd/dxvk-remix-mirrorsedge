@@ -101,6 +101,16 @@ namespace dxvk {
       AppCsSync,        // application thread: blocked in DxvkCsThread::synchronize (resource readbacks, CS back-pressure)
       AppEventQueryWait,// application thread: polling a pending D3DQUERYTYPE_EVENT (the game's own GPU throttle)
       AppResourceWait,  // application thread: D3D9DeviceEx::WaitForResource (Lock on a GPU-busy resource)
+      AppLock,          // application thread: inside the D3D9 buffer/texture Lock and Unlock entry points (data uploads; includes AppResourceWait)
+      AppDraw,          // application thread: inside the D3D9 Draw* entry points (classification, geometry hashing, capture setup, state binding, CS enqueue)
+      AppDrawPrepare,   // application thread: of which D3D9Rtx::PrepareDraw*GeometryForRT (draw classification and geometry processing)
+      // Phases of D3D9Rtx::internalPrepareDraw, in order; their sum is the bulk of AppDrawPrepare.
+      AppPrepClassify,  //   vertex factory and instancing classification, makeDrawCallType
+      AppPrepIndices,   //   index buffer processing (min/max scan or memoized lookup)
+      AppPrepRenderState,//  legacy material, fog and render state (textures, transforms, material hash)
+      AppPrepVertices,  //   vertex stream processing, UE3 instance transforms, skinning anchor, capture position source
+      AppPrepIdentity,  //   geometry identity keys (stable VS hash, cache keys, geometry hash and bounding box scheduling)
+      AppPrepCapture,   //   skinning data, static vertex-capture cache reuse and capture setup
       CsBusy,           // CS thread: executing command stream chunks (includes injectRTX)
       CsInjectRtx,      // CS thread: RtxContext::injectRTX
       CsSubmitBackpressure, // CS thread: blocked in DxvkSubmissionQueue::submit because MaxNumQueuedCommandBuffers lists are in flight
@@ -132,10 +142,33 @@ namespace dxvk {
       }
       CpuScope(const CpuScope&) = delete;
       CpuScope& operator=(const CpuScope&) = delete;
+      // The timer this scope reports to, or null when timings are disabled; lets nested scopes skip the enable check.
+      RtxGpuPassTimer* timer() const { return m_timer; }
     private:
       RtxGpuPassTimer* m_timer;
       CpuCounter m_counter;
       std::chrono::steady_clock::time_point m_start;
+    };
+
+    // Attributes consecutive phases of one code path to counters with a single timestamp per boundary:
+    // lap() adds the time since the previous lap (or construction) to the given counter.
+    class CpuPhaseTimer {
+    public:
+      explicit CpuPhaseTimer(RtxGpuPassTimer* timer) : m_timer(timer) {
+        if (m_timer != nullptr) {
+          m_last = std::chrono::steady_clock::now();
+        }
+      }
+      void lap(CpuCounter counter) {
+        if (m_timer != nullptr) {
+          const auto now = std::chrono::steady_clock::now();
+          m_timer->addCpuSample(counter, std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_last).count());
+          m_last = now;
+        }
+      }
+    private:
+      RtxGpuPassTimer* m_timer;
+      std::chrono::steady_clock::time_point m_last;
     };
 
     RTX_OPTION("rtx.gpuPassTimings", std::string, sweepSteps, "",
@@ -150,6 +183,10 @@ namespace dxvk {
     inline static const VirtualKeys kDefaultSweepHotkey{ VirtualKey{VK_CONTROL}, VirtualKey{VK_SHIFT}, VirtualKey{VK_MENU}, VirtualKey{'P'} };
     RTX_OPTION("rtx.gpuPassTimings", VirtualKeys, sweepHotkey, kDefaultSweepHotkey,
                "Hotkey that starts (or, while running, stops) the automated GPU pass timing sweep. Default is Ctrl+Shift+Alt+P.");
+    RTX_OPTION_ARGS("rtx.gpuPassTimings", float, sweepAutoStartSeconds, 0.0f,
+                    "Starts the sweep on its own this many seconds after the timings were first enabled (so include level load time), "
+                    "once per session, for unattended runs. 0 leaves the sweep to the hotkey and the Developer Settings button.",
+                    args.minValue = 0.0f, args.maxValue = 3600.0f);
 
     RTX_OPTION("rtx.gpuPassTimings", bool, enable, false,
                "Enables built-in per-pass GPU timings. Every GPU profile zone (the same markers Tracy and Nsight see) is bracketed with timestamp queries "
@@ -272,6 +309,7 @@ namespace dxvk {
     };
 
     bool parseSweepSteps(const std::string& text, std::vector<SweepStep>& outSteps) const;
+    void startSweepLocked();
     void applySweepStep(SweepStep& step);
     void restoreSweepStep(SweepStep& step);
     void advanceSweepLocked();
@@ -336,6 +374,8 @@ namespace dxvk {
 
     SweepState m_sweep;
     bool m_sweepHotkeyWasDown = false;
+    bool m_sweepAutoStarted = false;
+    std::chrono::steady_clock::time_point m_enabledTime = std::chrono::steady_clock::now();
 
     std::chrono::steady_clock::time_point m_lastLogTime = std::chrono::steady_clock::now();
   };
