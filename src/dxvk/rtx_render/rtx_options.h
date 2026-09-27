@@ -1301,7 +1301,10 @@ namespace dxvk {
       }
       // If the option is changed to WaitingForImplicitSwapchain, just leave the computed state as it was.
     }
-    RTX_OPTION_ARGS("rtx", EnableVsync, enableVsync, EnableVsync::WaitingForImplicitSwapchain, "Controls the game's V-Sync setting. Native game's V-Sync settings are ignored.", 
+    RTX_OPTION_ARGS("rtx", EnableVsync, enableVsync, EnableVsync::WaitingForImplicitSwapchain,
+                    "Controls V-Sync: 0 forces it off and 1 forces it on. The default (2) adopts the game's setting when it "
+                    "creates its device; only D3DPRESENT_INTERVAL_IMMEDIATE counts as off, and d3d9.presentInterval takes "
+                    "precedence when set. Later changes to the game's setting are ignored.",
                     args.flags = RtxOptionFlags::NoSave | RtxOptionFlags::UserSetting,
                     args.onChangeCallback = &EnableVsyncOnChange);
 

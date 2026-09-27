@@ -345,15 +345,19 @@ namespace dxvk {
     sentry::setTag("windowed", m_presentParams.Windowed ? "true" : "false");
 
     // NV-DXVK start: DLFG integration
-    if (RtxOptions::enableVsync() == EnableVsync::WaitingForImplicitSwapchain) {
-      // save the vsync state when the first swapchain is created, to act as the default.
-      // D3DPRESENT_INTERVAL_IMMEDIATE (0x80000000) is a non-zero interval that means vsync off (UE3 passes it
-      // when its V-Sync setting is disabled); interval 0 (DEFAULT) keeps the upstream reading of "off".
-      const bool gameWantsVsync = m_presentParams.PresentationInterval != 0 &&
-                                  m_presentParams.PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE;
-      RtxOptions::enableVsyncState = gameWantsVsync ? EnableVsync::On : EnableVsync::Off;
-      Logger::info(str::format("V-Sync latched from the game's present interval 0x", std::hex, m_presentParams.PresentationInterval, std::dec,
-                               ": ", gameWantsVsync ? "on" : "off", " (override with rtx.enableVsync)"));
+    // Only the implicit swapchain seeds the default: m_implicitSwapchain is still null while it is being constructed.
+    if (RtxOptions::enableVsync() == EnableVsync::WaitingForImplicitSwapchain && pDevice->m_implicitSwapchain == nullptr) {
+      // D3D9 semantics: DEFAULT behaves like ONE, and only IMMEDIATE presents without waiting for vblank.
+      const int32_t forcedInterval = pDevice->GetOptions()->presentInterval;
+      const bool vsync = forcedInterval >= 0
+        ? forcedInterval != 0
+        : m_presentParams.PresentationInterval != D3DPRESENT_INTERVAL_IMMEDIATE;
+      RtxOptions::enableVsyncState = vsync ? EnableVsync::On : EnableVsync::Off;
+
+      const std::string source = forcedInterval >= 0
+        ? str::format("d3d9.presentInterval = ", forcedInterval)
+        : str::format("the game's present interval 0x", std::hex, m_presentParams.PresentationInterval);
+      Logger::info(str::format("V-Sync ", vsync ? "on" : "off", " from ", source, " (override with rtx.enableVsync)"));
     }
     // NV-DXVK end
 
@@ -493,36 +497,10 @@ namespace dxvk {
 
     D3D9DeviceLock lock = m_parent->LockDevice();
 
-    uint32_t presentInterval = m_presentParams.PresentationInterval;
-
-    // This is not true directly in d3d9 to to timing differences that don't matter for us.
-    // For our purposes...
-    // D3DPRESENT_INTERVAL_DEFAULT (0) == D3DPRESENT_INTERVAL_ONE (1) which means VSYNC.
-    presentInterval = std::max(presentInterval, 1u);
-
-    if (presentInterval == D3DPRESENT_INTERVAL_IMMEDIATE || (dwFlags & D3DPRESENT_FORCEIMMEDIATE))
-      presentInterval = 0;
-
-    auto options = m_parent->GetOptions();
-
-    if (options->presentInterval >= 0)
-      presentInterval = options->presentInterval;
-
     // NV-DXVK start: Reflex integration
-    switch (RtxOptions::enableVsyncState) {
-    case EnableVsync::Off:
-      presentInterval = 0;
-      break;
-
-    case EnableVsync::On:
-      presentInterval = 1;
-      break;
-
-    default:
-      // this should never happen
-      assert(!"invalid vsync enable state");
-      break;
-    }
+    // rtx.enableVsync alone decides vsync: the game's interval and d3d9.presentInterval only seed its default
+    // (see the constructor), and D3DPRESENT_FORCEIMMEDIATE is ignored.
+    const uint32_t presentInterval = RtxOptions::enableVsyncState == EnableVsync::On ? 1 : 0;
     // NV-DXVK end
 
     bool vsync  = presentInterval != 0;
