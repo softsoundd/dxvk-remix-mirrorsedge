@@ -44,17 +44,20 @@ Texture2D<float4> multiscatteringLutInput;
 layout(binding = 3, rgba16f)
 RWTexture3D<float4> aerialPerspectiveLutOutput;
 
+layout(binding = 4)
+Texture2D<float> aerialPerspectiveTileDepthInput;
+
 [shader("compute")]
 [numthreads(4, 4, 4)]
 void main(uint3 threadId : SV_DispatchThreadID) {
-  AtmosphereArgs args = atmosphereArgs;
+  const AtmosphereArgs args = aerialPerspectiveMediumArgs(atmosphereArgs);
 
-  const uint size = args.aerialPerspectiveLutSize;
-  if (any(threadId >= uint3(size, size, size))) {
+  const uint3 size = uint3(args.aerialPerspectiveLutSize, args.aerialPerspectiveLutSize, args.aerialPerspectiveLutDepth);
+  if (any(threadId >= size)) {
     return;
   }
 
-  const vec3 uvw = (vec3(threadId) + 0.5f) / float(size);
+  const vec3 uvw = (vec3(threadId) + 0.5f) / vec3(size);
 
   const vec3 rayVectorWorld = aerialPerspectiveUvwToWorldPosition(uvw, args) - args.cameraPosition;
   const float rayLengthWorld = length(rayVectorWorld);
@@ -63,20 +66,17 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     return;
   }
 
-  const vec3 rayDirWorld = rayVectorWorld / rayLengthWorld;
-
-  // The atmosphere frame is Y-up with its origin on the ground under the camera. Only the axes need
-  // swapping for a Z-up game, since the ray is a direction plus a distance from here on.
-  const vec3 rayDir = normalize(args.isZUp != 0
-    ? vec3(rayDirWorld.x, rayDirWorld.z, rayDirWorld.y)
-    : rayDirWorld);
+  const vec3 rayDir = aerialPerspectiveWorldToAtmosphereDirection(rayVectorWorld / rayLengthWorld, args);
 
   const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKilometer, 1e-6f);
-  const vec3 rayOrigin = vec3(0.0f, max(args.viewAltitude, 0.0f), 0.0f);
+  const vec3 rayOrigin = aerialPerspectiveRayOrigin(args);
 
-  // Only the portion beyond the global volumetrics range belongs to this volume.
+  // Only the portion beyond the global volumetrics range and short of the tile's farthest surface
+  // belongs to this froxel.
+  const float maxRayLengthWorld = aerialPerspectiveMaxRayLength(
+    aerialPerspectiveTileDepthInput.Load(int3(threadId.xy, 0)), uvw.xy, args);
   const float startDistanceKm = args.aerialPerspectiveStartDistance * kmPerWorldUnit;
-  const float endDistanceKm = rayLengthWorld * kmPerWorldUnit;
+  const float endDistanceKm = min(rayLengthWorld, maxRayLengthWorld) * kmPerWorldUnit;
 
   vec3 transmittance = vec3(1.0f);
   vec3 inScatter = vec3(0.0f, 0.0f, 0.0f);

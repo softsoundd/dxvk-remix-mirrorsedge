@@ -284,6 +284,10 @@
 #define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_OUTPUT_SCALE 905
 #define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS 910
 
+// Physical Atmosphere aerial perspective, sampled in composite at each pixel's hit distance.
+#define DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_INSCATTER 920
+#define DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_TRANSMITTANCE 921
+
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,
   FinalRenderWithMaterialProperties,

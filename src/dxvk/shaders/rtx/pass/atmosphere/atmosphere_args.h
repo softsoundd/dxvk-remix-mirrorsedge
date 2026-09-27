@@ -23,22 +23,25 @@
 
 #include "rtx/utility/shader_types.h"
 
-// Atmosphere parameters for Hillaire physically-based atmospheric scattering
+// Atmosphere parameters for Hillaire physically-based atmospheric scattering.
 struct AtmosphereArgs {
   vec3 sunDirection;
   float planetRadius;  // in km
   
+  // Illuminance driving the light scattered by air molecules. In the Physical coefficient mode this
+  // carries the Rayleigh sky's spectral weights, which differ slightly from the direct sun's
+  // (sunDiscIlluminance) and from the aerosol's (sunIlluminanceAerosol).
   vec3 sunIlluminance;
   float atmosphereThickness;  // in km
   
   vec3 rayleighScattering;
-  float mieAnisotropy;  // Henyey-Greenstein phase function g parameter [-1, 1]
+  float mieAnisotropy;  // Aerosol phase asymmetry g [-1, 1]
   
-  vec3 mieScattering;
+  vec3 mieScattering;  // Ground level scattering coefficients (km^-1)
   float sunRayBrightness;  // Multiplier for direct sun ray brightness
 
   // Aerosols absorb as well as scatter (paper Table 1), so Mie extinction is scattering + absorption
-  vec3 mieAbsorption;  // Absorption coefficients (km^-1)
+  vec3 mieAbsorption;  // Ground level absorption coefficients (km^-1)
   uint sunDiscEnabled; // Draw the sun disc into the environment on camera / mirror rays
 
   // Ozone absorption (important for realistic sunset colors per Hillaire paper Section 3.4)
@@ -52,22 +55,49 @@ struct AtmosphereArgs {
   
   uint skyViewLutHeight;
   float ozoneLayerWidth;  // Half-width of the ozone tent profile (km)
-  float viewAltitude;     // Camera altitude offset (km)
+  float viewAltitude;     // Altitude of the baked LUTs' viewpoint (km), quantised when following the camera
   uint useSkyViewLut;     // Sample the precomputed sky-view LUT at runtime instead of ray marching per miss ray
   
   // Derived parameters (computed on CPU)
   float atmosphereRadius;  // planetRadius + atmosphereThickness
   float rayleighScaleHeight;  // exponential density falloff for Rayleigh (km)
-  float mieScaleHeight;  // exponential density falloff for Mie (km)
+  float mieScaleHeight;  // exponential density falloff of the free troposphere aerosol tail (km)
   float sunAngularRadius; // Sun angular radius in radians
+
+  // Illuminance of the sun disc and the distant sun light (direct-sun spectral weights).
+  vec3 sunDiscIlluminance;
+  float groundAlbedo;  // Diffuse albedo of the virtual planet ground (paper Section 4)
+
+  // Illuminance driving the light scattered by aerosol, whose spectral weights follow the aerosol's own
+  // wavelength dependence rather than the Rayleigh sky's. Equal to sunIlluminance in the Manual mode.
+  vec3 sunIlluminanceAerosol;
+  float pad0;
+
+  // Hestroffer-Magnan limb darkening exponents per channel, I(mu) = mu^alpha. 0 = uniform disc.
+  vec3 sunLimbDarkeningExponent;
+  // Rayleigh depolarisation term gamma = rho / (2 - rho) of Chandrasekhar's phase function. 0 = classic.
+  float rayleighPhaseGamma;
+
+  // Boundary (mixing) layer aerosol profile: unit density up to the layer top, then the exponential
+  // tail scaled by mieBoundaryLayerTailScale. 0 height = pure exponential profile (paper default).
+  float mieBoundaryLayerHeight;      // km
+  float mieBoundaryLayerTransition;  // km, half-width of the smooth layer top
+  float mieBoundaryLayerTailScale;   // Free troposphere / mixing layer concentration ratio
+  // Draine phase shape: 0 = Henyey-Greenstein, 1 = Cornette-Shanks.
+  float miePhaseAlpha;
+
+  float mieForwardPeakWeight;  // Blend weight of the narrow HG forward lobe (sun aureole), 0 disables
+  float mieForwardPeakG;       // Asymmetry of that forward lobe
+  uint multiscatteringSqrtDirectionCount;  // Directions per axis of the multiscattering LUT integral
+  uint multiscatteringStepCount;           // Ray march steps per direction in that integral
 
   // Aerial perspective froxel volume (camera frustum fitted, rebuilt every frame).
   // Note: RtxAtmosphere::kBakeInvariantArgsSize assumes every field from here on is camera dependent,
   // so anything that should invalidate the baked LUTs must be declared above this point.
-  uint aerialPerspectiveLutSize;   // Width / height / depth of the froxel volume, 0 when disabled
+  uint aerialPerspectiveLutSize;   // Width / height of the froxel volume, 0 when disabled
   float aerialPerspectiveDepthRange;  // Depth covered by the volume, in world units
-  // In-scatter closer than this is already integrated by the global volumetrics froxel grid, so the
-  // aerial perspective march starts here to avoid double counting. 0 when volumetrics are disabled.
+  // Where the march starts, in world units: the global volumetrics range, which already integrates the
+  // air nearer than it, or the artistic start distance option, whichever is larger.
   float aerialPerspectiveStartDistance;
   float worldUnitsPerKilometer;
 
@@ -77,11 +107,36 @@ struct AtmosphereArgs {
   uint isZUp;  // Non-zero when the game's world is Z-up rather than the atmosphere's internal Y-up
 
   vec3 cameraForward;
-  float pad0;
+  float aerialPerspectiveViewAltitude;  // Exact camera altitude (km) for the per-frame volume
 
   vec3 cameraRight;
-  float pad1;
+  uint aerialPerspectiveLutDepth;  // Slice count of the froxel volume
 
   vec3 cameraUp;
+  uint aerialPerspectiveShadowSteps;  // Samples per froxel ray in the ray-traced volume, each tracing a sun and a sky ray; 0 = unshadowed
+
+  // Previous frame's camera basis, for reprojecting the ray-traced volume's history.
+  vec3 prevCameraPosition;
+  float aerialPerspectiveShadowMaxDistance;  // Sun and sky visibility ray length, in world units
+
+  vec3 prevCameraForward;
+  float aerialPerspectiveTemporalBlend;  // History weight of the ray-traced volume, 0 = no accumulation
+
+  vec3 prevCameraRight;
+  uint aerialPerspectiveHistoryValid;  // Non-zero when the previous volume may be reprojected
+
+  vec3 prevCameraUp;
+  uint aerialPerspectiveFrameIndex;  // Drives the per-frame sample jitter of the ray-traced volume
+
+  // Stylisation: multiplies the aerosol coefficients inside the aerial perspective marches only, so haze
+  // on geometry can be thickened without touching the sky, the sun or the baked LUTs. 1 = physical.
+  float aerialPerspectiveAerosolScale;
+  // Linear view Z the G-buffer writes for a primary miss, which the tile depth pass treats as unbounded.
+  float aerialPerspectiveMissLinearViewZ;
+  float pad1;
   float pad2;
 };
+
+#ifdef __cplusplus
+static_assert((sizeof(AtmosphereArgs) & 15) == 0);
+#endif

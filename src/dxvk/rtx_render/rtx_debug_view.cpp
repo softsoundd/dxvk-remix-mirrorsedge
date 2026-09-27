@@ -357,6 +357,13 @@ namespace dxvk {
         {DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS,             "Sparse Rendering Active Threads",
                                                                  "Outputs 1 for pixels whose composite thread was active (or a primary miss)." },
 
+        {DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_INSCATTER,     "Atmosphere Aerial Perspective In-Scatter",
+                                                                 "Physical Atmosphere only. In-scattered radiance added between the camera and the primary hit,\n"
+                                                                 "including the reflected segment on mirror (PSR) pixels. Black on primary misses." },
+        {DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_TRANSMITTANCE, "Atmosphere Aerial Perspective Transmittance",
+                                                                 "Physical Atmosphere only. Mean transmittance applied to the primary hit radiance (1 = no haze).\n"
+                                                                 "White on primary misses." },
+
         {DEBUG_VIEW_SHADOW_TERMINATOR_OFFSET, "Shadow Terminator Offset"},
       };
 

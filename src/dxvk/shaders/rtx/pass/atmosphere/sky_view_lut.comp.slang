@@ -40,7 +40,7 @@ RWTexture2D<float4> skyViewLutOutput;
 // Compute sky color for a given view direction
 vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
   // Camera on the local vertical at the configured altitude, matching evalSkyRadiance().
-  const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, 0.0f), 0.0f);
+  const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, kPlanetRadiusOffset), 0.0f);
 
   // uv.x maps linearly to azimuth; uv.y uses the paper's Section 5.3 latitude compression, which
   // concentrates texels near the horizon where the sky has its highest visual frequency.

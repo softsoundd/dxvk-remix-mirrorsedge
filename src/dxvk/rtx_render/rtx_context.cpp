@@ -346,6 +346,26 @@ namespace dxvk {
     return mean.isValid() ? mean.view : nullptr;
   }
 
+  Rc<DxvkImageView> RtxContext::getAtmosphereTransmittanceLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getTransmittanceLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
+  Rc<DxvkImageView> RtxContext::getAtmosphereMultiscatteringLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getMultiscatteringLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
   RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
     if (shouldUseDLSS() && m_common->metaDLSS().isActive()) {
       return InternalUpscaler::DLSS;
@@ -746,6 +766,12 @@ namespace dxvk {
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("denoisedDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
           takeScreenshot("denoisedSpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
+        }
+
+        // Aerial perspective volume, bounded by the primary hits the G-buffer pass produced; kept out of
+        // the path tracing / NRC sequence and dispatched right before its consumer.
+        if (m_atmosphere && RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+          m_atmosphere->dispatchAerialPerspective(*this, rtOutput);
         }
 
         // Composition
@@ -1488,9 +1514,12 @@ namespace dxvk {
       constants.atmosphereArgs = RtxAtmosphere::buildAtmosphereArgsFromOptions();
       // The aerial perspective volume is fitted to the camera, so its basis has to be supplied
       // before the LUTs are baked.
-      RtxAtmosphere::fillAerialPerspectiveArgs(constants.atmosphereArgs, cameraManager.getMainCamera());
+      m_atmosphere->fillAerialPerspectiveArgs(constants.atmosphereArgs, cameraManager.getMainCamera());
+      constants.atmosphereArgs.aerialPerspectiveMissLinearViewZ = constants.primaryDirectNrd.missLinearViewZ;
 
       m_atmosphere->computeLuts(this, constants.atmosphereArgs);
+      // A rebake or resize above drops the ray traced volume's history.
+      constants.atmosphereArgs.aerialPerspectiveHistoryValid = m_atmosphere->isAerialPerspectiveHistoryValid() ? 1u : 0u;
       m_atmosphere->syncDistantSunLight(*this, constants.atmosphereArgs);
     }
 

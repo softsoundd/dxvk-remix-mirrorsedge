@@ -22,8 +22,8 @@
 
 // Multiple scattering LUT, the central contribution of Hillaire's EGSR 2020 paper (Section 5.5).
 //
-// For each (sun zenith angle, altitude) entry this integrates, over 64 uniformly distributed
-// directions around the sample point:
+// For each (sun zenith angle, altitude) entry this integrates, over a grid of uniformly distributed
+// directions around the sample point (8x8 by default):
 //   - L_2ndOrder (Equations 5-6): second order in-scattered luminance for a unit illuminance light,
 //     including the diffuse response of the planet's ground.
 //   - f_ms (Equations 7-8): a unitless [0, 1] transfer factor describing how much energy the
@@ -46,11 +46,12 @@ Texture2D<float4> transmittanceLutInput;
 layout(binding = 2, rgba16f)
 RWTexture2D<float4> multiscatteringLutOutput;
 
-// 8x8 directions over the sphere, matching the paper's 64 direction budget.
-static const uint kSqrtDirectionCount = 8;
-static const uint kDirectionCount = kSqrtDirectionCount * kSqrtDirectionCount;
-// Ray march step count per direction. The paper reports 20 as sufficient.
-static const int kMarchStepCount = 20;
+// The paper's budget is 8x8 directions over the sphere and 20 march steps per direction; both come from
+// the constant buffer so the bake, which only runs on parameter change, can be pushed further.
+static const uint kMinSqrtDirectionCount = 2;
+static const uint kMaxSqrtDirectionCount = 32;
+static const int kMinMarchStepCount = 4;
+static const int kMaxMarchStepCount = 128;
 
 struct MultiscatterIntegral {
   vec3 secondOrderLuminance;  // L_2ndOrder for E_I = 1
@@ -86,11 +87,12 @@ MultiscatterIntegral integrateDirection(
     return result;
   }
 
-  const float invSteps = 1.0f / float(kMarchStepCount);
+  const int marchStepCount = clamp(int(args.multiscatteringStepCount), kMinMarchStepCount, kMaxMarchStepCount);
+  const float invSteps = 1.0f / float(marchStepCount);
   vec3 throughput = vec3(1.0f);
   float segmentStart = 0.0f;
 
-  for (int i = 0; i < kMarchStepCount; ++i) {
+  for (int i = 0; i < marchStepCount; ++i) {
     const float segmentEnd = atmosphereStepFraction(float(i + 1) * invSteps);
     const float dt = (segmentEnd - segmentStart) * tEnd;
     const float t = (segmentStart + (segmentEnd - segmentStart) * 0.5f) * tEnd;
@@ -130,7 +132,7 @@ MultiscatterIntegral integrateDirection(
 
     if (NdotL > 0.0f) {
       const vec3 sunShadowing = evalSunShadowing(groundPos, sunDir, transmittanceLutInput, args);
-      result.secondOrderLuminance += throughput * sunShadowing * NdotL * (kGroundAlbedo / kPi);
+      result.secondOrderLuminance += throughput * sunShadowing * NdotL * (args.groundAlbedo / kPi);
     }
   }
 
@@ -138,7 +140,7 @@ MultiscatterIntegral integrateDirection(
 }
 
 vec3 computeMultiscattering(float sunZenithCosAngle, float altitude, AtmosphereArgs args) {
-  const vec3 samplePos = vec3(0.0f, clamp(altitude, 0.0f, args.atmosphereThickness), 0.0f);
+  const vec3 samplePos = vec3(0.0f, clamp(altitude, kPlanetRadiusOffset, args.atmosphereThickness), 0.0f);
 
   const float sunZenithSinAngle = sqrt(max(0.0f, 1.0f - sunZenithCosAngle * sunZenithCosAngle));
   const vec3 sunDir = normalize(vec3(sunZenithSinAngle, sunZenithCosAngle, 0.0f));
@@ -146,13 +148,16 @@ vec3 computeMultiscattering(float sunZenithCosAngle, float altitude, AtmosphereA
   vec3 secondOrderLuminance = vec3(0.0f);
   vec3 transferFactor = vec3(0.0f);
 
+  const uint sqrtDirectionCount = clamp(args.multiscatteringSqrtDirectionCount, kMinSqrtDirectionCount, kMaxSqrtDirectionCount);
+  const uint directionCount = sqrtDirectionCount * sqrtDirectionCount;
+
   // Uniform directions over the sphere, so the Monte Carlo estimator of Equations 5 and 7 carries a
   // 4pi/N weight. Those equations also apply p_u to the whole per-direction integral, on top of the
   // p_u that Equation 6 already applies to its own single scattering term.
-  for (uint i = 0; i < kSqrtDirectionCount; ++i) {
-    for (uint j = 0; j < kSqrtDirectionCount; ++j) {
-      const float u = (float(i) + 0.5f) / float(kSqrtDirectionCount);
-      const float v = (float(j) + 0.5f) / float(kSqrtDirectionCount);
+  for (uint i = 0; i < sqrtDirectionCount; ++i) {
+    for (uint j = 0; j < sqrtDirectionCount; ++j) {
+      const float u = (float(i) + 0.5f) / float(sqrtDirectionCount);
+      const float v = (float(j) + 0.5f) / float(sqrtDirectionCount);
 
       const float theta = 2.0f * kPi * u;
       const float cosPhi = 1.0f - 2.0f * v;
@@ -167,7 +172,7 @@ vec3 computeMultiscattering(float sunZenithCosAngle, float altitude, AtmosphereA
   }
 
   // The sphere solid angle and the outer p_u cancel exactly, leaving the mean over directions.
-  const float directionWeight = (4.0f * kPi) * kIsotropicPhase / float(kDirectionCount);
+  const float directionWeight = (4.0f * kPi) * kIsotropicPhase / float(directionCount);
   secondOrderLuminance *= directionWeight;
   transferFactor *= directionWeight;
 
@@ -196,9 +201,9 @@ void main(uint2 threadId : SV_DispatchThreadID) {
 
   const vec2 uv = (vec2(threadId) + 0.5f) / vec2(args.multiscatteringLutSize, args.multiscatteringLutSize);
 
-  // Parameterization from Section 5.5.2, matching sampleMultiscatteringLut().
+  // Parameterization matching sampleMultiscatteringLut().
   const float sunZenithCosAngle = textureCoordToUnitRange(uv.x, args.multiscatteringLutSize) * 2.0f - 1.0f;
-  const float altitude = textureCoordToUnitRange(uv.y, args.multiscatteringLutSize) * args.atmosphereThickness;
+  const float altitude = multiscatteringLutVToAltitude(textureCoordToUnitRange(uv.y, args.multiscatteringLutSize), args);
 
   multiscatteringLutOutput[threadId] = float4(computeMultiscattering(sunZenithCosAngle, altitude, args), 1.0f);
 }

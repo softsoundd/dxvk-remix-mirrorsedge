@@ -161,6 +161,10 @@ namespace dxvk {
     /** 1x1 sky-view LUT hemisphere mean, or nullptr before atmosphere init. */
     Rc<DxvkImageView> getSkyHemisphereMeanView() const;
 
+    /** Atmosphere transmittance / multiscattering LUTs, or nullptr before atmosphere init. */
+    Rc<DxvkImageView> getAtmosphereTransmittanceLutView() const;
+    Rc<DxvkImageView> getAtmosphereMultiscatteringLutView() const;
+
 #ifdef REMIX_DEVELOPMENT
     /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */
     bool handleCrashHotkeys();

@@ -129,6 +129,8 @@ namespace dxvk {
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
         TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
         TEXTURE2D(COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -407,6 +409,12 @@ namespace dxvk {
 
     ctx->bindResourceView(COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT,
       ctx->getSkyHemisphereMeanView(), nullptr);
+
+    // Marched only on mirror (PSR) pixels under Physical Atmosphere.
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT,
+      ctx->getAtmosphereTransmittanceLutView(), nullptr);
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT,
+      ctx->getAtmosphereMultiscatteringLutView(), nullptr);
 
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;

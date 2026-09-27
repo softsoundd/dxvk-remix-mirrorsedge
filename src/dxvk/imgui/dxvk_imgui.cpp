@@ -45,6 +45,7 @@
 #include "rtx_render/rtx_utils.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_render/rtx_camera.h"
+#include "rtx_render/rtx_atmosphere.h"
 #include "rtx_render/rtx_context.h"
 #include "rtx_render/rtx_hash_collision_detection.h"
 #include "rtx_render/rtx_options.h"
@@ -271,6 +272,35 @@ namespace dxvk {
     RemixGui::ComboWithKey<SkyMode>::ComboEntries { {
         {SkyMode::SkyboxRasterization, "Skybox Rasterization"},
         {SkyMode::PhysicalAtmosphere, "Physical Atmosphere"}
+    } }
+  };
+
+  RemixGui::ComboWithKey<AtmosphereAerosolModel> atmosphereAerosolModelCombo {
+    "Aerosol Model",
+    RemixGui::ComboWithKey<AtmosphereAerosolModel>::ComboEntries { {
+        {AtmosphereAerosolModel::Manual, "Manual Coefficients"},
+        {AtmosphereAerosolModel::Visibility, "Visibility + Boundary Layer"}
+    } }
+  };
+
+  RemixGui::ComboWithKey<AtmosphereAerosolType> atmosphereAerosolTypeCombo {
+    "Aerosol Type",
+    RemixGui::ComboWithKey<AtmosphereAerosolType>::ComboEntries { {
+        {AtmosphereAerosolType::ContinentalClean, "Continental Clean"},
+        {AtmosphereAerosolType::ContinentalAverage, "Continental Average"},
+        {AtmosphereAerosolType::ContinentalPolluted, "Continental Polluted"},
+        {AtmosphereAerosolType::Urban, "Urban"},
+        {AtmosphereAerosolType::MaritimeClean, "Maritime Clean"},
+        {AtmosphereAerosolType::DesertDust, "Desert Dust"},
+        {AtmosphereAerosolType::Custom, "Custom"}
+    } }
+  };
+
+  RemixGui::ComboWithKey<AtmosphereCoefficientMode> atmosphereCoefficientModeCombo {
+    "Molecular Coefficients",
+    RemixGui::ComboWithKey<AtmosphereCoefficientMode>::ComboEntries { {
+        {AtmosphereCoefficientMode::Manual, "Manual RGB"},
+        {AtmosphereCoefficientMode::Physical, "Physical (Spectral)"}
     } }
   };
 
@@ -2846,6 +2876,116 @@ namespace dxvk {
       assert(height >= thumbnailSize);
       return height;
     }
+
+    // An atmosphere preset sets every option that describes the planet and its medium, so applying one
+    // gives the same look whatever was tuned before. Sun position, stylisation and quality options are
+    // left alone. All presets keep the paper's Manual RGB coefficients (the spectral Physical mode stays
+    // an opt-in, since its weights read slightly warmer); the hazy Earth days use the Visibility aerosol
+    // model, everything else authors its aerosol directly.
+    struct AtmospherePreset {
+      const char* name;
+      const char* tooltip;
+
+      float planetRadiusKm;
+      float atmosphereThicknessKm;
+      float groundAlbedo;
+      Vector3 sunIlluminance;
+
+      AtmosphereCoefficientMode coefficientMode;
+      Vector3 rayleighScattering;  // km^-1, Manual coefficient mode
+      Vector3 ozoneAbsorption;     // km^-1, Manual coefficient mode
+      float ozoneLayerAltitudeKm;
+      float ozoneLayerWidthKm;
+
+      AtmosphereAerosolModel aerosolModel;
+      float visibilityKm;          // Visibility aerosol model
+      AtmosphereAerosolType aerosolType;
+      float boundaryLayerHeightKm;
+      Vector3 mieScattering;       // km^-1, Manual aerosol model
+      Vector3 mieAbsorption;       // km^-1, Manual aerosol model
+      float mieAnisotropy;
+    };
+
+    // Hillaire's Table 1 Earth, with the Mie absorption its implementation uses (see the option's note).
+    constexpr float kEarthRadiusKm = 6371.0f;
+    const Vector3 kEarthRayleigh(5.802e-3f, 13.558e-3f, 33.1e-3f);
+    const Vector3 kEarthOzone(0.650e-3f, 1.881e-3f, 0.085e-3f);
+    const Vector3 kEarthMieScattering(3.996e-3f, 3.996e-3f, 3.996e-3f);
+    const Vector3 kEarthMieAbsorption(0.444e-3f, 0.444e-3f, 0.444e-3f);
+    const Vector3 kSunWhite(20.0f, 20.0f, 20.0f);
+
+    const AtmospherePreset kAtmospherePresets[] = {
+      { "Earth",
+        "A clear day: the reference Earth atmosphere with exceptionally clean air (visibility over 200 km), so\n"
+        "the sky stays deep blue and only the far skyline hazes. The hazy days below add real aerosol loads.",
+        kEarthRadiusKm, 100.0f, 0.3f, kSunWhite,
+        AtmosphereCoefficientMode::Manual, kEarthRayleigh, kEarthOzone, 25.0f, 15.0f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::ContinentalAverage, 1.5f,
+        kEarthMieScattering, kEarthMieAbsorption, 0.8f },
+      { "Hazy Day",
+        "An average continental day: 40 km visibility with the continental average aerosol in a 1.5 km boundary\n"
+        "layer. The horizon whitens, the sunlight warms and distant blocks haze over; the sky above stays blue.",
+        kEarthRadiusKm, 100.0f, 0.3f, kSunWhite,
+        AtmosphereCoefficientMode::Manual, kEarthRayleigh, kEarthOzone, 25.0f, 15.0f,
+        AtmosphereAerosolModel::Visibility, 40.0f, AtmosphereAerosolType::ContinentalAverage, 1.5f,
+        kEarthMieScattering, kEarthMieAbsorption, 0.8f },
+      { "Polluted",
+        "Urban smog trapped under a 1 km inversion: 8 km visibility with the urban aerosol, whose soot absorbs\n"
+        "about a fifth of the light it intercepts, so the haze is grey and the sun dims and warms.",
+        kEarthRadiusKm, 100.0f, 0.3f, kSunWhite,
+        AtmosphereCoefficientMode::Manual, kEarthRayleigh, kEarthOzone, 25.0f, 15.0f,
+        AtmosphereAerosolModel::Visibility, 8.0f, AtmosphereAerosolType::Urban, 1.0f,
+        kEarthMieScattering, kEarthMieAbsorption, 0.8f },
+      { "Mars",
+        "A thin carbon dioxide atmosphere (Rayleigh scattering about 2% of Earth's) under suspended iron oxide\n"
+        "dust that absorbs toward the blue, giving the butterscotch sky, and a sun 43% as strong as Earth's.\n"
+        "The bluish glow around the low sun that real Martian dust produces needs a wavelength dependent phase\n"
+        "function, which the single asymmetry parameter cannot express.",
+        3389.5f, 80.0f, 0.25f, Vector3(8.6f, 8.6f, 8.6f),
+        AtmosphereCoefficientMode::Manual, Vector3(0.12e-3f, 0.29e-3f, 0.71e-3f), Vector3(0.0f, 0.0f, 0.0f), 25.0f, 15.0f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::DesertDust, 1.5f,
+        Vector3(0.320f, 0.304f, 0.2475f), Vector3(0.010f, 0.026f, 0.0825f), 0.7f },
+      { "Alien World",
+        "Fictional: an atmosphere whose molecules scatter green most strongly, under a slightly green star.",
+        5000.0f, 120.0f, 0.3f, Vector3(15.0f, 22.0f, 18.0f),
+        AtmosphereCoefficientMode::Manual, Vector3(4.0e-3f, 18.0e-3f, 10.0e-3f), Vector3(1.0e-3f, 0.5e-3f, 3.0e-3f), 30.0f, 20.0f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::ContinentalAverage, 1.5f,
+        Vector3(5.0e-3f, 5.0e-3f, 5.0e-3f), Vector3(5.5e-3f, 5.5e-3f, 5.5e-3f), 0.75f },
+      { "Desert Planet",
+        "Fictional: a hot, arid world with a warm star and sandy dust that scatters red and absorbs blue.",
+        6000.0f, 90.0f, 0.4f, Vector3(28.0f, 24.0f, 18.0f),
+        AtmosphereCoefficientMode::Manual, Vector3(7.0e-3f, 11.0e-3f, 18.0e-3f), Vector3(0.5e-3f, 1.0e-3f, 0.1e-3f), 20.0f, 10.0f,
+        AtmosphereAerosolModel::Manual, 40.0f, AtmosphereAerosolType::DesertDust, 1.5f,
+        Vector3(15.0e-3f, 12.0e-3f, 8.0e-3f), Vector3(8.0e-3f, 10.0e-3f, 16.0e-3f), 0.6f },
+    };
+
+    void applyAtmospherePreset(const AtmospherePreset& preset) {
+      RtxOptions::planetRadiusObject().setImmediately(preset.planetRadiusKm);
+      RtxOptions::atmosphereThicknessObject().setImmediately(preset.atmosphereThicknessKm);
+      RtxOptions::groundAlbedoObject().setImmediately(preset.groundAlbedo);
+      RtxOptions::sunIlluminanceObject().setImmediately(preset.sunIlluminance);
+
+      RtxOptions::coefficientModeObject().setImmediately(preset.coefficientMode);
+      RtxOptions::rayleighScatteringObject().setImmediately(preset.rayleighScattering);
+      RtxOptions::ozoneAbsorptionObject().setImmediately(preset.ozoneAbsorption);
+      RtxOptions::ozoneLayerAltitudeObject().setImmediately(preset.ozoneLayerAltitudeKm);
+      RtxOptions::ozoneLayerWidthObject().setImmediately(preset.ozoneLayerWidthKm);
+
+      RtxOptions::aerosolModelObject().setImmediately(preset.aerosolModel);
+      RtxOptions::visibilityKmObject().setImmediately(preset.visibilityKm);
+      RtxOptions::aerosolTypeObject().setImmediately(preset.aerosolType);
+      RtxOptions::boundaryLayerHeightKmObject().setImmediately(preset.boundaryLayerHeightKm);
+      RtxOptions::boundaryLayerTransitionKmObject().setImmediately(0.25f);
+      RtxOptions::freeTroposphereAerosolFractionObject().setImmediately(0.15f);
+      RtxOptions::mieScatteringObject().setImmediately(preset.mieScattering);
+      RtxOptions::mieAbsorptionObject().setImmediately(preset.mieAbsorption);
+      RtxOptions::mieAnisotropyObject().setImmediately(preset.mieAnisotropy);
+
+      // The multipliers are relative to the medium just set.
+      RtxOptions::airDensityObject().setImmediately(1.0f);
+      RtxOptions::aerosolDensityObject().setImmediately(1.0f);
+      RtxOptions::ozoneDensityObject().setImmediately(1.0f);
+    }
   }
 
   void ImGUI::showSetupWindow(const Rc<DxvkContext>& ctx) {
@@ -3149,170 +3289,222 @@ namespace dxvk {
 
         // Sky mode selection.
         skyModeCombo.getKey(&RtxOptions::skyModeObject());
-        RemixGui::SetTooltipToLastWidgetOnHover("Skybox Rasterization: Traditional skybox rendering\nPhysical Atmosphere: Hillaire atmospheric scattering");
+        RemixGui::SetTooltipToLastWidgetOnHover("Skybox Rasterization: Traditional skybox rendering\nPhysical Atmosphere: Physically based sky, sun and atmospheric haze");
 
         if (RtxOptions::skyMode() == SkyMode::SkyboxRasterization) {
           RemixGui::DragFloat("Sky Brightness", &RtxOptions::skyBrightnessObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
         } else {
           ImGui::Separator();
           ImGui::Text("Atmosphere Presets:");
+          RemixGui::SetTooltipToLastWidgetOnHover("Each preset sets the planet, the molecular and aerosol medium and the ground albedo, resets the Air / Dust /\nOzone multipliers and selects the Manual coefficient mode. Sun position, stylisation and quality options are\nleft as they are.");
 
-          if (ImGui::Button("Earth (Default)", ImVec2(120, 0))) {
-            RtxOptions::sunIlluminanceObject().setImmediately(Vector3(20.0f, 20.0f, 20.0f));
-            RtxOptions::planetRadiusObject().setImmediately(6371.0f);
-            RtxOptions::atmosphereThicknessObject().setImmediately(100.0f);
-            // Table 1 of the paper, converted from m^-1 to km^-1.
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f));
-            RtxOptions::mieScatteringObject().setImmediately(Vector3(3.996e-3f, 3.996e-3f, 3.996e-3f));
-            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(4.4e-3f, 4.4e-3f, 4.4e-3f));
-            RtxOptions::mieAnisotropyObject().setImmediately(0.8f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
-            RtxOptions::ozoneLayerAltitudeObject().setImmediately(25.0f);
-            RtxOptions::ozoneLayerWidthObject().setImmediately(15.0f);
+          {
+            constexpr int kPresetsPerRow = 3;
+            int presetIndex = 0;
+            for (const AtmospherePreset& preset : kAtmospherePresets) {
+              if (presetIndex++ % kPresetsPerRow != 0) {
+                ImGui::SameLine();
+              }
+              if (ImGui::Button(preset.name, ImVec2(120, 0))) {
+                applyAtmospherePreset(preset);
+              }
+              RemixGui::SetTooltipToLastWidgetOnHover(preset.tooltip);
+            }
           }
-          RemixGui::SetTooltipToLastWidgetOnHover("Physically accurate Earth atmosphere parameters from Hillaire paper");
-
-          ImGui::SameLine();
-          if (ImGui::Button("Mars", ImVec2(120, 0))) {
-            RtxOptions::sunIlluminanceObject().setImmediately(Vector3(15.0f, 12.0f, 10.0f));
-            RtxOptions::planetRadiusObject().setImmediately(3389.5f);
-            RtxOptions::atmosphereThicknessObject().setImmediately(50.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(8.0e-3f, 10.0e-3f, 12.0e-3f));
-            RtxOptions::mieScatteringObject().setImmediately(Vector3(8.0e-3f, 8.0e-3f, 8.0e-3f));
-            // Iron rich dust absorbs strongly toward the blue end, which is what inverts the sky
-            // and sunset colours relative to Earth.
-            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(4.0e-3f, 6.0e-3f, 10.0e-3f));
-            RtxOptions::mieAnisotropyObject().setImmediately(0.7f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.0f, 0.0f, 0.0f));
-            RtxOptions::ozoneLayerAltitudeObject().setImmediately(0.0f);
-            RtxOptions::ozoneLayerWidthObject().setImmediately(1.0f);
-          }
-          RemixGui::SetTooltipToLastWidgetOnHover("Mars-like atmosphere: thin, dusty, yellowish sky with blue sunsets");
-
-          ImGui::SameLine();
-          if (ImGui::Button("Clear Sky", ImVec2(120, 0))) {
-            RtxOptions::sunIlluminanceObject().setImmediately(Vector3(25.0f, 25.0f, 25.0f));
-            RtxOptions::planetRadiusObject().setImmediately(6371.0f);
-            RtxOptions::atmosphereThicknessObject().setImmediately(80.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(4.0e-3f, 9.0e-3f, 22.0e-3f));
-            RtxOptions::mieScatteringObject().setImmediately(Vector3(1.0e-3f, 1.0e-3f, 1.0e-3f));
-            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(1.1e-3f, 1.1e-3f, 1.1e-3f));
-            RtxOptions::mieAnisotropyObject().setImmediately(0.9f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
-            RtxOptions::ozoneLayerAltitudeObject().setImmediately(25.0f);
-            RtxOptions::ozoneLayerWidthObject().setImmediately(15.0f);
-          }
-          RemixGui::SetTooltipToLastWidgetOnHover("Crystal clear atmosphere with minimal haze");
-
-          if (ImGui::Button("Polluted/Hazy", ImVec2(120, 0))) {
-            RtxOptions::sunIlluminanceObject().setImmediately(Vector3(18.0f, 18.0f, 18.0f));
-            RtxOptions::planetRadiusObject().setImmediately(6371.0f);
-            RtxOptions::atmosphereThicknessObject().setImmediately(100.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(5.802e-3f, 13.558e-3f, 33.1e-3f));
-            RtxOptions::mieScatteringObject().setImmediately(Vector3(12.0e-3f, 12.0e-3f, 12.0e-3f));
-            // Pollution is soot heavy, so absorption dominates scattering here.
-            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(18.0e-3f, 18.0e-3f, 18.0e-3f));
-            RtxOptions::mieAnisotropyObject().setImmediately(0.65f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.650e-3f, 1.881e-3f, 0.085e-3f));
-            RtxOptions::ozoneLayerAltitudeObject().setImmediately(25.0f);
-            RtxOptions::ozoneLayerWidthObject().setImmediately(15.0f);
-          }
-          RemixGui::SetTooltipToLastWidgetOnHover("Heavy atmospheric haze with strong light scattering");
-
-          ImGui::SameLine();
-          if (ImGui::Button("Alien World", ImVec2(120, 0))) {
-            RtxOptions::sunIlluminanceObject().setImmediately(Vector3(15.0f, 22.0f, 18.0f));
-            RtxOptions::planetRadiusObject().setImmediately(5000.0f);
-            RtxOptions::atmosphereThicknessObject().setImmediately(120.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(4.0e-3f, 18.0e-3f, 10.0e-3f));
-            RtxOptions::mieScatteringObject().setImmediately(Vector3(5.0e-3f, 5.0e-3f, 5.0e-3f));
-            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(5.5e-3f, 5.5e-3f, 5.5e-3f));
-            RtxOptions::mieAnisotropyObject().setImmediately(0.75f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(1.0e-3f, 0.5e-3f, 3.0e-3f));
-            RtxOptions::ozoneLayerAltitudeObject().setImmediately(30.0f);
-            RtxOptions::ozoneLayerWidthObject().setImmediately(20.0f);
-          }
-          RemixGui::SetTooltipToLastWidgetOnHover("Fictional alien atmosphere with green-tinted scattering");
-
-          ImGui::SameLine();
-          if (ImGui::Button("Desert Planet", ImVec2(120, 0))) {
-            RtxOptions::sunIlluminanceObject().setImmediately(Vector3(28.0f, 24.0f, 18.0f));
-            RtxOptions::planetRadiusObject().setImmediately(6000.0f);
-            RtxOptions::atmosphereThicknessObject().setImmediately(90.0f);
-            RtxOptions::rayleighScatteringObject().setImmediately(Vector3(7.0e-3f, 11.0e-3f, 18.0e-3f));
-            RtxOptions::mieScatteringObject().setImmediately(Vector3(15.0e-3f, 12.0e-3f, 8.0e-3f));
-            RtxOptions::mieAbsorptionObject().setImmediately(Vector3(8.0e-3f, 10.0e-3f, 16.0e-3f));
-            RtxOptions::mieAnisotropyObject().setImmediately(0.6f);
-            RtxOptions::ozoneAbsorptionObject().setImmediately(Vector3(0.5e-3f, 1.0e-3f, 0.1e-3f));
-            RtxOptions::ozoneLayerAltitudeObject().setImmediately(20.0f);
-            RtxOptions::ozoneLayerWidthObject().setImmediately(10.0f);
-          }
-          RemixGui::SetTooltipToLastWidgetOnHover("Hot, arid world with sandy atmospheric dust");
 
           ImGui::Separator();
 
           RemixGui::Checkbox("Use Sky View LUT", &RtxOptions::useSkyViewLutObject());
           RemixGui::SetTooltipToLastWidgetOnHover("Sample the precomputed sky-view LUT on ray misses instead of ray marching the atmosphere per ray.\nVisually identical at a fraction of the GPU cost; disable only to A/B compare against the reference inline evaluation.");
 
-          RemixGui::Checkbox("Aerial Perspective", &RtxOptions::aerialPerspectiveObject());
-          RemixGui::SetTooltipToLastWidgetOnHover("Apply the atmosphere's in-scatter and extinction to scene geometry, which is what gives distant\nbuildings and terrain their haze and desaturation. Hands off to the global volumetrics froxel grid\nat its range so the two do not double count.");
+          ImGui::Separator();
+          ImGui::Text("Sun:");
 
-          if (RtxOptions::aerialPerspective()) {
-            RemixGui::DragFloat("Aerial Perspective Range", &RtxOptions::aerialPerspectiveDepthRangeMetersObject(), 100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Depth covered by the 32 slice aerial perspective volume. Reduce for denser atmospheres to spend\nthe slices over a shorter, more accurate range.");
+          RemixGui::Checkbox("Sun Disc", &RtxOptions::sunDiscObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Draw the sun disc into the sky as seen directly and in mirror reflections. Surfaces are lit by the sun\neither way; without this, a mirror reflecting the sky shows no sun at all.");
+
+          RemixGui::DragFloat("Sun Size", &RtxOptions::sunSizeObject(), 0.01f, 0.0f, 10.0f, "%.3f deg", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Angular diameter of the sun disc in degrees; Earth's sun is 0.545.\nAlso sets the sun's size and peak intensity in glossy reflections, so keep it physical and use\nSun Shadow Softening if you want softer shadows.");
+
+          RemixGui::Checkbox("Sun Limb Darkening", &RtxOptions::sunLimbDarkeningObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Darken the sun disc toward its edge as the real sun does. Blue darkens more than red, so the edge warms,\nwhile the disc's total brightness is preserved.");
+
+          RemixGui::DragFloat("Sun Shadow Softening", &RtxOptions::sunShadowSofteningObject(), 0.01f, 0.0f, 12.0f, "%.2f deg", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Extra half-angle added to the sun's cone purely to widen shadow penumbrae.\nThis trades reflection fidelity for softer shadows: the cone also sets how large and how bright the\nsun looks in reflections, so any non-zero value makes the reflected sun wider and dimmer.");
+
+          RemixGui::DragFloat("Sun Intensity", &RtxOptions::sunIntensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Strength of Sun");
+
+          RemixGui::DragFloat("Sun Elevation", &RtxOptions::sunElevationObject(), 0.01f, -90.0f, 90.0f, "%.2f deg", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Sun angle from horizon");
+
+          RemixGui::DragFloat("Sun Rotation", &RtxOptions::sunRotationObject(), 0.01f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Rotation of sun around zenith");
+
+          ImGui::Separator();
+          ImGui::Text("Atmosphere Parameters:");
+
+          RemixGui::DragFloat("Altitude", &RtxOptions::altitudeObject(), 1.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Height from sea level");
+
+          RemixGui::Checkbox("Altitude Follows Camera", &RtxOptions::altitudeFollowsCameraObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Add the camera's height above the ground level below to the altitude, so climbing thins the haze seen\nfrom above and thickens the aerial perspective toward the streets. The baked sky uses a 5 m quantised altitude.");
+          if (RtxOptions::altitudeFollowsCamera()) {
+            ImGui::Indent();
+            RemixGui::DragFloat("Ground Level (World Height)", &RtxOptions::groundLevelWorldHeightObject(), 10.0f, -1000000.0f, 1000000.0f, "%.0f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("World height (game units, along the up axis) that corresponds to the Altitude above.");
+            ImGui::Unindent();
           }
 
-          if (ImGui::TreeNode("Atmosphere Parameters")) {
-            RemixGui::Checkbox("Sun Disc", &RtxOptions::sunDiscObject());
-            RemixGui::SetTooltipToLastWidgetOnHover("Draw the sun disc into the environment on camera and mirror rays, which cannot reach the sun\nthrough next event estimation. Without it, a mirror reflecting the sky shows no sun at all.");
+          RemixGui::DragFloat("Air", &RtxOptions::airDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Density of air molecules");
 
-            RemixGui::DragFloat("Sun Size", &RtxOptions::sunSizeObject(), 0.01f, 0.0f, 10.0f, "%.3f deg", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Angular diameter of the sun disc in degrees; Earth's sun is 0.545.\nAlso sets the sun's size and peak intensity in glossy reflections, so keep it physical and use\nSun Shadow Softening if you want softer shadows.");
-
-            RemixGui::DragFloat("Sun Shadow Softening", &RtxOptions::sunShadowSofteningObject(), 0.01f, 0.0f, 12.0f, "%.2f deg", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Extra half-angle added to the sun's cone purely to widen shadow penumbrae.\nThis trades reflection fidelity for softer shadows: the cone also sets how large and how bright the\nsun looks in reflections, so any non-zero value makes the reflected sun wider and dimmer.");
-
-            RemixGui::DragFloat("Sun Intensity", &RtxOptions::sunIntensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Strength of Sun");
-
-            RemixGui::DragFloat("Sun Elevation", &RtxOptions::sunElevationObject(), 0.01f, -90.0f, 90.0f, "%.2f deg", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Sun angle from horizon");
-
-            RemixGui::DragFloat("Sun Rotation", &RtxOptions::sunRotationObject(), 0.01f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Rotation of sun around zenith");
-
-            RemixGui::DragFloat("Altitude", &RtxOptions::altitudeObject(), 1.0f, 0.0f, 100000.0f, "%.0f m", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Height from sea level");
-
-            RemixGui::DragFloat("Air", &RtxOptions::airDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Density of air molecules");
-
+          if (RtxOptions::aerosolModel() == AtmosphereAerosolModel::Manual) {
             RemixGui::DragFloat("Dust", &RtxOptions::aerosolDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Density of aerosols/dust");
+            RemixGui::SetTooltipToLastWidgetOnHover("Density of aerosols/dust (Manual aerosol model)");
+          }
 
-            RemixGui::DragFloat("Ozone", &RtxOptions::ozoneDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
-            RemixGui::SetTooltipToLastWidgetOnHover("Density of ozone layer");
+          RemixGui::DragFloat("Ozone", &RtxOptions::ozoneDensityObject(), 0.01f, 0.0f, 100.0f, "%.2f", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Density of ozone layer");
 
-            if (ImGui::TreeNode("Advanced")) {
-              RemixGui::DragFloat("Planet Radius", &RtxOptions::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
-              RemixGui::DragFloat("Atmosphere Thickness", &RtxOptions::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
-              RemixGui::DragFloat("Mie Anisotropy", &RtxOptions::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
-              RemixGui::SetTooltipToLastWidgetOnHover("Aerosol phase asymmetry. 0.8 is the paper's Earth default; approaching 1 concentrates nearly all\naerosol scattering into a tight forward halo around the sun.");
+          RemixGui::DragFloat("Ground Albedo", &RtxOptions::groundAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+          RemixGui::SetTooltipToLastWidgetOnHover("Diffuse albedo of the virtual planet surface below the horizon, feeding the sky's multiple scattering\nand the below-horizon sky. A bright city or snow (0.5+) lifts the horizon sky noticeably.");
 
-              RemixGui::DragFloat3("Base Sun Illuminance", &RtxOptions::sunIlluminanceObject(), 0.1f, 0.0f, 100.0f, "%.1f", sliderFlags);
-              RemixGui::DragFloat3("Base Rayleigh", &RtxOptions::rayleighScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
-              RemixGui::DragFloat3("Base Mie Scattering", &RtxOptions::mieScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
-              RemixGui::DragFloat3("Base Mie Absorption", &RtxOptions::mieAbsorptionObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
-              RemixGui::SetTooltipToLastWidgetOnHover("Aerosols absorb as well as scatter. Raising this relative to Mie scattering darkens the haze and\ncan tint it, which is how a Mars-like sky and its blue sunsets come about.");
-              RemixGui::DragFloat3("Base Ozone", &RtxOptions::ozoneAbsorptionObject(), 0.0001f, 0.0f, 0.01f, "%.6f", sliderFlags);
-              RemixGui::DragFloat("Ozone Layer Altitude", &RtxOptions::ozoneLayerAltitudeObject(), 0.5f, 0.0f, 50.0f, "%.1f km", sliderFlags);
-              RemixGui::DragFloat("Ozone Layer Width", &RtxOptions::ozoneLayerWidthObject(), 0.5f, 1.0f, 30.0f, "%.1f km", sliderFlags);
-              RemixGui::SetTooltipToLastWidgetOnHover("Half-width of the ozone tent profile; the paper uses a 30 km wide tent, so 15.");
+          atmosphereCoefficientModeCombo.getKey(&RtxOptions::coefficientModeObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Manual: the RGB Rayleigh / ozone coefficients and sun colour from Advanced Atmosphere Parameters.\nPhysical: derives them from the real solar spectrum and the physics of air and ozone, for a slightly more\naccurate sky and sun colour. Air, Ozone and the brightness of the Base Sun Illuminance still apply.");
+          if (RtxOptions::coefficientMode() == AtmosphereCoefficientMode::Physical) {
+            ImGui::Indent();
+            RemixGui::Checkbox("White Balance Sun", &RtxOptions::spectralWhiteBalanceObject());
+            RemixGui::SetTooltipToLastWidgetOnHover("Divide out the extraterrestrial sun colour so the sun above the atmosphere is white and only the\natmosphere's own reddening remains.");
+            ImGui::Unindent();
+          }
 
-              ImGui::TreePop();
+          RemixGui::Checkbox("Rayleigh Depolarization", &RtxOptions::rayleighDepolarizationObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Account for air molecules not being perfectly symmetric, which slightly brightens the sky at 90 degrees\nfrom the sun compared to the textbook formula.");
+
+          ImGui::Separator();
+          ImGui::Text("Haze (Aerosol):");
+
+          // Koschmieder visibility of the medium as configured, so an atmosphere too clear to ever haze
+          // anything over is obvious at a glance.
+          {
+            const AtmosphereArgs atmosphereArgs = RtxAtmosphere::buildAtmosphereArgsFromOptions();
+            const float effectiveVisibilityKm = RtxAtmosphere::computeEffectiveVisibilityKm(atmosphereArgs);
+            ImGui::Text("Effective ground visibility: %.0f km", effectiveVisibilityKm);
+            RemixGui::SetTooltipToLastWidgetOnHover("How far you could see through the current atmosphere at ground level.\nEarth's cleanest continental air is ~130 km, a clean day ~60 km, cities 10-30 km. Anything past ~150 km will show\nno visible aerial perspective at city distances.");
+          }
+
+          atmosphereAerosolModelCombo.getKey(&RtxOptions::aerosolModelObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Manual: ground level Mie coefficients from Advanced Atmosphere Parameters, thinning out exponentially with height.\nVisibility: the amount of haze follows from how far you can see at ground level, the aerosol type sets its\ncolour, absorption and phase, and it sits in a well mixed boundary layer. This is what makes distant city\nblocks actually haze over.");
+
+          if (RtxOptions::aerosolModel() == AtmosphereAerosolModel::Visibility) {
+            ImGui::Indent();
+            RemixGui::DragFloat("Visibility", &RtxOptions::visibilityKmObject(), 0.5f, 0.5f, 400.0f, "%.1f km", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Meteorological visibility at ground level. 20-30 km is a typical city day, 60 km clean continental air,\n130 km the clearest continental conditions.");
+
+            atmosphereAerosolTypeCombo.getKey(&RtxOptions::aerosolTypeObject());
+            RemixGui::SetTooltipToLastWidgetOnHover("Real world aerosol mixtures: each sets how dark the haze is (single scattering albedo), how much bluer\nthan white it scatters (Angstrom exponent) and its phase asymmetry. Custom exposes those directly.");
+
+            if (RtxOptions::aerosolType() == AtmosphereAerosolType::Custom) {
+              ImGui::Indent();
+              RemixGui::DragFloat3("Single Scattering Albedo", &RtxOptions::aerosolSingleScatteringAlbedoObject(), 0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Fraction of aerosol extinction that scatters rather than absorbs, per channel. Soot lowers it; making it\nfall toward blue tints the haze warm like desert dust.");
+              RemixGui::DragFloat("Angstrom Exponent", &RtxOptions::aerosolAngstromExponentObject(), 0.01f, -1.0f, 4.0f, "%.2f", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Wavelength dependence of the aerosol extinction, ~ lambda^-alpha. 0 for large particles (dust, sea salt),\n1-1.5 for fine continental and urban haze.");
+              RemixGui::DragFloat("Phase Asymmetry", &RtxOptions::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+
+              RemixGui::Checkbox("Low Sun Realism Blend", &RtxOptions::aerosolLowSunBlendObject());
+              RemixGui::SetTooltipToLastWidgetOnHover("Blend the custom albedo and Angstrom exponent toward the low sun values below as the sun descends.\nA blue scattering, red absorbing haze turns green under a reddened low sun; this lets it take on realistic\nwarm sunset colours while keeping the stylised look at high sun.");
+              if (RtxOptions::aerosolLowSunBlend()) {
+                ImGui::Indent();
+                ImGui::Text("Current blend: %.2f", RtxAtmosphere::computeAerosolLowSunBlend());
+                RemixGui::DragFloat3("Low Sun Albedo", &RtxOptions::aerosolLowSunSingleScatteringAlbedoObject(), 0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
+                RemixGui::DragFloat("Low Sun Angstrom Exponent", &RtxOptions::aerosolLowSunAngstromExponentObject(), 0.01f, -1.0f, 4.0f, "%.2f", sliderFlags);
+                RemixGui::SetTooltipToLastWidgetOnHover("Around 1 scatters the reddened sunlight nearly neutrally, which is what makes real sunset haze orange.");
+                RemixGui::DragFloat("Blend Start Elevation", &RtxOptions::aerosolLowSunBlendStartDegreesObject(), 0.1f, 0.0f, 90.0f, "%.1f deg", sliderFlags);
+                RemixGui::DragFloat("Blend End Elevation", &RtxOptions::aerosolLowSunBlendEndDegreesObject(), 0.1f, -10.0f, 90.0f, "%.1f deg", sliderFlags);
+                ImGui::Unindent();
+              }
+              ImGui::Unindent();
             }
 
-            ImGui::TreePop();
+            RemixGui::DragFloat("Boundary Layer Height", &RtxOptions::boundaryLayerHeightKmObject(), 0.01f, 0.05f, 5.0f, "%.2f km", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Height of the well mixed layer that holds the aerosol at constant density. 1-2 km on a sunny day; a thin\nlayer under an inversion is a few hundred meters.");
+            RemixGui::DragFloat("Boundary Layer Top Softness", &RtxOptions::boundaryLayerTransitionKmObject(), 0.01f, 0.01f, 2.0f, "%.2f km", sliderFlags);
+            RemixGui::DragFloat("Free Troposphere Fraction", &RtxOptions::freeTroposphereAerosolFractionObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Aerosol concentration just above the boundary layer relative to inside it, decaying exponentially above.");
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+          ImGui::Text("Aerial Perspective:");
+
+          RemixGui::Checkbox("Aerial Perspective", &RtxOptions::aerialPerspectiveObject());
+          RemixGui::SetTooltipToLastWidgetOnHover("Apply the atmosphere's in-scatter and extinction to scene geometry, which is what gives distant\nbuildings and terrain their haze and desaturation. Hands off to the global volumetrics froxel grid\nat its range so the two do not double count. Debug views \"Atmosphere Aerial Perspective In-Scatter /\nTransmittance\" show exactly what it adds.");
+
+          if (RtxOptions::aerialPerspective()) {
+            ImGui::Indent();
+            RemixGui::DragFloat("Range", &RtxOptions::aerialPerspectiveDepthRangeMetersObject(), 100.0f, 100.0f, 200000.0f, "%.0f m", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Depth covered by the aerial perspective volume. Slices are distributed cubically, so half of them\ncover the nearest eighth of this range. Reduce for denser atmospheres or smaller scenes.");
+
+            RemixGui::DragFloat("Start Distance", &RtxOptions::aerialPerspectiveStartDistanceMetersObject(), 1.0f, 0.0f, 5000.0f, "%.0f m", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Air nearer than this contributes no aerial perspective, which keeps rooms and corridors shorter than it\nclear when the unshadowed volume cannot know it is indoors. The global volumetrics froxel range applies\nas a minimum when volumetrics are enabled.");
+
+            RemixGui::DragFloat("Haze Scale (Geometry Only)", &RtxOptions::aerialPerspectiveAerosolScaleObject(), 0.05f, 0.0f, 50.0f, "%.2f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Stylisation: multiplies the aerosol density inside the aerial perspective volume only. 1 keeps the haze on\ngeometry consistent with the sky; higher values thicken it on distant geometry and mirror reflections while\nthe sky, the sun and the sky-view LUT stay exactly as they are.");
+
+            RemixGui::DragInt("Volume Size", &RtxOptions::aerialPerspectiveLutSizeObject(), 1.0f, 8, 128, "%d", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Width and height of the froxel volume. 32 suits the unshadowed effect; 64 sharpens ray traced shafts.");
+            RemixGui::DragInt("Volume Depth", &RtxOptions::aerialPerspectiveLutDepthObject(), 1.0f, 8, 128, "%d", sliderFlags);
+
+            RemixGui::Checkbox("Ray Traced Sun & Sky Visibility", &RtxOptions::aerialPerspectiveShadowsObject());
+            RemixGui::SetTooltipToLastWidgetOnHover("Trace sun and sky visibility rays through the scene inside the volume, so haze between buildings sits in\ntheir shadow, a low sun casts crepuscular rays, and air indoors, which sees neither sun nor sky, stays clear.\nAccumulated over frames.");
+
+            if (RtxOptions::aerialPerspectiveShadows()) {
+              ImGui::Indent();
+              RemixGui::DragInt("Shadow Steps", &RtxOptions::aerialPerspectiveShadowStepsObject(), 1.0f, 1, 32, "%d", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Samples per froxel ray and frame, each tracing a sun and a sky visibility ray. Positions and sky\ndirections are jittered every frame, so the accumulation converges toward the exact integral.");
+              RemixGui::DragFloat("Shadow Ray Length", &RtxOptions::aerialPerspectiveShadowMaxDistanceMetersObject(), 10.0f, 10.0f, 50000.0f, "%.0f m", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("Length of the sun and sky visibility rays; anything farther counts as unoccluded, which bounds the cost.");
+              RemixGui::DragFloat("Temporal Blend", &RtxOptions::aerialPerspectiveTemporalBlendObject(), 0.01f, 0.0f, 0.98f, "%.2f", sliderFlags);
+              RemixGui::SetTooltipToLastWidgetOnHover("History weight of the reprojected previous volume. 0 disables the accumulation.");
+              ImGui::Unindent();
+            }
+            ImGui::Unindent();
+          }
+
+          ImGui::Separator();
+
+          if (RemixGui::CollapsingHeader("Advanced Atmosphere Parameters", collapsingHeaderClosedFlags)) {
+            ImGui::Indent();
+
+            RemixGui::DragFloat("Planet Radius", &RtxOptions::planetRadiusObject(), 10.0f, 1000.0f, 10000.0f, "%.0f km", sliderFlags);
+            RemixGui::DragFloat("Atmosphere Thickness", &RtxOptions::atmosphereThicknessObject(), 1.0f, 10.0f, 500.0f, "%.0f km", sliderFlags);
+            RemixGui::DragFloat("Mie Anisotropy", &RtxOptions::mieAnisotropyObject(), 0.01f, -1.0f, 1.0f, "%.2f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("How strongly the haze scatters light forward. 0.8 suits Earth's aerosols; approaching 1 concentrates\nnearly all of it into a tight halo around the sun. The Visibility aerosol model takes it from the aerosol\ntype unless that is Custom.");
+            RemixGui::DragFloat("Mie Phase Shape", &RtxOptions::miePhaseAlphaObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Shape of the haze's scattering lobe: 0 is the classic Henyey-Greenstein lobe, 1 is Cornette-Shanks,\nwhich scatters more light sideways and backwards, brightening the sky away from the sun.");
+            RemixGui::DragFloat("Mie Forward Peak Weight", &RtxOptions::mieForwardPeakWeightObject(), 0.005f, 0.0f, 0.5f, "%.3f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Adds the bright, narrow glow immediately around the sun that the main lobe lacks. 0.1-0.2 is realistic;\nthe glow is not sampled by the lighting, so glossy surfaces may see more noise.");
+            RemixGui::DragFloat("Mie Forward Peak G", &RtxOptions::mieForwardPeakGObject(), 0.001f, 0.8f, 0.999f, "%.3f", sliderFlags);
+
+            RemixGui::DragFloat3("Base Sun Illuminance", &RtxOptions::sunIlluminanceObject(), 0.1f, 0.0f, 100.0f, "%.1f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Manual coefficients: the sun colour and strength. Physical coefficients: only its luminance is used.");
+            RemixGui::DragFloat3("Base Rayleigh", &RtxOptions::rayleighScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
+            RemixGui::DragFloat3("Base Mie Scattering", &RtxOptions::mieScatteringObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Manual aerosol model only.");
+            RemixGui::DragFloat3("Base Mie Absorption", &RtxOptions::mieAbsorptionObject(), 0.0001f, 0.0f, 0.1f, "%.6f", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Manual aerosol model only. Aerosols absorb as well as scatter. Raising this relative to Mie scattering\ndarkens the haze and can tint it, which is how the Mars preset gets its dust colour.");
+            RemixGui::DragFloat3("Base Ozone", &RtxOptions::ozoneAbsorptionObject(), 0.0001f, 0.0f, 0.01f, "%.6f", sliderFlags);
+            RemixGui::DragFloat("Ozone Layer Altitude", &RtxOptions::ozoneLayerAltitudeObject(), 0.5f, 0.0f, 50.0f, "%.1f km", sliderFlags);
+            RemixGui::DragFloat("Ozone Layer Width", &RtxOptions::ozoneLayerWidthObject(), 0.5f, 1.0f, 30.0f, "%.1f km", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Half-width of the ozone layer, which fades linearly from full density at its altitude to nothing this far above and below it.");
+
+            RemixGui::DragInt("Multiscattering Directions", &RtxOptions::multiscatteringDirectionsObject(), 1.0f, 2, 32, "%d", sliderFlags);
+            RemixGui::SetTooltipToLastWidgetOnHover("Quality of the sky's multiple scattering: directions per axis integrated for each lookup table entry (squared for the total).\nOnly rebuilt when the atmosphere changes, so raising it is cheap.");
+            RemixGui::DragInt("Multiscattering Steps", &RtxOptions::multiscatteringStepsObject(), 1.0f, 4, 128, "%d", sliderFlags);
+
+            ImGui::Unindent();
           }
         }
 

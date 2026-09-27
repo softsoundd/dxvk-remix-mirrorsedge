@@ -351,6 +351,25 @@ float3 evalReflectionSkyFloor()
   return lutMean * (cb.volumeArgs.skyAmbientStrength * 0.5f);
 }
 
+// Whether the aerial perspective volume applies this frame at all.
+bool aerialPerspectiveActive()
+{
+  return bool(cb.volumeArgs.physicalAtmosphereEnabled) &&
+    cb.atmosphereArgs.aerialPerspectiveLutSize != 0 &&
+    !cb.domeLightArgs.active;
+}
+
+// Camera segment of the aerial perspective for a pixel, up to a distance along its view ray.
+void evalCameraSegmentAerialPerspective(uint2 pixelCoordinate, float hitDistance, out vec3 inScatter, out float transmittance)
+{
+  const vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
+  const vec3 uvw = aerialPerspectiveScreenUvToUvw(screenUV, hitDistance, cb.atmosphereArgs);
+  const vec4 aerialPerspective = sampleAerialPerspectiveLut(AtmosphereAerialPerspectiveLut, uvw, cb.atmosphereArgs);
+
+  inScatter = max(aerialPerspective.rgb, vec3(0.0f));
+  transmittance = saturate(aerialPerspective.a);
+}
+
 vec3 integrateVolumetricTransmittance(
   inout RNG randomState,
   const VolumeArgs volumeArgs,
@@ -597,6 +616,9 @@ void applyVolumetricLighting(
       }
       alphaBlendOutput = totalLight.xyz;
 
+      // Volumetrics transmittance in front of the surface, which its aerial perspective is seen through.
+      vec3 alphaVolumetricAttenuation = vec3(1.0f, 1.0f, 1.0f);
+
       if (cb.volumeArgs.enable)
       {
         float alphaBlendSurfaceLinearViewZ = surface.hitT * primaryRayDirections.viewDirection.z;
@@ -605,7 +627,6 @@ void applyVolumetricLighting(
         volumeUV.x /= cb.volumeArgs.numFroxelVolumes;
         
         vec3 alphaVolumetricPreintegratedRadiance = vec3(0.0f, 0.0f, 0.0f);
-        vec3 alphaVolumetricAttenuation = vec3(1.0f, 1.0f, 1.0f);
         integrateVolumetricNEE(
           randomState, VolumeFilteredRadianceAge, VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg,
           cb.volumeArgs, cb.timeSinceStartMS, pixelCoordinate, volumeUV, false, cameraGetWorldPosition(cb.camera), surface.hitT, primaryRayDirections.worldDirection,
@@ -619,6 +640,17 @@ void applyVolumetricLighting(
         const vec4 fogColor = calculateFog(surface.hitT);
         alphaBlendOutput = alphaBlendOutput * (1.0f - fogColor.a) + fogColor.rgb * fogColor.a;
         alphaBlendOutput *= (1 - backgroundAlpha);
+      }
+
+      // Distant glass and particles haze over like the opaque surfaces behind them. The in-scatter
+      // covers the surface's share of the pixel.
+      if (aerialPerspectiveActive() && surface.hitT > 0.0f)
+      {
+        vec3 alphaInScatter;
+        float alphaTransmittance;
+        evalCameraSegmentAerialPerspective(pixelCoordinate, surface.hitT, alphaInScatter, alphaTransmittance);
+        alphaBlendOutput = alphaBlendOutput * alphaTransmittance
+          + alphaInScatter * alphaVolumetricAttenuation * (1 - backgroundAlpha);
       }
 
       // No sparse compensation scaling: alphaBlendOutput is already a dense per-pixel signal.
@@ -680,12 +712,48 @@ void applySkyContribution(
   radianceOutput += skyContribution;
 }
 
+// Aerial perspective of the segment a mirror (PSR) pixel reflects. The froxel volume is fitted to the
+// camera frustum, which the reflected ray leaves, so this marches the atmosphere inline from the mirror's
+// altitude. Like the camera segment it starts past the global volumetrics range, whose reflection fog
+// already covers the near part of the segment. Identity when the segment ends inside that range.
+void evalReflectedSegmentAerialPerspective(
+  float3 mirrorPosition,
+  float3 reflectionDirection,
+  float segmentLength,
+  out vec3 inScatter,
+  out vec3 transmittance)
+{
+  inScatter = vec3(0.0f);
+  transmittance = vec3(1.0f);
+
+  const AtmosphereArgs args = aerialPerspectiveMediumArgs(cb.atmosphereArgs);
+  const float kmPerWorldUnit = 1.0f / max(args.worldUnitsPerKilometer, 1e-6f);
+
+  const float startDistanceKm = args.aerialPerspectiveStartDistance * kmPerWorldUnit;
+  const float endDistanceKm = segmentLength * kmPerWorldUnit;
+  if (endDistanceKm <= startDistanceKm)
+  {
+    return;
+  }
+
+  // Mirror altitude relative to the camera, along the world up axis.
+  const float mirrorHeightKm = (args.isZUp != 0
+    ? mirrorPosition.z - args.cameraPosition.z
+    : mirrorPosition.y - args.cameraPosition.y) * kmPerWorldUnit;
+  const vec3 origin = vec3(0.0f, max(args.aerialPerspectiveViewAltitude + mirrorHeightKm, kPlanetRadiusOffset), 0.0f);
+  const vec3 direction = aerialPerspectiveWorldToAtmosphereDirection(reflectionDirection, args);
+
+  inScatter = evalAtmosphereRadianceSegment(
+    origin, direction, args.sunDirection, args, AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut,
+    8, endDistanceKm, startDistanceKm, transmittance);
+}
+
 // Aerial perspective (paper Section 5.4): atmospheric extinction and in-scatter between the camera
 // and the shaded surface, which is what makes distant geometry hazy and desaturated.
 //
 // Skipped on primary misses because the sky-view LUT already integrates the whole atmospheric column
-// for those directions. PSR pixels use their camera-to-mirror distance, so a reflection is correctly
-// attenuated by the air in front of the mirror.
+// for those directions. PSR pixels get the segment their mirror reflects first, then the camera-to-mirror
+// segment, so a reflected skyline hazes over and is then attenuated by the air in front of the mirror.
 //
 // The volume covers only the segment past the global volumetrics froxel grid, so its in-scatter is
 // attenuated by that grid's transmittance. Strictly the near in-scatter already in radianceOutput
@@ -696,24 +764,53 @@ void applyAerialPerspective(
   bool primaryMiss,
   float hitDistance,
   vec3 volumeAttenuation,
+  // Reflected segment of a PSR pixel: 0 length when there is none (including reflected sky, which
+  // already carries its full column). The throughput is the mirror reflectance its in-scatter is seen through.
+  float3 mirrorPosition,
+  float3 reflectionDirection,
+  float reflectedSegmentLength,
+  vec3 reflectedSegmentThroughput,
   inout vec3 radianceOutput)
 {
-  if (cb.volumeArgs.physicalAtmosphereEnabled == 0 ||
-      cb.atmosphereArgs.aerialPerspectiveLutSize == 0 ||
-      cb.domeLightArgs.active ||
-      primaryMiss ||
-      hitDistance <= 0.0f)
+  vec3 inScatter = vec3(0.0f);
+  float transmittance = 1.0f;
+
+  if (aerialPerspectiveActive() && !primaryMiss && hitDistance > 0.0f)
   {
-    return;
+    if (reflectedSegmentLength > 0.0f)
+    {
+      vec3 reflectedInScatter;
+      vec3 reflectedTransmittance;
+      evalReflectedSegmentAerialPerspective(
+        mirrorPosition, reflectionDirection, reflectedSegmentLength, reflectedInScatter, reflectedTransmittance);
+
+      const vec3 reflectedContribution = max(reflectedInScatter, vec3(0.0f)) * reflectedSegmentThroughput * volumeAttenuation;
+      radianceOutput = radianceOutput * reflectedTransmittance + reflectedContribution;
+
+      inScatter += reflectedContribution;
+      transmittance *= (reflectedTransmittance.x + reflectedTransmittance.y + reflectedTransmittance.z) * (1.0f / 3.0f);
+    }
+
+    vec3 cameraInScatter;
+    float cameraTransmittance;
+    evalCameraSegmentAerialPerspective(pixelCoordinate, hitDistance, cameraInScatter, cameraTransmittance);
+    cameraInScatter *= volumeAttenuation;
+
+    radianceOutput = radianceOutput * cameraTransmittance + cameraInScatter;
+
+    inScatter = inScatter * cameraTransmittance + cameraInScatter;
+    transmittance *= cameraTransmittance;
   }
 
-  const vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, pixelCoordinate);
-  const vec3 uvw = aerialPerspectiveScreenUvToUvw(screenUV, hitDistance, cb.atmosphereArgs);
-  const vec4 aerialPerspective = sampleAerialPerspectiveLut(AtmosphereAerialPerspectiveLut, uvw, cb.atmosphereArgs);
-
-  const vec3 inScatter = max(aerialPerspective.rgb, vec3(0.0f)) * volumeAttenuation;
-
-  radianceOutput = radianceOutput * saturate(aerialPerspective.a) + inScatter;
+  switch (cb.debugViewIdx)
+  {
+  case DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_INSCATTER:
+    storeInDebugView(pixelCoordinate, inScatter);
+    break;
+  case DEBUG_VIEW_ATMOSPHERE_AERIAL_PERSPECTIVE_TRANSMITTANCE:
+    storeInDebugView(pixelCoordinate, transmittance);
+    break;
+  }
 }
 
 float applyFog(
@@ -917,7 +1014,14 @@ vec4 compositeResult(
   radianceOutput += attenuateSharedAsSky ? (sharedRadiance * skyVolumeAttenuation) : sharedRadiance;
 
   // Applied before the sky so it only affects geometry; the sky already carries its full column.
-  applyAerialPerspective(pixelCoordinate, primaryMiss, volumeHitDistance, volumeAttenuation, radianceOutput);
+  // Only PSR content is entirely reflected, so only it gets the reflected segment; a reflection the
+  // indirect integrator produced shares its buffers with the surface's own lighting.
+  const bool psrReflectedGeometry = performedPsr && geometryFlags.performPSRR && psrReflectionSegmentSigned > 0.0f;
+  const float3 psrMirrorPosition = cameraGetWorldPosition(cb.camera) + primaryRayDirections.worldDirection * max(psrFirstHitDistance, 0.0f);
+  applyAerialPerspective(
+    pixelCoordinate, primaryMiss, volumeHitDistance, volumeAttenuation,
+    psrMirrorPosition, psrReflectionDirection, psrReflectedGeometry ? psrReflectionSegmentSigned : 0.0f, primaryAttenuation,
+    radianceOutput);
 
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
