@@ -460,6 +460,13 @@ namespace dxvk {
                "counters), so one entry serves every instance of a mesh and results can never go stale; the per-draw "
                "vertex-shader-constants hash component is recombined live so served hashes are bit-identical to a "
                "fresh compute.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3GeometryMemoSelfCheckFrames, 0,
+               "UE3 compat diagnostics: correctness check for rtx.d3d9.ue3StaticGeometryHashMemoization. Every N "
+               "frames, draws that would be served from the geometry hash / bounding box memo are hashed in full "
+               "instead; a geometry worker compares each hash component and the bounding box with the memoized "
+               "entry and logs [GeometryHashMemoCheck] for the first 20 mismatches, naming the differing components. "
+               "A mismatch means a buffer write reached the geometry without refreshing the buffer's content "
+               "generation. The fresh result replaces the entry. 0 = off.");
     RTX_OPTION("rtx.d3d9", bool, ue3ExactVertexCapture, true,
                "UE3 compat: capture positions from the register the vertex shader multiplies by ViewProjectionMatrix "
                "rather than by unprojecting its clip-space output. Unprojecting divides by a quantity built from the "
@@ -688,6 +695,12 @@ namespace dxvk {
                "either way. When disabled, every overlay replays on the tone-mapped output, where linear overlay maths runs "
                "on display-encoded colour: tints brighten the image and clip highlights.");
     RTX_OPTION("rtx", bool, enableIndexBufferMemoization, true, "CPU performance optimization, should generally be enabled.  Will reduce main thread time by caching processIndexBuffer operations and reusing when possible, this will come at the expense of some CPU RAM.");
+    RTX_OPTION("rtx", bool, poolVertexCaptureBuffers, true,
+               "CPU performance optimization (shader vertex capture). Transient capture buffers (those the UE3 static "
+               "vertex-capture cache does not retain) are pooled in power-of-two size classes and reused once nothing refers "
+               "to them and the GPU is done with them, instead of a new device-local buffer per draw; buffers idle for ~300 "
+               "frames are released. Captures the static cache retains keep exact-size allocations so its byte budget stays "
+               "accurate. Off: a new buffer per capture.");
     RTX_OPTION("rtx", uint32_t, numGeometryProcessingThreads, 2, "The desired number of CPU threads to dedicate to geometry processing  Will be limited by the number of CPU cores.  There may be some advantage to lowering this number in games which are fairly simple and use a low number of draw calls per frame.  The default was determined by looking at a game with around 2000 draw calls per frame, and with a reasonably high average triangle count per draw.");
 
     // Copy of the parameters issued to D3D9 on DrawXXX
@@ -1893,7 +1906,27 @@ namespace dxvk {
     template<typename T>
     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
 
-    bool prepareVertexCapture(const int vertexIndexOffset, Ue3CapturePositionSource positionSource);
+    // allowPooledBuffer: the capture is transient (not retained by the UE3 static vertex-capture
+    // cache), so rtx.poolVertexCaptureBuffers may serve it from the capture buffer pool.
+    bool prepareVertexCapture(const int vertexIndexOffset, Ue3CapturePositionSource positionSource, bool allowPooledBuffer);
+
+    // rtx.poolVertexCaptureBuffers: capture buffers in power-of-two size classes, reused once the
+    // pool holds the last reference and no command list still uses them. App thread only.
+    struct PooledCaptureBuffer {
+      Rc<DxvkBuffer> buffer;
+      uint32_t lastUsedFrame = 0;
+    };
+    struct CaptureBufferBucket {
+      std::vector<PooledCaptureBuffer> buffers;
+      size_t cursor = 0;
+    };
+    static constexpr VkDeviceSize kMinCaptureBufferClass = 4096;
+    static constexpr size_t kCaptureBufferProbes = 16;
+    static constexpr size_t kMaxPooledCaptureBuffersPerClass = 4096;
+    static constexpr uint32_t kCaptureBufferMaxIdleFrames = 300;
+    std::unordered_map<VkDeviceSize, CaptureBufferBucket> m_captureBufferPool;
+    DxvkBufferSlice allocVertexCaptureBuffer(const VkDeviceSize size, bool allowPooledBuffer);
+    void trimVertexCaptureBufferPool();
 
     void processVertices(const VertexContext vertexContext[caps::MaxStreams], int vertexIndexOffset, RasterGeometry& geoData);
 
@@ -2116,6 +2149,7 @@ namespace dxvk {
       bool ue3LogVertexConstantChurn = false;
       uint32_t ue3VertexConstantChurnMaxTrackedDraws = 0;
       bool ue3StaticGeometryHashMemoization = false;
+      uint32_t ue3GeometryMemoSelfCheckFrames = 0;
       bool ue3ExactVertexCapture = false;
       bool ue3RequireExactVertexCapture = false;
       Ue3CapturePositionSourceOverride ue3VertexCaptureSourceOverride = Ue3CapturePositionSourceOverride::Auto;
@@ -2141,6 +2175,7 @@ namespace dxvk {
       bool deferredUiRefreshSceneColor = false;
       bool deferredUiHdrReplay = false;
       bool enableIndexBufferMemoization = false;
+      bool poolVertexCaptureBuffers = false;
 
       // upstream RtxOptions (raytracedRenderTargetEnable caches
       // RtxOptions::RaytracedRenderTarget::enable, needsMeshBoundingBox the
@@ -2200,11 +2235,16 @@ namespace dxvk {
 
     // When publishTo is non-null, the worker additionally publishes the computed result
     // into the memo entry so later frames can reuse it without recomputing.
+    // When verifyAgainst is non-null (rtx.d3d9.ue3GeometryMemoSelfCheckFrames), the worker
+    // compares its result with that published entry and logs [GeometryHashMemoCheck] on a
+    // mismatch; the entry is only read (later draws may be served from it meanwhile).
     Future<AxisAlignedBoundingBox> computeAxisAlignedBoundingBox(const RasterGeometry& geoData,
-                                                                 const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {});
+                                                                 const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {},
+                                                                 const std::shared_ptr<const Ue3GeometryMemoEntry>& verifyAgainst = {});
 
     Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue,
-                                       const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {});
+                                       const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo = {},
+                                       const std::shared_ptr<const Ue3GeometryMemoEntry>& verifyAgainst = {});
 
     void submitActiveDrawCallState();
 

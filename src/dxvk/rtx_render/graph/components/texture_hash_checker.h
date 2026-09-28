@@ -54,7 +54,9 @@ void TextureHashChecker::updateRange(const Rc<DxvkContext>& context, const size_
   // Get the scene manager from context
   RtxContext* rtxContext = static_cast<RtxContext*>(context.ptr());
   const SceneManager& sceneManager = rtxContext->getSceneManager();
-  
+  // rtx.trackHashUsageOnlyWhenNeeded: keep the per-frame hash usage recording on.
+  sceneManager.noteHashUsageConsumer();
+
   for (size_t i = start; i < end; i++) {
     const uint64_t targetHash = m_textureHash[i];
     
