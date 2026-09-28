@@ -51,6 +51,10 @@ class RtxOptionManager;
 #endif
 
 namespace dxvk {
+  // Bumped after any option's resolved value changes (RtxOptionImpl::resolveValue). Caches derived from
+  // option values (DrawCallState's category lookup table) compare it to know when to rebuild.
+  inline std::atomic<uint64_t> g_rtxOptionResolveGeneration { 0 };
+
   class DxvkDevice;
 
   // RtxOption refers to a serializable option, which can be of a basic type (i.e. int) or a class type (i.e. vector hash value)

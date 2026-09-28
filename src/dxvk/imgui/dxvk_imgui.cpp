@@ -3285,11 +3285,13 @@ namespace dxvk {
         RemixGui::Checkbox("Capture Vertices from Shader", &D3D9Rtx::useVertexCaptureObject());
         RemixGui::Checkbox("Capture Normals from Shader", &D3D9Rtx::useVertexCapturedNormalsObject());
         RemixGui::Checkbox("Capture Texcoords from Shader", &D3D9Rtx::useVertexCapturedTexcoordsObject());
+        RemixGui::Checkbox("Pool Vertex Capture Buffers", &D3D9Rtx::poolVertexCaptureBuffersObject());
         RemixGui::Separator();
         RemixGui::Checkbox("Exact Position Capture (UE3)", &D3D9Rtx::ue3ExactVertexCaptureObject());
         RemixGui::Checkbox("Require Exact Position Capture (UE3)", &D3D9Rtx::ue3RequireExactVertexCaptureObject());
         RemixGui::Combo("Position Source Override (UE3)", &D3D9Rtx::ue3VertexCaptureSourceOverrideObject(),
                         "Auto\0Pre-Projection Register\0Input Assembler\0Clip Reconstruction\0");
+        RemixGui::DragInt("Self-Check Memoized Geometry Hashes Every N Frames (UE3, 0 = off)", &D3D9Rtx::ue3GeometryMemoSelfCheckFramesObject(), 1.f, 0, 100000);
         RemixGui::Separator();
         RemixGui::Checkbox("Use World Transforms", &D3D9Rtx::useWorldMatricesForShadersObject());
         ImGui::Unindent();
@@ -4724,6 +4726,8 @@ namespace dxvk {
       RemixGui::DragInt("Max Prims in Merged BLAS", &RtxOptions::maxPrimsInMergedBLASObject(), 1.f, 100, 0);
       RemixGui::Checkbox("Force Merge All Meshes", &RtxOptions::forceMergeAllMeshesObject());
       RemixGui::Checkbox("Minimize BLAS Merging", &RtxOptions::minimizeBlasMergingObject());
+      RemixGui::Separator();
+      RemixGui::Checkbox("Track Hash Usage Only for Hash Checker Graphs", &RtxOptions::trackHashUsageOnlyWhenNeededObject());
       RemixGui::Separator();
       RemixGui::Checkbox("Portals: Virtual Instance Matching", &RtxOptions::useRayPortalVirtualInstanceMatchingObject());
       RemixGui::Checkbox("Portals: Fade In Effect", &RtxOptions::enablePortalFadeInEffectObject());

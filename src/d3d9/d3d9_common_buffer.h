@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "d3d9_device_child.h"
 #include "d3d9_format.h"
 #include "../dxvk/dxvk_buffer.h"
@@ -217,10 +219,16 @@ namespace dxvk {
     using RemixIboMemoizer = MemoryRegionMemoizer<RemixIndexBufferMemoizationData>;
     RemixIboMemoizer remixMemoization;
 
-    // Monotonic content generation: incremented whenever the CPU may have written the
-    // buffer (any non-readonly lock, see D3D9DeviceEx::LockBuffer). Folded into
-    // static-geometry memoization keys so cached hashes/AABBs can never go stale.
-    uint64_t remixContentGeneration = 0;
+    // Content generation: refreshed whenever the CPU may have written the buffer (any
+    // non-readonly lock, see D3D9DeviceEx::LockBuffer). Folded into static-geometry
+    // memoization keys so cached hashes/AABBs can never go stale. Drawn from one
+    // process-wide counter so a buffer created at a freed buffer's address cannot repeat
+    // a (pointer, generation) pair that a memo or capture cache entry still holds.
+    static uint64_t nextRemixContentGeneration() {
+      static std::atomic<uint64_t> s_counter { 0 };
+      return s_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    uint64_t remixContentGeneration = nextRemixContentGeneration();
     // NV-DXVK end
 
   private:

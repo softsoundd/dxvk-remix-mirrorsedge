@@ -45,6 +45,11 @@ namespace dxvk {
     RTX_OPTION("rtx.opacityMicromap", bool, showAdvancedOptions, false, "Shows advanced options.");
 
     RTX_OPTION("rtx.opacityMicromap", bool, enableBinding, true, "Enables binding of built Opacity Micromaps to bottom level acceleration structures.");
+    RTX_OPTION("rtx.opacityMicromap", bool, bindSharedBlas, true,
+               "Per-geometry BLASes shared by several instances (meshes above rtx.minPrimsInDynamicBLAS drawn more than once,\n"
+               "e.g. repeated fences, grates and foliage) bind an opacity micromap when every instance requests the same\n"
+               "4-state one: same OMM source hash (material, alpha state, texture stage ops, texture transform, geometry) and\n"
+               "the same tFactor and colour flags. Off: only single-instance BLASes bind micromaps.");
     RTX_OPTION("rtx.opacityMicromap", bool, enableBakingArrays, true, "Enables baking of opacity textures into Opacity Micromap arrays per triangle.");
     RTX_OPTION("rtx.opacityMicromap", bool, enableBuilding, true, "Enables building of Opacity Micromap arrays.");
     RTX_OPTION("rtx.opacityMicromap", bool, enableResetEveryFrame, false, "Debug: resets Opacity Micromap runtime data every frame. ");
@@ -434,6 +439,21 @@ namespace dxvk {
     static bool usesSplitBillboardOpacityMicromap(const RtInstance& instance);
     static bool useStagingNumTexelsPerMicroTriangleObject(const RtInstance& instance);
     static XXH64_hash_t getOpacityMicromapHash(const RtInstance& instance);
+
+    // rtx.opacityMicromap.bindSharedBlas: whether one micromap is valid for every instance of a shared
+    // per-geometry BLAS. The micromap is baked into the BLAS, so this is only the same result as a
+    // per-instance micromap when every instance would request the very same one, and only 4-state ones
+    // are accepted (unknown micro-triangles keep the exact alpha test). Builds a fresh OmmRequest per
+    // instance, since the cached per-instance hash can lag a state change by a frame; callers pre-filter
+    // on the cached hashes agreeing.
+    enum class SharedBlasOmm : uint8_t {
+      NoUsers,      // no instance uses micromaps (or micromaps unavailable): nothing to bind
+      Compatible,   // all instances request the same 4-state micromap
+      MixedUsers,   // some instances use micromaps, others do not
+      HashMismatch, // instances request different micromaps
+      TwoState      // same micromap, but 2-state: not bound (it would drop unknown texels from the alpha test)
+    };
+    SharedBlasOmm checkSharedBlasOmm(const std::vector<RtInstance*>& instances, const InstanceManager& instanceManager) const;
 
     // Internal use only
     void onInstanceUnlinked(const RtInstance& instance);

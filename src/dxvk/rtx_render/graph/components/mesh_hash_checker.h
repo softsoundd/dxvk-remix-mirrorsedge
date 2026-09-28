@@ -55,7 +55,9 @@ void MeshHashChecker::updateRange(const Rc<DxvkContext>& context, const size_t s
   RtxContext* rtxContext = dynamic_cast<RtxContext*>(context.ptr());
   assert(rtxContext != nullptr && "Components must be run within a valid RtxContext.");
   const SceneManager& sceneManager = rtxContext->getSceneManager();
-  
+  // rtx.trackHashUsageOnlyWhenNeeded: keep the per-frame hash usage recording on.
+  sceneManager.noteHashUsageConsumer();
+
   for (size_t i = start; i < end; i++) {
     const uint64_t targetHash = m_meshHash[i];
     

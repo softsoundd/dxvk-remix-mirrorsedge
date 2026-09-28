@@ -397,12 +397,15 @@ namespace dxvk {
   // REMIX-231: merged category lookup table. Maps a tagged hash to a bitmask of the
   // categories whose option sets contain it, so per-draw categorization is 2-3 table
   // probes instead of ~23 option accesses (each takes the global option mutex) times
-  // 3 hash tiers of set probes. Rebuilt when any source set changes size (UI tagging);
-  // refreshed once per frame from D3D9Rtx::EndFrame and lazily on first use.
+  // 3 hash tiers of set probes. Rebuilt whenever any option's resolved value changed since
+  // the last build (g_rtxOptionResolveGeneration); refreshed once per frame from
+  // D3D9Rtx::EndFrame and lazily on first use.
   // Accessed only from the app thread that submits draw calls.
   namespace {
+    constexpr uint64_t kCategoryLookupTableNeverBuilt = ~0ull;
+
     struct CategoryLookupTable {
-      size_t fingerprint = SIZE_MAX;
+      uint64_t generation = kCategoryLookupTableNeverBuilt;
       fast_unordered_cache<uint32_t> bits;
 
       uint32_t lookup(const XXH64_hash_t h) const {
@@ -423,6 +426,13 @@ namespace dxvk {
   void DrawCallState::refreshCategoryLookupTable() {
     static_assert(static_cast<uint32_t>(InstanceCategories::Count) <= 32, "Category bits must fit in uint32_t");
 
+    const uint64_t generation = g_rtxOptionResolveGeneration.load(std::memory_order_acquire);
+    if (generation == s_categoryLookupTable.generation) {
+      return;
+    }
+
+    // The accessors take the option mutex themselves, so gather the (stable) set addresses
+    // before holding it below.
     const std::pair<InstanceCategories, const fast_unordered_set*> categorySets[] = {
       { InstanceCategories::WorldUI, &RtxOptions::worldSpaceUiTextures() },
       { InstanceCategories::WorldMatte, &RtxOptions::worldSpaceUiBackgroundTextures() },
@@ -451,31 +461,25 @@ namespace dxvk {
       { InstanceCategories::CullBackfacesInShadows, &RtxOptions::cullBackfacesInShadowTextures() },
     };
 
-    // Position-weighted size fingerprint: any single-set tagging change (add/remove via
-    // the UI) alters it, including moves between sets.
-    size_t fingerprint = 0;
-    size_t weight = 1;
-    for (const auto& [category, set] : categorySets) {
-      fingerprint += set->size() * (weight++);
-    }
-
-    if (fingerprint == s_categoryLookupTable.fingerprint) {
-      return;
-    }
-
-    s_categoryLookupTable.fingerprint = fingerprint;
-    s_categoryLookupTable.bits.clear();
-    for (const auto& [category, set] : categorySets) {
-      const uint32_t bit = categoryBit(category);
-      for (const XXH64_hash_t hash : *set) {
-        s_categoryLookupTable.bits[hash] |= bit;
+    // Under the option mutex: the CS thread assigns whole sets (RtxOptionImpl::copyValue) under it
+    // when it resolves pending option changes.
+    {
+      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+      s_categoryLookupTable.bits.clear();
+      for (const auto& [category, set] : categorySets) {
+        const uint32_t bit = categoryBit(category);
+        for (const XXH64_hash_t hash : *set) {
+          s_categoryLookupTable.bits[hash] |= bit;
+        }
       }
     }
+    // A change resolved between the load above and the build is picked up by the next refresh.
+    s_categoryLookupTable.generation = generation;
   }
 
   void DrawCallState::setupCategoriesForTexture() {
     // lazy first-frame initialization; steady-state refreshes happen once per frame
-    if (unlikely(s_categoryLookupTable.fingerprint == SIZE_MAX)) {
+    if (unlikely(s_categoryLookupTable.generation == kCategoryLookupTableNeverBuilt)) {
       refreshCategoryLookupTable();
     }
 

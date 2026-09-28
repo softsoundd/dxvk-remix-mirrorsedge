@@ -652,6 +652,14 @@ namespace dxvk {
     
     // Clear mesh hashes before the next frame.  These are used by components, so must clear after graphManager updates.
     clearFrameMeshHashes();
+
+    // rtx.trackHashUsageOnlyWhenNeeded: record hash usage next frame only if a hash checker
+    // component read it recently (the graph update ran before this point); the two-frame
+    // hysteresis covers the D3D9 thread running a frame ahead of this decision.
+    m_framesSinceHashUsageConsumer = m_hashUsageConsumerSeen.exchange(false, std::memory_order_relaxed)
+      ? 0 : std::min<uint32_t>(m_framesSinceHashUsageConsumer + 1, 1000u);
+    s_hashUsageTrackingWanted.store(!RtxOptions::trackHashUsageOnlyWhenNeeded() || m_framesSinceHashUsageConsumer <= 2,
+                                    std::memory_order_relaxed);
     
     // Reset the fog state to get it re-discovered on the next frame
     ImGUI::SetFogStates(m_fogStates, m_fog.getHash());
@@ -3269,6 +3277,9 @@ namespace dxvk {
   }
 
   void SceneManager::trackReplacementMaterialHash(XXH64_hash_t materialHash) {
+    if (!s_hashUsageTrackingWanted.load(std::memory_order_relaxed)) {
+      return;
+    }
     if (materialHash != kEmptyHash) {
       m_currentFrameReplacementMaterialHashes[materialHash]++;
     }
@@ -3288,6 +3299,9 @@ namespace dxvk {
   }
 
   void SceneManager::trackMeshHash(XXH64_hash_t meshHash) {
+    if (!s_hashUsageTrackingWanted.load(std::memory_order_relaxed)) {
+      return;
+    }
     if (meshHash != kEmptyHash) {
       m_currentFrameMeshHashes[meshHash]++;
     }

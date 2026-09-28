@@ -107,6 +107,13 @@ Do not use the classified factory type to tell foliage from particles; use the m
 
 `rtx.d3d9.ue3LogVertexConstantChurn` samples up to `rtx.d3d9.ue3VertexConstantChurnMaxTrackedDraws` meshes by input-assembler identity and reports what changed when a draw that should be static returns: whether the IA identity came back at all (buffer handles, draw range, or content-generation counters), whether the multiset of instance transforms matched between completed frames (same count but different placements means they moved; a count change is culling), and whether any other vertex constant moved, named by CTAB symbol. Camera and transform registers are skipped in that last check. Raw `LocalToWorld` is compared with the extracted matrices so an extraction bug is visible separately from the game. The tracker keys per mesh, not per placement, so ordinary instanced translations are not reported as churn. Changes only while the view moves point at a camera-derived constant; changes with the view still point at animation or time. `ue3ExcludePlacementFromVertexShaderHash` can address placement churn only.
 
+## Verifying the geometry hash memo
+
+`rtx.d3d9.ue3StaticGeometryHashMemoization` serves geometry hashes and bounding boxes from a memo keyed on the input-assembler identity, so a buffer write that reached the geometry without refreshing that identity would serve a stale hash silently. Two things guard against it:
+
+- Each buffer's content generation (`D3D9CommonBuffer::remixContentGeneration`, part of the memo key and of the static vertex-capture cache key) comes from one process-wide counter, at creation and on every non-readonly lock, so a buffer created at a freed buffer's address with the same slice length - routine under level streaming - never repeats a key an older entry still holds.
+- `rtx.d3d9.ue3GeometryMemoSelfCheckFrames = N` (default 0) hashes every memo-eligible draw in full every N frames instead of serving it; the geometry worker compares each hash component (the per-draw `VertexShader` slot excepted) and the bounding box against the memoized entry and logs `[GeometryHashMemoCheck]` with the differing component names, first 20 mismatches. The fresh result replaces the entry. Any such line names a write path that bypasses `LockBuffer`.
+
 ## Placement constants and the geometry hash
 
 Stock UE3 excludes `ViewProjectionMatrix` (`c0`) and `CameraPosition` (`c4`) from the stable VS hash. Other stock camera-derived vertex constants belong to factories the cache already refuses (e.g. Mirror's Edge reuses about 98% of eligible draws).

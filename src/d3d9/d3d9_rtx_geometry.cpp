@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <string>
 #include <vector>
 #include "d3d9_device.h"
 #include "d3d9_rtx.h"
@@ -8,6 +10,7 @@
 #include "d3d9_state.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../dxvk/rtx_render/rtx_hashing.h"
+#include "../util/util_bit.h"
 #include "../util/util_fastops.h"
 
 namespace dxvk {
@@ -23,10 +26,13 @@ namespace dxvk {
   }
 
   // NOTE: Intentionally leaving the legacy hashes out of here, because they are special (REMIX-656)
-  const std::map<HashComponents, VertexRegions::Type> componentToRegionMap = {
-    { HashComponents::VertexPosition,   VertexRegions::Position },
-    { HashComponents::VertexTexcoord,   VertexRegions::Texcoord },
-  };
+  inline bool componentToRegion(const HashComponents component, VertexRegions::Type& regionOut) {
+    switch (component) {
+    case HashComponents::VertexPosition: regionOut = VertexRegions::Position; return true;
+    case HashComponents::VertexTexcoord: regionOut = VertexRegions::Texcoord; return true;
+    default: return false;
+    }
+  }
 
   bool getVertexRegion(const RasterBuffer& buffer, const size_t vertexCount, HashQuery& outResult) {
     ScopedCpuProfileZone();
@@ -44,32 +50,33 @@ namespace dxvk {
     return true;
   }
 
-  // Sorts and deduplicates a set of integers, storing the result in a vector
+  // Sorts and deduplicates a set of integers, storing the result in a vector (REMIX-657)
   template<typename T>
   void deduplicateSortIndices(const void* pIndexData, const size_t indexCount, const uint32_t maxIndexValue, std::vector<T>& uniqueIndicesOut) {
-    // TODO (REMIX-657): Implement optimized variant of this function
-    // We know there will be at most, this many unique indices
-    const uint32_t indexRange = maxIndexValue + 1;
+    // One bit per index value in [0, maxIndexValue], in a table reused per worker thread.
+    thread_local std::vector<uint32_t> tlsIndexBits;
+    const uint32_t wordCount = (maxIndexValue >> 5) + 1;
+    tlsIndexBits.assign(wordCount, 0u);
 
-    // Initialize all to 0
-    uniqueIndicesOut.resize(indexRange, (T)0);
-
-    // Use memory as a bin table for index data
-    for (uint32_t i = 0; i < indexCount; i++) {
-      const T& index = ((T*) pIndexData)[i];
+    const T* pIndices = static_cast<const T*>(pIndexData);
+    for (size_t i = 0; i < indexCount; i++) {
+      const uint32_t index = pIndices[i];
       assert(index <= maxIndexValue);
-      uniqueIndicesOut[index] = 1;
+      tlsIndexBits[index >> 5] |= 1u << (index & 31);
     }
 
-    // Repopulate the bins with contiguous index values
-    uint32_t uniqueIndexCount = 0;
-    for (uint32_t i = 0; i < indexRange; i++) {
-      if (uniqueIndicesOut[i])
-        uniqueIndicesOut[uniqueIndexCount++] = i;
+    // Set bits in ascending order are the sorted unique indices.
+    uniqueIndicesOut.clear();
+    for (uint32_t word = 0; word < wordCount; word++) {
+      for (const uint32_t bitIndex : bit::BitMask(tlsIndexBits[word])) {
+        uniqueIndicesOut.push_back(static_cast<T>((word << 5) + bitIndex));
+      }
     }
 
-    // Remove any unused entries
-    uniqueIndicesOut.resize(uniqueIndexCount);
+    // Don't keep an unusually large draw's bit table alive on the worker.
+    if (tlsIndexBits.capacity() > (size_t(1) << 20)) {
+      std::vector<uint32_t>().swap(tlsIndexBits);
+    }
   }
 
   template<typename T>
@@ -79,8 +86,10 @@ namespace dxvk {
 
     const HashRule& globalHashRule = RtxOptions::geometryHashGenerationRule();
 
-    // TODO (REMIX-658): Improve this by reducing allocation overhead of vector
-    std::vector<T> uniqueIndices(0);
+    // Unique index list reused per worker thread (REMIX-658).
+    thread_local std::vector<T> tlsUniqueIndices;
+    std::vector<T>& uniqueIndices = tlsUniqueIndices;
+    uniqueIndices.clear();
     if constexpr (!std::is_same<T, NoIndices>::value) {
       assert((indexCount > 0 && indexBufferRef));
       deduplicateSortIndices(pIndexData, indexCount, maxIndexValue, uniqueIndices);
@@ -103,10 +112,15 @@ namespace dxvk {
     for (uint32_t i = 0; i < (uint32_t) HashComponents::Count; i++) {
       const HashComponents& component = (HashComponents) i;
 
-      if (globalHashRule.test(component) && componentToRegionMap.count(component) > 0) {
-        const VertexRegions::Type region = componentToRegionMap.at(component);
+      VertexRegions::Type region = VertexRegions::Position;
+      if (globalHashRule.test(component) && componentToRegion(component, region)) {
         hashesOut[component] = hashVertexRegionIndexed(vertexRegions[(uint32_t)region], uniqueIndices);
       }
+    }
+
+    // Don't keep an unusually large draw's bin table alive on the worker.
+    if (uniqueIndices.capacity() > (size_t(1) << 22)) {
+      std::vector<T>().swap(uniqueIndices);
     }
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
@@ -158,8 +172,15 @@ namespace dxvk {
     return vertexShaderHash;
   }
 
+  namespace {
+    // rtx.d3d9.ue3GeometryMemoSelfCheckFrames: only the first mismatches are logged.
+    std::atomic<uint32_t> s_geometryMemoMismatchLogs { 0 };
+    constexpr uint32_t kGeometryMemoMismatchLogLimit = 20;
+  }
+
   Future<GeometryHashes> D3D9Rtx::computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue,
-                                              const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
+                                              const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo,
+                                              const std::shared_ptr<const Ue3GeometryMemoEntry>& verifyAgainst) {
     ScopedCpuProfileZone();
 
     const uint32_t indexCount = geoData.indexCount;
@@ -213,9 +234,9 @@ namespace dxvk {
     }
 
     return m_pGeometryWorkers->Schedule([vertexRegions, indexBufferRef = indexBufferRef.ptr(),
-                                 pIndexData, indexStride, indexDataSize, indexCount,
+                                 pIndexData, indexStride, indexDataSize, indexCount, vertexCount,
                                  maxIndexValue, vertexShaderHash, geometryDescriptorHash,
-                                 vertexLayoutHash, publishTo]() -> GeometryHashes {
+                                 vertexLayoutHash, publishTo, verifyAgainst]() -> GeometryHashes {
       ScopedCpuProfileZone();
 
       GeometryHashes hashes;
@@ -242,6 +263,29 @@ namespace dxvk {
 
       hashes.precombine();
 
+      // rtx.d3d9.ue3GeometryMemoSelfCheckFrames: the memoized components must equal the fresh ones.
+      // The VertexShader slot is per-draw and recombined live by the memo consumer, so it is not compared.
+      if (verifyAgainst != nullptr && verifyAgainst->hashesReady.load(std::memory_order_acquire)) {
+        std::string differing;
+        for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {
+          const HashComponents component = HashComponents(i);
+          if (component == HashComponents::VertexShader) {
+            continue;
+          }
+          if (verifyAgainst->componentHashes[i] != hashes[component]) {
+            differing += str::format(differing.empty() ? "" : ", ", getHashComponentName(component), " 0x",
+                                     std::hex, verifyAgainst->componentHashes[i], " -> 0x", hashes[component]);
+          }
+        }
+        if (!differing.empty() &&
+            s_geometryMemoMismatchLogs.fetch_add(1, std::memory_order_relaxed) < kGeometryMemoMismatchLogLimit) {
+          Logger::warn(str::format(
+            "[GeometryHashMemoCheck] memoized geometry hash is stale: ", differing,
+            " (vertices=", vertexCount, ", indices=", indexCount,
+            "; first ", kGeometryMemoMismatchLogLimit, " mismatches are logged)"));
+        }
+      }
+
       // Publish into the static-geometry memo entry so later frames can reuse the
       // result without recomputing (entry storage is heap-pinned via shared_ptr).
       // The VertexShader component is per-draw (stable VS-constant hash, position source)
@@ -259,7 +303,8 @@ namespace dxvk {
   }
 
   Future<AxisAlignedBoundingBox> D3D9Rtx::computeAxisAlignedBoundingBox(const RasterGeometry& geoData,
-                                                                        const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo) {
+                                                                        const std::shared_ptr<Ue3GeometryMemoEntry>& publishTo,
+                                                                        const std::shared_ptr<const Ue3GeometryMemoEntry>& verifyAgainst) {
     ScopedCpuProfileZone();
 
     if (!m_frameOptions.needsMeshBoundingBox) {
@@ -277,7 +322,7 @@ namespace dxvk {
     auto vertexBuffer = geoData.positionBuffer.buffer().ptr();
     vertexBuffer->incRef();
 
-    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer, publishTo]()->AxisAlignedBoundingBox {
+    return m_pGeometryWorkers->Schedule([pVertexData, vertexCount, vertexStride, vertexBuffer, publishTo, verifyAgainst]()->AxisAlignedBoundingBox {
       ScopedCpuProfileZone();
 
 #if defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -323,6 +368,19 @@ namespace dxvk {
 #endif
 
       vertexBuffer->decRef();
+
+      // rtx.d3d9.ue3GeometryMemoSelfCheckFrames: the memoized box must equal the fresh one exactly.
+      if (verifyAgainst != nullptr && verifyAgainst->aabbReady.load(std::memory_order_acquire)) {
+        const AxisAlignedBoundingBox& memoized = verifyAgainst->boundingBox;
+        const bool same = memoized.minPos == boundingBox.minPos && memoized.maxPos == boundingBox.maxPos;
+        if (!same &&
+            s_geometryMemoMismatchLogs.fetch_add(1, std::memory_order_relaxed) < kGeometryMemoMismatchLogLimit) {
+          Logger::warn(str::format(
+            "[GeometryHashMemoCheck] memoized bounding box is stale: min ", memoized.minPos, " max ", memoized.maxPos,
+            " -> min ", boundingBox.minPos, " max ", boundingBox.maxPos,
+            " (vertices=", vertexCount, "; first ", kGeometryMemoMismatchLogLimit, " mismatches are logged)"));
+        }
+      }
 
       // Publish into the static-geometry memo entry for cross-frame reuse
       if (publishTo != nullptr) {

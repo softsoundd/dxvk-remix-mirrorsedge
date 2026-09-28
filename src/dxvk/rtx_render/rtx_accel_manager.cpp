@@ -999,12 +999,24 @@ namespace dxvk {
         // We can only support OMM on dynamic BLAS whos surface is unique to that BLAS.  This is so we can benefit from instancing BLAS memory.  
         // In cases where there are multiple linked instances each with different surfaces OMM would break.
         bool ommsCompatible = uniqueBlasEntry.instances.size() == 1;
+        // Whether every instance's cached OMM hash agrees with the first one's (trivially true for one instance).
+        bool cachedOmmHashesAgree = true;
         const XXH64_hash_t firstOmmHash = OpacityMicromapManager::getOpacityMicromapHash(*uniqueBlasEntry.instances[0]);
         for (uint32_t i = 1; i < uniqueBlasEntry.instances.size(); i++) {
           const XXH64_hash_t thisOmmHash = OpacityMicromapManager::getOpacityMicromapHash(*uniqueBlasEntry.instances[i]);
           if (thisOmmHash != firstOmmHash) {
             ommsCompatible = false;
+            cachedOmmHashesAgree = false;
             break;
+          }
+        }
+
+        // rtx.opacityMicromap.bindSharedBlas: a shared BLAS can carry the micromap all of its instances request.
+        // The cached-hash agreement above is the cheap pre-filter; checkSharedBlasOmm confirms with fresh requests.
+        if (!ommsCompatible && cachedOmmHashesAgree && OpacityMicromapOptions::bindSharedBlas()) {
+          if (opacityMicromapManager->checkSharedBlasOmm(uniqueBlasEntry.instances, instanceManager) ==
+              OpacityMicromapManager::SharedBlasOmm::Compatible) {
+            ommsCompatible = true;
           }
         }
 

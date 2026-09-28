@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -247,6 +248,12 @@ public:
   uint32_t getMeshHashUsageCount(XXH64_hash_t meshHash) const;
   void clearFrameMeshHashes();
 
+  // rtx.trackHashUsageOnlyWhenNeeded: the hash checker graph components (the only readers of the
+  // usage maps) call this when they read them; onFrameEnd folds it into s_hashUsageTrackingWanted,
+  // which the recording on both the CS and the D3D9 thread consults.
+  void noteHashUsageConsumer() const { m_hashUsageConsumerSeen.store(true, std::memory_order_relaxed); }
+  inline static std::atomic<bool> s_hashUsageTrackingWanted { true };
+
   Rc<DxvkSampler> patchSampler( const VkFilter filterMode,
                                 const VkSamplerAddressMode addressModeU,
                                 const VkSamplerAddressMode addressModeV,
@@ -468,6 +475,10 @@ private:
 
   // Mesh hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
+
+  // rtx.trackHashUsageOnlyWhenNeeded
+  mutable std::atomic<bool> m_hashUsageConsumerSeen { false };
+  uint32_t m_framesSinceHashUsageConsumer = 0;
 
   DrawCallTracker m_drawCallTracker;
 

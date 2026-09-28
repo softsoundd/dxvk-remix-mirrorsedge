@@ -29,6 +29,15 @@
 
 namespace dxvk {
 
+  // Size of the froxel radiance cache while volumetrics are off (rtx.volumetrics.consumerCacheQuality).
+  enum class FroxelConsumerCacheQuality : int {
+    Off = 0,
+    Low,
+    Medium,
+    High,
+    Full
+  };
+
   class RtxGlobalVolumetrics : public CommonDeviceObject, public RtxPass {
 
   public:
@@ -145,7 +154,21 @@ namespace dxvk {
     RTX_OPTION_FLAG("rtx.volumetrics", bool, enableReferenceMode, false, RtxOptionFlags::NoSave, "Enables reference mode for volumetrics.  This is very expensive, but allows for rendering engineers to test how close sampling approximations are to the real thing. This will not save.");
     RTX_OPTION_ARGS("rtx.volumetrics", bool, enable, true,
                "Enabling volumetric lighting provides higher quality ray traced physical volumetrics, disabling falls back to cheaper depth based fog.\n"
-               "Note that disabling this option does not disable the froxel radiance cache as a whole as it is still needed for other non-volumetric lighting approximations.",
+               "Note that disabling this option does not disable the froxel radiance cache as a whole as it is still needed for other non-volumetric lighting approximations; "
+               "rtx.volumetrics.consumerCacheQuality sets how much of it is kept (shrunk by default, or skipped).",
+               args.flags = RtxOptionFlags::UserSetting);
+    RTX_OPTION_ARGS("rtx.volumetrics", FroxelConsumerCacheQuality, consumerCacheQuality, FroxelConsumerCacheQuality::Medium,
+               "Froxel radiance cache resolution while rtx.volumetrics.enable is off. With volumetrics off the cache's only readers are its "
+               "surface consumers - opacity-lighting-approximated particles (smoke, dust), the decal/PSR diffuse approximation and the "
+               "stochastic alpha blend radiance-volume fallback - which need far less resolution than visible fog does.\n"
+               "Off (0): the cache is skipped (no GPU cost, its textures shrink to 1x1x1 placeholders) and those consumers receive no cache light.\n"
+               "Low (1): grid 4x coarser in x and y, half the depth slices (~1/32 of the full cache's cells).\n"
+               "Medium (2, default): grid 2x coarser in x and y, half the depth slices (~1/8 of the cells).\n"
+               "High (3): grid 2x coarser in x and y, all depth slices (~1/4 of the cells).\n"
+               "Full (4): the full-size cache volumetrics use.\n"
+               "The reduction applies on top of rtx.volumetrics.froxelGridResolutionScale and to both the froxel and the ReSTIR grid; "
+               "changing it reallocates the cache and restarts its history. Ignored while volumetrics are on.",
+               args.minValue = FroxelConsumerCacheQuality::Off, args.maxValue = FroxelConsumerCacheQuality::Full,
                args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.volumetrics", bool, enableTranslucentShadows, false,
                "Calculate coloured shadows from translucent materials (i.e. glass, water) in volumetric lighting. In engineering terms: include OBJECT_MASK_TRANSLUCENT into volumetric visibility rays.");
@@ -315,7 +338,10 @@ namespace dxvk {
     VolumeArgs getVolumeArgs(CameraManager const& cameraManager, FogState const& fogState, bool enablePortalVolumes) const;
 
     void dispatch(class RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, uint32_t numActiveFroxelVolumes);
-    
+
+    // Whether the froxel radiance cache passes run this frame.
+    bool isFroxelCacheActive() const { return m_froxelCacheMode != FroxelConsumerCacheQuality::Off; }
+
     const Resources::Resource& getCurrentVolumeReservoirs() const { return m_volumeReservoirs[0]; }
     const Resources::Resource& getPreviousVolumeReservoirs() const { return m_volumeReservoirs[1]; }
     const Resources::Resource& getCurrentVolumeAccumulatedRadianceY() const { return m_volumeAccumulatedRadianceY[m_swapTextures]; }
@@ -326,6 +352,9 @@ namespace dxvk {
     const Resources::Resource& getPreviousVolumeAccumulatedRadianceAge() const { return m_volumeAccumulatedRadianceAge[!m_swapTextures]; }
 
     void showPresetMenu();
+    // The quality level buttons while volumetrics are on (disabled when presetLocked), the
+    // consumer cache dropdown while they are off; showGridSize adds the live grid extent.
+    void showFroxelCacheQuality(bool presetLocked, bool showGridSize);
     void showImguiUserSettings();
     void showImguiSettings();
 
@@ -350,6 +379,13 @@ namespace dxvk {
     bool m_rebuildFroxels = false;
     // Set by setPreset; consumed (and cleared) in getVolumeArgs.
     mutable bool m_forceResetVolumeHistory = false;
+    // Cache size for this frame, latched in onFrameBegin: Full while volumetrics are on, otherwise
+    // rtx.volumetrics.consumerCacheQuality. m_froxelTexturesMode is the size the textures were last
+    // allocated for; m_froxelCacheHistoryStale marks the frame the mode changed (textures reallocated,
+    // history dropped like a camera cut).
+    FroxelConsumerCacheQuality m_froxelCacheMode = FroxelConsumerCacheQuality::Full;
+    FroxelConsumerCacheQuality m_froxelTexturesMode = FroxelConsumerCacheQuality::Full;
+    bool m_froxelCacheHistoryStale = false;
 
     DxvkRaytracingPipelineShaders getPipelineShaders(bool useRayQuery) const;
 

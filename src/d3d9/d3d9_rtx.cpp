@@ -6302,6 +6302,7 @@ namespace dxvk {
     o.ue3LogVertexConstantChurn = ue3LogVertexConstantChurnObject().get();
     o.ue3VertexConstantChurnMaxTrackedDraws = ue3VertexConstantChurnMaxTrackedDrawsObject().get();
     o.ue3StaticGeometryHashMemoization = ue3StaticGeometryHashMemoizationObject().get();
+    o.ue3GeometryMemoSelfCheckFrames = ue3GeometryMemoSelfCheckFramesObject().get();
     o.ue3ExactVertexCapture = ue3ExactVertexCaptureObject().get();
     o.ue3RequireExactVertexCapture = ue3RequireExactVertexCaptureObject().get();
     o.ue3VertexCaptureSourceOverride = ue3VertexCaptureSourceOverrideObject().get();
@@ -6327,6 +6328,7 @@ namespace dxvk {
     o.deferredUiRefreshSceneColor = deferredUiRefreshSceneColorObject().get();
     o.deferredUiHdrReplay = deferredUiHdrReplayObject().get();
     o.enableIndexBufferMemoization = enableIndexBufferMemoizationObject().get();
+    o.poolVertexCaptureBuffers = poolVertexCaptureBuffersObject().get();
 
     o.enableRaytracing = RtxOptions::enableRaytracingObject().get();
     o.enableAlphaTest = RtxOptions::enableAlphaTestObject().get();
@@ -6346,23 +6348,61 @@ namespace dxvk {
     o.logReplacementResolution = RtxOptions::logReplacementResolutionObject().get();
     o.drawCallRange = RtxOptions::drawCallRangeObject().get();
 
-    o.uiTextures = &RtxOptions::uiTexturesObject().get();
-    o.deferredUiTextures = &RtxOptions::deferredUiTexturesObject().get();
-    o.deferredUiPixelShaders = &deferredUiPixelShadersObject().get();
-    o.lightmapTextures = &RtxOptions::lightmapTexturesObject().get();
-    o.neverAlbedoTextures = &RtxOptions::neverAlbedoTexturesObject().get();
-    o.preferredAlbedoTextures = &RtxOptions::preferredAlbedoTexturesObject().get();
-    o.smoothNormalsTextures = &RtxOptions::smoothNormalsTexturesObject().get();
-    o.ignoreBakedLightingTextures = &RtxOptions::ignoreBakedLightingTexturesObject().get();
-    o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
-    o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
-    o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
-    o.ue3MicConstantIdentityExcludedMaterials = &ue3MicConstantIdentityExcludedMaterialsObject().get();
-    o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
-    o.ue3TraceDrawTextureHashes = &ue3TraceDrawTextureHashesObject().get();
-    o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
+    refreshFrameOptionSets();
+    const FrameOptionSets& s = m_frameOptionSets;
+    o.uiTextures = &s.uiTextures;
+    o.deferredUiTextures = &s.deferredUiTextures;
+    o.deferredUiPixelShaders = &s.deferredUiPixelShaders;
+    o.lightmapTextures = &s.lightmapTextures;
+    o.neverAlbedoTextures = &s.neverAlbedoTextures;
+    o.preferredAlbedoTextures = &s.preferredAlbedoTextures;
+    o.smoothNormalsTextures = &s.smoothNormalsTextures;
+    o.ignoreBakedLightingTextures = &s.ignoreBakedLightingTextures;
+    o.raytracedRenderTargetTextures = &s.raytracedRenderTargetTextures;
+    o.vsTexcoordCaptureOutlierTextures = &s.vsTexcoordCaptureOutlierTextures;
+    o.ue3MicConstantIdentityExcludedShaders = &s.ue3MicConstantIdentityExcludedShaders;
+    o.ue3MicConstantIdentityExcludedMaterials = &s.ue3MicConstantIdentityExcludedMaterials;
+    o.ue3MicIdentityExcludedTextureDescHashes = &s.ue3MicIdentityExcludedTextureDescHashes;
+    o.ue3TraceDrawTextureHashes = &s.ue3TraceDrawTextureHashes;
+    o.replacementDebugHashes = &s.replacementDebugHashes;
 
     o.valid = true;
+  }
+
+  void D3D9Rtx::refreshFrameOptionSets() {
+    const uint64_t generation = g_rtxOptionResolveGeneration.load(std::memory_order_acquire);
+    if (generation == m_frameOptionSets.generation) {
+      return;
+    }
+
+    // The accessors take the option mutex themselves, so gather the source addresses before holding it.
+    FrameOptionSets& s = m_frameOptionSets;
+    const std::pair<fast_unordered_set*, const fast_unordered_set*> sets[] = {
+      { &s.uiTextures, &RtxOptions::uiTexturesObject().get() },
+      { &s.deferredUiTextures, &RtxOptions::deferredUiTexturesObject().get() },
+      { &s.deferredUiPixelShaders, &deferredUiPixelShadersObject().get() },
+      { &s.lightmapTextures, &RtxOptions::lightmapTexturesObject().get() },
+      { &s.neverAlbedoTextures, &RtxOptions::neverAlbedoTexturesObject().get() },
+      { &s.preferredAlbedoTextures, &RtxOptions::preferredAlbedoTexturesObject().get() },
+      { &s.smoothNormalsTextures, &RtxOptions::smoothNormalsTexturesObject().get() },
+      { &s.ignoreBakedLightingTextures, &RtxOptions::ignoreBakedLightingTexturesObject().get() },
+      { &s.raytracedRenderTargetTextures, &RtxOptions::raytracedRenderTargetTexturesObject().get() },
+      { &s.vsTexcoordCaptureOutlierTextures, &vsTexcoordCaptureOutlierTexturesObject().get() },
+      { &s.ue3MicConstantIdentityExcludedShaders, &ue3MicConstantIdentityExcludedShadersObject().get() },
+      { &s.ue3MicConstantIdentityExcludedMaterials, &ue3MicConstantIdentityExcludedMaterialsObject().get() },
+      { &s.ue3MicIdentityExcludedTextureDescHashes, &ue3MicIdentityExcludedTextureDescHashesObject().get() },
+      { &s.ue3TraceDrawTextureHashes, &ue3TraceDrawTextureHashesObject().get() },
+      { &s.replacementDebugHashes, &RtxOptions::replacementDebugHashesObject().get() },
+    };
+
+    // The CS thread assigns whole sets under this mutex when it resolves pending option changes.
+    {
+      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+      for (const auto& [dst, src] : sets) {
+        *dst = *src;
+      }
+    }
+    s.generation = generation;
   }
 
   const char* D3D9Rtx::describeUe3CapturePositionSource(const Ue3CapturePositionSource source) {
@@ -7957,19 +7997,79 @@ namespace dxvk {
     return result.slice;
   }
 
-  DxvkBufferSlice allocVertexCaptureBuffer(DxvkDevice* pDevice, const VkDeviceSize size) {
+  static Rc<DxvkBuffer> createVertexCaptureBuffer(DxvkDevice* pDevice, const VkDeviceSize size) {
     DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     info.access = VK_ACCESS_TRANSFER_READ_BIT;
     info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.size = size;
     // Own category rather than AppBuffer: these are Remix-side allocations whose lifetime the
-    // runtime controls (per-draw, or held by the UE3 static capture cache), so lumping them in
-    // with the game's own buffers hides them from memory profiling.
-    return DxvkBufferSlice(pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXVertexCapture, "Vertex Capture Buffer"));
+    // runtime controls (per-draw, pooled, or held by the UE3 static capture cache), so lumping
+    // them in with the game's own buffers hides them from memory profiling.
+    return pDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXVertexCapture, "Vertex Capture Buffer");
   }
 
-  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const Ue3CapturePositionSource positionSource) {
+  DxvkBufferSlice D3D9Rtx::allocVertexCaptureBuffer(const VkDeviceSize size, const bool allowPooledBuffer) {
+    DxvkDevice* pDevice = m_parent->GetDXVKDevice().ptr();
+
+    if (!m_frameOptions.poolVertexCaptureBuffers) {
+      if (!m_captureBufferPool.empty()) {
+        m_captureBufferPool.clear();
+      }
+      return DxvkBufferSlice(createVertexCaptureBuffer(pDevice, size));
+    }
+
+    // A capture the static vertex-capture cache retains lives as long as its entry: pooling gains
+    // nothing and the power-of-two rounding would make the cache's byte budget undercount VRAM.
+    if (!allowPooledBuffer) {
+      return DxvkBufferSlice(createVertexCaptureBuffer(pDevice, size));
+    }
+
+    // Reuse only when the pool holds the last reference (no draw-call state, BlasEntry input, CS
+    // chunk, command list or context binding refers to it) and no command list still uses it.
+    VkDeviceSize sizeClass = kMinCaptureBufferClass;
+    while (sizeClass < size) {
+      sizeClass <<= 1;
+    }
+    CaptureBufferBucket& bucket = m_captureBufferPool[sizeClass];
+    const size_t count = bucket.buffers.size();
+    const size_t probes = std::min<size_t>(count, kCaptureBufferProbes);
+    for (size_t i = 0; i < probes; ++i) {
+      const size_t idx = (bucket.cursor + i) % count;
+      PooledCaptureBuffer& entry = bucket.buffers[idx];
+      entry.buffer->incRef();
+      const uint32_t refs = entry.buffer->decRef();
+      if (refs == 1 && !entry.buffer->isInUse()) { // isInUse(Read) checks readers and writers
+        bucket.cursor = idx + 1;
+        entry.lastUsedFrame = m_ue3FrameCounter;
+        return DxvkBufferSlice(entry.buffer, 0, size);
+      }
+    }
+
+    Rc<DxvkBuffer> buffer = createVertexCaptureBuffer(pDevice, sizeClass);
+    if (count < kMaxPooledCaptureBuffersPerClass) {
+      bucket.buffers.push_back({ buffer, m_ue3FrameCounter });
+    }
+    return DxvkBufferSlice(buffer, 0, size);
+  }
+
+  void D3D9Rtx::trimVertexCaptureBufferPool() {
+    // Drop the pool's reference to buffers not handed out for a while; one still referenced
+    // elsewhere simply stops being pooled.
+    if (m_captureBufferPool.empty() || (m_ue3FrameCounter % 64) != 0) {
+      return;
+    }
+    for (auto it = m_captureBufferPool.begin(); it != m_captureBufferPool.end();) {
+      std::vector<PooledCaptureBuffer>& buffers = it->second.buffers;
+      buffers.erase(std::remove_if(buffers.begin(), buffers.end(), [this](const PooledCaptureBuffer& e) {
+        return m_ue3FrameCounter - e.lastUsedFrame > kCaptureBufferMaxIdleFrames;
+      }), buffers.end());
+      it->second.cursor = 0;
+      it = buffers.empty() ? m_captureBufferPool.erase(it) : std::next(it);
+    }
+  }
+
+  bool D3D9Rtx::prepareVertexCapture(const int vertexIndexOffset, const Ue3CapturePositionSource positionSource, const bool allowPooledBuffer) {
     ScopedCpuProfileZone();
 
     static_assert(sizeof CapturedVertex == 48, "The injected shader code is expecting this exact structure size to work correctly, see emitVertexCaptureWrite in dxso_compiler.cpp");
@@ -8082,7 +8182,7 @@ namespace dxvk {
     const uint32_t stride = sizeof(CapturedVertex);
     const size_t vertexCaptureDataSize = align(geoData.vertexCount * stride, CACHE_LINE_SIZE);
 
-    DxvkBufferSlice slice = allocVertexCaptureBuffer(m_parent->GetDXVKDevice().ptr(), vertexCaptureDataSize);
+    DxvkBufferSlice slice = allocVertexCaptureBuffer(vertexCaptureDataSize, allowPooledBuffer);
 
     geoData.positionBuffer = RasterBuffer(slice, 0, stride, VK_FORMAT_R32G32B32A32_SFLOAT);
     assert(geoData.positionBuffer.offset() % 4 == 0);
@@ -11550,6 +11650,7 @@ namespace dxvk {
       // compute, which additionally publishes into the (heap-pinned) memo entry.
       bool servedGeometryFromMemo = false;
       std::shared_ptr<Ue3GeometryMemoEntry> geometryMemoPublishTo;
+      std::shared_ptr<const Ue3GeometryMemoEntry> geometryMemoVerifyAgainst;
       const bool canMemoizeIaGeometry = canMemoizeUe3IaGeometryHashes(indexContext, vertexContext, geoData);
       const XXH64_hash_t iaGeometryMemoKey =
         canMemoizeIaGeometry
@@ -11574,18 +11675,30 @@ namespace dxvk {
           Ue3GeometryMemoEntry& entry = *memoIt->second;
           entry.lastFrameTouched = currentFrame;
           if (entry.hashesReady.load(std::memory_order_acquire)) {
-            GeometryHashes hashes;
-            for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {
-              hashes[HashComponents(i)] = entry.componentHashes[i];
-            }
-            hashes[HashComponents::VertexShader] = computeLiveGeometryVertexShaderHashComponent();
-            hashes.precombine();
-            geoData.hashes = hashes;
-            servedGeometryFromMemo = true;
-            if (entry.aabbReady.load(std::memory_order_acquire)) {
-              geoData.boundingBox = entry.boundingBox;
+            const uint32_t selfCheckFrames = m_frameOptions.ue3GeometryMemoSelfCheckFrames;
+            const bool selfCheck = selfCheckFrames != 0 && (m_ue3FrameCounter % selfCheckFrames) == 0;
+            if (selfCheck) {
+              // rtx.d3d9.ue3GeometryMemoSelfCheckFrames: hash in full and have the worker compare
+              // against the published entry. The fresh result goes into a new entry that replaces
+              // this one in the map; the old one is only read from now on.
+              geometryMemoVerifyAgainst = memoIt->second;
+              geometryMemoPublishTo = std::make_shared<Ue3GeometryMemoEntry>();
+              geometryMemoPublishTo->lastFrameTouched = currentFrame;
+              memoIt->second = geometryMemoPublishTo;
             } else {
-              geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
+              GeometryHashes hashes;
+              for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {
+                hashes[HashComponents(i)] = entry.componentHashes[i];
+              }
+              hashes[HashComponents::VertexShader] = computeLiveGeometryVertexShaderHashComponent();
+              hashes.precombine();
+              geoData.hashes = hashes;
+              servedGeometryFromMemo = true;
+              if (entry.aabbReady.load(std::memory_order_acquire)) {
+                geoData.boundingBox = entry.boundingBox;
+              } else {
+                geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
+              }
             }
           }
           // hashes not ready yet (worker still busy from an earlier frame): fall through
@@ -11598,8 +11711,8 @@ namespace dxvk {
       }
 
       if (!servedGeometryFromMemo) {
-        geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, geometryMemoPublishTo);
-        geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData, geometryMemoPublishTo);
+        geoData.futureGeometryHashes = computeHash(geoData, maxOffsetedIndex, geometryMemoPublishTo, geometryMemoVerifyAgainst);
+        geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData, geometryMemoPublishTo, geometryMemoVerifyAgainst);
 
         if (geometryMemoPublishTo != nullptr && !geoData.futureGeometryHashes.valid()) {
           // hashing could not be scheduled (e.g. undefined position region): drop the
@@ -11645,7 +11758,8 @@ namespace dxvk {
       !reusedCachedVertexCapture &&
       !instancedDrawSuppressesCapture;
     if (needVertexCapture) {
-      needVertexCapture = prepareVertexCapture(vertexIndexOffset, m_activeCapturePositionSource);
+      needVertexCapture = prepareVertexCapture(vertexIndexOffset, m_activeCapturePositionSource,
+                                               /* allowPooledBuffer */ !canUseCachedVertexCapture);
     }
     if (canUseCachedVertexCapture && !reusedCachedVertexCapture && needVertexCapture) {
       ++m_ue3VertexCaptureCacheFrameCaptures;
@@ -13910,7 +14024,7 @@ namespace dxvk {
 
       // Flag smooth normals category at the d3d9 layer
       m_activeDrawCallState.setCategory(InstanceCategories::SmoothNormals, lookupHash(*m_frameOptions.smoothNormalsTextures, textureHash) || lookupHash(*m_frameOptions.smoothNormalsTextures, materialHash));
-      if (materialHash != kEmptyHash) {
+      if (materialHash != kEmptyHash && SceneManager::s_hashUsageTrackingWanted.load(std::memory_order_relaxed)) {
         // batched into a single CS command in EndFrame (see m_pendingReplacementMaterialHashes)
         m_pendingReplacementMaterialHashes.push_back(materialHash);
       }
@@ -14624,6 +14738,23 @@ namespace dxvk {
     return fallback;
   }
 
+  bool D3D9Rtx::ignoreOcclusionTestDrawEarly() {
+    if (!ShouldApplyConservativeOcclusionQueryState() ||
+        m_frameOptions.ue3LogOcclusionQueries ||
+        m_frameOptions.ue3LogDrawStatusFlaps) {
+      return false;
+    }
+
+    // What makeDrawCallType and finishPrepare would have recorded for this ignored draw.
+    ++m_drawCallID;
+    m_ue3LastDrawDecision = "occlusion query test draw (ignored, result synthesized)";
+    if (RtxGpuPassTimer::isEnabled()) {
+      ++m_drawDispositionStats.draws;
+      ++m_drawDispositionStats.ignored;
+    }
+    return true;
+  }
+
   PrepareDrawFlags D3D9Rtx::PrepareDrawGeometryForRT(const bool indexed, const DrawContext& context) {
     // Draws issued internally by the deferred UI overlay replay bypass classification and
     // execute as plain raster draws
@@ -14638,6 +14769,10 @@ namespace dxvk {
 
     if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    if (ignoreOcclusionTestDrawEarly()) {
+      return PrepareDrawFlag::Ignore;
     }
 
     m_parent->PrepareTextures();
@@ -14698,6 +14833,10 @@ namespace dxvk {
 
     if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    if (ignoreOcclusionTestDrawEarly()) {
+      return PrepareDrawFlag::Ignore;
     }
 
     m_parent->PrepareTextures();
@@ -15276,6 +15415,7 @@ namespace dxvk {
     m_drawCallID = 0;
     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
     ++m_ue3FrameCounter;
+    trimVertexCaptureBufferPool();
 
     // two-pass translucency dedup state must not span frames
     m_prevDrawVsPsHash = 0;

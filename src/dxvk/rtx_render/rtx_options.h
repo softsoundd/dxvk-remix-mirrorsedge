@@ -680,6 +680,11 @@ namespace dxvk {
                "(vertex/index counts, skinning, smooth-normals tagging, UE3 pass, shader and material hashes) and why "
                "(new object, vertex positions, vertex shader constants, bones or indices changed). Per-frame BLAS refits, "
                "geometry re-interleaving and smooth normal regeneration all follow from these events.");
+    RTX_OPTION("rtx", bool, trackHashUsageOnlyWhenNeeded, true,
+               "CPU performance optimization. Every draw records its mesh and texture hash in two per-frame maps that only "
+               "the graph components Mesh Hash Checker and Texture Hash Checker read. With this on the recording is skipped "
+               "while no such component has run for 2 frames; a checker that first appears sees one empty frame. "
+               "Off: always recorded.");
     RTX_OPTION("rtx", bool, logInstanceIdentityStats, false,
                "Diagnostics: log roughly once a second where instance lookups land - exact-identity hits, "
                "exact-transform hits, spatial nearest-neighbour hits, instances created - and how many candidates "

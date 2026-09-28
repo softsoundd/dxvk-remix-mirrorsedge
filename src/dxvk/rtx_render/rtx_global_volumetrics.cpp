@@ -39,6 +39,9 @@
 #include "rtx_atmosphere.h"
 #include "rtx_options.h"
 
+#include <algorithm>
+#include <iterator>
+
 namespace dxvk {
 
   // Defined within an unnamed namespace to ensure unique definition across binary
@@ -234,15 +237,62 @@ namespace dxvk {
     ImGui::TextUnformatted("Quality Level Preset");
   }
 
+  namespace {
+    // Grid divisors of the reduced froxel cache, per FroxelConsumerCacheQuality: gridXY on top of
+    // froxelGridResolutionScale (the ReSTIR grid follows through restirGridScale), depth on the depth
+    // slices of both grids.
+    struct ConsumerCacheDivisors {
+      uint32_t gridXY;
+      uint32_t depth;
+    };
+    constexpr ConsumerCacheDivisors kConsumerCacheDivisors[] = {
+      { 1, 1 }, // Off (placeholder textures, see createDownscaledResource)
+      { 4, 2 }, // Low    (~1/32 of the cells)
+      { 2, 2 }, // Medium (~1/8)
+      { 2, 1 }, // High   (~1/4)
+      { 1, 1 }, // Full
+    };
+    static_assert(std::size(kConsumerCacheDivisors) == static_cast<size_t>(FroxelConsumerCacheQuality::Full) + 1,
+                  "kConsumerCacheDivisors must have one entry per FroxelConsumerCacheQuality value");
+
+    RemixGui::ComboWithKey<FroxelConsumerCacheQuality> consumerCacheQualityCombo {
+      "Quality Level Preset##consumerCache",
+      RemixGui::ComboWithKey<FroxelConsumerCacheQuality>::ComboEntries { {
+          {FroxelConsumerCacheQuality::Off, "Off (fastest, particles and decals lose cache light)"},
+          {FroxelConsumerCacheQuality::Low, "Low"},
+          {FroxelConsumerCacheQuality::Medium, "Medium"},
+          {FroxelConsumerCacheQuality::High, "High"},
+          {FroxelConsumerCacheQuality::Full, "Full (slowest, same as volumetrics on)"},
+      } }
+    };
+  }
+
+  void RtxGlobalVolumetrics::showFroxelCacheQuality(const bool presetLocked, const bool showGridSize) {
+    if (enable()) {
+      ImGui::BeginDisabled(presetLocked);
+      showPresetMenu();
+      ImGui::EndDisabled();
+    } else {
+      consumerCacheQualityCombo.getKey(&consumerCacheQualityObject());
+      ImGui::TextDisabled("Volumetrics off: only particles, decals and dust read the cache.");
+    }
+
+    if (showGridSize) {
+      ImGui::TextDisabled("Froxel grid: %s, %ux%ux%u", isFroxelCacheActive() ? "active" : "skipped",
+                          m_froxelVolumeExtent.width, m_froxelVolumeExtent.height, m_froxelVolumeExtent.depth);
+    }
+  }
+
   void RtxGlobalVolumetrics::showImguiUserSettings() {
-    showPresetMenu();
+    // The quality level buttons are owned by the graphics preset unless it is Custom.
+    showFroxelCacheQuality(RtxOptions::graphicsPreset() != GraphicsPreset::Custom, false);
   }
 
   void RtxGlobalVolumetrics::showImguiSettings() {
     if (RemixGui::CollapsingHeader("Froxel Radiance Cache", ImGuiTreeNodeFlags_DefaultOpen)) {
       ImGui::Indent();
 
-      showPresetMenu();
+      showFroxelCacheQuality(false, true);
 
       RemixGui::Separator();
 
@@ -752,10 +802,22 @@ namespace dxvk {
     volumeArgs.resetHistory = isViewHistoryInvalidated || m_forceResetVolumeHistory;
     m_forceResetVolumeHistory = false;
 
+    // The cache textures were just reallocated (the cache restarted or changed size): no history to keep.
+    if (m_froxelCacheHistoryStale) {
+      volumeArgs.resetHistory = true;
+      volumeArgs.enableVolumeTemporalResampling = false;
+    }
+
     return volumeArgs;
   }
 
   void RtxGlobalVolumetrics::dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, uint32_t numActiveFroxelVolumes) {
+    // Nothing else gates these passes (isEnabled() is hard-wired true so the textures stay bound).
+    // With the cache off its readers sample the zero placeholders createDownscaledResource allocates.
+    if (!isFroxelCacheActive()) {
+      return;
+    }
+
     // Bind resources
 
     ctx->bindCommonRayTracingResources(rtOutput);
@@ -883,22 +945,31 @@ namespace dxvk {
   }
 
   void RtxGlobalVolumetrics::onFrameBegin(Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx) {
+    // Latched once per frame so getVolumeArgs and dispatch agree even if ImGui flips the options
+    // mid-frame, and before RtxPass::onFrameBegin so the first-frame allocation is already sized for it.
+    const FroxelConsumerCacheQuality mode = enable() ? FroxelConsumerCacheQuality::Full : consumerCacheQuality();
+    m_froxelCacheHistoryStale = mode != FroxelConsumerCacheQuality::Off && mode != m_froxelCacheMode;
+    m_froxelCacheMode = mode;
+
     RtxPass::onFrameBegin(ctx, frameBeginCtx);
 
     m_swapTextures = !m_swapTextures;
 
-    if (m_rebuildFroxels) {
+    if (m_rebuildFroxels || m_froxelTexturesMode != m_froxelCacheMode) {
       createDownscaledResource(ctx, frameBeginCtx.downscaledExtent);
     }
   }
 
   void RtxGlobalVolumetrics::createDownscaledResource(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent) {
+    const ConsumerCacheDivisors divisors = kConsumerCacheDivisors[static_cast<size_t>(m_froxelCacheMode)];
+    m_froxelTexturesMode = m_froxelCacheMode;
+
     m_froxelVolumeExtent = util::computeBlockCount(downscaledExtent, VkExtent3D {
-      froxelGridResolutionScale(),
-      froxelGridResolutionScale(),
+      froxelGridResolutionScale() * divisors.gridXY,
+      froxelGridResolutionScale() * divisors.gridXY,
       1
     });
-    m_froxelVolumeExtent.depth = froxelDepthSlices();
+    m_froxelVolumeExtent.depth = std::max(froxelDepthSlices() / divisors.depth, 1u);
     m_numFroxelVolumes = enableInPortals() ? maxRayPortalCount + 1 : 1;
 
     VkExtent3D froxelGridFullDimensions = m_froxelVolumeExtent;
@@ -906,19 +977,27 @@ namespace dxvk {
 
     froxelGridFullDimensions.width *= m_numFroxelVolumes;
 
+    // Calculate the restir grid resolution
+    m_restirFroxelVolumeExtent = util::computeBlockCount(m_froxelVolumeExtent, VkExtent3D { restirGridScale(), restirGridScale(), 1 });
+    m_restirFroxelVolumeExtent.depth = std::max(restirFroxelDepthSlices() / divisors.depth, 1u);
+
+    VkExtent3D restirFroxelGridFullDimensions = m_restirFroxelVolumeExtent;
+    restirFroxelGridFullDimensions.width *= m_numFroxelVolumes;
+
+    // With the cache off nothing writes these textures and every reader samples them by normalized
+    // coordinates, so cleared 1x1x1 placeholders keep the bindings valid and read as zero radiance.
+    // The logical extents above still feed VolumeArgs.
+    if (m_froxelCacheMode == FroxelConsumerCacheQuality::Off) {
+      froxelGridFullDimensions = VkExtent3D { 1, 1, 1 };
+      restirFroxelGridFullDimensions = VkExtent3D { 1, 1, 1 };
+    }
+
     m_volumeAccumulatedRadianceY[0] = Resources::createImageResource(ctx, "volume accumulated radiance SH(Y) 0", froxelGridFullDimensions, VK_FORMAT_R16G16B16A16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeAccumulatedRadianceY[1] = Resources::createImageResource(ctx, "volume accumulated radiance SH(Y) 1", froxelGridFullDimensions, VK_FORMAT_R16G16B16A16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeAccumulatedRadianceCoCg[0] = Resources::createImageResource(ctx, "volume accumulated radiance (Co, Cg) 0", froxelGridFullDimensions, VK_FORMAT_R16G16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeAccumulatedRadianceCoCg[1] = Resources::createImageResource(ctx, "volume accumulated radiance (Co, Cg) 1", froxelGridFullDimensions, VK_FORMAT_R16G16_SFLOAT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeAccumulatedRadianceAge[0] = Resources::createImageResource(ctx, "volume accumulated radiance (Age) 0", froxelGridFullDimensions, VK_FORMAT_R8_UNORM, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeAccumulatedRadianceAge[1] = Resources::createImageResource(ctx, "volume accumulated radiance (Age) 1", froxelGridFullDimensions, VK_FORMAT_R8_UNORM, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
-
-    // Calculate the restir grid resolution
-    m_restirFroxelVolumeExtent = util::computeBlockCount(m_froxelVolumeExtent, VkExtent3D { restirGridScale(), restirGridScale(), 1 });
-    m_restirFroxelVolumeExtent.depth = restirFroxelDepthSlices();
-
-    VkExtent3D restirFroxelGridFullDimensions = m_restirFroxelVolumeExtent;
-    restirFroxelGridFullDimensions.width *= m_numFroxelVolumes;
 
     m_volumeReservoirs[0] = Resources::createImageResource(ctx, "volume reservoir 0", restirFroxelGridFullDimensions, VK_FORMAT_R32G32B32A32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeReservoirs[1] = Resources::createImageResource(ctx, "volume reservoir 1", restirFroxelGridFullDimensions, VK_FORMAT_R32G32B32A32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);

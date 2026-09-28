@@ -1086,6 +1086,9 @@ namespace dxvk {
     if (valueHasChanged) {
       // Copy to m_resolvedValue
       copyValue(optionValue.data, value);
+      if (&value == &m_resolvedValue) {
+        g_rtxOptionResolveGeneration.fetch_add(1, std::memory_order_release);
+      }
     }
     return valueHasChanged;
   }

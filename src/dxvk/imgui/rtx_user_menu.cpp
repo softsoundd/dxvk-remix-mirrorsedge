@@ -578,11 +578,10 @@ namespace dxvk {
     {
       // Volumetrics being enabled/disabled is not controlled by the graphics preset, so show the user settings regardless of preset.
       RemixGui::Checkbox("Enable Volumetric Lighting", &RtxGlobalVolumetrics::enableObject());
-      // Volumetrics quality settings are set by the graphics preset, so only show the user settings if the preset is Custom and the volumetrics are enabled.
-      ImGui::BeginDisabled(!RtxGlobalVolumetrics::enable() || RtxOptions::graphicsPreset() != GraphicsPreset::Custom);
+      // Quality level buttons with volumetrics on (locked unless the graphics preset is Custom, which
+      // otherwise sets them), the consumer cache dropdown with volumetrics off.
       ImGui::Indent(static_cast<float>(subItemIndent));
       common->metaGlobalVolumetrics().showImguiUserSettings();
-      ImGui::EndDisabled();
       ImGui::Unindent(static_cast<float>(subItemIndent));
     }
 
