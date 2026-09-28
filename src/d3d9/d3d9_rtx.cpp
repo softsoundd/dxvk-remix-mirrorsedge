@@ -6348,23 +6348,61 @@ namespace dxvk {
     o.logReplacementResolution = RtxOptions::logReplacementResolutionObject().get();
     o.drawCallRange = RtxOptions::drawCallRangeObject().get();
 
-    o.uiTextures = &RtxOptions::uiTexturesObject().get();
-    o.deferredUiTextures = &RtxOptions::deferredUiTexturesObject().get();
-    o.deferredUiPixelShaders = &deferredUiPixelShadersObject().get();
-    o.lightmapTextures = &RtxOptions::lightmapTexturesObject().get();
-    o.neverAlbedoTextures = &RtxOptions::neverAlbedoTexturesObject().get();
-    o.preferredAlbedoTextures = &RtxOptions::preferredAlbedoTexturesObject().get();
-    o.smoothNormalsTextures = &RtxOptions::smoothNormalsTexturesObject().get();
-    o.ignoreBakedLightingTextures = &RtxOptions::ignoreBakedLightingTexturesObject().get();
-    o.raytracedRenderTargetTextures = &RtxOptions::raytracedRenderTargetTexturesObject().get();
-    o.vsTexcoordCaptureOutlierTextures = &vsTexcoordCaptureOutlierTexturesObject().get();
-    o.ue3MicConstantIdentityExcludedShaders = &ue3MicConstantIdentityExcludedShadersObject().get();
-    o.ue3MicConstantIdentityExcludedMaterials = &ue3MicConstantIdentityExcludedMaterialsObject().get();
-    o.ue3MicIdentityExcludedTextureDescHashes = &ue3MicIdentityExcludedTextureDescHashesObject().get();
-    o.ue3TraceDrawTextureHashes = &ue3TraceDrawTextureHashesObject().get();
-    o.replacementDebugHashes = &RtxOptions::replacementDebugHashesObject().get();
+    refreshFrameOptionSets();
+    const FrameOptionSets& s = m_frameOptionSets;
+    o.uiTextures = &s.uiTextures;
+    o.deferredUiTextures = &s.deferredUiTextures;
+    o.deferredUiPixelShaders = &s.deferredUiPixelShaders;
+    o.lightmapTextures = &s.lightmapTextures;
+    o.neverAlbedoTextures = &s.neverAlbedoTextures;
+    o.preferredAlbedoTextures = &s.preferredAlbedoTextures;
+    o.smoothNormalsTextures = &s.smoothNormalsTextures;
+    o.ignoreBakedLightingTextures = &s.ignoreBakedLightingTextures;
+    o.raytracedRenderTargetTextures = &s.raytracedRenderTargetTextures;
+    o.vsTexcoordCaptureOutlierTextures = &s.vsTexcoordCaptureOutlierTextures;
+    o.ue3MicConstantIdentityExcludedShaders = &s.ue3MicConstantIdentityExcludedShaders;
+    o.ue3MicConstantIdentityExcludedMaterials = &s.ue3MicConstantIdentityExcludedMaterials;
+    o.ue3MicIdentityExcludedTextureDescHashes = &s.ue3MicIdentityExcludedTextureDescHashes;
+    o.ue3TraceDrawTextureHashes = &s.ue3TraceDrawTextureHashes;
+    o.replacementDebugHashes = &s.replacementDebugHashes;
 
     o.valid = true;
+  }
+
+  void D3D9Rtx::refreshFrameOptionSets() {
+    const uint64_t generation = g_rtxOptionResolveGeneration.load(std::memory_order_acquire);
+    if (generation == m_frameOptionSets.generation) {
+      return;
+    }
+
+    // The accessors take the option mutex themselves, so gather the source addresses before holding it.
+    FrameOptionSets& s = m_frameOptionSets;
+    const std::pair<fast_unordered_set*, const fast_unordered_set*> sets[] = {
+      { &s.uiTextures, &RtxOptions::uiTexturesObject().get() },
+      { &s.deferredUiTextures, &RtxOptions::deferredUiTexturesObject().get() },
+      { &s.deferredUiPixelShaders, &deferredUiPixelShadersObject().get() },
+      { &s.lightmapTextures, &RtxOptions::lightmapTexturesObject().get() },
+      { &s.neverAlbedoTextures, &RtxOptions::neverAlbedoTexturesObject().get() },
+      { &s.preferredAlbedoTextures, &RtxOptions::preferredAlbedoTexturesObject().get() },
+      { &s.smoothNormalsTextures, &RtxOptions::smoothNormalsTexturesObject().get() },
+      { &s.ignoreBakedLightingTextures, &RtxOptions::ignoreBakedLightingTexturesObject().get() },
+      { &s.raytracedRenderTargetTextures, &RtxOptions::raytracedRenderTargetTexturesObject().get() },
+      { &s.vsTexcoordCaptureOutlierTextures, &vsTexcoordCaptureOutlierTexturesObject().get() },
+      { &s.ue3MicConstantIdentityExcludedShaders, &ue3MicConstantIdentityExcludedShadersObject().get() },
+      { &s.ue3MicConstantIdentityExcludedMaterials, &ue3MicConstantIdentityExcludedMaterialsObject().get() },
+      { &s.ue3MicIdentityExcludedTextureDescHashes, &ue3MicIdentityExcludedTextureDescHashesObject().get() },
+      { &s.ue3TraceDrawTextureHashes, &ue3TraceDrawTextureHashesObject().get() },
+      { &s.replacementDebugHashes, &RtxOptions::replacementDebugHashesObject().get() },
+    };
+
+    // The CS thread assigns whole sets under this mutex when it resolves pending option changes.
+    {
+      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+      for (const auto& [dst, src] : sets) {
+        *dst = *src;
+      }
+    }
+    s.generation = generation;
   }
 
   const char* D3D9Rtx::describeUe3CapturePositionSource(const Ue3CapturePositionSource source) {
@@ -14700,6 +14738,23 @@ namespace dxvk {
     return fallback;
   }
 
+  bool D3D9Rtx::ignoreOcclusionTestDrawEarly() {
+    if (!ShouldApplyConservativeOcclusionQueryState() ||
+        m_frameOptions.ue3LogOcclusionQueries ||
+        m_frameOptions.ue3LogDrawStatusFlaps) {
+      return false;
+    }
+
+    // What makeDrawCallType and finishPrepare would have recorded for this ignored draw.
+    ++m_drawCallID;
+    m_ue3LastDrawDecision = "occlusion query test draw (ignored, result synthesized)";
+    if (RtxGpuPassTimer::isEnabled()) {
+      ++m_drawDispositionStats.draws;
+      ++m_drawDispositionStats.ignored;
+    }
+    return true;
+  }
+
   PrepareDrawFlags D3D9Rtx::PrepareDrawGeometryForRT(const bool indexed, const DrawContext& context) {
     // Draws issued internally by the deferred UI overlay replay bypass classification and
     // execute as plain raster draws
@@ -14714,6 +14769,10 @@ namespace dxvk {
 
     if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    if (ignoreOcclusionTestDrawEarly()) {
+      return PrepareDrawFlag::Ignore;
     }
 
     m_parent->PrepareTextures();
@@ -14774,6 +14833,10 @@ namespace dxvk {
 
     if (!m_frameOptions.enableRaytracing || !m_enableDrawCallConversion || m_sceneCaptureSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
+    }
+
+    if (ignoreOcclusionTestDrawEarly()) {
+      return PrepareDrawFlag::Ignore;
     }
 
     m_parent->PrepareTextures();

@@ -1937,6 +1937,11 @@ namespace dxvk {
 
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
 
+    // Occlusion-test draws whose query result is synthesized are ignored by the draw entry points
+    // before the draw contexts are built. Returns false when the full path has to run instead
+    // (diagnostics that record bracketed draws or draw status flaps).
+    bool ignoreOcclusionTestDrawEarly();
+
     void recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
                                            const DrawContext& drawContext);
 
@@ -2101,8 +2106,6 @@ namespace dxvk {
     // resolve once per frame anyway, so a per-frame value snapshot is exactly as fresh
     // as the underlying resolution model. Refreshed in EndFrame (the same cadence as
     // DrawCallState::refreshCategoryLookupTable) and lazily on the first frame's draw.
-    // Set-typed options are intentionally not snapshotted: their accessors return
-    // references to stable storage and are read far less often per draw.
     // Field names mirror the option accessors they cache.
     struct FrameOptionCache {
       bool valid = false;
@@ -2198,11 +2201,10 @@ namespace dxvk {
       bool logReplacementResolution = false;
       Vector2i drawCallRange = Vector2i(0, 0);
 
-      // Set-typed options, cached as pointers: each option's resolved hash set is
-      // allocated once at construction and only mutated in place during option
-      // resolution, so a per-frame pointer is exactly as safe as the per-call
-      // reference the locked accessor hands out - both are read outside the option
-      // mutex between resolution points.
+      // Set-typed options: pointers into m_frameOptionSets' copies. The options' own storage
+      // cannot be read per draw without the option mutex (the CS thread assigns whole sets
+      // under it when it resolves pending option changes); the copies are refreshed only when
+      // g_rtxOptionResolveGeneration moved.
       const fast_unordered_set* uiTextures = nullptr;
       const fast_unordered_set* deferredUiTextures = nullptr;
       const fast_unordered_set* deferredUiPixelShaders = nullptr;
@@ -2221,6 +2223,28 @@ namespace dxvk {
     };
     FrameOptionCache m_frameOptions;
     void refreshFrameOptionCache();
+
+    // Storage behind FrameOptionCache's set pointers (see refreshFrameOptionSets).
+    struct FrameOptionSets {
+      uint64_t generation = ~0ull;
+      fast_unordered_set uiTextures;
+      fast_unordered_set deferredUiTextures;
+      fast_unordered_set deferredUiPixelShaders;
+      fast_unordered_set lightmapTextures;
+      fast_unordered_set neverAlbedoTextures;
+      fast_unordered_set preferredAlbedoTextures;
+      fast_unordered_set smoothNormalsTextures;
+      fast_unordered_set ignoreBakedLightingTextures;
+      fast_unordered_set raytracedRenderTargetTextures;
+      fast_unordered_set vsTexcoordCaptureOutlierTextures;
+      fast_unordered_set ue3MicConstantIdentityExcludedShaders;
+      fast_unordered_set ue3MicConstantIdentityExcludedMaterials;
+      fast_unordered_set ue3MicIdentityExcludedTextureDescHashes;
+      fast_unordered_set ue3TraceDrawTextureHashes;
+      fast_unordered_set replacementDebugHashes;
+    };
+    FrameOptionSets m_frameOptionSets;
+    void refreshFrameOptionSets();
 
     // Material hashes tracked this frame for SceneManager::trackReplacementMaterialHash,
     // flushed as one CS command in EndFrame instead of one EmitCs per draw. The only

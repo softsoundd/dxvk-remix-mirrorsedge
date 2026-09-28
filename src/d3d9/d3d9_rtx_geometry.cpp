@@ -10,6 +10,7 @@
 #include "d3d9_state.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../dxvk/rtx_render/rtx_hashing.h"
+#include "../util/util_bit.h"
 #include "../util/util_fastops.h"
 
 namespace dxvk {
@@ -49,32 +50,33 @@ namespace dxvk {
     return true;
   }
 
-  // Sorts and deduplicates a set of integers, storing the result in a vector
+  // Sorts and deduplicates a set of integers, storing the result in a vector (REMIX-657)
   template<typename T>
   void deduplicateSortIndices(const void* pIndexData, const size_t indexCount, const uint32_t maxIndexValue, std::vector<T>& uniqueIndicesOut) {
-    // TODO (REMIX-657): Implement optimized variant of this function
-    // We know there will be at most, this many unique indices
-    const uint32_t indexRange = maxIndexValue + 1;
+    // One bit per index value in [0, maxIndexValue], in a table reused per worker thread.
+    thread_local std::vector<uint32_t> tlsIndexBits;
+    const uint32_t wordCount = (maxIndexValue >> 5) + 1;
+    tlsIndexBits.assign(wordCount, 0u);
 
-    // Initialize all to 0
-    uniqueIndicesOut.resize(indexRange, (T)0);
-
-    // Use memory as a bin table for index data
-    for (uint32_t i = 0; i < indexCount; i++) {
-      const T& index = ((T*) pIndexData)[i];
+    const T* pIndices = static_cast<const T*>(pIndexData);
+    for (size_t i = 0; i < indexCount; i++) {
+      const uint32_t index = pIndices[i];
       assert(index <= maxIndexValue);
-      uniqueIndicesOut[index] = 1;
+      tlsIndexBits[index >> 5] |= 1u << (index & 31);
     }
 
-    // Repopulate the bins with contiguous index values
-    uint32_t uniqueIndexCount = 0;
-    for (uint32_t i = 0; i < indexRange; i++) {
-      if (uniqueIndicesOut[i])
-        uniqueIndicesOut[uniqueIndexCount++] = i;
+    // Set bits in ascending order are the sorted unique indices.
+    uniqueIndicesOut.clear();
+    for (uint32_t word = 0; word < wordCount; word++) {
+      for (const uint32_t bitIndex : bit::BitMask(tlsIndexBits[word])) {
+        uniqueIndicesOut.push_back(static_cast<T>((word << 5) + bitIndex));
+      }
     }
 
-    // Remove any unused entries
-    uniqueIndicesOut.resize(uniqueIndexCount);
+    // Don't keep an unusually large draw's bit table alive on the worker.
+    if (tlsIndexBits.capacity() > (size_t(1) << 20)) {
+      std::vector<uint32_t>().swap(tlsIndexBits);
+    }
   }
 
   template<typename T>
@@ -84,8 +86,7 @@ namespace dxvk {
 
     const HashRule& globalHashRule = RtxOptions::geometryHashGenerationRule();
 
-    // Bin table reused per worker thread (REMIX-658); after clear(), deduplicateSortIndices'
-    // resize(n, 0) zero-fills it like a fresh vector.
+    // Unique index list reused per worker thread (REMIX-658).
     thread_local std::vector<T> tlsUniqueIndices;
     std::vector<T>& uniqueIndices = tlsUniqueIndices;
     uniqueIndices.clear();
