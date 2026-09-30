@@ -251,7 +251,7 @@ Subtracting the whole sampler set leaves some draws with no albedo at all: a sur
 
 Where such a material does carry a colour it is in a `UniformVector_*` register, and the value is a tint UE3 multiplied against the lightmap for brightness rather than a finished albedo. Used raw once the lightmap is gone it reads as near-black, and since a register at or below `0.01` is rejected so a later one can supply the real colour, the bottom of a ramping tint falls back to the legacy constant and the surface would step straight from there to a dark tint. `rtx.d3d9.ue3ConstantAlbedoTintGain` closes both gaps: the register's brightest channel times the gain, clamped to 1, is the weight blending the legacy constant towards the register's fully saturated hue, so a ramp fades continuously.
 
-Textured materials are not tinted this way, because the albedo texture replaces the constant rather than modulating it. Mirror's Edge's Runner Vision highlighting is driven by exactly such a tint on textured surfaces, so it is not reproduced.
+Textured materials are not tinted this way, because the albedo texture replaces the constant rather than modulating it. The one tint the game fades on textured surfaces, Mirror's Edge's Runner Vision highlight, is reproduced separately and per surface; see [Runner Vision](#runner-vision).
 
 ### Identity
 
@@ -293,6 +293,40 @@ If you change any of this, measure it the same way: match materials between runs
 Turning `rtx.d3d9.ue3MicConstantIdentity` off makes identity shader + texture set alone, at the cost of merging every instance that shares a texture set onto one anchor. Mirror's Edge tints many of its variants from one set, so this collapses a substantial fraction of them.
 
 Any change to what feeds identity re-mints the affected material hashes, and `mat_<hash>` prims authored against the old ones stop matching. See [Re-anchoring after an identity change](#re-anchoring-after-an-identity-change).
+
+## Runner Vision
+
+Mirror's Edge highlights the geometry the player can use - Runner Vision, `LOI` in the game's own code - by fading a material parameter. When a highlight activates, `TdLOIAddOnObject` gives each element of the mesh a fresh `MaterialInstanceConstant` parented to the material it had, and fades its `LOI_Strength` scalar up to 1 and back down to 0. Enemy weapons about to strike use the same parameter. Nothing else about the draw changes: same shader, same textures, same vectors.
+
+Every master material that supports it compiles the same network. The diffuse is `lerp(X, X * V, S)`, with `S` the strength and `V` a `UniformVector_*` colour, and most of them add an unlit `0.1 * S * lerp(...)` glow on top of the lit surface. UE3's material translator folds arithmetic on uniform inputs into one CPU-evaluated register, but never a `Lerp`, so the strength always reaches the shader as a raw `UniformScalar_*`. Remix samples the albedo texture itself and never evaluates that arithmetic, so without help the highlight does not exist for it; `rtx.d3d9.ue3HighlightTints` re-derives it.
+
+### Proving the tint
+
+`src/dxso/dxso_highlight_tints.cpp` evaluates the pixel shader symbolically, lane by lane. Every register component holds a polynomial over the shader's inputs, with texture samples and the `UniformScalar_*` and `UniformVector_*` components as symbols. A value that involves no material parameter (lightmap filtering, normal and reflection math) is folded into a single opaque symbol, as is the result of anything non-polynomial, which keeps the expressions small. For each material scalar `S` and each output channel, the colour output splits into the part without `S`, `P0`, and the part linear in it, `Q`. `S` tints the channel towards a vector component `v` when every colour-bearing term `m` of `P0` that `S` fades out (`Q` holds `-m`) also appears in `Q` as `+m * v`, and every such term agrees on `v`. A term that fades towards nothing makes the channel a blend or a fade instead - a layer blend under UE3's `(1 - Emissive)` diffuse factor would otherwise pass as a tint towards the emissive colour - and a pair is only reported when all three channels are tinted.
+
+Because the proof is algebraic it holds however fxc scheduled the lerp: `mad` pairs with the operands either way round, `lrp`, the colour multiplied in before or after, a brightness scalar ahead of the lerp, and a lerp whose register has unrelated math packed into its spare lane. That last case is common - fxc routinely writes a sky-vector dot product into `.w` of the register holding the tinted colour - and a register-granular proof loses the lerp there.
+
+A strength that also scales an unlit copy of the tinted terms is the Runner Vision network by construction, and the coefficient of that copy is the glow. Where several lighting paths carry the tinted colour at different literal weights (the directional lightmap's transfer coefficients), the least attenuated one sets the colour's scale.
+
+The analysis runs once per shader, during the identity parse. Shaders that outgrow its expression budget are rim and fresnel networks with many scalar-weighted sums, never the Runner Vision lerp.
+
+### Which tints count as a highlight
+
+The proof identifies a tint, not what it is for: an authored "tint amount" parameter compiles to the same lerp. The glow separates most of them, and a pair with it applies at once. Runner Vision materials without a glow, the masked master materials among them, apply once their strength has been seen resting at exactly 0 on the same master material (`rtx.d3d9.ue3HighlightTintRequireRest`). `LOI_Strength` rests at its parent default of 0 on every surface that is not highlighted, whereas an authored amount sits wherever the artist left it and never moves. The evidence is keyed on the shader identity seed and the pair's CTAB names, so every lightmap policy compile and every material instance of a master material shares it, and it lasts for the session. `rtx.d3d9.ue3HighlightTintExcludedMaterials` names anything that still gets through.
+
+### Rendering it
+
+Per channel the tint is `lerp(1, V, S)` from the live registers, multiplied over every applying pair. The glow is its coefficient times the strength times `rtx.d3d9.ue3HighlightGlowIntensity` (and `rtx.emissiveIntensity`), emitted as that fraction of the tinted surface colour, so it is textured like the surface. Both travel on the draw's `RtSurface` rather than its material. A value that changes every frame of a fade would otherwise mint a new surface material per frame, and folding it into the material hash would move every replacement anchor on the surface for as long as the highlight lasts. The shader applies the tint right after the fixed-function stage ops and before linearisation, which is where the game's own lerp operates, and adds the glow to the emission; both happen in the full and the particle resolve.
+
+Keeping it out of the material has one consequence that needs handling. The preserve path reuses a static instance's surface and material whenever its draw looks unchanged, and a highlight fading on a static mesh changes nothing it compares, so it would freeze the tint at whatever value it had at the last incidental dynamic update. That reads as a highlight that half-fades or never appears. The instance manager therefore also refreshes the tint from the draw on the preserve path; surfaces are uploaded every frame, so that is all it takes.
+
+Living on the surface, the tint also applies over replacement materials and mesh replacements, which carry the draw's legacy state, so a replaced ledge still turns red. A capture exports the material untinted. On a textureless material the tint colour register is never taken as the surface's constant colour: it holds its value whether the highlight is on or not, and a material whose own colour is dark would otherwise render permanently red.
+
+Not covered: translucent materials, since the tint is applied to opaque ones, and the inverted `lerp(X * V, X, S)` and replacing `lerp(X, V, S)` forms, which the shader cache shows no Runner Vision material using.
+
+### Diagnostics
+
+`rtx.d3d9.ue3LogHighlightTints` logs `[RTX-Compatibility][UE3-Highlight]` lines. Per pixel shader, it gives the proven pairs with their CTAB names and glow coefficients, the material scalars that reach the colour output without proving a tint, and the reason a shader could not be analysed. Per master material, it reports when a strength is first seen at rest and when one is held back for want of that. Per material, it reports the first time a tint applies, with the live strength, colour, tint and glow and the hashes the exclusion list takes. `rtx.d3d9.ue3HighlightDebugForceTint` forces a tint onto every UE3 surface, which checks the rendering half independently of detection. The unit test `tests/rtx/unit/test_dxso_highlight_tints.cpp` covers the instruction shapes above; invoked with `.dxso` files, or a directory of them, from `DXVK_SHADER_DUMP_PATH`, it prints each shader's pairs, and with `--summary` only the totals.
 
 ## Albedo selection and the texture spread cache
 

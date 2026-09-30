@@ -281,7 +281,11 @@ struct RtSurface {
     textureFlags |= ((static_cast<uint32_t>(textureAlphaOperation)  & 0x7) << 11);
 
     textureFlags |= eyeParams ? (1 << 14) : 0;
-    // textureFlags bits 15-16 unused
+    // The highlight tint shares the eye origin's slots, so an eye keeps its origin and goes untinted.
+    const bool hasHighlightTint = !eyeParams &&
+      (highlightTint.x != 1.0f || highlightTint.y != 1.0f || highlightTint.z != 1.0f || highlightGlow > 0.0f);
+    textureFlags |= hasHighlightTint ? (1 << 15) : 0;
+    // textureFlags bit 16 unused
 
     static_assert(static_cast<uint32_t>(TexGenMode::Count) <= 4);
     textureFlags |= ((static_cast<uint32_t>(texgenMode) & 0x3) << 17);
@@ -294,11 +298,18 @@ struct RtSurface {
 
     writeGPUHelper(data, offset, clipPlane);
 
-    // eye origin
+    // eye origin, or the highlight tint and glow
     if (eyeParams) {
       writeGPUHelper(data, offset, eyeParams->eyeballOrigin.x);
       writeGPUHelper(data, offset, eyeParams->eyeballOrigin.y);
       writeGPUHelper(data, offset, eyeParams->eyeballOrigin.z);
+    } else if (hasHighlightTint) {
+      auto packHalves = [](const float low, const float high) {
+        return uint32_t(glm::packHalf1x16(low)) | (uint32_t(glm::packHalf1x16(high)) << 16);
+      };
+      writeGPUHelper(data, offset, packHalves(highlightTint.x, highlightTint.y));
+      writeGPUHelper(data, offset, packHalves(highlightTint.z, highlightGlow * getEmissiveIntensity()));
+      writeGPUHelper(data, offset, uint32_t{});
     } else {
       writeGPUHelper(data, offset, uint32_t{});
       writeGPUHelper(data, offset, uint32_t{});
@@ -357,6 +368,10 @@ struct RtSurface {
   uint32_t tFactor = 0xffffffff;   // Value for D3DRS_TEXTUREFACTOR, default value of is opaque white
   TexGenMode texgenMode = TexGenMode::None;
   std::optional<RtEyeParams> eyeParams = {};
+  // Runner Vision (rtx.d3d9.ue3HighlightTints): multiplies the surface colour, whichever material
+  // supplies it, and emits highlightGlow times the tinted colour. Identity is (1,1,1) and 0.
+  Vector3 highlightTint = Vector3(1.0f, 1.0f, 1.0f);
+  float highlightGlow = 0.0f;
 
   bool doBuffersMatch(const RtSurface& surface) {
     return positionBufferIndex == surface.positionBufferIndex
@@ -1893,6 +1908,13 @@ struct LegacyMaterialData {
   // conversion can use it as the albedo constant instead of rendering white.
   Vector4 ue3ConstantAlbedo = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
   bool hasUe3ConstantAlbedo = false;
+  // Runner Vision (rtx.d3d9.ue3HighlightTints): the tint the game's highlight applies to this
+  // draw's surface colour, and the fraction of the tinted colour it emits as glow. Both animate
+  // with the highlight and are carried on the surface, so they stay out of both hashes: the
+  // material hash would re-mint the material and its replacement anchors through a fade, and the
+  // preserve path refreshes them from the draw rather than re-processing the instance.
+  Vector3 ue3HighlightTint = Vector3(1.0f, 1.0f, 1.0f);
+  float ue3HighlightGlow = 0.0f;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;

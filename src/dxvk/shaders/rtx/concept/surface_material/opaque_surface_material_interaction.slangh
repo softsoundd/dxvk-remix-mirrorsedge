@@ -619,6 +619,11 @@ void opaqueSurfaceMaterialApplyTextureStageOps(
   if (surface.isTextureFactorBlend) {
     albedo *= tFactor.rgb;
   }
+  // After the stage ops, which can replace albedo outright, and before linearisation, where the
+  // game's own lerp operates.
+  if (surface.hasHighlightTint) {
+    albedo *= surface.highlightTint;
+  }
 
   float textureAlphaArg1, textureAlphaArg2;
   chooseTextureArgument(textureAlphaArg1, surface.textureAlphaArg1Source, opacity, vertexColor.a, tFactor.a, opacity);
@@ -642,6 +647,13 @@ void opaqueSurfaceMaterialApplyEmissiveTextureStageOps(
   if (surface.isTextureFactorBlend) {
     emissiveColor *= tFactor.rgb;
   }
+}
+
+// The glow Runner Vision adds on top of the lit surface: a fraction of the tinted surface colour,
+// emitted, so a highlighted object stays readable in shadow. Takes the linear base colour.
+vec3 opaqueSurfaceMaterialHighlightGlow(Surface surface, vec3 albedo)
+{
+  return (surface.hasHighlightTint && !surface.isMatte) ? surface.highlightGlow * albedo : vec3(0.0f);
 }
 
 // Particle path
@@ -758,8 +770,9 @@ void opaqueSurfaceMaterialParticleResolve(
 
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
 
+  const vec3 highlightGlow = opaqueSurfaceMaterialHighlightGlow(surface, albedo);
   albedo = surface.isMatte ? vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
-  emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+  emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity + highlightGlow;
 }
 
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
@@ -1061,7 +1074,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opaqueSurfaceMaterialInteraction.isotropicRoughness,
     opaqueSurfaceMaterialInteraction.anisotropicRoughness);
 
-  opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+  opaqueSurfaceMaterialInteraction.emissiveRadiance =
+    emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity +
+    opaqueSurfaceMaterialHighlightGlow(surface, albedo);
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
     subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);

@@ -15,6 +15,7 @@
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
 #include "../dxso/dxso_color_terms.h"
+#include "../dxso/dxso_highlight_tints.h"
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
@@ -1978,6 +1979,23 @@ namespace dxvk {
       // and =False run is the direct way to see whether a material's two compiles agree on
       // their identity inputs.
       std::string identitySummary;
+
+      // Material scalars the shader proves tint its colour as lerp(X, X * V, S): Mirror's Edge's
+      // Runner Vision highlight (rtx.d3d9.ue3HighlightTints). nameKey hashes the strength's and
+      // colour's CTAB names, which are fixed per material while their registers move between
+      // lightmap policy compiles; it keys the at-rest evidence every compile shares.
+      struct HighlightPair {
+        DxsoHighlightPair tint;
+        XXH64_hash_t nameKey = kEmptyHash;
+        std::string strengthName;
+        std::string colorName;
+      };
+      std::vector<HighlightPair> highlightPairs;
+      // The colour registers of those pairs: what the surface is tinted towards, never its colour.
+      std::vector<uint32_t> highlightColorRegisters;
+      // For rtx.d3d9.ue3LogHighlightTints.
+      DxsoHighlightFailure highlightFailure = DxsoHighlightFailure::None;
+      std::vector<uint32_t> highlightUnprovenScalars;
     };
 
     // CTAB sampler register -> declared name, for diagnostics. Cached per shader hash.
@@ -4540,6 +4558,36 @@ namespace dxvk {
         ranges = std::move(merged);
       };
       mergeConstRanges(info.constRanges);
+
+      // Runner Vision highlight tints. A shader without a material scalar cannot carry one.
+      const DxsoHighlightInputs highlightInputs = dxsoHighlightInputsFromUe3Ctab(ctab);
+      if (highlightInputs.scalarRegs.any()) {
+        const DxsoHighlightResult highlight =
+          analyzeDxsoHighlightTints(tokens, bytecode.size() / sizeof(uint32_t), highlightInputs);
+        info.highlightFailure = highlight.failure;
+        info.highlightUnprovenScalars = highlight.unprovenScalarRegs;
+        auto constantName = [&ctab](const uint32_t reg) {
+          for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+            if (c.registerSet == kD3dxRegisterSetFloat4 && reg >= c.registerIndex && reg < c.registerIndex + c.registerCount)
+              return c.name;
+          }
+          return std::string();
+        };
+        for (const DxsoHighlightPair& tint : highlight.pairs) {
+          Ue3PsMaterialIdentityInfo::HighlightPair pair;
+          pair.tint = tint;
+          pair.strengthName = constantName(tint.scalarReg);
+          pair.colorName = constantName(uint32_t(tint.colorReg[0]));
+          const std::string key = pair.strengthName + '\x01' + pair.colorName;
+          pair.nameKey = XXH3_64bits(key.data(), key.size());
+          info.highlightPairs.push_back(std::move(pair));
+          for (const int32_t reg : tint.colorReg) {
+            if (std::find(info.highlightColorRegisters.begin(), info.highlightColorRegisters.end(), uint32_t(reg)) ==
+                info.highlightColorRegisters.end())
+              info.highlightColorRegisters.push_back(uint32_t(reg));
+          }
+        }
+      }
       return info;
     }
 
@@ -4633,6 +4681,110 @@ namespace dxvk {
           psHash, parseUe3PsMaterialIdentityFromCtab(bytecode, pixelShader, detectVolatileConstants, texturelessIdentityFromBytecode)).first;
       }
       return it->second;
+    }
+
+    // Runner Vision (rtx.d3d9.ue3HighlightTints), per draw. The pairs are proven once per shader;
+    // the strength and colour are read live, because the game fades the strength on the material
+    // instance it creates for each highlighted mesh element.
+    struct Ue3HighlightTintDraw {
+      const Vector4* fConsts = nullptr;
+      XXH64_hash_t   shaderIdentitySeed = kEmptyHash;
+      bool           requireRest = true;
+      float          glowIntensity = 0.0f;
+      bool           log = false;
+    };
+
+    static std::string describeUe3HighlightPair(const Ue3PsMaterialIdentityInfo::HighlightPair& pair) {
+      return str::format(pair.strengthName, "@c", pair.tint.scalarReg,
+                         " -> ", pair.colorName, "@c", pair.tint.colorReg[0],
+                         " glow=", pair.tint.glowCoefficient);
+    }
+
+    // Multiplies each applying pair's tint into `tint` and adds its glow to `glow`; returns whether
+    // any pair applied. appliedLog, when given, receives the live values of those that did.
+    static bool evaluateUe3HighlightTints(const Ue3PsMaterialIdentityInfo& info, const Ue3HighlightTintDraw& draw,
+                                          Vector3& tint, float& glow, std::string* appliedLog) {
+      // Keyed by master material - identity seed plus the pair's CTAB names - so every lightmap
+      // policy compile and every material instance shares what any of them has shown.
+      static fast_unordered_set s_restSeen;
+      static fast_unordered_set s_heldBackLogged;
+
+      bool applied = false;
+      for (const Ue3PsMaterialIdentityInfo::HighlightPair& pair : info.highlightPairs) {
+        const uint32_t strengthReg = pair.tint.scalarReg;
+        if (strengthReg >= caps::MaxFloatConstantsPS)
+          continue;
+        const float strength = draw.fConsts[strengthReg].x;
+        if (!std::isfinite(strength) || strength < 0.0f)
+          continue;
+
+        const XXH64_hash_t gateKey = XXH3_64bits_withSeed(&pair.nameKey, sizeof(pair.nameKey), draw.shaderIdentitySeed);
+        if (strength == 0.0f) {
+          if (s_restSeen.insert(gateKey).second && draw.log) {
+            Logger::info(str::format(
+              "[RTX-Compatibility][UE3-Highlight] Strength seen at rest: ", describeUe3HighlightPair(pair),
+              " seed=0x", std::hex, draw.shaderIdentitySeed, std::dec, "."));
+          }
+          continue;
+        }
+
+        const bool fingerprinted = pair.tint.glowCoefficient > 0.0f;
+        if (draw.requireRest && !fingerprinted && !lookupHash(s_restSeen, gateKey)) {
+          if (draw.log && s_heldBackLogged.insert(gateKey).second) {
+            Logger::info(str::format(
+              "[RTX-Compatibility][UE3-Highlight] Held back ", describeUe3HighlightPair(pair), " at strength ", strength,
+              " seed=0x", std::hex, draw.shaderIdentitySeed, std::dec,
+              ": not yet seen at rest on this master material (rtx.d3d9.ue3HighlightTintRequireRest)."));
+          }
+          continue;
+        }
+
+        const float s = std::min(strength, 1.0f);
+        Vector3 color(1.0f, 1.0f, 1.0f);
+        for (uint32_t lane = 0; lane < 3; lane++) {
+          const int32_t reg = pair.tint.colorReg[lane];
+          if (reg < 0 || uint32_t(reg) >= caps::MaxFloatConstantsPS)
+            continue;
+          const float value = draw.fConsts[reg][pair.tint.colorComponent[lane]];
+          color[lane] = std::isfinite(value) ? std::max(value, 0.0f) : 1.0f;
+          tint[lane] *= 1.0f + s * (color[lane] - 1.0f);
+        }
+        if (fingerprinted)
+          glow += pair.tint.glowCoefficient * s * draw.glowIntensity;
+        applied = true;
+
+        if (appliedLog != nullptr) {
+          *appliedLog += str::format(appliedLog->empty() ? "" : "; ", describeUe3HighlightPair(pair),
+                                     " strength=", strength, " colour=(", color.x, ",", color.y, ",", color.z, ")");
+        }
+      }
+      return applied;
+    }
+
+    static void logUe3HighlightPairsOnce(const XXH64_hash_t psHash, const XXH64_hash_t shaderIdentitySeed,
+                                         const std::vector<uint8_t>& bytecode, const Ue3PsMaterialIdentityInfo& info) {
+      if (info.highlightPairs.empty() && info.highlightUnprovenScalars.empty() &&
+          info.highlightFailure == DxsoHighlightFailure::None)
+        return;
+      static fast_unordered_set s_logged;
+      if (!s_logged.insert(psHash).second)
+        return;
+
+      std::string tints;
+      for (const Ue3PsMaterialIdentityInfo::HighlightPair& pair : info.highlightPairs)
+        tints += str::format(tints.empty() ? "" : ", ", describeUe3HighlightPair(pair));
+      std::string unproven;
+      const std::map<uint32_t, std::string>& names = getUe3PsFloatConstantNames(psHash, bytecode);
+      for (const uint32_t reg : info.highlightUnprovenScalars) {
+        const auto it = names.find(reg);
+        unproven += str::format(unproven.empty() ? "" : ", ", it != names.end() ? it->second : std::string("?"), "@c", reg);
+      }
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Highlight] ps=0x", std::hex, psHash, " seed=0x", shaderIdentitySeed, std::dec,
+        " tints=[", tints, "] unprovenScalars=[", unproven, "]",
+        info.highlightFailure != DxsoHighlightFailure::None
+          ? str::format(" not analysed: ", dxsoHighlightFailureName(info.highlightFailure))
+          : std::string()));
     }
 
     bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
@@ -6316,6 +6468,11 @@ namespace dxvk {
     o.ue3StableDiffuseSelection = ue3StableDiffuseSelectionObject().get();
     o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
     o.ue3ConstantAlbedoTintGain = ue3ConstantAlbedoTintGainObject().get();
+    o.ue3HighlightTints = ue3HighlightTintsObject().get() && o.ue3EngineMode;
+    o.ue3HighlightTintRequireRest = ue3HighlightTintRequireRestObject().get();
+    o.ue3HighlightGlowIntensity = ue3HighlightGlowIntensityObject().get();
+    o.ue3LogHighlightTints = ue3LogHighlightTintsObject().get();
+    o.ue3HighlightDebugForceTint = ue3HighlightDebugForceTintObject().get();
     o.ue3LogClassification = ue3LogClassificationObject().get();
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
@@ -6363,6 +6520,7 @@ namespace dxvk {
     o.ue3MicConstantIdentityExcludedShaders = &s.ue3MicConstantIdentityExcludedShaders;
     o.ue3MicConstantIdentityExcludedMaterials = &s.ue3MicConstantIdentityExcludedMaterials;
     o.ue3MicIdentityExcludedTextureDescHashes = &s.ue3MicIdentityExcludedTextureDescHashes;
+    o.ue3HighlightTintExcludedMaterials = &s.ue3HighlightTintExcludedMaterials;
     o.ue3TraceDrawTextureHashes = &s.ue3TraceDrawTextureHashes;
     o.replacementDebugHashes = &s.replacementDebugHashes;
 
@@ -6391,6 +6549,7 @@ namespace dxvk {
       { &s.ue3MicConstantIdentityExcludedShaders, &ue3MicConstantIdentityExcludedShadersObject().get() },
       { &s.ue3MicConstantIdentityExcludedMaterials, &ue3MicConstantIdentityExcludedMaterialsObject().get() },
       { &s.ue3MicIdentityExcludedTextureDescHashes, &ue3MicIdentityExcludedTextureDescHashesObject().get() },
+      { &s.ue3HighlightTintExcludedMaterials, &ue3HighlightTintExcludedMaterialsObject().get() },
       { &s.ue3TraceDrawTextureHashes, &ue3TraceDrawTextureHashesObject().get() },
       { &s.replacementDebugHashes, &RtxOptions::replacementDebugHashesObject().get() },
     };
@@ -13915,6 +14074,11 @@ namespace dxvk {
               auto tryConstantAlbedo = [&](const uint32_t reg) {
                 if (reg >= caps::MaxFloatConstantsPS)
                   return false;
+                // A highlight colour holds its value whether the highlight is on or not, so taking
+                // it would leave the surface permanently tinted.
+                if (std::find(identityInfo.highlightColorRegisters.begin(), identityInfo.highlightColorRegisters.end(), reg) !=
+                    identityInfo.highlightColorRegisters.end())
+                  return false;
                 const Vector4& uniformColor = d3d9State().psConsts.fConsts[reg];
                 if (!std::isfinite(uniformColor.x) || !std::isfinite(uniformColor.y) ||
                     !std::isfinite(uniformColor.z) || !std::isfinite(uniformColor.w))
@@ -13955,6 +14119,51 @@ namespace dxvk {
                 }
               }
             }
+
+            // Runner Vision: the game fades a strength parameter up on the surfaces it highlights
+            // and tints them through constants Remix never evaluates. Carried per surface rather
+            // than in the material, so the fade reaches the renderer frame by frame without
+            // re-minting the material or moving its identity.
+            if (m_frameOptions.ue3HighlightTints) {
+              const bool logHighlight = m_frameOptions.ue3LogHighlightTints;
+              if (logHighlight)
+                logUe3HighlightPairsOnce(psHash, shaderIdentitySeed, bytecode, identityInfo);
+
+              LegacyMaterialData& materialData = m_activeDrawCallState.materialData;
+              const fast_unordered_set& excluded = *m_frameOptions.ue3HighlightTintExcludedMaterials;
+              const XXH64_hash_t colorTextureHash = materialData.getColorTexture().getImageHash();
+              bool tintable = !identityInfo.highlightPairs.empty();
+              if (tintable && (logHighlight || !excluded.empty())) {
+                materialData.updateCachedHash();
+                tintable = !lookupHash(excluded, materialData.getHash()) && !lookupHash(excluded, textureSetShaderHash) &&
+                           !lookupHash(excluded, colorTextureHash);
+              }
+
+              if (tintable) {
+                Ue3HighlightTintDraw draw;
+                draw.fConsts = d3d9State().psConsts.fConsts;
+                draw.shaderIdentitySeed = shaderIdentitySeed;
+                draw.requireRest = m_frameOptions.ue3HighlightTintRequireRest;
+                draw.glowIntensity = std::max(m_frameOptions.ue3HighlightGlowIntensity, 0.0f);
+                draw.log = logHighlight;
+
+                std::string appliedLog;
+                const bool applied = evaluateUe3HighlightTints(identityInfo, draw, materialData.ue3HighlightTint,
+                                                               materialData.ue3HighlightGlow, logHighlight ? &appliedLog : nullptr);
+                static fast_unordered_set s_loggedHighlightMaterials;
+                if (applied && logHighlight && s_loggedHighlightMaterials.insert(materialData.getHash()).second) {
+                  const Vector3& tint = materialData.ue3HighlightTint;
+                  Logger::info(str::format(
+                    "[RTX-Compatibility][UE3-Highlight] Tint applied: materialHash=0x", std::hex, materialData.getHash(),
+                    " textureSetShader=0x", textureSetShaderHash, " texture=0x", colorTextureHash, " ps=0x", psHash, std::dec,
+                    " tint=(", tint.x, ",", tint.y, ",", tint.z, ") glow=", materialData.ue3HighlightGlow, " ", appliedLog));
+                }
+              }
+            }
+
+            const Vector3& forcedHighlightTint = m_frameOptions.ue3HighlightDebugForceTint;
+            if (forcedHighlightTint.x != 1.0f || forcedHighlightTint.y != 1.0f || forcedHighlightTint.z != 1.0f)
+              m_activeDrawCallState.materialData.ue3HighlightTint = forcedHighlightTint;
 
             if (logMicHash) {
               m_activeDrawCallState.materialData.updateCachedHash();

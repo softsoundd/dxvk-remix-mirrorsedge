@@ -177,7 +177,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 784, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 800, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1119,6 +1119,8 @@ namespace dxvk {
         currentInstance.surface.textureAlphaOperation = drawCall.getMaterialData().textureAlphaOperation;
         currentInstance.surface.texgenMode = drawCall.getTransformData().texgenMode; // NOTE: Make it material data...
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
+        currentInstance.surface.highlightTint = drawCall.getMaterialData().ue3HighlightTint;
+        currentInstance.surface.highlightGlow = drawCall.getMaterialData().ue3HighlightGlow;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
@@ -1457,6 +1459,14 @@ namespace dxvk {
       bool hasPreviousPositions,
       bool isFirstUpdateThisFrame,
       bool fireEvents) {
+    // A highlight fades while everything else about the surface holds still, which is exactly when
+    // the preserve path skips the update that would carry it. Surfaces are uploaded every frame, so
+    // refreshing the value here is enough.
+    if (instance.surface.isPreservePath) {
+      instance.surface.highlightTint = drawCall.getMaterialData().ue3HighlightTint;
+      instance.surface.highlightGlow = drawCall.getMaterialData().ue3HighlightGlow;
+    }
+
     // Camera registration. This is per-instance, so this detects the first time an instance
     // is drawn with a given camera each frame.
     const bool isNewCameraTypeThisFrame =

@@ -476,6 +476,23 @@ struct Surface
     set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 14) : packedFlagUnset(data13.z, 1 << 14); }
   }
 
+  // Runner Vision (rtx.d3d9.ue3HighlightTints): a tint on the surface colour and the fraction of the
+  // tinted colour emitted as glow. They share data15.xyz with the eye origin, so an eye never has one.
+  property bool hasHighlightTint
+  {
+    get { return packedFlagGet(data13.z, 1 << 15); }
+  }
+
+  property vec3 highlightTint
+  {
+    get { return vec3(f16tof32(data15.x), f16tof32(data15.x >> 16), f16tof32(data15.y)); }
+  }
+
+  property float highlightGlow
+  {
+    get { return f16tof32(data15.y >> 16); }
+  }
+
   property uint tFactor
   {
     get { return data13.y; }
@@ -502,7 +519,8 @@ struct Surface
     set { data2.x = newValue; }
   }
 
-  // See RtEyeParams::eyeballOrigin (rtx_materials.h) for what this is decoded from.
+  // See RtEyeParams::eyeballOrigin (rtx_materials.h) for what this is decoded from. Shared with the
+  // highlight tint on surfaces that are not eyes.
   property vec3 eyeOrigin
   {
     get { return asfloat(data15.xyz); }

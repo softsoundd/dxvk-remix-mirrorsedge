@@ -177,6 +177,46 @@ namespace dxvk {
                "ramping up fades smoothly to its colour rather than stepping to it. The default reaches full "
                "saturation at 0.125, the peak Mirror's Edge's menu highlight reaches. Set to 0 to use the register "
                "value directly instead, which is faithful to the constant but renders these surfaces very dark.");
+    RTX_OPTION("rtx.d3d9", bool, ue3HighlightTints, true,
+               "UE3 compat: reproduce the tint a game fades in through a material strength parameter, such as Mirror's "
+               "Edge's Runner Vision (LOI_Strength). Remix samples the albedo texture itself, so a tint the pixel shader "
+               "applies from its constants never reaches the path tracer. The pixel shader is analysed to prove which "
+               "UniformScalar_* tints the colour output as lerp(X, X * V, S), and towards which UniformVector_*. The "
+               "tint is carried per surface, so it follows the fade frame by frame, leaves material hashes alone and "
+               "applies over replacement materials too. rtx.d3d9.ue3HighlightTintRequireRest decides which proven tints "
+               "count as a highlight. Requires rtx.d3d9.ue3EngineMode; see documentation/UE3Compatibility.md, "
+               "\"Runner Vision\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3HighlightTintRequireRest, true,
+               "UE3 compat: apply a proven tint only once its strength has been seen resting at exactly 0 on the same "
+               "master material. A strength that also scales an unlit copy of the tinted colour, the Runner Vision "
+               "glow, is a highlight by construction and applies at once. Without that glow, as on masked Runner Vision "
+               "materials, the lerp is indistinguishable from an authored tint amount, except that LOI_Strength rests "
+               "at 0 on every surface that is not highlighted while an authored amount stays wherever the artist left "
+               "it. The evidence is shared by every lightmap policy compile and material instance of a master material "
+               "and lasts for the session. Disable to apply every proven tint, authored amounts included.");
+    RTX_OPTION("rtx.d3d9", float, ue3HighlightGlowIntensity, 1.0f,
+               "UE3 compat: scale on the glow Runner Vision adds to a highlighted surface. Most Runner Vision materials "
+               "add an unlit copy of the tinted colour, weighted by the strength and a coefficient read from the shader "
+               "(0.1 on Mirror's Edge), which keeps highlighted objects readable in shadow. It is reproduced as emission "
+               "of that fraction of the surface's tinted albedo; 1 keeps the game's coefficient, and 0 disables the "
+               "glow while keeping the tint. Also scaled by rtx.emissiveIntensity.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3HighlightTintExcludedMaterials, {},
+               "UE3 compat: surfaces rtx.d3d9.ue3HighlightTints never tints, matched against the draw's material hash, "
+               "its textureSet+shader hash and its primary colour texture hash. For a tint the game uses for something "
+               "other than a highlight that rtx.d3d9.ue3HighlightTintRequireRest still lets through; "
+               "rtx.d3d9.ue3LogHighlightTints reports all three hashes the first time a tint applies to a material.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogHighlightTints, false,
+               "UE3 compat diagnostics: log what rtx.d3d9.ue3HighlightTints finds. Once per pixel shader: the proven "
+               "strength and colour pairs with their CTAB names and glow coefficients, the material scalars that reach "
+               "the colour output without proving a tint, and why a shader could not be analysed. Once per master "
+               "material and pair: when its strength is first seen at rest, and when a strength above 0 is held back "
+               "because it has not been. Once per material: the first time a tint applies, with each pair's live "
+               "strength and colour, the resulting tint and glow, and the hashes "
+               "rtx.d3d9.ue3HighlightTintExcludedMaterials takes.");
+    RTX_OPTION("rtx.d3d9", Vector3, ue3HighlightDebugForceTint, Vector3(1.f, 1.f, 1.f),
+               "UE3 compat diagnostic: force this tint onto every UE3 material, whatever the analysis found, to check "
+               "the per-surface tint reaches the shader independently of detection. Identity (1, 1, 1) disables the "
+               "override.");
     RTX_OPTION("rtx.d3d9", bool, ue3MicConstantIdentity, true,
                "UE3 MaterialInstanceConstant support: fold the material's Uniform* constants into its "
                "identity, distinguishing instances that share a parent and its textures but differ in "
@@ -2166,6 +2206,11 @@ namespace dxvk {
       bool ue3StableDiffuseSelection = false;
       bool ue3AutoDetectLightmapTextures = false;
       float ue3ConstantAlbedoTintGain = 0.f;
+      bool ue3HighlightTints = false;
+      bool ue3HighlightTintRequireRest = true;
+      float ue3HighlightGlowIntensity = 0.f;
+      bool ue3LogHighlightTints = false;
+      Vector3 ue3HighlightDebugForceTint = Vector3(1.f, 1.f, 1.f);
       bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;
       bool ue3LogUvAffineDetail = false;
@@ -2218,6 +2263,7 @@ namespace dxvk {
       const fast_unordered_set* ue3MicConstantIdentityExcludedShaders = nullptr;
       const fast_unordered_set* ue3MicConstantIdentityExcludedMaterials = nullptr;
       const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
+      const fast_unordered_set* ue3HighlightTintExcludedMaterials = nullptr;
       const fast_unordered_set* ue3TraceDrawTextureHashes = nullptr;
       const fast_unordered_set* replacementDebugHashes = nullptr;
     };
@@ -2240,6 +2286,7 @@ namespace dxvk {
       fast_unordered_set ue3MicConstantIdentityExcludedShaders;
       fast_unordered_set ue3MicConstantIdentityExcludedMaterials;
       fast_unordered_set ue3MicIdentityExcludedTextureDescHashes;
+      fast_unordered_set ue3HighlightTintExcludedMaterials;
       fast_unordered_set ue3TraceDrawTextureHashes;
       fast_unordered_set replacementDebugHashes;
     };
