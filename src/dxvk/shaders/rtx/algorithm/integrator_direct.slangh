@@ -498,7 +498,10 @@ void integrateDirectPath(
     PrimaryDirectSpecularLobeRadianceHitDistance[pixelCoordinate] =
       sanitizeRadianceHitDistance(specularLobeRadiance, lightHitDistance);
     // Store the surface illuminance for gradient computation.
-    PrimaryRtxdiIlluminance[pixelCoordinate] = illuminance;
+    if (cb.rtxdiIlluminanceAllocated)
+    {
+      PrimaryRtxdiIlluminance[pixelCoordinate] = illuminance;
+    }
   }
   else
   {
@@ -522,7 +525,10 @@ void integrateDirectPath(
 
     SecondaryCombinedDiffuseLobeRadianceHitDistance[pixelCoordinate] = secondaryCombinedDiffuseLobeRadianceHitDistance;
     SecondaryCombinedSpecularLobeRadianceHitDistance[pixelCoordinate] = secondaryCombinedSpecularLobeRadianceHitDistance;
-    PrimaryRtxdiIlluminance[pixelCoordinate] = 0;
+    if (cb.rtxdiIlluminanceAllocated)
+    {
+      PrimaryRtxdiIlluminance[pixelCoordinate] = 0;
+    }
   }
   
   integratorDirectPathOutputDebugView(pixelCoordinate, geometryFlags);

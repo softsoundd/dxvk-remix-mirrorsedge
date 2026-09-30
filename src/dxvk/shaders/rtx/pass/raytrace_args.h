@@ -302,6 +302,8 @@ struct RaytraceArgs {
   uint enableRtxdiDiscardEnlargedPixels;
   uint enableDirectLightBoilingFilter;
   uint enableRtxdiBestLightSampling;
+  uint rtxdiGradientResourcesAllocated;
+  uint rtxdiIlluminanceAllocated;
   float directLightBoilingThreshold;
   float rtxdiDisocclusionFrames;
 
