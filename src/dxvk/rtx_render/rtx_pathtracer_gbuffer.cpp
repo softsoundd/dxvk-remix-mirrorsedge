@@ -765,6 +765,32 @@ namespace dxvk {
       rtOutput.m_raytraceArgs.enableRaytracedRenderTarget,
       rtOutput.m_raytraceArgs.enableStochasticAlphaBlend);
     const VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
+    // TraceRay runs geometryResolverVertex in the closest-hit/miss shaders, which have no
+    // GBUFFER_FEATURE_DEBUG_VIEW variant, so the per-hit debug views would stay black there.
+    // Debug-view frames take the RayQuery compute path, whose debug variant covers the whole resolver.
+    RaytraceMode raytraceMode = RtxOptions::renderPassGBufferRaytraceMode();
+    if (debugViewEnabled && raytraceMode == RaytraceMode::TraceRay) {
+      raytraceMode = RaytraceMode::RayQuery;
+    }
+
+    // Binds the Primary Rays or PSR pass of the raytrace mode.
+    auto bindPass = [&](const bool isPSRPass) {
+      if (raytraceMode == RaytraceMode::RayQuery) {
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, isPSRPass, nrcEnabled, wboitEnabled));
+      } else {
+        ctx->bindRaytracingPipelineShaders(getPipelineShaders(
+          pipelineFeatureVariant, isPSRPass, raytraceMode == RaytraceMode::RayQueryRayGen,
+          serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
+      }
+    };
+
+    auto dispatchPass = [&]() {
+      if (raytraceMode == RaytraceMode::RayQuery) {
+        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+      } else {
+        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+      }
+    };
 
     GbufferPushConstants pushArgs = {};
     pushArgs.isTransmissionPSR = 0;
@@ -805,101 +831,35 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     };
 
-    // TraceRay runs geometryResolverVertex in the closest-hit/miss shaders, which have no
-    // GBUFFER_FEATURE_DEBUG_VIEW variant, so the per-hit debug views would stay black there.
-    // Debug-view frames take the RayQuery compute path, whose debug variant covers the whole resolver.
-    RaytraceMode raytraceMode = RtxOptions::renderPassGBufferRaytraceMode();
-    if (debugViewEnabled && raytraceMode == RaytraceMode::TraceRay) {
-      raytraceMode = RaytraceMode::RayQuery;
+    if (raytraceMode >= RaytraceMode::Count) {
+      assert(false && "Invalid RaytraceMode in DxvkPathtracerGbuffer::dispatch");
+      return;
     }
 
-    switch (raytraceMode) {
-    case RaytraceMode::RayQuery:
-      {
-        ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, false, nrcEnabled, wboitEnabled));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-      }
+    {
+      ScopedGpuProfileZone(ctx, "Primary Rays");
+      bindPass(false);
+      dispatchPass();
+    }
 
-      dispatchDeferredDecals();
-      dispatchPSRPrepare();
+    dispatchDeferredDecals();
+    dispatchPSRPrepare();
 
-      {
-        // Warning: do not change the order of Reflection and Transmission PSR, that will break
-        // PSR data dependencies due to resource aliasing.
-        ScopedGpuProfileZone(ctx, "Reflection PSR");
-        ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(rayQueryFeatureVariant, true, nrcEnabled, wboitEnabled));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-      }
+    {
+      // Warning: do not change the order of Reflection and Transmission PSR, that will break
+      // PSR data dependencies due to resource aliasing.
+      ScopedGpuProfileZone(ctx, "Reflection PSR");
+      ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
+      bindPass(true);
+      dispatchPass();
+    }
 
-      {
-        ScopedGpuProfileZone(ctx, "Transmission PSR");
-        ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
-        pushArgs.isTransmissionPSR = 1;
-        ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-      }
-      break;
-
-      case RaytraceMode::RayQueryRayGen:
-      {
-        ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, false, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      dispatchDeferredDecals();
-      dispatchPSRPrepare();
-
-      {
-        // Warning: do not change the order of Reflection and Transmission PSR, that will break
-        // PSR data dependencies due to resource aliasing.
-        ScopedGpuProfileZone(ctx, "Reflection PSR");
-        ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, true, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      {
-        ScopedGpuProfileZone(ctx, "Transmission PSR");
-        ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
-        pushArgs.isTransmissionPSR = 1;
-        ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-      break;
-
-      case RaytraceMode::TraceRay:
-      {
-        ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, false, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      dispatchDeferredDecals();
-      dispatchPSRPrepare();
-
-      {
-        // Warning: do not change the order of Reflection and Transmission PSR, that will break
-        // PSR data dependencies due to resource aliasing.
-        ScopedGpuProfileZone(ctx, "Reflection PSR");
-        ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindRaytracingPipelineShaders(getPipelineShaders(pipelineFeatureVariant, true, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-
-      {
-        ScopedGpuProfileZone(ctx, "Transmission PSR");
-        ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
-        pushArgs.isTransmissionPSR = 1;
-        ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
-      }
-      break;
-      case RaytraceMode::Count:
-        assert(false && "Invalid RaytraceMode in DxvkPathtracerGbuffer::dispatch");
-      break;
+    {
+      ScopedGpuProfileZone(ctx, "Transmission PSR");
+      ctx->setFramePassStage(RtxFramePassStage::TransmissionPSR);
+      pushArgs.isTransmissionPSR = 1;
+      ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
+      dispatchPass();
     }
   }
 
