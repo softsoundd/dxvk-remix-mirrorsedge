@@ -497,29 +497,54 @@ Optionally enable `rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces` to flag one
 
 ## Game executable patches
 
-Two Mirror's Edge behaviours that matter to Remix are decided inside the game process, where the runtime does not run: under the bridge it is hosted by `.trex\NvRemixBridge.exe`, and the only Remix code in `MirrorsEdge.exe` is the bridge client (`d3d9.dll`). The client therefore patches the executable's code in memory, at the runtime's request. Nothing on disk changes.
+Several Mirror's Edge behaviours that matter to Remix are decided inside the game process, where the runtime does not run: under the bridge it is hosted by `.trex\NvRemixBridge.exe`, and the only Remix code in `MirrorsEdge.exe` is the bridge client (`d3d9.dll`). The client therefore patches the executable's code in memory, at the runtime's request. Nothing on disk changes.
 
 | Option | Default | Effect |
 | --- | --- | --- |
 | `rtx.d3d9.ue3DisableFrustumCulling` | False (True in the Mirror's Edge profile) | The renderer stops culling primitives outside the view frustum, so off-screen geometry stays in the ray traced scene |
+| `rtx.d3d9.ue3FrustumBypassMaxDistanceMeters` | 0 (no limit) | Off-screen primitives are kept only within this distance of the camera |
+| `rtx.d3d9.ue3FrustumBypassMinRadiusMeters` | 0 (off) | With a max distance, off-screen primitives with at least this bounding radius are kept at any distance |
 | `rtx.d3d9.ue3ShowThirdPersonModel` | False (True in the Mirror's Edge profile) | The third-person body and weapon (`Mesh3p`) also draw in first person, as player-model geometry |
+| `rtx.d3d9.ue3DisableOcclusionQueries` | False (True in the Mirror's Edge profile) | No hardware occlusion queries, as with `toggleocclusion` |
+| `rtx.d3d9.ue3DisableSceneCaptures` | False (True in the Mirror's Edge profile) | No scene capture updates, as with `show scenecapture` |
+| `rtx.d3d9.ue3DisableDynamicShadows` | False (True in the Mirror's Edge profile) | No dynamic shadow depths or projections, as with `show dynamicshadows` |
+| `rtx.d3d9.ue3DisableDynamicLighting` | False (True in the Mirror's Edge profile) | No per-light passes, modulated shadows or lighting-only post process effects, as with `viewmode unlit` |
+| `rtx.d3d9.ue3DisableVelocityPass` | False (True in the Mirror's Edge profile) | No velocity pass, as with `MotionBlur=False` |
 
-Neither is requested outside `rtx.d3d9.ue3EngineMode`, nor while ray tracing is disabled, so the rasterised image Remix shows then is the game's own. Both are under Rendering > Mirror's Edge Game Patches in the developer menu, each with its status.
+None is requested outside `rtx.d3d9.ue3EngineMode`, nor while ray tracing is disabled, so the rasterised image Remix shows then is the game's own. All are under Rendering > Mirror's Edge Game Patches in the developer menu, each with its status.
 
 ### Request and status
 
-`D3D9Rtx::EndFrame` sends the wanted patches to the bridge client as a `GamePatchBits` mask whenever it changes (see `src/util/util_game_patches.h`), over the window-message channel that also carries `UWM_REMIX_UIACTIVE_MSG`. The client handles the request on the game's window thread: on the first one it locates both patches' sites, then it applies or reverts each patch to match the mask and answers with which patches are active and which it could not find. An answer sent before the channel's handshake completes is lost, so the runtime repeats its request every 2 seconds until the first answer arrives. The client logs the sites it finds and every change it makes to `bridge32.log`, prefixed `[GamePatch]`.
+`D3D9Rtx::EndFrame` sends the wanted patches to the bridge client as a `GamePatchBits` mask, with the frustum bypass limits packed into the message's `lParam`, whenever either changes (see `src/util/util_game_patches.h`). It uses the window-message channel that also carries `UWM_REMIX_UIACTIVE_MSG`. The client handles the request on the game's window thread: on the first one it locates every patch's sites, then it applies or reverts each patch to match the mask and answers with which patches are active and which it could not find. An answer sent before the channel's handshake completes is lost, so the runtime repeats its request every 2 seconds until the first answer arrives. The client logs the sites it finds and every change it makes to `bridge32.log`, prefixed `[GamePatch]`.
 
-The sites are found by code signature, which matches the GOG, Steam, retail and DLC executables. The EA app executable is encrypted on disk, so its signatures are unverified; the client only scans it after it has decrypted. Every change is one or two bytes within an instruction, written by a single interlocked store, so a thread executing it fetches either the old instruction or the new one and never a mix. That is what lets both patches toggle while the rendering thread is drawing.
+The sites are found by code signature, which matches the GOG, Steam, retail and DLC executables. The EA app executable is encrypted on disk, so its signatures are unverified; the client only scans it after it has decrypted. A patch with several sites is only used when all of them are found. Every change to code a thread can reach is one or two bytes within an instruction, written by a single interlocked store, so a thread executing it fetches either the old instruction or the new one and never a mix. That is what lets the patches toggle while the rendering thread is drawing. The one longer write is covered under [Range-limited bypass](#range-limited-bypass).
 
 ### Frustum culling
 
 `FSceneRenderer::InitViews` tests every primitive with `View.ViewFrustum.IntersectSphere(Bounds.Origin, Bounds.SphereRadius)` and skips one that fails, before occlusion and view relevance are considered. The patch turns that skip, a `jz rel32`, into a short jump over its own operand, so every primitive carries on as if it had passed.
 
-Primitives are still culled by distance (`CullDistance`, cull distance volumes), and occlusion culling is left to `toggleocclusion` and `rtx.d3d9.conservativeOcclusionQueries`. While the patch is active the Remix free camera sees the whole level, not just what the game's camera can.
+Primitives are still culled by distance (`CullDistance`, cull distance volumes). Occlusion culling is covered by `rtx.d3d9.ue3DisableOcclusionQueries` (see [Raster-only passes](#raster-only-passes)) and `rtx.d3d9.conservativeOcclusionQueries`. While the patch is active the Remix free camera sees the whole level, not just what the game's camera can.
+
+### Range-limited bypass
+
+Every primitive the bypass lets through costs CPU time in UE3's render thread, over the bridge and in the runtime. `rtx.d3d9.ue3FrustumBypassMaxDistanceMeters` trades some of that back: a primitive outside the view frustum is then kept only within that distance of the camera, or when its bounding sphere's radius is at least `rtx.d3d9.ue3FrustumBypassMinRadiusMeters`, which keeps the large buildings that fill distant reflections and cast long shadows. Primitives inside the frustum are unaffected. Distances are compared with InitViews' own `DistanceSquared`, so like the game's cull distances they scale with the field of view. Off-screen geometry the limits drop is gone from the ray traced scene unless `rtx.antiCulling.object.enable` retains it from when it was last seen.
+
+With a limit set, the jz points at a small stub generated in its own page instead of becoming a short jump. The jz is only taken for a primitive outside the frustum, and the stub sends it on to the visible path or the cull path by comparing the primitive's `Bounds.SphereRadius` and `DistanceSquared` with the two thresholds. The InitViews stack slots it reads them from are taken from the code around the test rather than assumed. Changing a limit is an interlocked store to its threshold, so no code is rewritten.
+
+Switching between the stock jz, the short jump and the stub-bound jz means rewriting the jz's 4-byte operand, which no single store can do atomically at its alignment. Every switch therefore passes through the short jump: the operand is only rewritten while the short jump keeps every thread off it, with `FlushProcessWriteBuffers` before and after, and only then is the jz restored. If the stack slots cannot be found, the limit reports as not found and the unlimited bypass still works.
 
 ### Third-person model
 
 In first person `TdPawn.SetFirstPerson` and `TdWeapon.SetFirstPerson` set `Mesh3p`'s `bOwnerNoSeeWithShadow`, a DICE addition to `PrimitiveComponent` that both `Mesh3p` archetypes also default to true. Rather than hiding the component from its owner's views, which would also drop its shadow, four of the renderer's draw loops check the flag: they skip a primitive whose component has it set when the view's `ViewActor` is among its scene proxy's `Owners`. The proxy's own copy of the flag only decides whether `Owners` is collected, and the shadow passes draw the primitive regardless.
 
 The patch zeroes the mask of each loop's `test byte ptr [reg+0xFC], 0x10`, so the test fails and the loop draws the primitive without looking for its owner. The flags stay as the game sets them, and only whether the renderer honours them changes, so the patch takes effect on the next frame either way. The body still needs the player-model tagging described in the README to stay out of the camera's view while it casts shadows and appears in reflections.
+
+### Raster-only passes
+
+The runtime drops the draws of several UE3 passes as soon as they arrive (see `D3D9Rtx::classifyUe3Pass`), but the game still issues each one, the bridge still carries it, and the runtime still processes it far enough to classify it. The frustum bypass multiplies them, because each pass covers everything the bypass lets through: a scene capture renders the whole level again, every off-screen primitive is occlusion tested, and off-screen shadow casters and movers add shadow and velocity draws. Each of these patches skips one pass at its source, through a branch the game already has, with the same render-side effect as a console command, so none of them depends on how the game was launched.
+
+- Occlusion queries (`toggleocclusion`): `GIgnoreAllOcclusionQueries` is read from both InitViews variants' tests of it and confirmed as the flag the `TOGGLEOCCLUSION` command toggles. Its three branches, two in InitViews and the one that sets `Render`'s `bIsOcclusionTesting`, become unconditional, so no queries are issued, and neither is the depth prepass UE3 only draws for occlusion testing (with `DirectionalLightmaps`). Remix answers queries as unoccluded while ray tracing anyway, so the patch changes what is drawn, not what is culled.
+- Scene captures (`show scenecapture`): the `SHOW_SceneCaptureUpdates` test before `RenderSceneCaptures` in the render thread's view family entry.
+- Dynamic shadows (`show dynamicshadows`): the `bAllowDynamicShadows` tests before `InitDynamicShadows` at the end of InitViews and before `RenderModulatedShadows`. Without the first no projected shadows exist, so no shadow depth or projection pass runs.
+- Dynamic lighting (the light-pass half of `viewmode unlit`): `Render`'s `SHOW_Lighting` block, which holds `RenderLights`, the modulated shadows and the lighting-only post process effects. Its `jz rel32` becomes a `nop` and an unconditional `jmp` with the same operand and target. Base pass shaders keep their lit permutations; only `viewmode unlit` itself changes those.
+- Velocity pass (`MotionBlur=False`): the `bAllowMotionBlur` test before `RenderVelocities`.

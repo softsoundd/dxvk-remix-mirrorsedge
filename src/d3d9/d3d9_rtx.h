@@ -405,13 +405,53 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3DisableFrustumCulling, false,
                "Mirror's Edge: patch the game so its renderer skips the per-primitive view frustum test and draws "
                "every primitive within its cull distance, keeping geometry outside the camera's view in the ray "
-               "traced scene for shadows, reflections and indirect light. Costs CPU time in both the game and Remix. "
+               "traced scene for shadows, reflections and indirect light. Costs CPU time in both the game and Remix; "
+               "rtx.d3d9.ue3FrustumBypassMaxDistanceMeters limits it. "
                "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
                "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION_ARGS("rtx.d3d9", float, ue3FrustumBypassMaxDistanceMeters, 0.f,
+               "Mirror's Edge: with rtx.d3d9.ue3DisableFrustumCulling, keep primitives outside the camera's view "
+               "only within this distance of the camera, or 0 to keep all of them. Measured like UE3's cull "
+               "distances, which scale with the field of view. Saves CPU time in the game and Remix at the cost of "
+               "far off-screen geometry, which rtx.antiCulling.object.enable can retain once it has been seen.",
+               args.minValue = 0.f);
+    RTX_OPTION_ARGS("rtx.d3d9", float, ue3FrustumBypassMinRadiusMeters, 0.f,
+               "Mirror's Edge: with rtx.d3d9.ue3FrustumBypassMaxDistanceMeters set, also keep primitives outside "
+               "the camera's view whose bounding sphere has at least this radius at any distance, such as the "
+               "buildings that fill distant reflections, or 0 to keep none by size.",
+               args.minValue = 0.f);
     RTX_OPTION("rtx.d3d9", bool, ue3ShowThirdPersonModel, false,
                "Mirror's Edge: patch the game so the third-person body and weapon meshes (Mesh3p) also draw in the "
                "first-person view. The game otherwise hides them from the player's own camera and keeps them only "
                "for its shadows and reflections; drawn, they become Remix player-model geometry (rtx.playerModel*). "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableOcclusionQueries, false,
+               "Mirror's Edge: patch the game to stop issuing hardware occlusion queries, as its toggleocclusion "
+               "console command does. Remix answers them as unoccluded while ray tracing, so they only cost a "
+               "bounding box draw per tested primitive, and with DirectionalLightmaps a depth prepass. "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableSceneCaptures, false,
+               "Mirror's Edge: patch the game to stop updating scene capture probes, as \"show scenecapture\" does. "
+               "Each capture renders the scene again into a texture Remix ignores, the whole level with "
+               "rtx.d3d9.ue3DisableFrustumCulling. "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableDynamicShadows, false,
+               "Mirror's Edge: patch the game to stop rendering its dynamic shadows, the shadow depths and their "
+               "projections, as \"show dynamicshadows\" does. Remix ignores these draws. "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableDynamicLighting, false,
+               "Mirror's Edge: patch the game to skip its per-light passes, modulated shadows and lighting-only post "
+               "process effects, which \"viewmode unlit\" also skips; base pass shaders are unchanged. Remix ignores "
+               "these draws. "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableVelocityPass, false,
+               "Mirror's Edge: patch the game to skip the velocity pass its motion blur reads, as MotionBlur=False "
+               "does. Remix computes its own motion vectors and ignores these draws. "
                "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
                "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
     RTX_OPTION("rtx.d3d9", bool, conservativeOcclusionQueries, false,
@@ -2381,8 +2421,9 @@ namespace dxvk {
     // the CS timeline, so batching is invisible to them.
     std::vector<XXH64_hash_t> m_pendingReplacementMaterialHashes;
 
-    // GamePatchBits last sent to the bridge client by updateUe3GamePatchRequest.
+    // GamePatchBits and frustum bypass limits last sent to the bridge client by updateUe3GamePatchRequest.
     uint32_t m_ue3GamePatchRequest = 0;
+    uint32_t m_ue3GamePatchLimits = 0;
     std::chrono::steady_clock::time_point m_ue3GamePatchRequestTime;
     void updateUe3GamePatchRequest();
 

@@ -73,7 +73,7 @@ show fog
 
     **Third-person model support** - Mirror's Edge hides the third-person player model in the default first-person camera state, which would leave Remix unable to cast shadows or reflect the character as you'd expect in a raytraced scenario. The runtime can patch the game in memory so the third-person model is always drawn. Make sure you have the runtime's `rtx.conf` file which has the necessary player/viewmodel hashes pre-tagged so this renders properly.
     
-    **Disabled frustum culling** - UE3 employs frustum culling in native C++ land, so geometry outside the camera's view never reaches Remix and results in missing reflections and shadows. The runtime can patch the game in memory so these primitives are always inside the view. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit!
+    **Disabled frustum culling** - UE3 employs frustum culling in native C++ land, so geometry outside the camera's view never reaches Remix and results in missing reflections and shadows. The runtime can patch the game in memory so these primitives are always inside the view. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit! The `Off-Screen Max Distance`/`Off-Screen Min Radius` settings beneath it can win some of that back by leaving far, small off-screen geometry culled.
 
 ### 3) Extra fork notes/debugging
 

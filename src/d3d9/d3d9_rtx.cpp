@@ -6501,12 +6501,28 @@ namespace dxvk {
 
   void D3D9Rtx::updateUe3GamePatchRequest() {
     uint32_t request = 0;
+    uint32_t limits = 0;
     if (m_frameOptions.ue3EngineMode && m_frameOptions.enableRaytracing) {
-      if (ue3DisableFrustumCullingObject().get()) {
-        request |= kGamePatchDisableFrustumCulling;
+      const std::pair<bool, GamePatchBits> patches[] = {
+        { ue3DisableFrustumCulling(), kGamePatchDisableFrustumCulling },
+        { ue3ShowThirdPersonModel(), kGamePatchShowThirdPersonModel },
+        { ue3DisableOcclusionQueries(), kGamePatchDisableOcclusionQueries },
+        { ue3DisableSceneCaptures(), kGamePatchDisableSceneCaptures },
+        { ue3DisableDynamicShadows(), kGamePatchDisableDynamicShadows },
+        { ue3DisableDynamicLighting(), kGamePatchDisableDynamicLighting },
+        { ue3DisableVelocityPass(), kGamePatchDisableVelocityPass },
+      };
+      for (const auto& [enabled, bit] : patches) {
+        if (enabled) {
+          request |= bit;
+        }
       }
-      if (ue3ShowThirdPersonModelObject().get()) {
-        request |= kGamePatchShowThirdPersonModel;
+
+      const float meterToWorldUnits = RtxOptions::getMeterToWorldUnitScale();
+      const float maxDistance = ue3FrustumBypassMaxDistanceMeters() * meterToWorldUnits;
+      if ((request & kGamePatchDisableFrustumCulling) != 0 && maxDistance > 0.f) {
+        request |= kGamePatchLimitFrustumBypass;
+        limits = packFrustumBypassLimits(maxDistance, ue3FrustumBypassMinRadiusMeters() * meterToWorldUnits);
       }
     }
 
@@ -6515,9 +6531,10 @@ namespace dxvk {
     const auto now = std::chrono::steady_clock::now();
     const bool unanswered = (s_ue3GamePatchStatus.load(std::memory_order_relaxed) & kUe3GamePatchAnswered) == 0;
     const bool retry = request != 0 && unanswered && now - m_ue3GamePatchRequestTime >= kUe3GamePatchRequestRetryInterval;
-    if ((request != m_ue3GamePatchRequest || retry) &&
-        BridgeMessageChannel::get().send(kGamePatchRequestMsgName, request, 0)) {
+    if ((request != m_ue3GamePatchRequest || limits != m_ue3GamePatchLimits || retry) &&
+        BridgeMessageChannel::get().send(kGamePatchRequestMsgName, request, limits)) {
       m_ue3GamePatchRequest = request;
+      m_ue3GamePatchLimits = limits;
       m_ue3GamePatchRequestTime = now;
     }
   }

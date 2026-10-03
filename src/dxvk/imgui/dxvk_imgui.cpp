@@ -4864,30 +4864,67 @@ namespace dxvk {
         RemixGui::CollapsingHeader("Mirror's Edge Game Patches", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       const D3D9Rtx::Ue3GamePatchStatus patchStatus = D3D9Rtx::getUe3GamePatchStatus();
-      const auto showPatch = [&patchStatus](const char* label, RtxOption<bool>& option, const uint32_t bit, const char* tooltip) {
+      const auto patchStatusText = [&patchStatus](const bool requested, const uint32_t bit) {
+        if (patchStatus.answered && (patchStatus.notFound & bit)) {
+          return "Not found in this executable";
+        }
+        if (patchStatus.answered && (patchStatus.active & bit)) {
+          return "Active";
+        }
+        if (requested && !RtxOptions::enableRaytracing()) {
+          return "Off while ray tracing is disabled";
+        }
+        if (requested && !patchStatus.answered) {
+          return "No response from the bridge client";
+        }
+        return "Off";
+      };
+      const auto showPatch = [&patchStatusText](const char* label, RtxOption<bool>& option, const uint32_t bit, const char* tooltip) {
         RemixGui::Checkbox(label, &option);
         if (ImGui::IsItemHovered()) {
           RemixGui::SetTooltipUnformatted(tooltip);
         }
-        const char* status = "Off";
-        if (patchStatus.answered && (patchStatus.notFound & bit)) {
-          status = "Not found in this executable";
-        } else if (patchStatus.answered && (patchStatus.active & bit)) {
-          status = "Active";
-        } else if (option.get() && !RtxOptions::enableRaytracing()) {
-          status = "Off while ray tracing is disabled";
-        } else if (option.get() && !patchStatus.answered) {
-          status = "No response from the bridge client";
-        }
-        ImGui::Text("Status: %s", status);
+        ImGui::Text("Status: %s", patchStatusText(option.get(), bit));
       };
+
+      ImGui::Text("Scene Coverage:");
       showPatch("Disable Game Frustum Culling", D3D9Rtx::ue3DisableFrustumCullingObject(), kGamePatchDisableFrustumCulling,
         "Patches the game so its renderer draws every primitive within its cull distance, not just those in the\n"
         "camera's view, keeping off-screen geometry in the ray traced scene for shadows, reflections and indirect light.\n"
         "Costs CPU time in the game and in Remix.");
+      ImGui::Indent();
+      ImGui::BeginDisabled(!D3D9Rtx::ue3DisableFrustumCulling());
+      RemixGui::DragFloat("Off-Screen Max Distance (m)", &D3D9Rtx::ue3FrustumBypassMaxDistanceMetersObject(), 1.0f, 0.0f, 10000.0f, "%.0f");
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "Keeps off-screen primitives only within this distance of the camera; 0 keeps all of them.\n"
+        "What it drops leaves the ray traced scene unless Anti-Culling retains it.");
+      ImGui::BeginDisabled(D3D9Rtx::ue3FrustumBypassMaxDistanceMeters() <= 0.f);
+      RemixGui::DragFloat("Off-Screen Min Radius (m)", &D3D9Rtx::ue3FrustumBypassMinRadiusMetersObject(), 1.0f, 0.0f, 10000.0f, "%.0f");
+      RemixGui::SetTooltipToLastWidgetOnHover("Also keeps off-screen primitives with at least this bounding radius, at any distance; 0 keeps none by size.");
+      ImGui::EndDisabled();
+      ImGui::EndDisabled();
+      if (D3D9Rtx::ue3FrustumBypassMaxDistanceMeters() > 0.f) {
+        ImGui::Text("Limit Status: %s", patchStatusText(D3D9Rtx::ue3DisableFrustumCulling(), kGamePatchLimitFrustumBypass));
+      }
+      ImGui::Unindent();
       showPatch("Show Third-Person Model", D3D9Rtx::ue3ShowThirdPersonModelObject(), kGamePatchShowThirdPersonModel,
         "Patches the game so it also draws the third-person body and weapon in first person, for Remix to use as\n"
         "player-model geometry in shadows and reflections.");
+
+      ImGui::Separator();
+      ImGui::Text("Raster-Only Passes:");
+      RemixGui::SetTooltipToLastWidgetOnHover("Passes the game still renders that Remix discards while ray tracing.");
+      showPatch("Disable Occlusion Queries", D3D9Rtx::ue3DisableOcclusionQueriesObject(), kGamePatchDisableOcclusionQueries,
+        "Stops the game issuing hardware occlusion queries, like its toggleocclusion command.");
+      showPatch("Disable Scene Captures", D3D9Rtx::ue3DisableSceneCapturesObject(), kGamePatchDisableSceneCaptures,
+        "Stops the game updating scene capture probes, like \"show scenecapture\".");
+      showPatch("Disable Dynamic Shadows", D3D9Rtx::ue3DisableDynamicShadowsObject(), kGamePatchDisableDynamicShadows,
+        "Stops the game rendering its dynamic shadows, like \"show dynamicshadows\".");
+      showPatch("Disable Dynamic Lighting", D3D9Rtx::ue3DisableDynamicLightingObject(), kGamePatchDisableDynamicLighting,
+        "Skips the game's per-light passes, modulated shadows and lighting-only post process effects, as\n"
+        "\"viewmode unlit\" does but without changing base pass shaders.");
+      showPatch("Disable Velocity Pass", D3D9Rtx::ue3DisableVelocityPassObject(), kGamePatchDisableVelocityPass,
+        "Skips the velocity pass the game's motion blur reads, like MotionBlur=False.");
       ImGui::Unindent();
     }
 
