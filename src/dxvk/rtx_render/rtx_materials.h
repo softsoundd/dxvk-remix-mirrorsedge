@@ -283,13 +283,18 @@ struct RtSurface {
     textureFlags |= eyeParams ? (1 << 14) : 0;
     // The highlight tint shares the eye origin's slots, so an eye keeps its origin and goes untinted.
     const bool hasHighlightTint = !eyeParams &&
-      (highlightTint.x != 1.0f || highlightTint.y != 1.0f || highlightTint.z != 1.0f || highlightGlow > 0.0f);
+      (highlightTint.x != 1.0f || highlightTint.y != 1.0f || highlightTint.z != 1.0f ||
+       highlightGlow.x > 0.0f || highlightGlow.y > 0.0f || highlightGlow.z > 0.0f);
     textureFlags |= hasHighlightTint ? (1 << 15) : 0;
-    // textureFlags bit 16 unused
+    const bool hasFadeCoverage = fadeCoverage != 1.0f;
+    textureFlags |= hasFadeCoverage ? (1 << 16) : 0;
 
     static_assert(static_cast<uint32_t>(TexGenMode::Count) <= 4);
     textureFlags |= ((static_cast<uint32_t>(texgenMode) & 0x3) << 17);
-    // textureFlags bits 19-30 unused
+    textureFlags |= highlightGlowFromEmissiveTexture ? (1 << 19) : 0;
+    textureFlags |= highlightGlowTextureIsLinear ? (1 << 20) : 0;
+    textureFlags |= (static_cast<uint32_t>(highlightGlowTextureChannel) & 0x3) << 21;
+    // textureFlags bits 23-30 unused
 
     writeGPUHelper(data, offset, textureFlags);
 
@@ -307,15 +312,16 @@ struct RtSurface {
       auto packHalves = [](const float low, const float high) {
         return uint32_t(glm::packHalf1x16(low)) | (uint32_t(glm::packHalf1x16(high)) << 16);
       };
+      const Vector3 glow = highlightGlow * getEmissiveIntensity();
       writeGPUHelper(data, offset, packHalves(highlightTint.x, highlightTint.y));
-      writeGPUHelper(data, offset, packHalves(highlightTint.z, highlightGlow * getEmissiveIntensity()));
-      writeGPUHelper(data, offset, uint32_t{});
+      writeGPUHelper(data, offset, packHalves(highlightTint.z, glow.x));
+      writeGPUHelper(data, offset, packHalves(glow.y, glow.z));
     } else {
       writeGPUHelper(data, offset, uint32_t{});
       writeGPUHelper(data, offset, uint32_t{});
       writeGPUHelper(data, offset, uint32_t{});
     }
-    writeGPUHelper(data, offset, uint32_t{});
+    writeGPUHelper(data, offset, hasFadeCoverage ? uint32_t(glm::packHalf1x16(std::clamp(fadeCoverage, 0.0f, 1.0f))) : uint32_t{});
 
     assert(offset - oldOffset == kSurfaceGPUSize);
   }
@@ -371,7 +377,17 @@ struct RtSurface {
   // Runner Vision (rtx.d3d9.ue3HighlightTints): multiplies the surface colour, whichever material
   // supplies it, and emits highlightGlow times the tinted colour. Identity is (1,1,1) and 0.
   Vector3 highlightTint = Vector3(1.0f, 1.0f, 1.0f);
-  float highlightGlow = 0.0f;
+  Vector3 highlightGlow = Vector3(0.0f, 0.0f, 0.0f);
+  // Or the glow is of one channel of the material's emissive texture, the one the game glows
+  // (LegacyMaterialData::ue3HighlightGlowTexture); linear when the game samples it without an sRGB decode.
+  bool highlightGlowFromEmissiveTexture = false;
+  bool highlightGlowTextureIsLinear = false;
+  uint8_t highlightGlowTextureChannel = 0;
+  // rtx.d3d9.ue3MaterialFades: scales the opacity and emission the blend mode derives, whichever
+  // material supplies them, fading the surface out towards 0. Identity is 1.
+  float fadeCoverage = 1.0f;
+  // CPU only: opacity micromaps bake without the vertex alpha (LegacyMaterialData::ue3AnimatedVertexOpacity).
+  bool hasAnimatedVertexOpacity = false;
 
   bool doBuffersMatch(const RtSurface& surface) {
     return positionBufferIndex == surface.positionBufferIndex
@@ -1914,7 +1930,20 @@ struct LegacyMaterialData {
   // material hash would re-mint the material and its replacement anchors through a fade, and the
   // preserve path refreshes them from the draw rather than re-processing the instance.
   Vector3 ue3HighlightTint = Vector3(1.0f, 1.0f, 1.0f);
-  float ue3HighlightGlow = 0.0f;
+  Vector3 ue3HighlightGlow = Vector3(0.0f, 0.0f, 0.0f);
+  // The texture a glow-only highlight glows, as a unorm view, in place of the surface colour. The
+  // material Remix renders carries it as its emissive texture, with emission left off (a replacement
+  // only when it authors no emission or emissive texture), so the identity hash includes it.
+  TextureRef ue3HighlightGlowTexture;
+  bool ue3HighlightGlowTextureIsSrgb = false;
+  // The channel of the texture the glow reads (DxsoHighlightPair::glowComponent).
+  uint8_t ue3HighlightGlowTextureChannel = 0;
+  // rtx.d3d9.ue3MaterialFades: how far the material parameters the shader fades this draw by have
+  // faded it in, 1 when fully in. Animates like the highlight, so it stays out of both hashes too.
+  float ue3FadeCoverage = 1.0f;
+  // rtx.d3d9.ue3ParticleVertexColor: the opacity carries the per-particle alpha, which animates
+  // per vertex while the geometry the opacity micromap cache keys on does not.
+  bool ue3AnimatedVertexOpacity = false;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;
@@ -2151,6 +2180,8 @@ struct MaterialData {
       if constexpr (std::is_same_v<T, OpaqueMaterialData>) {
         OpaqueMaterialData tmp;
         tmp.getAlbedoOpacityTexture() = input.getColorTexture();
+        if (!mat.getEnableEmission())
+          tmp.getEmissiveColorTexture() = input.ue3HighlightGlowTexture;
         if (auto s = input.getSampler().ptr()) {
           tmp.getFilterMode() = lss::Mdl::Filter::vkToMdl(s->info().magFilter);
           tmp.getWrapModeU() = lss::Mdl::WrapMode::vkToMdl(s->info().addressModeU);

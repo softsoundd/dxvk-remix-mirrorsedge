@@ -234,7 +234,9 @@ namespace dxvk {
 
     VkOpacityMicromapFormatEXT ommFormat = VK_OPACITY_MICROMAP_FORMAT_4_STATE_EXT;         // 4B
     uint32_t numTriangles = 0;
-    uint32_t pad32[2] = {};
+    // Baked from the texture alone (RtSurface::hasAnimatedVertexOpacity)
+    uint32_t ignoresVertexOpacity = 0;
+    uint32_t pad32 = 0;
   };
 
   // Static validation to detect any changes that require OmmHashData alignment re-check

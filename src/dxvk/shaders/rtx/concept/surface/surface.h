@@ -488,9 +488,37 @@ struct Surface
     get { return vec3(f16tof32(data15.x), f16tof32(data15.x >> 16), f16tof32(data15.y)); }
   }
 
-  property float highlightGlow
+  property vec3 highlightGlow
   {
-    get { return f16tof32(data15.y >> 16); }
+    get { return vec3(f16tof32(data15.y >> 16), f16tof32(data15.z), f16tof32(data15.z >> 16)); }
+  }
+
+  // The glow is of one channel of the material's emissive texture, the one the game glows, rather than
+  // of the colour; linear when the game reads it without an sRGB decode.
+  property bool highlightGlowFromEmissiveTexture
+  {
+    get { return packedFlagGet(data13.z, 1 << 19); }
+  }
+
+  property bool highlightGlowTextureIsLinear
+  {
+    get { return packedFlagGet(data13.z, 1 << 20); }
+  }
+
+  property uint highlightGlowTextureChannel
+  {
+    get { return (data13.z >> 21) & 0x3; }
+  }
+
+  // rtx.d3d9.ue3MaterialFades: how far the material parameters that fade this draw have faded it in.
+  property bool hasFadeCoverage
+  {
+    get { return packedFlagGet(data13.z, 1 << 16); }
+  }
+
+  property float fadeCoverage
+  {
+    get { return f16tof32(data15.w); }
   }
 
   property uint tFactor

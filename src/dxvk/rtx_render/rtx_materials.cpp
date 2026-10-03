@@ -38,6 +38,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
     XXH64_hash_t colorTextureHash1;
     XXH64_hash_t colorTextureDescriptorHash0;
     XXH64_hash_t colorTextureDescriptorHash1;
+    XXH64_hash_t highlightGlowTextureHash;
+    XXH64_hash_t highlightGlowTextureDescriptorHash;
     XXH64_hash_t samplerHash0;
     XXH64_hash_t samplerHash1;
     uint32_t alphaTestCompareOp;
@@ -59,7 +61,9 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
     uint8_t textureAlphaOperation;
     uint8_t isTextureFactorBlend;
     uint8_t isVertexColorBakedLighting;
-    uint8_t padding[7];
+    uint8_t highlightGlowTextureIsSrgb;
+    uint8_t highlightGlowTextureChannel;
+    uint8_t padding[5];
   };
 
   // NV-DXVK fork: UE3 streaming-stable image hashes are identical across every streamed
@@ -100,6 +104,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   data.colorTextureHash1 = colorTextures[1].getImageHash();
   data.colorTextureDescriptorHash0 = textureVariantHash(colorTextures[0]);
   data.colorTextureDescriptorHash1 = textureVariantHash(colorTextures[1]);
+  data.highlightGlowTextureHash = ue3HighlightGlowTexture.getImageHash();
+  data.highlightGlowTextureDescriptorHash = textureVariantHash(ue3HighlightGlowTexture);
   data.samplerHash0 = samplers[0].ptr() != nullptr ? samplers[0]->info().calculateHash() : kEmptyHash;
   data.samplerHash1 = samplers[1].ptr() != nullptr ? samplers[1]->info().calculateHash() : kEmptyHash;
   data.alphaTestCompareOp = static_cast<uint32_t>(alphaTestCompareOp);
@@ -121,12 +127,16 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   data.textureAlphaOperation = static_cast<uint8_t>(textureAlphaOperation);
   data.isTextureFactorBlend = isTextureFactorBlend ? 1u : 0u;
   data.isVertexColorBakedLighting = isVertexColorBakedLighting ? 1u : 0u;
+  data.highlightGlowTextureIsSrgb = ue3HighlightGlowTextureIsSrgb ? 1u : 0u;
+  data.highlightGlowTextureChannel = ue3HighlightGlowTextureChannel;
 
   return hashStructByMemory<LegacyMaterialIdentityHashData,
       &LegacyMaterialIdentityHashData::colorTextureHash0,
       &LegacyMaterialIdentityHashData::colorTextureHash1,
       &LegacyMaterialIdentityHashData::colorTextureDescriptorHash0,
       &LegacyMaterialIdentityHashData::colorTextureDescriptorHash1,
+      &LegacyMaterialIdentityHashData::highlightGlowTextureHash,
+      &LegacyMaterialIdentityHashData::highlightGlowTextureDescriptorHash,
       &LegacyMaterialIdentityHashData::samplerHash0,
       &LegacyMaterialIdentityHashData::samplerHash1,
       &LegacyMaterialIdentityHashData::alphaTestCompareOp,
@@ -148,6 +158,8 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
       &LegacyMaterialIdentityHashData::textureAlphaOperation,
       &LegacyMaterialIdentityHashData::isTextureFactorBlend,
       &LegacyMaterialIdentityHashData::isVertexColorBakedLighting,
+      &LegacyMaterialIdentityHashData::highlightGlowTextureIsSrgb,
+      &LegacyMaterialIdentityHashData::highlightGlowTextureChannel,
       &LegacyMaterialIdentityHashData::padding>(data);
 }
 
@@ -207,6 +219,9 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   }
   if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
+  }
+  if (ue3HighlightGlowTexture.isValid()) {
+    opaqueMat.setEmissiveColorTexture(ue3HighlightGlowTexture);
   }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {

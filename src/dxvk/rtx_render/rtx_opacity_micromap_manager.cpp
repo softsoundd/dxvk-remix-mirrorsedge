@@ -307,6 +307,7 @@ namespace dxvk {
       hashSourceData.texCoordHash = instance.getTexcoordHash();
       hashSourceData.indexHash = instance.getIndexHash();
       // ToDo add vertexOpacityHash
+      hashSourceData.ignoresVertexOpacity = instance.surface.hasAnimatedVertexOpacity ? 1 : 0;
     }
 
     // Select OmmFormat for the OMM request

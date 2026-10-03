@@ -221,7 +221,14 @@ namespace {
         out += " c" + std::to_string(pair.colorReg[lane]) + "." + "xyzw"[pair.colorComponent[lane]];
       }
     }
-    return out + " glow=" + std::to_string(pair.glowCoefficient);
+    const std::array<float, 3>& g = pair.glowCoefficient;
+    const std::string glow = g[0] == g[1] && g[1] == g[2]
+      ? std::to_string(g[0])
+      : "(" + std::to_string(g[0]) + "," + std::to_string(g[1]) + "," + std::to_string(g[2]) + ")";
+    const std::string texture = pair.glowOnly
+      ? " glow-only s" + std::to_string(pair.glowSampler) + "." + "rgba"[pair.glowComponent]
+      : "";
+    return out + texture + " glow=" + glow;
   }
 
   [[noreturn]] void fail(const char* label, const std::string& why) {
@@ -263,10 +270,17 @@ namespace {
     }
   }
 
-  void expectGlow(const DxsoHighlightPair& pair, float expected, const char* label) {
-    if (std::abs(pair.glowCoefficient - expected) > 1.0e-4f) {
-      fail(label, "pair " + describePair(pair) + ", expected glow " + std::to_string(expected));
+  void expectGlow(const DxsoHighlightPair& pair, std::array<float, 3> expected, const char* label) {
+    for (uint32_t lane = 0; lane < 3; lane++) {
+      if (std::abs(pair.glowCoefficient[lane] - expected[lane]) > 1.0e-4f) {
+        fail(label, "pair " + describePair(pair) + ", expected glow (" + std::to_string(expected[0]) + "," +
+                    std::to_string(expected[1]) + "," + std::to_string(expected[2]) + ")");
+      }
     }
+  }
+
+  void expectGlow(const DxsoHighlightPair& pair, float expected, const char* label) {
+    expectGlow(pair, { expected, expected, expected }, label);
   }
 
   void expectUnproven(const DxsoHighlightResult& res, uint32_t scalarReg, const char* label) {
@@ -294,6 +308,10 @@ namespace {
       test_maskWeightedBlendIsNotATint();
       test_replaceLerpIsNotATint();
       test_layerBlendUnderEmissiveFactorIsNotATint();
+      test_weaponGlowIsGlowOnly();
+      test_litScaleIsNotAGlow();
+      test_glowFromAnotherChannel();
+      test_emissiveIntensityIsNotAGlow();
       test_rejects();
       std::cout << "All DXSO highlight tint analysis tests passed." << std::endl;
     }
@@ -668,6 +686,109 @@ namespace {
       expectUnproven(res, 2, label);
     }
 
+    // Mirror's Edge's weapon materials (M_Glock18 and kin): LOI_Strength only adds 8 * S * a mask's
+    // red to oC0.r, unlit - the red flash before an enemy strikes.
+    static void test_weaponGlowIsGlowOnly() {
+      std::cout << "  test_weaponGlowIsGlowOnly" << std::endl;
+      PsBuilder ps;
+      ps.def(1, 2.0f, -1.0f, 8.0f, 0.0f)
+        .dclInput(DxsoUsage::Texcoord, 1, 0, MaskXY)
+        .dclInput(DxsoUsage::Texcoord, 2, 1, MaskXY)
+        .dclInput(DxsoUsage::Texcoord, 5, 2, MaskW)
+        .dclInput(DxsoUsage::Texcoord, 6, 3, MaskXYZ)
+        .dclSampler(0).dclSampler(1).dclSampler(2).dclSampler(3).dclSampler(4, DxsoTextureType::TextureCube)
+        .texld(rd(0), v(0), 0)                                                         // normal map
+        .op3(DxsoOpcode::Mad, rd(0, MaskXYZ), r(0), c(1, kXXXX), c(1, kYYYY))
+        .op1(DxsoOpcode::Nrm, rd(1, MaskXYZ), r(0))
+        .op1(DxsoOpcode::Nrm, rd(0, MaskXYZ), v(3))
+        .op2(DxsoOpcode::Dp3, rd(0, MaskW), r(1), r(0))
+        .op2(DxsoOpcode::Mul, rd(1, MaskXYZ), r(1), r(0, kWWWW))
+        .op3(DxsoOpcode::Mad, rd(0, MaskXYZ), r(1), c(1, kXXXX), r(0, kXYZW, kModNeg))
+        .texld(rd(0), r(0), 4)                                                         // reflection
+        .texld(rd(1), v(1), 1)
+        .op2(DxsoOpcode::Mul, rd(0, MaskXYZ), r(0), r(1))
+        .op2(DxsoOpcode::Mul, rd(1, MaskXYZ), r(1), c(2, kXXXX))                       // * LOI_Strength
+        .texld(rd(2), v(1), 2)
+        .texld(rd(3), v(1), 3)                                                         // diffuse
+        .op3(DxsoOpcode::Mad, rd(0, MaskXYZ), r(0), r(2), r(3))
+        .op1(DxsoOpcode::Mov, rd(2, MaskY | MaskZ | MaskW), c(1))
+        .op2(DxsoOpcode::Add, rd(3, MaskXYZ), r(2, kYYYY, kModNeg), c(0, kXYZW, kModNeg))  // 1 - Emissive
+        .op2(DxsoOpcode::Mul, rd(0, MaskXYZ), r(0), r(3))
+        .op3(DxsoOpcode::Mad, rd(1, MaskXYZ), r(1), r(2, swz(2, 3, 3, 3)), c(0))       // red glow + Emissive
+        .op3(DxsoOpcode::Mad, oC0(MaskXYZ), r(0), c(3), r(1))
+        .op1(DxsoOpcode::Mov, oC0(MaskW), v(2, kWWWW));
+
+      const DxsoHighlightResult res = ps.analyze(makeInputs({ 2 }, { 0 }, { 3 }, 0));
+      const char* label = "weapon glow";
+      expectAnalyzed(res, label);
+      expectPairCount(res, 1, label);
+      const DxsoHighlightPair& pair = findPair(res, 2, label);
+      if (!pair.glowOnly || pair.glowSampler != 1 || pair.glowComponent != 0) {
+        fail(label, "pair " + describePair(pair) + ", expected a glow-only pair glowing s1.r");
+      }
+      expectGlow(pair, { 8.0f, 0.0f, 0.0f }, label);
+    }
+
+    // A scalar that scales lit colour is a brightness, not a glow.
+    static void test_litScaleIsNotAGlow() {
+      std::cout << "  test_litScaleIsNotAGlow" << std::endl;
+      PsBuilder ps;
+      ps.dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+        .dclSampler(0)
+        .texld(rd(0), v(0), 0)
+        .op2(DxsoOpcode::Mul, rd(0, MaskXYZ), r(0), c(2, kXXXX))
+        .op2(DxsoOpcode::Mul, oC0(MaskXYZ), r(0), c(3))                                // * AmbientColorAndSkyFactor
+        .op1(DxsoOpcode::Mov, oC0(MaskW), r(0, kWWWW));
+
+      const DxsoHighlightResult res = ps.analyze(makeInputs({ 2 }, {}, { 3 }, 0));
+      const char* label = "lit scale";
+      expectAnalyzed(res, label);
+      expectPairCount(res, 0, label);
+      expectUnproven(res, 2, label);
+    }
+
+    // The weapons that glow 6 * S read their mask from a texture's green: red glows where it is set.
+    static void test_glowFromAnotherChannel() {
+      std::cout << "  test_glowFromAnotherChannel" << std::endl;
+      PsBuilder ps;
+      ps.def(1, 6.0f, 0.0f, 0.0f, 0.0f)
+        .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+        .dclSampler(0).dclSampler(1)
+        .texld(rd(0), v(0), 0)
+        .texld(rd(1), v(0), 1)
+        .op2(DxsoOpcode::Mul, rd(1, MaskX), r(1, kYYYY), c(2, kXXXX))
+        .op3(DxsoOpcode::Mad, oC0(MaskX), r(1, kXXXX), c(1, kXXXX), r(0, kXXXX))
+        .op1(DxsoOpcode::Mov, oC0(MaskY | MaskZ | MaskW), r(0));
+
+      const DxsoHighlightResult res = ps.analyze(makeInputs({ 2 }, {}, {}, 0));
+      const char* label = "glow from another channel";
+      expectAnalyzed(res, label);
+      expectPairCount(res, 1, label);
+      const DxsoHighlightPair& pair = findPair(res, 2, label);
+      if (!pair.glowOnly || pair.glowSampler != 1 || pair.glowComponent != 1) {
+        fail(label, "pair " + describePair(pair) + ", expected a glow-only pair glowing s1.g");
+      }
+      expectGlow(pair, { 6.0f, 0.0f, 0.0f }, label);
+    }
+
+    // A strength scaling an emissive texture into every channel is the material's own emission.
+    static void test_emissiveIntensityIsNotAGlow() {
+      std::cout << "  test_emissiveIntensityIsNotAGlow" << std::endl;
+      PsBuilder ps;
+      ps.dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+        .dclSampler(0).dclSampler(1)
+        .texld(rd(0), v(0), 0)
+        .texld(rd(1), v(0), 1)
+        .op3(DxsoOpcode::Mad, oC0(MaskXYZ), r(1), c(2, kXXXX), r(0))
+        .op1(DxsoOpcode::Mov, oC0(MaskW), r(0, kWWWW));
+
+      const DxsoHighlightResult res = ps.analyze(makeInputs({ 2 }, {}, {}, 0));
+      const char* label = "emissive intensity";
+      expectAnalyzed(res, label);
+      expectPairCount(res, 0, label);
+      expectUnproven(res, 2, label);
+    }
+
     static void test_rejects() {
       std::cout << "  test_rejects" << std::endl;
       const DxsoHighlightInputs in = makeInputs({ 4 }, { 3 }, {}, 0);
@@ -780,7 +901,7 @@ namespace {
     totals.withPairs += res.pairs.empty() ? 0u : 1u;
     bool glow = false;
     for (const DxsoHighlightPair& p : res.pairs) {
-      glow |= p.glowCoefficient > 0.0f;
+      glow |= p.glowCoefficient[0] > 0.0f || p.glowCoefficient[1] > 0.0f || p.glowCoefficient[2] > 0.0f;
     }
     totals.withGlow += glow ? 1u : 0u;
     totals.withUnproven += res.unprovenScalarRegs.empty() ? 0u : 1u;
@@ -790,7 +911,7 @@ namespace {
     }
     std::cout << "== " << path.string() << "\n";
     for (const DxsoHighlightPair& p : res.pairs) {
-      std::cout << "   tint " << nameOf(int32_t(p.scalarReg)) << " (" << describePair(p) << ") colour";
+      std::cout << (p.glowOnly ? "   glow " : "   tint ") << nameOf(int32_t(p.scalarReg)) << " (" << describePair(p) << ") colour";
       for (uint32_t lane = 0; lane < 3; lane++) {
         std::cout << " " << (p.colorReg[lane] < 0 ? std::string("-") : nameOf(p.colorReg[lane]));
       }

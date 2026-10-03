@@ -11,7 +11,9 @@ dxso_src = files([
   'dxso_decoder.cpp',
   'dxso_analysis.cpp',
   'dxso_color_terms.cpp',
+  'dxso_symbolic_eval.cpp',
   'dxso_highlight_tints.cpp',
+  'dxso_material_fades.cpp',
   'dxso_compiler.cpp',
   'dxso_enums.cpp'
 ])

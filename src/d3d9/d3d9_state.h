@@ -62,6 +62,11 @@ namespace dxvk {
   // inverting its clip-space output. Only valid when the vertex shader's oPos transform
   // was recognised (see DxsoPreProjectionPositionInfo).
   static constexpr uint32_t kVertexCaptureFlag_PositionFromPreProjection = 1u << 6;
+  // For the colour taken from D3D9RtxVertexCaptureData::colorOutputRegister: ColorWhiteRgb writes
+  // white in place of its rgb, ColorPremultiplyAlpha multiplies its rgb by its alpha. A colour above 1
+  // is scaled down by its brightest channel either way, so it keeps its hue in 8 bits.
+  static constexpr uint32_t kVertexCaptureFlag_ColorWhiteRgb = 1u << 7;
+  static constexpr uint32_t kVertexCaptureFlag_ColorPremultiplyAlpha = 1u << 8;
 
   struct D3D9RtxVertexCaptureData {
     Matrix4 normalTransform;
@@ -78,6 +83,8 @@ namespace dxvk {
     uint32_t texcoordOutputRegister = 0xffffffffu;
     uint32_t texcoordCompU = 0;
     uint32_t texcoordCompV = 1;
+    // VS output register captured as color0 instead of COLOR0, or out of range for COLOR0
+    uint32_t colorOutputRegister = 0xffffffffu;
   };
 
   enum class D3D9RtxVertexCaptureMembers {
@@ -95,6 +102,7 @@ namespace dxvk {
     TexcoordOutputRegister,
     TexcoordCompU,
     TexcoordCompV,
+    ColorOutputRegister,
 
     MemberCount
   };

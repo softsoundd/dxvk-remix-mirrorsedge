@@ -177,7 +177,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 800, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 816, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1121,6 +1121,12 @@ namespace dxvk {
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
         currentInstance.surface.highlightTint = drawCall.getMaterialData().ue3HighlightTint;
         currentInstance.surface.highlightGlow = drawCall.getMaterialData().ue3HighlightGlow;
+        currentInstance.surface.highlightGlowFromEmissiveTexture = drawCall.getMaterialData().ue3HighlightGlowTexture.isValid();
+        currentInstance.surface.highlightGlowTextureIsLinear =
+          currentInstance.surface.highlightGlowFromEmissiveTexture && !drawCall.getMaterialData().ue3HighlightGlowTextureIsSrgb;
+        currentInstance.surface.highlightGlowTextureChannel = drawCall.getMaterialData().ue3HighlightGlowTextureChannel;
+        currentInstance.surface.fadeCoverage = drawCall.getMaterialData().ue3FadeCoverage;
+        currentInstance.surface.hasAnimatedVertexOpacity = drawCall.getMaterialData().ue3AnimatedVertexOpacity;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
@@ -1459,12 +1465,13 @@ namespace dxvk {
       bool hasPreviousPositions,
       bool isFirstUpdateThisFrame,
       bool fireEvents) {
-    // A highlight fades while everything else about the surface holds still, which is exactly when
-    // the preserve path skips the update that would carry it. Surfaces are uploaded every frame, so
-    // refreshing the value here is enough.
+    // A highlight or a material fade animates while everything else about the surface holds still,
+    // which is exactly when the preserve path skips the update that would carry it. Surfaces are
+    // uploaded every frame, so refreshing the values here is enough.
     if (instance.surface.isPreservePath) {
       instance.surface.highlightTint = drawCall.getMaterialData().ue3HighlightTint;
       instance.surface.highlightGlow = drawCall.getMaterialData().ue3HighlightGlow;
+      instance.surface.fadeCoverage = drawCall.getMaterialData().ue3FadeCoverage;
     }
 
     // Camera registration. This is per-instance, so this detects the first time an instance

@@ -513,7 +513,8 @@ namespace dxvk {
         uintType, // boneCount
         uintType, // texcoordOutputRegister
         uintType, // texcoordCompU
-        uintType  // texcoordCompV
+        uintType, // texcoordCompV
+        uintType  // colorOutputRegister
       };
 
       static_assert(uint32_t(D3D9RtxVertexCaptureMembers::MemberCount) == std::size(members), "Member count mismatch with D3D9RtxVertexCaptureData");
@@ -549,6 +550,7 @@ namespace dxvk {
       SetMemberName("texcoordOutputRegister", offsetof(D3D9RtxVertexCaptureData, texcoordOutputRegister));
       SetMemberName("texcoordCompU", offsetof(D3D9RtxVertexCaptureData, texcoordCompU));
       SetMemberName("texcoordCompV", offsetof(D3D9RtxVertexCaptureData, texcoordCompV));
+      SetMemberName("colorOutputRegister", offsetof(D3D9RtxVertexCaptureData, colorOutputRegister));
 
       m_vs.vertexCaptureConstants = m_module.newVar(
         m_module.defPointerType(structType, spv::StorageClassUniform),
@@ -4228,17 +4230,62 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     // COLOR0 packed to D3D9 ARGB 0xAARRGGBB @ member 3
     {
       const uint32_t floatTypeId = getScalarTypeId(DxsoScalarType::Float32);
-      uint32_t colorU32 = m_module.constu32(0xFFFFFFFFu); // default opaque white
+      const uint32_t boolTypeId = m_module.defBoolType();
+      const uint32_t zeroF = m_module.constf32(0.0f);
 
-      if (m_vs.oColor0.id > 0) {
-        const uint32_t c4 = m_module.opLoad(vec4TypeId, m_vs.oColor0.id);
+      auto clamp01 = [&](uint32_t f) {
+        return m_module.opFMin(floatTypeId, m_module.opFMax(floatTypeId, f, zeroF), oneF);
+      };
+      auto isFlagSet = [&](uint32_t flag) {
+        return m_module.opINotEqual(boolTypeId, m_module.opBitwiseAnd(uintType, flagsId, m_module.constu32(flag)), c0);
+      };
 
-        auto clamp01 = [&](uint32_t f) {
-          const uint32_t z = m_module.constf32(0.0f);
-          const uint32_t o = m_module.constf32(1.0f);
-          return m_module.opFMin(floatTypeId, m_module.opFMax(floatTypeId, f, z), o);
+      // default opaque white
+      uint32_t c4 = m_vs.oColor0.id > 0
+        ? m_module.opLoad(vec4TypeId, m_vs.oColor0.id)
+        : m_module.constvec4f32(1.0f, 1.0f, 1.0f, 1.0f);
+
+      // An explicitly requested VS output register replaces COLOR0. The register is uniform, so draws
+      // without one skip its read and the colour math.
+      {
+        const uint32_t colorOutputReg = LoadConstant(uintType, (uint32_t) D3D9RtxVertexCaptureMembers::ColorOutputRegister);
+        const uint32_t regInBounds = m_module.opULessThan(boolTypeId, colorOutputReg, m_module.constu32(DxsoMaxInterfaceRegs));
+        const uint32_t testLabel = m_module.allocateId();
+        const uint32_t useRegLabel = m_module.allocateId();
+        const uint32_t mergeLabel = m_module.allocateId();
+        m_module.opBranch(testLabel);
+        m_module.opLabel(testLabel);
+        m_module.opSelectionMerge(mergeLabel, spv::SelectionControlMaskNone);
+        m_module.opBranchConditional(regInBounds, useRegLabel, mergeLabel);
+
+        m_module.opLabel(useRegLabel);
+        const uint32_t ptrTypeId = m_module.defPointerType(vec4TypeId, spv::StorageClassPrivate);
+        const uint32_t regColor = m_module.opLoad(vec4TypeId, m_module.opAccessChain(ptrTypeId, m_oArray, 1, &colorOutputReg));
+
+        const uint32_t r = m_module.opCompositeExtract(floatTypeId, regColor, 1, &lit0);
+        const uint32_t g = m_module.opCompositeExtract(floatTypeId, regColor, 1, &lit1);
+        const uint32_t b = m_module.opCompositeExtract(floatTypeId, regColor, 1, &lit2);
+        const uint32_t a = clamp01(m_module.opCompositeExtract(floatTypeId, regColor, 1, &lit3));
+
+        const uint32_t brightest = m_module.opFMax(floatTypeId, m_module.opFMax(floatTypeId, r, g), b);
+        const uint32_t hueScale = m_module.opFDiv(floatTypeId, oneF, m_module.opFMax(floatTypeId, brightest, oneF));
+        const uint32_t whiteRgb = isFlagSet(kVertexCaptureFlag_ColorWhiteRgb);
+        const uint32_t rgbScale = m_module.opSelect(floatTypeId, isFlagSet(kVertexCaptureFlag_ColorPremultiplyAlpha), a, oneF);
+        auto channel = [&](uint32_t value) {
+          const uint32_t hued = m_module.opSelect(floatTypeId, whiteRgb, oneF, m_module.opFMul(floatTypeId, value, hueScale));
+          return m_module.opFMul(floatTypeId, hued, rgbScale);
         };
+        const std::array<uint32_t, 4> regComps = { channel(r), channel(g), channel(b), a };
+        const uint32_t regColor4 = m_module.opCompositeConstruct(vec4TypeId, regComps.size(), regComps.data());
+        m_module.opBranch(mergeLabel);
 
+        m_module.opLabel(mergeLabel);
+        const std::array<SpirvPhiLabel, 2> sources = { { { regColor4, useRegLabel }, { c4, testLabel } } };
+        c4 = m_module.opPhi(vec4TypeId, sources.size(), sources.data());
+      }
+
+      uint32_t colorU32;
+      {
         uint32_t r = clamp01(m_module.opCompositeExtract(floatTypeId, c4, 1, &lit0));
         uint32_t g = clamp01(m_module.opCompositeExtract(floatTypeId, c4, 1, &lit1));
         uint32_t b = clamp01(m_module.opCompositeExtract(floatTypeId, c4, 1, &lit2));

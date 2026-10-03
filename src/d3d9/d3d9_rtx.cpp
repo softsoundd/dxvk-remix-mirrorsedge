@@ -16,6 +16,7 @@
 #include "d3d9_texture.h"
 #include "../dxso/dxso_color_terms.h"
 #include "../dxso/dxso_highlight_tints.h"
+#include "../dxso/dxso_material_fades.h"
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
@@ -4688,25 +4689,61 @@ namespace dxvk {
     // instance it creates for each highlighted mesh element.
     struct Ue3HighlightTintDraw {
       const Vector4* fConsts = nullptr;
-      XXH64_hash_t   shaderIdentitySeed = kEmptyHash;
-      bool           requireRest = true;
+      // The material instance, whatever its strength (the material hash leaves UniformScalar_*
+      // constants out), and the object drawn: that instance at this placement.
+      XXH64_hash_t   materialHash = kEmptyHash;
+      XXH64_hash_t   objectHash = kEmptyHash;
+      bool           requireMotion = true;
       float          glowIntensity = 0.0f;
       bool           log = false;
     };
 
+    // Whether the strength a key shows has changed since it first showed one above 0.
+    class Ue3StrengthMotion {
+    public:
+      bool record(const XXH64_hash_t key, const float strength, bool* seenBefore = nullptr) {
+        if (lookupHash(m_moved, key)) {
+          if (seenBefore != nullptr)
+            *seenBefore = true;
+          return true;
+        }
+        // Bounded, as a moving object shows a new placement, and so a new key, every frame.
+        if (m_first.size() >= kMaxStillKeys)
+          m_first.clear();
+        const auto [first, inserted] = m_first.emplace(key, strength);
+        if (seenBefore != nullptr)
+          *seenBefore = !inserted;
+        if (inserted || first->second == strength)
+          return false;
+        m_first.erase(first);
+        m_moved.insert(key);
+        return true;
+      }
+
+    private:
+      static constexpr size_t kMaxStillKeys = 1u << 16;
+      fast_unordered_cache<float> m_first;
+      fast_unordered_set m_moved;
+    };
+
     static std::string describeUe3HighlightPair(const Ue3PsMaterialIdentityInfo::HighlightPair& pair) {
-      return str::format(pair.strengthName, "@c", pair.tint.scalarReg,
-                         " -> ", pair.colorName, "@c", pair.tint.colorReg[0],
-                         " glow=", pair.tint.glowCoefficient);
+      const std::array<float, 3>& glow = pair.tint.glowCoefficient;
+      const std::string glowText = glow[0] == glow[1] && glow[1] == glow[2]
+        ? str::format(glow[0])
+        : str::format("(", glow[0], ",", glow[1], ",", glow[2], ")");
+      return pair.tint.glowOnly
+        ? str::format(pair.strengthName, "@c", pair.tint.scalarReg, " glow-only s", pair.tint.glowSampler, ".",
+                      "rgba"[pair.tint.glowComponent], " glow=", glowText)
+        : str::format(pair.strengthName, "@c", pair.tint.scalarReg, " -> ", pair.colorName, "@c", pair.tint.colorReg[0],
+                      " glow=", glowText);
     }
 
     // Multiplies each applying pair's tint into `tint` and adds its glow to `glow`; returns whether
     // any pair applied. appliedLog, when given, receives the live values of those that did.
     static bool evaluateUe3HighlightTints(const Ue3PsMaterialIdentityInfo& info, const Ue3HighlightTintDraw& draw,
-                                          Vector3& tint, float& glow, std::string* appliedLog) {
-      // Keyed by master material - identity seed plus the pair's CTAB names - so every lightmap
-      // policy compile and every material instance shares what any of them has shown.
-      static fast_unordered_set s_restSeen;
+                                          Vector3& tint, Vector3& glow, std::string* appliedLog) {
+      static Ue3StrengthMotion s_objectMotion;
+      static Ue3StrengthMotion s_instanceMotion;
       static fast_unordered_set s_heldBackLogged;
 
       bool applied = false;
@@ -4715,28 +4752,28 @@ namespace dxvk {
         if (strengthReg >= caps::MaxFloatConstantsPS)
           continue;
         const float strength = draw.fConsts[strengthReg].x;
-        if (!std::isfinite(strength) || strength < 0.0f)
+        if (!std::isfinite(strength) || strength <= 0.0f)
           continue;
 
-        const XXH64_hash_t gateKey = XXH3_64bits_withSeed(&pair.nameKey, sizeof(pair.nameKey), draw.shaderIdentitySeed);
-        if (strength == 0.0f) {
-          if (s_restSeen.insert(gateKey).second && draw.log) {
-            Logger::info(str::format(
-              "[RTX-Compatibility][UE3-Highlight] Strength seen at rest: ", describeUe3HighlightPair(pair),
-              " seed=0x", std::hex, draw.shaderIdentitySeed, std::dec, "."));
+        // Runner Vision fades the strength on the instances it creates (TdLOIAddOnObject), so a
+        // highlight shows it moving; an object that holds it still is authored in the tint colour,
+        // which Remix leaves to its material. Tracked per object, so one painted in the highlight
+        // colour stays untinted when an identical one is highlighted. An object at a placement not
+        // seen before - a moving one, every frame - follows its material instance.
+        if (draw.requireMotion) {
+          const XXH64_hash_t instanceKey = XXH3_64bits_withSeed(&pair.nameKey, sizeof(pair.nameKey), draw.materialHash);
+          const XXH64_hash_t objectKey = XXH3_64bits_withSeed(&pair.nameKey, sizeof(pair.nameKey), draw.objectHash);
+          bool objectSeen = false;
+          const bool objectMoved = s_objectMotion.record(objectKey, strength, &objectSeen);
+          const bool instanceMoved = s_instanceMotion.record(instanceKey, strength);
+          if (!objectMoved && (objectSeen || !instanceMoved)) {
+            if (draw.log && s_heldBackLogged.insert(instanceKey).second) {
+              Logger::info(str::format(
+                "[RTX-Compatibility][UE3-Highlight] Held back on materialHash=0x", std::hex, draw.materialHash, std::dec,
+                ": ", describeUe3HighlightPair(pair), " holds strength ", strength, " and has not moved."));
+            }
+            continue;
           }
-          continue;
-        }
-
-        const bool fingerprinted = pair.tint.glowCoefficient > 0.0f;
-        if (draw.requireRest && !fingerprinted && !lookupHash(s_restSeen, gateKey)) {
-          if (draw.log && s_heldBackLogged.insert(gateKey).second) {
-            Logger::info(str::format(
-              "[RTX-Compatibility][UE3-Highlight] Held back ", describeUe3HighlightPair(pair), " at strength ", strength,
-              " seed=0x", std::hex, draw.shaderIdentitySeed, std::dec,
-              ": not yet seen at rest on this master material (rtx.d3d9.ue3HighlightTintRequireRest)."));
-          }
-          continue;
         }
 
         const float s = std::min(strength, 1.0f);
@@ -4749,8 +4786,8 @@ namespace dxvk {
           color[lane] = std::isfinite(value) ? std::max(value, 0.0f) : 1.0f;
           tint[lane] *= 1.0f + s * (color[lane] - 1.0f);
         }
-        if (fingerprinted)
-          glow += pair.tint.glowCoefficient * s * draw.glowIntensity;
+        for (uint32_t lane = 0; lane < 3; lane++)
+          glow[lane] += pair.tint.glowCoefficient[lane] * s * draw.glowIntensity;
         applied = true;
 
         if (appliedLog != nullptr) {
@@ -4785,6 +4822,118 @@ namespace dxvk {
         info.highlightFailure != DxsoHighlightFailure::None
           ? str::format(" not analysed: ", dxsoHighlightFailureName(info.highlightFailure))
           : std::string()));
+    }
+
+    // Opacity-driven fades (rtx.d3d9.ue3MaterialFades, rtx.d3d9.ue3ParticleVertexColor). Analysed once
+    // per pixel shader and particle colour register; each draw evaluates the result with its constants.
+    static const DxsoMaterialFadeResult& getOrAnalyzeUe3MaterialFades(const XXH64_hash_t psHash,
+                                                                      const std::vector<uint8_t>& bytecode,
+                                                                      const int32_t particleColorInputRegister) {
+      static fast_unordered_cache<DxsoMaterialFadeResult> s_cache;
+      const XXH64_hash_t key = XXH3_64bits_withSeed(&particleColorInputRegister, sizeof(particleColorInputRegister), psHash);
+      const auto it = s_cache.find(key);
+      if (it != s_cache.end())
+        return it->second;
+
+      DxsoMaterialFadeResult result;
+      result.failure = DxsoHighlightFailure::NotPixelShader;
+      if (bytecode.size() >= 2 * sizeof(uint32_t) && (bytecode.size() % sizeof(uint32_t)) == 0) {
+        const uint32_t* tokens = reinterpret_cast<const uint32_t*>(bytecode.data());
+        if ((tokens[0] & 0xffff0000u) == 0xffff0000u) {
+          DxsoProgramInfo programInfo(DxsoProgramTypes::PixelShader, tokens[0] & 0xffu, (tokens[0] >> 8) & 0xffu);
+          DxsoDecodeContext decoder(programInfo);
+          DxsoCodeIter iter(tokens + 1);
+          while (decoder.decodeInstruction(iter)) {
+            if (decoder.getCtabInfo().m_size != 0)
+              break;
+          }
+          result = analyzeDxsoMaterialFades(tokens, bytecode.size() / sizeof(uint32_t),
+                                            dxsoHighlightInputsFromUe3Ctab(decoder.getCtabInfo()), particleColorInputRegister);
+        }
+      }
+      return s_cache.emplace(key, std::move(result)).first->second;
+    }
+
+    static std::string describeUe3MaterialFade(const DxsoMaterialFade& fade, const std::map<uint32_t, std::string>& names) {
+      const auto it = names.find(fade.reg);
+      return str::format(it != names.end() ? it->second : std::string("?"), "@c", fade.reg, ".", "xyzw"[fade.component & 3u],
+                         fade.laneMask == kDxsoFadeAlphaLane ? " oC0.a" : " oC0.rgb");
+    }
+
+    // The particle colour uses the shader proves, marked where they also depend on the draw's constants.
+    static std::string describeUe3ParticleColorUses(const DxsoParticleColorUse& use) {
+      auto anyTerms = [](const auto& polys) {
+        return std::any_of(polys.begin(), polys.end(), [](const DxsoFadePoly& p) { return !p.empty(); });
+      };
+      std::string uses;
+      uses += use.tintsColor ? (anyTerms(use.tintResidual) ? " tint(conditional)" : " tint") : "";
+      uses += use.scalesColor ? (anyTerms(use.scalesColorResidual) ? " scalesColor(conditional)" : " scalesColor") : "";
+      uses += use.scalesOpacity ? (use.scalesOpacityResidual.empty() ? " scalesOpacity" : " scalesOpacity(conditional)") : "";
+      return uses.empty() ? std::string(" unused") : uses;
+    }
+
+    static void logUe3MaterialFadesOnce(const XXH64_hash_t psHash, const std::vector<uint8_t>& bytecode,
+                                        const int32_t particleColorInputRegister, const DxsoMaterialFadeResult& result) {
+      static fast_unordered_set s_logged;
+      if (!s_logged.insert(XXH3_64bits_withSeed(&particleColorInputRegister, sizeof(particleColorInputRegister), psHash)).second)
+        return;
+
+      const std::map<uint32_t, std::string>& names = getUe3PsFloatConstantNames(psHash, bytecode);
+      std::string fades;
+      for (const DxsoMaterialFade& fade : result.fades)
+        fades += str::format(fades.empty() ? "" : ", ", describeUe3MaterialFade(fade, names));
+      std::string unproven;
+      for (const uint32_t reg : result.unprovenScalarRegs) {
+        const auto it = names.find(reg);
+        unproven += str::format(unproven.empty() ? "" : ", ", it != names.end() ? it->second : std::string("?"), "@c", reg);
+      }
+      std::string particleColor;
+      if (particleColorInputRegister >= 0)
+        particleColor = str::format(" particleColor=v", particleColorInputRegister, ":", describeUe3ParticleColorUses(result.particleColor));
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Fade] ps=0x", std::hex, psHash, std::dec,
+        " fades=[", fades, "]", particleColor, " unprovenScalars=[", unproven, "]",
+        !result.analyzed ? str::format(" not analysed: ", dxsoHighlightFailureName(result.failure)) : std::string()));
+    }
+
+    // The value each oC0 lane must hold for the draw's colour blend to leave the framebuffer as it was:
+    // a fade to that value fades the whole draw out. Opaque and masked draws have no such value.
+    struct Ue3BlendRest {
+      bool  alphaFades = false;
+      float alphaRest = 0.0f;
+      bool  colorFades = false;
+      float colorRest = 0.0f;
+    };
+
+    static Ue3BlendRest ue3BlendRest(const DxvkBlendMode& blend) {
+      Ue3BlendRest rest;
+      if (!blend.enableBlending || blend.colorBlendOp != VK_BLEND_OP_ADD)
+        return rest;
+      const VkBlendFactor src = blend.colorSrcFactor;
+      const VkBlendFactor dst = blend.colorDstFactor;
+      if (src == VK_BLEND_FACTOR_SRC_ALPHA && (dst == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA || dst == VK_BLEND_FACTOR_ONE)) {
+        // UE3 Translucent, and its emissive variant
+        rest.alphaFades = true;
+        rest.alphaRest = 0.0f;
+      } else if (src == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA && dst == VK_BLEND_FACTOR_SRC_ALPHA) {
+        rest.alphaFades = true;
+        rest.alphaRest = 1.0f;
+      }
+      if ((src == VK_BLEND_FACTOR_ONE || src == VK_BLEND_FACTOR_SRC_ALPHA) && dst == VK_BLEND_FACTOR_ONE) {
+        // UE3 Additive
+        rest.colorFades = true;
+        rest.colorRest = 0.0f;
+      } else if ((src == VK_BLEND_FACTOR_DST_COLOR && dst == VK_BLEND_FACTOR_ZERO) ||
+                 (src == VK_BLEND_FACTOR_ZERO && dst == VK_BLEND_FACTOR_SRC_COLOR)) {
+        // UE3 Modulate
+        rest.colorFades = true;
+        rest.colorRest = 1.0f;
+      } else if (src == VK_BLEND_FACTOR_DST_COLOR && dst == VK_BLEND_FACTOR_SRC_COLOR) {
+        // modulate 2x
+        rest.colorFades = true;
+        rest.colorRest = 0.5f;
+      }
+      return rest;
     }
 
     bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
@@ -6469,10 +6618,14 @@ namespace dxvk {
     o.ue3AutoDetectLightmapTextures = ue3AutoDetectLightmapTexturesObject().get() && o.ue3EngineMode;
     o.ue3ConstantAlbedoTintGain = ue3ConstantAlbedoTintGainObject().get();
     o.ue3HighlightTints = ue3HighlightTintsObject().get() && o.ue3EngineMode;
-    o.ue3HighlightTintRequireRest = ue3HighlightTintRequireRestObject().get();
+    o.ue3HighlightTintRequireMotion = ue3HighlightTintRequireMotionObject().get();
     o.ue3HighlightGlowIntensity = ue3HighlightGlowIntensityObject().get();
     o.ue3LogHighlightTints = ue3LogHighlightTintsObject().get();
     o.ue3HighlightDebugForceTint = ue3HighlightDebugForceTintObject().get();
+    o.ue3ParticleVertexColor = ue3ParticleVertexColorObject().get() && o.ue3EngineMode;
+    o.ue3MaterialFades = ue3MaterialFadesObject().get() && o.ue3EngineMode;
+    o.ue3LogMaterialFades = ue3LogMaterialFadesObject().get();
+    o.ue3MaterialFadeDebugForceCoverage = ue3MaterialFadeDebugForceCoverageObject().get();
     o.ue3LogClassification = ue3LogClassificationObject().get();
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
@@ -6521,6 +6674,7 @@ namespace dxvk {
     o.ue3MicConstantIdentityExcludedMaterials = &s.ue3MicConstantIdentityExcludedMaterials;
     o.ue3MicIdentityExcludedTextureDescHashes = &s.ue3MicIdentityExcludedTextureDescHashes;
     o.ue3HighlightTintExcludedMaterials = &s.ue3HighlightTintExcludedMaterials;
+    o.ue3MaterialFadeExcludedMaterials = &s.ue3MaterialFadeExcludedMaterials;
     o.ue3TraceDrawTextureHashes = &s.ue3TraceDrawTextureHashes;
     o.replacementDebugHashes = &s.replacementDebugHashes;
 
@@ -6550,6 +6704,7 @@ namespace dxvk {
       { &s.ue3MicConstantIdentityExcludedMaterials, &ue3MicConstantIdentityExcludedMaterialsObject().get() },
       { &s.ue3MicIdentityExcludedTextureDescHashes, &ue3MicIdentityExcludedTextureDescHashesObject().get() },
       { &s.ue3HighlightTintExcludedMaterials, &ue3HighlightTintExcludedMaterialsObject().get() },
+      { &s.ue3MaterialFadeExcludedMaterials, &ue3MaterialFadeExcludedMaterialsObject().get() },
       { &s.ue3TraceDrawTextureHashes, &ue3TraceDrawTextureHashesObject().get() },
       { &s.replacementDebugHashes, &RtxOptions::replacementDebugHashesObject().get() },
     };
@@ -8521,11 +8676,31 @@ namespace dxvk {
     }
     // 3 : non-skinned, VS doesn't output NORMAL, just keep IA normals from processVertices they're in the same object space as the captured positions anyway..
 
-    // Check if we should/can get colors
-    if (BoundShaderHas(vertexShader, DxsoUsage::Color, false) && d3d9State().pixelShader.ptr() == nullptr) {
+    // Check if we should/can get colors. UE3 passes its particle colour through the vertex shader
+    // as a TEXCOORD interpolant (ParticleSpriteVertexFactory.usf), which takes the place of COLOR0.
+    const uint32_t capturedColorOutputRegister = m_ue3ParticleColorTexcoordIndex != UINT32_MAX
+      ? FindVsTexcoordOutputRegister(vertexShader, m_ue3ParticleColorTexcoordIndex)
+      : std::numeric_limits<uint32_t>::max();
+    if (capturedColorOutputRegister != std::numeric_limits<uint32_t>::max() ||
+        (BoundShaderHas(vertexShader, DxsoUsage::Color, false) && d3d9State().pixelShader.ptr() == nullptr)) {
       const uint32_t colorOffset = offsetof(CapturedVertex, color0);
       geoData.color0Buffer = RasterBuffer(slice, colorOffset, stride, VK_FORMAT_B8G8R8A8_UNORM);
       assert(geoData.color0Buffer.offset() % 4 == 0);
+    }
+    if (capturedColorOutputRegister != std::numeric_limits<uint32_t>::max()) {
+      vertexCaptureFlags |= m_ue3ParticleColorCaptureFlags;
+    }
+    if (m_ue3ParticleColorTexcoordIndex != UINT32_MAX && m_frameOptions.ue3LogMaterialFades && vertexShader != nullptr) {
+      static fast_unordered_set s_loggedColorCaptures;
+      const XXH64_hash_t vsHash = vertexShader->GetBytecodeHash();
+      if (s_loggedColorCaptures.insert(XXH3_64bits_withSeed(&m_ue3ParticleColorTexcoordIndex, sizeof(uint32_t), vsHash)).second) {
+        Logger::info(str::format(
+          "[RTX-Compatibility][UE3-Fade] Capture: vs=0x", std::hex, vsHash, std::dec, " particle colour TEXCOORD",
+          m_ue3ParticleColorTexcoordIndex,
+          capturedColorOutputRegister != std::numeric_limits<uint32_t>::max()
+            ? str::format(" from o", capturedColorOutputRegister)
+            : std::string(" is not a vertex shader output, so the particle colour stays white")));
+      }
     }
 
     auto constants = m_vsVertexCaptureData->allocSlice();
@@ -8553,6 +8728,7 @@ namespace dxvk {
     data.texcoordOutputRegister = capturedTexcoordOutputRegister;
     data.texcoordCompU = m_texcoordCompU & 0x3u;
     data.texcoordCompV = m_texcoordCompV & 0x3u;
+    data.colorOutputRegister = capturedColorOutputRegister;
     if ((vertexCaptureFlags & kVertexCaptureFlag_NormalBoneSkinning) != 0 && ue3CtabInfo != nullptr) {
       data.boneMatricesBaseReg = ue3CtabInfo->boneMatricesRegisterIndex;
       data.boneCount = std::min(ue3CtabInfo->boneMatricesRegisterCount / 3u, 256u);
@@ -11095,6 +11271,145 @@ namespace dxvk {
       constantAlbedoLog));
   }
 
+  void D3D9Rtx::applyUe3MaterialFades(const XXH64_hash_t psHash, const std::vector<uint8_t>& bytecode,
+                                      const D3D9CommonShader* pixelShader, const XXH64_hash_t textureSetShaderHash) {
+    LegacyMaterialData& materialData = m_activeDrawCallState.materialData;
+    const bool logFades = m_frameOptions.ue3LogMaterialFades;
+
+    // The particle colour is TEXCOORD3 on SubUV sprites, whose TEXCOORD1 and 2 carry the second
+    // sub-image and the blend between them, and TEXCOORD1 on plain sprites and beams/trails.
+    uint32_t particleColorTexcoord = UINT32_MAX;
+    int32_t particleColorInputRegister = -1;
+    if (m_frameOptions.ue3ParticleVertexColor && pixelShader->GetInfo().majorVersion() >= 3 &&
+        (m_currentUe3VertexFactory == Ue3VertexFactoryType::Particle ||
+         m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleBeamTrail)) {
+      particleColorTexcoord = 1;
+      if (m_currentUe3VertexFactory == Ue3VertexFactoryType::Particle && d3d9State().vertexDecl != nullptr) {
+        for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+          if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == 3 && element.Type == D3DDECLTYPE_FLOAT4)
+            particleColorTexcoord = 3;
+        }
+      }
+      const DxsoIsgn& isgn = pixelShader->GetIsgn();
+      for (uint32_t i = 0; i < isgn.elemCount; i++) {
+        if (isgn.elems[i].semantic.usage == DxsoUsage::Texcoord && isgn.elems[i].semantic.usageIndex == particleColorTexcoord)
+          particleColorInputRegister = int32_t(isgn.elems[i].regNumber);
+      }
+    }
+
+    const Ue3BlendRest blendRest = ue3BlendRest(materialData.blendMode);
+    const bool canFade = m_frameOptions.ue3MaterialFades && (blendRest.alphaFades || blendRest.colorFades);
+    if (particleColorInputRegister < 0 && !canFade && !logFades)
+      return;
+
+    const DxsoMaterialFadeResult& result = getOrAnalyzeUe3MaterialFades(psHash, bytecode, particleColorInputRegister);
+    if (logFades)
+      logUe3MaterialFadesOnce(psHash, bytecode, particleColorInputRegister, result);
+    if (!result.analyzed)
+      return;
+
+    const float* constants = reinterpret_cast<const float*>(d3d9State().psConsts.fConsts);
+    const uint32_t constantCount = caps::MaxFloatConstantsPS;
+    auto vanishes = [&](const auto& polys) {
+      return std::all_of(polys.begin(), polys.end(),
+                         [&](const DxsoFadePoly& p) { return dxsoFadePolyVanishes(p, constants, constantCount); });
+    };
+
+    // The particle colour reaches Remix as the captured vertex colour, through the stage operations
+    // the shader's own use of it maps onto. It is a material tint, not baked lighting.
+    const DxsoParticleColorUse& particleColor = result.particleColor;
+    const bool hasParticleColor = particleColorInputRegister >= 0;
+    const bool tintsColor = hasParticleColor && particleColor.tintsColor && vanishes(particleColor.tintResidual);
+    const bool scalesColor = hasParticleColor && particleColor.scalesColor && vanishes(particleColor.scalesColorResidual);
+    const bool scalesOpacity = hasParticleColor && particleColor.scalesOpacity &&
+                               dxsoFadePolyVanishes(particleColor.scalesOpacityResidual, constants, constantCount);
+    if (tintsColor || scalesColor || scalesOpacity) {
+      m_ue3ParticleColorTexcoordIndex = particleColorTexcoord;
+      m_ue3ParticleColorCaptureFlags =
+        (tintsColor ? 0u : kVertexCaptureFlag_ColorWhiteRgb) |
+        (scalesColor ? kVertexCaptureFlag_ColorPremultiplyAlpha : 0u);
+      materialData.isVertexColorBakedLighting = false;
+      if (tintsColor || scalesColor) {
+        materialData.textureColorArg1Source = RtTextureArgSource::Texture;
+        materialData.textureColorArg2Source = RtTextureArgSource::VertexColor0;
+        materialData.textureColorOperation = DxvkRtTextureOperation::Modulate;
+      }
+      if (scalesOpacity) {
+        materialData.textureAlphaArg1Source = RtTextureArgSource::Texture;
+        materialData.textureAlphaArg2Source = RtTextureArgSource::VertexColor0;
+        materialData.textureAlphaOperation = DxvkRtTextureOperation::Modulate;
+        materialData.ue3AnimatedVertexOpacity = true;
+      }
+    }
+
+    const fast_unordered_set& excluded = *m_frameOptions.ue3MaterialFadeExcludedMaterials;
+    const XXH64_hash_t colorTextureHash = materialData.getColorTexture().getImageHash();
+    bool fadesExcluded = false;
+    if (logFades || !excluded.empty()) {
+      materialData.updateCachedHash();
+      fadesExcluded = lookupHash(excluded, materialData.getHash()) || lookupHash(excluded, textureSetShaderHash) ||
+                      lookupHash(excluded, colorTextureHash);
+    }
+
+    // Each modulator fades the draw once, whether its alpha, its colour or both come to rest. The
+    // analysis lists a modulator's candidates together.
+    float coverage = 1.0f;
+    const DxsoMaterialFade* lastApplied = nullptr;
+    std::string fadeLog;
+    if (canFade && !fadesExcluded) {
+      const std::map<uint32_t, std::string>* names = logFades ? &getUe3PsFloatConstantNames(psHash, bytecode) : nullptr;
+      for (const DxsoMaterialFade& fade : result.fades) {
+        const bool alphaLane = fade.laneMask == kDxsoFadeAlphaLane;
+        if (alphaLane ? !blendRest.alphaFades : !blendRest.colorFades)
+          continue;
+        if (lastApplied != nullptr && lastApplied->reg == fade.reg && lastApplied->component == fade.component)
+          continue;
+        const std::optional<float> fadeCoverage =
+          dxsoMaterialFadeCoverage(fade, alphaLane ? blendRest.alphaRest : blendRest.colorRest, constants, constantCount);
+        if (names != nullptr) {
+          fadeLog += str::format(fadeLog.empty() ? "" : "; ", describeUe3MaterialFade(fade, *names),
+                                 " value=", fade.reg < constantCount ? constants[fade.reg * 4u + (fade.component & 3u)] : 0.0f,
+                                 fadeCoverage ? str::format(" coverage=", *fadeCoverage) : std::string(" not at rest"));
+        }
+        if (!fadeCoverage)
+          continue;
+        lastApplied = &fade;
+        coverage *= *fadeCoverage;
+      }
+      materialData.ue3FadeCoverage = coverage;
+    }
+
+    if (logFades && (hasParticleColor || !result.fades.empty() || !result.unprovenScalarRegs.empty())) {
+      // One line per texture and state, so a fade's start, middle and end each show once.
+      const uint32_t srcBlend = d3d9State().renderStates[D3DRS_SRCBLEND];
+      const uint32_t dstBlend = d3d9State().renderStates[D3DRS_DESTBLEND];
+      const uint32_t state = (tintsColor ? 1u : 0u) | (scalesColor ? 2u : 0u) | (scalesOpacity ? 4u : 0u) |
+                             (lastApplied == nullptr ? 0u : coverage <= 0.0f ? 8u : coverage < 1.0f ? 16u : 32u) |
+                             (fadesExcluded ? 64u : 0u) | (srcBlend << 8) | (dstBlend << 16) |
+                             (uint32_t(m_currentUe3VertexFactory) << 24);
+      XXH64_hash_t key = XXH3_64bits_withSeed(&colorTextureHash, sizeof(colorTextureHash), psHash);
+      key = XXH3_64bits_withSeed(&state, sizeof(state), key);
+      static fast_unordered_set s_loggedFadeDraws;
+      if (s_loggedFadeDraws.insert(key).second) {
+        std::string particleLog;
+        if (hasParticleColor) {
+          std::string uses;
+          uses += tintsColor ? " tint" : "";
+          uses += scalesColor ? " scalesColor" : "";
+          uses += scalesOpacity ? " scalesOpacity" : "";
+          particleLog = str::format(" particleColor=v", particleColorInputRegister, " applied=[", uses.empty() ? uses : uses.substr(1),
+                                    "] proven=[", describeUe3ParticleColorUses(particleColor).substr(1), "]");
+        }
+        Logger::info(str::format(
+          "[RTX-Compatibility][UE3-Fade] Draw: texture=0x", std::hex, colorTextureHash, " ps=0x", psHash,
+          " materialHash=0x", materialData.getHash(), " textureSetShader=0x", textureSetShaderHash, std::dec,
+          " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory), " srcBlend=", srcBlend, " dstBlend=", dstBlend,
+          particleLog, fadesExcluded ? " excluded" : "",
+          canFade ? str::format(" coverage=", coverage, " fades=[", fadeLog, "]") : std::string(" blend does not fade")));
+      }
+    }
+  }
+
   namespace {
     const char* ue3DeclUsageName(const BYTE usage) {
       switch (usage) {
@@ -11637,6 +11952,8 @@ namespace dxvk {
 
     m_activeDrawCallState.categories = 0;
     m_activeDrawCallState.materialData = {};
+    m_ue3ParticleColorTexcoordIndex = UINT32_MAX;
+    m_ue3ParticleColorCaptureFlags = 0;
 
     // Fetch all the legacy state (colour modes, alpha test, etc...)
     setLegacyMaterialState(m_parent, m_parent->m_alphaSwizzleRTs & (1 << kRenderTargetIndex), m_frameOptions.vertexColorIsBakedLighting, m_activeDrawCallState.materialData);
@@ -14130,33 +14447,67 @@ namespace dxvk {
                 logUe3HighlightPairsOnce(psHash, shaderIdentitySeed, bytecode, identityInfo);
 
               LegacyMaterialData& materialData = m_activeDrawCallState.materialData;
-              const fast_unordered_set& excluded = *m_frameOptions.ue3HighlightTintExcludedMaterials;
-              const XXH64_hash_t colorTextureHash = materialData.getColorTexture().getImageHash();
-              bool tintable = !identityInfo.highlightPairs.empty();
-              if (tintable && (logHighlight || !excluded.empty())) {
-                materialData.updateCachedHash();
-                tintable = !lookupHash(excluded, materialData.getHash()) && !lookupHash(excluded, textureSetShaderHash) &&
-                           !lookupHash(excluded, colorTextureHash);
+              const auto& pairs = identityInfo.highlightPairs;
+              const Vector4* fConsts = d3d9State().psConsts.fConsts;
+              const float glowIntensity = std::max(m_frameOptions.ue3HighlightGlowIntensity, 0.0f);
+
+              // A glow-only pair glows one of the material's textures. It is bound whatever the
+              // strength, so the material stays the same through a highlight.
+              const auto glowPair = std::find_if(pairs.begin(), pairs.end(), [](const auto& pair) { return pair.tint.glowOnly; });
+              if (glowPair != pairs.end() && glowIntensity > 0.0f) {
+                const uint32_t stage = uint32_t(glowPair->tint.glowSampler);
+                D3D9CommonTexture* const glowTexture =
+                  stage < caps::MaxTexturesPS ? GetCommonTexture(d3d9State().textures[stage]) : nullptr;
+                if (glowTexture != nullptr && glowTexture->GetImage() != nullptr &&
+                    glowTexture->GetImage()->getHash() != kEmptyHash) {
+                  if (const Rc<DxvkImageView> view = getRemixSampleView(glowTexture, false); view != nullptr) {
+                    materialData.ue3HighlightGlowTexture = TextureRef(view);
+                    materialData.ue3HighlightGlowTextureIsSrgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
+                    materialData.ue3HighlightGlowTextureChannel = glowPair->tint.glowComponent;
+                  }
+                }
               }
 
-              if (tintable) {
-                Ue3HighlightTintDraw draw;
-                draw.fConsts = d3d9State().psConsts.fConsts;
-                draw.shaderIdentitySeed = shaderIdentitySeed;
-                draw.requireRest = m_frameOptions.ue3HighlightTintRequireRest;
-                draw.glowIntensity = std::max(m_frameOptions.ue3HighlightGlowIntensity, 0.0f);
-                draw.log = logHighlight;
+              // Nearly every draw holds its strengths at 0, which leaves the surface as it is.
+              const bool active = std::any_of(pairs.begin(), pairs.end(), [&](const auto& pair) {
+                return pair.tint.scalarReg < caps::MaxFloatConstantsPS && fConsts[pair.tint.scalarReg].x > 0.0f;
+              });
+              if (active) {
+                materialData.updateCachedHash();
+                const fast_unordered_set& excluded = *m_frameOptions.ue3HighlightTintExcludedMaterials;
+                const XXH64_hash_t colorTextureHash = materialData.getColorTexture().getImageHash();
+                const bool isExcluded = !excluded.empty() &&
+                  (lookupHash(excluded, materialData.getHash()) || lookupHash(excluded, textureSetShaderHash) ||
+                   lookupHash(excluded, colorTextureHash));
+                if (!isExcluded) {
+                  Ue3HighlightTintDraw draw;
+                  draw.fConsts = fConsts;
+                  draw.materialHash = materialData.getHash();
+                  draw.requireMotion = m_frameOptions.ue3HighlightTintRequireMotion;
+                  if (draw.requireMotion) {
+                    const Matrix4& objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
+                    draw.objectHash = XXH3_64bits_withSeed(&objectToWorld, sizeof(objectToWorld), draw.materialHash);
+                  }
+                  draw.glowIntensity = glowIntensity;
+                  draw.log = logHighlight;
 
-                std::string appliedLog;
-                const bool applied = evaluateUe3HighlightTints(identityInfo, draw, materialData.ue3HighlightTint,
-                                                               materialData.ue3HighlightGlow, logHighlight ? &appliedLog : nullptr);
-                static fast_unordered_set s_loggedHighlightMaterials;
-                if (applied && logHighlight && s_loggedHighlightMaterials.insert(materialData.getHash()).second) {
-                  const Vector3& tint = materialData.ue3HighlightTint;
-                  Logger::info(str::format(
-                    "[RTX-Compatibility][UE3-Highlight] Tint applied: materialHash=0x", std::hex, materialData.getHash(),
-                    " textureSetShader=0x", textureSetShaderHash, " texture=0x", colorTextureHash, " ps=0x", psHash, std::dec,
-                    " tint=(", tint.x, ",", tint.y, ",", tint.z, ") glow=", materialData.ue3HighlightGlow, " ", appliedLog));
+                  static fast_unordered_set s_loggedHighlightMaterials;
+                  const bool logApplied = logHighlight && !lookupHash(s_loggedHighlightMaterials, materialData.getHash());
+                  std::string appliedLog;
+                  const bool applied = evaluateUe3HighlightTints(identityInfo, draw, materialData.ue3HighlightTint,
+                                                                 materialData.ue3HighlightGlow, logApplied ? &appliedLog : nullptr);
+                  if (applied && logApplied) {
+                    s_loggedHighlightMaterials.insert(materialData.getHash());
+                    const Vector3& tint = materialData.ue3HighlightTint;
+                    const Vector3& glow = materialData.ue3HighlightGlow;
+                    const TextureRef& glowTexture = materialData.ue3HighlightGlowTexture;
+                    Logger::info(str::format(
+                      "[RTX-Compatibility][UE3-Highlight] Tint applied: materialHash=0x", std::hex, materialData.getHash(),
+                      " textureSetShader=0x", textureSetShaderHash, " texture=0x", colorTextureHash, " ps=0x", psHash,
+                      glowTexture.isValid() ? str::format(" glowTexture=0x", std::hex, glowTexture.getImageHash()) : std::string(),
+                      std::dec, " tint=(", tint.x, ",", tint.y, ",", tint.z, ") glow=(", glow.x, ",", glow.y, ",", glow.z, ") ",
+                      appliedLog));
+                  }
                 }
               }
             }
@@ -14164,6 +14515,16 @@ namespace dxvk {
             const Vector3& forcedHighlightTint = m_frameOptions.ue3HighlightDebugForceTint;
             if (forcedHighlightTint.x != 1.0f || forcedHighlightTint.y != 1.0f || forcedHighlightTint.z != 1.0f)
               m_activeDrawCallState.materialData.ue3HighlightTint = forcedHighlightTint;
+
+            // Opacity-driven fades: UE3 hands its particle colour to the shader as an interpolant Remix
+            // never treats as a vertex colour, and fades draws through material constants it never
+            // evaluates. Both come from the shader analysis and are carried per draw, like the highlight.
+            if (m_frameOptions.ue3ParticleVertexColor || m_frameOptions.ue3MaterialFades)
+              applyUe3MaterialFades(psHash, bytecode, psCommonShader, textureSetShaderHash);
+
+            const float forcedCoverage = m_frameOptions.ue3MaterialFadeDebugForceCoverage;
+            if (forcedCoverage >= 0.0f && m_activeDrawCallState.materialData.blendMode.enableBlending)
+              m_activeDrawCallState.materialData.ue3FadeCoverage = std::min(forcedCoverage, 1.0f);
 
             if (logMicHash) {
               m_activeDrawCallState.materialData.updateCachedHash();

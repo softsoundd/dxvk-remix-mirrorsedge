@@ -181,42 +181,75 @@ namespace dxvk {
                "UE3 compat: reproduce the tint a game fades in through a material strength parameter, such as Mirror's "
                "Edge's Runner Vision (LOI_Strength). Remix samples the albedo texture itself, so a tint the pixel shader "
                "applies from its constants never reaches the path tracer. The pixel shader is analysed to prove which "
-               "UniformScalar_* tints the colour output as lerp(X, X * V, S), and towards which UniformVector_*. The "
+               "UniformScalar_* tints the colour output as lerp(X, X * V, S), and towards which UniformVector_*, or "
+               "only adds an unlit glow of a texture to one channel, as enemy weapons flash red. The "
                "tint is carried per surface, so it follows the fade frame by frame, leaves material hashes alone and "
-               "applies over replacement materials too. rtx.d3d9.ue3HighlightTintRequireRest decides which proven tints "
-               "count as a highlight. Requires rtx.d3d9.ue3EngineMode; see documentation/UE3Compatibility.md, "
+               "applies over replacement materials too. rtx.d3d9.ue3HighlightTintRequireMotion decides which proven "
+               "tints count as a highlight. Requires rtx.d3d9.ue3EngineMode; see documentation/UE3Compatibility.md, "
                "\"Runner Vision\".");
-    RTX_OPTION("rtx.d3d9", bool, ue3HighlightTintRequireRest, true,
-               "UE3 compat: apply a proven tint only once its strength has been seen resting at exactly 0 on the same "
-               "master material. A strength that also scales an unlit copy of the tinted colour, the Runner Vision "
-               "glow, is a highlight by construction and applies at once. Without that glow, as on masked Runner Vision "
-               "materials, the lerp is indistinguishable from an authored tint amount, except that LOI_Strength rests "
-               "at 0 on every surface that is not highlighted while an authored amount stays wherever the artist left "
-               "it. The evidence is shared by every lightmap policy compile and material instance of a master material "
-               "and lasts for the session. Disable to apply every proven tint, authored amounts included.");
+    RTX_OPTION("rtx.d3d9", bool, ue3HighlightTintRequireMotion, true,
+               "UE3 compat: apply a proven tint, and its glow, only once its strength has been seen moving. Runner "
+               "Vision fades LOI_Strength on the material instances it creates, while an object authored in the tint "
+               "colour holds its strength still, and Remix leaves that colour to its material. Tracked per object - "
+               "material instance and placement - so an object painted in the highlight colour stays untinted when an "
+               "identical one is highlighted; an object at a placement not seen before, as a moving one is every "
+               "frame, follows its material instance. Disable to apply every proven tint and its glow, authored "
+               "colours included.");
     RTX_OPTION("rtx.d3d9", float, ue3HighlightGlowIntensity, 1.0f,
                "UE3 compat: scale on the glow Runner Vision adds to a highlighted surface. Most Runner Vision materials "
                "add an unlit copy of the tinted colour, weighted by the strength and a coefficient read from the shader "
-               "(0.1 on Mirror's Edge), which keeps highlighted objects readable in shadow. It is reproduced as emission "
-               "of that fraction of the surface's tinted albedo; 1 keeps the game's coefficient, and 0 disables the "
-               "glow while keeping the tint. Also scaled by rtx.emissiveIntensity.");
+               "(0.1 on Mirror's Edge), which keeps highlighted objects readable in shadow; enemy weapons instead glow "
+               "one of their textures red before a strike, at several times the strength. It is reproduced as "
+               "emission, per channel, of that fraction of the surface's tinted albedo, or of the glowing texture, "
+               "which the surface's material carries as its emissive texture (a replacement material only when it "
+               "authors no emission or emissive texture); 1 keeps the game's coefficients, and 0 disables the glow "
+               "while keeping the tint. Also scaled by rtx.emissiveIntensity.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3HighlightTintExcludedMaterials, {},
                "UE3 compat: surfaces rtx.d3d9.ue3HighlightTints never tints, matched against the draw's material hash, "
                "its textureSet+shader hash and its primary colour texture hash. For a tint the game uses for something "
-               "other than a highlight that rtx.d3d9.ue3HighlightTintRequireRest still lets through; "
+               "other than a highlight that rtx.d3d9.ue3HighlightTintRequireMotion still lets through; "
                "rtx.d3d9.ue3LogHighlightTints reports all three hashes the first time a tint applies to a material.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogHighlightTints, false,
                "UE3 compat diagnostics: log what rtx.d3d9.ue3HighlightTints finds. Once per pixel shader: the proven "
                "strength and colour pairs with their CTAB names and glow coefficients, the material scalars that reach "
-               "the colour output without proving a tint, and why a shader could not be analysed. Once per master "
-               "material and pair: when its strength is first seen at rest, and when a strength above 0 is held back "
-               "because it has not been. Once per material: the first time a tint applies, with each pair's live "
-               "strength and colour, the resulting tint and glow, and the hashes "
-               "rtx.d3d9.ue3HighlightTintExcludedMaterials takes.");
+               "the colour output without proving a tint, and why a shader could not be analysed. Once per material: "
+               "the first time a tint applies, with each pair's live strength and colour, the resulting tint and glow, "
+               "and the hashes rtx.d3d9.ue3HighlightTintExcludedMaterials takes; and when a tint is held back because "
+               "its strength has not moved.");
     RTX_OPTION("rtx.d3d9", Vector3, ue3HighlightDebugForceTint, Vector3(1.f, 1.f, 1.f),
                "UE3 compat diagnostic: force this tint onto every UE3 material, whatever the analysis found, to check "
                "the per-surface tint reaches the shader independently of detection. Identity (1, 1, 1) disables the "
                "override.");
+    RTX_OPTION("rtx.d3d9", bool, ue3ParticleVertexColor, true,
+               "UE3 compat: reproduce the per-particle colour and alpha of UE3 sprite, SubUV and beam/trail particles, such "
+               "as a ParticleModuleColorOverLife fade. UE3 hands the particle colour to the pixel shader as a TEXCOORD "
+               "interpolant (TEXCOORD3 on SubUV sprites, TEXCOORD1 otherwise), which Remix never treats as a vertex colour. "
+               "The pixel shader is analysed for how the colour reaches its output - a per-channel tint, an opacity scale, "
+               "or the colour scale of UE3's additive blend mode - and those uses are reproduced through the captured "
+               "vertex colour and the texture stage operations, on the draws whose constants allow them. Requires "
+               "rtx.d3d9.ue3EngineMode; see documentation/UE3Compatibility.md, \"Opacity-driven fades\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3MaterialFades, true,
+               "UE3 compat: fade a draw in and out with the material parameter its pixel shader fades it by, such as a "
+               "modulate decal lerping from white to its texture, or a translucent opacity multiplied by a parameter. The "
+               "pixel shader is analysed for the UniformScalar_* and UniformVector_* components its output is affine in; "
+               "each draw checks with its own constants whether one brings the whole output to the value its blend leaves "
+               "the framebuffer unchanged by, and scales the surface's opacity and emission by how far from there it is. "
+               "Carried per surface, so it follows the parameter frame by frame, leaves material hashes alone and applies "
+               "over blended replacement materials. Requires rtx.d3d9.ue3EngineMode; see documentation/UE3Compatibility.md, "
+               "\"Opacity-driven fades\".");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MaterialFadeExcludedMaterials, {},
+               "UE3 compat: surfaces rtx.d3d9.ue3MaterialFades never fades, matched against the draw's material hash, its "
+               "textureSet+shader hash and its primary colour texture hash, all of which rtx.d3d9.ue3LogMaterialFades "
+               "reports.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogMaterialFades, false,
+               "UE3 compat diagnostics: log what rtx.d3d9.ue3MaterialFades and rtx.d3d9.ue3ParticleVertexColor find. Once "
+               "per pixel shader: the fade candidates, the particle colour uses, the material scalars the output is not "
+               "affine in, and why a shader could not be analysed. Once per colour texture, shader and outcome: the blend, "
+               "the particle colour uses applied, each candidate's live value and coverage, and the hashes "
+               "rtx.d3d9.ue3MaterialFadeExcludedMaterials takes.");
+    RTX_OPTION("rtx.d3d9", float, ue3MaterialFadeDebugForceCoverage, -1.0f,
+               "UE3 compat diagnostic: force this coverage onto every blended UE3 surface, whatever the analysis found, to "
+               "check the per-surface fade reaches the shader independently of detection. Negative disables the override.");
     RTX_OPTION("rtx.d3d9", bool, ue3MicConstantIdentity, true,
                "UE3 MaterialInstanceConstant support: fold the material's Uniform* constants into its "
                "identity, distinguishing instances that share a parent and its textures but differ in "
@@ -1082,6 +1115,11 @@ namespace dxvk {
     };
     UvResolutionMode m_uvResolutionMode = UvResolutionMode::LegacyTss;
 
+    // Per draw: the TEXCOORD usage index carrying the UE3 particle colour the draw takes, and the
+    // kVertexCaptureFlag_Color* flags prepareVertexCapture captures it with. UINT32_MAX for none.
+    uint32_t m_ue3ParticleColorTexcoordIndex = UINT32_MAX;
+    uint32_t m_ue3ParticleColorCaptureFlags = 0;
+
     // two pass translucency dedup - track previous draw's shader/texture/geometry state
     // to detect UE3 back+front face translucency passes on the same mesh. The geometry
     // identity is required: UE3 sorts translucent prims back-to-front per camera, so
@@ -1634,6 +1672,9 @@ namespace dxvk {
                                  uint32_t usedTextureMask,
                                  const PsSamplerTexcoordEntry* inferredEntry);
     void logUe3ParticleDrawOnce();
+    // rtx.d3d9.ue3ParticleVertexColor and rtx.d3d9.ue3MaterialFades for the draw being prepared.
+    void applyUe3MaterialFades(XXH64_hash_t psHash, const std::vector<uint8_t>& bytecode,
+                               const D3D9CommonShader* pixelShader, XXH64_hash_t textureSetShaderHash);
 
     // UE3 albedo selection refuses render targets: soft-particle and scene-colour buffers carry a
     // content hash and near-backbuffer area, so at high resolutions they outscore the real material
@@ -2207,10 +2248,14 @@ namespace dxvk {
       bool ue3AutoDetectLightmapTextures = false;
       float ue3ConstantAlbedoTintGain = 0.f;
       bool ue3HighlightTints = false;
-      bool ue3HighlightTintRequireRest = true;
+      bool ue3HighlightTintRequireMotion = true;
       float ue3HighlightGlowIntensity = 0.f;
       bool ue3LogHighlightTints = false;
       Vector3 ue3HighlightDebugForceTint = Vector3(1.f, 1.f, 1.f);
+      bool ue3ParticleVertexColor = false;
+      bool ue3MaterialFades = false;
+      bool ue3LogMaterialFades = false;
+      float ue3MaterialFadeDebugForceCoverage = -1.f;
       bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;
       bool ue3LogUvAffineDetail = false;
@@ -2264,6 +2309,7 @@ namespace dxvk {
       const fast_unordered_set* ue3MicConstantIdentityExcludedMaterials = nullptr;
       const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
       const fast_unordered_set* ue3HighlightTintExcludedMaterials = nullptr;
+      const fast_unordered_set* ue3MaterialFadeExcludedMaterials = nullptr;
       const fast_unordered_set* ue3TraceDrawTextureHashes = nullptr;
       const fast_unordered_set* replacementDebugHashes = nullptr;
     };
@@ -2287,6 +2333,7 @@ namespace dxvk {
       fast_unordered_set ue3MicConstantIdentityExcludedMaterials;
       fast_unordered_set ue3MicIdentityExcludedTextureDescHashes;
       fast_unordered_set ue3HighlightTintExcludedMaterials;
+      fast_unordered_set ue3MaterialFadeExcludedMaterials;
       fast_unordered_set ue3TraceDrawTextureHashes;
       fast_unordered_set replacementDebugHashes;
     };

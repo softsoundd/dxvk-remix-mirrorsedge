@@ -522,7 +522,15 @@ namespace dxvk {
     // Fill out the arguments
     BakeOpacityMicromapArgs args {};
     size_t surfaceWriteOffset = 0;
-    instance.surface.writeGPUData(&args.surface[0], surfaceWriteOffset);
+    if (instance.surface.hasAnimatedVertexOpacity) {
+      // The source hash has no vertex opacity in it, so a micromap baked with one would freeze the
+      // alpha the vertices had at the time. Without it the bake only ever over-estimates opacity.
+      RtSurface bakeSurface = instance.surface;
+      bakeSurface.color0BufferIndex = kSurfaceInvalidBufferIndex;
+      bakeSurface.writeGPUData(&args.surface[0], surfaceWriteOffset);
+    } else {
+      instance.surface.writeGPUData(&args.surface[0], surfaceWriteOffset);
+    }
     args.numTriangles = desc.numTriangles;
     args.numMicroTrianglesPerTriangle = desc.numMicroTrianglesPerTriangle;
     args.is2StateOMMFormat = desc.ommFormat == VK_OPACITY_MICROMAP_FORMAT_2_STATE_EXT;

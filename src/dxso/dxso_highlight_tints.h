@@ -33,8 +33,9 @@ namespace dxvk {
    * \brief Material highlight tint analysis of a pixel shader
    *
    * Proves which material scalar parameters tint the colour output as lerp(X, X * V, S): the
-   * shape Mirror's Edge's Runner Vision highlight (LOI_Strength) compiles to in every master
-   * material that has it. The shader is evaluated symbolically, lane by lane, so the proof holds
+   * shape Mirror's Edge's Runner Vision highlight (LOI_Strength) compiles to in the world's master
+   * materials. Its weapon materials instead only add an unlit glow, which is proven as a glow-only
+   * pair. The shader is evaluated symbolically, lane by lane, so the proof holds
    * however fxc scheduled the lerp - mad pairs in either operand order, lrp, or the lerp spread
    * over registers whose other lanes carry unrelated math. See documentation/UE3Compatibility.md,
    * "Runner Vision".
@@ -71,13 +72,19 @@ namespace dxvk {
     // The strength: a material scalar register, read from its x component.
     uint32_t scalarReg = 0;
     // Per output channel (oC0.r, g, b), the vector register and component the channel is lerped
-    // towards. A pair is only reported when every channel is tinted.
+    // towards. A tint pair is only reported when every channel is tinted; a glow-only pair has none.
     std::array<int32_t, 3> colorReg = { -1, -1, -1 };
     std::array<uint8_t, 3> colorComponent = { 0, 0, 0 };
-    // Coefficient of an unlit copy of the tinted colour scaled by the strength, or 0. The Runner
-    // Vision network adds 0.1 * S * tinted diffuse as a glow on top of the lit surface; no other
-    // use of a tint lerp has that shape, so it also identifies the pair as a highlight.
-    float glowCoefficient = 0.0f;
+    // Per output channel, the coefficient of an unlit copy of the colour scaled by the strength. The
+    // Runner Vision network adds 0.1 * S * tinted diffuse on top of the lit surface; no other use
+    // of a tint lerp has that shape, so it also identifies a tint pair as a highlight.
+    std::array<float, 3> glowCoefficient = { 0.0f, 0.0f, 0.0f };
+    // No tint: the strength only adds an unlit k * S * texture sample to one channel, a flash of
+    // colour, as Mirror's Edge's weapons glow red before a strike (8 * LOI_Strength * a mask's red).
+    bool glowOnly = false;
+    // A glow-only pair's texture, and the channel of it (x to w) the glow reads.
+    int32_t glowSampler = -1;
+    uint8_t glowComponent = 0;
   };
 
   struct DxsoHighlightResult {

@@ -111,7 +111,9 @@ tests += exe
 dxso_analysis_src = files([
   '../../../src/dxso/dxso_analysis.cpp',
   '../../../src/dxso/dxso_color_terms.cpp',
+  '../../../src/dxso/dxso_symbolic_eval.cpp',
   '../../../src/dxso/dxso_highlight_tints.cpp',
+  '../../../src/dxso/dxso_material_fades.cpp',
   '../../../src/dxso/dxso_decoder.cpp',
   '../../../src/dxso/dxso_ctab.cpp',
   '../../../src/dxso/dxso_code.cpp',
@@ -133,6 +135,10 @@ tests += exe
 
 exe = executable('test_dxso_highlight_tints',  files('test_dxso_highlight_tints.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_dxso_highlight_tints', exe, env: test_env)
+tests += exe
+
+exe = executable('test_dxso_material_fades',  files('test_dxso_material_fades.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dxso_material_fades', exe, env: test_env)
 tests += exe
 
 if dxvk_is_x64 and get_option('remix_with_shim')

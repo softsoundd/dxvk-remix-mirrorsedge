@@ -633,6 +633,14 @@ void opaqueSurfaceMaterialApplyTextureStageOps(
   // Ensure we perform these opacity calculations after the texture operations have been applied to abledo and alpha.
   calcOpaqueSurfaceMaterialOpacity(
     albedo, opacity, surface, opacity, emissiveBlendOverrideInfluence, cb.wboitEnabled);
+
+  // After the blend mode, which derives opacity from the colour as often as from the alpha, so a fade
+  // covers every blend mode alike. A surface rendered opaque or cut out - by a replacement's alpha
+  // state or a category - stays so. Opacity micromaps bake without it and so stay conservative.
+  if (surface.hasFadeCoverage && !surface.isBlendingDisabled) {
+    opacity *= surface.fadeCoverage;
+    emissiveBlendOverrideInfluence *= surface.fadeCoverage;
+  }
 }
 
 // The fixed-function texture stage colour operations, applied to the emissive colour.
@@ -650,10 +658,24 @@ void opaqueSurfaceMaterialApplyEmissiveTextureStageOps(
 }
 
 // The glow Runner Vision adds on top of the lit surface: a fraction of the tinted surface colour,
-// emitted, so a highlighted object stays readable in shadow. Takes the linear base colour.
-vec3 opaqueSurfaceMaterialHighlightGlow(Surface surface, vec3 albedo)
+// emitted, so a highlighted object stays readable in shadow, or a flash of one channel of the texture
+// a glow-only highlight glows. Takes the linear base colour and the raw emissive texture sample.
+vec3 opaqueSurfaceMaterialHighlightGlow(Surface surface, vec3 albedo, vec4 emissiveSample, bool emissiveSampleLoaded)
 {
-  return (surface.hasHighlightTint && !surface.isMatte) ? surface.highlightGlow * albedo : vec3(0.0f);
+  if (!surface.hasHighlightTint || surface.isMatte)
+  {
+    return vec3(0.0f);
+  }
+
+  if (surface.highlightGlowFromEmissiveTexture && emissiveSampleLoaded)
+  {
+    // Decoded as the game samples it; alpha never is.
+    const uint channel = surface.highlightGlowTextureChannel;
+    const float value = emissiveSample[channel];
+    return surface.highlightGlow * ((surface.highlightGlowTextureIsLinear || channel == 3) ? value : pow(value, kSRGBGamma));
+  }
+
+  return surface.highlightGlow * albedo;
 }
 
 // Particle path
@@ -770,7 +792,7 @@ void opaqueSurfaceMaterialParticleResolve(
 
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
 
-  const vec3 highlightGlow = opaqueSurfaceMaterialHighlightGlow(surface, albedo);
+  const vec3 highlightGlow = opaqueSurfaceMaterialHighlightGlow(surface, albedo, samples.emissiveColor, samples.emissiveColorLoaded);
   albedo = surface.isMatte ? vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
   emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity + highlightGlow;
 }
@@ -1076,7 +1098,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   opaqueSurfaceMaterialInteraction.emissiveRadiance =
     emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity +
-    opaqueSurfaceMaterialHighlightGlow(surface, albedo);
+    opaqueSurfaceMaterialHighlightGlow(surface, albedo, emissiveColorSample, emissiveColorLoaded);
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
     subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);
