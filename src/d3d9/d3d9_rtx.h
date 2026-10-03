@@ -6,6 +6,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <vector>
 #include <optional>
@@ -401,6 +402,18 @@ namespace dxvk {
                "tagged as Player Model Geometry to control the third-person copy while the first-person copy "
                "stays a view model. Only active in rtx.d3d9.ue3EngineMode; promotion to the ViewModel camera "
                "additionally requires rtx.viewModel.enable.");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableFrustumCulling, false,
+               "Mirror's Edge: patch the game so its renderer skips the per-primitive view frustum test and draws "
+               "every primitive within its cull distance, keeping geometry outside the camera's view in the ray "
+               "traced scene for shadows, reflections and indirect light. Costs CPU time in both the game and Remix. "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3ShowThirdPersonModel, false,
+               "Mirror's Edge: patch the game so the third-person body and weapon meshes (Mesh3p) also draw in the "
+               "first-person view. The game otherwise hides them from the player's own camera and keeps them only "
+               "for its shadows and reflections; drawn, they become Remix player-model geometry (rtx.playerModel*). "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
     RTX_OPTION("rtx.d3d9", bool, conservativeOcclusionQueries, false,
                "Answer hardware occlusion queries with conservative results suited to path tracing instead "
                "of GPU-measured raster visibility: readbacks return immediately with full-backbuffer "
@@ -1051,7 +1064,28 @@ namespace dxvk {
              isAutoDetectedLightmapTexture(textureHash);
     }
 
+    // The bridge client's latest answer to the game patch request, as masks of GamePatchBits.
+    struct Ue3GamePatchStatus {
+      bool answered = false;
+      uint32_t active = 0;
+      uint32_t notFound = 0;
+    };
+
+    static Ue3GamePatchStatus getUe3GamePatchStatus() {
+      const uint64_t status = s_ue3GamePatchStatus.load(std::memory_order_relaxed);
+      Ue3GamePatchStatus result;
+      result.answered = (status & kUe3GamePatchAnswered) != 0;
+      result.active = uint32_t(status & 0xFFFFu);
+      result.notFound = uint32_t(status >> 16) & 0xFFFFu;
+      return result;
+    }
+
   private: 
+    // Written on the bridge message channel's thread: the active mask in bits 0-15, the not-found
+    // mask in bits 16-31, and whether any answer has arrived.
+    static constexpr uint64_t kUe3GamePatchAnswered = 1ull << 63;
+    inline static std::atomic<uint64_t> s_ue3GamePatchStatus { 0 };
+
     static void registerAutoDetectedLightmapTexture(XXH64_hash_t textureHash);
 
     // Reused fixed-size blocks: once allocated, a block is never reallocated, so background
@@ -2346,6 +2380,11 @@ namespace dxvk {
     // per-frame map during SceneManager::onFrameEnd, which executes after the flush on
     // the CS timeline, so batching is invisible to them.
     std::vector<XXH64_hash_t> m_pendingReplacementMaterialHashes;
+
+    // GamePatchBits last sent to the bridge client by updateUe3GamePatchRequest.
+    uint32_t m_ue3GamePatchRequest = 0;
+    std::chrono::steady_clock::time_point m_ue3GamePatchRequestTime;
+    void updateUe3GamePatchRequest();
 
     bool isRenderingUI();
 

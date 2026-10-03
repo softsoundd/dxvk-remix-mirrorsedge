@@ -61,6 +61,7 @@
 #include "rtx_render/rtx_sparse_rendering.h"
 #include "dxvk_image.h"
 #include "../util/rc/util_rc_ptr.h"
+#include "../util/util_game_patches.h"
 #include "../util/util_math.h"
 #include "../util/util_global_time.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
@@ -4856,6 +4857,37 @@ namespace dxvk {
         RemixGui::Checkbox("Over-modulate Blending", &RtxOptions::terrainAsDecalsAllowOverModulateObject());
       }
 
+      ImGui::Unindent();
+    }
+
+    if (D3D9Rtx::ue3EngineMode() &&
+        RemixGui::CollapsingHeader("Mirror's Edge Game Patches", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      const D3D9Rtx::Ue3GamePatchStatus patchStatus = D3D9Rtx::getUe3GamePatchStatus();
+      const auto showPatch = [&patchStatus](const char* label, RtxOption<bool>& option, const uint32_t bit, const char* tooltip) {
+        RemixGui::Checkbox(label, &option);
+        if (ImGui::IsItemHovered()) {
+          RemixGui::SetTooltipUnformatted(tooltip);
+        }
+        const char* status = "Off";
+        if (patchStatus.answered && (patchStatus.notFound & bit)) {
+          status = "Not found in this executable";
+        } else if (patchStatus.answered && (patchStatus.active & bit)) {
+          status = "Active";
+        } else if (option.get() && !RtxOptions::enableRaytracing()) {
+          status = "Off while ray tracing is disabled";
+        } else if (option.get() && !patchStatus.answered) {
+          status = "No response from the bridge client";
+        }
+        ImGui::Text("Status: %s", status);
+      };
+      showPatch("Disable Game Frustum Culling", D3D9Rtx::ue3DisableFrustumCullingObject(), kGamePatchDisableFrustumCulling,
+        "Patches the game so its renderer draws every primitive within its cull distance, not just those in the\n"
+        "camera's view, keeping off-screen geometry in the ray traced scene for shadows, reflections and indirect light.\n"
+        "Costs CPU time in the game and in Remix.");
+      showPatch("Show Third-Person Model", D3D9Rtx::ue3ShowThirdPersonModelObject(), kGamePatchShowThirdPersonModel,
+        "Patches the game so it also draws the third-person body and weapon in first person, for Remix to use as\n"
+        "player-model geometry in shadows and reflections.");
       ImGui::Unindent();
     }
 

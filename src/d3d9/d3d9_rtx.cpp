@@ -11,6 +11,7 @@
 #include "d3d9_initializer.h"
 
 #include "../util/util_fastops.h"
+#include "../util/util_game_patches.h"
 #include "../util/util_math.h"
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
@@ -18,6 +19,7 @@
 #include "../dxso/dxso_highlight_tints.h"
 #include "../dxso/dxso_material_fades.h"
 #include "../dxso/dxso_tables.h"
+#include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
 // NV-DXVK start: draw disposition statistics
@@ -6493,11 +6495,43 @@ namespace dxvk {
            m_ue3MovieTextureDescHashes.find(descHash) != m_ue3MovieTextureDescHashes.end();
   }
 
+  namespace {
+    constexpr auto kUe3GamePatchRequestRetryInterval = std::chrono::seconds(2);
+  }
+
+  void D3D9Rtx::updateUe3GamePatchRequest() {
+    uint32_t request = 0;
+    if (m_frameOptions.ue3EngineMode && m_frameOptions.enableRaytracing) {
+      if (ue3DisableFrustumCullingObject().get()) {
+        request |= kGamePatchDisableFrustumCulling;
+      }
+      if (ue3ShowThirdPersonModelObject().get()) {
+        request |= kGamePatchShowThirdPersonModel;
+      }
+    }
+
+    // Repeated until the bridge client first answers, as an answer sent before the message
+    // channel handshake completes is lost.
+    const auto now = std::chrono::steady_clock::now();
+    const bool unanswered = (s_ue3GamePatchStatus.load(std::memory_order_relaxed) & kUe3GamePatchAnswered) == 0;
+    const bool retry = request != 0 && unanswered && now - m_ue3GamePatchRequestTime >= kUe3GamePatchRequestRetryInterval;
+    if ((request != m_ue3GamePatchRequest || retry) &&
+        BridgeMessageChannel::get().send(kGamePatchRequestMsgName, request, 0)) {
+      m_ue3GamePatchRequest = request;
+      m_ue3GamePatchRequestTime = now;
+    }
+  }
+
   D3D9Rtx::D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion)
     : m_rtStagingData(d3d9Device->GetDXVKDevice(), "RtxStagingDataAlloc: D3D9", (VkMemoryPropertyFlagBits) (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     , m_parent(d3d9Device)
     , m_enableDrawCallConversion(enableDrawCallConversion)
     , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
+    BridgeMessageChannel::get().registerHandler(kGamePatchStatusMsgName, [](uint32_t active, uint32_t notFound) {
+      s_ue3GamePatchStatus.store(kUe3GamePatchAnswered | (uint64_t(notFound & 0xFFFFu) << 16) | (active & 0xFFFFu),
+                                 std::memory_order_relaxed);
+      return true;
+    });
   }
 
   D3D9Rtx::~D3D9Rtx() {
@@ -15895,6 +15929,8 @@ namespace dxvk {
     // Refresh the per-frame option snapshot: EndFrame's own consumers (deferred UI
     // replay) read fresh values and the next frame's draws see this frame's resolution.
     refreshFrameOptionCache();
+
+    updateUe3GamePatchRequest();
 
     // NV-DXVK start: draw disposition statistics
     reportDrawDispositionStats();

@@ -128,6 +128,8 @@ namespace dxvk {
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
       { "rtx.d3d9.ue3ExactVertexCapture",                            "True" },
       { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
+      { "rtx.d3d9.ue3DisableFrustumCulling",                         "True" },
+      { "rtx.d3d9.ue3ShowThirdPersonModel",                          "True" },
       // UE3's per-frame FrameSyncEvent otherwise serialises the GPU frame behind injectRTX's CPU time.
       { "rtx.d3d9.eventQueryCsCompletion",                           "True" },
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },

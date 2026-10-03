@@ -494,3 +494,32 @@ UE3 interiors are often a one-sided exterior static-mesh shell around BSP rooms 
 The Triangle Culling (Override Secondary Rays) option could mitigate this, but that also globally culls backfaces on every opaque mesh and weakens prop/foliage/character shadows which is not desireable. Instead, tag the wrapping shell as **Cull Backfaces in Shadows** (`rtx.cullBackfacesInShadowTextures` / `rtx.cullBackfacesInShadowGeometries`; geometry hashes when materials are shared).
 
 Optionally enable `rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces` to flag one-sided opaque meshes whose object AABB contains the camera and whose world-space extents fall between `rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters` (2 m) and `rtx.d3d9.ue3AutoCullEnclosingMeshMaxExtentMeters` (150 m). Tagging is more precise if auto misses a hangar or flags the wrong mesh. Do not tag thin floors or whole-level BSP, or rooms below can leak sun.
+
+## Game executable patches
+
+Two Mirror's Edge behaviours that matter to Remix are decided inside the game process, where the runtime does not run: under the bridge it is hosted by `.trex\NvRemixBridge.exe`, and the only Remix code in `MirrorsEdge.exe` is the bridge client (`d3d9.dll`). The client therefore patches the executable's code in memory, at the runtime's request. Nothing on disk changes.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3DisableFrustumCulling` | False (True in the Mirror's Edge profile) | The renderer stops culling primitives outside the view frustum, so off-screen geometry stays in the ray traced scene |
+| `rtx.d3d9.ue3ShowThirdPersonModel` | False (True in the Mirror's Edge profile) | The third-person body and weapon (`Mesh3p`) also draw in first person, as player-model geometry |
+
+Neither is requested outside `rtx.d3d9.ue3EngineMode`, nor while ray tracing is disabled, so the rasterised image Remix shows then is the game's own. Both are under Rendering > Mirror's Edge Game Patches in the developer menu, each with its status.
+
+### Request and status
+
+`D3D9Rtx::EndFrame` sends the wanted patches to the bridge client as a `GamePatchBits` mask whenever it changes (see `src/util/util_game_patches.h`), over the window-message channel that also carries `UWM_REMIX_UIACTIVE_MSG`. The client handles the request on the game's window thread: on the first one it locates both patches' sites, then it applies or reverts each patch to match the mask and answers with which patches are active and which it could not find. An answer sent before the channel's handshake completes is lost, so the runtime repeats its request every 2 seconds until the first answer arrives. The client logs the sites it finds and every change it makes to `bridge32.log`, prefixed `[GamePatch]`.
+
+The sites are found by code signature, which matches the GOG, Steam, retail and DLC executables. The EA app executable is encrypted on disk, so its signatures are unverified; the client only scans it after it has decrypted. Every change is one or two bytes within an instruction, written by a single interlocked store, so a thread executing it fetches either the old instruction or the new one and never a mix. That is what lets both patches toggle while the rendering thread is drawing.
+
+### Frustum culling
+
+`FSceneRenderer::InitViews` tests every primitive with `View.ViewFrustum.IntersectSphere(Bounds.Origin, Bounds.SphereRadius)` and skips one that fails, before occlusion and view relevance are considered. The patch turns that skip, a `jz rel32`, into a short jump over its own operand, so every primitive carries on as if it had passed.
+
+Primitives are still culled by distance (`CullDistance`, cull distance volumes), and occlusion culling is left to `toggleocclusion` and `rtx.d3d9.conservativeOcclusionQueries`. While the patch is active the Remix free camera sees the whole level, not just what the game's camera can.
+
+### Third-person model
+
+In first person `TdPawn.SetFirstPerson` and `TdWeapon.SetFirstPerson` set `Mesh3p`'s `bOwnerNoSeeWithShadow`, a DICE addition to `PrimitiveComponent` that both `Mesh3p` archetypes also default to true. Rather than hiding the component from its owner's views, which would also drop its shadow, four of the renderer's draw loops check the flag: they skip a primitive whose component has it set when the view's `ViewActor` is among its scene proxy's `Owners`. The proxy's own copy of the flag only decides whether `Owners` is collected, and the shadow passes draw the primitive regardless.
+
+The patch zeroes the mask of each loop's `test byte ptr [reg+0xFC], 0x10`, so the test fails and the loop draws the primitive without looking for its owner. The flags stay as the game sets them, and only whether the renderer honours them changes, so the patch takes effect on the next frame either way. The body still needs the player-model tagging described in the README to stay out of the camera's view while it casts shadows and appears in reflections.
