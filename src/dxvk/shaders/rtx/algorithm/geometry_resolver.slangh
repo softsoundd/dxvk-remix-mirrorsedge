@@ -1975,10 +1975,7 @@ void geometryResolverVertex(
 #ifdef ATMOSPHERE_AVAILABLE
     if (cb.skyMode == 1 && !cb.domeLightArgs.active)
     {
-      vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
-        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, AtmosphereAerosolPhaseLut, cb.isZUp != 0);
+      vec3 skyRadiance = sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
 
       // The camera ray never runs NEE, so the sun disc has to come from the environment here.
       skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
@@ -2606,10 +2603,7 @@ void geometryPSRResolverVertex(
     else if (cb.skyMode == 1)
     {
       // Physical atmosphere mode.
-      vec3 skyRadiance = cb.atmosphereArgs.useSkyViewLut != 0
-        ? sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0)
-        : evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                          AtmosphereTransmittanceLut, AtmosphereMultiscatteringLut, AtmosphereAerosolPhaseLut, cb.isZUp != 0);
+      vec3 skyRadiance = sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
 
       // Mirror-like PSR paths never run NEE either, so without this a mirror reflecting the sky
       // shows no sun.

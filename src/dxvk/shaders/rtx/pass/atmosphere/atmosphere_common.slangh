@@ -721,29 +721,6 @@ vec3 evalSunDisk(vec3 viewDir, Texture2D transmittanceLut, AtmosphereArgs args, 
   return min(radiance, vec3(kMaxSunDiscRadiance));
 }
 
-// Sky radiance for a view direction, ray marched inline rather than sampled from the sky-view LUT.
-vec3 evalSkyRadiance(
-  vec3 viewDir,
-  AtmosphereArgs args,
-  Texture2D transmittanceLut,
-  Texture2D multiscatteringLut,
-  Texture2D aerosolPhaseLut,
-  bool isZUp = false
-) {
-  const vec3 viewDirYUp = normalize(isZUp ? vec3(viewDir.x, viewDir.z, viewDir.y) : viewDir);
-
-  // Camera on the local vertical at the configured altitude, in Y-up space.
-  const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, kPlanetRadiusOffset), 0.0f);
-
-  const vec3 radiance = evalAtmosphereRadiance(
-    cameraPos, viewDirYUp, args.sunDirection, args, transmittanceLut, multiscatteringLut, aerosolPhaseLut,
-    int(args.skyViewStepCount));
-
-  // The sun disc is left to the caller, so paths that already sampled the sun through next event
-  // estimation do not double count it.
-  return max(radiance, vec3(0.0f));
-}
-
 // Latitude uses the paper's Section 5.3 compression, which concentrates texels toward the horizon
 // where the sky varies fastest. These two must stay exact inverses or the horizon will shear.
 float skyViewLutElevationToV(float elevation) {
@@ -757,10 +734,9 @@ float skyViewLutVToElevation(float v) {
   return sign(centered) * centered * centered * (0.5f * kPi);
 }
 
-// Sample the precomputed sky-view LUT instead of ray marching per miss ray. The bake in
-// sky_view_lut.comp.slang uses the same evalAtmosphereRadiance() as evalSkyRadiance(), so this
-// matches it up to LUT resolution and fp16 filtering. The LUT is a parameter because this header is
-// also compiled into the bake passes, where the runtime binding does not exist.
+// Sky radiance on miss rays, without the sun disc so paths that sampled the sun through next event
+// estimation do not double count it. The LUT is a parameter because this header is also compiled into
+// the bake passes, where the runtime binding does not exist.
 vec3 sampleSkyViewLutRadiance(
   Texture2D skyViewLut,
   vec3 viewDir,

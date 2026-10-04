@@ -1706,12 +1706,6 @@ namespace dxvk {
 
       RtCamera::showImguiSettings();
 
-      if (RemixGui::CollapsingHeader("Manager", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        RemixGui::Checkbox("Log Main Camera Updates", &CameraManager::logMainCameraUpdatesObject());
-        ImGui::Unindent();
-      }
-
       {
         ImGui::PushID("CameraInfos");
         auto& cameraManager = ctx->getCommonObjects()->getSceneManager().getCameraManager();
@@ -3342,11 +3336,6 @@ namespace dxvk {
               RemixGui::SetTooltipToLastWidgetOnHover(preset.tooltip);
             }
           }
-
-          ImGui::Separator();
-
-          RemixGui::Checkbox("Use Sky View LUT", &RtxOptions::useSkyViewLutObject());
-          RemixGui::SetTooltipToLastWidgetOnHover("Sample the precomputed sky-view LUT on ray misses instead of ray marching the atmosphere per ray.\nVisually identical at a fraction of the GPU cost; disable only to A/B compare against the reference inline evaluation.");
 
           ImGui::Separator();
           ImGui::Text("Sun:");
@@ -4996,7 +4985,6 @@ namespace dxvk {
             "Consecutive frames the automatic rules must agree before the player model shows on primary rays.\n"
             "Leaving the external-camera state is always immediate.");
         }
-        RemixGui::Checkbox("Log Camera Regime", &RtxOptions::PlayerModel::logCameraRegimeObject());
 
         const InstanceManager& instanceManager = common->getSceneManager().getInstanceManager();
         const float playerDistance = instanceManager.getPlayerModelBodyCameraDistance();

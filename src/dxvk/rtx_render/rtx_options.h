@@ -554,11 +554,6 @@ namespace dxvk {
                  "Guards against momentary signal dropouts - a camera cut that costs one frame of overlay\n"
                  "geometry, a frame where the player's own draws leave the tagged set - flipping the body\n"
                  "into view. Does not apply to enableInPrimarySpace.");
-      RTX_OPTION_FLAG("rtx.playerModel", bool, logCameraRegime, false, RtxOptionFlags::NoSave,
-                      "Log the external-camera regime decision whenever its inputs change, and every\n"
-                      "player-model instance's pose and world anchor once a second. Use when the player model\n"
-                      "or its shadow appears on primary rays at the wrong time, or when a character renders\n"
-                      "in bind pose (which means its instance is not being told apart from another copy).");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
       RTX_OPTION("rtx.playerModel", bool, autoDetectHeldEquipment, true,
                  "Automatically treat the world-space copy of view-model-drawn meshes as player-model geometry.\n"
@@ -1462,10 +1457,6 @@ namespace dxvk {
                "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
 
     // Atmosphere parameters
-    RTX_OPTION("rtx.atmosphere", bool, useSkyViewLut, true,
-               "Sample the precomputed sky-view LUT for sky radiance on ray misses instead of ray marching the atmosphere per ray. "
-               "The LUT is generated with the same scattering evaluation, so the result is visually identical at a fraction of the GPU cost. "
-               "Disable only to A/B compare against the reference inline evaluation.");
     RTX_OPTION("rtx.atmosphere", bool, aerialPerspective, true,
                "Apply the atmosphere's in-scatter and extinction to scene geometry through a camera fitted froxel "
                "volume (paper Section 5.4). This is what gives distant buildings and terrain their haze and "
@@ -1653,7 +1644,7 @@ namespace dxvk {
                "boundary layer need about 40. The bake only runs when the medium changes.",
                args.minValue = 4, args.maxValue = 128);
     RTX_OPTION_ARGS("rtx.atmosphere", int, skyViewSteps, 128,
-               "Ray march steps of the sky-view LUT bake, and of the inline sky when useSkyViewLut is off. The steps are "
+               "Ray march steps of the sky-view LUT bake. The steps are "
                "packed toward the viewer, where the boundary layer haze is: 32 leaves a few percent of error around the "
                "sun in hazy air, 128 is within 0.3% of a converged march. The bake only runs when the atmosphere or "
                "sun changes.",

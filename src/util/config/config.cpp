@@ -126,8 +126,6 @@ namespace dxvk {
       { "rtx.tonemappingMode",                                       "2" },
       { "rtx.d3d9.rasterizeFullscreenCompositeToPrimary",            "True" },
       { "rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache",             "True" },
-      { "rtx.d3d9.ue3ExactVertexCapture",                            "True" },
-      { "rtx.d3d9.ue3NativeLocalMeshVertexCapture",                  "True" },
       { "rtx.d3d9.ue3DisableFrustumCulling",                         "True" },
       { "rtx.d3d9.ue3ShowThirdPersonModel",                          "True" },
       { "rtx.d3d9.ue3DisableOcclusionQueries",                       "True" },

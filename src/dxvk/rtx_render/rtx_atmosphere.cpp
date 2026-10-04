@@ -538,7 +538,6 @@ namespace dxvk {
       args.sunRayBrightness = 0.0f;
       args.sunDiscEnabled = 0;
       args.viewAltitude = 0.0f;
-      args.useSkyViewLut = 0;
       args.sunAngularRadius = 0.0f;
       args.sunDiscIlluminance = vec3(0.0f, 0.0f, 0.0f);
       args.sunIlluminanceAerosol = vec3(0.0f, 0.0f, 0.0f);
@@ -634,8 +633,6 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   // View Altitude (converted m to km). fillAerialPerspectiveArgs() adds the camera height when enabled.
   args.viewAltitude = RtxOptions::altitude() * 0.001f;
   args.aerialPerspectiveViewAltitude = args.viewAltitude;
-
-  args.useSkyViewLut = RtxOptions::useSkyViewLut() ? 1u : 0u;
 
   // LUT dimensions
   args.transmittanceLutWidth = kTransmittanceLutWidth;

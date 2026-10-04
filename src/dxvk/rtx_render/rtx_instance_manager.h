@@ -488,9 +488,6 @@ private:
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
 
-  // Held-equipment transition logging (see detectHeldEquipmentInstances)
-  size_t m_heldEquipmentLastWinnerCount = SIZE_MAX;
-
   // Previous frame's view-model FOV, for detecting in-progress zoom transitions.
   float m_heldEquipmentPrevFovDegrees = -1.f;
 
@@ -498,12 +495,6 @@ private:
   float m_playerModelBodyCameraDistance = -1.f;
   bool m_externalCameraRegime = false;
   bool m_viewModelHidden = false;
-
-  // Reports each player-model instance's pose and world anchor (rtx.playerModel.logCameraRegime).
-  // Shows whether instances of a shared skeletal mesh are being told apart, and where each one
-  // actually sits relative to the camera.
-  void logPlayerModelInstances(const Vector3& cameraPosition);
-  uint32_t m_lastLoggedPlayerModelInstancesFrame = 0;
 
   // World instances currently classified as held equipment, mapped to the frame their
   // view-model twin last confirmed them. Classification outlives twin loss through a short

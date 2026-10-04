@@ -135,31 +135,11 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3EngineMode, false,
                "Master toggle for Unreal Engine 3 D3D9 compatibility. Also defaults rtx.zUp to True, UE3 being a "
                "Z-up engine, unless a config file sets it explicitly.");
-    RTX_OPTION("rtx.d3d9", bool, ue3CameraFromShaderConstants, false,
-               "UE3 compat: derive World/View and View/Projection matrices from UE3 reserved shader constants. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3ObjectToWorldFromShaderConstants, false,
-               "UE3 compat: extract LocalToWorld from vertex shader constants using shader CTAB and use it for object transforms. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, autoRaytracedRenderTargetFromFullscreenComposite, false,
                "D3D9 compat: auto-detect an offscreen render target being used as the main scene (sampled in a fullscreen composite pass) "
                "and treat it as a raytraced render target to capture the correct geometry in games that upscale/composite to the backbuffer.");
     RTX_OPTION("rtx.d3d9", bool, rasterizeFullscreenCompositeToPrimary, false,
                "D3D9 compat: rasterise likely fullscreen composite/postprocess passes to the primary render target. Helps avoid raytracing a fullscreen quad.");
-    RTX_OPTION("rtx.d3d9", bool, shaderPathTexcoordIndexFromPixelShader, false,
-               "Shader-path compat: infer TEXCOORD set used by pixel shader rather than trusting D3DTSS_TEXCOORDINDEX. "
-               "Helps UE3 games where fixed-function stage state is stale or incorrect when shaders are active. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3MaterialInstanceConstantHash, false,
-               "UE3 MaterialInstanceConstant support: deterministic child-level material identity composed of the "
-               "pixel shader bytecode hash, the ordered set of textures bound to the shader's material samplers "
-               "(CTAB names Texture2D_*/TextureCube_*), and the shader's material constants (CTAB UniformVector_*/"
-               "UniformScalar_* registers). Distinguishes material instances by their TextureParameterValues, "
-               "StaticSwitchParameters and VectorParameterValues/ScalarParameterValues, enabling tagging at the "
-               "child level instead of broadly at the parent level. Constant registers carrying frame-varying "
-               "expression values (Time, panners, fades, sub-UV frames) are recognised from shader dataflow and "
-               "left out of the identity - see rtx.d3d9.ue3MicVolatileConstantDetection. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3AutoDetectLightmapTextures, true,
                "UE3 compat: treat every texture bound to a lightmap sampler as if it had been listed in "
                "rtx.lightmapTextures. UE3 declares its baked lighting under fixed CTAB sampler names "
@@ -286,16 +266,6 @@ namespace dxvk {
                "unavoidable: their identity was not reproducible in the first place.\n"
                "Turning this off restores raw all-UniformVector_* identity and re-mints the hashes of every "
                "material carrying a volatile register.");
-    RTX_OPTION("rtx.d3d9", bool, ue3TexturelessIdentityFromBytecode, false,
-               "UE3 MaterialInstanceConstant support: seed the identity of a material with no "
-               "identity-bearing texture (constant-colour and lightmap-only materials, and materials whose "
-               "only textures are lighting inputs) from its pixel shader bytecode hash instead of its "
-               "canonical signature. UE3 compiles one base pass per lightmap policy, so a bytecode seed "
-               "gives such a material a different hash under DirectionalLightmaps=True, =False and with "
-               "Mirror's Edge's TdBicubicFiltering; the canonical signature (the material's kept "
-               "UniformVector_* names and the literals that reach its colour output unlit) is the same in "
-               "every permutation. Enable this only to keep replacements that were anchored on the old "
-               "bytecode-seeded hashes matching until they have been re-anchored.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
                "UE3 MaterialInstanceConstant support: pixel shader hashes whose UniformVector_* constants are "
                "excluded from material identity hashing wholesale. Reach for this only when every material on "
@@ -355,14 +325,6 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", fast_unordered_set, vsTexcoordCaptureOutlierTextures, {},
                "Texture hashes for which VS-captured texcoords should be overridden with IA (input assembler) texcoords. "
                "Useful as a compatibility fallback when certain textures appear stretched due to incorrect VS texcoord capture.");
-    RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthPrepass, false,
-               "UE3 multi-pass compat: skip draw calls using a position-only vertex declaration (no texcoords/colors), "
-               "which are characteristic of UE3 depth prepass draws. The geometry will be captured during the base pass instead. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3SkipShadowDepthPasses, false,
-               "UE3 multi-pass compat: skip draw calls targeting small square render targets (typical of shadow depth maps). "
-               "Prevents shadow-pass geometry from being incorrectly captured as scene geometry. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3AutoCullEnclosingMeshShadowBackfaces, false,
                "UE3 compat: on shadow/NEE visibility rays, ignore inward backfaces of one-sided opaque meshes whose object AABB contains the camera.\n"
                "For wrapping building shells around BSP interiors. Gated by rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters / MaxExtentMeters. Requires rtx.d3d9.ue3EngineMode. Off by default; geometry tagging is more precise.");
@@ -372,27 +334,6 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", float, ue3AutoCullEnclosingMeshMaxExtentMeters, 150.0f,
                "Maximum world-space mesh extent (meters) for rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces. "
                "Keeps whole-level BSP models from being treated as enclosing shells.");
-    RTX_OPTION("rtx.d3d9", bool, ue3SkipDepthTestDisabledTranslucency, false,
-               "UE3 translucency compat: skip alpha-blended draw calls that have depth test and depth write both disabled. "
-               "These are typically UE3 NeedsDepthTestDisabled materials (e.g. fullscreen overlays, fog volume composites) "
-               "that should not create RT geometry. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3SkipSceneCapturePasses, false,
-               "UE3 multi-pass compat: fully ignore UE3 SceneCapture rendering. SceneCapture probes "
-               "(SceneCapture2D/Reflect/Portal actors: security monitors, mirrors, scripted window reflections) "
-               "re-render the world from their own camera before the main view into the shared SceneColor render "
-               "target, with genuine ViewProjectionMatrix/CameraPosition constants - without this option the "
-               "capture camera can steal the Main camera for a frame (momentary camera flips) and capture "
-               "geometry is ingested into the ray-traced scene through mirrored or oblique-clipped views, "
-               "corrupting it. World-geometry draws are dropped when any capture signal matches: viewport "
-               "strictly smaller than half the backbuffer in both dimensions (probe-sized targets; exact-half "
-               "splitscreen viewports are never matched), a sub-full viewport whose aspect does not match the "
-               "backbuffer (e.g. square probe RTs on widescreen), a mirrored view-projection (negative 3x3 "
-               "determinant, reflect probes' FMirrorMatrix), or a CTAB-declared camera that fails plausibility "
-               "extraction (reflect/portal probes' oblique FClipProjectionMatrix near-plane clip; the main "
-               "view always extracts). Sub-main-view-sized world draws also cannot update the Main camera. "
-               "Skipped draws are removed entirely while ray tracing, so probe target textures show "
-               "their last resolved content - visually equivalent to running with 'show scenecapture' toggled "
-               "off. Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3ForegroundDpgIsViewModel, true,
                "UE3 compat: classify SDPG_Foreground draws as view-model (first-person overlay) geometry. "
                "UE3 renders the foreground depth priority group (first-person arms, held weapon, muzzle flash) "
@@ -676,20 +617,6 @@ namespace dxvk {
                "far index-paired instances moved between frames, and how often a batch could not be compared because "
                "its instance count changed. A mean displacement on the scale of a batch's own extent would mean the "
                "game reorders its instance buffer, making that option unsound.");
-    RTX_OPTION("rtx.d3d9", bool, ue3RequireCtabCameraConstants, false,
-               "UE3 compat: only allow a draw call to update the Main camera when its vertex shader CTAB explicitly "
-               "names both ViewProjectionMatrix and CameraPosition constants. Engine utility shaders (shadow depth, "
-               "filters, etc.) do not declare these, so whatever data happens to live in the fallback camera registers "
-               "(c0..c4) can otherwise be misinterpreted as a one-frame Main camera (e.g. a light-space matrix during "
-               "UE3 light environment updates). Geometry from unverified draws is still rendered normally. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
-    RTX_OPTION("rtx.d3d9", bool, ue3StableDiffuseSelection, false,
-               "Shader-path compat: cache the diffuse/albedo sampler selection per (pixel shader, bound texture set, "
-               "sRGB states, vertex factory) so the same material always resolves to the same albedo texture. "
-               "Without this, selection heuristics that read live shader constants (UE3 rewrites uniform expression "
-               "registers per draw for panner/time/view-driven materials) can flip the chosen sampler between frames "
-               "or with camera position, making a surface's albedo switch to an unrelated texture. "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
     RTX_OPTION("rtx.d3d9", bool, ue3StreamingStableTextureHashing, true,
                "UE3 compat: derive Remix texture hashes from the small-mip tail (mips at or below 64px, plus format and "
                "aspect ratio) instead of the top mip. UE3 texture streaming creates a new D3D9 texture object per "
@@ -726,12 +653,7 @@ namespace dxvk {
                "register could not be recognised from dataflow - a fade or tint the bytecode cannot "
                "distinguish from an authored parameter - announces itself instead of quietly breaking the "
                "replacements anchored on it. It costs nothing until a family actually churns, so unlike "
-               "rtx.logReplacementResolution it is on by default. Only active when material instance hashing "
-               "is enabled (rtx.d3d9.ue3MaterialInstanceConstantHash or rtx.d3d9.ue3EngineMode).");
-    RTX_OPTION("rtx.d3d9", bool, ue3LogClassification, false,
-               "UE3 compat: emits once-per-identity [UE3-Particle] lines (hashes, albedo, category bits, blend) "
-               "for Particle / ParticleBeamTrail / LensFlare draws. The per-draw pass/vertex-factory classification "
-               "decisions are logged at debug level, so they additionally need DXVK_LOG_LEVEL=debug.");
+               "rtx.logReplacementResolution it is on by default. Only active when rtx.d3d9.ue3EngineMode is enabled.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
@@ -777,19 +699,6 @@ namespace dxvk {
                "asset geometry hash is what replacements anchor on, so this is also how to confirm a mesh's hash is "
                "stable across sessions. Logged once per draw identity, but resolving the geometry hash synchronously "
                "costs a worker sync - leave the list empty in normal use.");
-    RTX_OPTION("rtx.d3d9", bool, ue3LogDrawStatusFlaps, false,
-               "UE3 compat diagnostics: detect draws whose raytracing status (raytraced/rasterized/ignored) changes "
-               "between nearby frames and log the transition with pass classification and shader hashes. A draw whose "
-               "status flaps frame-to-frame manifests as geometry flickering in and out of the raytraced scene; this "
-               "probe identifies which submission-side decision is responsible. Logs are capped per draw identity.");
-    RTX_OPTION("rtx.d3d9", bool, ue3LogOcclusionQueries, false,
-               "Occlusion query diagnostics: log bracketed test draws (fragment-test state, viewport, world "
-               "AABB, whether the view origin sits inside it; capped), 0-sample completions with their "
-               "recorded bracket contents (capped), and a periodic summary (bracket/draw/result counts, "
-               "empty brackets, zero-result causes, pending readbacks, min/max sample counts). Diagnoses "
-               "games whose hardware occlusion culling misbehaves under ray tracing - meshes hidden or "
-               "flickering, render thread stalling on readbacks - by showing what was queried and what the "
-               "game read back.");
     RTX_OPTION("rtx.d3d9", bool, deferredUiReplay, true,
                "Replay behavior for deferred UI overlay draws (rtx.deferredUiTextures / rtx.d3d9.deferredUiPixelShaders): "
                "when enabled, each tagged draw is snapshotted (vertex/index data, shaders, constants, textures, blend "
@@ -851,14 +760,6 @@ namespace dxvk {
       */
     void BeginOcclusionQuery() {
       ++m_activeOcclusionQueries;
-      ++m_oqBracketCounter;
-      if (m_frameOptions.ue3LogOcclusionQueries) {
-        ++m_oqDiag.brackets;
-        m_oqDiag.drawsInCurrentBracket = 0;
-        auto& record = m_oqRecords[m_oqBracketCounter & (kOcclusionQueryRecordCount - 1)];
-        record = {};
-        record.bracketId = m_oqBracketCounter;
-      }
     }
 
     /**
@@ -867,37 +768,7 @@ namespace dxvk {
     void EndOcclusionQuery() {
       --m_activeOcclusionQueries;
       assert(m_activeOcclusionQueries >= 0);
-      if (m_frameOptions.ue3LogOcclusionQueries &&
-          m_activeOcclusionQueries == 0 &&
-          m_oqDiag.drawsInCurrentBracket == 0) {
-        // A measured empty bracket is guaranteed to report 0 samples passed.
-        ++m_oqDiag.emptyBrackets;
-      }
     }
-
-    /**
-      * \brief: Diagnostics: count an occlusion query readback that found the result not yet
-      * available (see rtx.d3d9.ue3LogOcclusionQueries).
-      */
-    void TrackOcclusionQueryPendingRead() {
-      if (m_frameOptions.ue3LogOcclusionQueries) {
-        ++m_oqDiag.pendingReads;
-      }
-    }
-
-    /**
-      * \brief: Identifier of the most recently begun occlusion query bracket; stamped onto the
-      * query object so its eventual result can be correlated with the recorded bracket contents.
-      */
-    uint32_t GetCurrentOcclusionBracketId() const {
-      return m_oqBracketCounter;
-    }
-
-    /**
-      * \brief: Diagnostics: record an occlusion query result as it becomes available to the
-      * application (see rtx.d3d9.ue3LogOcclusionQueries).
-      */
-    void TrackOcclusionQueryResult(DWORD samplesPassed, uint32_t bracketId);
 
     /**
       * \brief: True when conservative occlusion query behaviour is active: occlusion query
@@ -1205,46 +1076,6 @@ namespace dxvk {
     DWORD m_prevDrawCullMode = 0;
 
     int m_activeOcclusionQueries = 0;
-    uint32_t m_oqBracketCounter = 0;
-
-    // Diagnostics for rtx.d3d9.ue3LogOcclusionQueries: bracket/result statistics flushed
-    // periodically from EndFrame, plus capped one-off detail logs.
-    struct OcclusionQueryDiagnostics {
-      uint32_t brackets = 0;
-      uint32_t emptyBrackets = 0;
-      uint32_t bracketedDraws = 0;
-      uint32_t drawsInCurrentBracket = 0;
-      uint32_t results = 0;
-      uint32_t zeroResults = 0;
-      uint32_t zeroCameraInside = 0;
-      uint32_t zeroSmallViewport = 0;
-      uint32_t pendingReads = 0;
-      DWORD minResult = ~0u;
-      DWORD maxResult = 0;
-      uint32_t framesSinceSummary = 0;
-      uint32_t stateSnapshotLogsRemaining = 12;
-      uint32_t zeroResultLogsRemaining = 24;
-    };
-    OcclusionQueryDiagnostics m_oqDiag;
-
-    // Per-bracket record of what was drawn inside an occlusion query, so a query result that
-    // arrives frames later can be correlated with the geometry that produced it. Ring-indexed
-    // by bracket id; sized for several frames of query traffic.
-    struct OcclusionQueryBracketRecord {
-      uint32_t bracketId = 0;
-      uint16_t drawCount = 0;
-      uint16_t primCount = 0;
-      uint16_t viewportW = 0;
-      uint16_t viewportH = 0;
-      bool conservativeActive = false;
-      bool cameraInsideBox = false;
-      float cameraToBoxDistance = 0.0f;
-      Vector3 boxMin = Vector3(0.0f);
-      Vector3 boxMax = Vector3(0.0f);
-      Vector3 cameraPos = Vector3(0.0f);
-    };
-    static constexpr uint32_t kOcclusionQueryRecordCount = 4096; // power of two
-    std::array<OcclusionQueryBracketRecord, kOcclusionQueryRecordCount> m_oqRecords = {};
 
     Rc<DxvkBuffer> m_vsVertexCaptureData;
 
@@ -1700,9 +1531,6 @@ namespace dxvk {
     // selection cache keys already dumped by rtx.d3d9.ue3LogAlbedoSelection
     fast_unordered_set m_loggedAlbedoSelections;
 
-    // draw identities already dumped as [UE3-Particle] by rtx.d3d9.ue3LogClassification
-    fast_unordered_set m_loggedUe3ParticleDraws;
-
     // per-texture spread over distinct pixel shaders: textures sampled by many unrelated
     // materials are shared detail/pattern/tint overlays rather than surface identity albedo.
     // Persisted across sessions (rtx-remix/ue3TextureSpread.cache). `count` accumulates every
@@ -1724,27 +1552,14 @@ namespace dxvk {
     void loadUe3TextureSpreadCache();
     void saveUe3TextureSpreadCache();
 
-    // Diagnostic state for rtx.d3d9.ue3LogDrawStatusFlaps: per draw identity, the
-    // prepare-flags outcome of the previous sighting, to detect frame-to-frame flapping
-    struct Ue3DrawStatusEntry {
-      uint32_t lastFlags = 0;
-      uint32_t lastFrame = 0;
-      const char* lastDecision = "";
-      uint8_t lastPassType = 0;
-      uint8_t logCount = 0;
-    };
-    fast_unordered_cache<Ue3DrawStatusEntry> m_ue3DrawStatusCache;
     uint32_t m_ue3FrameCounter = 0;
-    const char* m_ue3LastDrawDecision = "";
 
     XXH64_hash_t mixUe3InstanceTransformConstants(XXH64_hash_t seed) const;
-    void trackUe3DrawStatusFlap(const DrawContext& drawContext, PrepareDrawFlags flags);
     void logUe3UnboundAlbedoOnce(const D3D9CommonShader* pixelShader,
                                  XXH64_hash_t psHash,
                                  uint32_t usedSamplerMask,
                                  uint32_t usedTextureMask,
                                  const PsSamplerTexcoordEntry* inferredEntry);
-    void logUe3ParticleDrawOnce();
     // rtx.d3d9.ue3ParticleVertexColor and rtx.d3d9.ue3MaterialFades for the draw being prepared.
     void applyUe3MaterialFades(XXH64_hash_t psHash, const std::vector<uint8_t>& bytecode,
                                const D3D9CommonShader* pixelShader, XXH64_hash_t textureSetShaderHash);
@@ -2093,14 +1908,8 @@ namespace dxvk {
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
 
     // Occlusion-test draws whose query result is synthesized are ignored by the draw entry points
-    // before the draw contexts are built. Returns false when the full path has to run instead
-    // (diagnostics that record bracketed draws or draw status flaps).
+    // before the draw contexts are built.
     bool ignoreOcclusionTestDrawEarly();
-
-    void recordOcclusionQueryBracketedDraw(const VertexContext vertexContext[caps::MaxStreams],
-                                           const DrawContext& drawContext);
-
-    void flushOcclusionQueryDiagnostics();
 
     // A null targetImage injects into the backend's bound RT0. An hdrCanvas stages the injection
     // (see RtxContext::injectRTX), and finishInjectRTX must follow.
@@ -2273,22 +2082,13 @@ namespace dxvk {
       bool useVertexCapturedNormals = false;
       bool useWorldMatricesForShaders = false;
       bool ue3EngineMode = false;
-      bool ue3CameraFromShaderConstants = false;
-      bool ue3ObjectToWorldFromShaderConstants = false;
       bool autoRaytracedRenderTargetFromFullscreenComposite = false;
       bool rasterizeFullscreenCompositeToPrimary = false;
-      bool shaderPathTexcoordIndexFromPixelShader = false;
-      bool ue3MaterialInstanceConstantHash = false;
       bool ue3MicConstantIdentity = false;
       bool ue3MicExcludeRenderTargetsFromIdentity = true;
       bool ue3MicVolatileConstantDetection = true;
-      bool ue3TexturelessIdentityFromBytecode = false;
       bool ue3ReportMicIdentityChurn = true;
       bool ue3LogMaterialInstanceHash = false;
-      bool ue3SkipDepthPrepass = false;
-      bool ue3SkipShadowDepthPasses = false;
-      bool ue3SkipDepthTestDisabledTranslucency = false;
-      bool ue3SkipSceneCapturePasses = false;
       bool ue3ForegroundDpgIsViewModel = false;
       bool conservativeOcclusionQueries = false;
       bool eventQueryCsCompletion = false;
@@ -2317,8 +2117,6 @@ namespace dxvk {
       float ue3DecomposedInstanceCullDistance = 0.f;
       bool ue3StableDecomposedInstanceIdentity = false;
       bool ue3LogInstancedDrawStats = false;
-      bool ue3RequireCtabCameraConstants = false;
-      bool ue3StableDiffuseSelection = false;
       bool ue3AutoDetectLightmapTextures = false;
       float ue3ConstantAlbedoTintGain = 0.f;
       bool ue3HighlightTints = false;
@@ -2330,14 +2128,11 @@ namespace dxvk {
       bool ue3MaterialFades = false;
       bool ue3LogMaterialFades = false;
       float ue3MaterialFadeDebugForceCoverage = -1.f;
-      bool ue3LogClassification = false;
       bool ue3LogUvResolution = false;
       bool ue3LogUvAffineDetail = false;
       bool ue3LogAlbedoSelection = false;
       bool ue3LogCapturePrecision = false;
       bool ue3LogInstancedDraws = false;
-      bool ue3LogDrawStatusFlaps = false;
-      bool ue3LogOcclusionQueries = false;
       bool deferredUiReplay = false;
       bool deferredUiRefreshSceneColor = false;
       bool deferredUiHdrReplay = false;

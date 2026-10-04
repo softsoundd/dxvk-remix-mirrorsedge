@@ -153,7 +153,6 @@ namespace dxvk {
         m_state != D3D9_VK_QUERY_BEGUN &&
         m_parent->RTX().ConservativeOcclusionQueriesEnabled()) {
       m_dataCache.Occlusion = m_parent->RTX().GetConservativeOcclusionQueryResult();
-      m_parent->RTX().TrackOcclusionQueryResult(m_dataCache.Occlusion, m_rtxOcclusionBracketId);
       m_state = D3D9_VK_QUERY_CACHED;
       if (likely(pData && dwSize)) {
         memcpy(pData, &m_dataCache, dwSize);
@@ -163,13 +162,6 @@ namespace dxvk {
     // NV-DXVK end
 
     HRESULT hr = this->GetQueryData(pData, dwSize);
-
-    // NV-DXVK start: occlusion query diagnostics - quantify readback latency (games spin on
-    // pending readbacks; each attempt is a synchronous bridge round trip for 32-bit games)
-    if (m_queryType == D3DQUERYTYPE_OCCLUSION && hr == S_FALSE) {
-      m_parent->RTX().TrackOcclusionQueryPendingRead();
-    }
-    // NV-DXVK end
 
     // NV-DXVK start: CPU frame breakdown - measure how long the game polls a pending EVENT query.
     // The first S_FALSE starts the clock, the D3D_OK that ends the poll loop stops it.
@@ -279,10 +271,6 @@ namespace dxvk {
 
         case D3DQUERYTYPE_OCCLUSION:
           m_dataCache.Occlusion = DWORD(queryData[0].occlusion.samplesPassed);
-          // NV-DXVK start: occlusion query diagnostics - only reached when conservative
-          // occlusion queries are inactive (GetData otherwise answers with a synthesized result)
-          m_parent->RTX().TrackOcclusionQueryResult(m_dataCache.Occlusion, m_rtxOcclusionBracketId);
-          // NV-DXVK end
           break;
 
         case D3DQUERYTYPE_TIMESTAMP:

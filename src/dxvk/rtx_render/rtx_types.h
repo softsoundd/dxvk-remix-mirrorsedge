@@ -786,10 +786,9 @@ struct DrawCallState {
   XXH64_hash_t programmableVertexShaderBytecodeHash = 0;
 
   // False when the camera matrices came from unverified fallback shader-constant registers rather
-  // than CTAB-named ViewProjectionMatrix/CameraPosition constants (see
-  // rtx.d3d9.ue3RequireCtabCameraConstants). Such draws render normally but must not update the
-  // Main camera: engine utility passes (e.g. shadow depth) upload light-space matrices through
-  // those registers that can reconstruct as a plausible camera.
+  // than CTAB-named ViewProjectionMatrix/CameraPosition constants. Such draws render normally but
+  // must not update the Main camera: engine utility passes (e.g. shadow depth) upload light-space
+  // matrices through those registers that can reconstruct as a plausible camera.
   bool allowMainCameraUpdate = true;
 
   // UE3 pass classification for diagnostics (points to a static string)

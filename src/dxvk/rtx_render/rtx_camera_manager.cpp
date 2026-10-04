@@ -23,8 +23,6 @@
 
 #include "dxvk_device.h"
 
-#include <cmath>
-
 namespace {
   constexpr float kFovToleranceRadians = 0.001f;
 }
@@ -128,15 +126,7 @@ namespace dxvk {
     // Unverified camera constants (see DrawCallState::allowMainCameraUpdate) must not steer the
     // Main camera; the draw itself still renders through the Unknown-camera fallback.
     if (cameraType == CameraType::Main && !input.allowMainCameraUpdate) {
-      if (logMainCameraUpdates()) {
-        Logger::info(str::format(
-          "[RTX-Compatibility] CameraManager: skipped Main camera update from unverified camera constants on frame ", frameId,
-          "; vsHash=0x", std::hex, input.programmableVertexShaderBytecodeHash, std::dec,
-          ", pass=", input.ue3PassDescription,
-          ", drawCallID=", input.drawCallID));
-      } else {
-        ONCE(Logger::info("[RTX-Compatibility] CameraManager: skipped Main camera update from a draw with unverified camera constants (likely an engine utility pass)."));
-      }
+      ONCE(Logger::info("[RTX-Compatibility] CameraManager: skipped Main camera update from a draw with unverified camera constants (likely an engine utility pass)."));
       return CameraType::Unknown;
     }
 
@@ -155,28 +145,6 @@ namespace dxvk {
     bool isCameraCut = false;
     Matrix4 worldToView = input.getTransformData().worldToView;
     Matrix4 viewToProjection = input.getTransformData().viewToProjection;
-
-    // Logging-only; the previous Main pose must be captured before camera.update() overwrites it.
-    const bool hadPreviousMainCamera =
-      logMainCameraUpdates() &&
-      shouldUpdateMainCamera &&
-      frameId > 0 &&
-      getCamera(CameraType::Main).isValid(frameId - 1);
-    Vector3 previousMainPosition(0.0f);
-    Vector3 previousMainDirection(0.0f);
-    float previousMainFov = 0.0f;
-
-    if (hadPreviousMainCamera) {
-      const RtCamera& prevMain = getCamera(CameraType::Main);
-      previousMainPosition = prevMain.getPosition(false);
-      previousMainDirection = prevMain.getDirection(false);
-      const float previousDirectionLength = length(previousMainDirection);
-      if (previousDirectionLength > 0.0f) {
-        previousMainDirection /= previousDirectionLength;
-      }
-      previousMainFov = prevMain.getFov();
-    }
-
     if (isPlaying || isBrowsing) {
       if (shouldUpdateMainCamera) {
         RtCamera::RtCameraSetting setting;
@@ -204,34 +172,6 @@ namespace dxvk {
     if (shouldUpdateMainCamera && RtCameraSequence::mode() == RtCameraSequence::Mode::Record) {
       auto& setting = camera.getSetting();
       cameraSequence->addRecord(setting);
-    }
-
-    if (shouldUpdateMainCamera && logMainCameraUpdates() && camera.isValid(frameId)) {
-      float positionDelta = 0.0f;
-      float directionDot = 1.0f;
-      float fovDiff = 0.0f;
-      if (hadPreviousMainCamera) {
-        Vector3 currentDirection = camera.getDirection(false);
-        const float currentDirectionLength = length(currentDirection);
-        if (currentDirectionLength > 0.0f) {
-          currentDirection /= currentDirectionLength;
-        }
-
-        positionDelta = std::sqrt(lengthSqr(camera.getPosition(false) - previousMainPosition));
-        directionDot = dot(currentDirection, previousMainDirection);
-        fovDiff = std::abs(camera.getFov() - previousMainFov);
-      }
-
-      Logger::info(str::format(
-        "[RTX-Compatibility] CameraManager: accepted Main camera on frame ", frameId,
-        "; positionDelta=", positionDelta,
-        ", directionDot=", directionDot,
-        ", fovDiff=", fovDiff,
-        ", cameraCut=", isCameraCut ? "true" : "false",
-        ", viewHistoryInvalidated=", camera.isViewHistoryInvalidated(frameId) ? "true" : "false",
-        ", vsHash=0x", std::hex, input.programmableVertexShaderBytecodeHash, std::dec,
-        ", pass=", input.ue3PassDescription,
-        ", drawCallID=", input.drawCallID));
     }
 
     // Register camera cut when there are significant interruptions to the view (like changing level, or opening a menu)

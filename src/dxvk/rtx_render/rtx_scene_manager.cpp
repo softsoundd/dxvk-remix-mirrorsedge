@@ -2690,54 +2690,6 @@ namespace dxvk {
     }
   }
 
-  void SceneManager::logCameraRegimeChange(const bool externalCameraRegime, const bool viewModelCameraValid,
-                                           const bool demotedForeground, const bool distanceExternal,
-                                           const bool noViewModelExternal, const float playerDistance,
-                                           const bool viewModelHidden, const float viewModelFovDegrees) {
-    const size_t playerModelInstances = m_instanceManager.getPlayerModelInstanceCount();
-
-    // The distances move every frame, so only the boolean state selects a new log line.
-    const uint32_t state =
-      (externalCameraRegime ? 1u : 0u) |
-      (viewModelCameraValid ? 2u : 0u) |
-      (demotedForeground ? 4u : 0u) |
-      (distanceExternal ? 8u : 0u) |
-      (noViewModelExternal ? 16u : 0u) |
-      (playerModelInstances > 0 ? 32u : 0u) |
-      (viewModelHidden ? 64u : 0u);
-
-    // Repeat unchanged states about once a second so the distances can be followed through a
-    // cutscene, rather than only reporting the frame it began.
-    constexpr uint32_t kRepeatIntervalFrames = 60;
-    const uint32_t frameId = m_device->getCurrentFrameId();
-    if (state == m_lastLoggedCameraRegime && frameId - m_lastLoggedCameraRegimeFrame < kRepeatIntervalFrames) {
-      return;
-    }
-    m_lastLoggedCameraRegime = state;
-    m_lastLoggedCameraRegimeFrame = frameId;
-
-    const char* rule = "first person";
-    if (RtxOptions::PlayerModel::enableInPrimarySpace()) {
-      rule = "enableInPrimarySpace";
-    } else if (distanceExternal) {
-      rule = externalCameraRegime ? "body distance" : "body distance (held)";
-    } else if (noViewModelExternal) {
-      rule = externalCameraRegime ? "no view model" : "no view model (held)";
-    }
-
-    Logger::info(str::format(
-      "[RTX-CameraRegime] external=", externalCameraRegime ? 1 : 0,
-      " rule=", rule,
-      " viewModelCamera=", viewModelCameraValid ? 1 : 0,
-      " demotedForeground=", demotedForeground ? 1 : 0,
-      " viewModelHidden=", viewModelHidden ? 1 : 0,
-      " viewModelFov=", viewModelFovDegrees,
-      " playerModelInstances=", playerModelInstances,
-      " playerCamDist=", playerDistance,
-      " autoExternalFrames=", m_autoExternalCameraFrames,
-      " frame=", frameId));
-  }
-
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
@@ -2941,14 +2893,6 @@ namespace dxvk {
                           (hideBelowFovDegrees > 0.f && viewModelFovDegrees < hideBelowFovDegrees);
       }
       m_instanceManager.setViewModelHidden(viewModelHidden);
-
-      // Logged last so it can report the view-model hiding decision alongside the regime: both
-      // remove the first-person overlay, and only the reported state distinguishes them.
-      if (RtxOptions::PlayerModel::logCameraRegime()) {
-        logCameraRegimeChange(externalCameraRegime, viewModelCameraValid, demotedForeground,
-                              distanceExternal, noViewModelExternal, playerDistance,
-                              viewModelHidden, viewModelFovDegrees);
-      }
     }
 
     // Needs the camera regime, and runs before held-equipment detection and virtual-instance

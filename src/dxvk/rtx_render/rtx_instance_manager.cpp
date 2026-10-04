@@ -24,7 +24,6 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
-#include <sstream>
 #include <vector>
 
 #include "rtx_context.h"
@@ -1915,8 +1914,6 @@ namespace dxvk {
     }
 
     m_playerModelBodyCameraDistance = std::sqrt(minDistanceSqr);
-
-    logPlayerModelInstances(cameraPosition);
   }
 
   void InstanceManager::hideDistantPlayerModelInstances(const CameraManager& cameraManager) {
@@ -1946,38 +1943,6 @@ namespace dxvk {
 
       // Dropped from the list so virtual instances are not created for it either.
       m_playerModelInstances.erase(m_playerModelInstances.begin() + i);
-    }
-  }
-
-  void InstanceManager::logPlayerModelInstances(const Vector3& cameraPosition) {
-    if (!RtxOptions::PlayerModel::logCameraRegime()) {
-      return;
-    }
-
-    // Throttled: this walks every player-model draw, and the question it answers - whether a
-    // second, stationary copy of the player mesh is being submitted - is visible at any sample.
-    constexpr uint32_t kIntervalFrames = 60;
-    const uint32_t frameId = m_device->getCurrentFrameId();
-    if (frameId - m_lastLoggedPlayerModelInstancesFrame < kIntervalFrames) {
-      return;
-    }
-    m_lastLoggedPlayerModelInstancesFrame = frameId;
-
-    for (const RtInstance* instance : m_playerModelInstances) {
-      const DrawCallState& input = instance->getBlas()->input;
-      const Vector3 anchor = getPlayerModelInstancePosition(*instance);
-
-      // A bone hash that never changes means the game is submitting the same pose every frame.
-      // One that changes while the mesh still renders in bind pose means the instance is being
-      // handed another copy's geometry instead of its own.
-      Logger::info(str::format(
-        "[RTX-PlayerModel] topologyHash=0x",
-        std::hex, std::uppercase, input.getGeometryData().getHashForRule<rules::TopologicalHash>(),
-        " boneHash=0x", input.getSkinningState().boneHash, std::nouppercase, std::dec,
-        " hasAnchor=", input.hasSkinnedWorldAnchor() ? 1 : 0,
-        " anchor=(", anchor.x, ", ", anchor.y, ", ", anchor.z, ")",
-        " camDist=", length(anchor - cameraPosition),
-        " frame=", frameId));
     }
   }
 
@@ -2090,24 +2055,6 @@ namespace dxvk {
         }
         ++it;
       }
-    }
-
-    // Log classification transitions (held-instance count changes) only.
-    const size_t heldCount = m_heldEquipmentInstances.size();
-    if (heldCount != m_heldEquipmentLastWinnerCount) {
-      m_heldEquipmentLastWinnerCount = heldCount;
-
-      std::ostringstream held;
-      for (const auto& [heldInstance, lastConfirmedFrame] : m_heldEquipmentInstances) {
-        held << std::hex << std::uppercase
-             << heldInstance->getBlas()->input.getGeometryData().getHashForRule<rules::TopologicalHash>()
-             << std::dec << " ";
-      }
-      Logger::debug(str::format(
-        "[RTX-HeldEquipment] held=[ ", held.str(),
-        "] externalCamera=", m_externalCameraRegime ? 1 : 0,
-        " viewModelHidden=", m_viewModelHidden ? 1 : 0,
-        " playerCamDist=", m_playerModelBodyCameraDistance));
     }
   }
 

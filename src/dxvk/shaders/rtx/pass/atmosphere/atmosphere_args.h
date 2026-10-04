@@ -74,7 +74,7 @@ struct AtmosphereArgs {
   uint skyViewLutHeight;
   float ozoneLayerWidth;  // Half-width of the ozone tent profile (km)
   float viewAltitude;     // Altitude of the baked LUTs' viewpoint (km), quantised when following the camera
-  uint useSkyViewLut;     // Sample the precomputed sky-view LUT at runtime instead of ray marching per miss ray
+  uint pad3;
   
   // Derived parameters (computed on CPU)
   float atmosphereRadius;  // planetRadius + atmosphereThickness
@@ -89,7 +89,7 @@ struct AtmosphereArgs {
   // Illuminance driving the light scattered by aerosol, whose spectral weights follow the aerosol's own
   // wavelength dependence rather than the Rayleigh sky's. Equal to sunIlluminance in the Manual mode.
   vec3 sunIlluminanceAerosol;
-  uint skyViewStepCount;  // Ray march steps of the sky-view LUT bake and the inline sky
+  uint skyViewStepCount;  // Ray march steps of the sky-view LUT bake
 
   // Hestroffer-Magnan limb darkening exponents per channel, I(mu) = mu^alpha. 0 = uniform disc.
   vec3 sunLimbDarkeningExponent;
