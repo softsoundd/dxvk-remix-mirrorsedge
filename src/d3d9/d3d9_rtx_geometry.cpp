@@ -141,7 +141,7 @@ namespace dxvk {
     }
   }
 
-  XXH64_hash_t D3D9Rtx::computeLiveGeometryVertexShaderHashComponent() {
+  XXH64_hash_t D3D9Rtx::computeGeometryVertexShaderHash() {
     XXH64_hash_t vertexShaderHash = kEmptyHash;
 
     if (m_parent->UseProgrammableVS() && m_frameOptions.useVertexCapture) {
@@ -216,7 +216,7 @@ namespace dxvk {
     // per draw in internalPrepareDraw (m_activeStableVsHash) and shared with the static
     // vertex-capture cache key; only the geometry-hash-specific folds happen here. Shared
     // with the geometry memo hit path so served hashes recombine to identical values.
-    const XXH64_hash_t vertexShaderHash = computeLiveGeometryVertexShaderHashComponent();
+    const XXH64_hash_t vertexShaderHash = computeGeometryVertexShaderHash();
 
     // Calculate this based on the RasterGeometry input data
     XXH64_hash_t geometryDescriptorHash = kEmptyHash;

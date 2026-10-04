@@ -22,13 +22,16 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "d3d9_state.h"
+#include "../util/util_fast_cache.h"
 #include "../dxso/dxso_material_fades.h"
 #include "../dxso/dxso_sampler_inference.h"
 #include "../dxso/dxso_ue3_material_identity.h"
@@ -59,15 +62,11 @@ namespace dxvk {
     uint32_t notFound = 0;
   };
 
-  // Per-draw result of the deterministic UV resolution:
-  // - LegacyTss: no provable resolution, behave like upstream (TSS index + optional capture fallbacks)
-  // - ProvenIa: PS origin + VS trace proved an exact IA texcoord set; use IA texcoords
-  // - CaptureInterpolant: PS origin proven but the VS path is procedural/unprovable;
-  //   capture the exact interpolant components from the VS output instead of guessing an IA set
+  // How a draw's UV set was resolved.
   enum class UvResolutionMode : uint8_t {
-    LegacyTss = 0,
-    ProvenIa,
-    CaptureInterpolant,
+    LegacyTss = 0,      // nothing proven: the TSS texcoord index, with the capture fallbacks
+    ProvenIa,           // the pixel and vertex shaders prove one IA texcoord set
+    CaptureInterpolant, // the origin is proven but the VS math is not: capture the interpolant
   };
 
   enum class Ue3VertexFactoryType : uint8_t {
@@ -131,23 +130,15 @@ namespace dxvk {
     uint32_t sourceIndex = 0;
   };
 
-  // Instance-order stability probe for rtx.d3d9.ue3StableDecomposedInstanceIdentity, whose pairing
-  // of instance i with instance i of the previous frame is only sound while the game keeps its
-  // instance buffer in a stable order. Measures how far index-paired instances moved between
-  // consecutive frames: small means the order held, displacements on the scale of the batch's own
-  // extent mean the pairing is meaningless.
+  // How far index-paired instances moved between frames (rtx.d3d9.ue3LogInstancedDrawStats): the
+  // pairing ue3StableDecomposedInstanceIdentity relies on holds only while this stays small.
   struct Ue3InstanceOrderProbe {
     std::vector<Vector3> translations;
     uint32_t lastFrame = 0;
   };
 
-  // Transform-free identity of the instanced batch the current draw belongs to, combined with an
-  // instance's index to name it across frames. kEmptyHash outside a decomposed draw.
-  //
-  // Deliberately not derived from the instance buffer: UE3 hands out a fresh or pooled instance
-  // buffer per frame, so its handle is not an identity. The mesh streams are stable, so a batch is
-  // identified by its mesh plus continuity of its own centroid - there are only a handful of
-  // instanced batches per frame, so matching them is trivially cheap.
+  // Transform-free identity of the current draw's instanced batch, combined with an instance's index
+  // to name it across frames; kEmptyHash outside a decomposed draw.
   struct Ue3InstancedBatchRecord {
     XXH64_hash_t id = kEmptyHash;
     Vector3 centroid = Vector3(0.f, 0.f, 0.f);
@@ -251,12 +242,8 @@ namespace dxvk {
     bool hasWindMatrices = false;
   };
 
-  // Full CTAB symbol table per vertex shader. Deliberately kept out of Ue3VsShaderCtabInfo,
-  // which is copied by value into m_currentUe3CtabInfo on every draw - putting strings in there
-  // would allocate per draw. Two consumers: naming registers for the constant-churn diagnostic,
-  // and resolving which registers are shading-only for the hash exclusions below. Filled
-  // unconditionally at parse time (once per unique shader) so enabling the diagnostic
-  // mid-session still names registers for shaders already seen.
+  // Kept out of Ue3VsShaderCtabInfo, which is copied per draw. Filled for every shader at parse time, so
+  // enabling the constant-churn diagnostic mid-session still names the registers of shaders already seen.
   struct Ue3VsConstantSymbol {
     uint32_t registerIndex = 0;
     uint32_t registerCount = 0;
@@ -278,11 +265,8 @@ namespace dxvk {
     };
     std::array<Range, kMaxRanges> cameraOnly = {};
     uint32_t cameraOnlyCount = 0;
-    // Camera registers plus the shading-only constants (LightMapScale, lightmap/shadow
-    // coordinate scale-bias). LightMapScale holds a different element count and different
-    // values per lightmap policy, so leaving it in makes the geometry hash move with the
-    // DirectionalLightmaps setting. Unlike the object transform these registers cost nothing
-    // to drop - they never reach a vertex position - so UE3 mode always uses this variant.
+    // Camera registers plus the shading-only constants, which never reach a position (see "Placement
+    // constants and the geometry hash" in UE3Compatibility.md).
     std::array<Range, kMaxRanges> cameraAndShading = {};
     uint32_t cameraAndShadingCount = 0;
     // Camera registers plus the object transform and shading-only constants.
@@ -321,13 +305,9 @@ namespace dxvk {
     uint32_t lightmapSamplerMask = 0;
   };
 
-  // Deterministic diffuse selection: the winning sampler stages for a given
-  // (pixel shader, ordered bound texture set, sRGB states, vertex factory) key.
-  // Reusing the first decision keeps the albedo pick stable when scoring inputs
-  // read live shader constants that UE3 rewrites per draw.
-  // decisionAreaSum is the total bound texel area the decision was scored against:
-  // streamed mip variants share this key (streaming-stable hashes), and a set bound
-  // with more area re-scores and supersedes a decision made on streamed-down mips.
+  // The albedo pick for a (pixel shader, bound texture set, sRGB, vertex factory) key, pinned because
+  // scoring reads constants UE3 rewrites per draw. A set bound with more texel area than
+  // decisionAreaSum (more mips streamed in) re-scores and supersedes it.
   struct Ue3DiffuseSelectionEntry {
     uint8_t chosenStages[2] = { 0xFF, 0xFF };
     uint8_t cubemapFallbackStage = 0xFF;
@@ -336,16 +316,95 @@ namespace dxvk {
     bool fromDisk = false;
   };
 
-  // per-texture spread over distinct pixel shaders: textures sampled by many unrelated
-  // materials are shared detail/pattern/tint overlays rather than surface identity albedo.
-  // Persisted across sessions (rtx-remix/ue3TextureSpread.cache). `count` accumulates every
-  // shader seen, but scoring reads only `scoringCount` - the value loaded from disk - so the
-  // penalty is a fixed input for the whole session. Discoveries made now apply from the next
-  // session, which is what keeps a material's albedo pick from changing meaning mid-run.
+  // Order-independent digests of the texture tag sets albedo scoring reads.
+  struct Ue3AlbedoTagDigests {
+    uint32_t lightmap = 0;
+    uint32_t neverAlbedo = 0;
+    uint32_t preferredAlbedo = 0;
+
+    bool operator==(const Ue3AlbedoTagDigests& other) const {
+      return lightmap == other.lightmap && neverAlbedo == other.neverAlbedo && preferredAlbedo == other.preferredAlbedo;
+    }
+    bool operator!=(const Ue3AlbedoTagDigests& other) const {
+      return !(*this == other);
+    }
+  };
+
+  // Persisted to rtx-remix/ue3DiffuseSelection.cache. The pin survives a level reload in memory
+  // but not a relaunch, and a decision first made while a material's textures were still
+  // streamed down can differ from the settled one, so the file is what makes every session
+  // start from the same pick.
+  class Ue3DiffuseSelectionCache {
+  public:
+    // Loads the file on first use. True when the tags changed since the stored picks were scored,
+    // which drops them all.
+    bool updateTags(const Ue3AlbedoTagDigests& tags);
+
+    const Ue3DiffuseSelectionEntry* find(XXH64_hash_t key) const {
+      const auto it = m_selections.find(key);
+      return it != m_selections.end() ? &it->second : nullptr;
+    }
+
+    void erase(XXH64_hash_t key) {
+      m_selections.erase(key);
+    }
+
+    void store(XXH64_hash_t key, const Ue3DiffuseSelectionEntry& entry) {
+      m_selections[key] = entry;
+      m_dirty = true;
+    }
+
+    // A stored pick records a decision, not the inputs behind it, and is consulted whenever the
+    // bound texel area has not grown past the recorded peak - which after a settled run is
+    // essentially always. Changed scoring would therefore be invisible wherever a cache exists,
+    // so a bounded sample of loaded picks is re-scored and any disagreement reported once.
+    bool takeAudit(const Ue3DiffuseSelectionEntry& entry);
+    void reportAudit(XXH64_hash_t key, const uint8_t (&storedStages)[2], const uint8_t (&scoredStages)[2]);
+
+    void saveIfDue(uint64_t frameId);
+    void save();
+
+  private:
+    void load(const Ue3AlbedoTagDigests& tags);
+
+    fast_unordered_cache<Ue3DiffuseSelectionEntry> m_selections;
+    bool m_loaded = false;
+    bool m_dirty = false;
+    bool m_saveBlocked = false;
+    uint32_t m_lastSaveFrame = 0;
+    uint32_t m_auditsRemaining = 0;
+    bool m_auditWarned = false;
+    // The tags the stored picks were scored under.
+    Ue3AlbedoTagDigests m_tags;
+  };
+
+  // Distinct pixel shaders seen sampling a texture. Scoring reads only scoringCount, the value loaded
+  // from disk (see "Albedo selection and the texture spread cache" in UE3Compatibility.md).
   struct Ue3TextureMaterialSpread {
     std::array<XXH64_hash_t, 12> psHashes = {};
     uint8_t count = 0;
     uint8_t scoringCount = 0;
+  };
+
+  class Ue3TextureSpreadCache {
+  public:
+    // Loads the file on first use and records the shader for the next session. Returns the
+    // spread to score with, which is the one loaded from disk.
+    uint32_t recordShader(XXH64_hash_t textureHash, XXH64_hash_t psHash);
+
+    void saveIfDue(uint64_t frameId);
+    void save();
+
+  private:
+    void load();
+
+    fast_unordered_cache<Ue3TextureMaterialSpread> m_spreads;
+    bool m_loaded = false;
+    bool m_dirty = false;
+    // Set when the cache file existed but could not be read in full. Saving rewrites the
+    // file from the map, so a partial load must never be allowed to publish itself.
+    bool m_saveBlocked = false;
+    uint32_t m_lastSaveFrame = 0;
   };
 
   struct Ue3VsTexcoordTraceEntry {
@@ -370,27 +429,75 @@ namespace dxvk {
     VkDeviceSize byteSize = 0;
   };
 
-  // Admission tier: a CPU-only sighting record that holds no GPU resources. A key has to
-  // be seen on this many distinct frames before the tier above starts holding its capture
-  // buffer, so a key that never repeats - an animating skinned pose, or any object whose
-  // transform moves, both of which change the key every frame - costs a few bytes of
-  // bookkeeping rather than a retained device-local buffer per draw per frame.
+  // CPU-only sighting record: a key must be seen on enough distinct frames before its capture buffer
+  // is retained, so a key that never repeats (a moving or animating draw) costs no device memory.
   struct Ue3VertexCaptureAdmissionEntry {
     uint32_t vertexCount = 0;
     uint32_t sightings = 0;
     uint32_t lastFrameSeen = 0;
   };
 
-  // Constant-churn diagnostic (rtx.d3d9.ue3LogVertexConstantChurn). One entry per sampled
-  // *mesh*, keyed on input-assembler identity, holding the multiset of instance transforms seen
-  // for it each frame. Keying per mesh rather than per instance is what makes the three things
-  // that can break a cache key separable, because a key that folds them together cannot say
-  // which one moved:
-  //   1. the IA identity itself (buffer handles, draw range, content generation counters)
-  //   2. the set of instance transforms placed with that mesh
-  //   3. any other shader constant folded into the stable VS hash
-  // The transform registers are skipped in 3 precisely so it isolates the third cause; without
-  // that, 2 and 3 would both fire on the same underlying change and neither would be diagnostic.
+  // rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache: vertex captures of static meshes, served again
+  // on later frames while the draw's key repeats.
+  class Ue3StaticVertexCaptureCache {
+  public:
+    struct Settings {
+      bool enabled = false;
+      uint32_t warmupFrames = 0;
+      uint32_t budgetMiB = 0;
+      uint32_t maxEntries = 0;
+      uint32_t retentionFrames = 0;
+      uint32_t minReusePercent = 0;
+      uint32_t reuseProbeFrames = 0;
+      bool logStats = false;
+    };
+
+    bool isDormant() const {
+      return m_dormant;
+    }
+
+    bool tryReuse(XXH64_hash_t key, uint32_t currentFrame, RasterGeometry& geoData);
+    void recordCapture(XXH64_hash_t key, uint32_t currentFrame, const Settings& settings, const RasterGeometry& geoData);
+    void endFrame(uint32_t currentFrame, const Settings& settings);
+
+  private:
+    void prune(uint32_t currentFrame, const Settings& settings);
+    void enforceBudget(const Settings& settings);
+    void erase(XXH64_hash_t key);
+    void clear();
+    void evaluateDormancy(const Settings& settings);
+    void reportStats(uint32_t currentFrame, const Settings& settings);
+
+    fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_entries;
+    // Sum of byteSize over m_entries, so the budget is enforced without walking the map every frame.
+    VkDeviceSize m_bytes = 0;
+
+    fast_unordered_cache<Ue3VertexCaptureAdmissionEntry> m_admission;
+    uint32_t m_lastSweepFrame = 0;
+
+    // The per-frame pair is folded at end of frame into the dormancy window (always) and the
+    // logging interval (when rtx.d3d9.ue3LogStaticVertexCaptureCacheStats is on).
+    uint32_t m_frameReuses = 0;
+    uint32_t m_frameCaptures = 0;
+    uint64_t m_statReuses = 0;
+    uint64_t m_statCaptures = 0;
+    uint32_t m_statFrames = 0;
+    uint32_t m_statFrameStamp = 0;
+    uint64_t m_evictions = 0;
+
+    // Some titles recompute a draw's object transform every frame even for geometry that is not
+    // moving, which mints a fresh key per draw per frame. Standing the cache down when its measured
+    // reuse rate is hopeless keeps the option safe to leave enabled in any UE3 title.
+    bool m_dormant = false;
+    uint32_t m_probeCountdown = 0;
+    uint32_t m_windowFrames = 0;
+    uint64_t m_windowReuses = 0;
+    uint64_t m_windowCaptures = 0;
+  };
+
+  // rtx.d3d9.ue3LogVertexConstantChurn: one entry per mesh (IA identity) rather than per placement, so
+  // churn can be attributed to the IA identity, the set of placements, or another constant (see
+  // "Diagnosing a cache that never hits" in UE3Compatibility.md).
   struct Ue3ChurnMeshEntry {
     uint32_t lastFrameSeen = 0;
     // Frame the transform multiset below is accumulating for; rotated lazily on first touch of
@@ -432,17 +539,10 @@ namespace dxvk {
     XXH64_hash_t vsBytecodeHash = 0;
   };
 
-  // Cross-frame memo of geometry hash + bounding box results for draws whose IA
-  // vertex/index buffers are static (any vertex factory - a skinned mesh's bind-pose
-  // buffers are as immutable as a static mesh's; only its bone constants animate).
-  // Keyed purely on the IA identity (buffers, offsets, generations, draw range, decl,
-  // texcoord selection), so one entry serves every instance of a mesh regardless of
-  // transform. The entry holds the hash components computed from that identity; the
-  // per-draw VertexShader component (stable VS-constant hash, position source) is
-  // recombined live by the consumer, making served hashes bit-identical to a fresh
-  // compute. Entries are heap-pinned via shared_ptr: a geometry worker publishes
-  // results into the entry (release store on the ready flag) while the main thread
-  // owns the map and serves published results on later frames (acquire load).
+  // Geometry hash components and bounds of a draw with static IA buffers, keyed on IA identity alone so
+  // one entry serves every placement and pose; the VertexShader component is recombined live. A
+  // geometry worker publishes into the entry (release on the ready flags) while the app thread owns
+  // the map and serves it on later frames (acquire).
   struct Ue3GeometryMemoEntry {
     std::atomic<bool> hashesReady { false };
     std::atomic<bool> aabbReady { false };
@@ -450,6 +550,51 @@ namespace dxvk {
     std::array<XXH64_hash_t, size_t(HashComponents::Count)> componentHashes = {};
     AxisAlignedBoundingBox boundingBox;
     uint32_t lastFrameTouched = 0;
+  };
+
+  class Ue3GeometryMemo {
+  public:
+    struct Lookup {
+      // Published hashes to serve the draw from; null when it hashes in full.
+      const Ue3GeometryMemoEntry* ready = nullptr;
+      // Where a full hash publishes, and during a self-check the entry it must reproduce.
+      std::shared_ptr<Ue3GeometryMemoEntry> publishTo;
+      std::shared_ptr<const Ue3GeometryMemoEntry> verifyAgainst;
+    };
+
+    Lookup lookup(XXH64_hash_t key, uint32_t currentFrame, bool selfCheck);
+
+    void erase(XXH64_hash_t key) {
+      m_entries.erase(key);
+    }
+
+    void prune(uint32_t currentFrame);
+
+  private:
+    fast_unordered_cache<std::shared_ptr<Ue3GeometryMemoEntry>> m_entries;
+  };
+
+  // Per-draw state shared by the UE3 texture hooks of processTextures.
+  struct Ue3TextureState {
+    const D3D9CommonShader* inferredPs = nullptr;
+    XXH64_hash_t inferredPsHash = 0;
+    PsSamplerTexcoordEntry* inferredPsEntry = nullptr;
+    Ue3VertexFactoryType vfType = Ue3VertexFactoryType::Unknown;
+    bool isUe3GpuSkinVF = false;
+    bool isUe3TerrainVF = false;
+    bool isUe3ParticleVF = false;
+    bool isUe3FoliageVF = false;
+    bool isUe3SpeedTreeVF = false;
+    bool isUe3LocalDecalVF = false;
+    bool isUe3MorphVF = false;
+    bool likelyGpuSkinnedMesh = false;
+    const Ue3VsShaderCtabInfo* ue3VsHints = nullptr;
+    bool likelyUe3DecalUvSpace = false;
+    bool likelyUe3TerrainUvSpace = false;
+    bool likelyUe3BillboardUvSpace = false;
+    bool likelyUe3FlexiblePackedUvPath = false;
+    bool likelyPackedUvConventions = false;
+    bool selectedUe3MovieTexture = false;
   };
 
 }

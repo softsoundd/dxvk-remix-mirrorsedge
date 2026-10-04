@@ -431,6 +431,14 @@ The pixel shader consumes that as a `dp2add` of the UV pair against each matrix 
 
 `rtx.d3d9.ue3LogUvAffineDetail` reports a resolved rotator with `exact=1 psResolved=1 applied=1`, its `ps=` and `final=` values as `(a,b,c,d,tx,ty)`, and the matrix registers named in the `ctab:` list.
 
+## Streaming-stable texture hashes
+
+UE3's texture streamer creates a new D3D9 texture object whenever a texture's resident mip count changes. A hash of the top mip therefore differs for every streamed variant of one texture, and everything keyed on texture hashes - replacements, categories, tags and material identity - stops matching while a lower-mip variant is bound.
+
+`rtx.d3d9.ue3StreamingStableTextureHashing` hashes the mip tail instead: the mips at or below 64 texels on their longer side. Every variant holds the tail, because `GMinTextureResidentMipCount` keeps the last seven mips resident, and the engine copies it byte for byte between variants. The format and the reduced aspect ratio are folded in to keep unrelated textures with equal tails apart. Unmipped textures, render targets and textures whose tail buffers are missing keep the top-mip hash.
+
+`rtx.d3d9.ue3LogTextureHashProvenance` logs each texture's descriptor, image and mip 0 hashes and which path produced the image hash. Textures at or below the tail size, and cube maps, have pitfalls of their own, covered under [Material identity and replacement anchor stability](#material-identity-and-replacement-anchor-stability).
+
 ## Material identity and replacement anchor stability
 
 With `rtx.d3d9.ue3EngineMode`, a material's identity hash (the `mat_*` anchor that captures, texture tags, and asset replacements key off) is a chain: pixel shader identity → material texture set (image hash of every CTAB `Texture2D_*`/`TextureCube_*` sampler) → material constants (`UniformVector_*`). Every tier is a pure function of the draw *and of the shader*, decided before the first draw is hashed and never revised, so a material's hash is reproducible from the first frame of any session with no learned state behind it.

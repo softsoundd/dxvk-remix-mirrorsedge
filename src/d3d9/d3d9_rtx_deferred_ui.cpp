@@ -125,12 +125,8 @@ namespace dxvk {
     }
   }
 
-  // Snapshots a draw tagged via rtx.deferredUiTextures so it can be replayed on top of the
-  // ray-traced image after RTX injection. The referenced vertex/index ranges are copied to CPU
-  // memory (the game may re-lock its dynamic buffers between capture and replay) and the draw
-  // is later re-issued through the regular D3D9 UP draw path with the captured pipeline state.
-  // Multi-stream draws (UE3 static meshes split position/tangents/UVs across streams) are
-  // interleaved into a single stream-0 layout with a remapped vertex declaration.
+  // Snapshots a deferred UI draw for replay after injection. Vertex and index ranges are copied, as the
+  // game may re-lock its buffers, and multi-stream draws are interleaved into stream 0.
   bool D3D9Rtx::captureDeferredUiDraw(const IndexContext& indexContext,
                                       const VertexContext vertexContext[caps::MaxStreams],
                                       const DrawContext& drawContext) {
@@ -196,7 +192,7 @@ namespace dxvk {
     DeferredUiDraw draw;
     draw.primitiveType = drawContext.PrimitiveType;
     draw.primitiveCount = drawContext.PrimitiveCount;
-    draw.indexed = drawContext.Indexed != FALSE;
+    draw.indexed = drawContext.Indexed;
     draw.vertexStride = combinedStride;
 
     int64_t firstVertex = 0;
@@ -395,11 +391,8 @@ namespace dxvk {
 
     ScopedCpuProfileZone();
 
-    // Refreshes the scene-color textures a replayed overlay samples with the current content
-    // of sceneSourceImage, so scene-reading overlay materials (fade lerps, scope warps,
-    // damage effects) composite over the ray-traced image instead of the stale rasterized
-    // scene. Invoked before every replayed draw: an overlay's output on the target is picked
-    // up by the next overlay's scene input, matching the game's own effect chaining.
+    // Copies sceneSourceImage into the scene colour textures an overlay samples before every replayed
+    // draw, so each overlay reads the ray-traced image with the earlier overlays applied.
     auto refreshSampledSceneTargets = [&](const DeferredUiDraw& draw) {
       if (!m_frameOptions.deferredUiRefreshSceneColor || sceneSourceImage == nullptr) {
         return;
@@ -711,6 +704,112 @@ namespace dxvk {
       return false;
     }
     return true;
+  }
+
+  bool D3D9Rtx::DeferredUiTagQuery::isTagged() {
+    if (m_state < 0) {
+      m_state = m_rtx.isDeferredUiTaggedDraw(&m_matchedTextureHash) ? 1 : 0;
+    }
+    return m_state == 1;
+  }
+
+  // The emptiness test keeps post-process draws from building a bound-texture snapshot just to
+  // discover that no pixel shader tag exists.
+  bool D3D9Rtx::DeferredUiTagQuery::isPixelShaderTagged() {
+    return !m_rtx.m_frameOptions.deferredUiPixelShaders->empty() &&
+           isTagged() &&
+           m_matchedTextureHash == kEmptyHash;
+  }
+
+  // See "Deferred overlays" in UE3Compatibility.md. Runs after the pass switch, so only a pixel shader tag can
+  // defer a composite or video pass, and never defers world geometry or depth-writing draws, which
+  // can share textures with tagged overlays.
+  std::optional<D3D9Rtx::DrawCallType> D3D9Rtx::decideDeferredUiDraw(const DrawContext& drawContext,
+                                                                     DeferredUiTagQuery& deferredUiTag) {
+    if (!m_frameOptions.deferredUiTextures->empty() || !m_frameOptions.deferredUiPixelShaders->empty()) {
+      const XXH64_hash_t& matchedTextureHash = deferredUiTag.matchedTextureHash();
+
+      if (deferredUiTag.isTagged()) {
+        const bool matchedByPixelShaderTag = deferredUiTag.isPixelShaderTagged();
+        const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
+        const bool isWorldGeometryVertexFactory = isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory);
+
+        // Engine post-process shaders sample the scene target, but replaying them would brighten or paint over
+        // the ray-traced image, so a texture tag never defers them; a pixel shader tag still does.
+        bool isEnginePostProcessShader = false;
+        if (!matchedByPixelShaderTag && m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr) {
+          const Ue3ShaderFeatureInfo psInfo = getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
+          isEnginePostProcessShader = psInfo.hasGammaConstants ||
+                                      psInfo.hasToneMapConstants ||
+                                      psInfo.hasExposureOrToneSampler ||
+                                      psInfo.hasMotionBlurConstants ||
+                                      psInfo.hasVelocitySampler ||
+                                      psInfo.hasDistortionSampler ||
+                                      psInfo.hasFogConstants ||
+                                      psInfo.hasHazeConstants ||
+                                      psInfo.looksLikeDofAndBloomPostProcess();
+        }
+
+        // Overlay tiles have a Local-style declaration but never depth test, unlike even small world quads.
+        const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+                                       d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
+        const bool looksLikeOverlayTile = drawContext.PrimitiveCount <= 4 && depthTestDisabled && !zWriteEnabled;
+
+        const bool eligible = !zWriteEnabled && !isEnginePostProcessShader &&
+                              (!isWorldGeometryVertexFactory || looksLikeOverlayTile);
+        const char* refusalReason = isEnginePostProcessShader
+                                    ? "engine post-process shader"
+                                    : "world geometry or depth write";
+
+        // One-shot diagnostics per (pixel shader, decision): prints the stable pixel shader
+        // hash so tags on unstable render-target textures can be moved to
+        // rtx.d3d9.deferredUiPixelShaders.
+        const XXH64_hash_t psHash = (m_parent->UseProgrammablePS() && d3d9State().pixelShader != nullptr)
+                                    ? d3d9State().pixelShader->GetCommonShader()->GetBytecodeHash() : 0;
+        const XXH64_hash_t vsHash = (m_parent->UseProgrammableVS() && d3d9State().vertexShader != nullptr)
+                                    ? d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash() : 0;
+        const XXH64_hash_t logKey = psHash ^ (eligible ? 0xD1B54A32D192ED03ull
+                                                       : (isEnginePostProcessShader ? 0x2545F4914F6CDD1Dull
+                                                                                    : 0x9E3779B97F4A7C15ull));
+        if (m_deferredUiLoggedDecisions.insert(logKey).second) {
+          const std::string matchedDescription = matchedTextureHash != 0
+            ? str::format(" matchedTexture=0x", std::hex, matchedTextureHash, std::dec)
+            : std::string(" matchedBy=pixelShaderTag");
+
+          Logger::info(str::format(
+            "[RTX-DeferredUI] ",
+            eligible ? std::string("Deferring overlay draw")
+                     : str::format("Tagged draw NOT deferred (", refusalReason, ")"),
+            ": ps=0x", std::hex, psHash,
+            " vs=0x", vsHash, std::dec,
+            " vertexFactory=", describeUe3VertexFactory(m_currentUe3VertexFactory),
+            " pass=", describeUe3PassType(m_currentUe3PassType),
+            " prims=", drawContext.PrimitiveCount,
+            " ztest=", depthTestDisabled ? 0 : 1,
+            " zwrite=", zWriteEnabled ? 1 : 0,
+            " target=", getCurrentRenderTargetFormat(),
+            " domain=", isSceneLinearRenderTarget() ? "sceneLinear" : "display",
+            matchedDescription));
+        }
+
+        if (eligible) {
+          logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "deferred UI overlay");
+          return DrawCallType { RtxGeometryStatus::Rasterized, false, true };
+        }
+
+        // Screen-space contribution passes only reached this branch through a pixel shader tag;
+        // a refusal here restores the pass switch's decision rather than promoting a DoF/fog
+        // draw to normal classification.
+        if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess ||
+            m_currentUe3PassType == Ue3PassType::FogOrDistortion) {
+          logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+          return DrawCallType { RtxGeometryStatus::Ignored, false };
+        }
+        // Other ineligible tagged draws fall through to normal classification - never suppressed.
+      }
+    }
+
+    return std::nullopt;
   }
 
 }

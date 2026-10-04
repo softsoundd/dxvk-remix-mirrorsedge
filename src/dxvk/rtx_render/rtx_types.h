@@ -693,7 +693,7 @@ struct DrawCallState {
   DrawCallState& operator=(DrawCallState&&) = default;
 
   // Non-zero identifies one hardware instance of a draw that was decomposed into an instance per
-  // hardware instance (D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates). Such an instance stays
+  // hardware instance (D3D9Rtx::submitUe3DecomposedInstances). Such an instance stays
   // the same object while its transform changes every frame, so DrawCallTracker::computeIdentityHash
   // keys on this instead of the transform; otherwise it would miss the exact-identity lookup every
   // frame and fall back to a spatial search costing O(batch size) per instance.

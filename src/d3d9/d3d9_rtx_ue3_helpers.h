@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "d3d9_rtx.h"
+#include "d3d9_device.h"
 #include "../dxso/dxso_material_fades.h"
 #include "../dxso/dxso_ue3_material_identity.h"
 #include "../util/xxHash/xxhash.h"
@@ -37,6 +38,11 @@ namespace dxvk {
 
   // We only look at RT 0 currently.
   const uint32_t kRenderTargetIndex = 0;
+
+  // Defined here so the calls from every d3d9_rtx*.cpp file inline; the release build has no LTO.
+  inline const Direct3DState9& D3D9Rtx::d3d9State() const {
+    return *m_parent->GetRawState();
+  }
 
   // Static in the cross-frame sense: content only changes through an explicit upload,
   // which bumps the buffer's remixContentGeneration counter (part of every cache key).
@@ -84,14 +90,9 @@ namespace dxvk {
     uint8_t totalElements = 0;
   };
 
-  // ===== Replacement identity drift diagnostics =====
-  // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
-  //
-  // Remembers, per material family, the identity tiers behind the last minted material
-  // hash so a mint with a different hash can be attributed to the tier that moved
-  // (texture set, constants, or exclusion state). A family is keyed by (shader identity
-  // seed, primary color texture hash) - both stable across sessions, unlike any of the
-  // minted hashes themselves.
+  // [RTX-MicDrift] (rtx.logReplacementResolution / rtx.replacementDebugHashes): the identity tiers behind
+  // each material family's last minted hash, keyed by (shader identity seed, primary colour texture
+  // hash), so a new mint can be attributed to the tier that moved.
   constexpr uint32_t kMicDriftMaxTrackedSamplers = 16;  // caps::MaxTexturesPS
 
   constexpr uint32_t kMicDriftMaxTrackedConstants = 16;
@@ -163,12 +164,6 @@ namespace dxvk {
 
   static_assert(sizeof(Ue3IaMemoKeyHeader) == 28 + 11 * sizeof(uint32_t) + 5 * sizeof(uint64_t),
                 "Ue3IaMemoKeyHeader must have no implicit padding (it is hashed by memory).");
-
-  // Both learned caches are rewritten whole, so they are saved on an interval rather than on
-  // every change; the destructor flushes whatever the last interval missed.
-  constexpr uint32_t kUe3CacheSaveIntervalFrames = 600;
-
-  constexpr char kUe3DiffuseSelectionCachePath[] = "rtx-remix/ue3DiffuseSelection.cache";
 
   // shader may be null; the view then carries only the bytecode.
   DxsoShaderView makeDxsoShaderView(const std::vector<uint8_t>& bytecode, const D3D9CommonShader* shader);
@@ -246,14 +241,9 @@ namespace dxvk {
       const Vector4* fConsts,
       const Ue3MaterialConstRanges& ranges);
 
-  // Permutation-invariant constants identity: streams (name key, leading element value) of
-  // each named Uniform* constant, in name order. fxc trims each uniform array to the
-  // elements the permutation actually references (the directional lightmap path can
-  // reference more expression elements than the simple path, e.g. an unreferenced specular
-  // expression), so higher elements are not comparable across lightmap policy permutations.
-  // The leading element is always within the reported range and the engine uploads the same
-  // expression value to it in every permutation. Name keys keep the stream aligned even if
-  // a permutation strips an entire unreferenced uniform.
+  // Hashes (name key, leading element) of each named Uniform* constant in name order: fxc trims arrays to
+  // the elements a permutation references, so only the leading element is comparable across lightmap
+  // policies.
   XXH64_hash_t hashUe3MaterialConstantsByNameOrder(
       const Vector4* fConsts,
       const std::vector<std::pair<XXH64_hash_t, uint32_t>>& namedUniformFirstRegistersByNameOrder);
@@ -267,12 +257,12 @@ namespace dxvk {
   // Multiplies each applying pair's tint into `tint` and adds its glow to `glow`; returns whether
   // any pair applied. appliedLog, when given, receives the live values of those that did.
   bool evaluateUe3HighlightTints(const Ue3PsMaterialIdentityInfo& info, const Ue3HighlightTintDraw& draw,
-                                        Vector3& tint, Vector3& glow, std::string* appliedLog);
+                                 Vector3& tint, Vector3& glow, std::string* appliedLog);
 
   void logUe3HighlightPairsOnce(const XXH64_hash_t psHash, const XXH64_hash_t shaderIdentitySeed,
-                                       const std::vector<uint8_t>& bytecode, const Ue3PsMaterialIdentityInfo& info);
+                                const std::vector<uint8_t>& bytecode, const Ue3PsMaterialIdentityInfo& info);
 
-  bool tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
+  bool extractUe3CameraMatrices(
     const D3D9ShaderConstantsVSSoftware& vsConsts,
     const uint32_t viewProjRegisterBase,
     const uint32_t viewOriginRegister,

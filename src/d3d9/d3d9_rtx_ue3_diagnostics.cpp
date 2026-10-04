@@ -234,8 +234,9 @@ namespace dxvk {
     // The line below is a debug-level message: when the logger would drop it, return before
     // formatting it. This runs for every ray-traced draw, and formatting alone costs a few
     // microseconds each, which at thousands of draws per frame is several milliseconds.
-    if (Logger::logLevel() > LogLevel::Debug)
+    if (Logger::logLevel() > LogLevel::Debug) {
       return;
+    }
 
     XXH64_hash_t vsHash = 0;
     if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
@@ -659,49 +660,6 @@ namespace dxvk {
     s = DrawDispositionStats {};
   }
 
-  void D3D9Rtx::reportUe3StaticVertexCaptureCacheStats() {
-    if (!m_frameOptions.ue3LogStaticVertexCaptureCacheStats) {
-      return;
-    }
-
-    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
-
-    // roughly once a second at any plausible frame rate; this is a diagnostic, not a metric
-    constexpr uint32_t kStatIntervalFrames = 60;
-    if (currentFrame - m_ue3VertexCaptureCacheStatFrameStamp < kStatIntervalFrames) {
-      return;
-    }
-    m_ue3VertexCaptureCacheStatFrameStamp = currentFrame;
-
-    if (m_ue3VertexCaptureCacheDormant) {
-      Logger::info(str::format(
-        "[RTX-Compatibility][UE3-Capture] static vertex capture cache: dormant, re-testing in ",
-        m_ue3VertexCaptureCacheProbeCountdown, " frames."));
-      m_ue3VertexCaptureCacheStatReuses = 0;
-      m_ue3VertexCaptureCacheStatCaptures = 0;
-      m_ue3VertexCaptureCacheStatFrames = 0;
-      return;
-    }
-
-    const uint64_t considered = m_ue3VertexCaptureCacheStatReuses + m_ue3VertexCaptureCacheStatCaptures;
-    const uint32_t reusePercent = considered > 0
-      ? uint32_t((m_ue3VertexCaptureCacheStatReuses * 100ull) / considered)
-      : 0u;
-
-    Logger::info(str::format(
-      "[RTX-Compatibility][UE3-Capture] static vertex capture cache: ",
-      m_ue3VertexCaptureCache.size(), " retained entries, ",
-      m_ue3VertexCaptureCacheBytes / (1024 * 1024), " MiB, ",
-      m_ue3VertexCaptureAdmission.size(), " keys awaiting admission, ",
-      reusePercent, "% of eligible draws reused over the last ",
-      m_ue3VertexCaptureCacheStatFrames, " frames, ",
-      m_ue3VertexCaptureCacheEvictions, " total evictions."));
-
-    m_ue3VertexCaptureCacheStatReuses = 0;
-    m_ue3VertexCaptureCacheStatCaptures = 0;
-    m_ue3VertexCaptureCacheStatFrames = 0;
-  }
-
   // Shader, material and bound-texture hashes for a draw, so a warning about one names something
   // that can be looked up in the texture picker or fed to rtx.d3d9.ue3TraceDrawTextureHashes.
   std::string D3D9Rtx::describeUe3DrawIdentity() const {
@@ -943,6 +901,27 @@ namespace dxvk {
       "\n    decl=[", describeUe3VertexDeclaration(), "]",
       "\n    objectToWorld=", formatMatrixRows(m_activeDrawCallState.transformData.objectToWorld),
       instanceTransforms));
+  }
+
+  void D3D9Rtx::logNonPrimaryRenderTargetOnce() const {
+    if (Logger::logLevel() <= LogLevel::Debug) {
+      if (D3D9CommonTexture* rtTex = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()) {
+        if (rtTex->GetImage() != nullptr) {
+          const XXH64_hash_t rtDescHash = rtTex->GetImage()->getDescriptorHash();
+          if (s_loggedNonPrimaryRtDescHashes.insert(rtDescHash).second) {
+            const auto* rtDesc = rtTex->Desc();
+            Logger::debug(str::format(
+              "[RTX-Compatibility] Non-primary RT0 encountered: ",
+              rtDesc->Width, "x", rtDesc->Height,
+              " (backbuffer ", m_activePresentParams->BackBufferWidth, "x", m_activePresentParams->BackBufferHeight, "), ",
+              "rtDescHash=0x", std::hex, rtDescHash,
+              " resolutionAgnosticDescHash=0x", rtTex->GetImage()->getResolutionAgnosticDescriptorHash(), std::dec,
+              ". If this RT contains the main scene, add either hash to rtx.raytracedRenderTargetTextures "
+              "(the resolution-agnostic one survives resolution changes)."));
+          }
+        }
+      }
+    }
   }
 
 }

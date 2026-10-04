@@ -60,12 +60,9 @@
 
 namespace dxvk {
 
-  // UE3 instances a mesh by leaving its placement out of the shader constants entirely: the mesh
-  // streams carry D3DSTREAMSOURCE_INDEXEDDATA | instanceCount, one further stream is tagged
-  // D3DSTREAMSOURCE_INSTANCEDATA, and the vertex factory reads InstanceOffset (TEXCOORD1) plus the
-  // three basis axes (TEXCOORD2..4) out of it. See FParticleInstancedMeshVertexFactory::InitRHI and
-  // FFoliageVertexFactory::InitRHI in the UE3 engine, and GetInstanceToWorld in
-  // FoliageVertexFactory.usf which both compile down to that layout.
+  // The mesh streams are D3DSTREAMSOURCE_INDEXEDDATA and one D3DSTREAMSOURCE_INSTANCEDATA stream carries
+  // InstanceOffset and the basis axes in TEXCOORD1..4 (see "Hardware-instanced mesh particles and
+  // foliage" in UE3Compatibility.md).
   Ue3InstancingInfo D3D9Rtx::resolveUe3Instancing(
       const D3D9VertexElements& elements,
       const std::array<UINT, caps::MaxStreams>& streamFreq,
@@ -218,11 +215,8 @@ namespace dxvk {
     return true;
   }
 
-  // Whatever these bounds drop, the kept set has to be the same set next frame: an instance that
-  // comes and goes as the camera moves flickers, and a selection that reorders the survivors also
-  // renames them (see Ue3DecomposedInstance::sourceIndex). Hence the count clamp keeps the lowest
-  // source indices rather than the nearest to the camera. Distance culling is view-dependent by
-  // definition and can pop at its boundary, which is why it is opt-in.
+  // The kept set must be the same next frame, or instances flicker and are renamed, so the count clamp
+  // keeps the lowest source indices. Distance culling is view-dependent and therefore opt-in.
   void D3D9Rtx::cullAndClampUe3InstanceTransforms(std::vector<Ue3DecomposedInstance>& instances,
                                                   uint32_t& outCulledByDistance,
                                                   uint32_t& outCulledByBudget) const {
@@ -273,13 +267,8 @@ namespace dxvk {
     }
   }
 
-  // Names the batch an instanced draw belongs to, without involving any transform.
-  //
-  // The mesh streams say which mesh is being instanced but not which component is instancing it, and
-  // two piles of the same debris share them. The instance buffer would distinguish those but cannot
-  // serve as an identity - RenderNxFluidInstanced creates a fresh one per frame unless its pool hands
-  // one back - so batches are matched to the previous frame's by continuity of their own centroid,
-  // which holds because a batch as a whole barely moves even while its instances do.
+  // Names an instanced batch without its transforms. The instance buffer is fresh per frame, so a batch
+  // is matched to the previous frame's by the continuity of its centroid.
   XXH64_hash_t D3D9Rtx::resolveUe3InstancedBatchKey(const RasterGeometry& geoData,
                                                     const std::vector<Ue3DecomposedInstance>& instances) {
     if (instances.empty()) {
@@ -399,14 +388,10 @@ namespace dxvk {
     }
   }
 
-  // An instanced mesh factory's world position is GetInstanceToWorld(Input) * Input.Position
-  // (FoliageVertexFactory.usf, shared by FFoliageVertexFactory and
-  // FParticleInstancedMeshVertexFactory), so the declaration's POSITION is object space by
-  // construction - there is no shader constant involved and nothing to prove about the transform.
-  // That makes the conservatism canUseUe3NativeLocalVertexCapture applies to Local draws, where
-  // reading the input assembler is a guess about what the shader does, unnecessary here.
+  // An instanced factory's POSITION is object space by construction, so unlike a Local draw there is
+  // nothing to prove about the shader.
   bool D3D9Rtx::canUseUe3InstancedMeshVertexPositions(const RasterGeometry& geoData,
-                                                     const char** outReason) const {
+                                                      const char** outReason) const {
     auto fail = [&](const char* reason) {
       if (outReason != nullptr) {
         *outReason = reason;
@@ -468,18 +453,15 @@ namespace dxvk {
     return seed;
   }
 
-  void D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates(const DrawParameters& params) {
+  void D3D9Rtx::submitUe3DecomposedInstances(const DrawParameters& params) {
     ScopedCpuProfileZone();
 
     const bool timeSubmission = m_frameOptions.ue3LogInstancedDrawStats;
     const auto submitStart = timeSubmission ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point();
 
-    // Every copy of the draw state shares the pending futures' task pointers, and a task result is
-    // a one-shot: the first consumer disposes it and the rest would wait on a result that is never
-    // set again. Resolve them here so all copies carry finished data. Steady state usually costs
-    // nothing, because the geometry hash memo serves these draws without scheduling a future at all.
-    // (The caller guarantees there is no pending skinning future.)
+    // Every copy of the draw state shares the pending futures, whose results are one-shot, so they are
+    // resolved before copying. The caller guarantees there is no pending skinning future.
     RasterGeometry& geoData = m_activeDrawCallState.geometryData;
     if (geoData.futureGeometryHashes.valid()) {
       geoData.hashes = geoData.futureGeometryHashes.get();
@@ -538,6 +520,71 @@ namespace dxvk {
     if (timeSubmission) {
       m_ue3InstancedStatSubmitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - submitStart).count());
+    }
+  }
+
+  // Runs before the capture source is resolved, as per-vertex capture cannot represent instancing. Left
+  // at its default when decomposition is off, which is what makes ue3DecomposeInstancedDraws a bypass.
+  void D3D9Rtx::resolveUe3DrawInstancing() {
+    m_currentUe3Instancing = Ue3InstancingInfo();
+    m_ue3DecomposedInstances.clear();
+    m_ue3DecomposedBatchKey = kEmptyHash;
+    // m_activeDrawCallState is reused across draws, so a previous draw's per-instance identity must
+    // not leak into an ordinary one and detach it from the transform its identity depends on.
+    m_activeDrawCallState.decomposedInstanceId = kEmptyHash;
+    if (m_frameOptions.ue3EngineMode && m_frameOptions.ue3DecomposeInstancedDraws &&
+        d3d9State().vertexDecl != nullptr) {
+      m_currentUe3Instancing = resolveUe3Instancing(
+        d3d9State().vertexDecl->GetElements(), d3d9State().streamFreq, m_parent->GetInstanceCount());
+    }
+  }
+
+  // Recover the placements UE3 hid in the instance-data stream. Done before the capture source is
+  // resolved so that path can prefer input-assembler positions once the placements are in hand:
+  // object-space positions are only usable if there is a transform to place them with.
+  void D3D9Rtx::readUe3DrawInstances(const VertexContext vertexContext[caps::MaxStreams],
+                                     const DrawContext& drawContext,
+                                     const RasterGeometry& geoData) {
+    m_ue3InstanceTransformReadFailure = nullptr;
+    if (m_currentUe3Instancing.instanceCount > 1) {
+      const char* readReason = "";
+      if (readUe3InstanceTransforms(vertexContext, m_ue3DecomposedInstances, &readReason)) {
+        const size_t instancesRead = m_ue3DecomposedInstances.size();
+
+        // Both of these read the batch as the game wrote it, before any culling: the batch key's
+        // centroid has to stay view-independent, and the order probe measures the game's order.
+        m_ue3DecomposedBatchKey = resolveUe3InstancedBatchKey(geoData, m_ue3DecomposedInstances);
+        if (m_frameOptions.ue3LogInstancedDrawStats) {
+          trackUe3InstanceOrderStability(m_ue3DecomposedBatchKey, m_ue3DecomposedInstances);
+        }
+
+        uint32_t culledByDistance = 0;
+        uint32_t culledByBudget = 0;
+        cullAndClampUe3InstanceTransforms(m_ue3DecomposedInstances, culledByDistance, culledByBudget);
+
+        if (culledByBudget > 0) {
+          ONCE(Logger::warn(str::format(
+            "[RTX-Compatibility] UE3 instanced draw expands to ", instancesRead,
+            " instances, above rtx.d3d9.ue3MaxDecomposedInstances (",
+            std::max(m_frameOptions.ue3MaxDecomposedInstances, 1u), "); keeping a fixed ",
+            m_ue3DecomposedInstances.size(), " of them and dropping ", culledByBudget,
+            ". The kept subset is deliberately the same every frame - a view-dependent one flickers. ",
+            describeUe3DrawIdentity(),
+            " verts=", geoData.vertexCount, " prims=", drawContext.PrimitiveCount)));
+        }
+
+        if (m_frameOptions.ue3LogInstancedDrawStats) {
+          ++m_ue3InstancedStatDraws;
+          m_ue3InstancedStatInstancesSeen += instancesRead;
+          m_ue3InstancedStatInstancesSubmitted += m_ue3DecomposedInstances.size();
+          m_ue3InstancedStatCulledDistance += culledByDistance;
+          m_ue3InstancedStatCulledBudget += culledByBudget;
+        }
+      } else {
+        // Without placements, input-assembler positions would put the mesh at the world origin, so
+        // the draw is refused below rather than rendered somewhere it does not belong.
+        m_ue3InstanceTransformReadFailure = readReason;
+      }
     }
   }
 

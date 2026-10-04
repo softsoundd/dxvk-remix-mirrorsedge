@@ -252,11 +252,8 @@ namespace dxvk {
       return Ue3VertexFactoryType::GPUSkin;
     }
 
-    // Instanced mesh particles share FoliageVertexFactory.usf and the instancing axes in
-    // TEXCOORD1..4, but their declaration has no NORMAL: FParticleInstancedMeshVertexFactory
-    // walks {VEU_Tangent, VEU_Binormal, VEU_Normal} while only filling components 0 and 1, so
-    // the mesh's TangentZ arrives under the BINORMAL semantic. (The stock game's shader still
-    // declares it as NORMAL and therefore never reads it - so UE3 renders these unlit.)
+    // Instanced mesh particles have no NORMAL: the mesh's TangentZ arrives under BINORMAL (see "The two
+    // factories are not reliably distinguishable" in UE3Compatibility.md).
     if (sig.positionType == D3DDECLTYPE_FLOAT3 &&
         sig.hasTangent && sig.tangentType == D3DDECLTYPE_UBYTE4 &&
         sig.hasBinormal && sig.binormalType == D3DDECLTYPE_UBYTE4 &&
@@ -298,17 +295,20 @@ namespace dxvk {
     Ue3ShaderFeatureInfo empty;
     empty.initialized = true;
 
-    if (shader == nullptr)
+    if (shader == nullptr) {
       return empty;
+    }
 
     const auto& bytecode = shader->GetBytecode();
     const XXH64_hash_t shaderHash = shader->GetBytecodeHash();
-    if (shaderHash == 0)
+    if (shaderHash == 0) {
       return empty;
+    }
 
     auto it = m_ue3ShaderFeatureCache.find(shaderHash);
-    if (it != m_ue3ShaderFeatureCache.end())
+    if (it != m_ue3ShaderFeatureCache.end()) {
       return it->second;
+    }
 
     Ue3ShaderFeatureInfo info;
     info.initialized = true;
@@ -323,8 +323,9 @@ namespace dxvk {
       DxsoDecodeContext decoder(shader->GetInfo());
       DxsoCodeIter iter(tokens + 1);
       while (decoder.decodeInstruction(iter)) {
-        if (decoder.getCtabInfo().m_size != 0)
+        if (decoder.getCtabInfo().m_size != 0) {
           break;
+        }
       }
 
       const DxsoCtab& ctab = decoder.getCtabInfo();
@@ -506,11 +507,12 @@ namespace dxvk {
   }
 
   Ue3PassType D3D9Rtx::classifyUe3Pass(const DrawContext& drawContext) {
-    if (!m_frameOptions.ue3EngineMode)
+    if (!m_frameOptions.ue3EngineMode) {
       return Ue3PassType::Unknown;
+    }
 
     const bool depthEnabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_TRUE;
-    const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE;
+    const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
     const bool samplesRenderTarget = m_parent->GetActiveRTTextures() != 0;
     // UE3 binds textures lazily, leaving render targets in slots the current shader never
     // reads; classification keyed on raw bound-RT state varies with draw order (which UE3
@@ -524,8 +526,9 @@ namespace dxvk {
 
     // Cheap early-outs first: depth prepass and shadow depth draws are the most common
     // skipped passes and need no shader feature information.
-    if (m_currentUe3VertexFactory == Ue3VertexFactoryType::PositionOnly)
+    if (m_currentUe3VertexFactory == Ue3VertexFactoryType::PositionOnly) {
       return Ue3PassType::DepthPrepass;
+    }
 
     if (m_activePresentParams.has_value() &&
         d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
@@ -558,8 +561,9 @@ namespace dxvk {
       return Ue3PassType::VideoSurface;
     }
 
-    if (psInfo.hasUiSampler || psInfo.hasUiCompositeConstants)
+    if (psInfo.hasUiSampler || psInfo.hasUiCompositeConstants) {
       return Ue3PassType::UiComposite;
+    }
 
     // UE3 SceneCapture probes re-render the world before the main view; viewport size/aspect
     // (and later mirrored/undecomposable camera checks) keep them from stealing Main.
@@ -605,7 +609,7 @@ namespace dxvk {
     // TangentLightVector constants), so a draw with material samplers is the primary
     // textured draw, not a per-light pass - unless it uses additive light-pass blending
     const bool isAdditiveLightBlend =
-      d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE &&
+      d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] &&
       d3d9State().renderStates[D3DRS_SRCBLEND] == D3DBLEND_ONE &&
       d3d9State().renderStates[D3DRS_DESTBLEND] == D3DBLEND_ONE;
     const bool looksLikeLitBasePassMaterial = psInfo.hasMaterialSampler && !isAdditiveLightBlend;
@@ -859,27 +863,31 @@ namespace dxvk {
   }
 
   bool D3D9Rtx::isAutoDetectedLightmapTexture(const XXH64_hash_t textureHash) {
-    if (textureHash == kEmptyHash || !g_autoLightmapTexturesPopulated.load(std::memory_order_acquire))
+    if (textureHash == kEmptyHash || !g_autoLightmapTexturesPopulated.load(std::memory_order_acquire)) {
       return false;
+    }
 
     std::shared_lock lock(g_autoLightmapTexturesMutex);
     return g_autoLightmapTextures.find(textureHash) != g_autoLightmapTextures.end();
   }
 
   void D3D9Rtx::registerAutoDetectedLightmapTexture(const XXH64_hash_t textureHash) {
-    if (textureHash == kEmptyHash)
+    if (textureHash == kEmptyHash) {
       return;
+    }
 
     bool inserted = false;
     {
       std::unique_lock lock(g_autoLightmapTexturesMutex);
       inserted = g_autoLightmapTextures.insert(textureHash).second;
-      if (inserted)
+      if (inserted) {
         g_autoLightmapTexturesPopulated.store(true, std::memory_order_release);
+      }
     }
 
-    if (inserted)
+    if (inserted) {
       ImGUI::AddAutoTaggedLightmapTexture(textureHash);
+    }
   }
 
   void D3D9Rtx::OnClear(DWORD flags) {
@@ -988,6 +996,166 @@ namespace dxvk {
       m_ue3GamePatchRequest = request;
       m_ue3GamePatchLimits = limits;
       m_ue3GamePatchRequestTime = now;
+    }
+  }
+
+  // NeedsDepthTestDisabled materials, fog volume composites and fullscreen overlays: alpha blend with
+  // depth test and depth write off. UI and deferred-UI tagged draws match too, but rasterize.
+  bool D3D9Rtx::isUe3DepthTestDisabledTranslucency(DeferredUiTagQuery& deferredUiTag) const {
+    return m_frameOptions.ue3EngineMode &&
+           d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] &&
+           (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+            d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS) &&
+           !d3d9State().renderStates[D3DRS_ZWRITEENABLE] &&
+           !checkBoundTextureCategory(*m_frameOptions.uiTextures) &&
+           !deferredUiTag.isTagged();
+  }
+
+  // The UE3 passes Remix ignores or rasterizes, and the main-view gate for the foreground DPG.
+  std::optional<D3D9Rtx::DrawCallType> D3D9Rtx::classifyUe3DrawPass(const DrawContext& drawContext,
+                                                                    DeferredUiTagQuery& deferredUiTag) {
+    // UE3 depth prepass - position only vertex declarations have no texcoords/colours
+    // the same geometry will be drawn again in the base pass with full material
+    if (m_frameOptions.ue3EngineMode &&
+        m_currentUe3VertexFactory == Ue3VertexFactoryType::PositionOnly) {
+      ONCE(Logger::info("[RTX-Compatibility-Info] Skipped UE3 depth prepass draw (position-only vertex declaration)."));
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    }
+
+    m_currentUe3PassType = classifyUe3Pass(drawContext);
+
+    // Capture TdToneMapping state before the draw is ignored below.
+    if (m_currentUe3PassType == Ue3PassType::FullscreenPostProcess) {
+      maybeCaptureUe3ToneMapState();
+    }
+
+    switch (m_currentUe3PassType) {
+    case Ue3PassType::DepthPrepass:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "position-only depth prepass");
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::ShadowDepth:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "shadow depth render target");
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::Velocity:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native velocity helper pass");
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::Lighting:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 lighting pass");
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::ModulatedShadowProjection:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native modulated shadow projection");
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::SceneCapture:
+      if (!m_ue3ForegroundDpgActive) {
+        m_ue3SeenMainViewWorldDraw = false;
+      }
+      ONCE(Logger::info("[RTX-Compatibility-Info] Ignored UE3 scene capture offscreen view draw (world geometry, probe viewport)."));
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "scene capture offscreen view");
+      return DrawCallType { RtxGeometryStatus::Ignored, false };
+    case Ue3PassType::FullscreenPostProcess:
+    case Ue3PassType::FogOrDistortion:
+      // Ignore before the non-primary RT → Rasterized fallback; DoF gather/blur/blend
+      // target FilterColor/SceneColor and would otherwise still execute. Only a deferred-UI
+      // pixel shader tag outranks this: these passes sample the scene-colour target, so a
+      // texture tag on it matches every one of them and would replay DoF over the frame.
+      if (!deferredUiTag.isPixelShaderTagged()) {
+        logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Ignored, "native UE3 screen-space contribution pass");
+        return DrawCallType { RtxGeometryStatus::Ignored, false };
+      }
+      break;
+    case Ue3PassType::UiComposite:
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "UI composite");
+      return DrawCallType { RtxGeometryStatus::Rasterized, true };
+    case Ue3PassType::VideoCinematic:
+      trackUe3MovieTextureRenderTarget("video cinematic/decode");
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "video/cinematic pass");
+      return DrawCallType { RtxGeometryStatus::Rasterized, false };
+    case Ue3PassType::VideoSurface:
+      trackUe3MovieTextureRenderTarget("video surface/decode");
+      logUe3Classification(drawContext, m_currentUe3PassType, RtxGeometryStatus::Rasterized, "video texture surface/decode pass");
+      return DrawCallType { RtxGeometryStatus::Rasterized, false };
+    default:
+      break;
+    }
+
+    // Arm the foreground-DPG gate only after a true main-view-sized world draw.
+    if (m_frameOptions.ue3EngineMode &&
+        !m_ue3SeenMainViewWorldDraw &&
+        m_currentUe3PassType == Ue3PassType::Material &&
+        isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
+        m_activePresentParams.has_value()) {
+      const D3DVIEWPORT9& vp = d3d9State().viewport;
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+      if (ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
+        m_ue3SeenMainViewWorldDraw = true;
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  // UE3 shadow depth pass - draws to small square render targets that are used as shadow maps
+  bool D3D9Rtx::isUe3ShadowDepthPass() const {
+    if (m_frameOptions.ue3EngineMode && m_activePresentParams.has_value()) {
+      const auto& rtExt = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+      const bool isSmallSquare = rtExt.width == rtExt.height &&
+                                 rtExt.width <= 2048 &&
+                                 rtExt.width < bbW / 2;
+      const bool hasDepthWrite = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
+      if (isSmallSquare && hasDepthWrite) {
+        ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Skipped UE3 shadow depth pass (",
+                                       rtExt.width, "x", rtExt.height, ").")));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void D3D9Rtx::classifyUe3DrawVertexFactory() {
+    m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    m_currentUe3PassType = Ue3PassType::Unknown;
+    if (m_frameOptions.ue3EngineMode && d3d9State().vertexDecl != nullptr) {
+      const auto& elements = d3d9State().vertexDecl->GetElements();
+      XXH64_hash_t declKey = XXH3_64bits(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9));
+      auto it = m_ue3VertexFactoryCache.find(declKey);
+      if (it != m_ue3VertexFactoryCache.end()) {
+        m_currentUe3VertexFactory = it->second;
+      } else {
+        m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
+        m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
+      }
+    }
+  }
+
+  // A material showing a movie render target is world UI (monitors, billboards).
+  void D3D9Rtx::markUe3MovieTextureMaterial(const Ue3TextureState& ue3, const XXH64_hash_t materialHash,
+                                            const XXH64_hash_t textureHash) {
+    bool usesMovieTexture = ue3.selectedUe3MovieTexture;
+    for (uint32_t i = 0; i < LegacyMaterialData::kMaxSupportedTextures; i++) {
+      if (m_activeDrawCallState.materialData.colorTextures[i].isValid()) {
+        const DxvkImageView* imageView = m_activeDrawCallState.materialData.colorTextures[i].getImageView();
+        const XXH64_hash_t descHash =
+          imageView != nullptr
+            ? imageView->image()->getDescriptorHash()
+            : kEmptyHash;
+        if (isUe3MovieTextureDescHash(descHash)) {
+          usesMovieTexture = true;
+          break;
+        }
+      }
+    }
+    if (usesMovieTexture) {
+      m_activeDrawCallState.setCategory(InstanceCategories::WorldUI, true);
+      if (Logger::logLevel() <= LogLevel::Debug) {
+        static fast_unordered_set s_loggedMovieSurfaceMaterials;
+        if (s_loggedMovieSurfaceMaterials.insert(materialHash).second) {
+          Logger::debug(str::format(
+            "[RTX-Compatibility][UE3] Marked movie texture material as WorldUI: materialHash=0x",
+            std::hex, materialHash, ", textureHash=0x", textureHash, std::dec));
+        }
+      }
     }
   }
 

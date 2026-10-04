@@ -60,11 +60,8 @@
 
 namespace dxvk {
 
-  // Geometry hash/AABB memo eligibility: unlike the vertex-capture cache above, this only
-  // requires the IA vertex/index content to be immutable across frames - any vertex factory
-  // qualifies (a GPU-skinned mesh's bind-pose buffers are as static as a Local mesh's; only
-  // its bone constants animate, and those live in the per-draw VertexShader hash component
-  // which is recombined live rather than memoized).
+  // Unlike the capture cache this needs only immutable IA content, so any vertex factory qualifies: bone
+  // constants live in the VertexShader component, which is recombined live.
   bool D3D9Rtx::canMemoizeUe3IaGeometryHashes(const IndexContext& indexContext,
                                               const VertexContext vertexContext[caps::MaxStreams],
                                               const RasterGeometry& geoData) const {
@@ -110,11 +107,8 @@ namespace dxvk {
     return true;
   }
 
-  // IA-only identity for the geometry hash/AABB memo: draw range, decl, texcoord selection
-  // (it decides which stream feeds the hashed texcoord region) and per-buffer physical
-  // identity + content generation. Deliberately excludes the stable VS-constant hash and
-  // the object transform, so every instance of a mesh - and every animation pose of a
-  // skinned mesh - shares one entry.
+  // Leaves out the stable VS hash and the object transform, so every placement and pose of a mesh shares
+  // one entry.
   XXH64_hash_t D3D9Rtx::computeUe3IaGeometryMemoKey(const IndexContext& indexContext,
                                                     const VertexContext vertexContext[caps::MaxStreams],
                                                     const DrawContext& drawContext,
@@ -132,11 +126,8 @@ namespace dxvk {
                                    m_currentUe3Instancing.instanceDataStreamMask);
   }
 
-  // Resolved once per vertex shader. The camera registers are always excluded: hashing them would
-  // make every draw's identity move with the view. Stock UE3 reserves two (VSR_ViewProjMatrix at c0,
-  // VSR_ViewOrigin at c4), which the defaults encode. The second variant additionally drops the
-  // object transform and the shading-only constants, which describe where a mesh is and how it is
-  // lit rather than what its geometry is.
+  // Resolved once per vertex shader. Camera registers are always excluded; the second variant also drops
+  // the object transform and the shading-only constants.
   Ue3VsHashExclusions D3D9Rtx::buildUe3VsHashExclusions(
       const Ue3VsShaderCtabInfo& ctabInfo,
       const std::vector<Ue3VsConstantSymbol>* symbols) {
@@ -321,13 +312,131 @@ namespace dxvk {
     return hash;
   }
 
-  void D3D9Rtx::pruneUe3GeometryMemoCache() {
+  Ue3GeometryMemo::Lookup Ue3GeometryMemo::lookup(const XXH64_hash_t key, const uint32_t currentFrame, const bool selfCheck) {
+    Lookup result;
+    const auto it = m_entries.find(key);
+    if (it == m_entries.end()) {
+      result.publishTo = std::make_shared<Ue3GeometryMemoEntry>();
+      result.publishTo->lastFrameTouched = currentFrame;
+      m_entries.emplace(key, result.publishTo);
+      return result;
+    }
+
+    Ue3GeometryMemoEntry& entry = *it->second;
+    entry.lastFrameTouched = currentFrame;
+    if (!entry.hashesReady.load(std::memory_order_acquire)) {
+      // The worker from an earlier frame is still busy: hash in full, without publishing a second time.
+      return result;
+    }
+    if (selfCheck) {
+      // The fresh result goes into a new entry that replaces this one in the map; the old one is
+      // only read from now on.
+      result.verifyAgainst = it->second;
+      result.publishTo = std::make_shared<Ue3GeometryMemoEntry>();
+      result.publishTo->lastFrameTouched = currentFrame;
+      it->second = result.publishTo;
+      return result;
+    }
+    result.ready = &entry;
+    return result;
+  }
+
+  void Ue3GeometryMemo::prune(const uint32_t currentFrame) {
     constexpr uint32_t kMaxUntouchedFrames = 600;
-    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
     // In-flight workers hold the entry via shared_ptr, so erasing here is always safe.
-    m_ue3GeometryMemoCache.erase_if([&](auto it) {
+    m_entries.erase_if([&](auto it) {
       return currentFrame - it->second->lastFrameTouched > kMaxUntouchedFrames;
     });
+  }
+
+  // Skinned instances of a mesh share its bind-pose buffers, so the first bone's translation tells them
+  // apart. The bones are RefToLocal: the translation must go through LocalToWorld, or every instance
+  // anchors near the world origin.
+  void D3D9Rtx::updateUe3SkinnedDrawIdentity() {
+    m_activeDrawCallState.m_hasSkinnedWorldAnchor = false;
+    // Only VS-skinned draws assign a bone hash, so reset it: a leaked one churns every static draw's BLAS
+    // refit, draw call cache match and replacement identity as the pose animates.
+    m_activeDrawCallState.skinningData = SkinningData();
+    const bool usesVertexShaderSkinning =
+      m_frameOptions.ue3EngineMode &&
+      m_parent->UseProgrammableVS() &&
+      m_currentUe3CtabInfo.has_value() &&
+      m_currentUe3CtabInfo->hasBoneMatrices;
+    if (usesVertexShaderSkinning &&
+        m_currentUe3CtabInfo->boneMatricesRegisterCount >= 3) {
+      const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
+      const uint32_t floatConstRegCount = cb.meta.maxConstIndexF;
+      const uint32_t boneReg = m_currentUe3CtabInfo->boneMatricesRegisterIndex;
+      const uint32_t boneRegCount =
+        std::min(m_currentUe3CtabInfo->boneMatricesRegisterCount, floatConstRegCount > boneReg ? floatConstRegCount - boneReg : 0u);
+      if (boneRegCount >= 3) {
+        const auto& fConsts = d3d9State().vsConsts.fConsts;
+        // UE3 bone matrices are float4x3 (3 float4 rows per bone) and the translation lives in
+        // the .w of the first three rows of the first bone
+        const Vector3 boneTranslation(
+          fConsts[boneReg + 0].w,
+          fConsts[boneReg + 1].w,
+          fConsts[boneReg + 2].w);
+        m_activeDrawCallState.m_skinnedWorldAnchor =
+          (m_activeDrawCallState.transformData.objectToWorld * Vector4(boneTranslation, 1.0f)).xyz();
+        m_activeDrawCallState.m_hasSkinnedWorldAnchor = true;
+
+        // processSkinning() returns no SkinningData for programmable-VS draws, so skinningData
+        // stays default (numBones == 0) and this bone hash will not be overwritten by finalise
+        m_activeDrawCallState.skinningData.boneHash =
+          XXH3_64bits(&fConsts[boneReg], size_t(boneRegCount) * sizeof(Vector4));
+      }
+    }
+  }
+
+  // Serves static IA draws' geometry hashes from the memo. A first sighting hashes on a worker, which
+  // publishes into the entry.
+  D3D9Rtx::Ue3GeometryMemoLookup D3D9Rtx::lookupUe3GeometryMemo(const IndexContext& indexContext,
+                                                                const VertexContext vertexContext[caps::MaxStreams],
+                                                                const DrawContext& drawContext,
+                                                                RasterGeometry& geoData) {
+    Ue3GeometryMemoLookup memo;
+    
+    const bool canMemoizeIaGeometry = canMemoizeUe3IaGeometryHashes(indexContext, vertexContext, geoData);
+    memo.key =
+      canMemoizeIaGeometry
+        ? computeUe3IaGeometryMemoKey(indexContext, vertexContext, drawContext, geoData)
+        : kEmptyHash;
+
+    // Keyed off structural eligibility rather than the cache's, so it still explains a dormant cache.
+    if (m_frameOptions.ue3LogVertexConstantChurn &&
+        canMemoizeIaGeometry &&
+        isUe3StaticVertexCaptureCacheEligible(indexContext, vertexContext, geoData)) {
+      trackUe3ConstantChurn(memo.key, geoData);
+    }
+
+    if (canMemoizeIaGeometry) {
+      // rtx.d3d9.ue3GeometryMemoSelfCheckFrames: hash in full and have the worker compare against the published entry.
+      const uint32_t selfCheckFrames = m_frameOptions.ue3GeometryMemoSelfCheckFrames;
+      const bool selfCheck = selfCheckFrames != 0 && (m_ue3FrameCounter % selfCheckFrames) == 0;
+      Ue3GeometryMemo::Lookup found =
+        m_ue3GeometryMemo.lookup(memo.key, m_parent->GetDXVKDevice()->getCurrentFrameId(), selfCheck);
+      memo.publishTo = std::move(found.publishTo);
+      memo.verifyAgainst = std::move(found.verifyAgainst);
+      if (found.ready != nullptr) {
+        const Ue3GeometryMemoEntry& entry = *found.ready;
+        GeometryHashes hashes;
+        for (uint32_t i = 0; i < uint32_t(HashComponents::Count); i++) {
+          hashes[HashComponents(i)] = entry.componentHashes[i];
+        }
+        hashes[HashComponents::VertexShader] = computeGeometryVertexShaderHash();
+        hashes.precombine();
+        geoData.hashes = hashes;
+        memo.served = true;
+        if (entry.aabbReady.load(std::memory_order_acquire)) {
+          geoData.boundingBox = entry.boundingBox;
+        } else {
+          geoData.futureBoundingBox = computeAxisAlignedBoundingBox(geoData);
+        }
+      }
+    }
+
+    return memo;
   }
 
 }

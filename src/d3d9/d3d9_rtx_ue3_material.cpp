@@ -61,27 +61,9 @@
 namespace dxvk {
 
   namespace {
-    // ===== Residual identity churn reporting =====
-    // (rtx.d3d9.ue3ReportMicIdentityChurn)
-    //
-    // Volatile-register classification is a property of the shader, so a material's identity is
-    // decided before its first draw is hashed and cannot move afterwards. What the bytecode
-    // cannot see is a frame-varying expression that reaches the output colour rather than a
-    // coordinate - a time-driven fade or tint is indistinguishable from an authored
-    // VectorParameterValue there. Those families still mint more than one identity, so they are
-    // reported rather than left to break their anchors quietly. Nothing is excluded as a result:
-    // an identity that changes mid-session is exactly what this whole design exists to avoid,
-    // and the fix belongs in a config the next session starts from.
-    //
-    // Keyed on textureSetShaderHash, which already folds in the identity seed and is both the
-    // authoring handle (rtx.d3d9.ue3MicConstantIdentityExcludedMaterials) and the second
-    // replacement lookup tier.
-    //
-    // A second identity on one texture set is also what a colour variant looks like the first time
-    // its sibling is drawn, so reporting at two would bury the families that matter under benign
-    // ones. Measured constant-differentiated sibling sets run to about eight; a frame-varying
-    // register passes any bound within a second, so a threshold well clear of the former separates
-    // them without needing to understand the values.
+    // rtx.d3d9.ue3ReportMicIdentityChurn reports a family once it has minted this many identities: colour
+    // variant siblings run to about eight, while an animating register passes any bound within a second
+    // (see "What the runtime cannot recognise, and how it tells you" in UE3Compatibility.md).
     constexpr uint32_t kUe3MicChurnReportThreshold = 16;
 
     struct Ue3MicChurnReport {
@@ -103,16 +85,18 @@ namespace dxvk {
         EmitFn&& emit) {
       if (useNameOrderStream) {
         for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
-          if (uniformRegister < caps::MaxFloatConstantsPS && !emit(uniformRegister))
+          if (uniformRegister < caps::MaxFloatConstantsPS && !emit(uniformRegister)) {
             return;
+          }
         }
         return;
       }
 
       for (const auto& [rangeStart, rangeCount] : identityInfo.constRanges) {
         for (uint32_t r = rangeStart; r < rangeStart + rangeCount; r++) {
-          if (r < caps::MaxFloatConstantsPS && !emit(r))
+          if (r < caps::MaxFloatConstantsPS && !emit(r)) {
             return;
+          }
         }
       }
     }
@@ -128,18 +112,22 @@ namespace dxvk {
     public:
       bool record(const XXH64_hash_t key, const float strength, bool* seenBefore = nullptr) {
         if (lookupHash(m_moved, key)) {
-          if (seenBefore != nullptr)
+          if (seenBefore != nullptr) {
             *seenBefore = true;
+          }
           return true;
         }
         // Bounded, as a moving object shows a new placement, and so a new key, every frame.
-        if (m_first.size() >= kMaxStillKeys)
+        if (m_first.size() >= kMaxStillKeys) {
           m_first.clear();
+        }
         const auto [first, inserted] = m_first.emplace(key, strength);
-        if (seenBefore != nullptr)
+        if (seenBefore != nullptr) {
           *seenBefore = !inserted;
-        if (inserted || first->second == strength)
+        }
+        if (inserted || first->second == strength) {
           return false;
+        }
         m_first.erase(first);
         m_moved.insert(key);
         return true;
@@ -171,8 +159,9 @@ namespace dxvk {
       static fast_unordered_cache<DxsoMaterialFadeResult> s_cache;
       const XXH64_hash_t key = XXH3_64bits_withSeed(&particleColorInputRegister, sizeof(particleColorInputRegister), psHash);
       const auto it = s_cache.find(key);
-      if (it != s_cache.end())
+      if (it != s_cache.end()) {
         return it->second;
+      }
 
       DxsoMaterialFadeResult result;
       result.failure = DxsoHighlightFailure::NotPixelShader;
@@ -183,8 +172,9 @@ namespace dxvk {
           DxsoDecodeContext decoder(programInfo);
           DxsoCodeIter iter(tokens + 1);
           while (decoder.decodeInstruction(iter)) {
-            if (decoder.getCtabInfo().m_size != 0)
+            if (decoder.getCtabInfo().m_size != 0) {
               break;
+            }
           }
           result = analyzeDxsoMaterialFades(tokens, bytecode.size() / sizeof(uint32_t),
                                             dxsoHighlightInputsFromUe3Ctab(decoder.getCtabInfo()), particleColorInputRegister);
@@ -214,21 +204,24 @@ namespace dxvk {
     static void logUe3MaterialFadesOnce(const XXH64_hash_t psHash, const std::vector<uint8_t>& bytecode,
                                         const int32_t particleColorInputRegister, const DxsoMaterialFadeResult& result) {
       static fast_unordered_set s_logged;
-      if (!s_logged.insert(XXH3_64bits_withSeed(&particleColorInputRegister, sizeof(particleColorInputRegister), psHash)).second)
+      if (!s_logged.insert(XXH3_64bits_withSeed(&particleColorInputRegister, sizeof(particleColorInputRegister), psHash)).second) {
         return;
+      }
 
       const std::map<uint32_t, std::string>& names = getUe3PsFloatConstantNames(psHash, bytecode);
       std::string fades;
-      for (const DxsoMaterialFade& fade : result.fades)
+      for (const DxsoMaterialFade& fade : result.fades) {
         fades += str::format(fades.empty() ? "" : ", ", describeUe3MaterialFade(fade, names));
+      }
       std::string unproven;
       for (const uint32_t reg : result.unprovenScalarRegs) {
         const auto it = names.find(reg);
         unproven += str::format(unproven.empty() ? "" : ", ", it != names.end() ? it->second : std::string("?"), "@c", reg);
       }
       std::string particleColor;
-      if (particleColorInputRegister >= 0)
+      if (particleColorInputRegister >= 0) {
         particleColor = str::format(" particleColor=v", particleColorInputRegister, ":", describeUe3ParticleColorUses(result.particleColor));
+      }
       Logger::info(str::format(
         "[RTX-Compatibility][UE3-Fade] ps=0x", std::hex, psHash, std::dec,
         " fades=[", fades, "]", particleColor, " unprovenScalars=[", unproven, "]",
@@ -246,8 +239,9 @@ namespace dxvk {
 
     static Ue3BlendRest ue3BlendRest(const DxvkBlendMode& blend) {
       Ue3BlendRest rest;
-      if (!blend.enableBlending || blend.colorBlendOp != VK_BLEND_OP_ADD)
+      if (!blend.enableBlending || blend.colorBlendOp != VK_BLEND_OP_ADD) {
         return rest;
+      }
       const VkBlendFactor src = blend.colorSrcFactor;
       const VkBlendFactor dst = blend.colorDstFactor;
       if (src == VK_BLEND_FACTOR_SRC_ALPHA && (dst == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA || dst == VK_BLEND_FACTOR_ONE)) {
@@ -276,7 +270,6 @@ namespace dxvk {
     }
   }
 
-  // shader may be null; the view then carries only the bytecode.
   DxsoShaderView makeDxsoShaderView(const std::vector<uint8_t>& bytecode, const D3D9CommonShader* shader) {
     DxsoShaderView view;
     if (bytecode.size() >= sizeof(uint32_t) && (bytecode.size() % sizeof(uint32_t)) == 0) {
@@ -291,7 +284,6 @@ namespace dxvk {
     return view;
   }
 
-  // CTAB sampler register -> declared name. Cached per shader hash.
   const std::map<uint32_t, std::string>& getUe3PsSamplerNames(
       const XXH64_hash_t psHash,
       const std::vector<uint8_t>& bytecode) {
@@ -314,14 +306,16 @@ namespace dxvk {
         DxsoDecodeContext decoder(programInfo);
         DxsoCodeIter iter(tokens + 1);
         while (decoder.decodeInstruction(iter)) {
-          if (decoder.getCtabInfo().m_size != 0)
+          if (decoder.getCtabInfo().m_size != 0) {
             break;
+          }
         }
 
         const DxsoCtab& ctab = decoder.getCtabInfo();
         for (const DxsoCtab::Constant& c : ctab.m_constantData) {
-          if (c.registerSet != kD3dxRegisterSetSampler || c.registerCount == 0)
+          if (c.registerSet != kD3dxRegisterSetSampler || c.registerCount == 0) {
             continue;
+          }
           const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxTexturesPS);
           for (uint32_t s = c.registerIndex; s < end; s++) {
             names[s] = c.name;
@@ -333,8 +327,6 @@ namespace dxvk {
     return s_ue3PsSamplerNameCache.emplace(psHash, std::move(names)).first->second;
   }
 
-  // CTAB float-constant register -> declared name (UniformScalar_*/UniformVector_*/engine
-  // constants), for rtx.d3d9.ue3LogUvAffineDetail diagnostics. Cached per shader hash.
   const std::map<uint32_t, std::string>& getUe3PsFloatConstantNames(
       const XXH64_hash_t psHash,
       const std::vector<uint8_t>& bytecode) {
@@ -357,14 +349,16 @@ namespace dxvk {
         DxsoDecodeContext decoder(programInfo);
         DxsoCodeIter iter(tokens + 1);
         while (decoder.decodeInstruction(iter)) {
-          if (decoder.getCtabInfo().m_size != 0)
+          if (decoder.getCtabInfo().m_size != 0) {
             break;
+          }
         }
 
         const DxsoCtab& ctab = decoder.getCtabInfo();
         for (const DxsoCtab::Constant& c : ctab.m_constantData) {
-          if (c.registerSet != kD3dxRegisterSetFloat4 || c.registerCount == 0)
+          if (c.registerSet != kD3dxRegisterSetFloat4 || c.registerCount == 0) {
             continue;
+          }
           const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, caps::MaxFloatConstantsPS);
           for (uint32_t r = c.registerIndex; r < end; r++) {
             names[r] = c.registerCount > 1u
@@ -382,8 +376,6 @@ namespace dxvk {
 
   fast_unordered_set s_ue3MicRtPoisonWarnedFamilies;
 
-  // Bounded, for the per-family drift sample that is retained for every family while replacement
-  // diagnostics are on.
   uint32_t snapshotUe3MicIdentityConstants(
       const Vector4* fConsts,
       const Ue3PsMaterialIdentityInfo& identityInfo,
@@ -398,9 +390,6 @@ namespace dxvk {
     return count;
   }
 
-  // Unbounded: each family takes at most two, and a cap would silently drop the register that
-  // moved on any shader declaring more uniforms than the cap - leaving a report that says a
-  // family churned but not which value did, which is the only part worth reading.
   std::vector<Ue3MicIdentitySample::ConstantRecord> snapshotUe3MicIdentityConstants(
       const Vector4* fConsts,
       const Ue3PsMaterialIdentityInfo& identityInfo,
@@ -423,12 +412,14 @@ namespace dxvk {
       const Ue3PsMaterialIdentityInfo& identityInfo,
       const bool useNameOrderStream,
       const std::vector<uint8_t>& bytecode) {
-    if (textureSetShaderHash == kEmptyHash || constantsHash == kEmptyHash)
+    if (textureSetShaderHash == kEmptyHash || constantsHash == kEmptyHash) {
       return;
+    }
 
     Ue3MicChurnReport& report = s_ue3MicChurnByMaterialFamily[textureSetShaderHash];
-    if (report.warned)
+    if (report.warned) {
       return;
+    }
 
     if (report.firstConstantsHash == kEmptyHash) {
       report.firstConstantsHash = constantsHash;
@@ -452,8 +443,9 @@ namespace dxvk {
     std::string detail;
     for (const Ue3MicIdentitySample::ConstantRecord& now : current) {
       for (const Ue3MicIdentitySample::ConstantRecord& first : report.firstConstants) {
-        if (first.reg != now.reg)
+        if (first.reg != now.reg) {
           continue;
+        }
         if (first.value.x != now.value.x || first.value.y != now.value.y ||
             first.value.z != now.value.z || first.value.w != now.value.w) {
           const auto nameIt = constantNames.find(uint32_t(now.reg));
@@ -498,8 +490,9 @@ namespace dxvk {
       const bool constantsExcluded,
       const std::string& textureList) {
     static fast_unordered_set s_loggedMaterialInstanceHashes;
-    if (!s_loggedMaterialInstanceHashes.insert(materialHash).second)
+    if (!s_loggedMaterialInstanceHashes.insert(materialHash).second) {
       return;
+    }
 
     std::string ranges;
     for (const auto& [start, count] : identityInfo.constRanges) {
@@ -531,31 +524,29 @@ namespace dxvk {
       " ctab=", identityInfo.hasCtab ? 1 : 0));
   }
 
-  // Reused XXH3 streaming state: created once per thread instead of heap
-  // allocating/freeing a state per hash operation on the per-draw path. The state is
-  // fully reset before each use, so digests are identical to a fresh state.
   XXH3_state_t* getThreadLocalXxh3State() {
     static thread_local XXH3_state_t* const state = XXH3_createState();
     return state;
   }
 
-  // Returns kEmptyHash when ranges is empty: without CTAB info, a raw register-range
-  // fallback would fold per-view/per-mesh constants into the hash.
   XXH64_hash_t hashUe3MaterialConstants(
       const Vector4* fConsts,
       const Ue3MaterialConstRanges& ranges) {
-    if (ranges.empty())
+    if (ranges.empty()) {
       return kEmptyHash;
+    }
 
     XXH3_state_t* const state = getThreadLocalXxh3State();
-    if (state == nullptr)
+    if (state == nullptr) {
       return kEmptyHash;
+    }
     XXH3_64bits_reset(state);
 
     bool anyRegisterHashed = false;
     for (const auto& [start, count] : ranges) {
-      if (start + count > caps::MaxFloatConstantsPS)
+      if (start + count > caps::MaxFloatConstantsPS) {
         continue;
+      }
       XXH3_64bits_update(state, &fConsts[start], count * sizeof(Vector4));
       anyRegisterHashed = true;
     }
@@ -563,29 +554,24 @@ namespace dxvk {
     return anyRegisterHashed ? XXH3_64bits_digest(state) : kEmptyHash;
   }
 
-  // Permutation-invariant constants identity: streams (name key, leading element value) of
-  // each named Uniform* constant, in name order. fxc trims each uniform array to the
-  // elements the permutation actually references (the directional lightmap path can
-  // reference more expression elements than the simple path, e.g. an unreferenced specular
-  // expression), so higher elements are not comparable across lightmap policy permutations.
-  // The leading element is always within the reported range and the engine uploads the same
-  // expression value to it in every permutation. Name keys keep the stream aligned even if
-  // a permutation strips an entire unreferenced uniform.
   XXH64_hash_t hashUe3MaterialConstantsByNameOrder(
       const Vector4* fConsts,
       const std::vector<std::pair<XXH64_hash_t, uint32_t>>& namedUniformFirstRegistersByNameOrder) {
-    if (namedUniformFirstRegistersByNameOrder.empty())
+    if (namedUniformFirstRegistersByNameOrder.empty()) {
       return kEmptyHash;
+    }
 
     XXH3_state_t* const state = getThreadLocalXxh3State();
-    if (state == nullptr)
+    if (state == nullptr) {
       return kEmptyHash;
+    }
     XXH3_64bits_reset(state);
 
     bool anyRegisterHashed = false;
     for (const auto& [nameKey, reg] : namedUniformFirstRegistersByNameOrder) {
-      if (reg >= caps::MaxFloatConstantsPS)
+      if (reg >= caps::MaxFloatConstantsPS) {
         continue;
+      }
       XXH3_64bits_update(state, &nameKey, sizeof(nameKey));
       XXH3_64bits_update(state, &fConsts[reg], sizeof(Vector4));
       anyRegisterHashed = true;
@@ -612,10 +598,8 @@ namespace dxvk {
     return it->second;
   }
 
-  // Multiplies each applying pair's tint into `tint` and adds its glow to `glow`; returns whether
-  // any pair applied. appliedLog, when given, receives the live values of those that did.
   bool evaluateUe3HighlightTints(const Ue3PsMaterialIdentityInfo& info, const Ue3HighlightTintDraw& draw,
-                                        Vector3& tint, Vector3& glow, std::string* appliedLog) {
+                                 Vector3& tint, Vector3& glow, std::string* appliedLog) {
     static Ue3StrengthMotion s_objectMotion;
     static Ue3StrengthMotion s_instanceMotion;
     static fast_unordered_set s_heldBackLogged;
@@ -623,17 +607,16 @@ namespace dxvk {
     bool applied = false;
     for (const Ue3PsMaterialIdentityInfo::HighlightPair& pair : info.highlightPairs) {
       const uint32_t strengthReg = pair.tint.scalarReg;
-      if (strengthReg >= caps::MaxFloatConstantsPS)
+      if (strengthReg >= caps::MaxFloatConstantsPS) {
         continue;
+      }
       const float strength = draw.fConsts[strengthReg].x;
-      if (!std::isfinite(strength) || strength <= 0.0f)
+      if (!std::isfinite(strength) || strength <= 0.0f) {
         continue;
+      }
 
-      // Runner Vision fades the strength on the instances it creates (TdLOIAddOnObject), so a
-      // highlight shows it moving; an object that holds it still is authored in the tint colour,
-      // which Remix leaves to its material. Tracked per object, so one painted in the highlight
-      // colour stays untinted when an identical one is highlighted. An object at a placement not
-      // seen before - a moving one, every frame - follows its material instance.
+      // Only a highlight whose strength moves counts; one held still is authored in the tint colour. Tracked
+      // per object as well as per instance (see "Runner Vision" in UE3Compatibility.md).
       if (draw.requireMotion) {
         const XXH64_hash_t instanceKey = XXH3_64bits_withSeed(&pair.nameKey, sizeof(pair.nameKey), draw.materialHash);
         const XXH64_hash_t objectKey = XXH3_64bits_withSeed(&pair.nameKey, sizeof(pair.nameKey), draw.objectHash);
@@ -654,14 +637,16 @@ namespace dxvk {
       Vector3 color(1.0f, 1.0f, 1.0f);
       for (uint32_t lane = 0; lane < 3; lane++) {
         const int32_t reg = pair.tint.colorReg[lane];
-        if (reg < 0 || uint32_t(reg) >= caps::MaxFloatConstantsPS)
+        if (reg < 0 || uint32_t(reg) >= caps::MaxFloatConstantsPS) {
           continue;
+        }
         const float value = draw.fConsts[reg][pair.tint.colorComponent[lane]];
         color[lane] = std::isfinite(value) ? std::max(value, 0.0f) : 1.0f;
         tint[lane] *= 1.0f + s * (color[lane] - 1.0f);
       }
-      for (uint32_t lane = 0; lane < 3; lane++)
+      for (uint32_t lane = 0; lane < 3; lane++) {
         glow[lane] += pair.tint.glowCoefficient[lane] * s * draw.glowIntensity;
+      }
       applied = true;
 
       if (appliedLog != nullptr) {
@@ -673,17 +658,20 @@ namespace dxvk {
   }
 
   void logUe3HighlightPairsOnce(const XXH64_hash_t psHash, const XXH64_hash_t shaderIdentitySeed,
-                                       const std::vector<uint8_t>& bytecode, const Ue3PsMaterialIdentityInfo& info) {
+                                const std::vector<uint8_t>& bytecode, const Ue3PsMaterialIdentityInfo& info) {
     if (info.highlightPairs.empty() && info.highlightUnprovenScalars.empty() &&
-        info.highlightFailure == DxsoHighlightFailure::None)
+        info.highlightFailure == DxsoHighlightFailure::None) {
       return;
+    }
     static fast_unordered_set s_logged;
-    if (!s_logged.insert(psHash).second)
+    if (!s_logged.insert(psHash).second) {
       return;
+    }
 
     std::string tints;
-    for (const Ue3PsMaterialIdentityInfo::HighlightPair& pair : info.highlightPairs)
+    for (const Ue3PsMaterialIdentityInfo::HighlightPair& pair : info.highlightPairs) {
       tints += str::format(tints.empty() ? "" : ", ", describeUe3HighlightPair(pair));
+    }
     std::string unproven;
     const std::map<uint32_t, std::string>& names = getUe3PsFloatConstantNames(psHash, bytecode);
     for (const uint32_t reg : info.highlightUnprovenScalars) {
@@ -713,27 +701,32 @@ namespace dxvk {
       particleColorTexcoord = 1;
       if (m_currentUe3VertexFactory == Ue3VertexFactoryType::Particle && d3d9State().vertexDecl != nullptr) {
         for (const auto& element : d3d9State().vertexDecl->GetElements()) {
-          if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == 3 && element.Type == D3DDECLTYPE_FLOAT4)
+          if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == 3 && element.Type == D3DDECLTYPE_FLOAT4) {
             particleColorTexcoord = 3;
+          }
         }
       }
       const DxsoIsgn& isgn = pixelShader->GetIsgn();
       for (uint32_t i = 0; i < isgn.elemCount; i++) {
-        if (isgn.elems[i].semantic.usage == DxsoUsage::Texcoord && isgn.elems[i].semantic.usageIndex == particleColorTexcoord)
+        if (isgn.elems[i].semantic.usage == DxsoUsage::Texcoord && isgn.elems[i].semantic.usageIndex == particleColorTexcoord) {
           particleColorInputRegister = int32_t(isgn.elems[i].regNumber);
+        }
       }
     }
 
     const Ue3BlendRest blendRest = ue3BlendRest(materialData.blendMode);
     const bool canFade = m_frameOptions.ue3MaterialFades && (blendRest.alphaFades || blendRest.colorFades);
-    if (particleColorInputRegister < 0 && !canFade && !logFades)
+    if (particleColorInputRegister < 0 && !canFade && !logFades) {
       return;
+    }
 
     const DxsoMaterialFadeResult& result = getOrAnalyzeUe3MaterialFades(psHash, bytecode, particleColorInputRegister);
-    if (logFades)
+    if (logFades) {
       logUe3MaterialFadesOnce(psHash, bytecode, particleColorInputRegister, result);
-    if (!result.analyzed)
+    }
+    if (!result.analyzed) {
       return;
+    }
 
     const float* constants = reinterpret_cast<const float*>(d3d9State().psConsts.fConsts);
     const uint32_t constantCount = caps::MaxFloatConstantsPS;
@@ -787,10 +780,12 @@ namespace dxvk {
       const std::map<uint32_t, std::string>* names = logFades ? &getUe3PsFloatConstantNames(psHash, bytecode) : nullptr;
       for (const DxsoMaterialFade& fade : result.fades) {
         const bool alphaLane = fade.laneMask == kDxsoFadeAlphaLane;
-        if (alphaLane ? !blendRest.alphaFades : !blendRest.colorFades)
+        if (alphaLane ? !blendRest.alphaFades : !blendRest.colorFades) {
           continue;
-        if (lastApplied != nullptr && lastApplied->reg == fade.reg && lastApplied->component == fade.component)
+        }
+        if (lastApplied != nullptr && lastApplied->reg == fade.reg && lastApplied->component == fade.component) {
           continue;
+        }
         const std::optional<float> fadeCoverage =
           dxsoMaterialFadeCoverage(fade, alphaLane ? blendRest.alphaRest : blendRest.colorRest, constants, constantCount);
         if (names != nullptr) {
@@ -798,8 +793,9 @@ namespace dxvk {
                                  " value=", fade.reg < constantCount ? constants[fade.reg * 4u + (fade.component & 3u)] : 0.0f,
                                  fadeCoverage ? str::format(" coverage=", *fadeCoverage) : std::string(" not at rest"));
         }
-        if (!fadeCoverage)
+        if (!fadeCoverage) {
           continue;
+        }
         lastApplied = &fade;
         coverage *= *fadeCoverage;
       }
@@ -833,6 +829,510 @@ namespace dxvk {
           " vf=", describeUe3VertexFactory(m_currentUe3VertexFactory), " srcBlend=", srcBlend, " dstBlend=", dstBlend,
           particleLog, fadesExcluded ? " excluded" : "",
           canFade ? str::format(" coverage=", coverage, " fades=[", fadeLog, "]") : std::string(" blend does not fade")));
+      }
+    }
+  }
+
+  // See "Material identity and replacement anchor stability" in UE3Compatibility.md. Runs before
+  // setupCategoriesForTexture, whose lookups use the full material hash.
+  void D3D9Rtx::computeUe3MaterialIdentity(Ue3TextureState& ue3, const uint32_t firstStage) {
+    if (m_frameOptions.ue3EngineMode && m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr) {
+      ScopedCpuProfileZoneN("UE3 material identity");
+      const D3D9CommonShader* psCommonShader = d3d9State().pixelShader->GetCommonShader();
+      const auto& bytecode = psCommonShader->GetBytecode();
+      const XXH64_hash_t psHash = psCommonShader->GetBytecodeHash();
+      if (psHash != 0) {
+        const Ue3PsMaterialIdentityInfo& identityInfo = getOrParseUe3PsMaterialIdentityInfo(
+          psHash, bytecode, psCommonShader, m_frameOptions.ue3MicVolatileConstantDetection);
+
+        // Seeded from the canonical CTAB signature, including permutations without lightmap symbols, so a
+        // material keeps one identity across lightmap policies (see "Identity" in UE3Compatibility.md).
+        const bool useInvariantShaderIdentity =
+          m_frameOptions.ue3EngineMode &&
+          identityInfo.canonicalShaderSignature != kEmptyHash;
+        const XXH64_hash_t shaderIdentitySeed =
+          useInvariantShaderIdentity ? identityInfo.canonicalShaderSignature : psHash;
+
+        m_activeDrawCallState.materialData.setPixelShaderHashForMaterialInstance(shaderIdentitySeed);
+
+        // Every texture bound to a material sampler, keyed by CTAB name for invariant-identity shaders:
+        // lightmap sampler counts shift the register assignments between permutations.
+        const bool logMicHash = m_frameOptions.ue3LogMaterialInstanceHash;
+        if (logMicHash && !identityInfo.identitySummary.empty()) {
+          static fast_unordered_set s_loggedIdentitySummaries;
+          if (s_loggedIdentitySummaries.insert(psHash).second) {
+            Logger::info(str::format(
+              "[RTX-Ue3Identity] ps=0x", std::hex, psHash,
+              " seed=0x", identityInfo.canonicalShaderSignature, std::dec,
+              " ", identityInfo.identitySummary));
+          }
+        }
+        std::string micTextureListLog;
+        // Replacement identity drift diagnostics: record the (register, image hash, RT flag)
+        // tuples that feed textureSetHash so tier drift can be attributed per sampler.
+        Ue3MicIdentitySample::SamplerRecord micDiagSamplers[kMicDriftMaxTrackedSamplers];
+        uint32_t micDiagSamplerCount = 0;
+        const BoundTextureSnapshot& identityBoundTextures = ensureBoundTextureSnapshot();
+
+        XXH64_hash_t textureSetHash = kEmptyHash;
+        if (identityInfo.materialSamplerMask != 0) {
+          XXH3_state_t* const state = getThreadLocalXxh3State();
+          if (state != nullptr) {
+            XXH3_64bits_reset(state);
+            bool anyTextureHashed = false;
+            const BoundTextureSnapshot& boundTextures = identityBoundTextures;
+            auto hashMaterialSamplerTexture = [&](const void* samplerKey, const size_t samplerKeySize, const uint32_t samplerRegister, const char* samplerLogName) -> XXH64_hash_t {
+              if (samplerRegister >= SamplerCount || (boundTextures.mask & (1u << samplerRegister)) == 0) {
+                return kEmptyHash;
+              }
+              const BoundTextureSnapshotEntry& entry = boundTextures.entries[samplerRegister];
+              if (!entry.hasImage) {
+                return kEmptyHash;
+              }
+              const XXH64_hash_t imageHash = entry.imageHash;
+              if (imageHash == kEmptyHash) {
+                return kEmptyHash; // hashless (e.g. render target bound as a material texture)
+              }
+              if (m_frameOptions.ue3MicExcludeRenderTargetsFromIdentity && entry.isRenderTarget) {
+                // RT image hashes change on every recreation (respawn/checkpoint/level
+                // load) and would re-mint the identity each time; treat as hashless.
+                if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
+                  static fast_unordered_set s_loggedRtIdentityExclusions;
+                  const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
+                  if (s_loggedRtIdentityExclusions.insert(exclusionLogKey).second) {
+                    Logger::info(str::format(
+                      "[RTX-Compatibility][UE3-MIC] Excluded render-target image 0x", std::hex, imageHash,
+                      " (RT descriptor hash 0x", entry.rtDescriptorHash,
+                      ") at material sampler s", std::dec, samplerRegister,
+                      " of pixel shader 0x", std::hex, psHash, std::dec,
+                      " from material identity (rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity)."));
+                  }
+                }
+                return kEmptyHash;
+              }
+              if (!m_frameOptions.ue3MicIdentityExcludedTextureDescHashes->empty() &&
+                  lookupHash(*m_frameOptions.ue3MicIdentityExcludedTextureDescHashes, entry.descriptorHash)) {
+                // Identified by its descriptor hash rather than dropped: an empty texture set falls back to the
+                // primary colour texture's image hash, the very value being excluded.
+                if (m_frameOptions.logReplacementResolution || m_frameOptions.ue3LogMaterialInstanceHash) {
+                  static fast_unordered_set s_loggedDescIdentityExclusions;
+                  const XXH64_hash_t exclusionLogKey = XXH3_64bits_withSeed(&samplerRegister, sizeof(samplerRegister), psHash);
+                  if (s_loggedDescIdentityExclusions.insert(exclusionLogKey).second) {
+                    Logger::info(str::format(
+                      "[RTX-Compatibility][UE3-MIC] Identifying material sampler s", std::dec, samplerRegister,
+                      " of pixel shader 0x", std::hex, psHash,
+                      " by its descriptor hash 0x", entry.descriptorHash,
+                      " instead of its image hash 0x", imageHash, std::dec,
+                      " (rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes)."));
+                  }
+                }
+                XXH3_64bits_update(state, samplerKey, samplerKeySize);
+                XXH3_64bits_update(state, &entry.descriptorHash, sizeof(entry.descriptorHash));
+                anyTextureHashed = true;
+                if (micDiagSamplerCount < kMicDriftMaxTrackedSamplers) {
+                  micDiagSamplers[micDiagSamplerCount++] = Ue3MicIdentitySample::SamplerRecord {
+                    uint8_t(samplerRegister), entry.isRenderTarget, entry.descriptorHash, entry.descriptorHash };
+                }
+                if (logMicHash) {
+                  micTextureListLog += str::format(
+                    micTextureListLog.empty() ? "s" : ",s", samplerRegister,
+                    samplerLogName != nullptr ? str::format("(", samplerLogName, ")") : std::string(),
+                    ":desc0x", std::hex, entry.descriptorHash, std::dec);
+                }
+                return kEmptyHash;
+              }
+              XXH3_64bits_update(state, samplerKey, samplerKeySize);
+              XXH3_64bits_update(state, &imageHash, sizeof(imageHash));
+              anyTextureHashed = true;
+              if (micDiagSamplerCount < kMicDriftMaxTrackedSamplers) {
+                micDiagSamplers[micDiagSamplerCount++] = Ue3MicIdentitySample::SamplerRecord {
+                  uint8_t(samplerRegister), entry.isRenderTarget, imageHash, entry.descriptorHash };
+              }
+              if (logMicHash) {
+                micTextureListLog += str::format(
+                  micTextureListLog.empty() ? "s" : ",s", samplerRegister,
+                  samplerLogName != nullptr ? str::format("(", samplerLogName, ")") : std::string(),
+                  ":0x", std::hex, imageHash, "(desc:0x", entry.descriptorHash, ")", std::dec);
+              }
+              return imageHash;
+            };
+            if (useInvariantShaderIdentity) {
+              // name-keyed: register assignments shift between lightmap policy permutations
+              for (const auto& [samplerName, samplerNameKey, samplerRegister] : identityInfo.materialSamplersByNameOrder) {
+                if (samplerRegister < caps::MaxTexturesPS) {
+                  hashMaterialSamplerTexture(&samplerNameKey, sizeof(samplerNameKey), samplerRegister, samplerName.c_str());
+                }
+              }
+            } else {
+              // register-keyed
+              for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+                if ((identityInfo.materialSamplerMask & (1u << s)) == 0) {
+                  continue;
+                }
+                hashMaterialSamplerTexture(&s, sizeof(s), s, nullptr);
+              }
+            }
+            if (anyTextureHashed) {
+              textureSetHash = XXH3_64bits_digest(state);
+            }
+          }
+        }
+        m_activeDrawCallState.materialData.setMaterialTextureSetHashForMaterialInstance(textureSetHash);
+        // A canonical textureless signature already names the material; whatever albedo
+        // scoring bound for display must not leak into its identity.
+        const bool textureSetIsComplete = useInvariantShaderIdentity && identityInfo.materialSamplerMask == 0;
+        m_activeDrawCallState.materialData.setMaterialTextureSetIsComplete(textureSetIsComplete);
+
+        // Volatile registers are already out of identityInfo, so the constants tier cannot change mid-session.
+        // Both exclusion lists are keyed on values that outlive a session.
+        const XXH64_hash_t identityTextureSetHash =
+          (textureSetHash != kEmptyHash || textureSetIsComplete)
+            ? textureSetHash
+            : m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+        const XXH64_hash_t textureSetShaderHash =
+          XXH3_64bits_withSeed(&identityTextureSetHash, sizeof(identityTextureSetHash), shaderIdentitySeed);
+        const bool constantsExcluded =
+          // The tier that cannot be made lightmap-policy independent; opt-in only.
+          !m_frameOptions.ue3MicConstantIdentity ||
+          lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, psHash) ||
+          (useInvariantShaderIdentity && lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedShaders, shaderIdentitySeed)) ||
+          lookupHash(*m_frameOptions.ue3MicConstantIdentityExcludedMaterials, textureSetShaderHash);
+        // Invariant-identity shaders hash constants by uniform name, since lightmap permutations shift and trim
+        // uniform registers. Other shaders hash the register range.
+        XXH64_hash_t psConstsHash = kEmptyHash;
+        if (!constantsExcluded) {
+          psConstsHash = useInvariantShaderIdentity
+            ? hashUe3MaterialConstantsByNameOrder(d3d9State().psConsts.fConsts, identityInfo.namedUniformFirstRegistersByNameOrder)
+            : hashUe3MaterialConstants(d3d9State().psConsts.fConsts, identityInfo.constRanges);
+        }
+        m_activeDrawCallState.materialData.setPixelShaderConstantsHashForMaterialInstance(psConstsHash);
+
+        // Report - never act on - a family that still mints more than one identity, so a
+        // frame-varying register the bytecode could not see announces itself instead of
+        // quietly breaking the replacements anchored on it.
+        if (m_frameOptions.ue3ReportMicIdentityChurn && !constantsExcluded && psConstsHash != kEmptyHash) {
+          reportUe3MicIdentityChurnOnce(
+            textureSetShaderHash, psHash, shaderIdentitySeed,
+            m_activeDrawCallState.materialData.getColorTexture().getImageHash(),
+            psConstsHash, d3d9State().psConsts.fConsts, identityInfo, useInvariantShaderIdentity, bytecode);
+        }
+
+        // Replacement identity drift diagnostics: attribute a changed material hash
+        // to the tier that moved and flag RT-poisoned identities.
+        const bool replacementDiagActive =
+          m_frameOptions.logReplacementResolution ||
+          (m_frameOptions.replacementDebugHashes != nullptr && !m_frameOptions.replacementDebugHashes->empty());
+        if (replacementDiagActive) {
+          m_activeDrawCallState.materialData.updateCachedHash();
+          const XXH64_hash_t materialHash = m_activeDrawCallState.materialData.getHash();
+          const XXH64_hash_t primaryTexHash = m_activeDrawCallState.materialData.getColorTexture().getImageHash();
+
+          bool tracked = false;
+          if (m_frameOptions.replacementDebugHashes != nullptr && !m_frameOptions.replacementDebugHashes->empty()) {
+            const fast_unordered_set& dbg = *m_frameOptions.replacementDebugHashes;
+            tracked = lookupHash(dbg, primaryTexHash) || lookupHash(dbg, materialHash) || lookupHash(dbg, textureSetShaderHash);
+            for (uint32_t i = 0; !tracked && i < micDiagSamplerCount; i++) {
+              tracked = lookupHash(dbg, micDiagSamplers[i].imageHash);
+            }
+          }
+
+          if (m_frameOptions.logReplacementResolution || tracked) {
+            const XXH64_hash_t familyKey = XXH3_64bits_withSeed(&primaryTexHash, sizeof(primaryTexHash), shaderIdentitySeed);
+
+            // Snapshot the constant registers feeding the identity so drift can name the
+            // register(s) whose values moved.
+            Ue3MicIdentitySample::ConstantRecord curConstants[kMicDriftMaxTrackedConstants];
+            uint32_t curConstantCount = 0;
+            if (!constantsExcluded && psConstsHash != kEmptyHash) {
+              curConstantCount = snapshotUe3MicIdentityConstants(
+                d3d9State().psConsts.fConsts, identityInfo, useInvariantShaderIdentity,
+                curConstants, kMicDriftMaxTrackedConstants);
+            }
+
+            Ue3MicIdentitySample& prev = s_ue3MicIdentityByFamily[familyKey];
+            if (prev.valid && prev.materialHash != materialHash &&
+                prev.driftLogsEmitted < (tracked ? kMicDriftMaxLogsPerTrackedFamily : kMicDriftMaxLogsPerFamily)) {
+              ++prev.driftLogsEmitted;
+              std::string detail;
+              if (prev.textureSetHash != textureSetHash) {
+                detail += str::format("\n  textureSet 0x", std::hex, prev.textureSetHash, " -> 0x", textureSetHash, std::dec, ":");
+                for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                  const Ue3MicIdentitySample::SamplerRecord& cur = micDiagSamplers[i];
+                  const Ue3MicIdentitySample::SamplerRecord* old = nullptr;
+                  for (uint32_t j = 0; j < prev.samplerCount; j++) {
+                    if (prev.samplers[j].reg == cur.reg) {
+                      old = &prev.samplers[j];
+                      break;
+                    }
+                  }
+                  if (old == nullptr) {
+                    detail += str::format(" s", uint32_t(cur.reg), " added=0x", std::hex, cur.imageHash,
+                                          "(desc:0x", cur.descriptorHash, ")", std::dec, cur.isRenderTarget ? "(RT)" : "");
+                  } else if (old->imageHash != cur.imageHash) {
+                    detail += str::format(" s", uint32_t(cur.reg), " 0x", std::hex, old->imageHash, "->0x", cur.imageHash,
+                                          "(desc:0x", cur.descriptorHash, ")", std::dec, cur.isRenderTarget ? "(RT)" : "");
+                  }
+                }
+                for (uint32_t j = 0; j < prev.samplerCount; j++) {
+                  bool stillPresent = false;
+                  for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+                    if (micDiagSamplers[i].reg == prev.samplers[j].reg) {
+                      stillPresent = true;
+                      break;
+                    }
+                  }
+                  if (!stillPresent) {
+                    detail += str::format(" s", uint32_t(prev.samplers[j].reg), " removed=0x", std::hex, prev.samplers[j].imageHash, std::dec,
+                                          prev.samplers[j].isRenderTarget ? "(RT)" : "");
+                  }
+                }
+              }
+              if (prev.constantsExcluded != constantsExcluded) {
+                detail += str::format("\n  constantsExcluded ", prev.constantsExcluded ? 1 : 0, " -> ", constantsExcluded ? 1 : 0);
+              }
+              if (prev.constantsHash != psConstsHash) {
+                detail += str::format("\n  consts 0x", std::hex, prev.constantsHash, " -> 0x", psConstsHash, std::dec, ":");
+                for (uint32_t i = 0; i < curConstantCount; i++) {
+                  const Ue3MicIdentitySample::ConstantRecord& cur = curConstants[i];
+                  for (uint32_t j = 0; j < prev.constantCount; j++) {
+                    const Ue3MicIdentitySample::ConstantRecord& old = prev.constants[j];
+                    if (old.reg == cur.reg) {
+                      if (old.value.x != cur.value.x || old.value.y != cur.value.y ||
+                          old.value.z != cur.value.z || old.value.w != cur.value.w) {
+                        detail += str::format(" c", uint32_t(cur.reg),
+                                              " (", old.value.x, ",", old.value.y, ",", old.value.z, ",", old.value.w,
+                                              ")->(", cur.value.x, ",", cur.value.y, ",", cur.value.z, ",", cur.value.w, ")");
+                      }
+                      break;
+                    }
+                  }
+                }
+              }
+              Logger::warn(str::format(
+                "[RTX-MicDrift] Material identity changed for family tex=0x", std::hex, primaryTexHash,
+                " seed=0x", shaderIdentitySeed,
+                ": materialHash 0x", prev.materialHash, " -> 0x", materialHash,
+                " (textureSet+shader tier 0x", textureSetShaderHash, ")", std::dec,
+                detail.empty() ? "\n  (no attributable tier diff captured)" : detail.c_str(),
+                "\n  Replacements anchored on the previous hash no longer match this draw."));
+            }
+
+            prev.valid = true;
+            prev.materialHash = materialHash;
+            prev.textureSetHash = textureSetHash;
+            prev.constantsHash = psConstsHash;
+            prev.constantsExcluded = constantsExcluded;
+            prev.samplerCount = micDiagSamplerCount;
+            for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+              prev.samplers[i] = micDiagSamplers[i];
+            }
+            prev.constantCount = curConstantCount;
+            for (uint32_t i = 0; i < curConstantCount; i++) {
+              prev.constants[i] = curConstants[i];
+            }
+
+            // RT-poisoning sweep: a render-target-backed image hash inside the identity
+            // makes it unstable across RT recreation (respawn / level load).
+            for (uint32_t i = 0; i < micDiagSamplerCount; i++) {
+              if (micDiagSamplers[i].isRenderTarget) {
+                if (s_ue3MicRtPoisonWarnedFamilies.insert(familyKey).second) {
+                  Logger::warn(str::format(
+                    "[RTX-MicRtPoisoning] Material identity for family tex=0x", std::hex, primaryTexHash,
+                    " seed=0x", shaderIdentitySeed,
+                    " includes render-target image hash 0x", micDiagSamplers[i].imageHash,
+                    " at material sampler s", std::dec, uint32_t(micDiagSamplers[i].reg),
+                    std::hex, " (stable RT descriptor hash 0x", micDiagSamplers[i].descriptorHash,
+                    "): materialHash 0x", materialHash, std::dec,
+                    " will change whenever the game recreates this render target (respawn/level load),"
+                    " breaking replacements anchored on it."));
+                }
+                break;
+              }
+            }
+          }
+        }
+
+        // Constant-colour materials take the first plausible colour among the kept vectors in CTAB name order,
+        // which every lightmap compile shares. The lowest name often holds a zero vector.
+        if (identityInfo.materialSamplerMask == 0 &&
+            !identityInfo.uniformVectorRegisters.empty() &&
+            !m_activeDrawCallState.materialData.colorTextures[0].isValid()) {
+          const float tintGain = m_frameOptions.ue3ConstantAlbedoTintGain;
+          auto tryConstantAlbedo = [&](const uint32_t reg) {
+            if (reg >= caps::MaxFloatConstantsPS) {
+              return false;
+            }
+            // A highlight colour holds its value whether the highlight is on or not, so taking
+            // it would leave the surface permanently tinted.
+            if (std::find(identityInfo.highlightColorRegisters.begin(), identityInfo.highlightColorRegisters.end(), reg) !=
+                identityInfo.highlightColorRegisters.end()) {
+              return false;
+            }
+            const Vector4& uniformColor = d3d9State().psConsts.fConsts[reg];
+            if (!std::isfinite(uniformColor.x) || !std::isfinite(uniformColor.y) ||
+                !std::isfinite(uniformColor.z) || !std::isfinite(uniformColor.w)) {
+              return false;
+            }
+            const float maxComp = std::max({ uniformColor.x, uniformColor.y, uniformColor.z });
+            const float minComp = std::min({ uniformColor.x, uniformColor.y, uniformColor.z });
+            // reject blacks/negatives (not visible albedo) and HDR-scale values (intensities).
+            // Rejecting black also lets a register holding the material's switched-off colour
+            // fall through to whichever one holds its real tint.
+            if (minComp < 0.0f || maxComp <= 0.01f || maxComp > 8.0f) {
+              return false;
+            }
+
+            Vector4 albedo = uniformColor;
+            if (tintGain > 0.0f) {
+              // The register holds a tint UE3 multiplied against baked lighting for brightness,
+              // so raw it is near-black once the lightmap is gone. Blend the legacy constant
+              // towards the fully saturated hue by the register's own strength, which keeps a
+              // ramping tint continuous instead of stepping away from the unlit surface.
+              const Vector3 base = LegacyMaterialDefaults::albedoConstant();
+              const float weight = std::min(maxComp * tintGain, 1.0f);
+              albedo.x = base.x + (uniformColor.x / maxComp - base.x) * weight;
+              albedo.y = base.y + (uniformColor.y / maxComp - base.y) * weight;
+              albedo.z = base.z + (uniformColor.z / maxComp - base.z) * weight;
+            }
+            m_activeDrawCallState.materialData.ue3ConstantAlbedo = albedo;
+            m_activeDrawCallState.materialData.hasUe3ConstantAlbedo = true;
+            return true;
+          };
+          if (!identityInfo.namedUniformFirstRegistersByNameOrder.empty()) {
+            for (const auto& [uniformNameKey, uniformRegister] : identityInfo.namedUniformFirstRegistersByNameOrder) {
+              if (tryConstantAlbedo(uniformRegister)) {
+                break;
+              }
+            }
+          } else {
+            for (const uint32_t reg : identityInfo.uniformVectorRegisters) {
+              if (tryConstantAlbedo(reg)) {
+                break;
+              }
+            }
+          }
+        }
+
+        // Runner Vision: the game fades a strength parameter up on the surfaces it highlights
+        // and tints them through constants Remix never evaluates. Carried per surface rather
+        // than in the material, so the fade reaches the renderer frame by frame without
+        // re-minting the material or moving its identity.
+        if (m_frameOptions.ue3HighlightTints) {
+          const bool logHighlight = m_frameOptions.ue3LogHighlightTints;
+          if (logHighlight) {
+            logUe3HighlightPairsOnce(psHash, shaderIdentitySeed, bytecode, identityInfo);
+          }
+
+          LegacyMaterialData& materialData = m_activeDrawCallState.materialData;
+          const auto& pairs = identityInfo.highlightPairs;
+          const Vector4* fConsts = d3d9State().psConsts.fConsts;
+          const float glowIntensity = std::max(m_frameOptions.ue3HighlightGlowIntensity, 0.0f);
+
+          // A glow-only pair glows one of the material's textures. It is bound whatever the
+          // strength, so the material stays the same through a highlight.
+          const auto glowPair = std::find_if(pairs.begin(), pairs.end(), [](const auto& pair) { return pair.tint.glowOnly; });
+          if (glowPair != pairs.end() && glowIntensity > 0.0f) {
+            const uint32_t stage = uint32_t(glowPair->tint.glowSampler);
+            D3D9CommonTexture* const glowTexture =
+              stage < caps::MaxTexturesPS ? GetCommonTexture(d3d9State().textures[stage]) : nullptr;
+            if (glowTexture != nullptr && glowTexture->GetImage() != nullptr &&
+                glowTexture->GetImage()->getHash() != kEmptyHash) {
+              if (const Rc<DxvkImageView> view = getRemixSampleView(glowTexture, false); view != nullptr) {
+                materialData.ue3HighlightGlowTexture = TextureRef(view);
+                materialData.ue3HighlightGlowTextureIsSrgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
+                materialData.ue3HighlightGlowTextureChannel = glowPair->tint.glowComponent;
+              }
+            }
+          }
+
+          // Nearly every draw holds its strengths at 0, which leaves the surface as it is.
+          const bool active = std::any_of(pairs.begin(), pairs.end(), [&](const auto& pair) {
+            return pair.tint.scalarReg < caps::MaxFloatConstantsPS && fConsts[pair.tint.scalarReg].x > 0.0f;
+          });
+          if (active) {
+            materialData.updateCachedHash();
+            const fast_unordered_set& excluded = *m_frameOptions.ue3HighlightTintExcludedMaterials;
+            const XXH64_hash_t colorTextureHash = materialData.getColorTexture().getImageHash();
+            const bool isExcluded = !excluded.empty() &&
+              (lookupHash(excluded, materialData.getHash()) || lookupHash(excluded, textureSetShaderHash) ||
+               lookupHash(excluded, colorTextureHash));
+            if (!isExcluded) {
+              Ue3HighlightTintDraw draw;
+              draw.fConsts = fConsts;
+              draw.materialHash = materialData.getHash();
+              draw.requireMotion = m_frameOptions.ue3HighlightTintRequireMotion;
+              if (draw.requireMotion) {
+                const Matrix4& objectToWorld = m_activeDrawCallState.transformData.objectToWorld;
+                draw.objectHash = XXH3_64bits_withSeed(&objectToWorld, sizeof(objectToWorld), draw.materialHash);
+              }
+              draw.glowIntensity = glowIntensity;
+              draw.log = logHighlight;
+
+              static fast_unordered_set s_loggedHighlightMaterials;
+              const bool logApplied = logHighlight && !lookupHash(s_loggedHighlightMaterials, materialData.getHash());
+              std::string appliedLog;
+              const bool applied = evaluateUe3HighlightTints(identityInfo, draw, materialData.ue3HighlightTint,
+                                                             materialData.ue3HighlightGlow, logApplied ? &appliedLog : nullptr);
+              if (applied && logApplied) {
+                s_loggedHighlightMaterials.insert(materialData.getHash());
+                const Vector3& tint = materialData.ue3HighlightTint;
+                const Vector3& glow = materialData.ue3HighlightGlow;
+                const TextureRef& glowTexture = materialData.ue3HighlightGlowTexture;
+                Logger::info(str::format(
+                  "[RTX-Compatibility][UE3-Highlight] Tint applied: materialHash=0x", std::hex, materialData.getHash(),
+                  " textureSetShader=0x", textureSetShaderHash, " texture=0x", colorTextureHash, " ps=0x", psHash,
+                  glowTexture.isValid() ? str::format(" glowTexture=0x", std::hex, glowTexture.getImageHash()) : std::string(),
+                  std::dec, " tint=(", tint.x, ",", tint.y, ",", tint.z, ") glow=(", glow.x, ",", glow.y, ",", glow.z, ") ",
+                  appliedLog));
+              }
+            }
+          }
+        }
+
+        const Vector3& forcedHighlightTint = m_frameOptions.ue3HighlightDebugForceTint;
+        if (forcedHighlightTint.x != 1.0f || forcedHighlightTint.y != 1.0f || forcedHighlightTint.z != 1.0f) {
+          m_activeDrawCallState.materialData.ue3HighlightTint = forcedHighlightTint;
+        }
+
+        // Opacity-driven fades: UE3 hands its particle colour to the shader as an interpolant Remix
+        // never treats as a vertex colour, and fades draws through material constants it never
+        // evaluates. Both come from the shader analysis and are carried per draw, like the highlight.
+        if (m_frameOptions.ue3ParticleVertexColor || m_frameOptions.ue3MaterialFades) {
+          applyUe3MaterialFades(psHash, bytecode, psCommonShader, textureSetShaderHash);
+        }
+
+        const float forcedCoverage = m_frameOptions.ue3MaterialFadeDebugForceCoverage;
+        if (forcedCoverage >= 0.0f && m_activeDrawCallState.materialData.blendMode.enableBlending) {
+          m_activeDrawCallState.materialData.ue3FadeCoverage = std::min(forcedCoverage, 1.0f);
+        }
+
+        if (logMicHash) {
+          m_activeDrawCallState.materialData.updateCachedHash();
+          logUe3MaterialInstanceHashBreakdownOnce(
+            m_activeDrawCallState.materialData.getHash(), psHash, shaderIdentitySeed, textureSetHash,
+            textureSetShaderHash, psConstsHash, identityInfo, constantsExcluded, micTextureListLog);
+        }
+
+      }
+    }
+  }
+
+  // Texture-less materials have no presence in the texture selection UI; register
+  // their material hash as an entry (white thumbnail) so they can be clicked/tagged.
+  // Category and replacement lookups already accept material hashes.
+  void D3D9Rtx::registerUe3TexturelessMaterial() {
+    if (!m_activeDrawCallState.materialData.colorTextures[0].isValid()) {
+      const XXH64_hash_t texturelessMaterialHash = m_activeDrawCallState.materialData.getHash();
+      static fast_unordered_set s_registeredTexturelessMaterials;
+      if (texturelessMaterialHash != kEmptyHash &&
+          s_registeredTexturelessMaterials.insert(texturelessMaterialHash).second) {
+        m_parent->EmitCs([texturelessMaterialHash](DxvkContext* ctx) {
+          const Rc<DxvkImageView> whiteView =
+            static_cast<RtxContext*>(ctx)->getResourceManager().getWhiteTexture(ctx);
+          if (whiteView != nullptr) {
+            ImGUI::AddTexture(texturelessMaterialHash, whiteView, ImGUI::kTextureFlagsDefault);
+          }
+        });
       }
     }
   }

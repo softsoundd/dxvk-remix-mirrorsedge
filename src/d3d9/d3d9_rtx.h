@@ -969,6 +969,7 @@ namespace dxvk {
     XXH64_hash_t m_prevDrawTextureHash = 0;
     XXH64_hash_t m_prevDrawGeometryHash = 0;
     DWORD m_prevDrawCullMode = 0;
+    bool isUe3SecondTwoSidedTranslucentPass(const DrawContext& drawContext);
 
     int m_activeOcclusionQueries = 0;
 
@@ -1036,7 +1037,7 @@ namespace dxvk {
 
     // Keeps UE3's vertex lightmap coefficient streams and per-instance transform streams from
     // being mistaken for the surface's UVs.
-    uint32_t resolveIaTexcoordAvoidingNonUvElements(uint32_t iaTexcoordIdx) const;
+    uint32_t resolveIaTexcoordIndex(uint32_t iaTexcoordIdx) const;
 
     // Half-or-larger in both dims (allows ScreenPercentage >50%) and aspect-matched to the
     // backbuffer so square SceneCapture RTs cannot pass as main-view-sized on widescreen.
@@ -1106,6 +1107,8 @@ namespace dxvk {
     static constexpr size_t kUe3ObjectToWorldCacheMaxEntries = 32768;
     fast_unordered_cache<Matrix4> m_ue3ObjectToWorldCache;
 
+    bool applyUe3ShaderConstantTransforms(const DrawContext& drawContext, DrawCallTransforms& transformData);
+
     fast_unordered_cache<PsSamplerTexcoordEntry> m_psSamplerTexcoordCache;
     fast_unordered_set m_loggedUvResolutions;
 
@@ -1120,40 +1123,11 @@ namespace dxvk {
     fast_unordered_set m_loggedUvAffineDetails;
     fast_unordered_cache<uint16_t> m_uvAffineDetailLogCounts;
 
-    fast_unordered_cache<Ue3DiffuseSelectionEntry> m_ue3DiffuseSelectionCache;
-    // Persisted to rtx-remix/ue3DiffuseSelection.cache. The pin survives a level reload in memory
-    // but not a relaunch, and a decision first made while a material's textures were still
-    // streamed down can differ from the settled one, so the file is what makes every session
-    // start from the same pick.
-    bool m_ue3DiffuseSelectionLoaded = false;
-    bool m_ue3DiffuseSelectionDirty = false;
-    bool m_ue3DiffuseSelectionSaveBlocked = false;
-    uint32_t m_ue3DiffuseSelectionLastSaveFrame = 0;
-    // A stored pick records a decision, not the inputs behind it, and is consulted whenever the
-    // bound texel area has not grown past the recorded peak - which after a settled run is
-    // essentially always. Changed scoring would therefore be invisible wherever a cache exists,
-    // so a bounded sample of loaded picks is re-scored and any disagreement reported once.
-    uint32_t m_ue3DiffuseSelectionAuditsRemaining = 0;
-    bool m_ue3DiffuseSelectionAuditWarned = false;
-    void loadUe3DiffuseSelectionCache();
-    void saveUe3DiffuseSelectionCache();
-    // Tag-set digests the stored picks were scored under; a change drops them so tagging takes effect live.
-    uint32_t m_ue3DiffuseSelectionLightmapTagDigest = 0;
-    uint32_t m_ue3DiffuseSelectionNeverAlbedoTagDigest = 0;
-    uint32_t m_ue3DiffuseSelectionPreferredAlbedoTagDigest = 0;
-
+    Ue3DiffuseSelectionCache m_ue3DiffuseSelectionCache;
     // selection cache keys already dumped by rtx.d3d9.ue3LogAlbedoSelection
     fast_unordered_set m_loggedAlbedoSelections;
 
-    fast_unordered_cache<Ue3TextureMaterialSpread> m_ue3TextureMaterialSpread;
-    bool m_ue3TextureSpreadLoaded = false;
-    bool m_ue3TextureSpreadDirty = false;
-    // Set when the cache file existed but could not be read in full. Saving rewrites the
-    // file from the map, so a partial load must never be allowed to publish itself.
-    bool m_ue3TextureSpreadSaveBlocked = false;
-    uint32_t m_ue3TextureSpreadLastSaveFrame = 0;
-    void loadUe3TextureSpreadCache();
-    void saveUe3TextureSpreadCache();
+    Ue3TextureSpreadCache m_ue3TextureSpreadCache;
 
     uint32_t m_ue3FrameCounter = 0;
 
@@ -1212,34 +1186,7 @@ namespace dxvk {
       bool canUseBuffer;
     };
 
-    fast_unordered_cache<Ue3VertexCaptureCacheEntry> m_ue3VertexCaptureCache;
-    // Sum of byteSize over the retention tier, maintained incrementally so the budget can be
-    // enforced without walking the map every frame.
-    VkDeviceSize m_ue3VertexCaptureCacheBytes = 0;
-
-    fast_unordered_cache<Ue3VertexCaptureAdmissionEntry> m_ue3VertexCaptureAdmission;
-    uint32_t m_ue3VertexCaptureLastSweepFrame = 0;
-
-    // Cache effectiveness counters. The per-frame pair is folded at end of frame into the
-    // dormancy evaluation window (always) and the diagnostic interval (when logging is on).
-    uint32_t m_ue3VertexCaptureCacheFrameReuses = 0;
-    uint32_t m_ue3VertexCaptureCacheFrameCaptures = 0;
-    uint64_t m_ue3VertexCaptureCacheStatReuses = 0;
-    uint64_t m_ue3VertexCaptureCacheStatCaptures = 0;
-    uint32_t m_ue3VertexCaptureCacheStatFrames = 0;
-    uint32_t m_ue3VertexCaptureCacheStatFrameStamp = 0;
-    uint64_t m_ue3VertexCaptureCacheEvictions = 0;
-
-    // Dormancy guard. Some titles recompute a draw's object transform every frame even for
-    // geometry that is not moving, which mints a fresh cache key per draw per frame. The cache
-    // then cannot hit at all, and the admission tier alone accumulates a record per draw per
-    // frame for no benefit. Measuring the reuse rate over a window and standing the whole cache
-    // down when it is hopeless keeps the option safe to leave enabled in any UE3 title.
-    bool m_ue3VertexCaptureCacheDormant = false;
-    uint32_t m_ue3VertexCaptureCacheProbeCountdown = 0;
-    uint32_t m_ue3VertexCaptureWindowFrames = 0;
-    uint64_t m_ue3VertexCaptureWindowReuses = 0;
-    uint64_t m_ue3VertexCaptureWindowCaptures = 0;
+    Ue3StaticVertexCaptureCache m_ue3StaticVertexCaptureCache;
 
     fast_unordered_cache<Ue3ChurnMeshEntry> m_ue3ConstantChurn;
 
@@ -1266,8 +1213,7 @@ namespace dxvk {
     void trackUe3ConstantChurn(XXH64_hash_t iaKey, const RasterGeometry& geoData);
     void reportUe3ConstantChurn();
 
-    fast_unordered_cache<std::shared_ptr<Ue3GeometryMemoEntry>> m_ue3GeometryMemoCache;
-    void pruneUe3GeometryMemoCache();
+    Ue3GeometryMemo m_ue3GeometryMemo;
 
     bool canMemoizeUe3IaGeometryHashes(const IndexContext& indexContext,
                                        const VertexContext vertexContext[caps::MaxStreams],
@@ -1278,7 +1224,7 @@ namespace dxvk {
                                              const RasterGeometry& geoData) const;
     // The geometry-hash VertexShader component for the current draw (stable VS-constant
     // hash plus position-source/outlier folds); shared by computeHash and the memo hit path.
-    XXH64_hash_t computeLiveGeometryVertexShaderHashComponent();
+    XXH64_hash_t computeGeometryVertexShaderHash();
 
     // Position source resolved once per draw, before the vertex-capture cache key is built
     // (the cache is only valid for exact sources) and before capture flags are uploaded.
@@ -1338,16 +1284,6 @@ namespace dxvk {
                                                        const VertexContext vertexContext[caps::MaxStreams],
                                                        const DrawContext& drawContext,
                                                        const RasterGeometry& geoData) const;
-    bool tryReuseUe3StaticVertexCapture(XXH64_hash_t cacheKey, RasterGeometry& geoData);
-    void updateUe3StaticVertexCaptureCache(XXH64_hash_t cacheKey, const RasterGeometry& geoData);
-    void pruneUe3StaticVertexCaptureCache();
-    void enforceUe3StaticVertexCaptureCacheBudget();
-    void eraseUe3StaticVertexCaptureCacheEntry(XXH64_hash_t cacheKey);
-    void clearUe3StaticVertexCaptureCache();
-    // Called once per frame after pruning: folds the frame's reuse/capture counts into the
-    // dormancy window and the diagnostic interval, then runs both.
-    void updateUe3StaticVertexCaptureCacheState();
-
     // NV-DXVK start: draw disposition statistics (logged every 300 frames while the pass timer is on)
     struct DrawDispositionStats {
       uint32_t frames = 0;
@@ -1364,8 +1300,6 @@ namespace dxvk {
     DrawDispositionStats m_drawDispositionStats;
     void reportDrawDispositionStats();
     // NV-DXVK end
-    void evaluateUe3StaticVertexCaptureCacheDormancy();
-    void reportUe3StaticVertexCaptureCacheStats();
 
     static bool isPrimitiveSupported(const D3DPRIMITIVETYPE PrimitiveType) {
       return (PrimitiveType == D3DPT_TRIANGLELIST || PrimitiveType == D3DPT_TRIANGLEFAN || PrimitiveType == D3DPT_TRIANGLESTRIP);
@@ -1378,6 +1312,18 @@ namespace dxvk {
 
     template<typename T>
     DxvkBufferSlice processIndexBuffer(const uint32_t indexCount, const uint32_t startIndex, const IndexContext& indexCtx, uint32_t& minIndex, uint32_t& maxIndex);
+
+    struct VertexCapturePlan {
+      bool captureTexcoords = false;
+      bool captureNormals = false;
+      bool captureColor = false;
+      uint32_t texcoordOutputRegister = UINT32_MAX;
+      uint32_t colorOutputRegister = UINT32_MAX;
+      uint32_t flags = 0;   // kVertexCaptureFlag_*
+      uint32_t boneMatricesBaseReg = 0;
+      uint32_t boneCount = 0;
+    };
+    VertexCapturePlan planUe3VertexCapture(const D3D9CommonShader* vertexShader, Ue3CapturePositionSource positionSource) const;
 
     // allowPooledBuffer: the capture is transient (not retained by the UE3 static vertex-capture
     // cache), so rtx.poolVertexCaptureBuffers may serve it from the capture buffer pool.
@@ -1407,8 +1353,50 @@ namespace dxvk {
 
     template<bool FixedFunction>
     bool processTextures();
+    static Rc<DxvkImageView> getRemixSampleView(D3D9CommonTexture* texture, bool srgb);
+    Ue3TextureState beginUe3TextureState(bool programmablePs);
+    bool resolveInferredSamplerOffset(const PsSamplerTexcoordEntry* entry, uint32_t stage, float& outU, float& outV) const;
+    bool hasNonZeroInferredSamplerOffset(const PsSamplerTexcoordEntry* entry, uint32_t stage) const;
+    PsSamplerTexcoordEntry* getOrInitPsSamplerTexcoordEntry(const D3D9CommonShader* ps, XXH64_hash_t& outHash);
+    void selectUe3BoundTextures(Ue3TextureState& ue3, uint32_t& firstStage);
+    void computeUe3MaterialIdentity(Ue3TextureState& ue3, uint32_t firstStage);
+    void registerUe3TexturelessMaterial();
+    void markUe3MovieTextureMaterial(const Ue3TextureState& ue3, XXH64_hash_t materialHash, XXH64_hash_t textureHash);
+    void resolveUe3Texcoords(Ue3TextureState& ue3, uint32_t firstStage, uint32_t stageStateIdx, uint32_t& texcoordIdx, uint32_t& iaTexcoordIdx);
 
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
+
+    struct Ue3StaticVertexCaptureKey {
+      bool canUseCache = false;
+      XXH64_hash_t key = kEmptyHash;
+    };
+
+    // A draw's geometry hash memo entry: served from it, or the entry the computed hashes publish
+    // to (and, during a self-check, verify against).
+    struct Ue3GeometryMemoLookup {
+      bool served = false;
+      XXH64_hash_t key = kEmptyHash;
+      std::shared_ptr<Ue3GeometryMemoEntry> publishTo;
+      std::shared_ptr<const Ue3GeometryMemoEntry> verifyAgainst;
+    };
+
+    void classifyUe3DrawVertexFactory();
+    void resolveUe3DrawInstancing();
+    void readUe3DrawInstances(const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext,
+                              const RasterGeometry& geoData);
+    void updateUe3SkinnedDrawIdentity();
+    bool resolveUe3DrawCaptureSource(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
+                                     const RasterGeometry& geoData);
+    Ue3StaticVertexCaptureKey computeUe3DrawStaticVertexCaptureKey(const IndexContext& indexContext,
+                                                                   const VertexContext vertexContext[caps::MaxStreams],
+                                                                   const DrawContext& drawContext,
+                                                                   const RasterGeometry& geoData);
+    Ue3GeometryMemoLookup lookupUe3GeometryMemo(const IndexContext& indexContext,
+                                                const VertexContext vertexContext[caps::MaxStreams],
+                                                const DrawContext& drawContext,
+                                                RasterGeometry& geoData);
+    bool tryReuseUe3DrawStaticVertexCapture(const Ue3StaticVertexCaptureKey& key, RasterGeometry& geoData);
+    void recordUe3StaticVertexCapture(const Ue3StaticVertexCaptureKey& key, bool reused, const RasterGeometry& geoData);
 
     // Occlusion-test draws whose query result is synthesized are ignored by the draw entry points
     // before the draw contexts are built.
@@ -1532,6 +1520,28 @@ namespace dxvk {
       // injection - the draw is captured and replayed after injection fires later in the frame
       bool deferUntilInjection = false;
     };
+
+    // A draw's deferred-UI tag match (isDeferredUiTaggedDraw), evaluated at most once and only when
+    // asked. A matched hash of zero means a pixel shader tag matched, which the option documents as
+    // explicit intent, unlike a texture tag that a shared texture can trigger on any draw.
+    class DeferredUiTagQuery {
+    public:
+      explicit DeferredUiTagQuery(const D3D9Rtx& rtx) : m_rtx(rtx) { }
+      bool isTagged();
+      bool isPixelShaderTagged();
+      const XXH64_hash_t& matchedTextureHash() const { return m_matchedTextureHash; }
+    private:
+      const D3D9Rtx& m_rtx;
+      XXH64_hash_t m_matchedTextureHash = 0;
+      int m_state = -1;
+    };
+
+    bool isUe3DepthTestDisabledTranslucency(DeferredUiTagQuery& deferredUiTag) const;
+    std::optional<DrawCallType> classifyUe3DrawPass(const DrawContext& drawContext, DeferredUiTagQuery& deferredUiTag);
+    std::optional<DrawCallType> decideDeferredUiDraw(const DrawContext& drawContext, DeferredUiTagQuery& deferredUiTag);
+    bool isUe3ShadowDepthPass() const;
+    void logNonPrimaryRenderTargetOnce() const;
+    std::optional<DrawCallType> classifyRenderTargetSamplingDraw(const DrawContext& drawContext);
     DrawCallType makeDrawCallType(const DrawContext& drawContext);
 
     bool checkBoundTextureCategory(const fast_unordered_set& textureCategory) const;
@@ -1598,14 +1608,7 @@ namespace dxvk {
       bool sequenceTrackedLockWaits = true;
       bool discardCaptureOnlyDrawFragments = true;
       bool skipRenderTargetCopies = true;
-      bool ue3StaticLocalMeshVertexCaptureCache = false;
-      uint32_t ue3StaticLocalMeshVertexCaptureCacheWarmupFrames = 0;
-      uint32_t ue3StaticLocalMeshVertexCaptureCacheBudgetMiB = 0;
-      uint32_t ue3StaticLocalMeshVertexCaptureCacheMaxEntries = 0;
-      uint32_t ue3StaticLocalMeshVertexCaptureCacheRetentionFrames = 0;
-      uint32_t ue3StaticLocalMeshVertexCaptureCacheMinReusePercent = 0;
-      uint32_t ue3StaticLocalMeshVertexCaptureCacheReuseProbeFrames = 0;
-      bool ue3LogStaticVertexCaptureCacheStats = false;
+      Ue3StaticVertexCaptureCache::Settings ue3StaticVertexCaptureCache;
       bool ue3ExcludePlacementFromVertexShaderHash = false;
       bool ue3LogVertexConstantChurn = false;
       uint32_t ue3VertexConstantChurnMaxTrackedDraws = 0;
@@ -1708,10 +1711,7 @@ namespace dxvk {
       fast_unordered_set ue3MaterialFadeExcludedMaterials;
       fast_unordered_set ue3TraceDrawTextureHashes;
       fast_unordered_set replacementDebugHashes;
-      // Order-independent digests of the texture tag sets albedo scoring reads.
-      uint32_t lightmapTextureDigest = 0;
-      uint32_t neverAlbedoTextureDigest = 0;
-      uint32_t preferredAlbedoTextureDigest = 0;
+      Ue3AlbedoTagDigests albedoTagDigests;
     };
     FrameOptionSets m_frameOptionSets;
     void refreshFrameOptionSets();
@@ -1750,6 +1750,6 @@ namespace dxvk {
 
     // Expands m_ue3DecomposedInstances into one ray-traced submission per hardware instance, each
     // with its own object-to-world transform.
-    void submitUe3DecomposedInstanceDrawCallStates(const DrawParameters& params);
+    void submitUe3DecomposedInstances(const DrawParameters& params);
   };
 }
