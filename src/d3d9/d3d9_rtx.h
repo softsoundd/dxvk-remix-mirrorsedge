@@ -1692,11 +1692,10 @@ namespace dxvk {
     bool m_ue3DiffuseSelectionAuditWarned = false;
     void loadUe3DiffuseSelectionCache();
     void saveUe3DiffuseSelectionCache();
-    // scoring reads the user-taggable lightmap/never-albedo/preferred-albedo texture sets; drop
-    // cached decisions when those sets change so texture tagging in the UI takes effect live
-    size_t m_ue3DiffuseSelectionLightmapSetSize = 0;
-    size_t m_ue3DiffuseSelectionNeverAlbedoSetSize = 0;
-    size_t m_ue3DiffuseSelectionPreferredAlbedoSetSize = 0;
+    // Tag-set digests the stored picks were scored under; a change drops them so tagging takes effect live.
+    uint32_t m_ue3DiffuseSelectionLightmapTagDigest = 0;
+    uint32_t m_ue3DiffuseSelectionNeverAlbedoTagDigest = 0;
+    uint32_t m_ue3DiffuseSelectionPreferredAlbedoTagDigest = 0;
 
     // selection cache keys already dumped by rtx.d3d9.ue3LogAlbedoSelection
     fast_unordered_set m_loggedAlbedoSelections;
@@ -2411,6 +2410,10 @@ namespace dxvk {
       fast_unordered_set ue3MaterialFadeExcludedMaterials;
       fast_unordered_set ue3TraceDrawTextureHashes;
       fast_unordered_set replacementDebugHashes;
+      // Order-independent digests of the texture tag sets albedo scoring reads.
+      uint32_t lightmapTextureDigest = 0;
+      uint32_t neverAlbedoTextureDigest = 0;
+      uint32_t preferredAlbedoTextureDigest = 0;
     };
     FrameOptionSets m_frameOptionSets;
     void refreshFrameOptionSets();

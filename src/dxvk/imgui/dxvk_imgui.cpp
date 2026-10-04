@@ -4970,9 +4970,8 @@ namespace dxvk {
                         &RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModelObject());
       if (ImGui::IsItemHovered()) {
         RemixGui::SetTooltipUnformatted(
-          "Shows player-model geometry on primary rays when no ViewModel camera was submitted this frame,\n"
-          "provided the camera has also moved clear of the player. Games stop drawing first-person overlay\n"
-          "geometry during scripted first-person sequences without moving the camera off the player's head.");
+          "Shows player-model geometry on primary rays on frames where the game draws no first-person overlay\n"
+          "(no ViewModel camera), such as cutscenes. Auto Primary Space Body Distance is a separate rule.");
       }
       RemixGui::Checkbox("Create Virtual Instances", &RtxOptions::PlayerModel::enableVirtualInstancesObject());
       if (RemixGui::CollapsingHeader("Calibration", collapsingHeaderClosedFlags)) {

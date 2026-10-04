@@ -2111,6 +2111,14 @@ namespace dxvk {
       return true;
     }
 
+    uint32_t digestTextureTags(const fast_unordered_set& tags) {
+      uint64_t sum = tags.size();
+      for (const XXH64_hash_t tag : tags) {
+        sum += XXH3_64bits(&tag, sizeof(tag));
+      }
+      return uint32_t(sum ^ (sum >> 32));
+    }
+
     // ===== Replacement identity drift diagnostics =====
     // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
     //
@@ -5463,6 +5471,9 @@ namespace dxvk {
         markName(toLowerAscii(c.name), isSampler, isFloat4, c.registerIndex);
       }
     } catch (...) {
+      // Cached as-is so a malformed CTAB is decoded (and reported) once per shader.
+      Logger::warn(str::format("[RTX-Compatibility][UE3] Could not read the CTAB of shader 0x", std::hex, shaderHash,
+                               std::dec, "; its draws are classified without UE3 shader features."));
     }
 
     m_ue3ShaderFeatureCache.emplace(shaderHash, info);
@@ -6767,6 +6778,9 @@ namespace dxvk {
         *dst = *src;
       }
     }
+    s.lightmapTextureDigest = digestTextureTags(s.lightmapTextures);
+    s.neverAlbedoTextureDigest = digestTextureTags(s.neverAlbedoTextures);
+    s.preferredAlbedoTextureDigest = digestTextureTags(s.preferredAlbedoTextures);
     s.generation = generation;
   }
 
@@ -7316,17 +7330,7 @@ namespace dxvk {
       return false;
     }
 
-    auto isStaticBuffer = [](D3D9CommonBuffer* buffer) {
-      if (buffer == nullptr || buffer->Desc() == nullptr) {
-        return false;
-      }
-      if ((buffer->Desc()->Usage & D3DUSAGE_DYNAMIC) != 0 || buffer->WasWrittenByGPU()) {
-        return false;
-      }
-      return !buffer->NeedsUpload();
-    };
-
-    if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticBuffer(indexContext.ibo)) {
+    if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticD3D9Buffer(indexContext.ibo)) {
       return false;
     }
 
@@ -7336,7 +7340,7 @@ namespace dxvk {
       }
 
       const VertexContext& ctx = vertexContext[element.Stream];
-      if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticBuffer(ctx.pVBO)) {
+      if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticD3D9Buffer(ctx.pVBO)) {
         return false;
       }
     }
@@ -13085,23 +13089,19 @@ namespace dxvk {
         ScopedCpuProfileZoneN("UE3 diffuse selection lookup");
         if (!m_ue3DiffuseSelectionLoaded)
           loadUe3DiffuseSelectionCache();
-        // scoring consults the user-taggable lightmap/never-albedo/preferred-albedo sets; drop cached
-        // decisions when those sets change so texture tagging takes effect immediately
-        const size_t lightmapSetSize = m_frameOptions.lightmapTextures->size();
-        const size_t neverAlbedoSetSize = m_frameOptions.neverAlbedoTextures->size();
-        const size_t preferredAlbedoSetSize = m_frameOptions.preferredAlbedoTextures->size();
-        if (lightmapSetSize != m_ue3DiffuseSelectionLightmapSetSize ||
-            neverAlbedoSetSize != m_ue3DiffuseSelectionNeverAlbedoSetSize ||
-            preferredAlbedoSetSize != m_ue3DiffuseSelectionPreferredAlbedoSetSize) {
+        const FrameOptionSets& tagSets = m_frameOptionSets;
+        if (tagSets.lightmapTextureDigest != m_ue3DiffuseSelectionLightmapTagDigest ||
+            tagSets.neverAlbedoTextureDigest != m_ue3DiffuseSelectionNeverAlbedoTagDigest ||
+            tagSets.preferredAlbedoTextureDigest != m_ue3DiffuseSelectionPreferredAlbedoTagDigest) {
           m_ue3DiffuseSelectionCache.clear();
           // Tagging invalidates every stored decision, so the persisted set has to shrink with
           // the in-memory one rather than keep serving picks the tags have just overruled.
           m_ue3DiffuseSelectionDirty = true;
           // re-log re-scored selections so tag effects are visible in ue3LogAlbedoSelection output
           m_loggedAlbedoSelections.clear();
-          m_ue3DiffuseSelectionLightmapSetSize = lightmapSetSize;
-          m_ue3DiffuseSelectionNeverAlbedoSetSize = neverAlbedoSetSize;
-          m_ue3DiffuseSelectionPreferredAlbedoSetSize = preferredAlbedoSetSize;
+          m_ue3DiffuseSelectionLightmapTagDigest = tagSets.lightmapTextureDigest;
+          m_ue3DiffuseSelectionNeverAlbedoTagDigest = tagSets.neverAlbedoTextureDigest;
+          m_ue3DiffuseSelectionPreferredAlbedoTagDigest = tagSets.preferredAlbedoTextureDigest;
         }
 
         struct SelectionKeyTuple {
@@ -15540,10 +15540,9 @@ namespace dxvk {
     constexpr uint64_t kUe3DiffuseSelectionCacheMagic = 0x324C455344334555ull; // "UE3DSEL2"
     constexpr uint32_t kUe3DiffuseSelectionCacheMaxEntries = 1u << 20;
     // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
-    // the albedo score changes, so a build with different scoring re-derives instead of serving
-    // decisions its own scoring would no longer make.
-    // 3: UV expression flags constrained to the sampler's own coordinate lanes.
-    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 3;
+    // the albedo score or the header changes, so a build re-derives instead of serving decisions
+    // its own scoring would no longer make.
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 4;
     // How many loaded picks to re-score and check against current scoring per session. A scoring
     // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
     constexpr uint32_t kUe3DiffuseSelectionAuditCount = 32;
@@ -15569,27 +15568,24 @@ namespace dxvk {
       return;
     }
 
-    // Scoring reads the taggable texture sets, so a stored pick is only valid under the tags that
-    // produced it. Adopting the current sizes here is also what stops the tag-change check on the
-    // first scoring draw from comparing against zero and clearing everything just loaded.
-    const uint32_t currentLightmapSize = uint32_t(m_frameOptions.lightmapTextures->size());
-    const uint32_t currentNeverAlbedoSize = uint32_t(m_frameOptions.neverAlbedoTextures->size());
-    const uint32_t currentPreferredAlbedoSize = uint32_t(m_frameOptions.preferredAlbedoTextures->size());
-    m_ue3DiffuseSelectionLightmapSetSize = currentLightmapSize;
-    m_ue3DiffuseSelectionNeverAlbedoSetSize = currentNeverAlbedoSize;
-    m_ue3DiffuseSelectionPreferredAlbedoSetSize = currentPreferredAlbedoSize;
+    // A stored pick is only valid under the tags that produced it. Adopting the current digests
+    // here also stops the first scoring draw's tag-change check from clearing everything just loaded.
+    const FrameOptionSets& tagSets = m_frameOptionSets;
+    m_ue3DiffuseSelectionLightmapTagDigest = tagSets.lightmapTextureDigest;
+    m_ue3DiffuseSelectionNeverAlbedoTagDigest = tagSets.neverAlbedoTextureDigest;
+    m_ue3DiffuseSelectionPreferredAlbedoTagDigest = tagSets.preferredAlbedoTextureDigest;
 
     uint64_t magic = 0;
     uint32_t scoringVersion = 0;
-    uint32_t lightmapSize = 0;
-    uint32_t neverAlbedoSize = 0;
-    uint32_t preferredAlbedoSize = 0;
+    uint32_t lightmapDigest = 0;
+    uint32_t neverAlbedoDigest = 0;
+    uint32_t preferredAlbedoDigest = 0;
     uint32_t entryCount = 0;
     file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     file.read(reinterpret_cast<char*>(&scoringVersion), sizeof(scoringVersion));
-    file.read(reinterpret_cast<char*>(&lightmapSize), sizeof(lightmapSize));
-    file.read(reinterpret_cast<char*>(&neverAlbedoSize), sizeof(neverAlbedoSize));
-    file.read(reinterpret_cast<char*>(&preferredAlbedoSize), sizeof(preferredAlbedoSize));
+    file.read(reinterpret_cast<char*>(&lightmapDigest), sizeof(lightmapDigest));
+    file.read(reinterpret_cast<char*>(&neverAlbedoDigest), sizeof(neverAlbedoDigest));
+    file.read(reinterpret_cast<char*>(&preferredAlbedoDigest), sizeof(preferredAlbedoDigest));
     file.read(reinterpret_cast<char*>(&entryCount), sizeof(entryCount));
     if (!file || magic != kUe3DiffuseSelectionCacheMagic || entryCount > kUe3DiffuseSelectionCacheMaxEntries) {
       refuseFutureSaves("header is unreadable or not recognised");
@@ -15604,14 +15600,12 @@ namespace dxvk {
       m_ue3DiffuseSelectionDirty = true;
       return;
     }
-    if (lightmapSize != currentLightmapSize ||
-        neverAlbedoSize != currentNeverAlbedoSize ||
-        preferredAlbedoSize != currentPreferredAlbedoSize) {
-      Logger::info(str::format(
-        "[RTX-Compatibility][UE3] Albedo selection cache was written under different texture tags "
-        "(lightmap/never/preferred ", lightmapSize, "/", neverAlbedoSize, "/", preferredAlbedoSize,
-        ", now ", currentLightmapSize, "/", currentNeverAlbedoSize, "/", currentPreferredAlbedoSize,
-        "); re-deriving picks and rewriting it."));
+    if (lightmapDigest != tagSets.lightmapTextureDigest ||
+        neverAlbedoDigest != tagSets.neverAlbedoTextureDigest ||
+        preferredAlbedoDigest != tagSets.preferredAlbedoTextureDigest) {
+      Logger::info(
+        "[RTX-Compatibility][UE3] Albedo selection cache was written under different lightmap, never-albedo or "
+        "preferred-albedo texture tags; re-deriving picks and rewriting it.");
       m_ue3DiffuseSelectionDirty = true;
       return;
     }
@@ -15649,17 +15643,14 @@ namespace dxvk {
 
       const uint32_t entryCount =
         uint32_t(std::min<size_t>(m_ue3DiffuseSelectionCache.size(), kUe3DiffuseSelectionCacheMaxEntries));
-      // The tracked sizes rather than the live sets: these are what the stored decisions were
+      // The tracked digests rather than the live sets: these are what the stored decisions were
       // scored against, and they are readable from the destructor, where the frame options a
       // draw would have populated may never have existed.
-      const uint32_t lightmapSize = uint32_t(m_ue3DiffuseSelectionLightmapSetSize);
-      const uint32_t neverAlbedoSize = uint32_t(m_ue3DiffuseSelectionNeverAlbedoSetSize);
-      const uint32_t preferredAlbedoSize = uint32_t(m_ue3DiffuseSelectionPreferredAlbedoSetSize);
       file.write(reinterpret_cast<const char*>(&kUe3DiffuseSelectionCacheMagic), sizeof(kUe3DiffuseSelectionCacheMagic));
       file.write(reinterpret_cast<const char*>(&kUe3DiffuseSelectionScoringVersion), sizeof(kUe3DiffuseSelectionScoringVersion));
-      file.write(reinterpret_cast<const char*>(&lightmapSize), sizeof(lightmapSize));
-      file.write(reinterpret_cast<const char*>(&neverAlbedoSize), sizeof(neverAlbedoSize));
-      file.write(reinterpret_cast<const char*>(&preferredAlbedoSize), sizeof(preferredAlbedoSize));
+      file.write(reinterpret_cast<const char*>(&m_ue3DiffuseSelectionLightmapTagDigest), sizeof(m_ue3DiffuseSelectionLightmapTagDigest));
+      file.write(reinterpret_cast<const char*>(&m_ue3DiffuseSelectionNeverAlbedoTagDigest), sizeof(m_ue3DiffuseSelectionNeverAlbedoTagDigest));
+      file.write(reinterpret_cast<const char*>(&m_ue3DiffuseSelectionPreferredAlbedoTagDigest), sizeof(m_ue3DiffuseSelectionPreferredAlbedoTagDigest));
       file.write(reinterpret_cast<const char*>(&entryCount), sizeof(entryCount));
 
       uint32_t written = 0;
