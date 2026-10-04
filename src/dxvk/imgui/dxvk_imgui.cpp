@@ -222,7 +222,7 @@ namespace dxvk {
     {"neveralbedotextures","Never Albedo (optional)", &RtxOptions::neverAlbedoTexturesObject()}
   };
 
-  // Geometry-hash categories (no thumbnails) — prefer when Mesh1p/Mesh3p share materials.
+  // Geometry-hash categories (no thumbnails) — prefer when the first- and third-person meshes share materials.
   // Sky stays out: skyBoxGeometries still matches the asset-hash rule, not topology.
   std::vector<RtxTextureOption> rtxGeometryOptions = {
     {"viewmodelgeometries", "View Model Geometry (optional)", &RtxOptions::viewModelGeometriesObject()},

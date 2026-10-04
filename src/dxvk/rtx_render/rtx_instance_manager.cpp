@@ -1709,11 +1709,8 @@ namespace dxvk {
     createRayPortalVirtualViewModelInstances(viewModelInstances, cameraManager, rayPortalManager);
   }
 
-  // World-space representative position for player-model distance filtering. UE3 skinned
-  // draws carry identity object transforms with bind-pose bounds, so only their bone-derived
-  // world anchor is a real world position (same rule as BLAS matching in rtx_draw_call_cache).
-  // Rigid draws use the transformed bounds centroid, which falls back to the instance
-  // translation when bounds were not computed.
+  // Skinned UE3 draws have identity transforms and bind-pose bounds, so only their bone-derived anchor is
+  // a world position. Rigid draws use the transformed bounds centroid, or the translation without bounds.
   static Vector3 getPlayerModelInstancePosition(const RtInstance& instance) {
     const DrawCallState& input = instance.getBlas()->input;
     if (input.hasSkinnedWorldAnchor()) {

@@ -538,7 +538,7 @@ namespace dxvk {
       getGeometryData().getHashForRule(HashRule(rules::TopologicalHash));
 
     // Geometry tags OR with texture categories. Player-model geometry clears ViewModel so a
-    // shared material in viewModelTextures cannot pull Mesh3p onto the view-model camera.
+    // shared material in viewModelTextures cannot pull the third-person mesh onto the view-model camera.
     // Body geometry implies player-model: the body-anchor lookup only scans player-model instances.
     const bool playerModelBodyGeometry = lookupHash(RtxOptions::playerModelBodyGeometries(), topologyHash);
     if (playerModelBodyGeometry || lookupHash(RtxOptions::playerModelGeometries(), topologyHash)) {

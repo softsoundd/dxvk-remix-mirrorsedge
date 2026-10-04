@@ -40,7 +40,6 @@ RWTexture2D<float4> skyViewLutOutput;
 layout(binding = 4)
 Texture2D<float4> aerosolPhaseLutInput;
 
-// Compute sky color for a given view direction
 vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
   // Camera on the local vertical at the configured altitude, in Y-up space.
   const vec3 cameraPos = vec3(0.0f, max(args.viewAltitude, kPlanetRadiusOffset), 0.0f);
@@ -74,18 +73,12 @@ vec3 computeSkyView(vec2 uv, AtmosphereArgs args) {
 [numthreads(16, 16, 1)]
 void main(uint2 threadId : SV_DispatchThreadID) {
   AtmosphereArgs args = atmosphereArgs;
-  
-  // Check bounds
+
   if (threadId.x >= args.skyViewLutWidth || threadId.y >= args.skyViewLutHeight) {
     return;
   }
-  
-  // Convert pixel coordinates to UV
+
   vec2 uv = (vec2(threadId) + 0.5f) / vec2(args.skyViewLutWidth, args.skyViewLutHeight);
-  
-  // Compute sky appearance for this direction
   vec3 skyColor = computeSkyView(uv, args);
-  
-  // Write result
   skyViewLutOutput[threadId] = float4(skyColor, 1.0f);
 }

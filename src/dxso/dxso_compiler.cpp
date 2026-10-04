@@ -1,4 +1,4 @@
-﻿#include "dxso_compiler.h"
+#include "dxso_compiler.h"
 
 #include "dxso_analysis.h"
 
@@ -61,12 +61,14 @@ namespace dxvk {
     m_vs.oPos        = DxsoRegisterPointer{ };
     m_fog            = DxsoRegisterPointer{ };
     m_vs.oPSize      = DxsoRegisterPointer{ };
+    // NV-DXVK start: vertex shader data capture implementation
     m_vs.iPosition0  = DxsoRegisterPointer{ };
     m_vs.oTex0       = DxsoRegisterPointer{ };
     m_vs.oNormal0    = DxsoRegisterPointer{ };
     m_vs.oColor0     = DxsoRegisterPointer{ };
     m_vs.oBlendWeight0 = DxsoRegisterPointer{ };
     m_vs.oBlendIndices0 = DxsoRegisterPointer{ };
+    // NV-DXVK end
 
     for (uint32_t i = 0; i < m_ps.oColor.size(); i++)
       m_ps.oColor.at(i) = DxsoRegisterPointer{ };

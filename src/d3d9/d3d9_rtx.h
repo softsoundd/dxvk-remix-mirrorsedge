@@ -168,23 +168,12 @@ namespace dxvk {
                "lightmap policy. Either way, changing this re-mints the material hashes of every material "
                "carrying constants, so anchors keyed on the old ones stop matching.");
     RTX_OPTION("rtx.d3d9", bool, ue3MicVolatileConstantDetection, true,
-               "UE3 MaterialInstanceConstant support: leave a material's frame-varying UniformVector_* "
-               "registers out of its identity, recognised from the shader's own dataflow rather than learned "
-               "at runtime. UE3 re-evaluates every material uniform expression on the CPU per draw and writes "
-               "the result into the same registers that carry authored VectorParameterValues, so a panner, "
-               "flipbook/sub-UV frame, rotator or time-driven fade re-mints the material hash as it animates "
-               "and the replacements anchored on it match only on the frames the value comes back around. "
-               "A register is treated as volatile when the shader's dataflow shows a sampler's coordinate "
-               "depending on it, whatever shape the expression takes - a scale, an offset, a rotator's 2x2 "
-               "matrix across a register pair, or any chain of those through temporaries. Tint registers "
-               "reach the output colour instead and are kept, so UE3's colour variants "
-               "(RooftopPropsClusters and its Blue/Orange/Yellow siblings) still get one anchor each.\n"
-               "Because the classification is a property of the shader, identity is decided before the first "
-               "draw is ever hashed and never changes within or between sessions - no learning, no cache, no "
-               "mid-session flip. Materials separated only by a volatile register share an anchor, which is "
-               "unavoidable: their identity was not reproducible in the first place.\n"
-               "Turning this off restores raw all-UniformVector_* identity and re-mints the hashes of every "
-               "material carrying a volatile register.");
+               "UE3 MaterialInstanceConstant support: leave frame-varying UniformVector_* registers (panners, "
+               "rotators, flipbook frames, time-driven fades) out of material identity. A register is volatile when "
+               "the shader's dataflow shows a sampler's coordinate depending on it; tints reaching the output colour "
+               "are kept. Identity is decided before the first draw and never changes. Turning this off re-mints the "
+               "hashes of every material carrying a volatile register. See \"Material identity and replacement anchor "
+               "stability\" in documentation/UE3Compatibility.md.");
     RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3MicConstantIdentityExcludedShaders, {},
                "UE3 MaterialInstanceConstant support: pixel shader hashes whose UniformVector_* constants are "
                "excluded from material identity hashing wholesale. Reach for this only when every material on "
@@ -960,11 +949,7 @@ namespace dxvk {
     uint32_t m_ue3ParticleColorTexcoordIndex = UINT32_MAX;
     uint32_t m_ue3ParticleColorCaptureFlags = 0;
 
-    // two pass translucency dedup - track previous draw's shader/texture/geometry state
-    // to detect UE3 back+front face translucency passes on the same mesh. The geometry
-    // identity is required: UE3 sorts translucent prims back-to-front per camera, so
-    // consecutive draws of different meshes sharing one material are common and must
-    // never dedup against each other. Reset at frame end (EndFrame).
+    // The previous draw's identity, for isUe3SecondTwoSidedTranslucentPass. Reset in EndFrame.
     XXH64_hash_t m_prevDrawVsPsHash = 0;
     XXH64_hash_t m_prevDrawTextureHash = 0;
     XXH64_hash_t m_prevDrawGeometryHash = 0;
@@ -1057,11 +1042,8 @@ namespace dxvk {
     bool trackUe3MovieTextureRenderTarget(const char* reason);
     bool isUe3MovieTextureDescHash(XXH64_hash_t descHash) const;
 
-    // TdToneMapping capture: the game uploads its baked/blended colour curves
-    // as two 16x1 float textures (ColorCurvesK/ColorCurvesM) each frame; the
-    // texel payloads are snooped at upload/unlock time (keyed by destination
-    // texture) and joined with the tonemap pass's pixel shader constants when
-    // the fullscreen tonemap draw is classified.
+    // TdToneMapping's colour curves arrive as two 16x1 textures (ColorCurvesK/M) uploaded every frame. Their
+    // texels are kept at unlock and joined with the tone-map pass constants when that draw is classified.
     std::unordered_map<const D3D9CommonTexture*, Ue3CurveTexels> m_ue3CurveTexelCache;
     bool m_ue3ToneMapCapturedThisFrame = false;
 
@@ -1090,20 +1072,14 @@ namespace dxvk {
     static Ue3VsHashExclusions buildUe3VsHashExclusions(const Ue3VsShaderCtabInfo& ctabInfo,
                                                         const std::vector<Ue3VsConstantSymbol>* symbols);
 
-    // Small N-way cache: the main view, capture probes and engine utility shaders carry
-    // distinct camera constant blocks (including cached failures) that interleave within
-    // a frame, so a single slot thrashes and re-runs the heavy matrix extraction (4x4
-    // inverse, two projection decompositions) once per draw instead of once per unique
-    // camera.
+    // N-way: the main view, capture probes and utility shaders interleave distinct camera blocks within a
+    // frame, so a single slot would rerun the matrix extraction per draw.
     static constexpr uint32_t kUe3CameraConstantsCacheSlots = 8;
     std::array<Ue3CameraConstantsCache, kUe3CameraConstantsCacheSlots> m_ue3CameraConstantsCache;
     uint32_t m_ue3CameraConstantsCacheNextSlot = 0;
 
-    // ObjectToWorld extraction memo: the LocalToWorld (+ optional WorldToLocal) constant
-    // block resolves to the same transpose/affinity/inverse disambiguation result whenever
-    // the register contents repeat (static placements re-upload identical matrices every
-    // frame). All inputs are part of the key, so entries can never go stale; the map is
-    // cleared wholesale when it exceeds a size cap.
+    // Every input to the object-to-world disambiguation is in the key, so entries never go stale; the map
+    // is cleared when it exceeds the cap.
     static constexpr size_t kUe3ObjectToWorldCacheMaxEntries = 32768;
     fast_unordered_cache<Matrix4> m_ue3ObjectToWorldCache;
 
@@ -1406,11 +1382,8 @@ namespace dxvk {
     // (see RtxContext::injectRTX), and finishInjectRTX must follow.
     void triggerInjectRTX(const Rc<DxvkImage>& targetImage = nullptr, const Rc<DxvkImage>& hdrCanvas = nullptr);
 
-    // rtx.deferredUiTextures support: self-contained snapshots of overlay draws captured
-    // mid-scene and replayed on top of the ray-traced image once RTX injection has fired.
-    // The snapshot copies the referenced vertex/index ranges to CPU memory (immune to the
-    // game re-locking its dynamic buffers between capture and replay) and is re-issued
-    // through the regular D3D9 UP draw path.
+    // Deferred UI draws (see "Deferred overlays" in UE3Compatibility.md), snapshotted with their vertex and index ranges
+    // because the game may re-lock its buffers before the replay.
     static constexpr std::array<D3DRENDERSTATETYPE, 25> kDeferredUiRenderStates = {
       D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_BLENDOP,
       D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLENDALPHA, D3DRS_DESTBLENDALPHA, D3DRS_BLENDOPALPHA,
@@ -1546,12 +1519,8 @@ namespace dxvk {
 
     bool checkBoundTextureCategory(const fast_unordered_set& textureCategory) const;
 
-    // Per-draw snapshot of the bound texture slots (common texture pointer, cached image
-    // hash, render-target descriptor hash), lazily built and shared by the per-draw
-    // consumers that would otherwise each re-walk the texture stages: UI/deferred-UI tag
-    // checks, the MIC texture-set hash, the diffuse-selection cache key and the
-    // two-sided-translucency dedup.
-    // Invalidated at the top of internalPrepareDraw; bindings cannot change within a draw.
+    // The bound texture slots, built lazily and shared by the draw's consumers. Invalidated at the top of
+    // internalPrepareDraw; bindings cannot change within a draw.
     struct BoundTextureSnapshotEntry {
       D3D9CommonTexture* texture = nullptr;
       XXH64_hash_t imageHash = kEmptyHash;
@@ -1575,15 +1544,9 @@ namespace dxvk {
     mutable bool m_boundTextureSnapshotValid = false;
     const BoundTextureSnapshot& ensureBoundTextureSnapshot() const;
 
-    // Per-frame snapshot of the scalar options read on the per-draw hot path. Every
-    // RtxOption read acquires the global option update mutex; the per-draw pipeline
-    // (makeDrawCallType, classifyUe3Pass, processRenderState, processTextures, the
-    // geometry identity keys) reads dozens of options per draw, which at UE3 draw
-    // counts (~2400/frame) is >100k mutex acquisitions per frame. Option values only
-    // resolve once per frame anyway, so a per-frame value snapshot is exactly as fresh
-    // as the underlying resolution model. Refreshed in EndFrame (the same cadence as
-    // DrawCallState::refreshCategoryLookupTable) and lazily on the first frame's draw.
-    // Field names mirror the option accessors they cache.
+    // Options read per draw, snapshotted once per frame: every RtxOption read takes the global option mutex,
+    // which at UE3 draw counts is over 100k acquisitions a frame. Refreshed in EndFrame and on the first
+    // draw. Fields are named after their options.
     struct FrameOptionCache {
       bool valid = false;
 
@@ -1716,11 +1679,8 @@ namespace dxvk {
     FrameOptionSets m_frameOptionSets;
     void refreshFrameOptionSets();
 
-    // Material hashes tracked this frame for SceneManager::trackReplacementMaterialHash,
-    // flushed as one CS command in EndFrame instead of one EmitCs per draw. The only
-    // consumers (graph components via getReplacementMaterialHashUsageCount) read the
-    // per-frame map during SceneManager::onFrameEnd, which executes after the flush on
-    // the CS timeline, so batching is invisible to them.
+    // Flushed to SceneManager::trackReplacementMaterialHash as one CS command in EndFrame. Its consumers read
+    // the map in SceneManager::onFrameEnd, which runs after the flush on the CS timeline.
     std::vector<XXH64_hash_t> m_pendingReplacementMaterialHashes;
 
     // GamePatchBits and frustum bypass limits last sent to the bridge client by updateUe3GamePatchRequest.

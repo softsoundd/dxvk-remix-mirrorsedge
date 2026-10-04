@@ -212,10 +212,7 @@ namespace dxvk {
     const size_t indexDataSize = indexCount * indexStride;
 
     // Assume the GPU changed the data via shaders, include the constant buffer data in hash.
-    // The bytecode + constant hashing (with UE3 camera-register exclusions) is computed once
-    // per draw in internalPrepareDraw (m_activeStableVsHash) and shared with the static
-    // vertex-capture cache key; only the geometry-hash-specific folds happen here. Shared
-    // with the geometry memo hit path so served hashes recombine to identical values.
+    // Shared with the geometry memo, so served hashes recombine to identical values.
     const XXH64_hash_t vertexShaderHash = computeGeometryVertexShaderHash();
 
     // Calculate this based on the RasterGeometry input data

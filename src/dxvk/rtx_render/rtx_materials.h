@@ -1970,11 +1970,8 @@ struct LegacyMaterialData {
     m_materialTextureSetIsComplete = complete;
   }
 
-  // Hash over the material constant registers (CTAB UniformVector_* / UniformScalar_*).
-  // Differentiates MaterialInstanceConstants that override VectorParameterValues/
-  // ScalarParameterValues on an identical texture set. kEmptyHash for shaders listed in
-  // rtx.d3d9.ue3MicConstantIdentityExcludedShaders (frame-varying constants) or without
-  // CTAB constant ranges.
+  // Hash of the CTAB material constants, which tells apart MaterialInstanceConstants sharing a texture
+  // set. kEmptyHash without CTAB ranges or for rtx.d3d9.ue3MicConstantIdentityExcludedShaders.
   void setPixelShaderConstantsHashForMaterialInstance(XXH64_hash_t hash) {
     m_pixelShaderConstantsHashForMaterialInstance = hash;
   }
@@ -1995,11 +1992,8 @@ private:
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
-    // note - by default this is based on the color texture hash
-    // for UE3 MaterialInstanceConstant compat the identity is a deterministic seed chain:
-    //   PS bytecode hash -> material texture set -> material constants
-    // every input is a pure function of the current draw, so the same material instance
-    // always produces the same hash
+    // The colour texture hash by default; under UE3 the identity chain described in "Material identity
+    // and replacement anchor stability" in UE3Compatibility.md.
     const XXH64_hash_t textureHash = colorTextures[0].getImageHash();
     if (m_pixelShaderHashForMaterialInstance != kEmptyHash) {
       // when the shader's CTAB exposes no material samplers and the signature does not already

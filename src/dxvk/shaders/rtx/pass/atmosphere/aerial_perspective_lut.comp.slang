@@ -20,15 +20,9 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// Aerial perspective volume (paper Section 5.4).
-//
-// A froxel volume fitted to the camera frustum holding, per slice, the atmospheric in-scattered
-// luminance toward the camera in RGB and the mean transmittance in A. Applying it to a shaded pixel
-// is then a single multiply-add, which is what gives distant geometry its haze and desaturation.
-//
-// Unlike the paper this runs alongside Remix's global volumetrics froxel grid, which already
-// integrates a homogeneous medium out to its own range. The march therefore starts at
-// aerialPerspectiveStartDistance so the two systems hand off instead of stacking.
+// Aerial perspective volume (paper Section 5.4): per froxel slice, the in-scattered luminance toward the
+// camera (RGB) and the mean transmittance (A). The march starts at aerialPerspectiveStartDistance, where
+// Remix's global volumetrics froxel grid hands off.
 
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 

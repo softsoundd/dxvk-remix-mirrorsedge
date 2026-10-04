@@ -1009,11 +1009,11 @@ vec4 compositeResult(
   // Primary misses only carry sky in SharedRadiance when the atmosphere supplied it; skybox and
   // dome light misses are composited later from the sky matte and must stay pre-attenuated.
   const bool primarySkyMiss = primaryMiss
-    && cb.volumeArgs.physicalAtmosphereEnabled != 0
+    && cb.volumeArgs.physicalAtmosphereEnabled
     && !cb.domeLightArgs.active;
   const bool attenuateSharedAsSky = primarySkyMiss || psrReflectionSkyMiss;
   vec3 skyVolumeAttenuation = volumeAttenuation;
-  if (attenuateSharedAsSky && cb.volumeArgs.physicalAtmosphereEnabled != 0)
+  if (attenuateSharedAsSky && cb.volumeArgs.physicalAtmosphereEnabled)
   {
     const float3 T = max(volumeAttenuation, vec3(1e-6f));
     const float avgT = (T.x + T.y + T.z) * (1.0f / 3.0f);

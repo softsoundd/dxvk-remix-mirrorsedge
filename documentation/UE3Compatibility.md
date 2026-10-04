@@ -48,6 +48,18 @@ Some titles recompute a draw's transform every frame even for still geometry, so
 
 `rtx.d3d9.ue3LogStaticVertexCaptureCacheStats` reports entries, bytes, keys awaiting admission and reuse rate about once a second, including dormancy. Buffers appear under `RTXVertexCapture` in the memory profiler and HUD. If reuse is near zero, the keys are churning; raising the budget will not help.
 
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3ExactVertexCapture` | True | Read the pre-projection position register where the transform is recognised |
+| `rtx.d3d9.ue3NativeLocalMeshVertexCapture` | True | Otherwise use input-assembler positions for conservative static `Local` meshes |
+| `rtx.d3d9.ue3RequireExactVertexCapture` | False | Drop draws that would unproject |
+| `rtx.d3d9.ue3VertexCaptureSourceOverride` | 0 | Force one position source for every draw. 0: Auto, 1: Pre-projection, 2: Input assembler, 3: Clip reconstruction |
+| `rtx.d3d9.ue3LogCapturePrecision` | False | Log the resolved source per vertex shader and factory |
+| `rtx.d3d9.ue3StaticLocalMeshVertexCaptureCache` | False (True in the Mirror's Edge profile) | Reuse static meshes' captures on later frames |
+| `...WarmupFrames` / `...BudgetMiB` / `...MaxEntries` / `...RetentionFrames` | 2 / 256 / 16384 / 600 | The cache's admission, memory and staleness bounds |
+| `...MinReusePercent` / `...ReuseProbeFrames` | 10 / 1800 | Stand the cache down below this reuse rate, and re-test after this many frames |
+| `rtx.d3d9.ue3LogStaticVertexCaptureCacheStats` | False | Report the cache's entries, bytes and reuse about once a second |
+
 ## Hardware-instanced mesh particles and foliage
 
 Vertex capture cannot describe a hardware-instanced draw. The injected code writes each member at `data[gl_VertexIndex - baseVertex]`, and D3D9 instancing replays the same vertex indices once per instance, so every instance writes the same slots with no ordering between them. The surviving positions are an arbitrary mix of placements: individual triangles end up with corners from different instances, which reads on screen as an exploded cluster of stretched geometry that lands somewhere different every time it is captured.
@@ -113,6 +125,15 @@ Do not use the classified factory type to tell foliage from particles; use the m
 - `rtx.d3d9.ue3LogInstancedDrawStats`: per-frame instance counts, what each bound dropped, the wall time spent expanding them, and the instance-order stability `ue3StableDecomposedInstanceIdentity` rests on. A mean index-paired displacement on the scale of a batch's own extent would mean the game reorders its buffer, making that option unsound.
 - `rtx.logInstanceIdentityStats`: where instance lookups land and how many spatial candidates they examine. This is what shows the quadratic scan appearing or disappearing.
 - `rtx.d3d9.ue3TraceDrawTextureHashes`: a full `[UE3-DrawTrace]` dossier for draws binding a listed texture, including the object-to-world transform, the first few recovered instance transforms, and the asset and full geometry hashes. The asset hash is what replacements anchor on, so this is also how to confirm a mesh's hash is identical across two sessions.
+
+### Options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3DecomposeInstancedDraws` | True | Submit one ray-traced instance per hardware instance, placed from the instance stream |
+| `rtx.d3d9.ue3StableDecomposedInstanceIdentity` | True | Name decomposed instances by batch and index rather than by transform |
+| `rtx.d3d9.ue3MaxDecomposedInstances` | 4096 | Most instances kept per batch, in the game's order |
+| `rtx.d3d9.ue3DecomposedInstanceCullDistance` | 0 | Drop instances beyond this distance from the camera; 0 disables |
 
 ## Diagnosing a cache that never hits
 
@@ -285,7 +306,7 @@ The canonical signature is used for *every* UE3 material rather than only lightm
 
 A shader left with no identity-bearing sampler - constant-colour and lightmap-only materials, and materials whose only textures are lighting inputs - is signed from what else survives every permutation: its kept `UniformVector_*` names and the `def` literal components that reach the colour output unlit. The lightmap epsilon, the basis vectors, the normal unpack constants and the specular exponent never do; an emissive constant always does. `rtx.d3d9.ue3LogMaterialInstanceHash` marks these seeds `(canonical textureless, lightmap-permutation invariant)`. Only a shader with neither keeps its bytecode hash as the seed, and with it the policy dependence. Structurally identical textureless materials share one `textureSet+shader` family tier under this seed; their constants still separate the final hashes.
 
-The `LightMapBasis` literals are used for exactly one thing: qualifying a view-derived vector's dot product as the specular transfer. An earlier implementation tainted every value derived from them and pruned whatever the taint reached; because the literals exist in one compile only, it fired on the lightmapped shaders under `DirectionalLightmaps=True` and on nothing under `False`, removed samplers the other compile keeps, and manufactured the divergence it was meant to remove. The transfer bit has the opposite shape - it only ever excludes what `SIMPLE_LIGHTING` deletes - but any broader rule seeded on a one-compile symbol still has the earlier one's.
+The `LightMapBasis` literals are used for exactly one thing: qualifying a view-derived vector's dot product as the specular transfer. They exist in one compile only, so a rule seeded on them must only ever exclude what `SIMPLE_LIGHTING` deletes. A broader one - pruning everything derived from the literals, say - fires on the lightmapped shaders under `DirectionalLightmaps=True` and on nothing under `False`, removes samplers the other compile keeps, and manufactures the divergence it is meant to remove.
 
 ### Constants tier
 
@@ -293,7 +314,7 @@ Only `UniformVector_*` parameters contribute (`rtx.d3d9.ue3MicConstantIdentity`,
 
 ### Coverage
 
-Measured on the opening views of several levels with `rtx.d3d9.ue3LogMaterialInstanceHash`, matching materials between runs on their bound images, every material keeps one identity across all four combinations of `DirectionalLightmaps=True`/`False` and `TdBicubicFiltering` on/off. The `[RTX-Ue3Identity]` summary lists each shader's kept and excluded inputs.
+Every material keeps one identity across all four combinations of `DirectionalLightmaps=True`/`False` and `TdBicubicFiltering` on/off, which `rtx.d3d9.ue3LogMaterialInstanceHash` shows when materials are matched between runs on their bound images. The `[RTX-Ue3Identity]` summary lists each shader's kept and excluded inputs.
 
 Identity is one half of it; the *albedo pick* has to agree too, since the Remix UI, the texture-tier tags and the displayed colour all follow the texture the runtime chooses (see [Albedo selection](#albedo-selection-and-the-texture-spread-cache)). `ue3LogAlbedoSelection` is what to compare for that.
 
@@ -304,6 +325,14 @@ If you change any of this, measure it the same way: match materials between runs
 Turning `rtx.d3d9.ue3MicConstantIdentity` off makes identity shader + texture set alone, at the cost of merging every instance that shares a texture set onto one anchor. Mirror's Edge tints many of its variants from one set, so this collapses a substantial fraction of them.
 
 Any change to what feeds identity re-mints the affected material hashes, and `mat_<hash>` prims authored against the old ones stop matching. See [Re-anchoring after an identity change](#re-anchoring-after-an-identity-change).
+
+### Options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3AutoDetectLightmapTextures` | True | Recognise lightmaps from their CTAB sampler names and strip them from the draw |
+| `rtx.d3d9.ue3ConstantAlbedoTintGain` | 8 | Gain on a lightmap-era tint register before it blends the legacy albedo constant toward its hue |
+| `rtx.d3d9.ue3MicConstantIdentity` | True | Include the kept `UniformVector_*` constants in material identity |
 
 ## Runner Vision
 
@@ -403,6 +432,12 @@ The score also rewards a sampler whose coordinate is a material expression - a t
 
 The cache file is therefore part of the material's appearance, in the same way `rtx.conf` is. Ship it with a mod, and delete it only if you intend to relearn from scratch. To regenerate one: delete the file, play through a representative spread of levels, and exit the game normally (it is flushed on shutdown as well as periodically). Repeat until a pass adds no new entries - a texture's spread only counts shaders that have actually been drawn, so a single pass through one chapter will undercount anything reused later in the game. `rtx.preferredAlbedoTextures` and `rtx.neverAlbedoTextures` remain the per-texture override for anything the scoring still gets wrong.
 
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.preferredAlbedoTextures` | | Textures strongly preferred for the albedo slot |
+| `rtx.neverAlbedoTextures` | | Textures never chosen as albedo |
+| `rtx.d3d9.ue3LogAlbedoSelection` | False | Log the per-sampler score breakdown once per pinned material |
+
 ## Persisted albedo picks
 
 The winning sampler is pinned per material and persisted to `rtx-remix/ue3DiffuseSelection.cache`, so every session starts from the same pick. In memory the pin survives a level reload but not a relaunch, and a decision first made while a material's textures were still streamed down can differ from the settled one. A pin is still superseded once a larger set of mips arrives, so on a cold cache a surface can briefly show a different layer while a level pages in.
@@ -455,7 +490,7 @@ Getting there means each of the inputs UE3 offers that is not itself reproducibl
 
   Nothing about the material's appearance changes: the UV path reads those same registers live and still resolves the transform per draw. Only the identity declines to include them.
 
-  The cost is that two materials separated *only* by such a register share one anchor. Neither had a reproducible identity to anchor beforehand, so little is lost, but note that a static UV tiling parameter is no longer a discriminator: a material whose only distinguishing feature is its tiling now shares its sibling's `mat_<hash>`.
+  The cost is that two materials separated *only* by such a register share one anchor. Neither had a reproducible identity to anchor beforehand, so little is lost, but note that a static UV tiling parameter is not a discriminator: a material whose only distinguishing feature is its tiling shares its sibling's `mat_<hash>`.
 
 - **Render targets bound as material samplers** (scene captures, reflection buffers). An RT's image hash embeds a creation counter and changes every respawn, checkpoint, or level load. RTs are excluded from identity by default (`rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity`).
 
@@ -465,7 +500,7 @@ Getting there means each of the inputs UE3 offers that is not itself reproducibl
 
 - **Mipped textures at or below the streaming-stable tail size**, where the whole chain is the tail. Identity is latched while mip 0 is being flushed, so a smaller mip the game has not written yet is an allocated buffer holding recycled memory, and that becomes permanent identity - visible as an image hash that changes on every level load while the descriptor hash stays put. Use `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes` on the affected descriptor; `rtx.d3d9.ue3LogTextureHashProvenance` reports the mip 0 hash separately from the full-chain one, which is what distinguishes this from a texture whose contents genuinely differ.
 
-  Identifying such a texture by its top mip alone looks like the obvious fix and is not one. That size is also the state every larger texture passes through while streaming in, because UE3's minimum resident mip count lands there, and the whole point of the tail scheme is that the reduced variant hashes equal to the fully resident one. Break that equality and a replacement cannot bind until streaming finishes, which presents as an asset appearing unenhanced for a moment on every level load - the regression the tail scheme was introduced to remove.
+  Identifying such a texture by its top mip alone looks like the obvious fix and is not one. That size is also the state every larger texture passes through while streaming in, because UE3's minimum resident mip count lands there, and the whole point of the tail scheme is that the reduced variant hashes equal to the fully resident one. Break that equality and a replacement cannot bind until streaming finishes, which presents as an asset appearing unenhanced for a moment on every level load.
 
 - **Cube maps assembled face by face.** A cube map's hash is latched the first time it is set up for RTX and never recomputed, so hashing whichever faces happened to have CPU data at that moment makes the value depend on upload order - identifying a material one session and nothing the next. All six faces must be present before an identity is latched; waiting costs at most a rebind, since a face without data cannot be sampled yet. For a fully resident cube map the value is unchanged, so nothing anchored on one needs re-anchoring.
 
@@ -484,15 +519,28 @@ A frame-varying expression that reaches the *output colour* rather than a coordi
     rtx.d3d9.ue3MicConstantIdentityExcludedMaterials = 0x...
 ```
 
-It reports on a count rather than on the first disagreement, because a *second* identity on one texture set is also what a colour variant looks like the first time its sibling is drawn. Measured sibling sets run to about eight while an animating register passes any bound within a second, so a threshold clear of the former keeps the report to the families that actually cannot be anchored.
+It reports on a count rather than on the first disagreement, because a *second* identity on one texture set is also what a colour variant looks like the first time its sibling is drawn. Colour variant sets are small, while an animating register passes any bound within a second, so a threshold well clear of a variant set's size keeps the report to the families that actually cannot be anchored.
 
-Identity is never altered as a consequence of the report. An exclusion that takes effect part-way through a session is the exact failure this design exists to remove - it splits the material's anchors either side of an unpredictable moment - so the fix belongs in a config the next session starts from. `rtx.d3d9.ue3MicConstantIdentityExcludedMaterials` is keyed on `textureSetShaderHash`, which is both the second replacement lookup tier and one material family, so the same value that pins the exclusion can anchor the override. Reach for `rtx.d3d9.ue3MicConstantIdentityExcludedShaders` only when every material on a shader is frame-varying: it is keyed on the shader, and one UE3 base-pass shader commonly serves dozens of families - excluding one seed on this content stripped the constants tier from 64 of them and merged six authored anchors that differed only by tint.
+Identity is never altered as a consequence of the report. An exclusion that takes effect part-way through a session is the exact failure this design exists to remove - it splits the material's anchors either side of an unpredictable moment - so the fix belongs in a config the next session starts from. `rtx.d3d9.ue3MicConstantIdentityExcludedMaterials` is keyed on `textureSetShaderHash`, which is both the second replacement lookup tier and one material family, so the same value that pins the exclusion can anchor the override. Reach for `rtx.d3d9.ue3MicConstantIdentityExcludedShaders` only when every material on a shader is frame-varying: it is keyed on the shader, and one UE3 base-pass shader commonly serves dozens of families, so excluding it strips the constants tier from all of them and merges anchors that differ only by tint.
 
 ### Re-anchoring after an identity change
 
 Any change to what feeds identity re-mints the affected material hashes, and `mat_<hash>` prims authored against the old ones stop matching. There is nothing to alias them to: for a material that was animating there were many old hashes, one per frame, which is why its anchor was unreliable to begin with, and where the change is to the texture set the old value was a function of data that is no longer reproduced at all.
 
 So re-anchoring reads the new value rather than mapping the old one. `rtx.d3d9.ue3LogMaterialInstanceHash` prints one breakdown per material, and its `textures=[...]` field identifies which material is which by the images its samplers bind - match on the albedo texture and take the `materialHash`. A fresh capture works too, and is the better option when many materials moved at once. Two outcomes need a decision rather than a rewrite: two old anchors whose materials now share one identity (typically materials that differed only by an input the analysis now drops), and one old anchor whose material now splits into several (an input it now keeps differs between them), where the override belongs on each.
+
+### Options
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3MicVolatileConstantDetection` | True | Leave frame-varying constant registers out of identity |
+| `rtx.d3d9.ue3MicExcludeRenderTargetsFromIdentity` | True | Leave render targets out of the texture set |
+| `rtx.d3d9.ue3MicIdentityExcludedTextureDescHashes` | | Texture descriptors identified by their shape rather than their contents |
+| `rtx.d3d9.ue3MicConstantIdentityExcludedMaterials` | | Material families (`textureSetShaderHash`) whose constants tier is dropped |
+| `rtx.d3d9.ue3MicConstantIdentityExcludedShaders` | | Pixel shaders whose constants tier is dropped for every material |
+| `rtx.d3d9.ue3ReportMicIdentityChurn` | True | Warn once per family that keeps minting identities |
+| `rtx.d3d9.ue3LogMaterialInstanceHash` | False | Log each material's identity breakdown |
+| `rtx.d3d9.ue3LogTextureHashProvenance` | False | Log how each texture's image hash was derived |
 
 ## Replacement anchor diagnostics
 
@@ -510,9 +558,17 @@ When an authored enhancement does not appear (or appears intermittently), enable
 
 UE3 interiors are often a one-sided exterior static-mesh shell around BSP rooms with window openings. Rasterisation, primary rays, and GI already cull the shell's inward backfaces, so you see sky. Shadow/NEE visibility rays do not (`rtx.enableCullingInSecondaryRays` is off), so the same shell blocks the sun.
 
-The Triangle Culling (Override Secondary Rays) option could mitigate this, but that also globally culls backfaces on every opaque mesh and weakens prop/foliage/character shadows which is not desireable. Instead, tag the wrapping shell as **Cull Backfaces in Shadows** (`rtx.cullBackfacesInShadowTextures` / `rtx.cullBackfacesInShadowGeometries`; geometry hashes when materials are shared).
+The Triangle Culling (Override Secondary Rays) option could mitigate this, but that also globally culls backfaces on every opaque mesh and weakens prop, foliage and character shadows. Instead, tag the wrapping shell as **Cull Backfaces in Shadows** (`rtx.cullBackfacesInShadowTextures` / `rtx.cullBackfacesInShadowGeometries`; geometry hashes when materials are shared).
 
 Optionally enable `rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces` to flag one-sided opaque meshes whose object AABB contains the camera and whose world-space extents fall between `rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters` (2 m) and `rtx.d3d9.ue3AutoCullEnclosingMeshMaxExtentMeters` (150 m). Tagging is more precise if auto misses a hangar or flags the wrong mesh. Do not tag thin floors or whole-level BSP, or rooms below can leak sun.
+
+While any surface is tagged, shadow and NEE visibility rays use closest-hit traversal instead of stopping at the first hit, which costs a little GPU time.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.cullBackfacesInShadowTextures` / `rtx.cullBackfacesInShadowGeometries` | | Shells whose backfaces shadow and NEE rays ignore |
+| `rtx.d3d9.ue3AutoCullEnclosingMeshShadowBackfaces` | False | Flag one-sided opaque meshes that enclose the camera automatically |
+| `rtx.d3d9.ue3AutoCullEnclosingMeshMinExtentMeters` / `...MaxExtentMeters` | 2 / 150 | World-space extents an enclosing mesh must fall between |
 
 ## Game executable patches
 
@@ -567,6 +623,30 @@ The runtime drops the draws of several UE3 passes as soon as they arrive (see `D
 - Dynamic shadows (`show dynamicshadows`): the `bAllowDynamicShadows` tests before `InitDynamicShadows` at the end of InitViews and before `RenderModulatedShadows`. Without the first no projected shadows exist, so no shadow depth or projection pass runs.
 - Dynamic lighting (the light-pass half of `viewmode unlit`): `Render`'s `SHOW_Lighting` block, which holds `RenderLights`, the modulated shadows and the lighting-only post process effects. Its `jz rel32` becomes a `nop` and an unconditional `jmp` with the same operand and target. Base pass shaders keep their lit permutations; only `viewmode unlit` itself changes those.
 - Velocity pass (`MotionBlur=False`): the `bAllowMotionBlur` test before `RenderVelocities`.
+
+## First person and the player model
+
+Games draw the player twice: a view model for the first-person camera (arms and the held weapon, `Mesh1p` in Mirror's Edge) and a third-person body that casts the player's shadow and appears in reflections (`Mesh3p`). In first person the body stays off primary rays; once the camera leaves the player it moves onto them. One decision per frame makes that switch, read by the ray tracing constants, view-model instance creation, held-equipment detection and the UE3 foreground draws.
+
+Three rules can make it automatically. Frames with no ViewModel camera, such as cutscenes and flyovers that draw no view model, count as external, except where the absence is Remix's own doing: on external cameras UE3 foreground draws are rendered as world geometry, which itself removes the ViewModel camera. A camera farther from the player than a set distance counts too, which catches cameras that detach while the game still draws the first-person overlay. The player position is the nearest tagged player-model instance, so check the distance the game actually reports first: where the pawn is parked away from the camera during scripted sequences, or extra copies of the player mesh share its tags, the distance leaves the first-person range during ordinary play and any threshold inside that spread flickers the body in and out. Entering the external state can wait for several frames of agreement, so a camera cut that costs one frame of overlay geometry does not flip the body into view; leaving it is immediate.
+
+A body far from the first-person camera is not the player's own shadow caster. Scripted sequences move the pawn to where it needs to be and fly the camera in separately, and a game modified to always draw its third-person mesh leaves that copy standing in the scene, casting a shadow nobody is there to cast. Such instances can be dropped entirely until the camera reaches them.
+
+Held equipment often renders twice as well: a view-model copy and a world-space copy kept as a shadow caster. When a mesh is drawn both ways in one frame, the world instance nearest the camera is treated as player model, hidden from primary rays but still casting shadows and appearing in reflections. Copies without a view-model twin that frame, dropped or held by someone else, stay world geometry, so these meshes need no tagging.
+
+Games hide the view model during scoped zoom through raster tricks that ray tracing ignores, such as pushing the near plane past it. The field of view is the more robust signal, since it holds however the game or a mod manages its clipping planes, but cinematics narrow it too: Mirror's Edge's sniper zoom goes from about 59 to about 7 degrees, while its scripted sequences reach about 43. A threshold between the two hides the view model only while zoomed.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.playerModel.enableInPrimarySpace` | False | Always show the player model on primary rays, and hide the view model |
+| `rtx.playerModel.autoEnableInPrimarySpaceWhenNoViewModel` | False | Show it in frames with no ViewModel camera |
+| `rtx.playerModel.autoEnableInPrimarySpaceBodyDistance` | 0 | Show it while the camera is farther than this from the player; 0 disables |
+| `rtx.playerModel.autoEnableInPrimarySpaceDelayFrames` | 0 | Frames the automatic rules must agree before the body appears |
+| `rtx.playerModel.firstPersonMaxDistance` | 0 | In first person, drop player-model instances farther than this; 0 disables |
+| `rtx.playerModel.autoDetectHeldEquipment` | True | Treat the world copy of view-model meshes as player model |
+| `rtx.playerModel.heldEquipmentMaxDistance` | 200 | Farthest held-equipment candidate from the camera |
+| `rtx.viewModel.hideBelowFovDegrees` | 0 | Hide the view model below this vertical FOV; 0 disables |
+| `rtx.viewModel.maxNearPlane` | 0 | Hide the view model while the near plane exceeds this; unreliable when mods rewrite the near plane |
 
 ## Per-map settings
 

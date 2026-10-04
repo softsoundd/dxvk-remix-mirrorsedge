@@ -917,12 +917,8 @@ private:
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
 
-  // for UE3 vertex shader skinned (GPUSkin) draws, objectToWorld is identity and both the
-  // geometry position hash and the bounding box are derived from the static bindpose source
-  // buffer - that makes every instance of a shared skeletal mesh look identical to the BLAS
-  // cache, which then cross assigns BlasEntries between unrelated instances. This is a worldspace anchor
-  // derived from the bone matrices in the VS constants so it gives the cache a per-instance + frame-stable position so it can tell
-  // simultaneous skinned instances apart and rematch them across frames
+  // GPUSkin draws have an identity objectToWorld and bind-pose hashes and bounds, so every instance of a
+  // skeletal mesh looks the same to the BLAS cache. This bone-derived world anchor tells them apart.
   Vector3 m_skinnedWorldAnchor = Vector3(0.0f, 0.0f, 0.0f);
   bool m_hasSkinnedWorldAnchor = false;
 

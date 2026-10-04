@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <iostream>
+// NV-DXVK start: resolution-agnostic render target tagging
 #include <numeric>
+// NV-DXVK end
 #include <sstream>
 #include "../dxvk/imgui/dxvk_imgui.h"
 
@@ -17,6 +19,7 @@
 
 namespace dxvk {
 
+  // NV-DXVK start: resolution-agnostic render target tagging
   XXH64_hash_t D3D9_COMMON_TEXTURE_DESC::CalculateResolutionAgnosticHash() const {
     assert(sizeof(D3D9_COMMON_TEXTURE_DESC) == 44);
 
@@ -26,6 +29,7 @@ namespace dxvk {
     normalized.Height = Height / aspectGcd;
     return XXH3_64bits(&normalized, sizeof(normalized));
   }
+  // NV-DXVK end
 
   D3D9CommonTexture::D3D9CommonTexture(
           D3D9DeviceEx*             pDevice,
@@ -113,9 +117,11 @@ namespace dxvk {
       if (m_image->getDescriptorHash() != kEmptyHash) {
         ImGUI::ReleaseTexture(m_image->getDescriptorHash());
       }
+      // NV-DXVK start: resolution-agnostic render target tagging
       if (m_image->getResolutionAgnosticDescriptorHash() != kEmptyHash) {
         ImGUI::ReleaseTexture(m_image->getResolutionAgnosticDescriptorHash());
       }
+      // NV-DXVK end
     }
   }
 
@@ -662,7 +668,9 @@ namespace dxvk {
       // Assumption: All image hashes are created before creating sample view. Put assert here to track hash bugs.
       assert(m_image->getHash() != kEmptyHash);
       ImGUI::AddTexture(m_image->getHash(), m_sampleView.Color, ImGUI::kTextureFlagsDefault);
+      // NV-DXVK start: resolution-agnostic render target tagging
       RegisterRenderTargetDescriptorHashes(m_sampleView.Color);
+      // NV-DXVK end
     }
   }
 
@@ -676,6 +684,8 @@ namespace dxvk {
   }
   // NV-DXVK end
 
+  // NV-DXVK start: cube textures in Remix's 2D material slots, UE3 streaming-stable texture hashes and
+  // resolution-agnostic render target tagging
   void D3D9CommonTexture::SetupForRtxFrom(const D3D9CommonTexture* source) {
     ScopedCpuProfileZone();
 
@@ -684,8 +694,9 @@ namespace dxvk {
 
     const bool is2DTexture = m_type == D3DRTYPE_TEXTURE;
     const bool isCubeTexture = m_type == D3DRTYPE_CUBETEXTURE;
-    if ((!is2DTexture && !isCubeTexture) || (m_desc.Usage & D3DUSAGE_DEPTHSTENCIL))
+    if ((!is2DTexture && !isCubeTexture) || (m_desc.Usage & D3DUSAGE_DEPTHSTENCIL)) {
       return;
+    }
 
     if (m_image->getHash() != kEmptyHash) {
       // Already setup.
@@ -699,12 +710,11 @@ namespace dxvk {
       constexpr uint32_t subresource = 0;
       const auto& buffer = source->m_buffers[subresource];
 
-      if (nullptr == buffer.ptr())
+      if (buffer.ptr() == nullptr) {
         return;
+      }
 
-      // NV-DXVK start: UE3 streaming-stable texture identity
       imageHash = ComputeUe3StreamingStableHash(source);
-      // NV-DXVK end
 
       // standard top-mip content hash (also the fallback for tail-ineligible textures)
       if (imageHash == kEmptyHash) {
@@ -720,34 +730,25 @@ namespace dxvk {
     } else {
       // resolve cubemap albedo materials
       //
-      // Every face has to be present before an identity is latched. The hash is set once and
-      // this function returns early forever after, so hashing whichever faces happened to have
-      // CPU data first makes the value depend on upload order - a cube map that identifies a
-      // material one session identifies nothing the next, and the material's identity moves with
-      // it. Waiting costs at most a rebind: a face without data cannot be sampled yet.
-      //
-      // The streaming-stable mip tail deliberately does not apply here. UE3's texture streamer
-      // iterates UTexture2D only and a cube map's faces skip UpdateResource entirely, so a cube
-      // map never presents itself as a series of mip-count variants the way a 2D texture does.
-      // Routing it through the tail would buy no stability and would re-mint the identity of
-      // every material binding one.
+      // Every face must be present before the identity is latched, and the streaming-stable mip tail does
+      // not apply to cube maps (see "Material identity and replacement anchor stability" in UE3Compatibility.md).
       for (uint32_t face = 0; face < 6; face++) {
         const auto& buffer = source->m_buffers[CalcSubresource(face, 0)];
-        if (buffer.ptr() == nullptr)
+        if (buffer.ptr() == nullptr) {
           return;
+        }
 
         const XXH64_hash_t subHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
         imageHash = XXH3_64bits_withSeed(&subHash, sizeof(subHash), imageHash);
       }
 
       texturePickerView = GetCubeFaceView(false);
-      if (texturePickerView == nullptr)
+      if (texturePickerView == nullptr) {
         texturePickerView = m_sampleView.Color;
+      }
     }
 
-    // NV-DXVK start: UE3 streaming-stable texture identity
     LogUe3TextureHashProvenance(source, imageHash, is2DTexture);
-    // NV-DXVK end
 
     // save hash to dxvkImage
     m_image->setHash(imageHash);
@@ -785,6 +786,7 @@ namespace dxvk {
       ImGUI::AddTexture(resolutionAgnosticDescriptorHash, pickerView, ImGUI::kTextureFlagsRenderTarget);
     }
   }
+  // NV-DXVK end
 
   void D3D9CommonTexture::SetupForRtx() {
     SetupForRtxFrom(this);
@@ -805,10 +807,12 @@ namespace dxvk {
       m_image->setDescriptorHash(kEmptyHash);
     }
 
+    // NV-DXVK start: resolution-agnostic render target tagging
     if (m_image->getResolutionAgnosticDescriptorHash() != kEmptyHash) {
       ImGUI::ReleaseTexture(m_image->getResolutionAgnosticDescriptorHash());
       m_image->setResolutionAgnosticDescriptorHash(kEmptyHash);
     }
+    // NV-DXVK end
   }
 
 }

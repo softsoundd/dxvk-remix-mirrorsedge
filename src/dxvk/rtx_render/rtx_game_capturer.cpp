@@ -883,11 +883,8 @@ namespace dxvk {
                                           const float currentFrameNum,
                                           std::shared_ptr<Mesh> pMesh) {
 
-    // Only float32 texcoord formats can be safely read as float* on the CPU.
-    // Non-float32 formats (e.g. R16G16_SFLOAT) are normally converted to R32G32_SFLOAT by the
-    // GPU interleaver before reaching here, but guard defensively in case that changes.
-    // Note: must skip BEFORE numOutstandingInc, otherwise the capture waits forever on a
-    // buffer callback that never ran.
+    // Only float32 texcoords can be read as float*; the interleaver normally converts the others. This must
+    // skip before numOutstandingInc, or the capture waits forever on a callback that never runs.
     const VkFormat texFmt = geomData.texcoordBuffer.vertexFormat();
     if (texFmt != VK_FORMAT_R32G32_SFLOAT && texFmt != VK_FORMAT_R32G32B32_SFLOAT && texFmt != VK_FORMAT_R32G32B32A32_SFLOAT) {
       Logger::err(str::format("[GameCapturer] Skipping texcoord capture for unsupported format: ", texFmt));

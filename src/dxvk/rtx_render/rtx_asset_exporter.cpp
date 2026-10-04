@@ -67,11 +67,13 @@ namespace {
   }
 
   VkDeviceSize computeAlignedPitch(VkDeviceSize pitch, VkDeviceSize alignment) {
-    if (alignment == 0 || pitch == 0)
+    if (alignment == 0 || pitch == 0) {
       return pitch;
+    }
 
-    if (pitch <= alignment)
+    if (pitch <= alignment) {
       return alignment;
+    }
 
     const VkDeviceSize remainder = pitch % alignment;
     return remainder == 0 ? pitch : (pitch + alignment - remainder);

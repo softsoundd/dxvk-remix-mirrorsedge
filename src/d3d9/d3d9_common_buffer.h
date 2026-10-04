@@ -1,6 +1,8 @@
 #pragma once
 
+// NV-DXVK start: buffer content generation counter
 #include <atomic>
+// NV-DXVK end
 
 #include "d3d9_device_child.h"
 #include "d3d9_format.h"

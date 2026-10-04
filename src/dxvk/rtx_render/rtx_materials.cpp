@@ -66,15 +66,9 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
     uint8_t padding[5];
   };
 
-  // NV-DXVK fork: UE3 streaming-stable image hashes are identical across every streamed
-  // mip variant of a logical texture by design (see rtx.d3d9.ue3StreamingStableTextureHashing),
-  // so the image hash alone cannot tell the preserve path that the game swapped the bound
-  // texture object for a different-resolution variant - a preserved instance would keep
-  // sampling the stale low-mip image view in the bindless table indefinitely. A signature of
-  // the image properties (extent, mip count, format) differs across streamed variants while
-  // remaining stable across identical recreations, forcing exactly one dynamic-path rebind
-  // when the variant changes. (Note: DxvkImage::getDescriptorHash is only populated for
-  // render targets, so it cannot serve this purpose for regular textures.)
+  // Streaming-stable image hashes are equal across a texture's streamed mip variants, so the preserve
+  // path needs the image's extent, mip count and format to notice the game binding another variant.
+  // DxvkImage::getDescriptorHash is only populated for render targets.
   auto textureVariantHash = [](const TextureRef& tex) -> XXH64_hash_t {
     if (const DxvkImageView* view = tex.getImageView()) {
       const DxvkImageCreateInfo& info = view->image()->info();

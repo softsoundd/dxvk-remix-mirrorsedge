@@ -1791,8 +1791,9 @@ namespace dxvk {
       uint32_t textureID = 0;
       for (uint32_t idx = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
         const uint8_t stage = texcoordIndexToStage[idx];
-        if (stage == kInvalidStage || d3d9State().textures[stage] == nullptr)
+        if (stage == kInvalidStage || d3d9State().textures[stage] == nullptr) {
           continue;
+        }
 
         D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
         assert(pTexInfo != nullptr);
@@ -1802,11 +1803,13 @@ namespace dxvk {
             ? pTexInfo->GetImage()->getDescriptorHash()
             : kEmptyHash;
 
-        if (texHash == kEmptyHash)
+        if (texHash == kEmptyHash) {
           continue;
+        }
 
-        if (textureID == 0)
+        if (textureID == 0) {
           firstStage = stage;
+        }
 
         D3D9SamplerKey key = m_parent->CreateSamplerKey(stage);
         XXH64_hash_t samplerHash = D3D9SamplerKeyHash{}(key);
@@ -1824,13 +1827,15 @@ namespace dxvk {
         // Cache the slot we want to bind
         const bool srgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
         Rc<DxvkImageView> sampleView = getRemixSampleView(pTexInfo, srgb);
-        if (sampleView == nullptr)
+        if (sampleView == nullptr) {
           continue;
+        }
         m_activeDrawCallState.materialData.colorTextures[textureID] = TextureRef(sampleView);
         m_activeDrawCallState.materialData.samplers[textureID] = sampler;
         ue3.selectedUe3MovieTexture |= isUe3MovieTextureDescHash(texDescHash);
-        if (textureID == 0)
+        if (textureID == 0) {
           m_activeDrawCallState.materialData.colorTextureIsSrgb = srgb;
+        }
 
         auto shaderSampler = RemapStateSamplerShader(stage);
         m_activeDrawCallState.materialData.colorTextureSlot[textureID] = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
@@ -1944,20 +1949,24 @@ namespace dxvk {
         return false;
       }
       for (uint32_t i = 0; i < LegacyMaterialData::kMaxSupportedTextures; i++) {
-        if (lookupHash(outlierSet, m_activeDrawCallState.materialData.colorTextures[i].getImageHash()))
+        if (lookupHash(outlierSet, m_activeDrawCallState.materialData.colorTextures[i].getImageHash())) {
           return true;
+        }
       }
 
       for (uint32_t stage = 0; stage < SamplerCount; stage++) {
-        if (d3d9State().textures[stage] == nullptr)
+        if (d3d9State().textures[stage] == nullptr) {
           continue;
+        }
 
         D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[stage]);
-        if (texture == nullptr || texture->GetImage() == nullptr)
+        if (texture == nullptr || texture->GetImage() == nullptr) {
           continue;
+        }
 
-        if (lookupHash(outlierSet, texture->GetImage()->getHash()))
+        if (lookupHash(outlierSet, texture->GetImage()->getHash())) {
           return true;
+        }
       }
 
       return false;
@@ -1973,23 +1982,21 @@ namespace dxvk {
     return true;
   }
 
-  // Two kinds of UE3 TEXCOORD element are not coordinates at all:
-  //  - vertex lightmap policies append packed lighting coefficients as TEXCOORD5 (simple) or
-  //    TEXCOORD5/6/7 (directional), typed D3DCOLOR rather than a float pair. The element count
-  //    moves with the DirectionalLightmaps setting, and a D3DCOLOR-typed TEXCOORD is never a UV
-  //    set in UE3, so the type alone identifies them without consulting the vertex shader.
-  //  - instanced vertex factories put the per-instance basis in TEXCOORD1..4 on an instance-data
-  //    stream. Those advance once per instance, so they carry no per-vertex meaning.
+  // UE3 TEXCOORD elements that are not UV sets: vertex lightmap coefficients (D3DCOLOR-typed, TEXCOORD5..7)
+  // and the per-instance basis on an instance-data stream (TEXCOORD1..4).
   uint32_t D3D9Rtx::resolveIaTexcoordIndex(const uint32_t iaTexcoordIdx) const {
-    if (!m_frameOptions.ue3EngineMode || d3d9State().vertexDecl == nullptr)
+    if (!m_frameOptions.ue3EngineMode || d3d9State().vertexDecl == nullptr) {
       return iaTexcoordIdx;
+    }
 
     const uint32_t instanceDataStreamMask = m_currentUe3Instancing.instanceDataStreamMask;
     auto isNonUvElement = [instanceDataStreamMask](const D3DVERTEXELEMENT9& element) {
-      if (element.Usage != D3DDECLUSAGE_TEXCOORD)
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD) {
         return false;
-      if (element.Type == D3DDECLTYPE_D3DCOLOR)
+      }
+      if (element.Type == D3DDECLTYPE_D3DCOLOR) {
         return true;
+      }
       return element.Stream < caps::MaxStreams &&
              (instanceDataStreamMask & (1u << element.Stream)) != 0;
     };
@@ -2003,16 +2010,18 @@ namespace dxvk {
       }
     }
 
-    if (!requestedIsNonUv)
+    if (!requestedIsNonUv) {
       return iaTexcoordIdx;
+    }
 
     // Fall back to the mesh's lowest real UV set rather than leaving the surface with the
     // lighting stream: an unresolvable index would drop the texcoord buffer entirely.
     uint32_t fallback = iaTexcoordIdx;
     bool found = false;
     for (const auto& element : elements) {
-      if (element.Usage != D3DDECLUSAGE_TEXCOORD || isNonUvElement(element))
+      if (element.Usage != D3DDECLUSAGE_TEXCOORD || isNonUvElement(element)) {
         continue;
+      }
       if (!found || element.UsageIndex < fallback) {
         fallback = element.UsageIndex;
         found = true;

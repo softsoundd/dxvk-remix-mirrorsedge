@@ -1314,13 +1314,9 @@ void RtxAtmosphere::syncDistantSunLight(RtxContext& ctx, const AtmosphereArgs& a
   const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
   const bool sunAboveHorizon = sunDirYUp.y > 0.0f;
 
-  // RtDistantLight stores illuminance / pi, since distantLightSampleArea() recovers the sample
-  // radiance as that divided by sin^2(halfAngle). This keeps the delivered illuminance independent
-  // of the cone width, so widening the cone only softens shadows and dims the reflected disc.
-  //
-  // The horizon needs no artificial fade: atmTransmittanceYUp() reddens and then extinguishes the
-  // sun as it descends, and returns zero once the planet occludes it. Twilight is then the sky's own
-  // multiple scattering rather than direct sunlight leaking below the horizon.
+  // RtDistantLight stores illuminance / pi: distantLightSampleArea() divides it by sin^2(halfAngle), so
+  // widening the cone only softens shadows and dims the reflected disc. No horizon fade is needed, since
+  // atmTransmittanceYUp() extinguishes the sun as it sets.
   Vector3 radiance(0.0f, 0.0f, 0.0f);
   if (sunAboveHorizon) {
     const Vector3 T = atmTransmittanceYUp(args, sunDirYUp, args.viewAltitude);

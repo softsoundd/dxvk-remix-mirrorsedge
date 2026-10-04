@@ -672,14 +672,9 @@ namespace dxvk {
 
   std::unordered_set<XXH64_hash_t> uniqueHashes;
 
-  // ===== Replacement resolution diagnostics =====
-  // (rtx.logReplacementResolution / rtx.replacementDebugHashes)
-  //
-  // Detects authored anchors silently un-matching mid-session: the last resolution outcome
-  // is remembered per material family (color texture hash + material shader seed, both
-  // stable across sessions) and per mesh, and any change - matched<->miss, or a different
-  // identity hash while the family stayed the same - is logged with the hashes needed to
-  // attribute the drift to a specific identity tier.
+  // [RTX-ReplacementResolve] and [RTX-ReplacementFlap] (rtx.logReplacementResolution,
+  // rtx.replacementDebugHashes): the last resolution per material family and per mesh, so a change can
+  // be logged with the hashes that attribute it to an identity tier.
   namespace replacement_diag {
     // Per-family log caps: without them an identity oscillating between two hashes would
     // emit a flap warning on every draw. Tracked families get a higher budget.
@@ -1122,16 +1117,9 @@ namespace dxvk {
 
     // test if any direct material replacements exist
     //
-    // UE3 MaterialInstanceConstant tiered lookup - every tier is a pure function of the
-    // current draw (no session history), so the same surface always resolves to the same
-    // replacement:
-    //   1. materialHash          - exact child identity (PS + material texture set + constants)
-    //   2. textureSetShaderHash  - all MIC siblings sharing the shader and texture set (constants
-    //                              ignored; stable even for shaders with frame-varying constants)
-    //   3. textureHash           - parent-level tag on the primary color texture
-    // The exact identity comes before the family and parent fallbacks so a specifically
-    // authored replacement always wins over a broader one. For non-UE3 games the tiers
-    // collapse into the legacy single texture-hash lookup.
+    // UE3 materials look up their materialHash (shader, texture set and constants), then their
+    // textureSetShaderHash (every sibling, constants ignored), then the colour texture hash, so the most
+    // specific anchor wins. Every tier is a pure function of the draw.
     const LegacyMaterialData& inputMaterial = input.getMaterialData();
     const XXH64_hash_t materialHash = inputMaterial.getHash();
     const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
@@ -2060,11 +2048,8 @@ namespace dxvk {
     return instance; 
   }
 
-  // Maps an objectPickingValue to its draw's legacy texture hashes so clicking
-  // a surface in the texture UI resolves to that texture's entry. The per-tick map clears
-  // every frame, so BOTH submission paths must insert every visible instance each frame:
-  // the dynamic path from processDrawCallState, the preserve path from
-  // preserveReplacementInstance (preserved draws never reach processDrawCallState).
+  // Maps objectPickingValue to its draw's texture hashes for the texture UI. The map clears every frame,
+  // so both the dynamic path (processDrawCallState) and the preserve path must insert every instance.
   void SceneManager::trackObjectPickingMeta(
       const DrawCallState& drawCallState,
       ObjectPickingValue objectPickingValue) {
@@ -2846,21 +2831,15 @@ namespace dxvk {
     m_instanceManager.findPortalForVirtualInstances(m_cameraManager, m_rayPortalManager);
     m_instanceManager.updatePlayerModelBodyCameraDistance(m_cameraManager);
 
-    // Single per-frame camera-regime decision consumed by the raytrace constants
-    // (player model on primary rays), view-model instance creation (hide view-model
-    // copies), held-equipment detection (suspend classification), and the UE3
-    // foreground-DPG category override (demote first-person overlay draws to world
-    // geometry so e.g. the held weapon renders normally on external cameras).
+    // One camera-regime decision per frame, read by the ray tracing constants, view model instances,
+    // held-equipment detection and the UE3 foreground draws.
     {
       const bool viewModelCameraValid = m_cameraManager.isCameraValid(CameraType::ViewModel);
       const float playerDistance = m_instanceManager.getPlayerModelBodyCameraDistance();
       const float maxDistance = RtxOptions::PlayerModel::autoEnableInPrimarySpaceBodyDistance();
       const bool distanceExternal = maxDistance > 0.f && playerDistance > maxDistance;
-      // The no-ViewModel rule must not read back the regime's own effect: while external,
-      // foreground draws are demoted to world, which itself invalidates the ViewModel
-      // camera. Suppress the rule only when the absence is self-inflicted (we demoted
-      // overlay draws since the last scene prep); a genuine absence - the game drew no
-      // first-person overlay at all - fires it stably every frame.
+      // The no-ViewModel rule must not read back the regime's own effect: demoting foreground draws
+      // invalidates the ViewModel camera, so the rule is off while any were demoted since the last prep.
       const bool demotedForeground = m_ue3ForegroundDemotedDrawCount > 0;
       m_ue3ForegroundDemotedDrawCount = 0;
       const bool noViewModelExternal = RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModel() &&

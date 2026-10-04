@@ -1640,7 +1640,9 @@ namespace dxvk {
 
     D3D9DeviceLock lock = LockDevice();
 
+    // NV-DXVK start: UE3 foreground draw boundary
     m_rtx.OnClear(Flags);
+    // NV-DXVK end
 
     const auto& vp = m_state.viewport;
     const auto& sc = m_state.scissorRect;
@@ -4782,7 +4784,9 @@ namespace dxvk {
         const XXH64_hash_t imageHash = image->getHash();
         const bool keepConfiguredHash =
           lookupHash(RtxOptions::terrainTextures(), imageHash) ||
+          // NV-DXVK start: auto-detected UE3 lightmaps
           D3D9Rtx::isLightmapTexture(imageHash) ||
+          // NV-DXVK end
           lookupHash(RtxOptions::ignoreTextures(), imageHash) ||
           lookupHash(RtxOptions::ignoreBakedLightingTextures(), imageHash);
         if (imageHash != kEmptyHash && !keepConfiguredHash) {
@@ -7688,8 +7692,7 @@ namespace dxvk {
 
 
   bool D3D9DeviceEx::UseProgrammableVS() {
-    // NV-DXVK start: profile zone removed - trivial getter called tens of thousands of
-    // times per frame; the Tracy event cost dwarfs the body and distorts captures
+    // NV-DXVK start: no profile zone, as this runs tens of thousands of times a frame
     // NV-DXVK end
     return m_state.vertexShader != nullptr
       && m_state.vertexDecl != nullptr
@@ -7698,7 +7701,7 @@ namespace dxvk {
 
 
   bool D3D9DeviceEx::UseProgrammablePS() {
-    // NV-DXVK start: profile zone removed - see UseProgrammableVS
+    // NV-DXVK start: no profile zone (see UseProgrammableVS)
     // NV-DXVK end
     return m_state.pixelShader != nullptr;
   }

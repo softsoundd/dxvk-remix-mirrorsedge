@@ -235,17 +235,11 @@ namespace dxvk {
                   "All exclusively UI-related textures should be classified this way and doing so allows the UI to be rasterized on top of the ray traced scene like usual.\n"
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
     RTX_OPTION("rtx", fast_unordered_set, deferredUiTextures, {},
-                  "Textures on overlay draw calls (fullscreen fades, scope/damage screen effects) that the game renders mid-scene, before 3D rendering has finished for the frame.\n"
-                  "Like rtx.uiTextures these draws are rasterized on top of the ray-traced image, but they never trigger RTX injection; instead each tagged draw is captured and replayed right after RTX injection fires later in the frame (at the first real UI draw, or at the end-of-frame fallback). "
-                  "Draws the game rendered into a floating-point target (linear scene colour, e.g. UE3 MaterialEffects) replay on the linear HDR image before tone mapping instead (rtx.d3d9.deferredUiHdrReplay).\n"
-                  "Use this for post-process style overlays (e.g. UE3 MaterialEffect fades) that would otherwise end the ray-traced scene early and force later geometry (such as first-person meshes) back to rasterization.\n"
-                  "Non-RT textures match by image hash. Render targets match either descriptor hash the texture picker "
-                  "registers for them: the resolution-agnostic one (aspect ratio in place of Width/Height) survives "
-                  "resolution changes, while the absolute one pins a single target when several share an aspect ratio "
-                  "(e.g. a scene colour buffer and its half-resolution post-process chain). "
-                  "rtx.d3d9.deferredUiPixelShaders can tag the overlay's pixel shader instead.\n"
-                  "Tagging is not absolute: depth-writing draws, world geometry (anything beyond trivial depth-test-off overlay quads), and engine post-process shaders are refused deferral and classified normally, so shared textures cannot pull scene geometry out of the ray-traced world.\n"
-                  "See rtx.d3d9.deferredUiReplay and rtx.d3d9.deferredUiRefreshSceneColor for the replay behavior.");
+                  "Textures on overlay draw calls (fullscreen fades, scope and damage effects) that the game renders mid-scene.\n"
+                  "Like rtx.uiTextures they are rasterized on top of the ray-traced image, but they never trigger RTX injection: "
+                  "each is captured and replayed once injection fires. Render targets match by either descriptor hash the "
+                  "texture picker shows for them. Depth-writing draws, world geometry and engine post-process shaders are never "
+                  "deferred. See \"Deferred overlays\" in documentation/UE3Compatibility.md.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
                   "Textures on draw calls that should be treated as worldspace UI elements.\n"
                   "Unlike typical UI textures this option is useful for improved rendering of UI elements which appear as part of the scene (moving around in 3D space rather than as a screenspace element).");
@@ -265,7 +259,7 @@ namespace dxvk {
                   "Remix uses the tagged body instance as the anchor for filtering nearby player-model parts and for creating or positioning virtual player-model instances through portals.");
     RTX_OPTION("rtx", fast_unordered_set, playerModelGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) for third-person player model draw calls.\n"
-                  "Use when Mesh3p shares materials with the first-person mesh.");
+                  "Use when the third-person mesh shares materials with the first-person one.");
     RTX_OPTION("rtx", fast_unordered_set, playerModelBodyGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) identifying the player model body/root position.\n"
                   "Geometry-based equivalent of rtx.playerModelBodyTextures; implies the player-model category.\n"
@@ -273,12 +267,12 @@ namespace dxvk {
                   "player-model-tagged instances beyond that capsule revert to regular world geometry each frame.\n"
                   "Optional - held weapons are classified automatically (rtx.playerModel.autoDetectHeldEquipment) and need no tagging.");
     RTX_OPTION("rtx", fast_unordered_set, viewModelTextures, {},
-                  "Textures / material hashes for first-person view-model draw calls (e.g. Mesh1p arms, FP weapon).\n"
+                  "Textures / material hashes for first-person view-model draw calls (e.g. first-person arms and weapon).\n"
                   "Forces CameraType::ViewModel when rtx.viewModel.enable is true.\n"
                   "Prefer rtx.viewModelGeometries when the same material is also used on the third-person body.");
     RTX_OPTION("rtx", fast_unordered_set, viewModelGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) for first-person view-model draw calls.\n"
-                  "Preferred when Mesh1p shares materials with Mesh3p.");
+                  "Preferred when the first-person and third-person meshes share materials.");
     RTX_OPTION_ARGS("rtx", fast_unordered_set, cullBackfacesInShadowTextures, {},
                   "Textures / material hashes for wrapping world-shell meshes whose inward backfaces should be ignored on shadow and NEE visibility rays.\n"
                   "Use for one-sided building exteriors around BSP interiors with window openings. Primary and GI rays already cull those faces; visibility rays do not by default, so the shell blocks the sun. Front faces still cast outdoor shadows.\n"
@@ -510,13 +504,9 @@ namespace dxvk {
                  "Set between the game's normal and pushed-out near plane values. Unreliable when mods rewrite the\n"
                  "near plane per frame - prefer hideBelowFovDegrees in that case.");
       RTX_OPTION("rtx.viewModel", float, hideBelowFovDegrees, 0.f,
-                 "Hide view-model instances while the view-model camera's vertical FOV is below this many degrees. 0 disables.\n"
-                 "Scoped zoom shrinks the FOV drastically (e.g. Mirror's Edge sniper zoom: ~59 down to ~7 degrees), and games\n"
-                 "hide the first-person view model while zoomed via raster tricks ray tracing ignores. The FOV itself is the\n"
-                 "most robust zoom signal: it works regardless of how the game or mods manage clipping planes.\n"
-                 "Set it well below the narrowest FOV the game uses for anything else. Cinematics pull the FOV in too\n"
-                 "(Mirror's Edge scripted sequences reach ~43 degrees), and a threshold above that hides the first-person\n"
-                 "overlay for the length of the cutscene. Only the depth of the zoom separates the two cases.");
+                 "Hide view-model instances while the view-model camera's vertical FOV is below this many degrees, as games\n"
+                 "do during scoped zoom. 0 disables. Set it below every other FOV the game uses, cutscenes included;\n"
+                 "see \"First person and the player model\" in documentation/UE3Compatibility.md.");
     } viewModel;
 
     struct PlayerModel {
@@ -527,26 +517,16 @@ namespace dxvk {
                  "Also hides the view model while enabled; prefer autoEnableInPrimarySpaceWhenNoViewModel for cutscenes.");
       RTX_OPTION("rtx.playerModel", bool, autoEnableInPrimarySpaceWhenNoViewModel, false,
                  "Show player-model instances on primary rays in frames with no ViewModel camera\n"
-                 "(cutscenes / flyovers that do not draw Mesh1p). Does not override enableInPrimarySpace.");
+                 "(cutscenes / flyovers that do not draw the view model). Does not override enableInPrimarySpace.");
       RTX_OPTION("rtx.playerModel", float, autoEnableInPrimarySpaceBodyDistance, 0.f,
                  "Show player-model instances on primary rays when the main camera is farther than this\n"
-                 "many world units from the player (external / third-person / cutscene cameras). Catches\n"
-                 "cameras that detach while the game still draws first-person overlay geometry, which\n"
-                 "defeats the no-ViewModel heuristic. 0 disables.\n"
-                 "The player position is the minimum camera distance across this frame's player-model\n"
-                 "instances (anything tagged via rtx.playerModelTextures / rtx.playerModelGeometries).\n"
-                 "Check the distance a game actually reports before setting this. Where the pawn is parked\n"
-                 "away from the camera during scripted sequences, or extra copies of the player mesh share\n"
-                 "its tags, the measured distance leaves the first-person range during ordinary play and any\n"
-                 "threshold inside that spread flickers the body in and out.");
+                 "many world units from the player, for cameras that detach while the game still draws the\n"
+                 "first-person overlay. 0 disables. Check the distance the game reports before setting it;\n"
+                 "see \"First person and the player model\" in documentation/UE3Compatibility.md.");
       RTX_OPTION("rtx.playerModel", float, firstPersonMaxDistance, 0.f,
                  "While the camera is the first-person view, drop player-model instances farther than this\n"
                  "many world units from it entirely - no primary rays, no shadows, no reflections. 0 disables.\n"
-                 "Primary shadows exist so the player casts a shadow of their own body. A player model parked\n"
-                 "far from the camera is not that: scripted sequences move the pawn to where it needs to be and\n"
-                 "fly the camera in separately, and a game modified to always draw its third-person mesh leaves\n"
-                 "that copy standing in the scene casting a shadow nobody is there to cast. The instance\n"
-                 "returns to normal once the camera reaches it.");
+                 "For bodies the game leaves away from the camera; see \"First person and the player model\" in documentation/UE3Compatibility.md.");
       RTX_OPTION("rtx.playerModel", uint32_t, autoEnableInPrimarySpaceDelayFrames, 0,
                  "Consecutive frames the automatic rules must agree before the player model moves onto\n"
                  "primary rays. Leaving the external-camera state is always immediate, so returning to\n"
@@ -556,13 +536,9 @@ namespace dxvk {
                  "into view. Does not apply to enableInPrimarySpace.");
       RTX_OPTION("rtx.playerModel", bool, enablePrimaryShadows, true, "");
       RTX_OPTION("rtx.playerModel", bool, autoDetectHeldEquipment, true,
-                 "Automatically treat the world-space copy of view-model-drawn meshes as player-model geometry.\n"
-                 "Held equipment (e.g. weapons) often renders twice: a view-model copy for the point of view and\n"
-                 "a world-space copy kept as shadow caster. When a mesh is drawn both ways in one frame, the world\n"
-                 "instance closest to the camera is classified as player model: hidden from primary rays, still\n"
-                 "casting shadows and appearing in reflections. Instances without a view-model twin that frame\n"
-                 "(dropped or NPC-held duplicates of the same mesh) remain regular world geometry.\n"
-                 "Such meshes need no texture or geometry tagging at all.");
+                 "Treat the world-space copy of a mesh the view model also draws this frame as player-model geometry:\n"
+                 "hidden from primary rays, still casting shadows and appearing in reflections. Such meshes need no\n"
+                 "tagging; see \"First person and the player model\" in documentation/UE3Compatibility.md.");
       RTX_OPTION("rtx.playerModel", float, heldEquipmentMaxDistance, 200.f,
                  "Maximum distance (world units) from the camera for autoDetectHeldEquipment candidates.\n"
                  "Guards against classifying a distant duplicate when the real held copy is absent (e.g. culled).");
@@ -1454,7 +1430,7 @@ namespace dxvk {
                "Only effective when Sky Auto-Detect and Reproject Sky to Main Camera are both enabled.");
 
     RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::SkyboxRasterization,
-               "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
+               "Sky rendering mode. 0: SkyboxRasterization, the game's rasterized skybox. 1: PhysicalAtmosphere, Hillaire atmospheric scattering.");
 
     // Atmosphere parameters
     RTX_OPTION("rtx.atmosphere", bool, aerialPerspective, true,

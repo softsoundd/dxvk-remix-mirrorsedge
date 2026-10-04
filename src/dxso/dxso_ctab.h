@@ -30,7 +30,9 @@ namespace dxvk {
 
     struct Constant {
       std::string name;
+      // NV-DXVK start: CTAB register sets
       uint16_t registerSet = 0;
+      // NV-DXVK end
       uint32_t registerIndex;
       uint32_t registerCount;
     };

@@ -667,18 +667,10 @@ vec3 getTransmittanceToSunAtAltitude(float altitudeKm, Texture2D transmittanceLu
   return evalSunShadowing(samplePos, args.sunDirection, transmittanceLut, args);
 }
 
-// Radiance of the sun disc itself. The paper composites the disc separately from the Sky-View LUT
-// (Section 5.3) because its 0.545 degree angular size cannot be resolved at LUT resolution.
-//
-// Peak radiance follows from the illuminance and the disc's solid angle: for a small cone of half
-// angle theta, Omega ~= pi * sin^2(theta) and E = L * Omega, so L = E / (pi * sin^2(theta)). This is
-// the same convention distantLightSampleArea() uses, which keeps a mirror reflection of the sun and
-// a next event estimation highlight on a rough surface at matching brightness.
-//
-// A true Earth sun overflows the fp16 shared radiance buffers, which are neither denoised nor firefly
-// filtered on the way to the output, hence the clamp. It still sits orders of magnitude past display
-// white. Rough surfaces are unaffected: they take the sun from the distant light, where the cone pdf
-// cancels this factor before anything is stored.
+// Radiance of the sun disc, composited apart from the sky-view LUT, which cannot resolve its 0.545 degree
+// size (Section 5.3). L = E / (pi * sin^2(theta)), the convention distantLightSampleArea() uses, so a
+// mirrored sun and a rough highlight match. Clamped because a true sun overflows the fp16 radiance
+// buffers, which are neither denoised nor firefly filtered; rough surfaces take the distant light instead.
 static const float kMaxSunDiscRadiance = 16384.0f;
 
 vec3 evalSunDisk(vec3 viewDir, Texture2D transmittanceLut, AtmosphereArgs args, bool isZUp = false) {

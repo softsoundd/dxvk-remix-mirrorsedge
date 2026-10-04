@@ -51,7 +51,9 @@ namespace dxvk {
 
       Constant constant;
       constant.name = std::string(pStart + info.Name);
+      // NV-DXVK start: CTAB register sets
       constant.registerSet = info.RegisterSet;
+      // NV-DXVK end
       constant.registerIndex = info.RegisterIndex;
       constant.registerCount = info.RegisterCount;
 

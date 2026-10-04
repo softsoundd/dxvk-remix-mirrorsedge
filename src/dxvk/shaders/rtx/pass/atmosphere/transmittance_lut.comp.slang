@@ -31,12 +31,9 @@ ConstantBuffer<AtmosphereArgs> atmosphereArgs;
 layout(binding = 1, rgba16f)
 RWTexture2D<float4> transmittanceLutOutput;
 
-// Transmittance from (altitude, viewZenithCosAngle) to the atmosphere's top boundary.
-//
-// Note: the planet is deliberately ignored here. Rays that would pass through the ground still get
-// an entry, integrated with the density clamped at ground level, so bilinear filtering near the
-// horizon does not bleed hard zeros into valid neighbours. Occlusion by the planet is a separate
-// visibility term (evalPlanetShadow, the Vis factor of Equation 4).
+// Transmittance from (altitude, viewZenithCosAngle) to the top of the atmosphere. The planet is ignored on
+// purpose: rays through the ground are integrated with the density clamped at ground level, so bilinear
+// filtering near the horizon does not bleed zeros. Planet occlusion is evalPlanetShadow.
 vec3 computeTransmittance(float altitude, float viewZenithCosAngle, AtmosphereArgs args) {
   altitude = clamp(altitude, 0.0f, args.atmosphereThickness);
   viewZenithCosAngle = clamp(viewZenithCosAngle, -1.0f, 1.0f);

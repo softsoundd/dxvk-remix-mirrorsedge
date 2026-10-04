@@ -414,10 +414,12 @@ namespace dxvk {
     Vector4d dot0{ Vector4d(m[0].x,m[0].y,m[0].z,m[0].w) * row0 };
     double dot1 = (dot0.x + dot0.y) + (dot0.z + dot0.w);
 
+    // NV-DXVK start: identity for a non-invertible matrix rather than NaNs
     if (dot1 == 0.0) {
       mathValidationAssert(false, "Attempted invert a non-invertible matrix.");
       return Matrix4Base<T>();
     }
+    // NV-DXVK end
 
     Matrix4Base<T> output;
 

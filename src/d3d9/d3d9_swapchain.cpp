@@ -482,11 +482,12 @@ namespace dxvk {
                                               RtxGpuPassTimer::CpuCounter::AppPresent);
     // NV-DXVK end
 
-    HWND window = m_presentParams.hDeviceWindow;
-    if (hDestWindowOverride != nullptr)
-      window = hDestWindowOverride;
-
     // NV-DXVK start: minimized window handling
+    HWND window = m_presentParams.hDeviceWindow;
+    if (hDestWindowOverride != nullptr) {
+      window = hDestWindowOverride;
+    }
+
     if (SkipPresentForMinimizedWindow(window))
       return D3D_OK;
     // NV-DXVK end
@@ -1878,21 +1879,23 @@ namespace dxvk {
     return D3D_OK;
   }
   
-  // NV-DXVK start: 
+  // NV-DXVK start: RTX end-of-frame events while the window is inactive
   void D3D9SwapChainEx::onWindowMessageEvent(UINT message, WPARAM wParam) {
   
     // Present may not run while unfocused; EndFrame here keeps RTX state coherent.
     const bool triggerRtxEndOfFrameEvents =
       (message == WM_ACTIVATE && wParam == WA_INACTIVE) ||
-      (message == WM_ACTIVATEAPP && wParam == FALSE) ||
+      (message == WM_ACTIVATEAPP && !wParam) ||
       (message == WM_SIZE && wParam == SIZE_MINIMIZED);
 
-    if (!triggerRtxEndOfFrameEvents)
+    if (!triggerRtxEndOfFrameEvents) {
       return;
+    }
 
     // Bridge delivers WndProc off the D3D thread; Present ends minimized frames itself.
-    if (env::isRemixBridgeActive())
+    if (env::isRemixBridgeActive()) {
       return;
+    }
 
     EndFrameWithoutPresent(/* advanceFrameId = */ true);
   }
@@ -1940,8 +1943,9 @@ namespace dxvk {
   }
 
   void D3D9SwapChainEx::EndFrameWithoutPresent(bool advanceFrameId) {
-    if (m_backBuffers.empty() || m_backBuffers[0] == nullptr)
+    if (m_backBuffers.empty() || m_backBuffers[0] == nullptr) {
       return;
+    }
 
     m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage(), /* callInjectRtx = */ false);
 
