@@ -331,10 +331,7 @@ namespace dxvk {
     const uint32_t frameIdx,
     const Resources::RaytracingOutput& rtOutput)
   {
-    if (!enable()) {
-      return;
-    }
-    if (!isChromaticAberrationEnabled() && !isVignetteEnabled()) {
+    if (!isLensEffectsEnabled()) {
       return;
     }
 

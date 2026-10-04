@@ -242,7 +242,8 @@ namespace dxvk {
     void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
     bool dispatchDlssNR(const Resources::RaytracingOutput& rtOutput);
-    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure = true);
+    // allowDither: nothing runs between tone mapping and the final dither, so a tonemapper may apply it.
+    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure, bool allowDither);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
@@ -304,6 +305,8 @@ namespace dxvk {
     // is already display-encoded (gamma + colour curves), so the final
     // srgb_dither pass must skip its linear -> sRGB conversion.
     bool m_ue3DisplayTransformApplied = false;
+    // True when that tonemapper also applied the final dither, leaving srgb_dither nothing to do.
+    bool m_ue3DitherApplied = false;
 
     // What an injectRTX call given an HDR canvas leaves for finishInjectRTX (CS thread only)
     struct PendingInjectFinish {

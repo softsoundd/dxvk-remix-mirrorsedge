@@ -47,8 +47,12 @@
 
 #include "rtx/pass/tonemap/tonemapping_ue3.h"
 #include "rtx/pass/tonemap/tonemapping.slangh"
+#include "rtx/pass/tonemap/tonemapping_noise.slangh"
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/color.slangh"
+
+[[vk::binding(TONEMAPPING_UE3_BLUE_NOISE_INPUT)]]
+Texture2DArray BlueNoise;
 
 [[vk::binding(TONEMAPPING_UE3_COLOR_INPUT)]]
 RWTexture2D<float4> InColorBuffer;
@@ -429,7 +433,13 @@ void main(uint2 threadId : SV_DispatchThreadID)
 
   const float3 inputColor = imageLoad(InColorBuffer, threadId).xyz;
 
-  const float3 outputColor = applyUe3ToneMapping(inputColor);
+  const float3 outputColor = ditherTo8Bit(
+    applyUe3ToneMapping(inputColor),
+    threadId,
+    cb.ditherFrameIndex,
+    cb.ditherMode != ditherModeNone,
+    cb.ditherMode == ditherModeSpatialTemporal
+  );
 
   OutColorBuffer[threadId] = float4(saturate(outputColor), 1.0f);
 }

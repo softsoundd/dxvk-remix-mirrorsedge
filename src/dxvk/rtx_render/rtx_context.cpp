@@ -922,7 +922,7 @@ namespace dxvk {
 
   void RtxContext::outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
                                bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage) {
-    dispatchToneMapping(rtOutput, updateAutoExposure);
+    dispatchToneMapping(rtOutput, updateAutoExposure, !m_common->metaPostFx().isLensEffectsEnabled());
 
     // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
     // display-space artifacts so they operate on post-tonemap LDR data.
@@ -933,9 +933,12 @@ namespace dxvk {
     // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
     // for 16bit float formats), and when the Mirror's Edge (UE3) tonemapper ran: its
     // output is already display-encoded (gamma 2.0 + colour curves), matching what the
-    // game wrote to its backbuffer, so only dithering applies.
-    const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
-    dispatchSRGBDither(rtOutput, performSRGBConversion);
+    // game wrote to its backbuffer, so only dithering applies, and that tonemapper
+    // usually applies it itself.
+    if (!m_ue3DitherApplied) {
+      const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
+      dispatchSRGBDither(rtOutput, performSRGBConversion);
+    }
 
     if (captureScreenImage) {
       if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
@@ -2140,10 +2143,11 @@ namespace dxvk {
     return true;
   }
 
-  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure) {
+  void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure, bool allowDither) {
     ScopedCpuProfileZone();
 
     m_ue3DisplayTransformApplied = false;
+    m_ue3DitherApplied = false;
 
     if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PRE_TONEMAP_OUTPUT) {
       return;
@@ -2173,17 +2177,20 @@ namespace dxvk {
         autoExposure.enabled());
     } else if (RtxOptions::tonemappingMode() == TonemappingMode::MirrorsEdge) {
       // Mirror's Edge (UE3) display transform: outputs display-encoded color
-      // (gamma + colour curves), consumed by the srgb_dither pass with its
-      // sRGB conversion skipped.
+      // (gamma + colour curves), which leaves srgb_dither only its dither, and
+      // this pass takes that over unless something runs after it.
       DxvkUe3ToneMapping& ue3ToneMapper = m_common->metaUe3ToneMapping();
+      const bool ditherHere = allowDither && !m_common->metaLocalToneMapping().isActive();
       ue3ToneMapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         autoExposure.getExposureTexture().view,
         rtOutput,
         autoExposure.enabled(),
         GlobalTime::get().deltaTimeMs(),
-        resetToneMapperHistory);
+        resetToneMapperHistory,
+        ditherHere);
       m_ue3DisplayTransformApplied = true;
+      m_ue3DitherApplied = ditherHere;
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
     if (localTonemapper.isActive()) {

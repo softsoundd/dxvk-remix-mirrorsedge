@@ -26,6 +26,8 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_context.h"
 #include "rtx_imgui.h"
+#include "rtx_srgb_dither.h"
+#include "rtx/pass/tonemap/tonemapping.h"
 #include "rtx/pass/tonemap/tonemapping_ue3.h"
 #include "rtx/pass/tonemap/tonemapping_ue3_exposure.h"
 #include "rtx/pass/tonemap/scene_unit_scale.h"
@@ -51,6 +53,7 @@ namespace dxvk {
         SAMPLER1D(TONEMAPPING_UE3_CURVE_M_INPUT)
         CONSTANT_BUFFER(TONEMAPPING_UE3_CONSTANTS_INPUT)
         RW_TEXTURE2D(TONEMAPPING_UE3_COLOR_OUTPUT)
+        TEXTURE2DARRAY(TONEMAPPING_UE3_BLUE_NOISE_INPUT)
       END_PARAMETER()
     };
 
@@ -191,7 +194,8 @@ namespace dxvk {
     const Resources::RaytracingOutput& rtOutput,
     bool autoExposureEnabled,
     float frameTimeMilliseconds,
-    bool resetHistory) {
+    bool resetHistory,
+    bool applyDither) {
 
     ScopedGpuProfileZone(ctx, "Mirror's Edge Tone Mapping");
 
@@ -325,6 +329,9 @@ namespace dxvk {
     args.hueReference = uint32_t(hueReference());
     args.highlightDesaturation = std::clamp(highlightDesaturation(), 0.f, 1.f);
 
+    args.ditherMode = applyDither ? DxvkSRGBDither::getShaderDitherMode() : ditherModeNone;
+    args.ditherFrameIndex = DxvkSRGBDither::getDitherFrameIndex(device());
+
     if (m_constants == nullptr) {
       DxvkBufferCreateInfo info;
       info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -347,6 +354,7 @@ namespace dxvk {
     ctx->bindResourceSampler(TONEMAPPING_UE3_CURVE_M_INPUT, linearSampler);
     ctx->bindResourceBuffer(TONEMAPPING_UE3_CONSTANTS_INPUT, DxvkBufferSlice(m_constants, 0, m_constants->info().size));
     ctx->bindResourceView(TONEMAPPING_UE3_COLOR_OUTPUT, outputColorBuffer.view, nullptr);
+    ctx->bindResourceView(TONEMAPPING_UE3_BLUE_NOISE_INPUT, ctx->getResourceManager().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, Ue3ToneMappingShader::getShader());
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 

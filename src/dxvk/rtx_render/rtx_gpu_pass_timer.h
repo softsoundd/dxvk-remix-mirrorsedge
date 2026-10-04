@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../dxvk_include.h"
@@ -173,7 +174,7 @@ namespace dxvk {
 
     RTX_OPTION("rtx.gpuPassTimings", std::string, sweepSteps, "",
                "Steps for the automated GPU pass timing A/B sweep. Steps are separated by ';'. Each step is one or more 'option=value' "
-               "assignments separated by '&', applied together while the step is held (an empty step measures the unmodified baseline). "
+               "assignments separated by '&', applied together while the step is held (a step named 'baseline' measures the unmodified state). "
                "Example: 'rtx.volumetrics.enable=False;rtx.skyMode=0&rtx.atmosphere.aerialPerspective=False'. "
                "Values are written to the user option layer for the duration of the step and restored afterwards; options that the active "
                "graphics preset controls cannot be overridden this way.");
@@ -187,6 +188,10 @@ namespace dxvk {
                     "Starts the sweep on its own this many seconds after the timings were first enabled (so include level load time), "
                     "once per session, for unattended runs. 0 leaves the sweep to the hotkey and the Developer Settings button.",
                     args.minValue = 0.0f, args.maxValue = 3600.0f);
+    RTX_OPTION("rtx.gpuPassTimings", bool, sweepScreenshots, false,
+               "Captures Remix's output at the end of each sweep step, as the screenshot hotkey does, while the step is still applied, "
+               "so the steps' images can be compared alongside their timings. The capture follows the step's timing table, so its "
+               "readback does not count towards it.");
 
     RTX_OPTION("rtx.gpuPassTimings", bool, enable, false,
                "Enables built-in per-pass GPU timings. Every GPU profile zone (the same markers Tracy and Nsight see) is bracketed with timestamp queries "
@@ -270,6 +275,19 @@ namespace dxvk {
       bool seenThisFrame = false;
     };
 
+    // GPU idle time between top-level zones since the stats were last reset or the last periodic table, keyed
+    // by the zone the GPU started next ("next frame" for the gap after a frame's last zone), to show where it waits.
+    std::unordered_map<std::string, double> m_idleBeforeZoneMs;
+    std::uint32_t m_idleFrames = 0;
+    std::uint64_t m_prevFrameLastZoneEnd = 0;
+    // The same between the command lists of a frame, keyed by the first top-level zone of the list that followed.
+    struct ListGap {
+      double totalMs = 0.0;
+      std::uint32_t count = 0;
+    };
+    std::unordered_map<std::string, ListGap> m_idleBeforeListMs;
+    std::uint32_t m_idleListCount = 0;
+
     struct FrameSummary {
       float busyMs = 0.0f;   // sum of top-level zones
       float spanMs = 0.0f;   // last top-level end - first top-level begin (includes idle gaps)
@@ -306,7 +324,12 @@ namespace dxvk {
       std::vector<SweepStep> steps;
       std::chrono::steady_clock::time_point stepStart;
       bool stepApplied = false;
+      // Set once the step's table is logged; with sweepScreenshots the step then stays applied
+      // until the capture requested in screenshotFrameId has been rendered.
+      bool tableLogged = false;
+      std::uint32_t screenshotFrameId = 0;
     };
+    static constexpr std::uint32_t kSweepScreenshotFrames = 2;
 
     bool parseSweepSteps(const std::string& text, std::vector<SweepStep>& outSteps) const;
     void startSweepLocked();
@@ -323,6 +346,8 @@ namespace dxvk {
     StreamState& findOrCreateStream(const DxvkContext* ctx, std::uint16_t& outStreamId);
     void resolvePendingFrames(std::uint32_t currentFrameId);
     bool resolveFrame(FrameRecord& frame);
+    void accumulateIdle(const FrameRecord& frame, const std::vector<std::uint64_t>& beginTicks, const std::vector<std::uint64_t>& endTicks,
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>>& listSpans);
     void foldFrameIntoStats(const FrameRecord& frame, const std::vector<float>& durationsMs, const FrameSummary& summary);
     void resizeWindow(std::uint32_t frames);
     std::vector<DisplayRow> buildRows() const;

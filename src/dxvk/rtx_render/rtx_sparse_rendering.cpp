@@ -32,6 +32,7 @@
 #include "rtx_imgui.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "rtx/pass/sparse_rendering/active_pixel_mask_binding_indices.h"
 #include "rtx/pass/sparse_rendering/compact_active_pixels_binding_indices.h"
@@ -120,6 +121,12 @@ namespace dxvk {
       dest.f = src.f;
       return true;
     }
+
+    // The shaders round the rate to 8 bits (quantizeSamplingRate) and keep a pixel whose [0, 1) threshold is at most
+    // that, so at a rate that rounds to 1 every pixel is active and sparse rendering only adds cost.
+    bool isFullSamplingRate() {
+      return std::lround(std::clamp(SparseRendering::Options::samplingRate(), 0.0f, 1.0f) * 255.0f) == 255;
+    }
   }
 
   // Both deprecated rates route here so the order they are attempted in is fixed: with a value on
@@ -140,7 +147,7 @@ namespace dxvk {
   }
 
   bool SparseRendering::isEnabled() const {
-    if (!Options::enableSparseRendering()) {
+    if (!Options::enableSparseRendering() || isFullSamplingRate()) {
       return false;
     }
 
@@ -220,7 +227,7 @@ namespace dxvk {
   }
 
   bool SparseRendering::isEnabledByOptions() {
-    if (!Options::enableSparseRendering()) {
+    if (!Options::enableSparseRendering() || isFullSamplingRate()) {
       return false;
     }
     // See SparseRendering::isEnabled() for explanation on why these checks are necessary.

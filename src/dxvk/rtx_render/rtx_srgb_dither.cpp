@@ -52,6 +52,19 @@ namespace dxvk {
     RemixGui::Combo("Dither Mode", &ditherModeObject(), "Disabled\0Spatial\0Spatial + Temporal\0");
   }
 
+  uint32_t DxvkSRGBDither::getShaderDitherMode() {
+    switch (ditherMode()) {
+    default:
+    case DitherMode::None: return ditherModeNone;
+    case DitherMode::Spatial: return ditherModeSpatialOnly;
+    case DitherMode::SpatialTemporal: return ditherModeSpatialTemporal;
+    }
+  }
+
+  uint32_t DxvkSRGBDither::getDitherFrameIndex(const DxvkDevice* device) {
+    return RtxOptions::rngSeedWithFrameIndex() ? device->getCurrentFrameId() : 0;
+  }
+
   void DxvkSRGBDither::dispatch(
     Rc<RtxContext> ctx,
     const Resources::RaytracingOutput& rtOutput,
@@ -67,12 +80,8 @@ namespace dxvk {
 
     SRGBDitherArgs pushArgs = {};
     pushArgs.performSRGBConversion = performSRGBConversion;
-    switch (ditherMode()) {
-    case DitherMode::None: pushArgs.ditherMode = ditherModeNone; break;
-    case DitherMode::Spatial: pushArgs.ditherMode = ditherModeSpatialOnly; break;
-    case DitherMode::SpatialTemporal: pushArgs.ditherMode = ditherModeSpatialTemporal; break;
-    }
-    pushArgs.frameIndex = RtxOptions::rngSeedWithFrameIndex() ? ctx->getDevice()->getCurrentFrameId() : 0;
+    pushArgs.ditherMode = getShaderDitherMode();
+    pushArgs.frameIndex = getDitherFrameIndex(ctx->getDevice().ptr());
 
     ctx->bindResourceView(SRGB_DITHER_BLUE_NOISE_TEXTURE_INPUT, ctx->getResourceManager().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindResourceView(SRGB_DITHER_COLOR_INPUT_OUTPUT, inoutColorBuffer.view, nullptr);

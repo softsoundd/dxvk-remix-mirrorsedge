@@ -404,8 +404,8 @@ namespace dxvk {
     logIntegrateIndirectMode();
 
     // Written sparsely below, so without this pixels the paths do not reach retain the previous frame's
-    // length.
-    {
+    // length. Only written and read with volumetrics on.
+    if (rtOutput.m_raytraceArgs.volumeArgs.enable) {
       const VkClearColorValue clearValue = { 0.f, 0.f, 0.f, 0.f };
       VkImageSubresourceRange subRange = {};
       subRange.layerCount = 1;

@@ -954,7 +954,8 @@ vec4 compositeResult(
     // only through the density field, so the mirror direction serves a rough lobe.
     // The term is scaled by the primary specular albedo below, so the second froxel integration is skipped
     // where that reflectance is too small for the fog to show (most dielectrics away from grazing angles).
-    const float indirectSegment = IndirectReflectionSegment[pixelCoordinate];
+    // Only stashed with volumetrics on, the one case the fog needs it.
+    const float indirectSegment = cb.volumeArgs.enable ? IndirectReflectionSegment[pixelCoordinate] : 0.0f;
     const float reflectionFogReflectance = max(primarySpecularAlbedo.x, max(primarySpecularAlbedo.y, primarySpecularAlbedo.z));
     if (indirectSegment != 0.0f && reflectionFogReflectance >= cb.volumeArgs.reflectionFogMinSpecularAlbedo)
     {

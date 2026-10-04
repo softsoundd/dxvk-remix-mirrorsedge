@@ -39,7 +39,8 @@ namespace dxvk {
 
     struct Options {
       RTX_OPTION_ARGS("rtx.sparseRendering", bool, enableSparseRendering, false,
-        "Enables sparse rendering. When enabled, applies a constant per-pixel sampling rate across the screen. DLSS Ray Reconstruction is required.",
+        "Enables sparse rendering. When enabled, applies a constant per-pixel sampling rate across the screen. DLSS Ray Reconstruction is required.\n"
+        "Has no effect at a sampling rate of 1, which traces every pixel.",
             args.environment = "RTX_SPARSE_RENDERING_ENABLE");
 
       RTX_OPTION_ENV("rtx.sparseRendering", PerPixelRateNoiseSource, perPixelRateNoiseSource, PerPixelRateNoiseSource::BlueNoise128x128x64x8, "RTX_SPARSE_RENDERING_PER_PIXEL_RATE_NOISE_SOURCE",

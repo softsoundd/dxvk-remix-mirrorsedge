@@ -349,11 +349,11 @@ void integratePathVertex(
   }
 #endif  
 
-  // Composite fogs a non-PSR reflection along this length. firstBounceHitDistance cannot serve instead: it
-  // is a float16_t, the copy reaching composite has been normalised by the denoiser and cannot express a
-  // ray leaving the scene, and it travels in m_indirectRadianceHitDistance, whose memory is reused before
-  // composite runs. Skipped where PSR ran, since the G-buffer wrote that pixel's segment.
-  bool stashReflectionSegment = pathState.bounceIteration == 1;
+  // Composite fogs a non-PSR reflection along this length, with volumetrics on. firstBounceHitDistance cannot
+  // serve instead: it is a float16_t, the copy reaching composite has been normalised by the denoiser and
+  // cannot express a ray leaving the scene, and it travels in m_indirectRadianceHitDistance, whose memory is
+  // reused before composite runs. Skipped where PSR ran, since the G-buffer wrote that pixel's segment.
+  bool stashReflectionSegment = cb.volumeArgs.enable && pathState.bounceIteration == 1;
 
 #if ENABLE_NRC
   // For update paths pathState.pixelCoordinate indexes the update domain rather than the screen.

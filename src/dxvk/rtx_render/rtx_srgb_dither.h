@@ -44,6 +44,11 @@ namespace dxvk {
 
     void showImguiSettings();
 
+    // This pass's dither (a ditherMode* shader value and the frame index of its temporal noise), for a
+    // pass that dithers in its place.
+    static uint32_t getShaderDitherMode();
+    static uint32_t getDitherFrameIndex(const DxvkDevice* device);
+
   private:
     enum class DitherMode : uint32_t {
       None = 0,

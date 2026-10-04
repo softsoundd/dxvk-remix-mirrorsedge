@@ -30,6 +30,7 @@
 #define TONEMAPPING_UE3_CURVE_M_INPUT    3
 #define TONEMAPPING_UE3_CONSTANTS_INPUT  4
 #define TONEMAPPING_UE3_COLOR_OUTPUT     5
+#define TONEMAPPING_UE3_BLUE_NOISE_INPUT 6
 
 // Mirror's Edge bakes its per-map colour curves into 16 piecewise-linear
 // segments (FCurveInfo.Ms[16]/Bs[16]) uploaded as two 16x1 LUT textures:
@@ -74,8 +75,9 @@ struct ToneMappingUe3Args {
 
   float neutwoWhiteClip;              // Neutwo: graded value that lands exactly on display white
   float neutwoContrast;               // Neutwo: power around mid grey (0.18) applied to luminance before the curve; 1 = none
-  uint pad0;
-  uint pad1;
+  // The srgb_dither pass's dither, applied here when that pass is skipped; ditherModeNone otherwise.
+  uint ditherMode;
+  uint ditherFrameIndex;
 };
 
 #endif  // TONEMAPPING_UE3_H

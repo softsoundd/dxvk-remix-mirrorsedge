@@ -102,7 +102,9 @@ namespace dxvk {
       const Resources::RaytracingOutput& rtOutput,
       bool autoExposureEnabled,
       float frameTimeMilliseconds,
-      bool resetHistory);
+      bool resetHistory,
+      // Applies the srgb_dither pass's dither too, so the caller can skip that pass.
+      bool applyDither);
 
     // Called on the CS thread (via RtxContext::setUe3ToneMapCapture).
     void onCapture(const Ue3ToneMapCapture& capture, uint32_t frameId);

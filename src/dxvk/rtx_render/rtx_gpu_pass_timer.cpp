@@ -30,6 +30,7 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "dxvk_objects.h"
+#include "rtx_context.h"
 #include "rtx_imgui.h"
 #include "rtx_options.h"
 #include "rtx_option_layer.h"
@@ -321,7 +322,9 @@ namespace dxvk {
     const std::uint32_t currentFrameId = m_device->getCurrentFrameId();
     const auto now = std::chrono::steady_clock::now();
 
-    if (currentFrameId != m_lastFrameBeginId) {
+    // injectFrame calls this more than once per frame, and only the first call goes on to render.
+    const bool firstCallThisFrame = currentFrameId != m_lastFrameBeginId;
+    if (firstCallThisFrame) {
       if (m_lastFrameBeginId != UINT32_MAX) {
         const float intervalMs = std::chrono::duration<float, std::milli>(now - m_lastFrameBeginTime).count();
         m_frameIntervalSamples[m_frameIntervalCursor] = intervalMs;
@@ -351,7 +354,7 @@ namespace dxvk {
       startSweepLocked();
     }
 
-    if (m_sweep.active) {
+    if (m_sweep.active && firstCallThisFrame) {
       advanceSweepLocked();
     }
 
@@ -361,6 +364,11 @@ namespace dxvk {
       if (elapsed >= interval) {
         m_lastLogTime = now;
         logTimingsLocked("periodic");
+        // Each periodic table's idle lines cover the interval since the previous one.
+        m_idleBeforeZoneMs.clear();
+        m_idleFrames = 0;
+        m_idleBeforeListMs.clear();
+        m_idleListCount = 0;
       }
     }
   }
@@ -527,11 +535,31 @@ namespace dxvk {
       return;
     }
 
-    const std::string reason = str::format("sweep step ", m_sweep.stepIndex + 1, "/", m_sweep.steps.size(), ": ", step.label);
-    logTimingsLocked(reason.c_str());
+    const std::uint32_t currentFrameId = m_device->getCurrentFrameId();
+    if (!m_sweep.tableLogged) {
+      const std::string reason = str::format("sweep step ", m_sweep.stepIndex + 1, "/", m_sweep.steps.size(), ": ", step.label);
+      logTimingsLocked(reason.c_str());
+      m_sweep.tableLogged = true;
+
+      if (sweepScreenshots()) {
+        // This runs at the start of the frame's rendering injectFrame call, so the capture lands in this frame.
+        RtxContext::triggerScreenshot();
+        m_sweep.screenshotFrameId = currentFrameId;
+        // The camera, so a comparison of the steps' images can tell when the view itself moved.
+        const RtCamera& camera = m_device->getCommon()->getSceneManager().getCamera();
+        const Vector3 position = camera.getPosition();
+        const Vector3 direction = camera.getDirection();
+        Logger::info(str::format("[GPU Pass Timings] Sweep step ", m_sweep.stepIndex + 1, "/", m_sweep.steps.size(), " screenshot: ", step.label,
+                                 " (camera ", position.x, ",", position.y, ",", position.z, " facing ", direction.x, ",", direction.y, ",", direction.z, ")"));
+        return;
+      }
+    } else if (currentFrameId - m_sweep.screenshotFrameId < kSweepScreenshotFrames) {
+      return;
+    }
 
     restoreSweepStep(step);
     m_sweep.stepApplied = false;
+    m_sweep.tableLogged = false;
     ++m_sweep.stepIndex;
 
     if (m_sweep.stepIndex >= m_sweep.steps.size()) {
@@ -556,6 +584,8 @@ namespace dxvk {
         done = true;
       } else if (tooOld) {
         ++m_droppedFrames;
+        // The next frame's leading gap would otherwise span this one.
+        m_prevFrameLastZoneEnd = 0;
         done = true;
       }
 
@@ -622,6 +652,7 @@ namespace dxvk {
     // Whole command lists: everything the GPU executed for this frame, zoned or not.
     std::uint64_t firstListBegin = UINT64_MAX;
     std::uint64_t lastListEnd = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> listSpans;
     for (const ListRecord& list : frame.lists) {
       if (list.beginQuery == nullptr || list.endQuery == nullptr) {
         continue;
@@ -642,16 +673,69 @@ namespace dxvk {
         summary.listTotalMs += static_cast<float>(static_cast<double>(end - begin) * m_timestampPeriodNs * 1.0e-6);
         firstListBegin = std::min(firstListBegin, begin);
         lastListEnd = std::max(lastListEnd, end);
+        listSpans.emplace_back(begin, end);
       }
     }
     if (lastListEnd > firstListBegin && firstListBegin != UINT64_MAX) {
       summary.listSpanMs = static_cast<float>(static_cast<double>(lastListEnd - firstListBegin) * m_timestampPeriodNs * 1.0e-6);
     }
 
+    // Past the last early return: a frame that is retried must not be counted twice.
+    accumulateIdle(frame, beginTicks, endTicks, listSpans);
+
     foldFrameIntoStats(frame, durationsMs, summary);
     m_lastResolvedFrameId = frame.frameId;
     ++m_resolvedFrames;
     return true;
+  }
+
+  void RtxGpuPassTimer::accumulateIdle(const FrameRecord& frame, const std::vector<std::uint64_t>& beginTicks,
+                                       const std::vector<std::uint64_t>& endTicks,
+                                       std::vector<std::pair<std::uint64_t, std::uint64_t>>& listSpans) {
+    const auto ticksToMs = [this](std::uint64_t ticks) { return static_cast<double>(ticks) * m_timestampPeriodNs * 1.0e-6; };
+
+    std::vector<std::size_t> topLevel;
+    for (std::size_t i = 0; i < frame.zones.size(); ++i) {
+      if (frame.zones[i].depth == 0 && endTicks[i] != 0) {
+        topLevel.push_back(i);
+      }
+    }
+    if (topLevel.empty()) {
+      return;
+    }
+    std::sort(topLevel.begin(), topLevel.end(), [&](std::size_t a, std::size_t b) { return beginTicks[a] < beginTicks[b]; });
+
+    // Zones of the two recording streams can overlap, so a gap is measured from the latest end so far.
+    std::uint64_t reached = m_prevFrameLastZoneEnd;
+    for (std::size_t n = 0; n < topLevel.size(); ++n) {
+      const std::size_t i = topLevel[n];
+      if (reached != 0 && beginTicks[i] > reached) {
+        m_idleBeforeZoneMs[n == 0 ? std::string("next frame") : std::string(frame.zones[i].name.data())] += ticksToMs(beginTicks[i] - reached);
+      }
+      reached = std::max(reached, endTicks[i]);
+    }
+    m_prevFrameLastZoneEnd = reached;
+    ++m_idleFrames;
+
+    std::sort(listSpans.begin(), listSpans.end());
+    reached = 0;
+    for (const auto& [begin, end] : listSpans) {
+      if (reached != 0 && begin > reached) {
+        const char* first = "(no zone)";
+        std::uint64_t firstZoneBegin = UINT64_MAX;
+        for (const std::size_t i : topLevel) {
+          if (beginTicks[i] >= begin && beginTicks[i] <= end && beginTicks[i] < firstZoneBegin) {
+            firstZoneBegin = beginTicks[i];
+            first = frame.zones[i].name.data();
+          }
+        }
+        ListGap& gap = m_idleBeforeListMs[first];
+        gap.totalMs += ticksToMs(begin - reached);
+        ++gap.count;
+      }
+      reached = std::max(reached, end);
+    }
+    m_idleListCount += static_cast<std::uint32_t>(listSpans.size());
   }
 
   void RtxGpuPassTimer::resizeWindow(std::uint32_t frames) {
@@ -698,6 +782,11 @@ namespace dxvk {
     }
     m_resolvedFrames = 0;
     m_droppedFrames = 0;
+    m_idleBeforeZoneMs.clear();
+    m_idleFrames = 0;
+    m_prevFrameLastZoneEnd = 0;
+    m_idleBeforeListMs.clear();
+    m_idleListCount = 0;
   }
 
   RtxGpuPassTimer::CpuSummary RtxGpuPassTimer::computeCpuSummary() const {
@@ -986,6 +1075,32 @@ namespace dxvk {
       out << row.name << '\n';
     }
 
+    if (m_idleFrames > 0) {
+      std::vector<std::pair<std::string, double>> idle(m_idleBeforeZoneMs.begin(), m_idleBeforeZoneMs.end());
+      std::sort(idle.begin(), idle.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+      out << "  gpu idle between top-level zones, per frame over " << m_idleFrames << " frames:";
+      for (const auto& [zone, totalMs] : idle) {
+        const double perFrameMs = totalMs / m_idleFrames;
+        if (perFrameMs >= 0.005) {
+          out << " before " << zone << ' ' << perFrameMs << ',';
+        }
+      }
+      out << " ms\n";
+
+      std::vector<std::pair<std::string, ListGap>> lists(m_idleBeforeListMs.begin(), m_idleBeforeListMs.end());
+      std::sort(lists.begin(), lists.end(), [](const auto& a, const auto& b) { return a.second.totalMs > b.second.totalMs; });
+      out << "  gpu idle between command lists (" << std::setprecision(1) << static_cast<double>(m_idleListCount) / m_idleFrames
+          << " lists per frame), per frame:" << std::setprecision(3);
+      for (const auto& [zone, gap] : lists) {
+        const double perFrameMs = gap.totalMs / m_idleFrames;
+        if (perFrameMs >= 0.005) {
+          out << " before a list starting with " << zone << ' ' << perFrameMs << " (" << std::setprecision(1)
+              << static_cast<double>(gap.count) / m_idleFrames << " gaps)," << std::setprecision(3);
+        }
+      }
+      out << " ms\n";
+    }
+
     Logger::info(out.str());
   }
 
@@ -1013,6 +1128,7 @@ namespace dxvk {
     RemixGui::SetTooltipToLastWidgetOnHover("Steps separated by ';', assignments within a step by '&', e.g. rtx.skyMode=0;rtx.volumetrics.enable=False. "
                                             "Each step is held, logged, then restored. Baseline tables are logged before and after.");
     RemixGui::DragFloat("Hold Seconds Per Step", &sweepHoldSecondsObject(), 1.0f, 1.0f, 600.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
+    RemixGui::Checkbox("Screenshot Each Step", &sweepScreenshotsObject());
 
     {
       bool sweepActive = false;
