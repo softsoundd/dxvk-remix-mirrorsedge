@@ -14,7 +14,7 @@ namespace dxvk {
   DxsoAnalysisInfo DxsoModule::analyze() {
     DxsoAnalysisInfo info;
 
-    // NV-DXVK start: exact vertex capture - analyzer needs the program type
+    // NV-DXVK start: pre-projection position for vertex capture - the analyzer takes the program info
     DxsoAnalyzer analyzer(m_header.info(), info);
     // NV-DXVK end
 

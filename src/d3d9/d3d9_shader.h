@@ -67,7 +67,7 @@ namespace dxvk {
     }
     // NV-DXVK end
 
-    // NV-DXVK start: exact vertex capture
+    // NV-DXVK start: pre-projection position for vertex capture
     const DxsoPreProjectionPositionInfo& GetPreProjectionPositionInfo() const {
       return m_preProjPosition;
     }
@@ -88,7 +88,7 @@ namespace dxvk {
     // NV-DXVK start: expose shader outputs for vertex capture
     DxsoIsgn              m_osgn;
     // NV-DXVK end
-    // NV-DXVK start: exact vertex capture
+    // NV-DXVK start: pre-projection position for vertex capture
     DxsoPreProjectionPositionInfo m_preProjPosition;
     // NV-DXVK end
     uint32_t              m_usedSamplers;

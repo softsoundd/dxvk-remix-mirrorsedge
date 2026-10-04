@@ -110,10 +110,15 @@ tests += exe
 
 dxso_analysis_src = files([
   '../../../src/dxso/dxso_analysis.cpp',
+  '../../../src/dxso/dxso_preproj_position.cpp',
   '../../../src/dxso/dxso_color_terms.cpp',
   '../../../src/dxso/dxso_symbolic_eval.cpp',
   '../../../src/dxso/dxso_highlight_tints.cpp',
   '../../../src/dxso/dxso_material_fades.cpp',
+  '../../../src/dxso/dxso_opcode_util.cpp',
+  '../../../src/dxso/dxso_uv_dataflow.cpp',
+  '../../../src/dxso/dxso_sampler_inference.cpp',
+  '../../../src/dxso/dxso_ue3_material_identity.cpp',
   '../../../src/dxso/dxso_decoder.cpp',
   '../../../src/dxso/dxso_ctab.cpp',
   '../../../src/dxso/dxso_code.cpp',
@@ -139,6 +144,18 @@ tests += exe
 
 exe = executable('test_dxso_material_fades',  files('test_dxso_material_fades.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_dxso_material_fades', exe, env: test_env)
+tests += exe
+
+exe = executable('test_dxso_uv_dataflow',  files('test_dxso_uv_dataflow.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dxso_uv_dataflow', exe, env: test_env)
+tests += exe
+
+exe = executable('test_dxso_sampler_inference',  files('test_dxso_sampler_inference.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dxso_sampler_inference', exe, env: test_env)
+tests += exe
+
+exe = executable('test_dxso_ue3_material_identity',  files('test_dxso_ue3_material_identity.cpp'), dxso_analysis_src,  include_directories : [ test_include_path, dxvk_include_path ], dependencies : test_unit_deps, link_with: [ dxvk_lib, util_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_dxso_ue3_material_identity', exe, env: test_env)
 tests += exe
 
 if dxvk_is_x64 and get_option('remix_with_shim')

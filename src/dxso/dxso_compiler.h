@@ -187,9 +187,8 @@ namespace dxvk {
     DxsoRegisterPointer oBlendIndices0;
     // NV-DXVK end
 
-    // NV-DXVK start: exact vertex capture
-    // vec4 snapshot of the register the shader transforms into oPos, taken at the
-    // instruction the analyzer identified. Zero when the analyzer found no transform.
+    // NV-DXVK start: pre-projection position for vertex capture
+    // Snapshot of the register the shader transforms into oPos; 0 when none was found.
     uint32_t preProjPosition = 0;
     // NV-DXVK end
   };
@@ -738,7 +737,7 @@ namespace dxvk {
 
     // NV-DXVK end
 
-    // NV-DXVK start: exact vertex capture
+    // NV-DXVK start: pre-projection position for vertex capture
     void emitPreProjectionPositionSnapshot(const DxsoInstructionContext& ctx);
     // NV-DXVK end
 

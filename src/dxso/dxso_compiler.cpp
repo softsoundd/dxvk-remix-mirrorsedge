@@ -94,7 +94,7 @@ namespace dxvk {
         processInstruction(coissue, coissue.instructionIdx);
     }
 
-    // NV-DXVK start: exact vertex capture
+    // NV-DXVK start: pre-projection position for vertex capture
     this->emitPreProjectionPositionSnapshot(ctx);
     // NV-DXVK end
 
@@ -649,7 +649,7 @@ namespace dxvk {
   }
   // NV-DXVK end
 
-  // NV-DXVK start: exact vertex capture
+  // NV-DXVK start: pre-projection position for vertex capture
   void DxsoCompiler::emitPreProjectionPositionSnapshot(const DxsoInstructionContext& ctx) {
     const DxsoPreProjectionPositionInfo& info = m_analysis->preProjPosition;
 
@@ -3884,7 +3884,7 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       capturedPosition = m_module.opSelect(vec3TypeId, conditionVec3(hasPositionFromInputFlagId), inputPosition3, capturedPosition);
     }
 
-    // NV-DXVK start: exact vertex capture
+    // NV-DXVK start: pre-projection position for vertex capture
     // The shader's own pre-projection position, taken straight to object space with no
     // projective inverse. See DxsoPreProjectionPositionInfo.
     if (m_vs.preProjPosition != 0) {

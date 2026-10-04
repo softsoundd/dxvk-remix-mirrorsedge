@@ -67,7 +67,7 @@ namespace dxvk {
     // NV-DXVK start: expose shader outputs for vertex capture
     m_osgn = pModule->osgn();
     // NV-DXVK end
-    // NV-DXVK start: exact vertex capture
+    // NV-DXVK start: pre-projection position for vertex capture
     m_preProjPosition = AnalysisInfo.preProjPosition;
     // NV-DXVK end
     m_usedSamplers = pModule->usedSamplers();

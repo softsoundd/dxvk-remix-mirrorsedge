@@ -10,10 +10,15 @@ dxso_src = files([
   'dxso_tables.cpp',
   'dxso_decoder.cpp',
   'dxso_analysis.cpp',
+  'dxso_preproj_position.cpp',
   'dxso_color_terms.cpp',
   'dxso_symbolic_eval.cpp',
   'dxso_highlight_tints.cpp',
   'dxso_material_fades.cpp',
+  'dxso_opcode_util.cpp',
+  'dxso_uv_dataflow.cpp',
+  'dxso_sampler_inference.cpp',
+  'dxso_ue3_material_identity.cpp',
   'dxso_compiler.cpp',
   'dxso_enums.cpp'
 ])

@@ -50,154 +50,26 @@
 #include "../../../src/dxso/dxso_highlight_tints.h"
 #include "../../../src/util/log/log.h"
 
+#include "dxso_test_assembler.h"
+
 namespace dxvk {
   // Standalone executables own the logger singleton, as the d3d9/dxgi entry points do.
   Logger Logger::s_instance("test_dxso_highlight_tints.log", LogLevel::None);
 }
 
 using namespace dxvk;
+using namespace dxvk::dxso_test;
 
 namespace {
 
-  constexpr uint32_t kPs30Header = 0xFFFF0300u;
-  constexpr uint32_t kEndToken = 0x0000FFFFu;
-
-  constexpr uint32_t kRegTemp = 0u;
-  constexpr uint32_t kRegInput = 1u;
-  constexpr uint32_t kRegConst = 2u;
-  constexpr uint32_t kRegColorOut = 8u;
-  constexpr uint32_t kRegSampler = 10u;
-  constexpr uint32_t kRegConstBool = 14u;
-
-  constexpr uint32_t kModNeg = 1u;
-  constexpr uint32_t kModAbs = 11u;
-
-  enum WriteMask : uint32_t {
-    MaskX = 0x1u, MaskY = 0x2u, MaskZ = 0x4u, MaskW = 0x8u,
-    MaskXY = 0x3u, MaskXYZ = 0x7u, MaskAll = 0xFu,
-  };
-
-  uint32_t swz(uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
-    return x | (y << 2) | (z << 4) | (w << 6);
-  }
-  const uint32_t kXYZW = swz(0, 1, 2, 3);
-  const uint32_t kXXXX = swz(0, 0, 0, 0);
-  const uint32_t kYYYY = swz(1, 1, 1, 1);
-  const uint32_t kZZZZ = swz(2, 2, 2, 2);
-  const uint32_t kWWWW = swz(3, 3, 3, 3);
-
-  uint32_t encodeRegisterType(uint32_t type) {
-    return ((type & 0x7u) << 28) | ((type & 0x18u) << 8);
-  }
-
-  uint32_t dst(uint32_t type, uint32_t num, uint32_t mask) {
-    return 0x80000000u | encodeRegisterType(type) | ((mask & 0xFu) << 16) | (num & 0x7FFu);
-  }
-
-  uint32_t src(uint32_t type, uint32_t num, uint32_t swizzle = kXYZW, uint32_t modifier = 0) {
-    return 0x80000000u | encodeRegisterType(type) | ((modifier & 0xFu) << 24) | ((swizzle & 0xFFu) << 16) | (num & 0x7FFu);
-  }
-
-  uint32_t r(uint32_t n, uint32_t s = kXYZW, uint32_t m = 0) { return src(kRegTemp, n, s, m); }
-  uint32_t v(uint32_t n, uint32_t s = kXYZW, uint32_t m = 0) { return src(kRegInput, n, s, m); }
-  uint32_t c(uint32_t n, uint32_t s = kXYZW, uint32_t m = 0) { return src(kRegConst, n, s, m); }
-  uint32_t smp(uint32_t n) { return src(kRegSampler, n); }
-  uint32_t rd(uint32_t n, uint32_t mask = MaskAll) { return dst(kRegTemp, n, mask); }
-  uint32_t oC0(uint32_t mask = MaskAll) { return dst(kRegColorOut, 0, mask); }
-
-  uint32_t opcodeToken(DxsoOpcode opcode, uint32_t length) {
-    return uint32_t(opcode) | ((length & 0xFu) << 24);
-  }
-
-  uint32_t floatBits(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, sizeof(u));
-    return u;
-  }
-
-  class PsBuilder {
+  class PsBuilder : public DxsoTestShader {
   public:
-    PsBuilder() {
-      m_tokens.push_back(kPs30Header);
-    }
-
-    PsBuilder& def(uint32_t constNum, float x, float y, float z, float w) {
-      m_tokens.push_back(opcodeToken(DxsoOpcode::Def, 5));
-      m_tokens.push_back(dst(kRegConst, constNum, MaskAll));
-      m_tokens.push_back(floatBits(x));
-      m_tokens.push_back(floatBits(y));
-      m_tokens.push_back(floatBits(z));
-      m_tokens.push_back(floatBits(w));
-      return *this;
-    }
-
-    PsBuilder& dclInput(DxsoUsage usage, uint32_t usageIndex, uint32_t regNum, uint32_t mask = MaskAll) {
-      m_tokens.push_back(opcodeToken(DxsoOpcode::Dcl, 2));
-      m_tokens.push_back(0x80000000u | uint32_t(usage) | ((usageIndex & 0xFu) << 16));
-      m_tokens.push_back(dst(kRegInput, regNum, mask));
-      return *this;
-    }
-
-    PsBuilder& dclSampler(uint32_t samplerNum, DxsoTextureType type = DxsoTextureType::Texture2D) {
-      m_tokens.push_back(opcodeToken(DxsoOpcode::Dcl, 2));
-      m_tokens.push_back(0x80000000u | (uint32_t(type) << 27));
-      m_tokens.push_back(dst(kRegSampler, samplerNum, MaskAll));
-      return *this;
-    }
-
-    PsBuilder& texld(uint32_t dstToken, uint32_t coord, uint32_t samplerNum) {
-      return op2(DxsoOpcode::Tex, dstToken, coord, smp(samplerNum));
-    }
-
-    PsBuilder& texkill(uint32_t regToken) {
-      m_tokens.push_back(opcodeToken(DxsoOpcode::TexKill, 1));
-      m_tokens.push_back(regToken);
-      return *this;
-    }
-
-    PsBuilder& op1(DxsoOpcode opcode, uint32_t d, uint32_t s0) {
-      m_tokens.push_back(opcodeToken(opcode, 2));
-      m_tokens.push_back(d);
-      m_tokens.push_back(s0);
-      return *this;
-    }
-
-    PsBuilder& op2(DxsoOpcode opcode, uint32_t d, uint32_t s0, uint32_t s1) {
-      m_tokens.push_back(opcodeToken(opcode, 3));
-      m_tokens.push_back(d);
-      m_tokens.push_back(s0);
-      m_tokens.push_back(s1);
-      return *this;
-    }
-
-    PsBuilder& op3(DxsoOpcode opcode, uint32_t d, uint32_t s0, uint32_t s1, uint32_t s2) {
-      m_tokens.push_back(opcodeToken(opcode, 4));
-      m_tokens.push_back(d);
-      m_tokens.push_back(s0);
-      m_tokens.push_back(s1);
-      m_tokens.push_back(s2);
-      return *this;
-    }
-
-    PsBuilder& ifBool(uint32_t boolReg) {
-      m_tokens.push_back(opcodeToken(DxsoOpcode::If, 1));
-      m_tokens.push_back(src(kRegConstBool, boolReg));
-      return *this;
-    }
-
-    PsBuilder& endIf() {
-      m_tokens.push_back(opcodeToken(DxsoOpcode::EndIf, 0));
-      return *this;
-    }
+    PsBuilder() : DxsoTestShader(kPs30Header) { }
 
     DxsoHighlightResult analyze(const DxsoHighlightInputs& inputs) const {
-      std::vector<uint32_t> tokens = m_tokens;
-      tokens.push_back(kEndToken);
-      return analyzeDxsoHighlightTints(tokens.data(), tokens.size(), inputs);
+      const std::vector<uint32_t> bytecode = tokens();
+      return analyzeDxsoHighlightTints(bytecode.data(), bytecode.size(), inputs);
     }
-
-  private:
-    std::vector<uint32_t> m_tokens;
   };
 
   DxsoHighlightInputs makeInputs(std::initializer_list<uint32_t> scalars,

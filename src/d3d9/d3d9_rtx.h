@@ -1,6 +1,8 @@
 #pragma once
 
 #include "d3d9_state.h"
+#include "../dxso/dxso_sampler_inference.h"
+#include "../dxso/dxso_uv_dataflow.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../util/util_threadpool.h"
 
@@ -34,73 +36,6 @@ namespace dxvk {
     };
   }
   using PrepareDrawFlags = uint32_t;
-
-  // Exact UV dataflow analysis types (shared between the PS coordinate-origin resolver,
-  // the VS interpolant->IA trace, and the per-draw UV decision in D3D9Rtx).
-  //
-  // A UvAffineTerm models one term of `value' = value * scale + offset` as a small sum:
-  //   term = imm + consts[constReg][constComp] * factor + consts[constReg2][constComp2] * factor2
-  // where each part is optional (immValid / constReg >= 0 / constReg2 >= 0; constReg2 is only
-  // used when constReg is). When no part is set the term is absent (identity for scale, zero
-  // for offset). Scale terms only ever carry a single part (immediate or one constant ref -
-  // products of two draw-time constants are not representable); offset terms may legitimately
-  // sum an immediate and up to two constant refs (UE3 materials add uniform-expression tile
-  // offsets and literal centering biases to one coordinate). `inexact` marks terms that
-  // encountered math not representable in this model (the origin may still be provable).
-  struct UvAffineTerm {
-    bool immValid = false;
-    float imm = 0.0f;
-    int16_t constReg = -1;
-    uint8_t constComp = 0;
-    float factor = 1.0f;
-    int16_t constReg2 = -1;
-    uint8_t constComp2 = 0;
-    float factor2 = 1.0f;
-    bool inexact = false;
-  };
-
-  // One coordinate component as `value * scale + offset`, or - for a UV matrix such as UE3's
-  // Rotator - as a combination of two components of the same interpolant:
-  //   value' = scale * uv[scaleComponent] + cross * uv[crossComponent] + offset
-  // Center biases fold into `offset` as an immediate alongside the two matrix-row constants,
-  // which is what the two constant slots of an offset term are for. A coefficient that would
-  // become the product of two draw-time constants (a Panner feeding a Rotator) is not
-  // representable and marks the term inexact.
-  struct UvComponentAffine {
-    UvAffineTerm scale;   // absent => 1.0
-    UvAffineTerm offset;  // absent => 0.0
-    UvAffineTerm cross;   // absent => 0.0, so an unmixed component is unaffected by it
-    bool hasCross = false;
-    uint8_t scaleComponent = 0;  // interpolant component `scale` multiplies when hasCross
-    uint8_t crossComponent = 0;  // interpolant component `cross` multiplies when hasCross
-  };
-
-  // Deterministic resolution of the coordinate a pixel shader feeds into a sampler:
-  // proves (or fails to prove) that both the U and V components of every sample site
-  // originate from components of a single TEXCOORD interpolant, with an affine chain.
-  struct PsSamplerUvOrigin {
-    bool originValid = false;    // U/V proven to originate from one TEXCOORD interpolant
-    bool sitesAgree = true;      // all valid sample sites agreed on origin + affine
-    bool affineExact = false;    // affine chain fully representable for both components
-    // disagreeing static-tiling sites resolved by keeping the highest-frequency one
-    // (UE3 distance-fade anti-tiling idiom) instead of first-in-bytecode order
-    bool preferredHighestFrequencySite = false;
-    uint8_t semanticIndex = 0;   // TEXCOORD usage index of the source interpolant
-    uint8_t compU = 0;           // interpolant component feeding sample U
-    uint8_t compV = 1;           // interpolant component feeding sample V
-    UvComponentAffine affineU;
-    UvComponentAffine affineV;
-    uint16_t validSiteCount = 0;
-    uint16_t invalidSiteCount = 0;
-  };
-
-  // Classification of the VS-side path from an output TEXCOORD interpolant back to the IA.
-  enum class Ue3VsUvTraceKind : uint8_t {
-    Invalid = 0,     // origin could not be proven (procedural UVs, mixed inputs, unsupported ops)
-    PureMove,        // interpolant components == IA texcoord set `.xy` exactly
-    AffineConst,     // interpolant == IA texcoord `.xy` * scale + offset (constants/immediates)
-    OriginOnly,      // origin proven but the VS math is not representable as an affine transform
-  };
 
   // Where vertex capture reads a draw's positions from. Both exact sources are independent
   // of view depth; ClipReconstruction inverts the projection, whose error grows with the
@@ -657,13 +592,6 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvResolution, false,
                "UE3 compat: log the deterministic UV resolution decision (proven IA set / captured interpolant / legacy fallback) "
                "once per unique pixel shader + stage combination, including ambiguity diagnostics.");
-    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3UvTraceShaderHashes, {},
-               "UE3 compat diagnostics: pixel shader bytecode hashes whose UV dataflow analysis is traced "
-               "instruction by instruction to the log ([RTX-UV-TRACE] lines: opcode, operands, and the "
-               "per-component origin/affine/constant-expression verdict after each write, plus every sampler "
-               "site decision). The trace runs once when the shader is first analyzed. Use together with "
-               "rtx.d3d9.ue3LogUvAffineDetail to root-cause atlas/tiling materials whose affine chain "
-               "resolves inexactly.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogUvAffineDetail, false,
                "UE3 compat diagnostics: log the full UV affine chain behind the deterministic UV resolution of "
                "shader-path draws: per-component scale, cross and offset terms (immediate or constant-register "
@@ -1446,32 +1374,10 @@ namespace dxvk {
       // exact per-sampler coordinate origin resolution (authoritative for the UV decision)
       std::array<PsSamplerUvOrigin, caps::MaxTexturesPS> samplerUvOrigin;
       // statistical inference below is used for diffuse-sampler *scoring* only
-      std::array<int8_t, caps::MaxTexturesPS> samplerToTexcoord;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompValid;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompU;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerCoordCompV;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerSemanticFlags;
-      std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlags;
+      std::array<PsSamplerTexcoordInference, caps::MaxTexturesPS> samplers;
       // expression flags the register-granular inference derived that the lane-precise
       // coordinate analysis showed to be impossible on the sampler's own lanes (diagnostic)
-      std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlagsCleared;
-      std::array<uint16_t, caps::MaxTexturesPS> samplerSampleCount;
-      std::array<int16_t, caps::MaxTexturesPS> samplerScaleConstReg;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompU;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerScaleConstCompV;
-      std::array<float, caps::MaxTexturesPS> samplerScaleFactorU;
-      std::array<float, caps::MaxTexturesPS> samplerScaleFactorV;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerScaleImmediateValid;
-      std::array<float, caps::MaxTexturesPS> samplerScaleImmediateU;
-      std::array<float, caps::MaxTexturesPS> samplerScaleImmediateV;
-      std::array<int16_t, caps::MaxTexturesPS> samplerOffsetConstReg;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetConstCompU;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetConstCompV;
-      std::array<float, caps::MaxTexturesPS> samplerOffsetFactorU;
-      std::array<float, caps::MaxTexturesPS> samplerOffsetFactorV;
-      std::array<uint8_t, caps::MaxTexturesPS> samplerOffsetImmediateValid;
-      std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateU;
-      std::array<float, caps::MaxTexturesPS> samplerOffsetImmediateV;
+      std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlagsCleared = {};
       // Sampler registers holding UE3 lightmap machinery (LightMapTextures[] coefficients and
       // the bicubic B-spline weight LUT). Their count is a function of the DirectionalLightmaps
       // setting - 3 coefficients vs 1 - so every draw-time decision that reads the bound texture
