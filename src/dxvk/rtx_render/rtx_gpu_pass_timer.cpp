@@ -364,11 +364,11 @@ namespace dxvk {
       if (elapsed >= interval) {
         m_lastLogTime = now;
         logTimingsLocked("periodic");
-        // Each periodic table's idle lines cover the interval since the previous one.
-        m_idleBeforeZoneMs.clear();
-        m_idleFrames = 0;
-        m_idleBeforeListMs.clear();
-        m_idleListCount = 0;
+        // Each periodic table's gap lines cover the interval since the previous one.
+        m_gapBeforeZoneMs.clear();
+        m_gapFrames = 0;
+        m_gapBeforeListMs.clear();
+        m_gapListCount = 0;
       }
     }
   }
@@ -681,7 +681,7 @@ namespace dxvk {
     }
 
     // Past the last early return: a frame that is retried must not be counted twice.
-    accumulateIdle(frame, beginTicks, endTicks, listSpans);
+    accumulateGaps(frame, beginTicks, endTicks, listSpans);
 
     foldFrameIntoStats(frame, durationsMs, summary);
     m_lastResolvedFrameId = frame.frameId;
@@ -689,7 +689,7 @@ namespace dxvk {
     return true;
   }
 
-  void RtxGpuPassTimer::accumulateIdle(const FrameRecord& frame, const std::vector<std::uint64_t>& beginTicks,
+  void RtxGpuPassTimer::accumulateGaps(const FrameRecord& frame, const std::vector<std::uint64_t>& beginTicks,
                                        const std::vector<std::uint64_t>& endTicks,
                                        std::vector<std::pair<std::uint64_t, std::uint64_t>>& listSpans) {
     const auto ticksToMs = [this](std::uint64_t ticks) { return static_cast<double>(ticks) * m_timestampPeriodNs * 1.0e-6; };
@@ -710,12 +710,12 @@ namespace dxvk {
     for (std::size_t n = 0; n < topLevel.size(); ++n) {
       const std::size_t i = topLevel[n];
       if (reached != 0 && beginTicks[i] > reached) {
-        m_idleBeforeZoneMs[n == 0 ? std::string("next frame") : std::string(frame.zones[i].name.data())] += ticksToMs(beginTicks[i] - reached);
+        m_gapBeforeZoneMs[n == 0 ? std::string("next frame") : std::string(frame.zones[i].name.data())] += ticksToMs(beginTicks[i] - reached);
       }
       reached = std::max(reached, endTicks[i]);
     }
     m_prevFrameLastZoneEnd = reached;
-    ++m_idleFrames;
+    ++m_gapFrames;
 
     std::sort(listSpans.begin(), listSpans.end());
     reached = 0;
@@ -729,13 +729,13 @@ namespace dxvk {
             first = frame.zones[i].name.data();
           }
         }
-        ListGap& gap = m_idleBeforeListMs[first];
+        ListGap& gap = m_gapBeforeListMs[first];
         gap.totalMs += ticksToMs(begin - reached);
         ++gap.count;
       }
       reached = std::max(reached, end);
     }
-    m_idleListCount += static_cast<std::uint32_t>(listSpans.size());
+    m_gapListCount += static_cast<std::uint32_t>(listSpans.size());
   }
 
   void RtxGpuPassTimer::resizeWindow(std::uint32_t frames) {
@@ -782,11 +782,11 @@ namespace dxvk {
     }
     m_resolvedFrames = 0;
     m_droppedFrames = 0;
-    m_idleBeforeZoneMs.clear();
-    m_idleFrames = 0;
+    m_gapBeforeZoneMs.clear();
+    m_gapFrames = 0;
     m_prevFrameLastZoneEnd = 0;
-    m_idleBeforeListMs.clear();
-    m_idleListCount = 0;
+    m_gapBeforeListMs.clear();
+    m_gapListCount = 0;
   }
 
   RtxGpuPassTimer::CpuSummary RtxGpuPassTimer::computeCpuSummary() const {
@@ -1075,27 +1075,27 @@ namespace dxvk {
       out << row.name << '\n';
     }
 
-    if (m_idleFrames > 0) {
-      std::vector<std::pair<std::string, double>> idle(m_idleBeforeZoneMs.begin(), m_idleBeforeZoneMs.end());
-      std::sort(idle.begin(), idle.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-      out << "  gpu idle between top-level zones, per frame over " << m_idleFrames << " frames:";
-      for (const auto& [zone, totalMs] : idle) {
-        const double perFrameMs = totalMs / m_idleFrames;
+    if (m_gapFrames > 0) {
+      std::vector<std::pair<std::string, double>> zones(m_gapBeforeZoneMs.begin(), m_gapBeforeZoneMs.end());
+      std::sort(zones.begin(), zones.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+      out << "  gpu gaps between top-level zones, per frame over " << m_gapFrames << " frames:";
+      for (const auto& [zone, totalMs] : zones) {
+        const double perFrameMs = totalMs / m_gapFrames;
         if (perFrameMs >= 0.005) {
           out << " before " << zone << ' ' << perFrameMs << ',';
         }
       }
       out << " ms\n";
 
-      std::vector<std::pair<std::string, ListGap>> lists(m_idleBeforeListMs.begin(), m_idleBeforeListMs.end());
+      std::vector<std::pair<std::string, ListGap>> lists(m_gapBeforeListMs.begin(), m_gapBeforeListMs.end());
       std::sort(lists.begin(), lists.end(), [](const auto& a, const auto& b) { return a.second.totalMs > b.second.totalMs; });
-      out << "  gpu idle between command lists (" << std::setprecision(1) << static_cast<double>(m_idleListCount) / m_idleFrames
+      out << "  gpu gaps between command lists (" << std::setprecision(1) << static_cast<double>(m_gapListCount) / m_gapFrames
           << " lists per frame), per frame:" << std::setprecision(3);
       for (const auto& [zone, gap] : lists) {
-        const double perFrameMs = gap.totalMs / m_idleFrames;
+        const double perFrameMs = gap.totalMs / m_gapFrames;
         if (perFrameMs >= 0.005) {
           out << " before a list starting with " << zone << ' ' << perFrameMs << " (" << std::setprecision(1)
-              << static_cast<double>(gap.count) / m_idleFrames << " gaps)," << std::setprecision(3);
+              << static_cast<double>(gap.count) / m_gapFrames << " gaps)," << std::setprecision(3);
         }
       }
       out << " ms\n";

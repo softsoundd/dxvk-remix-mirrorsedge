@@ -666,6 +666,16 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK start: cube textures in Remix's 2D material slots
+  const Rc<DxvkImageView>& D3D9CommonTexture::GetCubeFaceView(bool srgb) {
+    const bool pickSrgb = srgb && IsSrgbCompatible();
+    Rc<DxvkImageView>& view = m_cubeFaceView.Pick(pickSrgb);
+    if (view == nullptr)
+      view = CreateView(0, 0, VK_IMAGE_USAGE_SAMPLED_BIT, pickSrgb);
+    return view;
+  }
+  // NV-DXVK end
+
   constexpr uint32_t kUe3TailMaxDimension = 64;
 
   // UE3 streaming-stable texture identity: UE3's texture streamer creates a new D3D9 texture
@@ -848,7 +858,7 @@ namespace dxvk {
         imageHash = XXH3_64bits_withSeed(&subHash, sizeof(subHash), imageHash);
       }
 
-      texturePickerView = CreateView(0, 0, VK_IMAGE_USAGE_SAMPLED_BIT, false);
+      texturePickerView = GetCubeFaceView(false);
       if (texturePickerView == nullptr)
         texturePickerView = m_sampleView.Color;
     }

@@ -198,10 +198,10 @@ namespace dxvk {
                "and aggregated over a rolling window of frames. The table is shown under Developer Settings and can be dumped to the log; "
                "use it to attribute GPU frame time to individual render passes when A/B testing options. Off by default; the disabled path costs a single branch per zone.");
     RTX_OPTION("rtx.gpuPassTimings", bool, gpuZones, true,
-               "Bracket every GPU profile zone with timestamp queries (the per-pass table). Each timestamp is a small GPU-side "
-               "serialisation point, so with a few hundred zones per frame the table itself costs measurable GPU time. Disable to keep "
-               "only the per-command-list totals, the frame interval and the CPU breakdown, which is the least intrusive way to read "
-               "frame time and total GPU time.");
+               "Bracket every GPU profile zone with timestamp queries (the per-pass table). Each timestamp waits for the work recorded "
+               "before it, which costs a little GPU time and can serialise very small zones such as single draws. Disable to keep only "
+               "the per-command-list totals, the frame interval and the CPU breakdown, which is the least intrusive way to read frame "
+               "time and total GPU time.");
     RTX_OPTION_ARGS("rtx.gpuPassTimings", uint32_t, averagingFrames, 120,
                     "Number of resolved frames the GPU pass timings are averaged over.",
                     args.minValue = 1u, args.maxValue = 1024u);
@@ -275,23 +275,24 @@ namespace dxvk {
       bool seenThisFrame = false;
     };
 
-    // GPU idle time between top-level zones since the stats were last reset or the last periodic table, keyed
-    // by the zone the GPU started next ("next frame" for the gap after a frame's last zone), to show where it waits.
-    std::unordered_map<std::string, double> m_idleBeforeZoneMs;
-    std::uint32_t m_idleFrames = 0;
+    // GPU time between top-level zones since the stats were last reset or the last periodic table, keyed by the
+    // zone the GPU started next ("next frame" for the gap after a frame's last zone). A gap is idle time or untimed
+    // work, such as a list's init buffer, which runs before the list's begin timestamp.
+    std::unordered_map<std::string, double> m_gapBeforeZoneMs;
+    std::uint32_t m_gapFrames = 0;
     std::uint64_t m_prevFrameLastZoneEnd = 0;
     // The same between the command lists of a frame, keyed by the first top-level zone of the list that followed.
     struct ListGap {
       double totalMs = 0.0;
       std::uint32_t count = 0;
     };
-    std::unordered_map<std::string, ListGap> m_idleBeforeListMs;
-    std::uint32_t m_idleListCount = 0;
+    std::unordered_map<std::string, ListGap> m_gapBeforeListMs;
+    std::uint32_t m_gapListCount = 0;
 
     struct FrameSummary {
       float busyMs = 0.0f;   // sum of top-level zones
-      float spanMs = 0.0f;   // last top-level end - first top-level begin (includes idle gaps)
-      float listTotalMs = 0.0f; // sum of all command lists recorded for the frame (everything the GPU executed)
+      float spanMs = 0.0f;   // last top-level end - first top-level begin (includes the gaps)
+      float listTotalMs = 0.0f; // sum of all command lists recorded for the frame (their init buffers run before the begin timestamp)
       float listSpanMs = 0.0f;  // last list end - first list begin
     };
 
@@ -346,7 +347,7 @@ namespace dxvk {
     StreamState& findOrCreateStream(const DxvkContext* ctx, std::uint16_t& outStreamId);
     void resolvePendingFrames(std::uint32_t currentFrameId);
     bool resolveFrame(FrameRecord& frame);
-    void accumulateIdle(const FrameRecord& frame, const std::vector<std::uint64_t>& beginTicks, const std::vector<std::uint64_t>& endTicks,
+    void accumulateGaps(const FrameRecord& frame, const std::vector<std::uint64_t>& beginTicks, const std::vector<std::uint64_t>& endTicks,
                         std::vector<std::pair<std::uint64_t, std::uint64_t>>& listSpans);
     void foldFrameIntoStats(const FrameRecord& frame, const std::vector<float>& durationsMs, const FrameSummary& summary);
     void resizeWindow(std::uint32_t frames);

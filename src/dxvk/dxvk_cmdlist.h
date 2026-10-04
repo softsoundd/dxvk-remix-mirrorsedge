@@ -693,21 +693,19 @@ namespace dxvk {
     }
 
     // NV-DXVK start:
-    // Resets the query pool using InitBuffer. Upstream DXVK no longer performs this reset specifically in InitBuffer,
-    // so we should align with their updated logic for handling query resets when integrating future changes.
+    // Queries without a reset event (the device has hostQueryReset) are reset on the host: a reset recorded on
+    // the GPU costs about a microsecond of GPU time per query on NVIDIA, which hundreds of timestamps per frame
+    // add up to. This uses the core entry point, as vkResetQueryPoolEXT is only valid with
+    // VK_EXT_host_query_reset enabled, which it never is here. The others are reset in the init buffer.
     // NV-DXVK end
     void cmdResetQuery(
             VkQueryPool             queryPool,
             uint32_t                queryId,
             VkEvent                 event) {
       if (event == VK_NULL_HANDLE) {
-        // NV-DXVK: Previously used vkResetQueryPoolEXT here, but it caused access violations(AV).
-        // Now replaced with vkCmdResetQueryPool submitted via the init command buffer.
-        // This workaround can be removed once upstream logic is integrated and verified to work correctly.
-        m_cmdBuffersUsed.set(DxvkCmdBuffer::InitBuffer);
-
-        m_vkd->vkCmdResetQueryPool(
-          m_initBuffer, queryPool, queryId, 1);
+        // NV-DXVK start: host query reset
+        // Not in use: a handle only returns to the allocator once the command lists that used it have completed.
+        m_vkd->vkResetQueryPool(m_vkd->device(), queryPool, queryId, 1);
         // NV-DXVK end
       } else {
         m_cmdBuffersUsed.set(DxvkCmdBuffer::InitBuffer);

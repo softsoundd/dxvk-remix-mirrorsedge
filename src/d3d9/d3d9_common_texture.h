@@ -358,6 +358,16 @@ namespace dxvk {
       return m_sampleView.Pick(srgb && IsSrgbCompatible());
     }
 
+    // NV-DXVK start: cube textures in Remix's 2D material slots
+    /**
+     * \brief 2D view of the first face of a cube texture
+     *
+     * Created on first use and kept: Remix keys material textures by view, so a
+     * new view per draw would add a texture and a material to the scene per draw.
+     */
+    const Rc<DxvkImageView>& GetCubeFaceView(bool srgb);
+    // NV-DXVK end
+
     VkImageLayout DetermineRenderTargetLayout() const {
       return m_image != nullptr &&
              m_image->info().tiling == VK_IMAGE_TILING_OPTIMAL &&
@@ -519,6 +529,9 @@ namespace dxvk {
     bool                          m_hazardous = false;
 
     D3D9ColorView                 m_sampleView;
+    // NV-DXVK start: cube textures in Remix's 2D material slots
+    D3D9ColorView                 m_cubeFaceView;
+    // NV-DXVK end
 
     D3D9SubresourceBitset         m_locked = { };
 

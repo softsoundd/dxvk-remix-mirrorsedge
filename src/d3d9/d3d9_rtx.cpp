@@ -12963,7 +12963,7 @@ namespace dxvk {
       // legacy Remix albedo path is 2D oriented so for cubemap albedo slots,
       // bind a face view to avoid falling back to white placeholders
       if (texture->GetType() == D3DRTYPE_CUBETEXTURE) {
-        return texture->CreateView(0, 0, VK_IMAGE_USAGE_SAMPLED_BIT, srgb);
+        return texture->GetCubeFaceView(srgb);
       }
       return texture->GetSampleView(srgb);
     };
