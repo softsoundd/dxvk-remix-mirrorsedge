@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <vector>
 #include <thread>
 
@@ -70,9 +71,64 @@ private:
   }
 };
 
+// One producer and one consumer thread with their own queue objects over the same memory, as the
+// client and server use it, through a queue small enough to wrap and fill constantly.
+class CommandQueueThreadedTest {
+public:
+  static void run() {
+    cout << "Begin CommandQueue threaded test" << endl;
+    test_threaded();
+    cout << "CommandQueue threaded test passed" << endl;
+  }
+
+private:
+  static void test_threaded() {
+    static constexpr size_t kQueueSize = 7;
+    static constexpr uint32_t kCount = 1'000'000;
+    using Writer = AtomicCircularQueue<Header, Accessor::Writer>;
+    using Reader = AtomicCircularQueue<Header, Accessor::Reader>;
+
+    const size_t memSize = Writer::getExtraMemoryRequirements() + sizeof(Header) * kQueueSize;
+    vector<char> memory(memSize);
+    Writer writer("ThreadedTestCommand", memory.data(), memSize, kQueueSize);
+    Reader reader("ThreadedTestCommand", memory.data(), memSize, kQueueSize);
+
+    thread producer([&writer] {
+      for (uint32_t i = 0; i < kCount; ++i) {
+        writer.push({ static_cast<D3D9Command>(i & 0x7FFF), 0, i, ~i });
+      }
+    });
+
+    // Drains every command even after a mismatch, or the producer would block on a full queue.
+    string error;
+    for (uint32_t i = 0; i < kCount; ++i) {
+      Result result = Result::Failure;
+      if ((i & 1) == 0) {
+        const Header& peeked = reader.peek(result);
+        if (error.empty() && (result != Result::Success || peeked.dataOffset != i)) {
+          error = "Peeked command out of order";
+        }
+      }
+      const Header h = reader.pull(result);
+      if (error.empty() && (result != Result::Success || h.dataOffset != i || h.pHandle != ~i)) {
+        error = "Pulled command out of order";
+      }
+    }
+    producer.join();
+
+    if (!error.empty()) {
+      throw error;
+    }
+    if (!reader.isEmpty()) {
+      throw string("Queue not empty after the last command");
+    }
+  }
+};
+
 int main() {
   try {
     CommandQueueHistoryTest::run();
+    CommandQueueThreadedTest::run();
   }
   catch (const string& errorMessage) {
     cerr << errorMessage << endl;

@@ -311,6 +311,7 @@ void ProcessDeviceCommandQueue() {
     }
 #endif
 
+    uint32_t processedUid = 0;
     {
       ZoneScoped;
       if (ZoneIsActive) {
@@ -318,6 +319,7 @@ void ProcessDeviceCommandQueue() {
         ZoneName(commandStr.c_str(), commandStr.size());
       }
       PULL_U(currentUID);
+      processedUid = currentUID;
 #if defined(_DEBUG) || defined(DEBUGOPT)
       if (GlobalOptions::getLogServerCommands()) {
         Logger::info("Device Processing: " + toString(rpcHeader.command) + " UID: " + std::to_string(currentUID));
@@ -848,7 +850,8 @@ void ProcessDeviceCommandQueue() {
           gpD3DResources[pHandle] = pVertexBuffer;
         }
         assert(SUCCEEDED(hresult));
-        SEND_OPTIONAL_CREATE_FUNCTION_SERVER_RESPONSE(hresult, currentUID);
+        // The client does not wait for buffer creates (see Direct3DDevice9Ex_LSS::CreateVertexBuffer).
+        SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
         break;
       }
       case IDirect3DDevice9Ex_CreateIndexBuffer:
@@ -865,7 +868,7 @@ void ProcessDeviceCommandQueue() {
           gpD3DResources[pHandle] = pIndexBuffer;
         }
         assert(SUCCEEDED(hresult));
-        SEND_OPTIONAL_CREATE_FUNCTION_SERVER_RESPONSE(hresult, currentUID);
+        SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
         break;
       }
       case IDirect3DDevice9Ex_CreateRenderTarget:
@@ -3192,6 +3195,7 @@ void ProcessDeviceCommandQueue() {
     }
     assert(CHECK_DATA_OFFSET);
     *DeviceBridge::getReaderChannel().serverDataPos = DeviceBridge::get_data_pos();
+    DeviceBridge::getReaderChannel().serverProcessedUid->store(processedUid, std::memory_order_release);
     // Check if overwrite condition was met
     if (*DeviceBridge::getReaderChannel().clientDataExpectedPos != -1) {
       if (!gOverwriteConditionAlreadyActive) {
@@ -3518,7 +3522,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     SharedHeap::init();
   }
 
-  gpPresent = new NamedSemaphore("Present", GlobalOptions::getPresentSemaphoreMaxFrames(), GlobalOptions::getPresentSemaphoreMaxFrames());
+  // Opens the client's semaphore, which already has its counts.
+  gpPresent = new NamedSemaphore("Present", GlobalOptions::getPresentSemaphoreMaxFrames(),
+                                 std::max<uint8_t>(1, GlobalOptions::getPresentSemaphoreMaxFrames()));
 
   // Initialize our shared client command queue as a Reader.
   // (1) Wait for connection for client.

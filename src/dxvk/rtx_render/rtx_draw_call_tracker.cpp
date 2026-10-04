@@ -32,8 +32,10 @@ namespace dxvk {
   // Compute which lookup-key fields differ from the RI's cached values and write
   // the lookup-drift bits to ri->dirtyFlags (dynamic-feature bits are preserved).
   // Caller is expected to invoke this BEFORE overwriting the RI's cached fields.
+  // identityMatched: the key's identity hash matched the RI's (a transform-free key, so the
+  // transform is the only lookup input left to compare).
   static void computeDirtyFlags(
-      ReplacementInstance* ri, const ReplacementInstance::LookupKey& key) {
+      ReplacementInstance* ri, const ReplacementInstance::LookupKey& key, bool identityMatched = false) {
     ri->dirtyFlags.clr(ReplacementInstance::kLookupDriftMask);
     // Usually called because the full identity hash did not match, so something must have changed.
     // The exception is a key whose identity excludes the transform, where an identity match says
@@ -58,8 +60,9 @@ namespace dxvk {
     }
     // The tracked set above does not cover every input a submission can change - a skinned
     // mesh's bone hash is in the identity but has no dirty bit - so an unattributed difference
-    // has to fall back to the dynamic path rather than be treated as no change.
-    if ((ri->dirtyFlags & ReplacementInstance::kLookupDriftMask).isClear()) {
+    // has to fall back to the dynamic path rather than be treated as no change. After an identity
+    // match there is no such difference, and an instance that did not move must stay clean.
+    if (!identityMatched && (ri->dirtyFlags & ReplacementInstance::kLookupDriftMask).isClear()) {
       ri->dirtyFlags.set(ReplacementInstance::DirtyFlag::Other);
     }
   }
@@ -220,7 +223,7 @@ namespace dxvk {
           // whenever the dirty flags come back clear, and move the instance's spatial entry so the
           // nearest-neighbour search still finds it where it now is. computeDirtyFlags does its own
           // comparison, so an instance that genuinely did not move still sets no bits.
-          computeDirtyFlags(match, key);
+          computeDirtyFlags(match, key, true);
           match->vertexPositionHash = key.vertexPositionHash;
           match->materialHash = key.materialHash;
           match->centroid = key.worldPos;

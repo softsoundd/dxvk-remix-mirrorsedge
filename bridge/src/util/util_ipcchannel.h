@@ -47,7 +47,9 @@ public:
     , serverDataPos(static_cast<int64_t*>(sharedMem->data()))
     , clientDataExpectedPos(serverDataPos + 1)
     , serverResetPosRequired(reinterpret_cast<bool*>(clientDataExpectedPos + 1))
-    // Offsetting shared memory to account for 3 pointers used above
+    , serverProcessedUid(reinterpret_cast<std::atomic<uint32_t>*>(
+        reinterpret_cast<uintptr_t>(sharedMem->data()) + kServerProcessedUidOffset))
+    // Offsetting shared memory to account for the fields above
     , commands(new CommandQueue(name + "Command",
                                 reinterpret_cast<void*>(
                                   reinterpret_cast<uintptr_t>(sharedMem->data()) +
@@ -70,6 +72,7 @@ public:
       *serverDataPos = -1;
       *clientDataExpectedPos = -1;
       *serverResetPosRequired = false;
+      new (serverProcessedUid) std::atomic<uint32_t>(0);
     }
   }
 
@@ -94,6 +97,8 @@ public:
   int64_t*                           serverDataPos;
   int64_t*                           clientDataExpectedPos;
   bool*                              serverResetPosRequired;
+  // UID of the last command the server finished processing, stored after every command.
+  std::atomic<uint32_t>*             serverProcessedUid;
   CommandQueue* const                commands;
   bridge_util::DataQueue* const      data;
   bridge_util::NamedSemaphore* const dataSemaphore;
@@ -101,8 +106,9 @@ public:
   mutable std::mutex                 m_mutex;
 
   // Extra storage needed for data queue synchronization params
-  static constexpr size_t kReservedSpace = align<size_t>(sizeof(*serverDataPos) +
-    sizeof(*clientDataExpectedPos) + sizeof(*serverResetPosRequired), 64);
+  static constexpr size_t kServerProcessedUidOffset =
+    align<size_t>(2 * sizeof(int64_t) + sizeof(bool), alignof(std::atomic<uint32_t>));
+  static constexpr size_t kReservedSpace = align<size_t>(kServerProcessedUidOffset + sizeof(uint32_t), 64);
 };
 using WriterChannel = IpcChannel<bridge_util::Accessor::Writer>;
 using ReaderChannel = IpcChannel<bridge_util::Accessor::Reader>;

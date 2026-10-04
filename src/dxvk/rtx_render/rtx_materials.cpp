@@ -183,8 +183,7 @@ float getDisplacementOutFactor() {
   return RtxOptions::Displacement::displacementFactor() * RtxOptions::Displacement::displacementOutFactor();
 }
 
-dxvk::OpaqueMaterialData LegacyMaterialData::createDefault() {
-  OpaqueMaterialData opaqueMat;
+static void setLegacyMaterialDefaults(OpaqueMaterialData& opaqueMat) {
   opaqueMat.setAnisotropyConstant(LegacyMaterialDefaults::anisotropy());
   opaqueMat.setEmissiveIntensity(LegacyMaterialDefaults::emissiveIntensity());
   opaqueMat.setAlbedoConstant(LegacyMaterialDefaults::albedoConstant());
@@ -196,33 +195,40 @@ dxvk::OpaqueMaterialData LegacyMaterialData::createDefault() {
   opaqueMat.setEnableThinFilm(LegacyMaterialDefaults::enableThinFilm());
   opaqueMat.setAlphaIsThinFilmThickness(LegacyMaterialDefaults::alphaIsThinFilmThickness());
   opaqueMat.setThinFilmThicknessConstant(LegacyMaterialDefaults::thinFilmThicknessConstant());
+}
+
+dxvk::OpaqueMaterialData LegacyMaterialData::createDefault() {
+  OpaqueMaterialData opaqueMat;
+  opaqueMat.batchSet(setLegacyMaterialDefaults);
   return opaqueMat;
 }
 
 template<> OpaqueMaterialData LegacyMaterialData::as() const {
-  // Legacy materials have parameters that can directly carry over onto the opaque material.
-  const OpaqueMaterialData defaultLegacyOpaqueMaterial = createDefault();
-  // Copy off the defaults, and make dynamic adjustments for the remaining params from this legacy material
-  OpaqueMaterialData opaqueMat(defaultLegacyOpaqueMaterial);
-  if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
-    opaqueMat.setAlbedoOpacityTexture(getColorTexture());
-  }
-  // UE3 constant-color materials carry their color in UniformVector_* shader constants;
-  // without this they render plain white. Opacity stays at the default - the vector's
-  // w component rarely holds opacity.
-  if (hasUe3ConstantAlbedo && !getColorTexture().isValid()) {
-    const Vector3 clampedAlbedo(
-      std::clamp(ue3ConstantAlbedo.x, 0.0f, 1.0f),
-      std::clamp(ue3ConstantAlbedo.y, 0.0f, 1.0f),
-      std::clamp(ue3ConstantAlbedo.z, 0.0f, 1.0f));
-    opaqueMat.setAlbedoConstant(clampedAlbedo);
-  }
-  if (getColorTexture2().isValid()) {
-    opaqueMat.setSecondaryTexture(getColorTexture2());
-  }
-  if (ue3HighlightGlowTexture.isValid()) {
-    opaqueMat.setEmissiveColorTexture(ue3HighlightGlowTexture);
-  }
+  // Legacy materials have parameters that can directly carry over onto the opaque material:
+  // start from the defaults and make dynamic adjustments for the remaining params from this legacy material.
+  OpaqueMaterialData opaqueMat;
+  opaqueMat.batchSet([this](OpaqueMaterialData& mat) {
+    setLegacyMaterialDefaults(mat);
+    if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
+      mat.setAlbedoOpacityTexture(getColorTexture());
+    }
+    // UE3 constant-color materials carry their color in UniformVector_* shader constants;
+    // without this they render plain white. Opacity stays at the default - the vector's
+    // w component rarely holds opacity.
+    if (hasUe3ConstantAlbedo && !getColorTexture().isValid()) {
+      const Vector3 clampedAlbedo(
+        std::clamp(ue3ConstantAlbedo.x, 0.0f, 1.0f),
+        std::clamp(ue3ConstantAlbedo.y, 0.0f, 1.0f),
+        std::clamp(ue3ConstantAlbedo.z, 0.0f, 1.0f));
+      mat.setAlbedoConstant(clampedAlbedo);
+    }
+    if (getColorTexture2().isValid()) {
+      mat.setSecondaryTexture(getColorTexture2());
+    }
+    if (ue3HighlightGlowTexture.isValid()) {
+      mat.setEmissiveColorTexture(ue3HighlightGlowTexture);
+    }
+  });
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

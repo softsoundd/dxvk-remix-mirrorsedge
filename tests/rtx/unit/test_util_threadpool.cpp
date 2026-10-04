@@ -55,6 +55,9 @@ public:
     test_smoke<4>();
     cout << "Begin misc tests" << endl;
     test_misc();
+    cout << "Begin parked worker tests" << endl;
+    test_parked<true>();
+    test_parked<false>();
     cout << "WorkerThreadPool successfully smoke tested" << endl;
   }
   
@@ -192,6 +195,37 @@ private:
 
     if (result != 2) {
       throw DxvkError("Result didnt match");
+    }
+  }
+
+  // Low-latency workers park once they have been idle for a while, and a task scheduled after that
+  // has to wake a worker that can run it. One task at a time, so only one parked worker gets woken.
+  template<bool WorkStealing>
+  static void test_parked() {
+    const uint32_t numThreads = 4;
+    const uint32_t numTasks = 32;
+    const uint32_t numRounds = 16;
+
+    std::atomic<uint32_t> executed = 0;
+    WorkerThreadPool<numTasks, WorkStealing, true> threadPool(numThreads);
+    cout << "Created thread pool with " << numThreads << " threads, work stealing " << (WorkStealing ? "on" : "off") << endl;
+
+    for (uint32_t round = 1; round <= numRounds; round++) {
+      // Long enough for every worker to run out of idle passes and park
+      std::this_thread::sleep_for(milliseconds(20));
+
+      // Schedule assigns worker queues round robin, so each round targets the next worker
+      if (!threadPool.Schedule([&executed] { ++executed; }).valid()) {
+        throw DxvkError("Failed to schedule task");
+      }
+
+      const auto deadline = steady_clock::now() + seconds(5);
+      while (executed < round) {
+        if (steady_clock::now() > deadline) {
+          throw DxvkError("A task scheduled while the workers were parked did not run");
+        }
+        std::this_thread::yield();
+      }
     }
   }
 };

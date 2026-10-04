@@ -662,7 +662,10 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::CreateVertexBuffer(UINT Length, DWORD
       c.send_many(Length, Usage, FVF, Pool, (uint32_t) pLssVertexBuffer->getId());
     }
   }
-  WAIT_FOR_OPTIONAL_CREATE_FUNCTION_SERVER_RESPONSE("CreateVertexBuffer()", D3DERR_INVALIDCALL, currentUID);
+  // Unlike other creates, buffers only wait for the server with sendAllServerResponses: games also
+  // create them during gameplay (UE3's NxFluid renderer every frame), and the wait drains the whole
+  // command queue. The handle is the client's own, so all that goes unreported is a failed create.
+  WAIT_FOR_OPTIONAL_SERVER_RESPONSE("CreateVertexBuffer()", D3DERR_INVALIDCALL, currentUID);
 }
 
 template<bool EnableSync>
@@ -689,7 +692,8 @@ HRESULT Direct3DDevice9Ex_LSS<EnableSync>::CreateIndexBuffer(UINT Length, DWORD 
       c.send_many(Length, Usage, Format, Pool, (uint32_t) pLssIndexBuffer->getId());
     }
   }
-  WAIT_FOR_OPTIONAL_CREATE_FUNCTION_SERVER_RESPONSE("CreateIndexBuffer()", D3DERR_INVALIDCALL, currentUID);
+  // See CreateVertexBuffer.
+  WAIT_FOR_OPTIONAL_SERVER_RESPONSE("CreateIndexBuffer()", D3DERR_INVALIDCALL, currentUID);
 }
 
 template<bool EnableSync>

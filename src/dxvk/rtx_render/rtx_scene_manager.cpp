@@ -1011,6 +1011,51 @@ namespace dxvk {
         !terrainCascadesJustChanged &&
         cachedTexturesValidForPreserve;
 
+    if (RtxOptions::logDynamicGeometryStats()) {
+      using Path = SubmissionPath;
+      using Dirty = ReplacementInstance::DirtyFlag;
+      const auto& dirty = replacementInstance->dirtyFlags;
+      Path path = Path::Preserve;
+      if (!usePreservePath) {
+        if (!RtxOptions::enablePreservePath()) {
+          path = Path::PreserveDisabled;
+        } else if (replacementInstance->prims.empty()) {
+          path = Path::NewInstance;
+        } else if (dirty.test(Dirty::Transform)) {
+          path = Path::TransformChanged;
+        } else if (dirty.test(Dirty::VertexPosHash)) {
+          path = Path::VertexPositionsChanged;
+        } else if (dirty.test(Dirty::MaterialHash)) {
+          path = Path::MaterialHashChanged;
+        } else if (dirty.test(Dirty::Other)) {
+          path = Path::OtherLookupDrift;
+        } else if (dirty.test(Dirty::ParticleSystem)) {
+          path = Path::ParticleSystem;
+        } else if (RtxOptionManager::isDrawcallTranslationInvalid()) {
+          path = Path::OptionChanged;
+        } else if (secondSubmissionThisFrame) {
+          path = Path::SecondSubmission;
+        } else if (input.getCategoryFlags().test(InstanceCategories::ParticleEmitter)) {
+          path = Path::ParticleEmitter;
+        } else if (RtxOptions::shouldConvertToLight(input.getMaterialData().getHash())) {
+          path = Path::ConvertToLight;
+        } else if (blasAlreadyTouchedByOtherDraw()) {
+          path = Path::SharedBlasUpdated;
+        } else if (overrideMaterialHasParticles) {
+          path = Path::OverrideParticles;
+        } else if (!activeReplacementsMatch) {
+          path = Path::ReplacementsChanged;
+        } else if (!legacyMaterialIdentityHashMatch) {
+          path = Path::MaterialIdentityChanged;
+        } else if (terrainCascadesJustChanged) {
+          path = Path::TerrainCascades;
+        } else {
+          path = Path::TextureCacheGeneration;
+        }
+      }
+      ++m_submissionPathCounts[static_cast<size_t>(path)];
+    }
+
 
     if (usePreservePath) {
       preserveReplacementInstance(ctx, input, pReplacements, replacementInstance);
@@ -1884,11 +1929,28 @@ namespace dxvk {
       out << '\n';
     }
 
+    static constexpr const char* kPathNames[] = {
+      "preserve", "preserve disabled", "new instance", "transform", "vertex positions", "material hash",
+      "other lookup drift", "particle system", "option changed", "second submission", "particle emitter",
+      "convert to light", "shared BLAS updated", "override particles", "replacements changed",
+      "material identity", "terrain cascades", "texture cache generation"
+    };
+    static_assert(std::size(kPathNames) == static_cast<size_t>(SubmissionPath::Count));
+    out << "  submissions per frame by update path (dynamic: first failing preserve condition):";
+    for (size_t i = 0; i < m_submissionPathCounts.size(); ++i) {
+      if (m_submissionPathCounts[i] != 0) {
+        out << ' ' << kPathNames[i] << '=' << std::setprecision(1)
+            << (static_cast<float>(m_submissionPathCounts[i]) / static_cast<float>(frames));
+      }
+    }
+    out << '\n';
+
     Logger::info(out.str());
 
     m_dynamicGeometryStats.clear();
     m_dynamicGeometryStatsTotalBuilds = 0;
     m_dynamicGeometryStatsTotalUpdates = 0;
+    m_submissionPathCounts.fill(0);
   }
   // NV-DXVK end
 

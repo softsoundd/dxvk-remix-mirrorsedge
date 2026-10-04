@@ -253,6 +253,10 @@ public:
     return get().eliminateRedundantSetterCalls;
   }
 
+  static bool getEventQueryServerCompletion() {
+    return get().eventQueryServerCompletion;
+  }
+
 private:
   GlobalOptions() = default;
 
@@ -284,7 +288,9 @@ private:
 
     // Device Channel Defaults
     static constexpr size_t kDefaultClientChannelMemSize = 96 << 20; // 96MB
-    static constexpr size_t kDefaultClientCmdQueueSize = 3 << 10; // 3k
+    // Deep enough for the client to carry on through the server's per-frame stalls (Present, end of
+    // frame) rather than block on a full queue and leave the server idle afterwards.
+    static constexpr size_t kDefaultClientCmdQueueSize = 32 << 10; // 32k
     static constexpr size_t kDefaultClientDataQueueSize = 3 << 10; // 3k
     static constexpr size_t kDefaultServerChannelMemSize = 32 << 20; // 32MB
     static constexpr size_t kDefaultServerCmdQueueSize = 10;
@@ -315,7 +321,8 @@ private:
 
     // Create API calls from the client wait for a response from the server by default,
     // but the wait can be disabled if both sendCreateFunctionServerResponses and
-    // sendAllServerResponses are set to False.
+    // sendAllServerResponses are set to False. Vertex and index buffer creation only
+    // waits when sendAllServerResponses is set.
     sendCreateFunctionServerResponses = bridge_util::Config::getOption<bool>("sendCreateFunctionServerResponses", true);
 
     // In a Debug or DebugOptimized build of the bridge, setting LogApiCalls
@@ -380,8 +387,10 @@ private:
 
     // This is the maximum latency in number of frames the client can be ahead of the
     // server before it blocks and waits for the server to catch up. We want this value
-    // to be rather small so the two processes don't get too far out of sync.
-    presentSemaphoreMaxFrames = bridge_util::Config::getOption<uint8_t>("presentSemaphoreMaxFrames", 3);
+    // to be rather small so the two processes don't get too far out of sync. At 1 the
+    // client prepares the next frame while the server finishes the current one; at 0
+    // every Present waits for the server to finish that frame.
+    presentSemaphoreMaxFrames = bridge_util::Config::getOption<uint8_t>("presentSemaphoreMaxFrames", 1);
     presentSemaphoreEnabled = bridge_util::Config::getOption<bool>("presentSemaphoreEnabled", true);
 
     // Toggles between waiting on and triggering the command queue semaphore for each
@@ -430,6 +439,12 @@ private:
     // If set, the bridge client will not send certain setter calls to the bridge server if the client knows the setter is writing
     // the the same value that is currently stored.
     eliminateRedundantSetterCalls = bridge_util::Config::getOption<bool>("eliminateRedundantSetterCalls", false);
+
+    // If set, an event query (D3DQUERYTYPE_EVENT) completes once the server has processed its Issue, and the client
+    // answers GetData without the round trip, which waits for the server to work through every command queued before
+    // it (UE3 polls its FrameSyncEvent every frame). Only for games that do not rely on events for other
+    // synchronization, such as reusing D3DLOCK_NOOVERWRITE buffer ranges.
+    eventQueryServerCompletion = bridge_util::Config::getOption<bool>("eventQueryServerCompletion", false);
   }
 
   void initSharedHeapPolicy();
@@ -482,4 +497,5 @@ private:
   bool alwaysCopyEntireStaticBuffer;
   bool exposeRemixApi;
   bool eliminateRedundantSetterCalls;
+  bool eventQueryServerCompletion;
 };

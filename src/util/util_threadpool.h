@@ -268,8 +268,9 @@ namespace dxvk {
     *  NumThreads: How many threads to spawn (up to 255)
     *  NumTasksPerThread: Size of the task queue ring buffer
     *  WorkStealing: Enables the work stealing features of the scheduler
-    *  LowLatency: Enables the low-latency mode where workers will spin instead of
-    *              waiting for tasks on a conditional variable
+    *  LowLatency: Enables the low-latency mode where idle workers spin for a while
+    *              before parking, instead of waiting for every task on a conditional
+    *              variable
     *  (ctor)workerName: Name given to threads with the pattern: workerName(N)
     * 
     *  Example usage:
@@ -318,6 +319,9 @@ namespace dxvk {
       if constexpr (!LowLatency) {
         std::unique_lock<TaskMutex> lock(m_taskMutex);
         m_condOnAdd.notify_all();
+      } else {
+        std::lock_guard<dxvk::mutex> lock(m_parkMutex);
+        m_condOnPark.notify_all();
       }
 
       for (auto& worker : m_workerThreads) {
@@ -364,6 +368,9 @@ namespace dxvk {
         // Place task into queue
         m_workerTasks[thread]->push(std::move(taskId));
 
+        // Counted before any wake-up, since the woken worker's wait predicate reads it.
+        ++m_numTasks;
+
         if constexpr (!LowLatency) {
           std::unique_lock<TaskMutex> lock(m_taskMutex);
           if constexpr (WorkStealing) {
@@ -373,16 +380,29 @@ namespace dxvk {
             // Notify all workers when they cannot steal
             m_condOnAdd.notify_all();
           }
+        } else if (m_numParked.load() > 0) {
+          // park() registers in m_numParked before it tests m_numTasks, so a worker that parks
+          // concurrently either sees this task or is counted here.
+          std::lock_guard<dxvk::mutex> lock(m_parkMutex);
+          if constexpr (WorkStealing) {
+            m_condOnPark.notify_one();
+          } else {
+            // Only the owner of the task's queue can run it
+            m_condOnPark.notify_all();
+          }
         }
-
-        ++m_numTasks;
       }
 
       return future;
     }
 
   private:
+    // Idle passes (each ending in a yield) a low-latency worker spins through before parking.
+    // Long enough to stay awake across the gaps between draws that schedule work.
+    static constexpr uint32_t kIdlePassesBeforePark = 1024;
+
     void processWork(const uint32_t workerId) {
+      uint32_t idlePasses = 0;
       while (true) {
         // Using a conditional wait in high-latency mode
         if constexpr (!LowLatency) {
@@ -398,8 +418,10 @@ namespace dxvk {
         }
 
         // Try executing a task from our queue
-        if (executeTask(workerId))
+        if (executeTask(workerId)) {
+          idlePasses = 0;
           continue;
+        }
 
         if (WorkStealing) {
           // There's no work to do!
@@ -413,12 +435,31 @@ namespace dxvk {
             }
           }
 
-          // If nothing to steal, yield this thread
-          if (!workStolen && LowLatency) {
+          if (workStolen) {
+            idlePasses = 0;
+            continue;
+          }
+        }
+
+        if constexpr (LowLatency) {
+          if (++idlePasses < kIdlePassesBeforePark) {
             std::this_thread::yield();
+          } else {
+            park();
+            idlePasses = 0;
           }
         }
       }
+    }
+
+    // Blocks an idle low-latency worker until a task is scheduled or the pool stops.
+    void park() {
+      std::unique_lock<dxvk::mutex> lock(m_parkMutex);
+      ++m_numParked;
+      m_condOnPark.wait(lock, [this] {
+        return m_numTasks > 0 || m_stopWork.load();
+      });
+      --m_numParked;
     }
 
     // True if front pop, False if back pop
@@ -459,6 +500,11 @@ namespace dxvk {
     TaskMutex m_taskMutex;
     OnAddCondition m_condOnAdd;
 
+    // Low-latency mode: idle workers park here until Schedule wakes one
+    dxvk::mutex m_parkMutex;
+    dxvk::condition_variable m_condOnPark;
+    std::atomic<uint32_t> m_numParked = 0;
+
     // Used to synchronize intra-thread stealing
     sync::Spinlock m_threadMutex;
 
@@ -470,6 +516,6 @@ namespace dxvk {
     //  1. Non-circular queue incurs allocation overhead thats unacceptable
     //  2. Use of mutex, and CVs, incur overhead thats unacceptable
     std::vector<QueuePtr> m_workerTasks;
-    std::atomic_uint32_t m_numTasks;
+    std::atomic_uint32_t m_numTasks = 0;
   };
 } //dxvk

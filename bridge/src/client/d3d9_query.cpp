@@ -99,6 +99,10 @@ HRESULT Direct3DQuery9_LSS::Issue(DWORD dwIssueFlags) {
     currentUID = c.get_uid();
     c.send_data(dwIssueFlags);
   }
+  if (m_type == D3DQUERYTYPE_EVENT && (dwIssueFlags & D3DISSUE_END) != 0) {
+    m_eventIssueUid = static_cast<uint32_t>(currentUID);
+    m_eventIssued = true;
+  }
   WAIT_FOR_OPTIONAL_SERVER_RESPONSE("Direct3DQuery9_LSS::Issue()", D3DERR_INVALIDCALL, currentUID);
 
   return S_OK;
@@ -106,6 +110,19 @@ HRESULT Direct3DQuery9_LSS::Issue(DWORD dwIssueFlags) {
 
 HRESULT Direct3DQuery9_LSS::GetData(void* pData, DWORD dwSize, DWORD dwGetDataFlags) {
   LogFunctionCall();
+
+  // Answered here without a round trip, see eventQueryServerCompletion. UIDs wrap, hence the signed difference.
+  // A stopped bridge processes nothing more, so the event counts as complete rather than pending forever.
+  if (m_type == D3DQUERYTYPE_EVENT && m_eventIssued && GlobalOptions::getEventQueryServerCompletion()) {
+    const uint32_t processedUid = DeviceBridge::getWriterChannel().serverProcessedUid->load(std::memory_order_acquire);
+    if (gbBridgeRunning && static_cast<int32_t>(processedUid - m_eventIssueUid) < 0) {
+      return S_FALSE;
+    }
+    if (pData != nullptr && dwSize >= sizeof(BOOL)) {
+      *static_cast<BOOL*>(pData) = TRUE;
+    }
+    return S_OK;
+  }
 
   UID currentUID = 0;
   {

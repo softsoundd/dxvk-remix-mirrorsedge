@@ -13,6 +13,13 @@
 
 #include <d3d9.h>
 
+#include <chrono>
+#include <thread>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
 using namespace Commands;
 
 // Mapping between client and server pointer addresses
@@ -71,12 +78,47 @@ namespace {
 
     return presParam;
   }
+
+  // How long the module queue spins after its last command before it falls back to polling.
+  constexpr auto kModuleQueueSpinWindow = std::chrono::milliseconds(20);
+
+  void sleepAboutOneMillisecond(HANDLE highResolutionTimer) {
+    if (highResolutionTimer != nullptr) {
+      LARGE_INTEGER dueTime;
+      dueTime.QuadPart = -10'000; // relative, 100 ns units
+      if (SetWaitableTimerEx(highResolutionTimer, &dueTime, 0, nullptr, nullptr, nullptr, 0)) {
+        WaitForSingleObject(highResolutionTimer, INFINITE);
+        return;
+      }
+    }
+    Sleep(1);
+  }
 }
 
 void processModuleCommandQueue(std::atomic<bool>* const pbSignalEnd) {
   bool destroyReceived = false;
-  while (RESULT_SUCCESS(ModuleBridge::waitForCommand(
-    Commands::Bridge_Any, 0, pbSignalEnd))) {
+  // Module (IDirect3D9) commands mostly arrive at startup and on display mode changes, so an idle queue
+  // is polled every millisecond rather than spun on. The high-resolution timer keeps that period without
+  // raising the system timer resolution (a plain Sleep(1) can take 15.6 ms).
+  const HANDLE idleTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  auto lastCommandTime = std::chrono::steady_clock::now();
+  // waitForCommand spins until a command arrives (there is no timeout), so it is only entered once one
+  // is queued. False once the end is signalled with nothing left to process.
+  const auto waitForModuleCommand = [&]() {
+    while (ModuleBridge::getReaderChannel().commands->isEmpty()) {
+      if (pbSignalEnd->load()) {
+        return false;
+      }
+      if (std::chrono::steady_clock::now() - lastCommandTime > kModuleQueueSpinWindow) {
+        sleepAboutOneMillisecond(idleTimer);
+      } else {
+        std::this_thread::yield();
+      }
+    }
+    return true;
+  };
+  while (waitForModuleCommand() && RESULT_SUCCESS(ModuleBridge::waitForCommand(Commands::Bridge_Any, 0, pbSignalEnd))) {
+    lastCommandTime = std::chrono::steady_clock::now();
     const Header rpcHeader = ModuleBridge::pop_front();
     PULL_U(currentUID);
 #if defined(_DEBUG) || defined(DEBUGOPT)
@@ -335,6 +377,9 @@ void processModuleCommandQueue(std::atomic<bool>* const pbSignalEnd) {
         break;
       }
     }
+  }
+  if (idleTimer != nullptr) {
+    CloseHandle(idleTimer);
   }
   // Check if we exited the command processing loop unexpectedly while the bridge is still enabled
   if (!destroyReceived && gbBridgeRunning) {

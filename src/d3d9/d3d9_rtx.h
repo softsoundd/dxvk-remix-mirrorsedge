@@ -1833,6 +1833,7 @@ namespace dxvk {
     };
 
     fast_unordered_cache<Ue3VertexCaptureAdmissionEntry> m_ue3VertexCaptureAdmission;
+    uint32_t m_ue3VertexCaptureLastSweepFrame = 0;
 
     // Cache effectiveness counters. The per-frame pair is folded at end of frame into the
     // dormancy evaluation window (always) and the diagnostic interval (when logging is on).

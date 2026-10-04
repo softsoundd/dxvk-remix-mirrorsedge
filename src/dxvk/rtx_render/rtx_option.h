@@ -277,8 +277,8 @@ namespace dxvk {
     const char* m_description; // Description string for the option that will get included in documentation
     OptionType m_type;
     GenericValue m_resolvedValue;
-    // Atomic: getValue() ORs in RTX_OPTION_INVALIDATION_SCOPE flags from any thread under
-    // getUpdateMutex, while getFlags() is read lock-free elsewhere (e.g. RtxOptionManager::applyPendingValues).
+    // Atomic: getValue() ORs in RTX_OPTION_INVALIDATION_SCOPE flags from any thread without a lock,
+    // and getFlags() is read lock-free elsewhere (e.g. RtxOptionManager::applyPendingValues).
     mutable std::atomic<uint32_t> m_flags{ 0 };
     std::function<void(DxvkDevice* device)> m_onChangeCallback;
     
@@ -634,11 +634,14 @@ namespace dxvk {
       }
     }
 
+    // No lock: callers read the value through the returned reference after this returns, so a lock
+    // here could not cover the read, and the resolved storage (inline for scalars, allocated once for
+    // the rest) is only rewritten in place, under the update mutex, when values resolve.
     const T& getValue() const {
-      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
       assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded.");
       tagInvalidationScope();
 #if RTX_OPTION_DEBUG_LOGGING
+      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
       // Print out a warning whenever a dirty value is accessed.
       if (isDirty()) {
         GenericValueWrapper freshValue(type);

@@ -506,6 +506,15 @@ private:
   uint32_t m_dynamicGeometryStatsFirstFrame = 0;
   uint32_t m_dynamicGeometryStatsTotalBuilds = 0;
   uint32_t m_dynamicGeometryStatsTotalUpdates = 0;
+  // Submissions per update path over the same window: the preserve path, or the first preserve
+  // condition that sent the draw down the dynamic path (in the order submitDrawState tests them).
+  enum class SubmissionPath : uint32_t {
+    Preserve, PreserveDisabled, NewInstance, TransformChanged, VertexPositionsChanged, MaterialHashChanged,
+    OtherLookupDrift, ParticleSystem, OptionChanged, SecondSubmission, ParticleEmitter, ConvertToLight,
+    SharedBlasUpdated, OverrideParticles, ReplacementsChanged, MaterialIdentityChanged, TerrainCascades,
+    TextureCacheGeneration, Count
+  };
+  std::array<uint32_t, static_cast<size_t>(SubmissionPath::Count)> m_submissionPathCounts {};
   void recordDynamicGeometry(const DrawCallState& drawCallState, const BlasEntry* pBlas, ObjectCacheState result,
                              const GeometryHashes& previousHashes, XXH64_hash_t previousBoneHash, bool isNew);
   void reportDynamicGeometryStats();

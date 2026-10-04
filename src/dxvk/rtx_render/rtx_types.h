@@ -688,6 +688,9 @@ struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;
   DrawCallState& operator=(const DrawCallState& drawCallState) = default;
+  // Spelled out because the copy operations above suppress the implicit moves.
+  DrawCallState(DrawCallState&&) = default;
+  DrawCallState& operator=(DrawCallState&&) = default;
 
   // Non-zero identifies one hardware instance of a draw that was decomposed into an instance per
   // hardware instance (D3D9Rtx::submitUe3DecomposedInstanceDrawCallStates). Such an instance stays

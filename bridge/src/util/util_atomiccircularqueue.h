@@ -39,13 +39,22 @@ namespace bridge_util {
   // Single Producer, Single Consumer ONLY!
   template<typename T, bridge_util::Accessor Accessor>
   class AtomicCircularQueue {
+    // Next slot the reader takes; only the reader stores it.
     std::atomic<uint32_t>* m_write;
+    // Next slot the writer fills; only the writer stores it.
     std::atomic<uint32_t>* m_read;
 
     T* m_data;
     T m_default;
+    T m_pulled;
 
     const size_t m_queueSize;
+
+    // Each side's last seen value of the other side's index, so the shared one, which the other
+    // process keeps storing to, is only re-read when this says the queue is full (writer) or empty
+    // (reader). A stale value is always behind the real one: the queue just looks fuller or emptier.
+    uint32_t m_cachedWrite = 0;
+    mutable uint32_t m_cachedRead = 0;
 
     static const size_t kAlignment = 128;
     static const size_t kWriteAtomicOffset = 0;
@@ -77,6 +86,11 @@ namespace bridge_util {
       }
 
       assert(m_read->is_lock_free() && m_write->is_lock_free()); // Must be runtime check as it's CPU specific
+
+      // Both start at the reader's index: current for the writer, and "empty" for the reader, which
+      // then fetches m_read on first use.
+      m_cachedWrite = m_write->load(std::memory_order_acquire);
+      m_cachedRead = m_write->load(std::memory_order_acquire);
     }
 
     AtomicCircularQueue(const AtomicCircularQueue& q) = delete;
@@ -86,27 +100,28 @@ namespace bridge_util {
 
     // Push object to queue
     Result push(const T& obj) {
-      ULONGLONG start = 0, curTick;
-      const DWORD timeoutMS = GlobalOptions::getCommandTimeout();
-      do {
-        const auto currentRead = m_read->load(std::memory_order_relaxed);
-        const auto nextRead = queueIdxInc(currentRead);
-        if (nextRead != m_write->load(std::memory_order_acquire)) {
-          m_data[currentRead] = obj;
-          // The store above is not atomic. Issue a membar after it to ensure
-          // it is not reordered.
-          std::atomic_thread_fence(std::memory_order_seq_cst);
-          m_read->store(nextRead, std::memory_order_release);
-          return Result::Success;
+      const auto currentRead = m_read->load(std::memory_order_relaxed);
+      const auto nextRead = queueIdxInc(currentRead);
+      if (nextRead == m_cachedWrite) {
+        // Full as of the last seen reader index: fetch the current one, and wait while it really is full.
+        // Acquire, so the reader is done with a slot before it is overwritten.
+        ULONGLONG start = 0, curTick;
+        const DWORD timeoutMS = GlobalOptions::getCommandTimeout();
+        while ((m_cachedWrite = m_write->load(std::memory_order_acquire)) == nextRead) {
+          std::this_thread::yield();
+
+          curTick = GetTickCount64();
+          start = start > 0 ? start : curTick;
+          if (timeoutMS != 0 && start + timeoutMS <= curTick) {
+            return Result::Failure;
+          }
         }
+      }
 
-        std::this_thread::yield();
-
-        curTick = GetTickCount64();
-        start = start > 0 ? start : curTick;
-      } while (timeoutMS == 0 || start + timeoutMS > curTick);
-
-      return Result::Failure;
+      m_data[currentRead] = obj;
+      // Release: the slot's contents become visible to the reader before the index that publishes it.
+      m_read->store(nextRead, std::memory_order_release);
+      return Result::Success;
     }
 
     // Does nothing but wait for the next command to come in
@@ -117,58 +132,28 @@ namespace bridge_util {
     // Returns a ref to the first element in the queue
     // Note: Blocks if the queue is empty
     const T& peek(Result& result, const DWORD timeoutMS = 0, std::atomic<bool>* const pbEarlyOutSignal = nullptr) const {
-      ULONGLONG start = 0, curTick;
-      do {
-        const auto currentWrite = m_write->load(std::memory_order_relaxed);
-        if (currentWrite != m_read->load(std::memory_order_acquire)) {
-          // Issue a membar before reading the data since it is not atomic
-          std::atomic_thread_fence(std::memory_order_seq_cst);
-          result = Result::Success;
-          return m_data[currentWrite];
-        }
-
-        std::this_thread::yield();
-
-        curTick = GetTickCount64();
-        start = start > 0 ? start : curTick;
-        
-        if (pbEarlyOutSignal && pbEarlyOutSignal->load()) {
-          result = Result::Timeout;
-          return m_default;
-        }
-      } while (timeoutMS == 0 || start + timeoutMS > curTick);
-
-      result = Result::Timeout;
-
-      return m_default;
+      const auto currentWrite = m_write->load(std::memory_order_relaxed);
+      if (!waitForData(currentWrite, timeoutMS, pbEarlyOutSignal)) {
+        result = Result::Timeout;
+        return m_default;
+      }
+      result = Result::Success;
+      return m_data[currentWrite];
     }
 
     // Returns a copy to the first element in queue, AND removes it
     // Note: Blocks if queue is empty
     const T& pull(Result& result, const DWORD timeoutMS = 0, std::atomic<bool>* const pbEarlyOutSignal = nullptr) {
-      ULONGLONG start = 0, curTick;
-      do {
-        const auto currentWrite = m_write->load(std::memory_order_relaxed);
-        if (currentWrite != m_read->load(std::memory_order_acquire)) {
-          m_write->store(queueIdxInc(currentWrite), std::memory_order_release);
-          // Issue a membar before reading the data since it is not atomic
-          std::atomic_thread_fence(std::memory_order_seq_cst);
-          result = Result::Success;
-          return m_data[currentWrite];
-        }
-
-        std::this_thread::yield();
-
-        curTick = GetTickCount64();
-        start = start > 0 ? start : curTick;
-
-        if (pbEarlyOutSignal && pbEarlyOutSignal->load()) {
-          result = Result::Timeout;
-          return m_default;
-        }
-      } while (timeoutMS == 0 || start + timeoutMS > curTick);
-
-      return m_default;
+      const auto currentWrite = m_write->load(std::memory_order_relaxed);
+      if (!waitForData(currentWrite, timeoutMS, pbEarlyOutSignal)) {
+        result = Result::Timeout;
+        return m_default;
+      }
+      // Copy the slot out before handing it back to the writer.
+      m_pulled = m_data[currentWrite];
+      m_write->store(queueIdxInc(currentWrite), std::memory_order_release);
+      result = Result::Success;
+      return m_pulled;
     }
 
     // Check for queue emptiness. The function may guarantee a correct result
@@ -211,6 +196,31 @@ namespace bridge_util {
 
     uint32_t queueIdxDec(uint32_t idx) const {
       return idx == 0 ?  m_queueSize - 1 : idx - 1 ;
+    }
+
+  private:
+    // Waits until the slot at currentWrite (the reader's index) has been filled. False on timeout or
+    // early out. Acquire, so the slot's contents are visible once its index is.
+    bool waitForData(const uint32_t currentWrite, const DWORD timeoutMS, std::atomic<bool>* const pbEarlyOutSignal) const {
+      if (currentWrite != m_cachedRead) {
+        return true;
+      }
+
+      ULONGLONG start = 0, curTick;
+      while ((m_cachedRead = m_read->load(std::memory_order_acquire)) == currentWrite) {
+        std::this_thread::yield();
+
+        curTick = GetTickCount64();
+        start = start > 0 ? start : curTick;
+
+        if (pbEarlyOutSignal && pbEarlyOutSignal->load()) {
+          return false;
+        }
+        if (timeoutMS != 0 && start + timeoutMS <= curTick) {
+          return false;
+        }
+      }
+      return true;
     }
   };
 

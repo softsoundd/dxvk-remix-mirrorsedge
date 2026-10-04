@@ -7684,20 +7684,27 @@ namespace dxvk {
     const uint32_t retentionFrames =
       std::max(1u, m_frameOptions.ue3StaticLocalMeshVertexCaptureCacheRetentionFrames);
 
-    m_ue3VertexCaptureCache.erase_if([&](auto it) {
-      if (currentFrame - it->second.lastFrameTouched <= retentionFrames) {
-        return false;
-      }
-      m_ue3VertexCaptureCacheBytes -= std::min(m_ue3VertexCaptureCacheBytes, it->second.byteSize);
-      return true;
-    });
+    // Expiry is a staleness bound hundreds of frames long and the budget below is what bounds
+    // memory, so both maps are swept every 1/16 of the window rather than every frame.
+    const uint32_t sweepIntervalFrames = std::max(1u, retentionFrames / 16);
+    if (currentFrame - m_ue3VertexCaptureLastSweepFrame >= sweepIntervalFrames) {
+      m_ue3VertexCaptureLastSweepFrame = currentFrame;
 
-    // Admission records are pure bookkeeping, but a churning key mints one per draw per frame,
-    // so they need the same expiry to stay bounded. A key still warming up is re-seen every
-    // frame, so the retention window is more than enough to keep it alive.
-    m_ue3VertexCaptureAdmission.erase_if([&](auto it) {
-      return currentFrame - it->second.lastFrameSeen > retentionFrames;
-    });
+      m_ue3VertexCaptureCache.erase_if([&](auto it) {
+        if (currentFrame - it->second.lastFrameTouched <= retentionFrames) {
+          return false;
+        }
+        m_ue3VertexCaptureCacheBytes -= std::min(m_ue3VertexCaptureCacheBytes, it->second.byteSize);
+        return true;
+      });
+
+      // Admission records are pure bookkeeping, but a churning key mints one per draw per frame,
+      // so they need the same expiry to stay bounded. A key still warming up is re-seen every
+      // frame, so the retention window is more than enough to keep it alive.
+      m_ue3VertexCaptureAdmission.erase_if([&](auto it) {
+        return currentFrame - it->second.lastFrameSeen > retentionFrames;
+      });
+    }
 
     enforceUe3StaticVertexCaptureCacheBudget();
   }
@@ -12469,10 +12476,12 @@ namespace dxvk {
   }
 
   void D3D9Rtx::submitActiveDrawCallState() {
+    // The next draw carries on from m_activeDrawCallState, so the queue gets a copy of it.
     // We must be prepared for `push` failing here, this can happen, since we're pushing to a circular buffer, which 
     //  may not have room for new entries.  In such cases, we trust that the consumer thread will make space for us, and
     //  so we may just need to wait a little bit.
-    while (!m_drawCallStateQueue.push(std::move(m_activeDrawCallState))) {
+    DrawCallState drawCallState = m_activeDrawCallState;
+    while (!m_drawCallStateQueue.push(std::move(drawCallState))) {
       Sleep(0);
     }
   }

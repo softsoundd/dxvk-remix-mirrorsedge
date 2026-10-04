@@ -28,6 +28,9 @@
 class Direct3DQuery9_LSS: public D3DBase<IDirect3DQuery9> {
   void onDestroy() override;
   D3DQUERYTYPE m_type;
+  // UID of the last Issue(D3DISSUE_END) of an event query (eventQueryServerCompletion).
+  uint32_t m_eventIssueUid = 0;
+  bool m_eventIssued = false;
 
 protected:
   BaseDirect3DDevice9Ex_LSS* const m_pDevice = nullptr;

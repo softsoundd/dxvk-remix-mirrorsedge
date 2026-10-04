@@ -675,7 +675,9 @@ namespace dxvk {
                "Diagnostics: log roughly every 5 seconds which geometries required a BLAS build or refit per frame "
                "(vertex/index counts, skinning, smooth-normals tagging, UE3 pass, shader and material hashes) and why "
                "(new object, vertex positions, vertex shader constants, bones or indices changed). Per-frame BLAS refits, "
-               "geometry re-interleaving and smooth normal regeneration all follow from these events.");
+               "geometry re-interleaving and smooth normal regeneration all follow from these events. Also counts draws per "
+               "frame by update path: the preserve path, or the first preserve condition that sent the draw down the "
+               "dynamic path.");
     RTX_OPTION("rtx", bool, trackHashUsageOnlyWhenNeeded, true,
                "CPU performance optimization. Every draw records its mesh and texture hash in two per-frame maps that only "
                "the graph components Mesh Hash Checker and Texture Hash Checker read. With this on the recording is skipped "

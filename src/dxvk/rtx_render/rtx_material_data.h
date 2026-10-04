@@ -175,13 +175,13 @@
 #define WRITE_CONSTANT_MEMBER_FUNC(name, usd_attr, type, minVal, maxVal, defaultVal) \
       type& get##name() { return m_##name; } \
       const type& get##name() const { return m_##name; } \
-      void set##name(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); sanitizeData(); updateCachedHash(); } \
+      void set##name(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); if (!m_batchingSetters) { sanitizeData(); updateCachedHash(); } } \
       static pxr::TfToken get##name##Token() { return pxr::TfToken("inputs:"#usd_attr); }
 
 #define WRITE_TEXTURE_MEMBER_FUNC(name, usd_attr, type, minVal, maxVal, defaultVal) \
       type& get##name() { return m_##name; } \
       const type& get##name() const { return m_##name; } \
-      void set##name(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); sanitizeData(); updateCachedHash(); } \
+      void set##name(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); if (!m_batchingSetters) { sanitizeData(); updateCachedHash(); } } \
       static pxr::TfToken get##name##Token() { return pxr::TfToken("inputs:"#usd_attr); }
 
 #define WRITE_CONSTANT_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
@@ -262,6 +262,17 @@ struct name##Data {                                                             
     updateCachedHash();                                                                              \
   }                                                                                                  \
                                                                                                      \
+  /* Runs f, which may call any number of setters, then sanitizes and hashes once instead of after */ \
+  /* every setter. Sanitization clamps each constant independently, so the result is the same.    */ \
+  template<typename F>                                                                               \
+  void batchSet(F&& f) {                                                                             \
+    m_batchingSetters = true;                                                                        \
+    f(*this);                                                                                        \
+    m_batchingSetters = false;                                                                       \
+    sanitizeData();                                                                                  \
+    updateCachedHash();                                                                              \
+  }                                                                                                  \
+                                                                                                     \
   const XXH64_hash_t getHash() const {                                                               \
     return m_cachedHash;                                                                             \
   }                                                                                                  \
@@ -316,6 +327,7 @@ private:                                                                        
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
+  bool m_batchingSetters = false;                                                                    \
 };
 
 namespace dxvk {

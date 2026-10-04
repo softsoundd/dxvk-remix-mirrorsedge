@@ -551,7 +551,9 @@ bool RemixAttach(HMODULE hModule) {
     initModuleBridge();
     initDeviceBridge();
 
-    gpPresent = new NamedSemaphore("Present", 0, GlobalOptions::getPresentSemaphoreMaxFrames());
+    // Created here, before the server is launched, so these counts are the ones that apply.
+    gpPresent = new NamedSemaphore("Present", GlobalOptions::getPresentSemaphoreMaxFrames(),
+                                   std::max<uint8_t>(1, GlobalOptions::getPresentSemaphoreMaxFrames()));
 
     BridgeState::setClientState(BridgeState::ProcessState::Init);
 

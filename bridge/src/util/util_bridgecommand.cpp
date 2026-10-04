@@ -279,15 +279,16 @@ DECL_COMMAND_FUNC(,Command,const Commands::D3D9Command command,
   s_pWriterChannel->m_mutex.lock();
 #endif
 
-  assert(!s_pWriterChannel->pbCmdInProgress->load());
-  if (s_pWriterChannel->pbCmdInProgress->load()) {
+  // Only touched by the thread sending on this channel (under m_mutex on the client), so relaxed.
+  assert(!s_pWriterChannel->pbCmdInProgress->load(std::memory_order_relaxed));
+  if (s_pWriterChannel->pbCmdInProgress->load(std::memory_order_relaxed)) {
     Logger::errLogMessageBoxAndExit(logger_strings::MultipleActiveCommands);
   }
   // Only start a data batch if the bridge is actually enabled, otherwise this becomes a no-op
   if (gbBridgeRunning) {
     s_pWriterChannel->data->begin_batch();
   }
-  s_pWriterChannel->pbCmdInProgress->store(true);
+  s_pWriterChannel->pbCmdInProgress->store(true, std::memory_order_relaxed);
   s_curBatchStartPos = (int32_t) s_pWriterChannel->data->get_pos();
   s_cmdCounter++;
   if (gbBridgeRunning) {
@@ -346,7 +347,7 @@ DECL_COMMAND_FUNC(,~Command) {
         Logger::debug(format_string("The command %s took %d retries (%d ms)!", command.c_str(), numRetries, numRetries * GlobalOptions::getCommandTimeout()));
       }
   }
-  s_pWriterChannel->pbCmdInProgress->store(false);
+  s_pWriterChannel->pbCmdInProgress->store(false, std::memory_order_relaxed);
 #ifdef REMIX_BRIDGE_CLIENT
   ++s_cmdUID;
   s_pWriterChannel->m_mutex.unlock();
