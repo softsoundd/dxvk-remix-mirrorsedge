@@ -564,6 +564,7 @@ namespace dxvk {
     m_toneMapping(device),
     m_localToneMapping(device),
     m_ue3ToneMapping(device),
+    m_ue3MapSettings(device),
     m_bloom(device),
     m_geometryUtils(device),
     m_imageUtils(device),

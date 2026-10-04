@@ -33,6 +33,7 @@
 #include "config/config.h"
 #include "config/global_options.h"
 #include "di_hook.h"
+#include "game_map.h"
 #include "game_patches.h"
 #include "log/log.h"
 #include "remix_state.h"
@@ -547,6 +548,7 @@ bool RemixAttach(HMODULE hModule) {
     initRemixMessageChannel();
     RemixState::init(*gpRemixMessageChannel);
     GamePatches::init(*gpRemixMessageChannel);
+    GameMap::init(*gpRemixMessageChannel);
 
     initModuleBridge();
     initDeviceBridge();

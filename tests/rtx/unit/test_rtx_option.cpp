@@ -257,6 +257,11 @@ namespace rtx_option_test {
     // User hashset (with UserSetting flag) - should be in user.conf
     RTX_OPTION_ARGS("rtx.test", fast_unordered_set, testMigrateUserHash, {}, "User hashset for migration test",
       args.flags = RtxOptionFlags::UserSetting);
+
+    // Options for the layer target override test
+    RTX_OPTION("rtx.test", int32_t, testTargetOverrideDeveloper, 100, "Developer option for layer target override test");
+    RTX_OPTION_ARGS("rtx.test", int32_t, testTargetOverrideUser, 200, "User option for layer target override test",
+      args.flags = RtxOptionFlags::UserSetting);
   };
 
   // ============================================================================
@@ -2931,6 +2936,68 @@ namespace rtx_option_test {
   }
 
   // ============================================================================
+  // Test: Layer Target Override
+  // Tests that RtxOptionLayerTarget's override layer takes user-driven changes to options without the
+  // UserSetting flag, that nested scopes keep or clear it, and that it ends with its scope
+  // ============================================================================
+
+  void test_layerTargetOverride() {
+    std::cout << "  Running test_layerTargetOverride..." << std::endl;
+
+    Config emptyConfig;
+    const RtxOptionLayer* overrideLayer = RtxOptionManager::acquireLayer("",
+      RtxOptionLayerKey{ 20500, "TargetOverrideLayer" }, 1.0f, 0.1f, false, &emptyConfig);
+    TEST_ASSERT(overrideLayer != nullptr, "Failed to create test layer");
+
+    const RtxOptionImpl& developerOption = TestOptions::testTargetOverrideDeveloperObject();
+    const RtxOptionImpl& userOption = TestOptions::testTargetOverrideUserObject();
+    const RtxOptionLayer* rtxConfLayer = RtxOptionLayer::getRtxConfLayer();
+
+    {
+      RtxOptionLayerTarget target(RtxOptionEditTarget::User, overrideLayer);
+      TEST_ASSERT(developerOption.getTargetLayer() == overrideLayer,
+                  "Developer option should target the override layer");
+      TEST_ASSERT(userOption.getTargetLayer() == RtxOptionLayer::getUserLayer(),
+                  "User setting should still target the user layer");
+      {
+        RtxOptionLayerTarget nested(RtxOptionEditTarget::User);
+        TEST_ASSERT(developerOption.getTargetLayer() == overrideLayer,
+                    "A nested single-argument scope should keep the override");
+      }
+      {
+        RtxOptionLayerTarget nested(RtxOptionEditTarget::User, nullptr);
+        TEST_ASSERT(developerOption.getTargetLayer() == rtxConfLayer,
+                    "A nested scope with a null override should target rtx.conf");
+      }
+      {
+        RtxOptionLayerTarget nested(RtxOptionEditTarget::Derived);
+        TEST_ASSERT(developerOption.getTargetLayer() == RtxOptionLayer::getDerivedLayer(),
+                    "Code-driven changes should ignore the override");
+      }
+      TEST_ASSERT(developerOption.getTargetLayer() == overrideLayer,
+                  "The override should be restored when nested scopes end");
+
+      TestOptions::testTargetOverrideDeveloper.setDeferred(4242);
+      RtxOptionManager::applyPendingValues(nullptr, false);
+      TEST_ASSERT(developerOption.hasValueInLayer(overrideLayer), "setDeferred should write to the override layer");
+      TEST_ASSERT(!developerOption.hasValueInLayer(rtxConfLayer), "setDeferred should not write to rtx.conf");
+      TEST_ASSERT(TestOptions::testTargetOverrideDeveloper() == 4242, "The override layer's value should resolve");
+    }
+
+    {
+      RtxOptionLayerTarget target(RtxOptionEditTarget::User);
+      TEST_ASSERT(developerOption.getTargetLayer() == rtxConfLayer, "The override should end with its scope");
+    }
+
+    RtxOptionManager::releaseLayer(overrideLayer);
+    RtxOptionManager::applyPendingValues(nullptr, false);
+    TEST_ASSERT(TestOptions::testTargetOverrideDeveloper() == 100,
+                "testTargetOverrideDeveloper should return to its default when the layer is released");
+
+    std::cout << "    PASSED" << std::endl;
+  }
+
+  // ============================================================================
   // Test Runner
   // ============================================================================
   
@@ -2973,6 +3040,7 @@ namespace rtx_option_test {
     test_hasValueInLayer();
     test_multipleLayersComplex();
     test_migrateMiscategorizedOptions();
+    test_layerTargetOverride();
     
     // Blending tests
     test_floatBlending();

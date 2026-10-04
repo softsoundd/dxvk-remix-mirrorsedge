@@ -21,6 +21,7 @@
  */
 #include "game_patches.h"
 
+#include "code_scan.h"
 #include "log/log.h"
 
 #include "../../../src/util/util_game_patches.h"
@@ -35,18 +36,9 @@
 #include <vector>
 
 using namespace bridge_util;
+using namespace code_scan;
 
 namespace {
-  struct CodeSpan {
-    const uint8_t* begin;
-    size_t size;
-  };
-
-  struct BytePattern {
-    std::vector<uint8_t> bytes;
-    std::vector<uint8_t> mask;
-  };
-
   // Bytes swapped between their original and patched values by one interlocked store, so a thread
   // executing the instruction they belong to never fetches a torn one.
   struct PatchWrite {
@@ -158,7 +150,6 @@ namespace {
   // nop, then a jmp reusing the jz's rel32: it ends where the jz did, so it reaches the same target
   constexpr uint8_t kNopThenJump[] = { 0x90, 0xE9 };
 
-  constexpr size_t kMaxMatches = 8;
   constexpr size_t kMaxOwnerNoSeeWithShadowTests = 32;
 
   constexpr const char* kFrustumCullingName = "Disable frustum culling";
@@ -192,105 +183,6 @@ namespace {
 
   MessageChannelClient* g_pMsgChannel = nullptr;
   bool g_patchesLocated = false;
-
-  uint8_t parseHexDigit(const char c) {
-    return static_cast<uint8_t>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
-  }
-
-  BytePattern parsePattern(const char* text) {
-    BytePattern pattern;
-    for (const char* p = text; *p != '\0'; ) {
-      if (*p == ' ') {
-        ++p;
-        continue;
-      }
-      if (p[0] == '?') {
-        pattern.bytes.push_back(0);
-        pattern.mask.push_back(0);
-      } else {
-        pattern.bytes.push_back(static_cast<uint8_t>((parseHexDigit(p[0]) << 4) | parseHexDigit(p[1])));
-        pattern.mask.push_back(0xFF);
-      }
-      p += 2;
-    }
-    return pattern;
-  }
-
-  // Raw arguments only: __try cannot share a frame with objects that need unwinding.
-  // Returns the match count, storing at most maxMatches of them, or SIZE_MAX if the span faulted.
-  size_t scanSpan(const uint8_t* pBegin, const size_t size, const uint8_t* pBytes, const uint8_t* pMask,
-                  const size_t length, const uint8_t** pMatches, const size_t maxMatches) {
-    size_t count = 0;
-    __try {
-      for (size_t offset = 0; offset + length <= size; ++offset) {
-        size_t i = 0;
-        while (i < length && (pBegin[offset + i] & pMask[i]) == pBytes[i]) {
-          ++i;
-        }
-        if (i == length) {
-          if (count < maxMatches) {
-            pMatches[count] = pBegin + offset;
-          }
-          ++count;
-        }
-      }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-      return SIZE_MAX;
-    }
-    return count;
-  }
-
-  bool isReadableCode(const DWORD protect) {
-    return (protect & PAGE_GUARD) == 0 &&
-           (protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-  }
-
-  // Adjacent regions are merged so a pattern straddling a protection change another mod made is still found.
-  std::vector<CodeSpan> collectExecutableCode() {
-    std::vector<CodeSpan> spans;
-    const auto pBase = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
-    const uint8_t* pCursor = pBase;
-    MEMORY_BASIC_INFORMATION info;
-    while (VirtualQuery(pCursor, &info, sizeof(info)) == sizeof(info) && info.AllocationBase == pBase) {
-      const auto pRegion = static_cast<const uint8_t*>(info.BaseAddress);
-      if (info.State == MEM_COMMIT && isReadableCode(info.Protect)) {
-        if (!spans.empty() && spans.back().begin + spans.back().size == pRegion) {
-          spans.back().size += info.RegionSize;
-        } else {
-          spans.push_back({ pRegion, info.RegionSize });
-        }
-      }
-      pCursor = pRegion + info.RegionSize;
-    }
-    return spans;
-  }
-
-  const CodeSpan* findSpan(const std::vector<CodeSpan>& spans, const uint8_t* pAddress) {
-    for (const CodeSpan& span : spans) {
-      if (pAddress >= span.begin && pAddress < span.begin + span.size) {
-        return &span;
-      }
-    }
-    return nullptr;
-  }
-
-  std::vector<const uint8_t*> findInCode(const std::vector<CodeSpan>& spans, const BytePattern& pattern,
-                                         const size_t maxMatches = kMaxMatches) {
-    std::vector<const uint8_t*> found;
-    std::vector<const uint8_t*> matches(maxMatches);
-    for (const CodeSpan& span : spans) {
-      const size_t count = scanSpan(span.begin, span.size, pattern.bytes.data(), pattern.mask.data(),
-                                    pattern.bytes.size(), matches.data(), maxMatches);
-      if (count == SIZE_MAX) {
-        Logger::warn(format_string("[GamePatch] Skipped unreadable code at 0x%p.", static_cast<const void*>(span.begin)));
-        continue;
-      }
-      for (size_t i = 0; i < std::min(count, maxMatches) && found.size() < maxMatches; ++i) {
-        found.push_back(matches[i]);
-      }
-    }
-    return found;
-  }
 
   void addWrite(GamePatch& patch, uint8_t* pAddress, const uint8_t* original, const uint8_t* patched, const size_t size) {
     PatchWrite write;

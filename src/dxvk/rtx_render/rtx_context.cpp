@@ -1003,6 +1003,8 @@ namespace dxvk {
   void RtxContext::completeInjection(bool raytracedThisFrame, float gpuIdleTimeMilliseconds) {
     onInjectRtxFrameEnd(raytracedThisFrame);
 
+    m_common->metaUe3MapSettings().onFrameEnd();
+
     // apply changes to RtxOptions after the frame has ended
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
 

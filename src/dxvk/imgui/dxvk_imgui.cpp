@@ -1105,8 +1105,9 @@ namespace dxvk {
   }
 
   void ImGUI::showMainMenu(const Rc<DxvkContext>& ctx) {
-    // Target rtx.conf layer for developer menu changes
-    RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::User);
+    // Target rtx.conf layer for developer menu changes, or the current map's settings file while it is being edited
+    const RtxOptionLayer* mapEditLayer = ctx->getCommonObjects()->metaUe3MapSettings().getEditLayer();
+    RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::User, mapEditLayer);
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(m_windowOnRight ? viewport->Size.x - m_windowWidth : 0.f, viewport->Pos.y));
@@ -1128,6 +1129,14 @@ namespace dxvk {
       RemixGui::Checkbox("Default Menu", &RtxOptions::defaultToAdvancedUIObject());
       
       RemixGui::Separator();
+
+      if (mapEditLayer != nullptr) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Editing %s", mapEditLayer->getFilePath().c_str());
+        RemixGui::SetTooltipToLastWidgetOnHover(
+          "Changes in this menu go to the current map's settings file instead of rtx.conf, so they apply on this map only.\n"
+          "User settings still go to user.conf. Turn this off under Rendering > Mirror's Edge Map Settings.");
+        RemixGui::Separator();
+      }
 
       const static ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_NoCloseWithMiddleMouseButton;
       const static ImGuiTabItemFlags tab_item_flags = ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
@@ -3301,6 +3310,14 @@ namespace dxvk {
       if (RemixGui::CollapsingHeader("Sky Tuning", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
 
+        const std::string mapFilePath = ctx->getCommonObjects()->metaUe3MapSettings().getActiveFilePath();
+        if (!mapFilePath.empty()) {
+          ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f), "Map settings: %s", mapFilePath.c_str());
+          RemixGui::SetTooltipToLastWidgetOnHover(
+            "This map's settings file applies over rtx.conf, so the settings it contains take its values here.\n"
+            "To tune them for this map, turn on Edit This Map's Settings under Rendering > Mirror's Edge Map Settings.");
+        }
+
         // Sky mode selection.
         skyModeCombo.getKey(&RtxOptions::skyModeObject());
         RemixGui::SetTooltipToLastWidgetOnHover("Skybox Rasterization: Traditional skybox rendering\nPhysical Atmosphere: Physically based sky, sun and atmospheric haze");
@@ -4935,6 +4952,13 @@ namespace dxvk {
         "\"viewmode unlit\" does but without changing base pass shaders.");
       showPatch("Disable Velocity Pass", D3D9Rtx::ue3DisableVelocityPassObject(), kGamePatchDisableVelocityPass,
         "Skips the velocity pass the game's motion blur reads, like MotionBlur=False.");
+      ImGui::Unindent();
+    }
+
+    if (D3D9Rtx::ue3EngineMode() &&
+        RemixGui::CollapsingHeader("Mirror's Edge Map Settings", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      common->metaUe3MapSettings().showImguiSettings();
       ImGui::Unindent();
     }
 

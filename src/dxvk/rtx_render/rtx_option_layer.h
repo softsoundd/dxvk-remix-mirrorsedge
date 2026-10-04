@@ -402,13 +402,24 @@ namespace dxvk {
   public:
     // Construct with a target type. The layer is resolved from the target type.
     explicit RtxOptionLayerTarget(RtxOptionEditTarget target)
-      : m_previousTarget(s_currentTarget) {
+      : m_previousTarget(s_currentTarget)
+      , m_previousLayerOverride(s_currentLayerOverride) {
       s_currentTarget = target;
+    }
+
+    // As above, with user-driven changes to options without the UserSetting flag going to layerOverride
+    // instead of the Remix Config layer, or to the Remix Config layer if it is null.
+    RtxOptionLayerTarget(RtxOptionEditTarget target, const RtxOptionLayer* layerOverride)
+      : m_previousTarget(s_currentTarget)
+      , m_previousLayerOverride(s_currentLayerOverride) {
+      s_currentTarget = target;
+      s_currentLayerOverride = layerOverride;
     }
 
     // Destructor restores the previous target
     ~RtxOptionLayerTarget() {
       s_currentTarget = m_previousTarget;
+      s_currentLayerOverride = m_previousLayerOverride;
     }
 
     // Delete copy operations to prevent misuse
@@ -426,7 +437,12 @@ namespace dxvk {
       return s_currentTarget;
     }
 
+    static const RtxOptionLayer* getLayerOverride() {
+      return s_currentLayerOverride;
+    }
+
     RtxOptionEditTarget m_previousTarget;
+    const RtxOptionLayer* m_previousLayerOverride;
 
     // Thread-local current target. Defaults to Derived for programmatic/derived changes
     // when no menu is open. User target is set when in the User Graphics Menu,
@@ -436,6 +452,7 @@ namespace dxvk {
     // which is important for multi-threaded rendering where different threads
     // may be operating on different menus.
     inline static thread_local RtxOptionEditTarget s_currentTarget = RtxOptionEditTarget::Derived;
+    inline static thread_local const RtxOptionLayer* s_currentLayerOverride = nullptr;
   };
 
 } // namespace dxvk

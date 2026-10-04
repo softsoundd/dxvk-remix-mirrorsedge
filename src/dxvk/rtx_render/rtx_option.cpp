@@ -831,7 +831,10 @@ namespace dxvk {
       if (hasUserSettingsFlag) {
         return RtxOptionLayer::getUserLayer();
       }
-      // Options without UserSettings flag go to Remix Config layer
+      // Options without UserSettings flag go to the scope's override layer, or the Remix Config layer
+      if (const RtxOptionLayer* layerOverride = RtxOptionLayerTarget::getLayerOverride()) {
+        return layerOverride;
+      }
       return RtxOptionLayer::getRtxConfLayer();
     }
     

@@ -548,3 +548,38 @@ The runtime drops the draws of several UE3 passes as soon as they arrive (see `D
 - Dynamic shadows (`show dynamicshadows`): the `bAllowDynamicShadows` tests before `InitDynamicShadows` at the end of InitViews and before `RenderModulatedShadows`. Without the first no projected shadows exist, so no shadow depth or projection pass runs.
 - Dynamic lighting (the light-pass half of `viewmode unlit`): `Render`'s `SHOW_Lighting` block, which holds `RenderLights`, the modulated shadows and the lighting-only post process effects. Its `jz rel32` becomes a `nop` and an unconditional `jmp` with the same operand and target. Base pass shaders keep their lit permutations; only `viewmode unlit` itself changes those.
 - Velocity pass (`MotionBlur=False`): the `bAllowMotionBlur` test before `RenderVelocities`.
+
+## Per-map settings
+
+While a map is loaded, the runtime applies that map's settings file over `rtx.conf`, so any setting the game can change at runtime can differ per map, such as the Physical Atmosphere sun's `rtx.atmosphere.sunElevation`, `sunRotation` and `sunIlluminance` (its colour in the default Manual coefficient mode).
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3MapSettings` | True | Detects the loaded map and applies its settings file |
+| `rtx.d3d9.ue3MapSettingsDirectory` | `rtx-remix/maps` | Folder of the settings files, relative to the game's working directory (`Binaries`) |
+
+Both only take effect in `rtx.d3d9.ue3EngineMode`. Rendering > Mirror's Edge Map Settings in the developer menu shows the detected map and its file.
+
+### Map files
+
+A map's file is named after its package in lowercase: `tdmainmenu.conf` for the main menu, `edge_p.conf` for the Prologue, etc. It holds ordinary `rtx.conf` lines:
+
+```ini
+rtx.atmosphere.sunElevation = 32
+rtx.atmosphere.sunRotation = 145
+rtx.atmosphere.sunIlluminance = 20, 18.5, 16
+```
+
+Each file is an option layer at priority 1000: above `rtx.conf`, and below Remix Logic's default (10000), so a Logic graph can still override a map's settings in one area of it. `user.conf` and the graphics presets override map files as they do `rtx.conf`. Settings read only at startup cannot change per map, and an option flagged `NoReset` keeps a map's value after the map unloads. Lines setting `rtx.d3d9.ue3EngineMode` or the two options above are ignored with a warning, since a map file switching map settings off would unload itself and so switch them back on.
+
+### Editing a map's settings
+
+Edit This Map's Settings, in the same panel, sends the developer menu's changes to the current map's file instead of `rtx.conf`, user settings (graphics preferences) aside, so Sky Tuning tunes the sun for that map only. A banner at the top of the menu names the file, and Save writes it, creating it and its folder for a map that had none. The toggle stays on across map loads, each map's changes going to its own file. Unsaved changes are kept when their map unloads and restored when it loads again, until the game exits, and a file edited by hand is read again whenever its map loads.
+
+The routing is `RtxOptionLayerTarget`'s two-argument constructor, which `ImGUI::showMainMenu` passes the map's layer while it is being edited.
+
+### Detecting the map
+
+The name is `UGameEngine::LastURL.Map`, which `UGameEngine::LoadMap` assigns once the new world has begun play. It is the persistent map, which streaming levels do not change, and the package `WorldInfo.GetMapName` takes its name from. Loading screens therefore keep the previous map, and the first frame or two after a load can still show its settings, behind the game's fade in.
+
+The bridge client reads it on the game's window thread whenever the runtime asks, every 250 ms, over the window-message channel the [game executable patches](#game-executable-patches) use. It finds `GNames` and `GObjects` by code signature (verified against the GOG executable), then the `TdGameEngine` object that is not the class default object, and reads `LastURL.Map` only while `LastURL.Protocol` reads `unreal`, which guards the SDK offsets it relies on. A window message carries two 32-bit values, so the answer carries the name's hash, its length and a status, and the name follows in chunks when its hash differs from the query's. One query is in flight at a time, repeated after 2 seconds without an answer, which covers an answer lost before the channel's handshake as well as a game thread busy loading. The client logs to `bridge32.log` with the prefix `[GameMap]`, and the runtime logs each switch with `[UE3 Map]`.

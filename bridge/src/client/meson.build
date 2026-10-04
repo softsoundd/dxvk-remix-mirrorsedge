@@ -28,6 +28,7 @@ d3d9_version = vcs_tag(
 d3d9_res = wrc_generator.process(d3d9_version)
 
 d3d9_src = files([
+  'code_scan.cpp',
   'd3d9_bootstrap.cpp',
   'd3d9_cubetexture.cpp',
   'd3d9_device_base.cpp',
@@ -48,6 +49,7 @@ d3d9_src = files([
   'd3d9_volume.cpp',
   'd3d9_volumetexture.cpp',
   'di_hook.cpp',
+  'game_map.cpp',
   'game_patches.cpp',
   'message_channels.cpp',
   'pch.cpp',
@@ -59,6 +61,7 @@ d3d9_src = files([
 d3d9_header = files([
   'base.h',
   'client_options.h',
+  'code_scan.h',
   'd3d9_base_texture.h',
   'd3d9_commonshader.h',
   'd3d9_cubetexture.h',
@@ -84,6 +87,7 @@ d3d9_header = files([
   'detours_common.h',
   'di_hook.h',
   'framework.h',
+  'game_map.h',
   'game_patches.h',
   'lockable_buffer.h',
   'message_channels.h',

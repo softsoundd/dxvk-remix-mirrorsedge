@@ -49,6 +49,7 @@
 #include "rtx_render/rtx_tone_mapping.h"
 #include "rtx_render/rtx_local_tone_mapping.h"
 #include "rtx_render/rtx_ue3_tone_mapping.h"
+#include "rtx_render/rtx_ue3_map_settings.h"
 #include "rtx_render/rtx_bloom.h"
 #include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_image_utils.h"
@@ -270,6 +271,10 @@ namespace dxvk {
       return m_ue3ToneMapping.get();
     }
 
+    Ue3MapSettings& metaUe3MapSettings() {
+      return m_ue3MapSettings.get();
+    }
+
     DxvkBloom& metaBloom() {
       return m_bloom.get();
     }
@@ -418,6 +423,7 @@ namespace dxvk {
     Active<DxvkToneMapping>                 m_toneMapping;
     Active<DxvkLocalToneMapping>            m_localToneMapping;
     Active<DxvkUe3ToneMapping>              m_ue3ToneMapping;
+    Active<Ue3MapSettings>                  m_ue3MapSettings;
     Active<DxvkBloom>                       m_bloom;
     Active<RtxGeometryUtils>                m_geometryUtils;
     Active<RtxImageUtils>                   m_imageUtils;
