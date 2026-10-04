@@ -23,6 +23,24 @@
 
 #include "rtx/utility/shader_types.h"
 
+// The multiple scattering texture (multiscattering_lut.comp.slang) is an atlas of tiles of multiscatteringLutSize^2
+// texels over (sun zenith cosine, altitude). Tile row 0 holds the isotropic estimate of the bake's first pass (only
+// its scratch copy keeps one), then the second moments of the radiance field that the R, G and B Rayleigh responses
+// need; each later row holds one relative azimuth of the aerosol response, one tile per view zenith.
+#define ATMOSPHERE_MS_VIEW_ZENITH_COUNT 16
+#define ATMOSPHERE_MS_RELATIVE_AZIMUTH_COUNT 8
+#define ATMOSPHERE_MS_ATLAS_TILES_X ATMOSPHERE_MS_VIEW_ZENITH_COUNT
+#define ATMOSPHERE_MS_ATLAS_TILES_Y (ATMOSPHERE_MS_RELATIVE_AZIMUTH_COUNT + 1)
+
+// Passes of the multiple scattering bake, see multiscattering_lut.comp.slang.
+#define ATMOSPHERE_MS_PASS_ISOTROPIC 0
+#define ATMOSPHERE_MS_PASS_FROM_ISOTROPIC 1
+#define ATMOSPHERE_MS_PASS_FROM_DIRECTIONAL 2
+
+struct AtmosphereMultiscatteringBakeArgs {
+  uint passIndex;
+};
+
 // Atmosphere parameters for Hillaire physically-based atmospheric scattering.
 struct AtmosphereArgs {
   vec3 sunDirection;
@@ -88,8 +106,8 @@ struct AtmosphereArgs {
 
   float mieForwardPeakWeight;  // Blend weight of the narrow HG forward lobe (sun aureole), 0 disables
   float mieForwardPeakG;       // Asymmetry of that forward lobe
-  uint multiscatteringSqrtDirectionCount;  // Directions per axis of the multiscattering LUT integral
-  uint multiscatteringStepCount;           // Ray march steps per direction in that integral
+  uint pad0;
+  uint multiscatteringStepCount;  // Ray march steps per direction of the multiple scattering bake
 
   // Tabulated aerosol phase function (OPAC Mie / T-matrix data), sampled by miePhase() instead of the
   // analytic lobes when enabled. The type and humidity identify the LUT's contents for the bake check.

@@ -64,10 +64,14 @@ namespace dxvk {
     class MultiscatteringLutShader : public ManagedShader {
       SHADER_SOURCE(MultiscatteringLutShader, VK_SHADER_STAGE_COMPUTE_BIT, multiscattering_lut)
 
+      PUSH_CONSTANTS(AtmosphereMultiscatteringBakeArgs)
+
       BEGIN_PARAMETER()
         CONSTANT_BUFFER(0)
         TEXTURE2D(1)
-        RW_TEXTURE2D(2)
+        TEXTURE2D(2)
+        TEXTURE2D(3)
+        RW_TEXTURE2D(4)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(MultiscatteringLutShader);
@@ -496,11 +500,14 @@ namespace dxvk {
       const float relativeHumidity = RtxOptions::aerosolRelativeHumidity();
       const RtxAtmosphere::AerosolOptics optics = RtxAtmosphere::getAerosolOptics(type, relativeHumidity);
 
-      // Koschmieder gives the total ground level extinction at 550 nm; the green channel stands for
-      // 550 nm, so whatever the molecules do not account for is aerosol. The type's spectral extinction
-      // spreads it over the channels' wavelengths.
-      const float totalExtinction550 = kKoschmiederConstant / std::max(RtxOptions::visibilityKm(), 0.5f);
-      const float aerosolExtinction550 = std::max(totalExtinction550 - args.rayleighScattering.y, 0.0f);
+      // OPAC types bring their own typical ground level extinction at 550 nm. A visibility instead gives the
+      // total through Koschmieder; the green channel stands for 550 nm, so whatever the molecules do not account
+      // for is aerosol. The type's spectral extinction spreads it over the channels' wavelengths.
+      float aerosolExtinction550 = optics.extinction550;
+      if (!optics.tabulated || RtxOptions::visibilityOverride()) {
+        const float totalExtinction550 = kKoschmiederConstant / std::max(RtxOptions::visibilityKm(), 0.5f);
+        aerosolExtinction550 = std::max(totalExtinction550 - args.rayleighScattering.y, 0.0f);
+      }
       const Vector3 aerosolExtinction = optics.extinctionRatio * aerosolExtinction550;
 
       const Vector3 ssa(
@@ -521,6 +528,23 @@ namespace dxvk {
       args.mieBoundaryLayerHeight = RtxOptions::boundaryLayerHeightKm();
       args.mieBoundaryLayerTransition = RtxOptions::boundaryLayerTransitionKm();
       args.mieBoundaryLayerTailScale = RtxOptions::freeTroposphereAerosolFraction();
+    }
+
+    // The sun, its colour and the viewpoint only reach the sky-view LUT; the transmittance and multiple
+    // scattering LUTs depend on the medium alone.
+    AtmosphereArgs clearSkyViewOnlyFields(AtmosphereArgs args) {
+      args.sunDirection = vec3(0.0f, 0.0f, 0.0f);
+      args.sunIlluminance = vec3(0.0f, 0.0f, 0.0f);
+      args.sunRayBrightness = 0.0f;
+      args.sunDiscEnabled = 0;
+      args.viewAltitude = 0.0f;
+      args.useSkyViewLut = 0;
+      args.sunAngularRadius = 0.0f;
+      args.sunDiscIlluminance = vec3(0.0f, 0.0f, 0.0f);
+      args.sunIlluminanceAerosol = vec3(0.0f, 0.0f, 0.0f);
+      args.skyViewStepCount = 0;
+      args.sunLimbDarkeningExponent = vec3(0.0f, 0.0f, 0.0f);
+      return args;
     }
 
   }
@@ -620,7 +644,6 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   args.skyViewLutWidth = kSkyViewLutWidth;
   args.skyViewLutHeight = kSkyViewLutHeight;
   args.aerosolPhaseLutSize = kAerosolPhaseLutSize;
-  args.multiscatteringSqrtDirectionCount = uint32_t(std::max(RtxOptions::multiscatteringDirections(), 2));
   args.multiscatteringStepCount = uint32_t(std::max(RtxOptions::multiscatteringSteps(), 4));
   args.skyViewStepCount = uint32_t(std::min(std::max(RtxOptions::skyViewSteps(), 16), 512));
 
@@ -745,13 +768,23 @@ RtxAtmosphere::AerosolOptics RtxAtmosphere::getAerosolOptics(AtmosphereAerosolTy
   return optics;
 }
 
-bool RtxAtmosphere::needsLutRecompute(const AtmosphereArgs& args) const {
+bool RtxAtmosphere::needsSkyViewRecompute(const AtmosphereArgs& args) const {
   if (!m_initialized || m_lutsNeedRecompute) {
     return true;
   }
 
   // Only the camera independent prefix matters here; see kBakeInvariantArgsSize.
   return memcmp(&args, &m_cachedArgs, kBakeInvariantArgsSize) != 0;
+}
+
+bool RtxAtmosphere::needsMediumRecompute(const AtmosphereArgs& args) const {
+  if (!m_initialized || m_lutsNeedRecompute) {
+    return true;
+  }
+
+  const AtmosphereArgs medium = clearSkyViewOnlyFields(args);
+  const AtmosphereArgs cachedMedium = clearSkyViewOnlyFields(m_cachedArgs);
+  return memcmp(&medium, &cachedMedium, kBakeInvariantArgsSize) != 0;
 }
 
 void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
@@ -771,11 +804,25 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     1 // mipLevels
   );
 
-  // Create multiscattering LUT (stores multiple scattering contribution)
-  VkExtent3D multiscatteringExtent = { kMultiscatteringLutSize, kMultiscatteringLutSize, 1 };
+  // Multiple scattering atlas (layout in atmosphere_args.h), and the scratch copy its bake passes alternate with.
+  VkExtent3D multiscatteringExtent = {
+    kMultiscatteringLutSize * ATMOSPHERE_MS_ATLAS_TILES_X, kMultiscatteringLutSize * ATMOSPHERE_MS_ATLAS_TILES_Y, 1 };
   m_multiscatteringLut = Resources::createImageResource(
     ctx,
     "Atmosphere Multiscattering LUT",
+    multiscatteringExtent,
+    VK_FORMAT_R16G16B16A16_SFLOAT,
+    1, // numLayers
+    VK_IMAGE_TYPE_2D,
+    VK_IMAGE_VIEW_TYPE_2D,
+    0, // imageCreateFlags
+    VK_IMAGE_USAGE_STORAGE_BIT, // extraUsageFlags
+    VkClearColorValue{}, // clearValue
+    1 // mipLevels
+  );
+  m_multiscatteringScratch = Resources::createImageResource(
+    ctx,
+    "Atmosphere Multiscattering Scratch",
     multiscatteringExtent,
     VK_FORMAT_R16G16B16A16_SFLOAT,
     1, // numLayers
@@ -960,19 +1007,22 @@ void RtxAtmosphere::computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args)
   // Before the bakes, which sample it.
   updateAerosolPhaseLut(ctx, args);
 
-  if (needsLutRecompute(args)) {
+  const bool mediumChanged = needsMediumRecompute(args);
+  if (mediumChanged || needsSkyViewRecompute(args)) {
     m_cachedArgs = args;
 
-    // Transmittance first: the multiscattering and sky-view bakes both sample it.
-    dispatchTransmittanceLut(ctx);
-    ctx->emitMemoryBarrier(0,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (mediumChanged) {
+      // Transmittance first: the multiscattering and sky-view bakes both sample it.
+      dispatchTransmittanceLut(ctx);
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-    dispatchMultiscatteringLut(ctx);
-    ctx->emitMemoryBarrier(0,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+      dispatchMultiscatteringLut(ctx);
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    }
 
     dispatchSkyViewLut(ctx);
     ctx->emitMemoryBarrier(0,
@@ -1016,15 +1066,43 @@ void RtxAtmosphere::dispatchTransmittanceLut(Rc<DxvkContext> ctx) {
 void RtxAtmosphere::dispatchMultiscatteringLut(Rc<DxvkContext> ctx) {
   ScopedGpuProfileZone(ctx, "Atmosphere Multiscattering LUT");
 
+  ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, MultiscatteringLutShader::getShader());
   ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
   ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
-  ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
-
+  ctx->bindResourceView(2, m_aerosolPhaseLut.view, nullptr);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
-  ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_multiscatteringLut.image);
+  ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerosolPhaseLut.image);
 
-  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, MultiscatteringLutShader::getShader());
-  ctx->dispatch((kMultiscatteringLutSize + 7) / 8, (kMultiscatteringLutSize + 7) / 8, 1);
+  // The isotropic estimate goes to the scratch atlas, then the full order passes alternate between the two
+  // atlases, each reading the previous pass, so the last one lands in m_multiscatteringLut. Dense haze needs the
+  // third full order pass to converge.
+  constexpr uint32_t kFullOrderPassCount = 3;
+  for (uint32_t pass = 0; pass <= kFullOrderPassCount; ++pass) {
+    const bool writesScratch = (pass % 2) == 0;
+    const Resources::Resource& input = writesScratch ? m_multiscatteringLut : m_multiscatteringScratch;
+    const Resources::Resource& output = writesScratch ? m_multiscatteringScratch : m_multiscatteringLut;
+
+    AtmosphereMultiscatteringBakeArgs bakeArgs = {};
+    bakeArgs.passIndex = pass == 0 ? ATMOSPHERE_MS_PASS_ISOTROPIC
+                       : pass == 1 ? ATMOSPHERE_MS_PASS_FROM_ISOTROPIC
+                       : ATMOSPHERE_MS_PASS_FROM_DIRECTIONAL;
+
+    ctx->bindResourceView(3, input.view, nullptr);
+    ctx->bindResourceView(4, output.view, nullptr);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(input.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(output.image);
+
+    ctx->pushConstants(0, sizeof(bakeArgs), &bakeArgs);
+    // One workgroup per texel of a tile.
+    ctx->dispatch(kMultiscatteringLutSize, kMultiscatteringLutSize, 1);
+
+    if (pass < kFullOrderPassCount) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+  }
 }
 
 void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {

@@ -195,7 +195,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
 
       vec3 sampleTransmittance;
       const vec3 contribution = transmittance * integrateAtmosphereStep(
-        samplePos, dt, args.sunDirection, phaseR, phaseM, sunShadowing, skyVisibility, args, AtmosphereMultiscatteringLut, sampleTransmittance);
+        samplePos, rayDir, dt, args.sunDirection, phaseR, phaseM, sunShadowing, skyVisibility, args, AtmosphereMultiscatteringLut, sampleTransmittance);
 
       if (any(isnan(contribution)) || any(isinf(contribution))) {
         continue;

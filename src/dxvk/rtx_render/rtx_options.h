@@ -1545,25 +1545,31 @@ namespace dxvk {
     // Aerosol (haze) model.
     RTX_OPTION("rtx.atmosphere", AtmosphereAerosolModel, aerosolModel, AtmosphereAerosolModel::Manual,
                "How the aerosol (haze) is specified. 0: Manual, ground level Mie coefficients from mieScattering / "
-               "mieAbsorption with an exponential profile. 1: Visibility, the ground level extinction follows from "
-               "visibilityKm through the Koschmieder relation (extinction = 3.912 / V at 550 nm) and aerosolType sets its "
-               "colour, absorption and phase, laid out in a well mixed boundary layer.");
+               "mieAbsorption with an exponential profile. 1: Visibility, aerosolType sets the haze's typical amount at "
+               "aerosolRelativeHumidity along with its colour, absorption and phase, laid out in a well mixed boundary layer; "
+               "visibilityOverride sets the amount from visibilityKm instead.");
+    RTX_OPTION("rtx.atmosphere", bool, visibilityOverride, false,
+               "Visibility aerosol model: take the amount of haze from visibilityKm through the Koschmieder relation "
+               "(extinction = 3.912 / V at 550 nm) instead of the aerosol type's typical concentration. The Custom type "
+               "always uses visibilityKm.");
     RTX_OPTION_ARGS("rtx.atmosphere", float, visibilityKm, 40.0f,
-               "Meteorological visibility at ground level in kilometers (Visibility aerosol model). 20-30 km is a "
-               "typical city day, 60 km clean continental air, 130 km the clearest continental conditions.",
+               "Meteorological visibility at ground level in kilometers, for the Custom aerosol type and visibilityOverride. "
+               "10-20 km is city smog, 40-60 km an average continental day, 100-150 km clean continental air.",
                args.minValue = 0.5f, args.maxValue = 400.0f);
     RTX_OPTION("rtx.atmosphere", AtmosphereAerosolType, aerosolType, AtmosphereAerosolType::ContinentalAverage,
                "Aerosol mixture for the Visibility aerosol model, one of the OPAC database types (Hess et al. 1998, Koepke et "
-               "al. 2015). Its single scattering albedo (how dark the haze is), spectral extinction (how much bluer than white "
-               "it scatters) and scattering phase function are tabulated per channel wavelength and relative humidity from "
-               "Mie theory, with mineral dust as spheroids. 0: Continental Clean, 1: Continental Average, 2: Continental "
-               "Polluted, 3: Urban, 4: Maritime Clean, 5: Desert Dust, 6: Custom (aerosolSingleScatteringAlbedo, "
-               "aerosolAngstromExponent, mieAnisotropy).");
-    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolRelativeHumidity, 80.0f,
+               "al. 2015). Its typical concentration (how much haze there is), single scattering albedo (how dark it is), "
+               "spectral extinction (how much bluer than white it scatters) and scattering phase function are tabulated per "
+               "channel wavelength and relative humidity from Mie theory, with mineral dust as spheroids. Typical ground "
+               "visibility at 50% humidity: Continental Clean 125 km, Continental Average 59 km, Continental Polluted 28 km, "
+               "Urban 14 km, Maritime Clean 53 km, Desert Dust 26 km. 0: Continental Clean, 1: Continental Average, "
+               "2: Continental Polluted, 3: Urban, 4: Maritime Clean, 5: Desert Dust, 6: Custom (visibilityKm, "
+               "aerosolSingleScatteringAlbedo, aerosolAngstromExponent, mieAnisotropy).");
+    RTX_OPTION_ARGS("rtx.atmosphere", float, aerosolRelativeHumidity, 50.0f,
                "Relative humidity the Visibility model's aerosol sits in, percent. Its water soluble particles swell as this "
-               "rises, which brightens the haze (less absorption per unit of extinction), whitens its colour and pulls its "
-               "scattering forward; the amount of haze still follows visibilityKm. Tabulated for OPAC's 0, 50, 70, 80, 90, "
-               "95, 98 and 99% classes and interpolated between them. Not used by the Custom type.",
+               "rises, which thickens the haze (unless visibilityOverride pins the amount), brightens it (less absorption per "
+               "unit of extinction), whitens its colour and pulls its scattering forward. Tabulated for OPAC's 0, 50, 70, 80, "
+               "90, 95, 98 and 99% classes and interpolated between them. Not used by the Custom type.",
                args.minValue = 0.0f, args.maxValue = 99.0f);
     RTX_OPTION("rtx.atmosphere", bool, aerosolMiePhase, true,
                "Scatter the Visibility model's aerosol with its type's own phase function from the OPAC database (Mie theory, "
@@ -1642,12 +1648,9 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.atmosphere", float, mieForwardPeakG, 0.97f,
                "Asymmetry of the analytic aerosol forward lobe.",
                args.minValue = 0.8f, args.maxValue = 0.999f);
-    RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringDirections, 8,
-               "Directions per axis integrated for each multiscattering LUT entry (squared for the total). The paper "
-               "uses 8; the LUT only bakes on parameter change, so raising this is cheap.",
-               args.minValue = 2, args.maxValue = 32);
-    RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringSteps, 20,
-               "Ray march steps per direction of the multiscattering LUT integral. The paper reports 20 as sufficient.",
+    RTX_OPTION_ARGS("rtx.atmosphere", int, multiscatteringSteps, 40,
+               "Ray march steps per direction of the multiple scattering bake. The long grazing paths through a hazy "
+               "boundary layer need about 40. The bake only runs when the medium changes.",
                args.minValue = 4, args.maxValue = 128);
     RTX_OPTION_ARGS("rtx.atmosphere", int, skyViewSteps, 128,
                "Ray march steps of the sky-view LUT bake, and of the inline sky when useSkyViewLut is off. The steps are "

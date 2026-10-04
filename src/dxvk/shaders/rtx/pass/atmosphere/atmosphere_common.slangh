@@ -40,8 +40,6 @@ static const float kPi = 3.14159265358979323846f;
 // distance zero; the multiscattering LUT's ground row, for one, would bake to nothing. Hillaire's
 // implementation applies the same 10 m offset (PLANET_RADIUS_OFFSET).
 static const float kPlanetRadiusOffset = 0.01f;
-// Isotropic phase function p_u, used for every scattering order beyond the first (paper Section 5.5.1).
-static const float kIsotropicPhase = 1.0f / (4.0f * kPi);
 
 // Rayleigh phase function including molecular anisotropy (Chandrasekhar 1960):
 // p = 3 / (16 pi) * ((1 + 3 gamma) + (1 - gamma) cos^2) / (1 + 2 gamma), gamma = rho / (2 - rho).
@@ -330,10 +328,11 @@ vec3 sampleTransmittanceLut(Texture2D transmittanceLut, float altitude, float vi
 }
 
 // Psi_ms of Equation 10: the transfer function (sr^-1) that converts a directional light's illuminance
-// into the contribution of every scattering order at or above two. Parameterized by sun zenith angle
-// cosine and altitude, per paper Section 5.5.2. The altitude axis is square root mapped rather than the
-// paper's linear one: it puts a quarter of the rows in the lowest 6 km, where the aerosol layer that
-// dominates the horizon's multiple scattering would otherwise fall between two rows.
+// into the contribution of every scattering order at or above two, per unit scattering coefficient. Each tile of
+// the multiple scattering texture is parameterized by sun zenith angle cosine and altitude, per paper Section
+// 5.5.2. The altitude axis is square root mapped rather than the paper's linear one: it puts a quarter of the
+// rows in the lowest 6 km, where the aerosol layer that dominates the horizon's multiple scattering would
+// otherwise fall between two rows.
 float multiscatteringLutAltitudeToV(float altitude, AtmosphereArgs args) {
   return sqrt(saturate(altitude / max(args.atmosphereThickness, kAtmosphereEpsilon)));
 }
@@ -342,13 +341,96 @@ float multiscatteringLutVToAltitude(float v, AtmosphereArgs args) {
   return v * v * args.atmosphereThickness;
 }
 
-vec3 sampleMultiscatteringLut(Texture2D multiscatteringLut, float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
-  const float u = unitRangeToTextureCoord(
-    (clamp(sunZenithCosAngle, -1.0f, 1.0f) + 1.0f) * 0.5f, args.multiscatteringLutSize);
-  const float v = unitRangeToTextureCoord(multiscatteringLutAltitudeToV(altitude, args), args.multiscatteringLutSize);
+// Texel coordinates within a tile, texel centres on the parameter range bounds.
+vec2 multiscatteringTileCoordinate(float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  const float last = float(args.multiscatteringLutSize) - 1.0f;
+  return vec2(
+    saturate((clamp(sunZenithCosAngle, -1.0f, 1.0f) + 1.0f) * 0.5f) * last,
+    multiscatteringLutAltitudeToV(altitude, args) * last);
+}
 
-  return max(sampleLut2DBilinearClamp(
-    multiscatteringLut, vec2(u, v), int(args.multiscatteringLutSize), int(args.multiscatteringLutSize)), vec3(0.0f));
+vec4 loadMultiscatteringTile(Texture2D multiscatteringLut, int2 tile, vec2 coordinate, AtmosphereArgs args) {
+  const int size = int(max(args.multiscatteringLutSize, 1u));
+  const vec2 clamped = clamp(coordinate, vec2(0.0f), vec2(float(size - 1)));
+  const int2 c0 = int2(floor(clamped));
+  const int2 c1 = min(c0 + 1, int2(size - 1));
+  const vec2 weight = clamped - vec2(c0);
+  const int2 origin = tile * size;
+
+  const vec4 t00 = multiscatteringLut.Load(int3(origin + int2(c0.x, c0.y), 0));
+  const vec4 t10 = multiscatteringLut.Load(int3(origin + int2(c1.x, c0.y), 0));
+  const vec4 t01 = multiscatteringLut.Load(int3(origin + int2(c0.x, c1.y), 0));
+  const vec4 t11 = multiscatteringLut.Load(int3(origin + int2(c1.x, c1.y), 0));
+
+  return mix(mix(t00, t10, weight.x), mix(t01, t11, weight.x), weight.y);
+}
+
+// The bake's isotropic estimate, the paper's Psi_ms with the real phase functions and the ground's
+// interreflection in its series.
+vec3 sampleMultiscatteringIsotropic(Texture2D multiscatteringLut, float altitude, float sunZenithCosAngle, AtmosphereArgs args) {
+  const vec2 coordinate = multiscatteringTileCoordinate(altitude, sunZenithCosAngle, args);
+  return max(loadMultiscatteringTile(multiscatteringLut, int2(0, 0), coordinate, args).rgb, vec3(0.0f));
+}
+
+// Psi_ms per species for the light that leaves a point at the given altitude against viewDir, i.e. the radiance
+// field of every order past the first scattered through each species' own phase function toward the viewer
+// (see multiscattering_lut.comp.slang). up is the local vertical.
+void evalMultipleScatteringPsi(
+  Texture2D multiscatteringLut,
+  float altitude,
+  vec3 up,
+  vec3 viewDir,
+  vec3 sunDir,
+  AtmosphereArgs args,
+  out vec3 rayleighPsi,
+  out vec3 aerosolPsi)
+{
+  const float sunZenithCosAngle = clamp(dot(up, sunDir), -1.0f, 1.0f);
+  const vec2 coordinate = multiscatteringTileCoordinate(altitude, sunZenithCosAngle, args);
+
+  // Local frame of the bake: vertical, horizontal toward the sun and across. A sun at the zenith leaves the
+  // field symmetric about the vertical, so any horizontal axis serves.
+  vec3 towardSun = sunDir - up * sunZenithCosAngle;
+  const float towardSunLength = length(towardSun);
+  if (towardSunLength > 1e-4f) {
+    towardSun /= towardSunLength;
+  } else {
+    towardSun = normalize(cross(up, abs(up.x) < 0.9f ? vec3(1.0f, 0.0f, 0.0f) : vec3(0.0f, 0.0f, 1.0f)));
+  }
+  const float viewVertical = clamp(dot(viewDir, up), -1.0f, 1.0f);
+  const float viewTowardSun = dot(viewDir, towardSun);
+  const float viewAcross = abs(dot(viewDir, cross(up, towardSun)));
+
+  // Rayleigh: p(mu) = a + b mu^2, so its response to the field is a * trace(M) + b * v^T M v with M the field's
+  // second moments, stored per channel as (toward sun^2, across^2, vertical^2, toward sun * vertical).
+  const float gamma = args.rayleighPhaseGamma;
+  const float scale = 3.0f / (16.0f * kPi * (1.0f + 2.0f * gamma));
+  const float isotropicTerm = scale * (1.0f + 3.0f * gamma);
+  const float cosineTerm = scale * (1.0f - gamma);
+  const vec4 basis = vec4(
+    viewTowardSun * viewTowardSun, viewAcross * viewAcross, viewVertical * viewVertical, 2.0f * viewTowardSun * viewVertical);
+  rayleighPsi = vec3(0.0f);
+  for (int channel = 0; channel < 3; ++channel) {
+    const vec4 moments = loadMultiscatteringTile(multiscatteringLut, int2(1 + channel, 0), coordinate, args);
+    rayleighPsi[channel] = isotropicTerm * (moments.x + moments.y + moments.z) + cosineTerm * dot(moments, basis);
+  }
+  rayleighPsi = max(rayleighPsi, vec3(0.0f));
+
+  // Aerosol: one tile per view zenith, square root compressed toward the horizon, and azimuth from the sun.
+  const float viewZenithCoordinate =
+    (sign(viewVertical) * sqrt(abs(viewVertical)) + 1.0f) * 0.5f * float(ATMOSPHERE_MS_VIEW_ZENITH_COUNT - 1);
+  const float azimuthCoordinate =
+    saturate(atan2(viewAcross, viewTowardSun) / kPi) * float(ATMOSPHERE_MS_RELATIVE_AZIMUTH_COUNT - 1);
+  const int v0 = clamp(int(viewZenithCoordinate), 0, ATMOSPHERE_MS_VIEW_ZENITH_COUNT - 2);
+  const int a0 = clamp(int(azimuthCoordinate), 0, ATMOSPHERE_MS_RELATIVE_AZIMUTH_COUNT - 2);
+  const float viewWeight = saturate(viewZenithCoordinate - float(v0));
+  const float azimuthWeight = saturate(azimuthCoordinate - float(a0));
+
+  const vec3 a00 = loadMultiscatteringTile(multiscatteringLut, int2(v0, 1 + a0), coordinate, args).rgb;
+  const vec3 a10 = loadMultiscatteringTile(multiscatteringLut, int2(v0 + 1, 1 + a0), coordinate, args).rgb;
+  const vec3 a01 = loadMultiscatteringTile(multiscatteringLut, int2(v0, 2 + a0), coordinate, args).rgb;
+  const vec3 a11 = loadMultiscatteringTile(multiscatteringLut, int2(v0 + 1, 2 + a0), coordinate, args).rgb;
+  aerosolPsi = max(mix(mix(a00, a10, viewWeight), mix(a01, a11, viewWeight), azimuthWeight), vec3(0.0f));
 }
 
 // Transmittance from a point in the atmosphere to the sun, combining the atmospheric shadowing term
@@ -427,11 +509,13 @@ bool clipAtmosphereMarch(
 
 // Scattering of one march step of length dt at samplePos (Equation 11), integrated analytically over
 // the step against its own extinction (Equation 17): integral of exp(-sigma_t x) S dx = S (1 - T) / sigma_t.
-// sunShadowing is S(x, l) of Equation 4 times any further visibility the caller applies, and
-// skyVisibility scales the multiple scattering, which stands for the sky light reaching the step. The
-// running transmittance to the step is left to the caller; outSampleTransmittance is the step's own.
+// rayDir is the march direction, away from the viewer. sunShadowing is S(x, l) of Equation 4 times any further
+// visibility the caller applies, and skyVisibility scales the multiple scattering, which stands for the sky
+// light reaching the step. The running transmittance to the step is left to the caller;
+// outSampleTransmittance is the step's own.
 vec3 integrateAtmosphereStep(
   vec3 samplePos,
+  vec3 rayDir,
   float dt,
   vec3 sunDir,
   float phaseR,
@@ -453,10 +537,13 @@ vec3 integrateAtmosphereStep(
 
   const vec3 singleScatter = sunShadowing * (rayleighLight * phaseR + mieLight * phaseM);
 
-  // Every higher scattering order, via the paper's Psi_ms transfer function. Equation 11 applies
-  // sigma_s and the light's illuminance exactly once each, so neither is baked into the LUT.
+  // Every higher scattering order, via the Psi_ms transfer function. Equation 11 applies sigma_s and the
+  // light's illuminance exactly once each, so neither is baked into the LUT.
   const vec3 up = normalize(samplePos - planetCenter);
-  const vec3 multiScatter = skyVisibility * sampleMultiscatteringLut(multiscatteringLut, altitude, dot(up, sunDir), args) * (rayleighLight + mieLight);
+  vec3 rayleighPsi;
+  vec3 aerosolPsi;
+  evalMultipleScatteringPsi(multiscatteringLut, altitude, up, rayDir, sunDir, args, rayleighPsi, aerosolPsi);
+  const vec3 multiScatter = skyVisibility * (rayleighLight * rayleighPsi + mieLight * aerosolPsi);
 
   const vec3 scatteredLight = max(singleScatter + multiScatter, vec3(0.0f));
 
@@ -520,7 +607,7 @@ vec3 evalAtmosphereRadianceSegment(
 
     vec3 sampleTransmittance;
     const vec3 contribution = transmittance * integrateAtmosphereStep(
-      samplePos, dt, sunDir, phaseR, phaseM, sunShadowing, vec3(1.0f), args, multiscatteringLut, sampleTransmittance);
+      samplePos, rayDir, dt, sunDir, phaseR, phaseM, sunShadowing, vec3(1.0f), args, multiscatteringLut, sampleTransmittance);
 
     // Skip numerical edge cases rather than letting a NaN poison the whole ray.
     if (any(isnan(contribution)) || any(isinf(contribution))) {

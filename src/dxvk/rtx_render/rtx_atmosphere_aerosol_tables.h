@@ -61,7 +61,7 @@ constexpr float kAngleDegrees[kAngleCount] = {
 };
 
 struct TypeOptics {
-  float extinction550;             // km^-1 at OPAC's own number densities, 550 nm (for reference)
+  float extinction550;             // km^-1 at OPAC's own number densities, 550 nm: the type's typical amount
   float extinctionRatio[3];        // Extinction at the channel wavelength relative to 550 nm
   float singleScatteringAlbedo[3];
   float asymmetry[3];

@@ -51,9 +51,9 @@ public:
   /**
    * \brief Compute atmospheric LUTs if needed
    *
-   * The transmittance, multiscattering and sky-view LUTs only depend on the atmosphere parameters,
-   * so they are rebaked when those change. The sky-view hemisphere mean is derived from the sky-view
-   * LUT at the same time. The aerial perspective volume is rebuilt every frame by
+   * The transmittance and multiscattering LUTs depend on the medium alone and the sky-view LUT also on the
+   * sun and the viewpoint, so each is rebaked when its inputs change. The sky-view hemisphere mean is derived
+   * from the sky-view LUT at the same time. The aerial perspective volume is rebuilt every frame by
    * dispatchAerialPerspective() instead, once the primary hits it is bounded by exist.
    */
   void computeLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
@@ -65,11 +65,6 @@ public:
    * composite. computeLuts() must have run this frame.
    */
   void dispatchAerialPerspective(RtxContext& ctx, const Resources::RaytracingOutput& rtOutput);
-
-  /**
-   * \brief Check if the parameter-driven LUTs need recomputation
-   */
-  bool needsLutRecompute(const AtmosphereArgs& args) const;
 
   /**
    * \brief Get transmittance LUT resource
@@ -187,6 +182,8 @@ public:
   void dropDistantSunLight();
 
 private:
+  bool needsSkyViewRecompute(const AtmosphereArgs& args) const;
+  bool needsMediumRecompute(const AtmosphereArgs& args) const;
   void createLutResources(Rc<DxvkContext> ctx);
   void ensureAerialPerspectiveLuts(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
   void updateAerosolPhaseLut(Rc<DxvkContext> ctx, const AtmosphereArgs& args);
@@ -201,7 +198,7 @@ private:
   // LUT dimensions
   static constexpr uint32_t kTransmittanceLutWidth = 512;   // Increased from 256 for better precision
   static constexpr uint32_t kTransmittanceLutHeight = 128;  // Increased from 64 for better precision
-  static constexpr uint32_t kMultiscatteringLutSize = 32;
+  static constexpr uint32_t kMultiscatteringLutSize = 32;  // Per tile of the multiple scattering atlas
   static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
   static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
   // Over sqrt(theta / pi): 0.07 degree texels at the forward peak, 1.4 degrees at back-scatter.
@@ -217,6 +214,7 @@ private:
 
   Resources::Resource m_transmittanceLut;
   Resources::Resource m_multiscatteringLut;
+  Resources::Resource m_multiscatteringScratch;
   Resources::Resource m_skyViewLut;
   Resources::Resource m_skyHemisphereMean;
   // Two of each so the ray traced variant can reproject the previous frame while writing the current one.
