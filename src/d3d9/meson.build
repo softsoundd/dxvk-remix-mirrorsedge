@@ -88,6 +88,17 @@ d3d9_src = [
   'd3d9_rtx_utils.cpp',
   'd3d9_rtx_utils.h',
   'd3d9_rtx_geometry.cpp',
+  'd3d9_rtx_ue3.h',
+  'd3d9_rtx_ue3_helpers.h',
+  'd3d9_rtx_ue3_albedo.cpp',
+  'd3d9_rtx_ue3_camera.cpp',
+  'd3d9_rtx_ue3_classify.cpp',
+  'd3d9_rtx_ue3_diagnostics.cpp',
+  'd3d9_rtx_ue3_geometry_hash.cpp',
+  'd3d9_rtx_ue3_instancing.cpp',
+  'd3d9_rtx_ue3_material.cpp',
+  'd3d9_rtx_ue3_vertex_capture.cpp',
+  'd3d9_rtx_deferred_ui.cpp',
   'd3d9_swapchain_external.cpp',
 ]
 

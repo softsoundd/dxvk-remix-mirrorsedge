@@ -1,0 +1,333 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#include "d3d9_rtx.h"
+#include "d3d9_rtx_ue3_helpers.h"
+
+#include "d3d9_include.h"
+#include "d3d9_state.h"
+#include "d3d9_util.h"
+#include "d3d9_buffer.h"
+#include "d3d9_device.h"
+#include "d3d9_initializer.h"
+#include "../util/util_fastops.h"
+#include "../util/util_game_patches.h"
+#include "../util/util_math.h"
+#include "d3d9_rtx_utils.h"
+#include "d3d9_texture.h"
+#include "../dxso/dxso_color_terms.h"
+#include "../dxso/dxso_highlight_tints.h"
+#include "../dxso/dxso_material_fades.h"
+#include "../dxso/dxso_sampler_inference.h"
+#include "../dxso/dxso_ue3_material_identity.h"
+#include "../dxso/dxso_uv_dataflow.h"
+#include "../dxso/dxso_tables.h"
+#include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
+#include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../dxvk/rtx_render/rtx_ue3_tone_mapping.h"
+#include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
+#include "../dxvk/imgui/dxvk_imgui.h"
+#include <algorithm>
+#include <atomic>
+#include <bitset>
+#include <cassert>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <shared_mutex>
+#include <sstream>
+#include <system_error>
+
+namespace dxvk {
+
+  // Geometry hash/AABB memo eligibility: unlike the vertex-capture cache above, this only
+  // requires the IA vertex/index content to be immutable across frames - any vertex factory
+  // qualifies (a GPU-skinned mesh's bind-pose buffers are as static as a Local mesh's; only
+  // its bone constants animate, and those live in the per-draw VertexShader hash component
+  // which is recombined live rather than memoized).
+  bool D3D9Rtx::canMemoizeUe3IaGeometryHashes(const IndexContext& indexContext,
+                                              const VertexContext vertexContext[caps::MaxStreams],
+                                              const RasterGeometry& geoData) const {
+    if (!m_frameOptions.ue3StaticGeometryHashMemoization) {
+      return false;
+    }
+    if (!m_frameOptions.ue3EngineMode) {
+      return false;
+    }
+    // staging copies get a fresh physical slice every draw, so their keys never repeat and
+    // memo entries would be dead weight
+    if (m_forceGeometryCopy) {
+      return false;
+    }
+    if (d3d9State().vertexDecl == nullptr) {
+      return false;
+    }
+    if (!geoData.positionBuffer.defined()) {
+      return false;
+    }
+
+    if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR && !isStaticD3D9Buffer(indexContext.ibo)) {
+      return false;
+    }
+
+    for (const auto& element : d3d9State().vertexDecl->GetElements()) {
+      if (element.Stream >= caps::MaxStreams) {
+        return false;
+      }
+
+      // Instance-data streams are dynamic by nature and contribute nothing to the geometry the
+      // memo describes; computeUe3IaGeometryMemoKey leaves them out of the key for the same reason.
+      if ((m_currentUe3Instancing.instanceDataStreamMask & (1u << element.Stream)) != 0) {
+        continue;
+      }
+
+      const VertexContext& ctx = vertexContext[element.Stream];
+      if (ctx.mappedSlice.handle == VK_NULL_HANDLE || !isStaticD3D9Buffer(ctx.pVBO)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // IA-only identity for the geometry hash/AABB memo: draw range, decl, texcoord selection
+  // (it decides which stream feeds the hashed texcoord region) and per-buffer physical
+  // identity + content generation. Deliberately excludes the stable VS-constant hash and
+  // the object transform, so every instance of a mesh - and every animation pose of a
+  // skinned mesh - shares one entry.
+  XXH64_hash_t D3D9Rtx::computeUe3IaGeometryMemoKey(const IndexContext& indexContext,
+                                                    const VertexContext vertexContext[caps::MaxStreams],
+                                                    const DrawContext& drawContext,
+                                                    const RasterGeometry& geoData) const {
+    constexpr uint64_t kSeed = 0x7BD5C66E91A3D4F1ull;
+
+    const Ue3IaMemoKeyHeader header = makeUe3IaMemoKeyHeader(
+        indexContext, drawContext, geoData,
+        uint32_t(m_texcoordIndex), uint32_t(m_iaTexcoordIndex),
+        uint32_t(m_texcoordCompU), uint32_t(m_texcoordCompV),
+        uint32_t(m_uvResolutionMode), m_forceIaTexcoordForOutlier);
+
+    const XXH64_hash_t headerHash = XXH3_64bits_withSeed(&header, sizeof(header), kSeed);
+    return hashUe3KeyStreamRecords(d3d9State().vertexDecl->GetElements(), vertexContext, headerHash,
+                                   m_currentUe3Instancing.instanceDataStreamMask);
+  }
+
+  // Resolved once per vertex shader. The camera registers are always excluded: hashing them would
+  // make every draw's identity move with the view. Stock UE3 reserves two (VSR_ViewProjMatrix at c0,
+  // VSR_ViewOrigin at c4), which the defaults encode. The second variant additionally drops the
+  // object transform and the shading-only constants, which describe where a mesh is and how it is
+  // lit rather than what its geometry is.
+  Ue3VsHashExclusions D3D9Rtx::buildUe3VsHashExclusions(
+      const Ue3VsShaderCtabInfo& ctabInfo,
+      const std::vector<Ue3VsConstantSymbol>* symbols) {
+    using Range = Ue3VsHashExclusions::Range;
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> raw = {};
+    uint32_t rawCount = 0;
+    auto add = [&](const uint32_t begin, const uint32_t count) {
+      if (count == 0 || rawCount >= Ue3VsHashExclusions::kMaxRanges) {
+        return;
+      }
+      raw[rawCount++] = Range { begin, begin + count };
+    };
+
+    // Sorts, merges overlaps, and writes the result out. Merging means the per-draw path can walk
+    // the ranges once in order and hash the gaps between them.
+    auto finalize = [](std::array<Range, Ue3VsHashExclusions::kMaxRanges>& ranges,
+                       const uint32_t count,
+                       std::array<Range, Ue3VsHashExclusions::kMaxRanges>& out,
+                       uint32_t& outCount) {
+      outCount = 0;
+      if (count == 0) {
+        return;
+      }
+      std::sort(ranges.begin(), ranges.begin() + count,
+                [](const Range& a, const Range& b) { return a.begin < b.begin; });
+      out[0] = ranges[0];
+      outCount = 1;
+      for (uint32_t i = 1; i < count; i++) {
+        if (ranges[i].begin <= out[outCount - 1].end) {
+          out[outCount - 1].end = std::max(out[outCount - 1].end, ranges[i].end);
+        } else {
+          out[outCount++] = ranges[i];
+        }
+      }
+    };
+
+    // Where the CTAB names them, those locations replace the reserved defaults rather than adding
+    // to them. Excluding both would drop c0..c4 from the hash for a shader that keeps real
+    // per-draw state there, letting draws that differ collide on the same hash.
+    uint32_t viewProjReg = kUe3VsrViewProjMatrixRegister;
+    uint32_t viewProjRegCount = 4;
+    uint32_t viewOriginReg = kUe3VsrViewOriginRegister;
+    uint32_t viewOriginRegCount = 1;
+    if (ctabInfo.hasViewProjectionMatrix && ctabInfo.viewProjectionMatrixRegisterCount > 0) {
+      viewProjReg = ctabInfo.viewProjectionMatrixRegisterIndex;
+      viewProjRegCount = ctabInfo.viewProjectionMatrixRegisterCount;
+    }
+    if (ctabInfo.hasCameraPosition && ctabInfo.cameraPositionRegisterCount > 0) {
+      viewOriginReg = ctabInfo.cameraPositionRegisterIndex;
+      viewOriginRegCount = ctabInfo.cameraPositionRegisterCount;
+    }
+    add(viewProjReg, viewProjRegCount);
+    add(viewOriginReg, viewOriginRegCount);
+
+    Ue3VsHashExclusions result;
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> cameraRaw = raw;
+    const uint32_t cameraRawCount = rawCount;
+    finalize(cameraRaw, cameraRawCount, result.cameraOnly, result.cameraOnlyCount);
+
+    if (symbols != nullptr) {
+      auto contains = [](const std::string& haystack, const char* needle) {
+        return haystack.find(needle) != std::string::npos;
+      };
+      for (const Ue3VsConstantSymbol& symbol : *symbols) {
+        const std::string name = toLowerAscii(symbol.name);
+        // Shading-only: these reach interpolators, never vertex positions.
+        if (contains(name, "lightmapscale") ||
+            contains(name, "light_map_scale") ||
+            contains(name, "lightmapcoordinatescalebias") ||
+            contains(name, "light_map_coordinate_scale_bias") ||
+            contains(name, "shadowcoordinatescalebias") ||
+            contains(name, "shadow_coordinate_scale_bias")) {
+          add(symbol.registerIndex, symbol.registerCount);
+        }
+      }
+    }
+
+    std::array<Range, Ue3VsHashExclusions::kMaxRanges> shadingRaw = raw;
+    const uint32_t shadingRawCount = rawCount;
+    finalize(shadingRaw, shadingRawCount, result.cameraAndShading, result.cameraAndShadingCount);
+
+    if (ctabInfo.hasLocalToWorld) {
+      add(ctabInfo.localToWorldRegisterIndex, ctabInfo.localToWorldRegisterCount);
+    }
+    if (ctabInfo.hasWorldToLocal) {
+      add(ctabInfo.worldToLocalRegisterIndex, ctabInfo.worldToLocalRegisterCount);
+    }
+    finalize(raw, rawCount, result.withPlacement, result.withPlacementCount);
+
+    return result;
+  }
+
+  XXH64_hash_t D3D9Rtx::computeUe3StableVertexShaderHash(bool* outHashedFloatConstsWithExclusions) const {
+    if (outHashedFloatConstsWithExclusions != nullptr) {
+      *outHashedFloatConstsWithExclusions = false;
+    }
+
+    if (d3d9State().vertexShader.ptr() == nullptr) {
+      return kEmptyHash;
+    }
+
+    const D3D9ConstantSets& cb = m_parent->m_consts[DxsoProgramTypes::VertexShader];
+    XXH64_hash_t hash = d3d9State().vertexShader->GetCommonShader()->GetBytecodeHash();
+
+    const uint32_t floatConstRegCount = cb.meta.maxConstIndexF;
+    const uint8_t* const floatConstBase = reinterpret_cast<const uint8_t*>(&d3d9State().vsConsts.fConsts[0]);
+
+    auto hashFloatConstRange = [&](uint32_t beginReg, uint32_t endReg) {
+      beginReg = std::min(beginReg, floatConstRegCount);
+      endReg = std::min(endReg, floatConstRegCount);
+      if (beginReg >= endReg) {
+        return;
+      }
+
+      const size_t offsetBytes = size_t(beginReg) * sizeof(Vector4);
+      const size_t sizeBytes = size_t(endReg - beginReg) * sizeof(Vector4);
+      hash = XXH3_64bits_withSeed(floatConstBase + offsetBytes, sizeBytes, hash);
+    };
+
+    // The exclusion ranges are a pure function of the shader's CTAB, so they are resolved once per
+    // shader and borrowed here. This path runs for every draw; it must not build or sort anything.
+    bool hashedFloatConstsWithExclusions = false;
+    if (m_frameOptions.ue3EngineMode &&
+        floatConstRegCount > 0) {
+      // A shader with no resolved CTAB still must not hash the reserved camera registers, or its
+      // identity would move with the view.
+      static const Ue3VsHashExclusions s_reservedOnly = buildUe3VsHashExclusions(Ue3VsShaderCtabInfo {}, nullptr);
+      const Ue3VsHashExclusions& exclusions =
+        m_currentUe3VsHashExclusions != nullptr ? *m_currentUe3VsHashExclusions : s_reservedOnly;
+      const bool excludePlacement = m_frameOptions.ue3ExcludePlacementFromVertexShaderHash;
+      // Dropping the shading-only constants is free and keeps the hash off the lightmap policy,
+      // so UE3 mode takes it unconditionally; the placement registers stay opt-in for their cost.
+      const bool excludeShading = m_frameOptions.ue3EngineMode;
+      const Ue3VsHashExclusions::Range* ranges = exclusions.cameraOnly.data();
+      uint32_t rangeCount = exclusions.cameraOnlyCount;
+      if (excludePlacement) {
+        ranges = exclusions.withPlacement.data();
+        rangeCount = exclusions.withPlacementCount;
+      } else if (excludeShading) {
+        ranges = exclusions.cameraAndShading.data();
+        rangeCount = exclusions.cameraAndShadingCount;
+      }
+
+      if (rangeCount > 0) {
+        uint32_t cursor = 0;
+        for (uint32_t i = 0; i < rangeCount; i++) {
+          if (ranges[i].begin >= floatConstRegCount) {
+            break;
+          }
+          hashFloatConstRange(cursor, ranges[i].begin);
+          cursor = std::max(cursor, ranges[i].end);
+        }
+        hashFloatConstRange(cursor, floatConstRegCount);
+        hashedFloatConstsWithExclusions = true;
+      }
+    }
+
+    if (!hashedFloatConstsWithExclusions && floatConstRegCount > 0) {
+      hash = XXH3_64bits_withSeed(
+        &d3d9State().vsConsts.fConsts[0],
+        size_t(floatConstRegCount) * sizeof(Vector4),
+        hash);
+    }
+
+    if (cb.meta.maxConstIndexI > 0) {
+      hash = XXH3_64bits_withSeed(
+        &d3d9State().vsConsts.iConsts[0],
+        size_t(cb.meta.maxConstIndexI) * sizeof(int) * 4,
+        hash);
+    }
+    if (cb.meta.maxConstIndexB > 0) {
+      hash = XXH3_64bits_withSeed(
+        &d3d9State().vsConsts.bConsts[0],
+        size_t(cb.meta.maxConstIndexB) * sizeof(uint32_t) / 32,
+        hash);
+    }
+
+    if (outHashedFloatConstsWithExclusions != nullptr) {
+      *outHashedFloatConstsWithExclusions = hashedFloatConstsWithExclusions;
+    }
+
+    return hash;
+  }
+
+  void D3D9Rtx::pruneUe3GeometryMemoCache() {
+    constexpr uint32_t kMaxUntouchedFrames = 600;
+    const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    // In-flight workers hold the entry via shared_ptr, so erasing here is always safe.
+    m_ue3GeometryMemoCache.erase_if([&](auto it) {
+      return currentFrame - it->second->lastFrameTouched > kMaxUntouchedFrames;
+    });
+  }
+
+}

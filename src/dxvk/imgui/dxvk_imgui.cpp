@@ -4879,7 +4879,7 @@ namespace dxvk {
     if (D3D9Rtx::ue3EngineMode() &&
         RemixGui::CollapsingHeader("Mirror's Edge Game Patches", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
-      const D3D9Rtx::Ue3GamePatchStatus patchStatus = D3D9Rtx::getUe3GamePatchStatus();
+      const Ue3GamePatchStatus patchStatus = D3D9Rtx::getUe3GamePatchStatus();
       const auto patchStatusText = [&patchStatus](const bool requested, const uint32_t bit) {
         if (patchStatus.answered && (patchStatus.notFound & bit)) {
           return "Not found in this executable";
