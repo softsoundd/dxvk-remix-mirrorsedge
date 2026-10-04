@@ -2861,8 +2861,8 @@ namespace dxvk {
       // camera. Suppress the rule only when the absence is self-inflicted (we demoted
       // overlay draws since the last scene prep); a genuine absence - the game drew no
       // first-person overlay at all - fires it stably every frame.
-      const bool demotedForeground = g_ue3ForegroundDemotedDrawCount > 0;
-      g_ue3ForegroundDemotedDrawCount = 0;
+      const bool demotedForeground = m_ue3ForegroundDemotedDrawCount > 0;
+      m_ue3ForegroundDemotedDrawCount = 0;
       const bool noViewModelExternal = RtxOptions::PlayerModel::autoEnableInPrimarySpaceWhenNoViewModel() &&
                                        !viewModelCameraValid && !demotedForeground;
 
@@ -2877,7 +2877,6 @@ namespace dxvk {
 
       const bool externalCameraRegime = RtxOptions::PlayerModel::enableInPrimarySpace() || autoExternalEngaged;
       m_instanceManager.setExternalCameraRegime(externalCameraRegime);
-      g_ue3ForegroundDemoteToWorld = externalCameraRegime;
 
       // Scoped-zoom view-model hiding (see rtx.viewModel.hideBelowFovDegrees / maxNearPlane).
       // Computed here so held-equipment detection can freeze its classification while the

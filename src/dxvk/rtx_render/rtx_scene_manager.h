@@ -169,6 +169,8 @@ public:
   const std::vector<RtInstance*>& getInstanceTable() const { return m_instanceManager.getInstanceTable(); }
   
   const InstanceManager& getInstanceManager() const { return m_instanceManager; }
+
+  void recordUe3ForegroundDemotion() { ++m_ue3ForegroundDemotedDrawCount; }
   const AccelManager& getAccelManager() const { return m_accelManager; }
   const LightManager& getLightManager() const { return m_lightManager; }
   const GraphManager& getGraphManager() const { return m_graphManager; }
@@ -383,6 +385,10 @@ private:
   // Consecutive frames the automatic external-camera rules have agreed
   // (rtx.playerModel.autoEnableInPrimarySpaceDelayFrames).
   uint32_t m_autoExternalCameraFrames = 0;
+
+  // UE3 foreground draws rendered as world geometry since the last scene preparation, which
+  // tells a ViewModel camera absence we caused from one where the game drew no overlay.
+  uint32_t m_ue3ForegroundDemotedDrawCount = 0;
 
   RtxGlobals m_globals;
 

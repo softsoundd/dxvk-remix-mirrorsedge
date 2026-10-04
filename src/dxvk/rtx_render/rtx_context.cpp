@@ -1178,6 +1178,9 @@ namespace dxvk {
 
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
+      if (drawCallState.applyUe3ForegroundDpg(getSceneManager().getInstanceManager().isExternalCameraRegime())) {
+        getSceneManager().recordUe3ForegroundDemotion();
+      }
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
       if (drawCallState.cameraType == CameraType::Unknown) {

@@ -672,16 +672,6 @@ enum class InstanceCategories : uint32_t {
 
 using CategoryFlags = Flags<InstanceCategories>;
 
-// External-camera regime flag written by SceneManager::prepareSceneData: while true, UE3
-// foreground-DPG draws skip the ViewModel category override and render as world geometry
-// (first-person overlay meshes like the held weapon show normally on external cameras).
-extern bool g_ue3ForegroundDemoteToWorld;
-
-// Number of foreground draws demoted since the last scene preparation; sampled and reset
-// there. Distinguishes self-inflicted ViewModel-camera absence (we demoted the overlay)
-// from genuine absence (the game drew no first-person overlay at all).
-extern uint32_t g_ue3ForegroundDemotedDrawCount;
-
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
 struct DrawCallState {
@@ -763,6 +753,10 @@ struct DrawCallState {
   }
 
   bool finalizePendingFutures(const RtCamera* pLastCamera);
+
+  // Tags a UE3 foreground draw ViewModel, over any texture or geometry tag (FP and TP weapon
+  // components share one mesh). On external cameras it stays world geometry; returns true then.
+  bool applyUe3ForegroundDpg(bool externalCameraRegime);
 
   bool hasTextureCoordinates() const {
     return getGeometryData().texcoordBuffer.defined() || getTransformData().texgenMode != TexGenMode::None;

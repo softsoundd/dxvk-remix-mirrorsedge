@@ -341,7 +341,7 @@ void loadInputRadiance(
 // LUT hemisphere mean * 0.5 * strength matches froxel SH evaluateHG(*, 0) (2π / 4π).
 float3 evalReflectionSkyFloor()
 {
-  if (cb.volumeArgs.physicalAtmosphereEnabled == 0 ||
+  if (!cb.volumeArgs.physicalAtmosphereEnabled ||
       cb.volumeArgs.skyAmbientStrength <= 0.0f)
   {
     return cb.volumeArgs.multiScatteringEstimate;
@@ -695,7 +695,7 @@ void applySkyContribution(
 
   // Physical Atmosphere sky is already in SharedRadiance — skip SkyMatte/SkyLight. An external
   // dome light still takes priority over the atmosphere, and is composited from here as usual.
-  if (cb.volumeArgs.physicalAtmosphereEnabled != 0 && !cb.domeLightArgs.active)
+  if (cb.volumeArgs.physicalAtmosphereEnabled && !cb.domeLightArgs.active)
   {
     return;
   }
@@ -745,7 +745,7 @@ void evalReflectedSegmentAerialPerspective(
   }
 
   // Mirror altitude relative to the camera, along the world up axis.
-  const float mirrorHeightKm = (args.isZUp != 0
+  const float mirrorHeightKm = (args.isZUp
     ? mirrorPosition.z - args.cameraPosition.z
     : mirrorPosition.y - args.cameraPosition.y) * kmPerWorldUnit;
   const vec3 origin = vec3(0.0f, max(args.aerialPerspectiveViewAltitude + mirrorHeightKm, kPlanetRadiusOffset), 0.0f);
@@ -756,17 +756,10 @@ void evalReflectedSegmentAerialPerspective(
     AtmosphereAerosolPhaseLut, 8, endDistanceKm, startDistanceKm, transmittance);
 }
 
-// Aerial perspective (paper Section 5.4): atmospheric extinction and in-scatter between the camera
-// and the shaded surface, which is what makes distant geometry hazy and desaturated.
-//
-// Skipped on primary misses because the sky-view LUT already integrates the whole atmospheric column
-// for those directions. PSR pixels get the segment their mirror reflects first, then the camera-to-mirror
-// segment, so a reflected skyline hazes over and is then attenuated by the air in front of the mirror.
-//
-// The volume covers only the segment past the global volumetrics froxel grid, so its in-scatter is
-// attenuated by that grid's transmittance. Strictly the near in-scatter already in radianceOutput
-// should not pick up the far transmittance in turn, but the froxel grid spans tens of metres against
-// this volume's kilometres, so its transmittance is near one wherever the far term matters.
+// Aerial perspective (paper Section 5.4). Skipped on primary misses, whose sky-view LUT radiance already
+// carries the whole column. PSR pixels apply their mirror's reflected segment first, then the camera's.
+// The volume starts past the froxel grid and is attenuated by the grid's transmittance; that the near
+// in-scatter picks it up too is negligible at the grid's scale of tens of metres.
 void applyAerialPerspective(
   uint2 pixelCoordinate,
   bool primaryMiss,

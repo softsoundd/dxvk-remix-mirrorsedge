@@ -206,10 +206,8 @@ namespace dxvk {
       return true;
     }
 
-    // CPU counterpart of evalSunShadowing(). Ray marches the optical depth from an altitude toward
-    // the sun through the spherical atmosphere, the same integral the transmittance LUT bakes, so the
-    // CPU-side sun light and the GPU sky agree. Returns zero once the planet occludes the sun.
-    // dirYUp must be unit length.
+    // CPU counterpart of the transmittance LUT bake (transmittance_lut.comp.slang), so the CPU-side
+    // sun light and the GPU sky agree. Zero once the planet occludes the sun. dirYUp must be unit length.
     Vector3 atmTransmittanceYUp(const AtmosphereArgs& a, const Vector3& dirYUp, float altitudeKm = 0.0f) {
       const Vector3 planetCenter(0.0f, -a.planetRadius, 0.0f);
       const Vector3 origin(0.0f, std::max(altitudeKm, 0.0f), 0.0f);
@@ -550,7 +548,6 @@ namespace dxvk {
 
 RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
   : CommonDeviceObject(device) {
-  // Create constant buffer for atmosphere parameters
   DxvkBufferCreateInfo info = {};
   info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   info.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -576,24 +573,21 @@ void RtxAtmosphere::initialize(Rc<DxvkContext> ctx) {
 AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   AtmosphereArgs args = {};
 
-  // Convert sun angles to direction vector (in Y-up space, for LUT generation)
   constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
   float azimuthRad = RtxOptions::sunRotation() * kDegToRad; // Mapped to Rotation
   float elevationRad = RtxOptions::sunElevation() * kDegToRad;
   
-  // Sun direction is always in Y-up space since the LUTs are generated in Y-up space
+  // Y-up, the space the LUTs are generated in.
   args.sunDirection.x = std::cos(elevationRad) * std::sin(azimuthRad);
   args.sunDirection.y = std::sin(elevationRad);
   args.sunDirection.z = std::cos(elevationRad) * std::cos(azimuthRad);
 
-  // Basic atmosphere parameters
   args.planetRadius = RtxOptions::planetRadius();
   args.atmosphereThickness = RtxOptions::atmosphereThickness();
 
   const bool physicalCoefficients = RtxOptions::coefficientMode() == AtmosphereCoefficientMode::Physical;
   const SpectralCalibration& spectral = getSpectralCalibration();
 
-  // Molecular coefficients (Base * Density Multiplier)
   args.rayleighScattering = (physicalCoefficients ? spectral.rayleighScattering : RtxOptions::rayleighScattering()) * RtxOptions::airDensity();
   args.ozoneAbsorption = (physicalCoefficients ? spectral.ozoneAbsorption : RtxOptions::ozoneAbsorption()) * RtxOptions::ozoneDensity();
   args.ozoneLayerAltitude = RtxOptions::ozoneLayerAltitude();
@@ -620,13 +614,10 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
 
   args.groundAlbedo = RtxOptions::groundAlbedo();
 
-  // Sun Angular Radius (from Sun Size in degrees)
-  // sunSize is diameter in degrees. Radius = Size / 2
+  // sunSize is the disc's diameter.
   float sunSizeRad = RtxOptions::sunSize() * kDegToRad;
   args.sunAngularRadius = sunSizeRad * 0.5f;
-  
-  // Brightness multiplier
-  args.sunRayBrightness = 1.0f; 
+  args.sunRayBrightness = 1.0f;
 
   args.sunDiscEnabled = RtxOptions::sunDisc() ? 1u : 0u;
 
@@ -634,7 +625,6 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   args.viewAltitude = RtxOptions::altitude() * 0.001f;
   args.aerialPerspectiveViewAltitude = args.viewAltitude;
 
-  // LUT dimensions
   args.transmittanceLutWidth = kTransmittanceLutWidth;
   args.transmittanceLutHeight = kTransmittanceLutHeight;
   args.multiscatteringLutSize = kMultiscatteringLutSize;
@@ -644,7 +634,6 @@ AtmosphereArgs RtxAtmosphere::buildAtmosphereArgsFromOptions() {
   args.multiscatteringStepCount = uint32_t(std::max(RtxOptions::multiscatteringSteps(), 4));
   args.skyViewStepCount = uint32_t(std::min(std::max(RtxOptions::skyViewSteps(), 16), 512));
 
-  // Derived parameters
   args.atmosphereRadius = args.planetRadius + args.atmosphereThickness;
 
   // Aerial perspective. The camera basis is filled in per frame by fillAerialPerspectiveArgs().
@@ -785,7 +774,6 @@ bool RtxAtmosphere::needsMediumRecompute(const AtmosphereArgs& args) const {
 }
 
 void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
-  // Create transmittance LUT (stores atmospheric transmittance)
   VkExtent3D transmittanceExtent = { kTransmittanceLutWidth, kTransmittanceLutHeight, 1 };
   m_transmittanceLut = Resources::createImageResource(
     ctx,
@@ -831,7 +819,6 @@ void RtxAtmosphere::createLutResources(Rc<DxvkContext> ctx) {
     1 // mipLevels
   );
 
-  // Create sky view LUT (main view-dependent sky color LUT)
   VkExtent3D skyViewExtent = { kSkyViewLutWidth, kSkyViewLutHeight, 1 };
   m_skyViewLut = Resources::createImageResource(
     ctx,
@@ -1110,17 +1097,14 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
   ctx->bindResourceView(3, m_skyViewLut.view, nullptr);
   ctx->bindResourceView(4, m_aerosolPhaseLut.view, nullptr);
-  
-  // Track resources
+
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_aerosolPhaseLut.image);
   ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_skyViewLut.image);
-  
-  // Bind shader and dispatch
+
   ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SkyViewLutShader::getShader());
-  
-  // Dispatch with 16x16 thread groups
+
   uint32_t groupsX = (kSkyViewLutWidth + 15) / 16;
   uint32_t groupsY = (kSkyViewLutHeight + 15) / 16;
   ctx->dispatch(groupsX, groupsY, 1);
@@ -1257,8 +1241,7 @@ void RtxAtmosphere::dropDistantSunLight() {
 }
 
 Vector3 RtxAtmosphere::estimateVolumeAmbientRadiance(const AtmosphereArgs& args) {
-  // Fallback isotropic fill from ground-reaching sun irradiance (Rayleigh-ish tint).
-  // Prefer the sky-view LUT froxel path when sky ambient strength > 0.
+  // Isotropic fallback from the sun irradiance reaching the ground; the sky-view LUT path is preferred.
   const Vector3 sunDirYUp(args.sunDirection.x, args.sunDirection.y, args.sunDirection.z);
   constexpr float kTwilightLo = -0.259f; // -15 deg
   constexpr float kTwilightHi = 0.15f;

@@ -167,32 +167,26 @@ AtmosphereMedium sampleAtmosphereMedium(float altitude, AtmosphereArgs args) {
   return medium;
 }
 
-// Ray-sphere intersection with improved numerical stability
-// Returns true if intersection exists, outputs near and far intersection distances
+// Sorted ray-sphere roots; false when the ray misses.
 bool intersectSphere(vec3 origin, vec3 direction, vec3 center, float radius, out float t0, out float t1) {
   vec3 oc = origin - center;
   float a = dot(direction, direction);
   float b = 2.0f * dot(oc, direction);
   float c = dot(oc, oc) - radius * radius;
   float discriminant = b * b - 4.0f * a * c;
-  
-  // Use a small positive threshold to handle grazing angles more robustly
-  // This prevents precision issues when ray is nearly tangent to sphere
+
+  // Nearly tangent rays can produce a slightly negative discriminant and must still hit.
   const float kDiscriminantEpsilon = 1e-6f;
   if (discriminant < -kDiscriminantEpsilon) {
     t0 = t1 = -1.0f;
     return false;
   }
-  
-  // Clamp discriminant to zero for near-tangent cases
   discriminant = max(0.0f, discriminant);
-  
+
   float sqrtDiscriminant = sqrt(discriminant);
-  float inv2A = 0.5f / max(a, 1e-7f);  // Prevent division by zero
-  
-  // Use numerically stable formula to avoid catastrophic cancellation
-  // When b > 0, use t0 = (-b - sqrt(disc)) / 2a, then t1 = c / (a * t0)
-  // When b < 0, use t1 = (-b + sqrt(disc)) / 2a, then t0 = c / (a * t1)
+  float inv2A = 0.5f / max(a, 1e-7f);
+
+  // The root without cancellation is computed directly and the other from the product c / a.
   if (b > 0.0f) {
     t0 = (-b - sqrtDiscriminant) * inv2A;
     t1 = (abs(t0) > 1e-6f) ? (c / (a * t0)) : ((-b + sqrtDiscriminant) * inv2A);
@@ -200,8 +194,7 @@ bool intersectSphere(vec3 origin, vec3 direction, vec3 center, float radius, out
     t1 = (-b + sqrtDiscriminant) * inv2A;
     t0 = (abs(t1) > 1e-6f) ? (c / (a * t1)) : ((-b - sqrtDiscriminant) * inv2A);
   }
-  
-  // Ensure t0 <= t1
+
   if (t0 > t1) {
     float temp = t0;
     t0 = t1;
@@ -213,7 +206,8 @@ bool intersectSphere(vec3 origin, vec3 direction, vec3 center, float radius, out
 
 // Nearest non-negative intersection distance, or -1 when the sphere is behind or missed.
 float intersectSphereNearest(vec3 origin, vec3 direction, vec3 center, float radius) {
-  float t0, t1;
+  float t0;
+  float t1;
   if (!intersectSphere(origin, direction, center, radius, t0, t1)) {
     return -1.0f;
   }
@@ -688,7 +682,7 @@ vec3 getTransmittanceToSunAtAltitude(float altitudeKm, Texture2D transmittanceLu
 static const float kMaxSunDiscRadiance = 16384.0f;
 
 vec3 evalSunDisk(vec3 viewDir, Texture2D transmittanceLut, AtmosphereArgs args, bool isZUp = false) {
-  if (args.sunDiscEnabled == 0) {
+  if (!args.sunDiscEnabled) {
     return vec3(0.0f);
   }
 

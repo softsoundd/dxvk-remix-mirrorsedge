@@ -20,30 +20,9 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// Mirror's Edge (UE3 / TdToneMapping) display transform.
-//
-// Reproduces the game's tone map pipeline on Remix's linear HDR output:
-//   exposure -> highlights/shadows/midtones grade -> desaturation + overlay ->
-//   display gamma encode -> 16-segment per-channel colour curves.
-//
-// With cb.faithfulLuma == 0 the transform is the shipped TdToneMappingPixelShader.usf
-// verbatim: saturate(Color * Exposure) clips each channel at exposed 1.0 and every pow()
-// is Common.usf's ClampedPow, pow(max(abs(x), 1e-4), y), whose guard is what puts the
-// shipped black at #020202 (1e-4 encodes to 0.01 at gamma 2.0).
-//
-// With cb.faithfulLuma != 0 the shipped shader is changed only where it loses information:
-//   - the clip becomes a per-channel range compression curve: Neutwo (RenoDX's peak /
-//     white-clip form of x / sqrt(x^2 + 1)) or the Faithful Luma shoulder (identity below a
-//     knee, extended Reinhard to a white point);
-//   - the curve's value and saturation are kept and its hue is solved so the OKLab hue is the
-//     scene's, turned by the small Bezold-Bruecke shift a dimmer rendering needs and,
-//     optionally, part of the way toward the hue the shipped clip gave the colour;
-//   - optionally over-range colours are desaturated to the chroma the shipped clip left them;
-//   - the 1e-4 pow() guard is dropped so black reaches 0.
-//
-// IMPORTANT: the output of this pass is already display-encoded (gamma +
-// curves), exactly what the game wrote to its backbuffer. The final sRGB
-// conversion in the srgb_dither pass must be skipped when this pass runs.
+// Mirror's Edge (UE3 TdToneMapping) display transform; see "Mirror's Edge tonemapper and colour
+// curves" in documentation/UE3Compatibility.md. The output is display-encoded like the game's backbuffer,
+// so the srgb_dither pass must skip its sRGB conversion when this pass runs.
 
 #include "rtx/pass/tonemap/tonemapping_ue3.h"
 #include "rtx/pass/tonemap/tonemapping.slangh"
@@ -352,7 +331,7 @@ float curveSampleCoord(float x)
 {
   const float u = saturate(x * kCurveLutAddressScale);
 
-  if (cb.curvePointSampling != 0)
+  if (cb.curvePointSampling)
   {
     const float texel = min(floor(u * UE3_TONEMAP_NUM_CURVE_SEGMENTS), UE3_TONEMAP_NUM_CURVE_SEGMENTS - 1.0f);
     return (texel + 0.5f) / UE3_TONEMAP_NUM_CURVE_SEGMENTS;
@@ -414,7 +393,7 @@ float3 applyUe3ToneMapping(float3 linearColor)
   float3 outColor = gradePow(saturate(materialResult * cb.gammaColorScaleAndInverse.rgb), float3(gammaInverse));
 
   // Per-map colour curves in display space
-  if (cb.applyColorCurves != 0)
+  if (cb.applyColorCurves)
   {
     outColor = applyMsBsColorCurves(outColor);
   }

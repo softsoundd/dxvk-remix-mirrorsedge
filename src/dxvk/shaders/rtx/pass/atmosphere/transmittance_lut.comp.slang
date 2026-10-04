@@ -49,7 +49,8 @@ vec3 computeTransmittance(float altitude, float viewZenithCosAngle, AtmosphereAr
   const vec3 rayDir = normalize(vec3(sinZenith, viewZenithCosAngle, 0.0f));
 
   // Intersect with top of atmosphere
-  float t0, t1;
+  float t0;
+  float t1;
   if (!intersectSphere(rayOrigin, rayDir, planetCenter, args.atmosphereRadius, t0, t1)) {
     return vec3(1.0f);  // No atmosphere intersection
   }
@@ -95,22 +96,17 @@ vec3 computeTransmittance(float altitude, float viewZenithCosAngle, AtmosphereAr
 [numthreads(16, 16, 1)]
 void main(uint2 threadId : SV_DispatchThreadID) {
   AtmosphereArgs args = atmosphereArgs;
-  
-  // Check bounds
+
   if (threadId.x >= args.transmittanceLutWidth || threadId.y >= args.transmittanceLutHeight) {
     return;
   }
-  
-  // Convert pixel coordinates to UV
+
   vec2 uv = (vec2(threadId) + 0.5f) / vec2(args.transmittanceLutWidth, args.transmittanceLutHeight);
-  
-  // Convert UV to atmosphere parameters
-  float viewZenithCosAngle, altitude;
+
+  float viewZenithCosAngle;
+  float altitude;
   uvToTransmittanceLutParams(uv, args, viewZenithCosAngle, altitude);
-  
-  // Compute transmittance
+
   vec3 transmittance = computeTransmittance(altitude, viewZenithCosAngle, args);
-  
-  // Write result
   transmittanceLutOutput[threadId] = float4(transmittance, 1.0f);
 }

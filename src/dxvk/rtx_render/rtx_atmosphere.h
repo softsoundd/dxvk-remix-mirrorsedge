@@ -196,11 +196,11 @@ private:
   void dispatchShadowedAerialPerspectiveLut(RtxContext& ctx, const AtmosphereArgs& args);
 
   // LUT dimensions
-  static constexpr uint32_t kTransmittanceLutWidth = 512;   // Increased from 256 for better precision
-  static constexpr uint32_t kTransmittanceLutHeight = 128;  // Increased from 64 for better precision
+  static constexpr uint32_t kTransmittanceLutWidth = 512;
+  static constexpr uint32_t kTransmittanceLutHeight = 128;
   static constexpr uint32_t kMultiscatteringLutSize = 32;  // Per tile of the multiple scattering atlas
-  static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
-  static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
+  static constexpr uint32_t kSkyViewLutWidth = 512;
+  static constexpr uint32_t kSkyViewLutHeight = 256;
   // Over sqrt(theta / pi): 0.07 degree texels at the forward peak, 1.4 degrees at back-scatter.
   static constexpr uint32_t kAerosolPhaseLutSize = 512;
 

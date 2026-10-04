@@ -295,23 +295,22 @@ namespace dxvk {
       // Update any categories that require geometry hash
       setupCategoriesForGeometry();
 
-      // UE3 SDPG_Foreground draws are first-person overlay geometry. Runs after texture and
-      // geometry tagging so it wins (FP/TP weapon components share one mesh, so player-model
-      // tags must only bind the world-DPG copy). On external cameras the override is
-      // suspended and the overlay renders as world geometry.
-      if (isUe3ForegroundDpg) {
-        if (!g_ue3ForegroundDemoteToWorld) {
-          setCategory(InstanceCategories::ViewModel, true);
-          removeCategory(InstanceCategories::ThirdPersonPlayerModel);
-          removeCategory(InstanceCategories::ThirdPersonPlayerBody);
-        } else {
-          ++g_ue3ForegroundDemotedDrawCount;
-        }
-      }
-
       return true;
     }
 
+    return false;
+  }
+
+  bool DrawCallState::applyUe3ForegroundDpg(const bool externalCameraRegime) {
+    if (!isUe3ForegroundDpg) {
+      return false;
+    }
+    if (externalCameraRegime) {
+      return true;
+    }
+    setCategory(InstanceCategories::ViewModel, true);
+    removeCategory(InstanceCategories::ThirdPersonPlayerModel);
+    removeCategory(InstanceCategories::ThirdPersonPlayerBody);
     return false;
   }
 
@@ -380,9 +379,6 @@ namespace dxvk {
       geometryData.numBonesPerVertex = skinningData.numBonesPerVertex;
     }
   }
-
-  bool g_ue3ForegroundDemoteToWorld = false;
-  uint32_t g_ue3ForegroundDemotedDrawCount = 0;
 
   void DrawCallState::setCategory(InstanceCategories category, bool doSet) {
     if (doSet) {
