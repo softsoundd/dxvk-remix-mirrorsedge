@@ -308,10 +308,10 @@ namespace dxvk {
 
     constexpr float kCloudPi = 3.14159265358979323846f;
 
-    // The optical depth grids' window around the camera, and their far cascade's for the lighting of distant
-    // clouds, which spans the far field shadow map's.
+    // The optical depth grids' window around the camera, and their far cascade's (250 m texels) for the lighting
+    // of distant clouds.
     constexpr float kGridExtentKm = 12.0f;
-    constexpr float kFarGridExtentKm = 64.0f;
+    constexpr float kFarGridExtentKm = 96.0f;
     constexpr float kShadowMapExtentKm = 64.0f;
 
     // Red-black sweeps the diffusion floor's solve converges in from any start, within a thousandth on clouds
@@ -583,27 +583,25 @@ namespace dxvk {
 
     const VkExtent3D nvdfExtent = { CLOUD_NVDF_SIZE_XZ, CLOUD_NVDF_SIZE_Y, CLOUD_NVDF_SIZE_XZ };
     const VkExtent3D gridExtent = { CLOUD_GRID_SIZE_XZ, CLOUD_GRID_SIZE_Y, CLOUD_GRID_SIZE_XZ };
+    const VkExtent3D farGridExtent = { CLOUD_FAR_GRID_SIZE_XZ, CLOUD_GRID_SIZE_Y, CLOUD_FAR_GRID_SIZE_XZ };
 
     m_placementMap = create2D("Cloud Placement Map", VkExtent3D { CLOUD_PLACEMENT_MAP_SIZE, CLOUD_PLACEMENT_MAP_SIZE, 1 }, VK_FORMAT_R8G8B8A8_UNORM);
     m_detailNoise = create3D("Cloud Detail Noise", VkExtent3D { CLOUD_DETAIL_NOISE_SIZE, CLOUD_DETAIL_NOISE_SIZE, CLOUD_DETAIL_NOISE_SIZE },
       VK_FORMAT_R8G8B8A8_UNORM, CLOUD_DETAIL_NOISE_MIP_COUNT);
     createMipViews(m_detailNoise, VK_FORMAT_R8G8B8A8_UNORM, CLOUD_DETAIL_NOISE_MIP_COUNT, m_detailNoiseMipViews);
 
-    m_nvdfOccupancy = create3D("Cloud NVDF Occupancy", nvdfExtent, VK_FORMAT_R8_UNORM, 1);
-    m_nvdfSeeds[0] = create3D("Cloud NVDF Seeds 0", nvdfExtent, VK_FORMAT_R32_UINT, 1);
-    m_nvdfSeeds[1] = create3D("Cloud NVDF Seeds 1", nvdfExtent, VK_FORMAT_R32_UINT, 1);
     m_nvdfSdf[0] = create3D("Cloud NVDF 0", nvdfExtent, VK_FORMAT_R16_SFLOAT, 1);
     m_nvdfSdf[1] = create3D("Cloud NVDF 1", nvdfExtent, VK_FORMAT_R16_SFLOAT, 1);
 
     m_sunGrid = create3D("Cloud Sun Optical Depth Grid", gridExtent, VK_FORMAT_R16G16_SFLOAT, CLOUD_SUN_GRID_MIP_COUNT);
     createMipViews(m_sunGrid, VK_FORMAT_R16G16_SFLOAT, CLOUD_SUN_GRID_MIP_COUNT, m_sunGridMipViews);
     m_ambientGrid = create3D("Cloud Vertical Optical Depth Grid", gridExtent, VK_FORMAT_R16G16_SFLOAT, 1);
-    m_sunGridFar = create3D("Cloud Sun Optical Depth Grid Far", gridExtent, VK_FORMAT_R16G16_SFLOAT, 1);
-    m_ambientGridFar = create3D("Cloud Vertical Optical Depth Grid Far", gridExtent, VK_FORMAT_R16G16_SFLOAT, 1);
+    m_sunGridFar = create3D("Cloud Sun Optical Depth Grid Far", farGridExtent, VK_FORMAT_R16G16_SFLOAT, 1);
+    m_ambientGridFar = create3D("Cloud Vertical Optical Depth Grid Far", farGridExtent, VK_FORMAT_R16G16_SFLOAT, 1);
     m_diffusionCells[0] = create3D("Cloud Diffusion Cells", gridExtent, VK_FORMAT_R32G32_SFLOAT, 1);
-    m_diffusionCells[1] = create3D("Cloud Diffusion Cells Far", gridExtent, VK_FORMAT_R32G32_SFLOAT, 1);
+    m_diffusionCells[1] = create3D("Cloud Diffusion Cells Far", farGridExtent, VK_FORMAT_R32G32_SFLOAT, 1);
     m_diffusionFluence[0] = create3D("Cloud Diffusion Fluence", gridExtent, VK_FORMAT_R32_SFLOAT, 1);
-    m_diffusionFluence[1] = create3D("Cloud Diffusion Fluence Far", gridExtent, VK_FORMAT_R32_SFLOAT, 1);
+    m_diffusionFluence[1] = create3D("Cloud Diffusion Fluence Far", farGridExtent, VK_FORMAT_R32_SFLOAT, 1);
 
     const VkExtent3D skyApExtent = { CLOUD_SKY_AP_LUT_WIDTH, CLOUD_SKY_AP_LUT_HEIGHT, CLOUD_SKY_AP_LUT_DEPTH };
     m_skyApInScatter = create3D("Cloud Sky Aerial Perspective In-Scatter", skyApExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 1);
@@ -695,6 +693,46 @@ namespace dxvk {
     }
   }
 
+  void RtxClouds::releaseResources() {
+    for (Resources::Resource* resource : {
+           &m_placementMap, &m_detailNoise, &m_nvdfOccupancy, &m_nvdfSeeds[0], &m_nvdfSeeds[1], &m_nvdfSdf[0], &m_nvdfSdf[1],
+           &m_sunGrid, &m_ambientGrid, &m_sunGridFar, &m_ambientGridFar, &m_diffusionCells[0], &m_diffusionCells[1],
+           &m_diffusionFluence[0], &m_diffusionFluence[1], &m_skyApInScatter, &m_skyApTransmittance, &m_skySh, &m_skyShParts,
+           &m_phaseLut, &m_phaseCdf, &m_shadowMap, &m_dome[0], &m_dome[1], &m_layer[0], &m_layer[1], &m_layerAge[0],
+           &m_layerAge[1], &m_compositeLayer, &m_reflection[0], &m_reflection[1], &m_glossyRay }) {
+      resource->reset();
+    }
+    m_detailNoiseMipViews.clear();
+    m_sunGridMipViews.clear();
+    m_referenceStatistics = nullptr;
+    m_referenceStatisticsReadback = nullptr;
+    releaseReferenceResources();
+
+    // What described their contents.
+    m_initialized = false;
+    m_nvdfValid = false;
+    m_nvdfBakeActive = false;
+    m_nvdfJumpIndex = 0;
+    m_nvdfFront = 0;
+    m_publishedNvdfKey = NvdfKey {};
+    m_pendingNvdfKey = NvdfKey {};
+    m_gridsNeedFullBake = true;
+    m_diffusionSettleSweeps[0] = m_diffusionSettleSweeps[1] = 0;
+    m_farDiffusionCatchUpSweeps = 0;
+    m_skyApValid = false;
+    m_skyLightKey = 0;
+    m_lastInputsKey = 0;
+    m_lastRestartKey = 0;
+    m_domeWidth = 0;
+    m_domeIndex = 0;
+    m_domeHistoryValid = false;
+    m_screenExtent = VkExtent3D { 0, 0, 0 };
+    m_layerIndex = 0;
+    m_screenHistoryValid = false;
+    m_referenceFrames = 0;
+    m_horizonBiasAnchored = false;
+  }
+
   void RtxClouds::uploadPhaseLut(Rc<DxvkContext> ctx) {
     using namespace cloud_tables;
     static_assert(kPhaseLutSize == CLOUD_PHASE_LUT_SIZE && kRadiusCount == CLOUD_PHASE_LUT_RADII, "Cloud phase LUT size mismatch");
@@ -777,7 +815,7 @@ namespace dxvk {
       std::round(cameraFieldX / gridTexelKm) * gridTexelKm, std::round(cameraFieldZ / gridTexelKm) * gridTexelKm,
       std::round(cameraFieldX / shadowTexelKm) * shadowTexelKm, std::round(cameraFieldZ / shadowTexelKm) * shadowTexelKm);
     a.shadowMapExtentKm = kShadowMapExtentKm;
-    const float farGridTexelKm = kFarGridExtentKm / float(CLOUD_GRID_SIZE_XZ);
+    const float farGridTexelKm = kFarGridExtentKm / float(CLOUD_FAR_GRID_SIZE_XZ);
     a.farGridExtentKm = kFarGridExtentKm;
     a.farGridOriginKm = Vector2(
       std::round(cameraFieldX / farGridTexelKm) * farGridTexelKm, std::round(cameraFieldZ / farGridTexelKm) * farGridTexelKm);
@@ -827,6 +865,15 @@ namespace dxvk {
     a.nearDetailStrength = std::clamp(nearDetailStrength(), 0.0f, 2.0f);
     a.nearDetailRangeKm = std::max(nearDetailRangeKm(), 0.01f);
     a.detailLodBias = detailLodBias();
+
+    // At full strength the horizon bias's shift reaches past the bodies' cores (half their smaller extent) and
+    // what the surface's displacement pushes out.
+    a.horizonBias = std::clamp(horizonBias(), -1.0f, 1.0f);
+    a.horizonBiasStartKm = std::max(horizonBiasStartKm(), 0.0f);
+    a.horizonBiasEndKm = std::max(horizonBiasEndKm(), a.horizonBiasStartKm + 0.1f);
+    a.horizonBiasShiftKm = a.horizonBias != 0.0f
+      ? 0.5f * std::min(a.thicknessKm, a.cellSizeKm) + 0.5f * (0.6f * a.wobbleStrength + a.shapeVarietyKm)
+      : 0.0f;
 
     a.viewSamplesMax = tier.viewSamplesMax;
     a.viewStepKm = tier.viewStepKm;
@@ -879,23 +926,25 @@ namespace dxvk {
   {
     Rc<DxvkContext> ctx = &rtxCtx;
     m_screenRanThisFrame = false;
-    initialize(ctx);
 
     if (!isActive()) {
+      // Nothing of the clouds stays allocated while they are off; the next frame they are on starts every bake over.
+      if (m_initialized) {
+        releaseResources();
+      }
       m_args = CloudArgs {};
-      m_screenHistoryValid = false;
-      m_domeHistoryValid = false;
-      m_skyApValid = false;
-      m_gridsNeedFullBake = true;
-      m_referenceFrames = 0;
-      releaseReferenceResources();
       // Passes outside this module read the constants too (the aerial perspective), so they must say off.
-      CloudConstants constants = {};
-      constants.atmosphere = atmosphere;
-      ctx->updateBuffer(m_constantsBuffer, 0, sizeof(CloudConstants), &constants);
-      ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+      if (!m_offConstantsWritten) {
+        CloudConstants constants = {};
+        constants.atmosphere = atmosphere;
+        ctx->updateBuffer(m_constantsBuffer, 0, sizeof(CloudConstants), &constants);
+        ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+        m_offConstantsWritten = true;
+      }
       return m_args;
     }
+    m_offConstantsWritten = false;
+    initialize(ctx);
 
     ScopedGpuProfileZone(ctx, "Clouds");
 
@@ -904,7 +953,7 @@ namespace dxvk {
     const Vector2 windBefore = m_windOffsetKm;
     const float riseBefore = m_evolutionRiseKm;
     const float shearBefore = m_evolutionShearKm;
-    if (!reference()) {
+    if (motion() && !reference()) {
       advanceMotion();
     }
     m_windStepKm = m_windOffsetKm - windBefore;
@@ -973,9 +1022,34 @@ namespace dxvk {
     // wind carries, so the wind alone changes none of them and they only bake the strips their windows slide over;
     // rise and shear evolve the field, and with either on they rebake on their interleave. The sky's aerial
     // perspective and the dome see the clouds from the camera, so the wind moves what they hold.
-    const uint64_t inputsKey = computeInputsKey(args, atmosphere);
+    if (args.horizonBiasShiftKm > 0.0f) {
+      // The horizon bias follows the camera while the bakes hold the field the wind carries, so they restart once the
+      // camera has moved through the field far enough for the bias to move the clouds' surfaces by 20 m.
+      const Vector2 cameraFieldKm(args.cameraPositionKm.x - args.windOffsetKm.x, args.cameraPositionKm.z - args.windOffsetKm.y);
+      const float gradient = std::abs(args.horizonBias) * args.horizonBiasShiftKm * 1.5f / (args.horizonBiasEndKm - args.horizonBiasStartKm);
+      const float toleranceKm = std::clamp(0.02f / gradient, 0.01f, 1.0f);
+      const Vector2 moved = cameraFieldKm - m_horizonBiasAnchorKm;
+      if (!m_horizonBiasAnchored || moved.x * moved.x + moved.y * moved.y > toleranceKm * toleranceKm) {
+        m_horizonBiasAnchorKm = cameraFieldKm;
+        m_horizonBiasAnchored = true;
+      }
+    } else {
+      m_horizonBiasAnchored = false;
+    }
+    const auto keyOf = [&](const CloudArgs& keyArgs) {
+      const uint64_t key = computeInputsKey(keyArgs, atmosphere);
+      return m_horizonBiasAnchored ? hashBytes(&m_horizonBiasAnchorKm, sizeof(m_horizonBiasAnchorKm), key) : key;
+    };
+    const uint64_t inputsKey = keyOf(args);
     const bool inputsChanged = inputsKey != m_lastInputsKey;
     m_lastInputsKey = inputsKey;
+    // The same but for the field's evolution, which changes the bakes only slowly.
+    CloudArgs unevolved = args;
+    unevolved.evolutionRiseKm = 0.0f;
+    unevolved.evolutionShearKm = 0.0f;
+    const uint64_t restartKey = keyOf(unevolved);
+    const bool inputsRestarted = restartKey != m_lastRestartKey;
+    m_lastRestartKey = restartKey;
     const bool windMoved = m_windStepKm.x != 0.0f || m_windStepKm.y != 0.0f;
     const vec3 cameraMove = args.cameraPositionKm - m_skyCameraPositionKm;
     const float cameraMoveKm = std::sqrt(cameraMove.x * cameraMove.x + cameraMove.y * cameraMove.y + cameraMove.z * cameraMove.z);
@@ -995,7 +1069,7 @@ namespace dxvk {
     // Window origins in texels.
     const auto texels = [](float originKm, float texelKm) { return int64_t(std::llround(double(originKm) / double(texelKm))); };
     const float gridTexelKm = kGridExtentKm / float(CLOUD_GRID_SIZE_XZ);
-    const float farGridTexelKm = kFarGridExtentKm / float(CLOUD_GRID_SIZE_XZ);
+    const float farGridTexelKm = kFarGridExtentKm / float(CLOUD_FAR_GRID_SIZE_XZ);
     const float shadowTexelKm = kShadowMapExtentKm / float(CLOUD_SHADOW_MAP_SIZE);
 
     bool nearWritten = false;
@@ -1007,10 +1081,18 @@ namespace dxvk {
         nearWritten = updateWorldBake(m_nearGridState, inputsKey, texels(args.gridOriginKm.x, gridTexelKm), texels(args.gridOriginKm.y, gridTexelKm),
           CLOUD_GRID_SIZE_XZ, std::max(tier.gridInterleave, 1u), [&](const BakeRegion& region) { bakeLightingGrids(ctx, 0, region); });
       }
+      const int64_t farOriginX = texels(args.farGridOriginKm.x, farGridTexelKm);
+      const int64_t farOriginZ = texels(args.farGridOriginKm.y, farGridTexelKm);
+      // A full bake, or a jump that brings in over a kilometre of the window at once.
+      const bool farRebaked = !m_farGridState.valid || std::abs(farOriginX - m_farGridState.interleavedOrigin) > 4 ||
+                              std::abs(farOriginZ - m_farGridState.otherOrigin) > 4;
       {
         ScopedGpuProfileZone(ctx, "Clouds Far Grids");
-        farWritten = updateWorldBake(m_farGridState, inputsKey, texels(args.farGridOriginKm.x, farGridTexelKm), texels(args.farGridOriginKm.y, farGridTexelKm),
-          CLOUD_GRID_SIZE_XZ, kFarGridInterleave, [&](const BakeRegion& region) { bakeLightingGrids(ctx, 1, region); });
+        farWritten = updateWorldBake(m_farGridState, inputsKey, farOriginX, farOriginZ,
+          CLOUD_FAR_GRID_SIZE_XZ, kFarGridInterleave, [&](const BakeRegion& region) { bakeLightingGrids(ctx, 1, region); });
+      }
+      if (inputsRestarted || farRebaked) {
+        m_farDiffusionCatchUpSweeps = kDiffusionSettleSweeps;
       }
       barrier(ctx);
       if (nearWritten) {
@@ -1018,7 +1100,8 @@ namespace dxvk {
         bakeSunGridMips(ctx);
       }
       // The diffusion floor's solve sweeps each frame its cascade's grid changes and for kDiffusionSettleSweeps
-      // after, enough to converge from any start; then it holds.
+      // after, enough to converge from any start; then it holds. Between restarts the far cascade's grid changes only
+      // as the field slowly evolves, which a sweep a frame keeps up with; after one it catches up at the tier's pace.
       const bool gridWritten[2] = { nearWritten, farWritten };
       if (nearWritten || farWritten || m_diffusionSettleSweeps[0] > 0 || m_diffusionSettleSweeps[1] > 0) {
         ScopedGpuProfileZone(ctx, "Clouds Diffusion");
@@ -1026,10 +1109,14 @@ namespace dxvk {
           if (gridWritten[cascade]) {
             m_diffusionSettleSweeps[cascade] = kDiffusionSettleSweeps;
           }
-          const uint32_t sweeps = std::min(std::max(tier.diffusionSweeps, 1u), m_diffusionSettleSweeps[cascade]);
+          const bool tracking = cascade == 1 && gridWritten[cascade] && m_farDiffusionCatchUpSweeps == 0;
+          const uint32_t sweeps = std::min(tracking ? 1u : std::max(tier.diffusionSweeps, 1u), m_diffusionSettleSweeps[cascade]);
           if (sweeps > 0) {
             bakeDiffusion(ctx, cascade, gridWritten[cascade], sweeps);
             m_diffusionSettleSweeps[cascade] -= sweeps;
+            if (cascade == 1) {
+              m_farDiffusionCatchUpSweeps -= std::min(sweeps, m_farDiffusionCatchUpSweeps);
+            }
           }
         }
       }
@@ -1149,6 +1236,15 @@ namespace dxvk {
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_nvdfConstantsBuffer);
     m_pendingNvdfKey = makeNvdfKey(args);
 
+    // The jump flood's volumes live only while a bake runs.
+    const VkExtent3D nvdfExtent = { CLOUD_NVDF_SIZE_XZ, CLOUD_NVDF_SIZE_Y, CLOUD_NVDF_SIZE_XZ };
+    const auto create3D = [&](const char* name, VkFormat format) {
+      return Resources::createImageResource(ctx, name, nvdfExtent, format, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
+    };
+    m_nvdfOccupancy = create3D("Cloud NVDF Occupancy", VK_FORMAT_R8_UNORM);
+    m_nvdfSeeds[0] = create3D("Cloud NVDF Seeds 0", VK_FORMAT_R32_UINT);
+    m_nvdfSeeds[1] = create3D("Cloud NVDF Seeds 1", VK_FORMAT_R32_UINT);
+
     // The placement map follows the cell size and tile, so it bakes with the field.
     bakePlacement(ctx);
     barrier(ctx);
@@ -1229,6 +1325,9 @@ namespace dxvk {
     m_nvdfValid = true;
     m_nvdfBakeActive = false;
     m_nvdfJumpIndex = 0;
+    m_nvdfOccupancy.reset();
+    m_nvdfSeeds[0].reset();
+    m_nvdfSeeds[1].reset();
     // The grids describe the old field until baked again in full.
     m_gridsNeedFullBake = true;
   }
@@ -1323,6 +1422,7 @@ namespace dxvk {
   void RtxClouds::bakeDiffusion(Rc<DxvkContext> ctx, uint32_t cascade, bool cellsChanged, uint32_t sweeps) {
     const Resources::Resource& cells = m_diffusionCells[cascade];
     const Resources::Resource& fluence = m_diffusionFluence[cascade];
+    const uint32_t sizeXZ = cascade == 0 ? CLOUD_GRID_SIZE_XZ : CLOUD_FAR_GRID_SIZE_XZ;
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
     CloudPassArgs pushArgs = {};
     pushArgs.level = cascade;
@@ -1337,7 +1437,7 @@ namespace dxvk {
       ctx->bindResourceView(CLOUD_BINDING_BAKE_OUTPUT, cells.view, nullptr);
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(sunGrid.image);
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(cells.image);
-      const VkExtent3D groups = util::computeBlockCount(VkExtent3D { CLOUD_GRID_SIZE_XZ, CLOUD_GRID_SIZE_Y, CLOUD_GRID_SIZE_XZ }, VkExtent3D { 8, 4, 8 });
+      const VkExtent3D groups = util::computeBlockCount(VkExtent3D { sizeXZ, CLOUD_GRID_SIZE_Y, sizeXZ }, VkExtent3D { 8, 4, 8 });
       ctx->dispatch(groups.width, groups.height, groups.depth);
       barrier(ctx);
     }
@@ -1349,7 +1449,7 @@ namespace dxvk {
     ctx->bindResourceView(CLOUD_BINDING_BAKE_OUTPUT, fluence.view, nullptr);
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(cells.image);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(fluence.image);
-    const VkExtent3D halfGroups = util::computeBlockCount(VkExtent3D { CLOUD_GRID_SIZE_XZ / 2, CLOUD_GRID_SIZE_Y, CLOUD_GRID_SIZE_XZ }, VkExtent3D { 4, 4, 8 });
+    const VkExtent3D halfGroups = util::computeBlockCount(VkExtent3D { sizeXZ / 2, CLOUD_GRID_SIZE_Y, sizeXZ }, VkExtent3D { 4, 4, 8 });
     for (uint32_t i = 0; i < 2 * sweeps; ++i) {
       pushArgs.phase = i & 1u;
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);

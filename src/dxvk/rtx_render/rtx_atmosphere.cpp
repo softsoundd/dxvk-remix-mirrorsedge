@@ -1199,7 +1199,6 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(RtxContext& ctx, const Atmosphe
 
   // The cloud layer's shadow on the air: its constants' leading CloudArgs, its sun grid and shadow map.
   RtxClouds& clouds = ctx.getClouds();
-  clouds.initialize(&ctx);
   ctx.bindResourceBuffer(6, DxvkBufferSlice(clouds.getConstantsBuffer(), 0, sizeof(CloudArgs)));
   ctx.bindResourceView(7, clouds.getSunGridView(), nullptr);
   ctx.bindResourceView(8, clouds.getShadowMapView(), nullptr);

@@ -53,7 +53,8 @@ float sunTransmittance(vec3 uvw, CloudArgs cloud) {
 [shader("compute")]
 [numthreads(8, 4, 8)]
 void main(uint3 voxel : SV_DispatchThreadID) {
-  if (any(voxel >= uint3(CLOUD_GRID_SIZE_XZ, CLOUD_GRID_SIZE_Y, CLOUD_GRID_SIZE_XZ))) {
+  const uint sizeXZ = cloudGridSizeXZ(passArgs.level);
+  if (any(voxel >= uint3(sizeXZ, CLOUD_GRID_SIZE_Y, sizeXZ))) {
     return;
   }
   const CloudArgs cloud = constants.cloud;
@@ -62,7 +63,7 @@ void main(uint3 voxel : SV_DispatchThreadID) {
     cellsOutput[voxel] = vec2(0.0f);
     return;
   }
-  const vec3 gridSize = vec3(float(CLOUD_GRID_SIZE_XZ), float(CLOUD_GRID_SIZE_Y), float(CLOUD_GRID_SIZE_XZ));
+  const vec3 gridSize = vec3(float(sizeXZ), float(CLOUD_GRID_SIZE_Y), float(sizeXZ));
   const float windowExtentKm = bool(passArgs.level) ? cloud.farGridExtentKm : cloud.gridExtentKm;
   const vec3 extentKm = vec3(windowExtentKm, cloud.thicknessKm, windowExtentKm);
   const float h = min(extentKm.x / gridSize.x, extentKm.y / gridSize.y);

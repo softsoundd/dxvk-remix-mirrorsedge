@@ -168,6 +168,13 @@ vec2 cloudControls(vec2 xzKm, CloudArgs cloud) {
     saturate(cloud.coverage + (coverageNoise - 0.5f) * cloud.coverageSpread));
 }
 
+// The share of the clouds the horizon bias takes at a cloud frame position, 0 none to 1 all: within
+// horizonBiasStartKm of the camera for a positive bias, beyond horizonBiasEndKm for a negative one, blending between.
+float cloudHorizonBiasReduction(vec2 xzKm, CloudArgs cloud) {
+  const float towardHorizon = smoothstep(cloud.horizonBiasStartKm, cloud.horizonBiasEndKm, length(xzKm - cloud.cameraPositionKm.xz));
+  return cloud.horizonBias > 0.0f ? cloud.horizonBias * (1.0f - towardHorizon) : -cloud.horizonBias * towardHorizon;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Vertical extinction profile. In an adiabatic parcel the liquid water grows linearly with height above the base
 // and the droplet number stays constant, so the extinction grows as height^(2/3) (Brenguier et al. 2000): flat,
@@ -230,14 +237,25 @@ CloudDensitySample cloudSampleDensity(
     sdfMinKm = sdfKm;
   }
 
-  // Coverage as a live level set offset against the coverage the body was baked at.
-  const float offsetKm = (coverageLocal - cloud.nvdfNominalCoverage) * cloud.nvdfCoverageOffsetKm;
+  // Coverage as a live level set offset against the coverage the body was baked at. The horizon bias shrinks the
+  // bodies further; its shift varies over the field, so the empty radius shrinks by the shift's steepest gradient.
+  float offsetKm = (coverageLocal - cloud.nvdfNominalCoverage) * cloud.nvdfCoverageOffsetKm;
+  float biasFade = 1.0f;
+  float emptyScale = 1.0f;
+  if (cloud.horizonBiasShiftKm > 0.0f) {
+    const float reduction = cloudHorizonBiasReduction(positionKm.xz, cloud);
+    offsetKm -= reduction * cloud.horizonBiasShiftKm;
+    // Cores deeper than the shift fade out over the bias's last tenth.
+    biasFade = saturate((1.0f - reduction) * 10.0f);
+    emptyScale = 1.0f / (1.0f + abs(cloud.horizonBias) * cloud.horizonBiasShiftKm * 1.5f
+      / max(cloud.horizonBiasEndKm - cloud.horizonBiasStartKm, 1e-3f));
+  }
   float sdfLive = sdfKm - offsetKm;
 
   // Both level set displacements below can push the surface out by at most half their amplitude.
   const float wobbleKm = max(cloud.wobbleStrength, 0.0f) * 0.6f;
   const float maxOutwardKm = 0.5f * (wobbleKm + cloud.shapeVarietyKm);
-  result.emptyKm = min(sdfMinKm - offsetKm - maxOutwardKm, tileBoundaryKm);
+  result.emptyKm = min((sdfMinKm - offsetKm - maxOutwardKm) * emptyScale, tileBoundaryKm);
   result.surfaceKm = sdfLive - maxOutwardKm;
   if (sdfLive >= maxOutwardKm) {
     return result;
@@ -388,7 +406,7 @@ CloudDensitySample cloudSampleDensity(
     density = pow(max(density, 0.0f), lerp(0.5f, 1.0f, softenBlend)) * lerp(0.666f, 1.0f, softenBlend);
   }
 
-  result.density = saturate(density);
+  result.density = saturate(density) * biasFade;
   return result;
 }
 

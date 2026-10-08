@@ -41,8 +41,10 @@
 // 2D placement map of the column model, periodic at one noise tile.
 #define CLOUD_PLACEMENT_MAP_SIZE 512
 
-// Sun and vertical optical depth grids around the camera; texture y is vertical (the slab).
+// Sun and vertical optical depth grids around the camera; texture y is vertical (the slab). The far cascade has more
+// columns over its wider window.
 #define CLOUD_GRID_SIZE_XZ 256
+#define CLOUD_FAR_GRID_SIZE_XZ 384
 #define CLOUD_GRID_SIZE_Y 32
 // Box filtered levels of the sun grid, read by the higher scattering orders (optical depth through blurred
 // density).
@@ -205,6 +207,13 @@ struct CloudArgs {
   vec2 windStepKm;    // The field's displacement since the last frame, x / z
   float riseStepKm;   // The detail's convective rise since the last frame
   float shearStepKm;  // The detail's downwind shear at the top since the last frame
+
+  // Overhead against horizon bias: shrinks the clouds within horizonBiasStartKm of the camera (bias > 0) or beyond
+  // horizonBiasEndKm (bias < 0), blending between; the level set shift at full strength, 0 for none.
+  float horizonBias;
+  float horizonBiasStartKm;
+  float horizonBiasEndKm;
+  float horizonBiasShiftKm;
 };
 
 // Constant buffer of the cloud passes: this frame's cloud and atmosphere parameters together. The cloud

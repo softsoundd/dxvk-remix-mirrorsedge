@@ -204,21 +204,26 @@ bool cloudFarGridContains(vec2 xzKm, CloudArgs cloud) {
 static const float kCloudNearWindowBandKm = 1.0f;
 static const float kCloudFarWindowBandKm = 4.0f;
 
+// Columns of a grid cascade, 0 the near window, 1 the far one.
+uint cloudGridSizeXZ(uint cascade) {
+  return cascade != 0u ? CLOUD_FAR_GRID_SIZE_XZ : CLOUD_GRID_SIZE_XZ;
+}
+
 // Weight of a window's contents at a cloud frame position: 1 well inside, falling to 0 over its band at the edge.
 // Measured from the camera rather than the window's texel snapped origin, whose every snap would move the edge a
 // texel across the clouds at once. It ends half a texel inside, the furthest the snapped window sits off the camera.
-float cloudWindowWeight(vec2 xzKm, float extentKm, float bandKm, CloudArgs cloud) {
+float cloudWindowWeight(vec2 xzKm, float extentKm, uint sizeXZ, float bandKm, CloudArgs cloud) {
   const vec2 offset = abs(xzKm - cloud.cameraPositionKm.xz);
-  const float halfTexelKm = 0.5f * extentKm / float(CLOUD_GRID_SIZE_XZ);
+  const float halfTexelKm = 0.5f * extentKm / float(sizeXZ);
   return saturate((0.5f * extentKm - halfTexelKm - max(offset.x, offset.y)) / bandKm);
 }
 
 float cloudNearWindowWeight(vec2 xzKm, CloudArgs cloud) {
-  return cloudWindowWeight(xzKm, cloud.gridExtentKm, kCloudNearWindowBandKm, cloud);
+  return cloudWindowWeight(xzKm, cloud.gridExtentKm, CLOUD_GRID_SIZE_XZ, kCloudNearWindowBandKm, cloud);
 }
 
 float cloudFarWindowWeight(vec2 xzKm, CloudArgs cloud) {
-  return cloudWindowWeight(xzKm, cloud.farGridExtentKm, kCloudFarWindowBandKm, cloud);
+  return cloudWindowWeight(xzKm, cloud.farGridExtentKm, CLOUD_FAR_GRID_SIZE_XZ, kCloudFarWindowBandKm, cloud);
 }
 
 // Shadow map coordinate of a position on the slab's base, or false outside its window (shadowMapExtentKm about

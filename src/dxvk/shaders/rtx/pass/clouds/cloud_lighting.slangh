@@ -237,14 +237,15 @@ float cloudDiffusionFluence(Texture3D<float> grid, vec3 uvw) {
 // looking along v, D = 1 / (3 sigma_tr) of the sample, the flux term clamped where P1 would turn negative. The
 // gradient is needed only along v: a central difference a cell either side.
 float cloudDiffusionRadiance(
-  Texture3D<float> grid, vec3 uvw, float windowExtentKm, float localDensity, float transport, vec3 viewDir, CloudArgs cloud)
+  Texture3D<float> grid, vec3 uvw, float windowExtentKm, uint windowSizeXZ, float localDensity, float transport, vec3 viewDir,
+  CloudArgs cloud)
 {
   const float fluence = cloudDiffusionFluence(grid, uvw);
   if (fluence <= 0.0f) {
     return 0.0f;
   }
   const vec3 extentKm = vec3(windowExtentKm, cloud.thicknessKm, windowExtentKm);
-  const float stepKm = min(windowExtentKm / float(CLOUD_GRID_SIZE_XZ), cloud.thicknessKm / float(CLOUD_GRID_SIZE_Y));
+  const float stepKm = min(windowExtentKm / float(windowSizeXZ), cloud.thicknessKm / float(CLOUD_GRID_SIZE_Y));
   const vec3 offset = viewDir * stepKm / extentKm;
   const float alongView = (cloudDiffusionFluence(grid, uvw + offset) - cloudDiffusionFluence(grid, uvw - offset)) / (2.0f * stepKm);
   const float threeD = 1.0f / (transport * max(localDensity, 1e-3f));
@@ -258,12 +259,12 @@ float cloudDiffusionFloor(vec3 positionKm, float localDensity, float transport, 
   const float nearWeight = cloudNearWindowWeight(positionKm.xz, cloud);
   float radiance = 0.0f;
   if (nearWeight > 0.0f) {
-    radiance += nearWeight * cloudDiffusionRadiance(
-      CloudDiffusionGrid, cloudGridUvw(positionKm, cloud), cloud.gridExtentKm, localDensity, transport, viewDir, cloud);
+    radiance += nearWeight * cloudDiffusionRadiance(CloudDiffusionGrid, cloudGridUvw(positionKm, cloud), cloud.gridExtentKm,
+      CLOUD_GRID_SIZE_XZ, localDensity, transport, viewDir, cloud);
   }
   if (nearWeight < 1.0f) {
-    radiance += (1.0f - nearWeight) * cloudDiffusionRadiance(
-      CloudDiffusionGridFar, cloudFarGridUvw(positionKm, cloud), cloud.farGridExtentKm, localDensity, transport, viewDir, cloud);
+    radiance += (1.0f - nearWeight) * cloudDiffusionRadiance(CloudDiffusionGridFar, cloudFarGridUvw(positionKm, cloud),
+      cloud.farGridExtentKm, CLOUD_FAR_GRID_SIZE_XZ, localDensity, transport, viewDir, cloud);
   }
   return radiance;
 }

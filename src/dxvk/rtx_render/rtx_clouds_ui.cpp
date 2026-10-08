@@ -111,6 +111,16 @@ namespace dxvk {
     RemixGui::DragFloat("Type Variation", &typeSpreadObject(), 0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
     RemixGui::DragFloat("Type Variation Scale", &typeSpreadScaleKmObject(), 0.05f, 0.5f, 32.0f, "%.1f km", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover("Size of the patches of wispier and more billowy clouds; about the cloud spacing gives each cloud its own\ncharacter.");
+    RemixGui::DragFloat("Horizon Bias", &horizonBiasObject(), 0.005f, -1.0f, 1.0f, "%.3f", sliderFlags);
+    RemixGui::SetTooltipToLastWidgetOnHover("Shrinks the clouds overhead (above 0; 1 clears them, leaving clouds only towards the horizon, like a\nskybox) or towards the horizon (below 0).");
+    if (horizonBias() != 0.0f) {
+      ImGui::Indent();
+      RemixGui::DragFloat("Overhead Radius", &horizonBiasStartKmObject(), 0.1f, 0.0f, 100.0f, "%.1f km", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover("Horizontal distance from the camera within which the overhead side applies in full. Clouds 2 km above\nthe eye stand 10 degrees above the horizon 11 km away.");
+      RemixGui::DragFloat("Horizon Distance", &horizonBiasEndKmObject(), 0.1f, 0.1f, 160.0f, "%.1f km", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover("Horizontal distance beyond which the horizon side applies in full; between the two the bias blends.");
+      ImGui::Unindent();
+    }
 
     {
       const DropletReadout readout = computeDropletReadout();
@@ -126,12 +136,18 @@ namespace dxvk {
     RemixGui::SetTooltipToLastWidgetOnHover("Stylisation: multiplies the physical extinction. 1 = physical.");
 
     ImGui::Separator();
-    ImGui::Text("Wind:");
+    ImGui::Text("Motion:");
+    RemixGui::Checkbox("Cloud Motion", &motionObject());
+    RemixGui::SetTooltipToLastWidgetOnHover("Move the clouds: the wind carries them and they rise and shear as they travel. Off holds them where they\nare, keeping the settings below.");
+    ImGui::BeginDisabled(!motion());
     RemixGui::DragFloat("Wind Speed", &windSpeedObject(), 0.1f, 0.0f, 50.0f, "%.1f m/s", sliderFlags);
     RemixGui::SetTooltipToLastWidgetOnHover("At cloud level: 5-15 m/s is typical, 25 and more a gale.");
+    ImGui::EndDisabled();
     RemixGui::DragFloat("Wind Direction", &windDirectionObject(), 0.5f, 0.0f, 360.0f, "%.1f deg", sliderFlags);
+    ImGui::BeginDisabled(!motion());
     RemixGui::DragFloat("Convective Rise", &evolutionRiseObject(), 0.05f, 0.0f, 10.0f, "%.2f m/s", sliderFlags);
     RemixGui::DragFloat("Top Shear", &evolutionShearObject(), 0.05f, 0.0f, 10.0f, "%.2f m/s", sliderFlags);
+    ImGui::EndDisabled();
 
     ImGui::Separator();
     ImGui::Text("Scene and Atmosphere:");

@@ -183,13 +183,14 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
   const CloudArgs cloud = constants.cloud;
   const AtmosphereArgs atmosphere = constants.atmosphere;
 
-  const uint period = max(passArgs.period, 1u);
-  const uint column = cloudInterleavedTexel(dispatchId.x, period, passArgs.phase) % CLOUD_GRID_SIZE_XZ;
-  const uint3 voxel = uint3(column, dispatchId.y, (dispatchId.z + passArgs.offset) % CLOUD_GRID_SIZE_XZ);
-  const vec3 uvw = (vec3(voxel) + 0.5f) / vec3(float(CLOUD_GRID_SIZE_XZ), float(CLOUD_GRID_SIZE_Y), float(CLOUD_GRID_SIZE_XZ));
-
   // passArgs.level picks the cascade: 0 the near window, 1 the far one.
   const bool far = bool(passArgs.level);
+  const uint sizeXZ = cloudGridSizeXZ(passArgs.level);
+  const uint period = max(passArgs.period, 1u);
+  const uint column = cloudInterleavedTexel(dispatchId.x, period, passArgs.phase) % sizeXZ;
+  const uint3 voxel = uint3(column, dispatchId.y, (dispatchId.z + passArgs.offset) % sizeXZ);
+  const vec3 uvw = (vec3(voxel) + 0.5f) / vec3(float(sizeXZ), float(CLOUD_GRID_SIZE_Y), float(sizeXZ));
+
   const vec2 windowOriginKm = far ? cloud.farGridOriginKm : cloud.gridOriginKm.xy;
   const float windowExtentKm = far ? cloud.farGridExtentKm : cloud.gridExtentKm;
   const vec3 positionKm = vec3(
@@ -199,7 +200,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupThreadId : SV_Group
 
   // Point sampled, detail finer than the voxel would flip the diffusion's cells across the medium's threshold as
   // the field evolves. The filter is the voxel's size, undoing the sharpening the view's detail LOD bias adds.
-  const float voxelKm = max(windowExtentKm / float(CLOUD_GRID_SIZE_XZ), cloud.thicknessKm / float(CLOUD_GRID_SIZE_Y));
+  const float voxelKm = max(windowExtentKm / float(sizeXZ), cloud.thicknessKm / float(CLOUD_GRID_SIZE_Y));
   const float voxelFootprintKm = voxelKm * exp2(-cloud.detailLodBias);
 
   // The coverage and type fields are the same for every voxel of a column.

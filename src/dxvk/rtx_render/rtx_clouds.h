@@ -72,12 +72,6 @@ public:
   explicit RtxClouds(DxvkDevice* device);
 
   /**
-   * \brief Creates every resource the common bindings and composite read, so they are valid even while the
-   * clouds are off, and bakes the static noise.
-   */
-  void initialize(Rc<DxvkContext> ctx);
-
-  /**
    * \brief Whether clouds render this frame: enabled under the Physical Atmosphere.
    */
   static bool isActive();
@@ -171,6 +165,12 @@ public:
   RTX_OPTION("rtx.clouds", float, coverage, 0.45f, "(genus) Fraction of the sky the layer covers, 0 to 1.");
   RTX_OPTION("rtx.clouds", float, coverageSpread, 0.0f, "Amplitude of the large scale variation of the coverage.");
   RTX_OPTION("rtx.clouds", float, coverageSpreadScaleKm, 16.0f, "Size of the patches over which the coverage varies: denser and sparser clusters of clouds.");
+  RTX_OPTION("rtx.clouds", float, horizonBias, 0.0f,
+    "Shifts the cloud cover between overhead and the horizon by shrinking the clouds on one side: above 0 those overhead\n"
+    "(1 clears them, leaving clouds only towards the horizon, like a skybox), below 0 those towards the horizon (-1 leaves\n"
+    "them only overhead).");
+  RTX_OPTION("rtx.clouds", float, horizonBiasStartKm, 5.0f, "Horizontal distance from the camera within which the horizon bias's overhead side applies in full.");
+  RTX_OPTION("rtx.clouds", float, horizonBiasEndKm, 30.0f, "Horizontal distance from the camera beyond which its horizon side applies in full; between the two it blends.");
   RTX_OPTION("rtx.clouds", float, cloudType, 0.75f, "(genus) Erosion character: 0 wispy, 1 billowy.");
   RTX_OPTION("rtx.clouds", float, typeSpread, 0.54f, "Amplitude of the large scale variation of the type.");
   RTX_OPTION("rtx.clouds", float, typeSpreadScaleKm, 3.0f, "Size of the patches over which the type varies; about the cloud spacing gives each cloud its own character.");
@@ -213,6 +213,7 @@ public:
   RTX_OPTION("rtx.clouds", float, detailLodBias, -1.0f, "Mip bias of the detail volume's pixel footprint filtering; lower keeps more detail at distance.");
 
   // Motion
+  RTX_OPTION("rtx.clouds", bool, motion, true, "Move the clouds: the wind carries them and they rise and shear as they travel. Off holds them where they are.");
   RTX_OPTION("rtx.clouds", float, windSpeed, 10.0f, "Wind speed at cloud level, m/s: 5 to 15 is typical of the lower troposphere. The field moves with it.");
   RTX_OPTION("rtx.clouds", float, windDirection, 45.0f, "Direction the wind blows toward, degrees (0 = +X, 90 = +Z in the atmosphere's frame).");
   RTX_OPTION("rtx.clouds", float, evolutionRise, 2.0f, "Convective rise of the detail field, m/s: clouds boil.");
@@ -295,11 +296,16 @@ private:
   CloudArgs buildArgs(const AtmosphereArgs& atmosphere, const RtCamera& camera, const VkExtent3D& renderExtent, uint32_t debugView);
   void advanceMotion();
 
+  // The resources the bakes, the passes and the common bindings read, and the static noise and tables, on the
+  // first frame the clouds are on after being off.
+  void initialize(Rc<DxvkContext> ctx);
   void createResources(Rc<DxvkContext> ctx);
   void ensureDome(Rc<DxvkContext> ctx, uint32_t width);
   void ensureScreenResources(Rc<DxvkContext> ctx, const VkExtent3D& extent);
   void ensureReferenceResources(Rc<DxvkContext> ctx);
   void releaseReferenceResources();
+  // Everything initialize, the dome and the screen targets allocate, and the state describing it.
+  void releaseResources();
   void uploadPhaseLut(Rc<DxvkContext> ctx);
 
   void barrier(Rc<DxvkContext> ctx);
@@ -358,6 +364,7 @@ private:
   Resources::Resource m_placementMap;
   Resources::Resource m_detailNoise;
   std::vector<Rc<DxvkImageView>> m_detailNoiseMipViews;
+  // The body field's jump flood, allocated only while a bake runs, and the published field with its back buffer.
   Resources::Resource m_nvdfOccupancy;
   Resources::Resource m_nvdfSeeds[2];
   Resources::Resource m_nvdfSdf[2];
@@ -365,7 +372,7 @@ private:
   Resources::Resource m_sunGrid;
   std::vector<Rc<DxvkImageView>> m_sunGridMipViews;
   Resources::Resource m_ambientGrid;
-  // The far cascade of the two, over the far field shadow map's window, for distant clouds.
+  // The far cascade of the two, over a wider window at more columns, for distant clouds.
   Resources::Resource m_sunGridFar;
   Resources::Resource m_ambientGridFar;
   // Per cascade, near then far: the diffusion floor's cells (Q, density) and fluence, and the sweeps left before
@@ -373,6 +380,8 @@ private:
   Resources::Resource m_diffusionCells[2];
   Resources::Resource m_diffusionFluence[2];
   uint32_t m_diffusionSettleSweeps[2] = {};
+  // Sweeps the far cascade's solve still runs at the tier's pace after a restart, before it tracks a sweep a frame.
+  uint32_t m_farDiffusionCatchUpSweeps = 0;
   Resources::Resource m_skyApInScatter;
   Resources::Resource m_skyApTransmittance;
   Resources::Resource m_skySh;
@@ -428,8 +437,8 @@ private:
 
   // The far field shadow map bakes a quarter of its rows a frame.
   static constexpr uint32_t kShadowMapInterleave = 4;
-  // The far grid cascade bakes an eighth of its columns a frame: distant clouds change slowly on screen.
-  static constexpr uint32_t kFarGridInterleave = 8;
+  // The far grid cascade bakes a sixteenth of its columns a frame: distant clouds change slowly on screen.
+  static constexpr uint32_t kFarGridInterleave = 16;
   // The sky aerial perspective LUT refreshes a quarter of its columns a frame once it has been baked in full.
   static constexpr uint32_t kSkyApInterleave = 4;
   bool m_skyApValid = false;
@@ -445,7 +454,14 @@ private:
   WorldBakeState m_farGridState;
   WorldBakeState m_shadowMapState;
   uint64_t m_lastInputsKey = 0;
+  // The inputs key without the field's evolution.
+  uint64_t m_lastRestartKey = 0;
   uint64_t m_skyLightKey = 0;
+  // The camera's place in the field the bakes last restarted from for the horizon bias, which follows the camera.
+  Vector2 m_horizonBiasAnchorKm = Vector2(0.0f, 0.0f);
+  bool m_horizonBiasAnchored = false;
+  // Whether the constants say off, as passes outside the module read them while the clouds are off.
+  bool m_offConstantsWritten = false;
   // Camera the sky aerial perspective LUT and the dome last restarted their refreshes for.
   vec3 m_skyCameraPositionKm = vec3(0.0f, 0.0f, 0.0f);
   float m_skyCameraWorldHeightKm = 0.0f;

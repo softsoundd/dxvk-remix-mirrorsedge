@@ -51,14 +51,15 @@ static const float kOverRelaxation = 1.8f;
 [numthreads(4, 4, 8)]
 void main(uint3 threadId : SV_DispatchThreadID) {
   const uint3 voxel = uint3(threadId.x * 2u + ((threadId.y + threadId.z + passArgs.phase) & 1u), threadId.y, threadId.z);
-  if (any(voxel >= uint3(CLOUD_GRID_SIZE_XZ, CLOUD_GRID_SIZE_Y, CLOUD_GRID_SIZE_XZ))) {
+  const uint sizeXZ = cloudGridSizeXZ(passArgs.level);
+  if (any(voxel >= uint3(sizeXZ, CLOUD_GRID_SIZE_Y, sizeXZ))) {
     return;
   }
   const CloudArgs cloud = constants.cloud;
   const bool far = bool(passArgs.level);
   const vec2 windowOriginKm = far ? cloud.farGridOriginKm : cloud.gridOriginKm.xy;
   const float windowExtentKm = far ? cloud.farGridExtentKm : cloud.gridExtentKm;
-  const vec3 gridSize = vec3(float(CLOUD_GRID_SIZE_XZ), float(CLOUD_GRID_SIZE_Y), float(CLOUD_GRID_SIZE_XZ));
+  const vec3 gridSize = vec3(float(sizeXZ), float(CLOUD_GRID_SIZE_Y), float(sizeXZ));
   const vec3 cellKm = vec3(windowExtentKm, cloud.thicknessKm, windowExtentKm) / gridSize;
   const float transport = (1.0f - cloud.asymmetry) * cloud.extinctionKm;
   const vec3 sunDir = normalize(constants.atmosphere.sunDirection);
@@ -95,7 +96,7 @@ void main(uint3 threadId : SV_DispatchThreadID) {
       if (coordinate < (axis == 0 ? windowMin.x : windowMin.y) || coordinate > (axis == 0 ? windowMax.x : windowMax.y)) {
         continue;
       }
-      neighbour[axis] = (neighbour[axis] + CLOUD_GRID_SIZE_XZ) % CLOUD_GRID_SIZE_XZ;
+      neighbour[axis] = (neighbour[axis] + int(sizeXZ)) % int(sizeXZ);
     }
     const vec2 other = outside ? vec2(0.0f) : cells.Load(int4(neighbour, 0));
 

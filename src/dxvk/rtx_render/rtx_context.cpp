@@ -1819,8 +1819,7 @@ namespace dxvk {
       bindResourceView(BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT, aerosolPhaseLut.view, nullptr);
     }
 
-    // Likewise the clouds' resources, which stay valid (and inert) while the clouds are off.
-    m_clouds->initialize(this);
+    // Likewise the clouds' resources, null while the clouds are off and nothing reads them.
     bindResourceView(BINDING_CLOUD_SUN_GRID, m_clouds->getSunGridView(), nullptr);
     bindResourceView(BINDING_CLOUD_DOME, m_clouds->getDomeView(), nullptr);
     bindResourceView(BINDING_CLOUD_SHADOW_MAP, m_clouds->getShadowMapView(), nullptr);
