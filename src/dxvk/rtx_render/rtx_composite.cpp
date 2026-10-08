@@ -138,6 +138,7 @@ namespace dxvk {
         TEXTURE2D(COMPOSITE_CLOUD_LAYER_INPUT)
         TEXTURE2D(COMPOSITE_CLOUD_REFLECTION_INPUT)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT)
+        TEXTURE2D(COMPOSITE_CLOUD_MISS_FOREGROUND_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -433,6 +434,7 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_CLOUD_LAYER_INPUT, cloudLayer, nullptr);
     ctx->bindResourceView(COMPOSITE_CLOUD_REFLECTION_INPUT, ctx->getClouds().getReflectionView(), nullptr);
     ctx->bindResourceView(COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT, ctx->getAtmosphereSkyViewLutView(), nullptr);
+    ctx->bindResourceView(COMPOSITE_CLOUD_MISS_FOREGROUND_INPUT, ctx->getClouds().getMissForegroundView(), nullptr);
 
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;

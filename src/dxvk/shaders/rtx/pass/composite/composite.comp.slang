@@ -1068,6 +1068,8 @@ vec4 compositeResult(
 
   // The cloud layer lies behind the froxel fog and in front of whatever the pixel shows, the screen pass having
   // stopped each ray there, so the fog's in-scatter F stays on top: F + T_cloud (radiance - F) + T_fog C.
+  // A sky miss's radiance E gathered before the sky (world space UI, particles) stays on top as well,
+  // with the layer behind its transmittance A: F + T_fog E + T_cloud (radiance - F - T_fog E) + T_fog A C.
   // A PSR chain whose miss the screen pass marched instead (a mirror's or glass's first reflection, the sky straight
   // through glass) has its sky replaced in place: by the clouds and the sun through them, at the chain's
   // attenuation the PSR resolver stored and through the fog and air its sky was seen through.
@@ -1105,10 +1107,20 @@ vec4 compositeResult(
     else
     {
       cloudLayerTransmittance = saturate(cloudLayer.a);
-      // Sparse misses carry their sky at the sampling rate's scale; the clouds over it follow.
+      // Sparse misses carry their sky at the sampling rate's scale, and the clouds over it follow.
       const float cloudRadianceScale = primaryMiss ? radianceScale : 1.0f;
-      radianceOutput = fogInScatter + (radianceOutput - fogInScatter) * cloudLayerTransmittance
-        + fogTransmittance * max(cloudLayer.rgb, vec3(0.0f)) * cloudRadianceScale;
+      vec3 behindLayer = radianceOutput - fogInScatter;
+      vec3 foregroundRadiance = vec3(0.0f);
+      float foregroundTransmittance = 1.0f;
+      if (primarySkyMiss)
+      {
+        const vec4 missForeground = CloudMissForeground[pixelCoordinate];
+        foregroundRadiance = fogTransmittance * missForeground.rgb;
+        foregroundTransmittance = missForeground.a;
+        behindLayer = max(behindLayer - foregroundRadiance, vec3(0.0f));
+      }
+      radianceOutput = fogInScatter + foregroundRadiance + behindLayer * cloudLayerTransmittance
+        + fogTransmittance * max(cloudLayer.rgb, vec3(0.0f)) * cloudRadianceScale * foregroundTransmittance;
     }
   }
 

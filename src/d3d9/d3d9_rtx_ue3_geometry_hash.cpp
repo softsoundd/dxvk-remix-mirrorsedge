@@ -389,6 +389,37 @@ namespace dxvk {
     }
   }
 
+  // Identifies a CPU-skinned mesh's double-buffered vertices by its index buffer, which stays the same.
+  // See "First person and the player model" in UE3Compatibility.md.
+  void D3D9Rtx::updateUe3DynamicMeshIdentity(const IndexContext& indexContext,
+                                             const VertexContext vertexContext[caps::MaxStreams],
+                                             RasterGeometry& geoData) {
+    if (!m_frameOptions.ue3EngineMode || indexContext.ibo == nullptr) {
+      return;
+    }
+
+    const D3D9VertexElements& elements = d3d9State().vertexDecl->GetElements();
+    const auto position = std::find_if(elements.begin(), elements.end(), [](const D3DVERTEXELEMENT9& element) {
+      return element.Usage == D3DDECLUSAGE_POSITION && element.UsageIndex == 0;
+    });
+    if (position == elements.end() || position->Stream >= caps::MaxStreams) {
+      return;
+    }
+
+    // A ring pool's draws read slices of shared dynamic buffers instead, which identify no mesh.
+    const VertexContext& positions = vertexContext[position->Stream];
+    if (positions.pVBO == nullptr || (positions.pVBO->Desc()->Usage & D3DUSAGE_DYNAMIC) == 0 || positions.offset != 0) {
+      return;
+    }
+    const D3D9_BUFFER_DESC& indexDesc = *indexContext.ibo->Desc();
+    const uint64_t indexBytes = uint64_t(geoData.indexCount) * (indexContext.indexType == VK_INDEX_TYPE_UINT32 ? 4u : 2u);
+    if ((indexDesc.Usage & D3DUSAGE_DYNAMIC) != 0 && indexBytes * 4 < indexDesc.Size) {
+      return;
+    }
+
+    geoData.sourceVertexBufferAddress = indexContext.ibo->GetBuffer<D3D9_COMMON_BUFFER_TYPE_MAPPING>().ptr();
+  }
+
   // Serves static IA draws' geometry hashes from the memo. A first sighting hashes on a worker, which
   // publishes into the entry.
   D3D9Rtx::Ue3GeometryMemoLookup D3D9Rtx::lookupUe3GeometryMemo(const IndexContext& indexContext,

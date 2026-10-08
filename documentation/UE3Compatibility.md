@@ -634,6 +634,8 @@ A body far from the first-person camera is not the player's own shadow caster. S
 
 Held equipment often renders twice as well: a view-model copy and a world-space copy kept as a shadow caster. When a mesh is drawn both ways in one frame, the world instance nearest the camera is treated as player model, hidden from primary rays but still casting shadows and appearing in reflections. Copies without a view-model twin that frame, dropped or held by someone else, stay world geometry, so these meshes need no tagging.
 
+UE3 CPU-skins some skeletal meshes, the first person arms among them, into a pair of dedicated dynamic vertex buffers that it alternates between every frame. Draws that change from frame to frame are matched to last frame's instances by proximity, and only against instances from the same source buffer, so these meshes give their index buffer as that source instead, since it stays the same. A dedicated buffer is told from a ring pool's shared one by the draw reading it from the start, with an index buffer that is static or that the draw mostly covers. Without this, the arms would be recreated every frame without a previous-frame transform, and motion blur would smear them like static world geometry.
+
 Games hide the view model during scoped zoom through raster tricks that ray tracing ignores, such as pushing the near plane past it. The field of view is the more robust signal, since it holds however the game or a mod manages its clipping planes, but cinematics narrow it too: Mirror's Edge's sniper zoom goes from about 59 to about 7 degrees, while its scripted sequences reach about 43. A threshold between the two hides the view model only while zoomed.
 
 | Option | Default | Effect |

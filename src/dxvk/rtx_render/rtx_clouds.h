@@ -111,6 +111,7 @@ public:
   // This frame's layer along mirrors' and glass's first reflections into the sky, likewise.
   Rc<DxvkImageView> getReflectionView() const { return m_screenRanThisFrame ? m_reflection[m_layerIndex].view : nullptr; }
   Rc<DxvkImageView> getGlossyRayView() const { return m_glossyRay.view; }
+  Rc<DxvkImageView> getMissForegroundView() const { return m_missForeground.view; }
 
   // Optical properties of the droplets at the current microphysics, for the UI's readout.
   struct DropletReadout {
@@ -403,6 +404,10 @@ private:
   Resources::Resource m_reflection[2];
   // The indirect integrator's near-mirror rays into the sky, zeroed by the glossy pass as it consumes them.
   Resources::Resource m_glossyRay;
+  // Holds what camera rays passed through before reaching the sky (world space UI, particles),
+  // which composite keeps in front of the layer: the radiance gathered before the sky and its transmittance.
+  // Pixels with nothing in front hold no light and full transmittance.
+  Resources::Resource m_missForeground;
 
   // Reference mode: the paths' sums, their mean for composite and each 4x4 tile's path in flight (position,
   // direction, throughput, radiance), allocated only while the reference runs; the droplets' inverse phase CDF;

@@ -1361,6 +1361,8 @@ namespace dxvk {
     void readUe3DrawInstances(const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext,
                               const RasterGeometry& geoData);
     void updateUe3SkinnedDrawIdentity();
+    void updateUe3DynamicMeshIdentity(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
+                                      RasterGeometry& geoData);
     bool resolveUe3DrawCaptureSource(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams],
                                      const RasterGeometry& geoData);
     Ue3StaticVertexCaptureKey computeUe3DrawStaticVertexCaptureKey(const IndexContext& indexContext,

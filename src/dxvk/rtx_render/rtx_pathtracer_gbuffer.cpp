@@ -174,6 +174,7 @@ namespace dxvk {
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_SPECULAR_ALBEDO_DLSSRR_OUTPUT)
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_WORLD_POSITION_COMPACTED_OUTPUT)
         RW_TEXTURE2D(GBUFFER_BINDING_PRIMARY_WORLD_SHADING_NORMAL_DENSE_OUTPUT)
+        RW_TEXTURE2D(GBUFFER_BINDING_CLOUD_MISS_FOREGROUND_OUTPUT)
 
         RW_STRUCTURED_BUFFER(GBUFFER_BINDING_NRC_QUERY_PATH_INFO_OUTPUT)
         RW_STRUCTURED_BUFFER(GBUFFER_BINDING_NRC_TRAINING_PATH_INFO_OUTPUT)
@@ -840,6 +841,9 @@ namespace dxvk {
         ? rtOutput.m_primaryWorldShadingNormalDense.view
         : nullptr, nullptr);
     ctx->bindResourceView(GBUFFER_BINDING_DLSS_NR_CONTROL_MASK_OUTPUT, rtOutput.m_controlMask.view, nullptr);
+
+    // Null while the clouds are off, where the shader skips it (cloudArgs.enabled).
+    ctx->bindResourceView(GBUFFER_BINDING_CLOUD_MISS_FOREGROUND_OUTPUT, ctx->getClouds().getMissForegroundView(), nullptr);
 
     // Bind necessary resources for Neural Radiance Cache
     NeuralRadianceCache& nrc = ctx->getCommonObjects()->metaNeuralRadianceCache();

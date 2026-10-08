@@ -683,6 +683,7 @@ namespace dxvk {
       m_reflection[i] = Resources::createImageResource(ctx, i == 0 ? "Cloud Reflection Layer 0" : "Cloud Reflection Layer 1", size, VK_FORMAT_R16G16B16A16_SFLOAT);
     }
     m_glossyRay = Resources::createImageResource(ctx, "Cloud Glossy Sky Rays", size, VK_FORMAT_R32G32_UINT);
+    m_missForeground = Resources::createImageResource(ctx, "Cloud Sky Miss Foreground", size, VK_FORMAT_R16G16B16A16_SFLOAT);
     m_screenExtent = size;
     m_screenHistoryValid = false;
     // The reference's targets follow the screen's size when it next runs.
@@ -719,7 +720,7 @@ namespace dxvk {
            &m_sunGrid, &m_ambientGrid, &m_sunGridFar, &m_ambientGridFar, &m_diffusionCells[0], &m_diffusionCells[1],
            &m_diffusionFluence[0], &m_diffusionFluence[1], &m_skyApInScatter, &m_skyApTransmittance, &m_skySh, &m_skyShParts,
            &m_phaseLut, &m_phaseCdf, &m_shadowMap, &m_dome[0], &m_dome[1], &m_layer[0], &m_layer[1], &m_layerAge[0],
-           &m_layerAge[1], &m_compositeLayer, &m_reflection[0], &m_reflection[1], &m_glossyRay }) {
+           &m_layerAge[1], &m_compositeLayer, &m_reflection[0], &m_reflection[1], &m_glossyRay, &m_missForeground }) {
       resource->reset();
     }
     m_detailNoiseMipViews.clear();
@@ -992,6 +993,17 @@ namespace dxvk {
     ensureDome(ctx, tier.domeWidth);
     // Before the arguments, whose history flag a resize clears.
     ensureScreenResources(ctx, renderExtent);
+
+    // The G-buffer writes the miss foreground only where something lies in front of the sky.
+    {
+      VkClearColorValue noForeground = {};
+      noForeground.float32[3] = 1.0f;
+      VkImageSubresourceRange subRange = {};
+      subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      subRange.levelCount = 1;
+      subRange.layerCount = 1;
+      ctx->clearColorImage(m_missForeground.image, noForeground, subRange);
+    }
 
     CloudArgs args = buildArgs(atmosphere, camera, renderExtent, debugView);
 

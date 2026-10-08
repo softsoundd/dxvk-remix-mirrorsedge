@@ -86,6 +86,8 @@
 // The sky the cloud layer replaces where a mirror reflects it or glass shows it.
 #define COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT                         68
 
+#define COMPOSITE_CLOUD_MISS_FOREGROUND_INPUT                       71
+
 // Inputs/Outputs
 
 #define COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT                       40

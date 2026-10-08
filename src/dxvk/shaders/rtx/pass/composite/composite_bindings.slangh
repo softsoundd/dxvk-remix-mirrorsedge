@@ -122,6 +122,9 @@ layout(binding = COMPOSITE_CLOUD_REFLECTION_INPUT)
 Texture2D<float4> CloudReflection;
 layout(binding = COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT)
 Texture2D AtmosphereSkyViewLut;
+// Holds what primary rays passed through before reaching the sky. See RtxClouds::m_missForeground.
+layout(binding = COMPOSITE_CLOUD_MISS_FOREGROUND_INPUT)
+Texture2D<float4> CloudMissForeground;
 
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;

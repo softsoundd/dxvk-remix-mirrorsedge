@@ -2268,6 +2268,15 @@ void geometryResolverVertex(
       skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
       isSkyRadianceValid = true;
 
+      // The cloud layer composites between the sky and whatever this ray passed through before reaching it.
+      // Pixels with nothing in front keep the value RtxClouds clears them to.
+      if (cb.cloudArgs.enabled &&
+          (any(geometryResolverState.radiance != 0.0f) || any(vec3(geometryResolverState.attenuation) != 1.0f)))
+      {
+        CloudMissForeground[geometryResolverState.pixelCoordinate] = vec4(
+          geometryResolverState.radiance, calcBt709Luminance(vec3(geometryResolverState.attenuation)));
+      }
+
       geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
     }
 #endif
