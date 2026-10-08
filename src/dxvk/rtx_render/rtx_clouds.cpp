@@ -858,6 +858,7 @@ namespace dxvk {
     a.interiorTexture = std::clamp(interiorTexture(), 0.0f, 1.0f);
     a.edgeErosion = std::clamp(edgeErosion(), 0.0f, 3.0f);
     a.fineDetailStrength = std::clamp(fineDetailStrength(), 0.0f, 2.0f);
+    a.edgeDetailStrength = std::clamp(edgeDetail(), 0.0f, 2.0f);
     a.shapeVarietyWavelengthKm = std::max(shapeVarietyWavelengthKm(), 0.05f);
     // A level set displaced by more than about wavelength / pi peak to peak folds into detached sheets.
     a.shapeVarietyKm = std::min(std::clamp(shapeVarietyKm(), 0.0f, 1.5f), 0.65f * a.shapeVarietyWavelengthKm);

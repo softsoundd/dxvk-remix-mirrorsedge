@@ -197,6 +197,7 @@ namespace dxvk {
       RemixGui::DragFloat("Silhouette Wobble", &wobbleStrengthObject(), 0.005f, 0.0f, 2.0f, "%.3f", sliderFlags);
       RemixGui::DragFloat("Interior Texture", &interiorTextureObject(), 0.005f, 0.0f, 1.0f, "%.3f", sliderFlags);
       RemixGui::DragFloat("Edge Wisps", &edgeErosionObject(), 0.005f, 0.0f, 3.0f, "%.3f", sliderFlags);
+      RemixGui::DragFloat("Edge Detail", &edgeDetailObject(), 0.005f, 0.0f, 2.0f, "%.3f", sliderFlags);
       RemixGui::DragFloat("Fine Detail", &fineDetailStrengthObject(), 0.005f, 0.0f, 2.0f, "%.3f", sliderFlags);
       RemixGui::DragFloat("Curl Distortion", &curlStrengthMetersObject(), 0.5f, 0.0f, 500.0f, "%.0f m", sliderFlags);
       RemixGui::DragFloat("Near Detail", &nearDetailStrengthObject(), 0.005f, 0.0f, 2.0f, "%.3f", sliderFlags);

@@ -205,6 +205,7 @@ public:
   RTX_OPTION("rtx.clouds", float, interiorTexture, 0.0f, "Density variation through the body, not only at its skin.");
   RTX_OPTION("rtx.clouds", float, edgeErosion, 0.0f, "Wispy strands cut through the outer shell.");
   RTX_OPTION("rtx.clouds", float, fineDetailStrength, 0.0f, "A finer erosion band, faded out between 3 and 9 km.");
+  RTX_OPTION("rtx.clouds", float, edgeDetail, 1.0f, "Fine detail along wispy clouds' edges, cutting strands into the rim and drawing others out past it; none on billowy erosion, faded out between 10 and 16 km.");
   RTX_OPTION("rtx.clouds", float, shapeVarietyKm, 1.35f, "Amplitude of the mid frequency lobes that break bodies into clusters, at most 0.65 x their wavelength (beyond that the surface folds).");
   RTX_OPTION("rtx.clouds", float, shapeVarietyWavelengthKm, 2.1f, "Wavelength of those lobes.");
   RTX_OPTION("rtx.clouds", float, curlStrengthMeters, 60.0f, "Domain warp of the erosion field (Schneider and Vos 2015's curl distortion), strongest at the base.");

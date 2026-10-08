@@ -384,6 +384,29 @@ CloudDensitySample cloudSampleDensity(
     erosion += wispyNoise * wispyNoise * cloud.edgeErosion * saturate(1.0f - profile) * 1.5f;
   }
 
+  // Edge detail at 3.17x the detail frequency: displaces the eroded edge both ways, cutting strands into the rim
+  // and drawing others out past it, so soft wispy blobs read as fibrous. Billowy erosion takes none, or its crisp
+  // edges would fuzz. Faded out between 10 and 16 km, where its finest strands shrink to a pixel. A sample further
+  // outside the edge than the displacement reaches stays empty and skips the tap, and erosion stays non-negative
+  // so nothing is drawn past the body's surface.
+  if (cloud.edgeDetailStrength > 0.0f && !coarse && cameraDistKm < 16.0f) {
+    const float strength = cloud.edgeDetailStrength * (1.0f - typeShaped) * saturate((16.0f - cameraDistKm) / 6.0f);
+    const float reach = 0.15f * strength;
+    const float band = 0.2f * strength;
+    const float edgeDistance = profile - erosion;
+    if (edgeDistance > -reach && edgeDistance < band) {
+      const float edgeFreq = detailFreq * 3.17f;
+      // One mip level, dithered between the two the footprint falls between: half a trilinear tap's texels.
+      const float edgeMip = floor(cloudDetailMip(edgeFreq, footprintKm, cloud) + cloudHash31(positionKm * 41.0f));
+      const vec4 noiseEdge = detailNoise.SampleLevel(volumeSampler,
+        frac(boilPosFine * edgeFreq + vec3(0.41f, 0.19f, 0.67f)), edgeMip);
+      const float edgeNoise = lerp(lerp(noiseEdge.r, noiseEdge.g, 0.5f), lerp(noiseEdge.b, noiseEdge.a, 0.5f), typeShaped);
+      const float signedNoise = saturate(edgeNoise * 2.0f - 0.5f) * 2.0f - 1.0f;
+      const float taper = 1.0f - smoothstep(0.5f * band, band, abs(edgeDistance));
+      erosion = max(erosion - signedNoise * taper * reach, 0.0f);
+    }
+  }
+
   float density = cloudValueErosion(profile, erosion);
 
   // Sharpen: a sub-1 exponent lifts low densities, defining wisps and edges.

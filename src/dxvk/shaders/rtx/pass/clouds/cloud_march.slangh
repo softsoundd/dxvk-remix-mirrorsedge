@@ -104,8 +104,11 @@ float cloudMarchSample(
     return 0.0f;
   }
 
+  // Behind a front that already hides 90% of the background, near camera detail would not show: such a sample
+  // takes the field without it.
+  const bool cameraDetail = settings.cameraDetail && transmittance > 0.1f;
   const CloudDensitySample s = cloudSampleDensity(
-    positionKm, heightFraction, controls.x, controls.y, settings.cameraDetail ? tSample : 1e6f,
+    positionKm, heightFraction, controls.x, controls.y, cameraDetail ? tSample : 1e6f,
     tSample * settings.footprintPerKm, false, cloud, CloudNvdf, CloudDetailNoise, CloudVolumeSampler);
   emptyKm = s.emptyKm;
   surfaceKm = s.surfaceKm;

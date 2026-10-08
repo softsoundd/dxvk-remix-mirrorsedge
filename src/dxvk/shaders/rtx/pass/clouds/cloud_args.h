@@ -214,6 +214,11 @@ struct CloudArgs {
   float horizonBiasStartKm;
   float horizonBiasEndKm;
   float horizonBiasShiftKm;
+
+  float edgeDetailStrength;  // Displacement of the eroded edge by a finer detail octave near the camera, 0 = none
+  uint pad1;
+  uint pad2;
+  uint pad3;
 };
 
 // Constant buffer of the cloud passes: this frame's cloud and atmosphere parameters together. The cloud
