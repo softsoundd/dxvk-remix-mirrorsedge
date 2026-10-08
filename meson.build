@@ -94,6 +94,8 @@ if dxvk_is_msvc
     # Older TBB attempts to redefine some x64 intrinsics which are not available in arm64ec
     add_global_arguments('/wd4163', language : 'cpp')
     add_project_arguments('/DNO_AVX', language : 'cpp')
+    # dxvk_imgui.cpp exceeds the COFF 65535-section limit (C1128) when ARM64EC debug info is enabled.
+    add_global_arguments('/bigobj', language : 'cpp')
   endif
 
   if get_option('buildtype') == 'release'
