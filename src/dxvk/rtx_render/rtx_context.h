@@ -217,7 +217,7 @@ namespace dxvk {
 
     void checkOpacityMicromapSupport();
     void checkShaderExecutionReorderingSupport();
-    void checkNeuralRadianceCacheSupport();
+    void checkIndirectLightingSupport();
 
     VkExtent3D setDownscaleExtent(const VkExtent3D& upscaleExtent);
 

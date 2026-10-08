@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -28,6 +28,12 @@
 //!variant gbuffer_psr_nrc_miss.rmiss
 //!>       ENABLE_NRC=1
 
+// SHaRC
+// Note: Only Sharc update routines are called from Sharc header during gbuffer pass. 
+//       Remix does not support SHaRC queries at the primary hits, and all query path processing is handled in the indirect PT pass.
+
+//!variant gbuffer_psr_sharc_miss.rmiss
+//!>       SHARC_UPDATE=1
 
 //!variant gbuffer_psr_miss_wboit.rmiss
 //!>       UNORDERED_RESOLVE_WBOIT
@@ -38,12 +44,22 @@
 //!>       ENABLE_NRC=1
 //!>       UNORDERED_RESOLVE_WBOIT
 
+// SHaRC
+
+//!variant gbuffer_psr_sharc_miss_wboit.rmiss
+//!>       SHARC_UPDATE=1
+//!>       UNORDERED_RESOLVE_WBOIT
+
+
+
 //!end-variants
 
 #define RAY_TRACING_PRIMARY_RAY
 #define RT_TRACE_RAY
 #define RAY_PIPELINE
 #define ATMOSPHERE_AVAILABLE
+// This shader resolves PSR surfaces, so the shared resolver code builds its PSR side, as in the PSR ray generation shaders.
+#define GBUFFER_PSR
 // Note: Opacity lighting approximation used in the GBuffer pass due to it being most visually
 // prominent on particles in primary rays and important in PSR.
 #define RESOLVE_OPACITY_LIGHTING_APPROXIMATION 1

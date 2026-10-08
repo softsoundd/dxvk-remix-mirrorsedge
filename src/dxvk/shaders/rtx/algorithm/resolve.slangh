@@ -893,12 +893,9 @@ void resolveVertexUnorderedParticles<
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
   out uint numInteractions,
   out int surfaceIndex,
-  // Set when a decal candidate was met, or when the candidate limit stopped the traversal before every candidate
-  // was seen; clear means the deferred decal pass has nothing to do along this ray.
-  out bool decalCandidatePresent)
+  inout bool decalCandidateSeen)
 {
   surfaceIndex = -1;
-  decalCandidatePresent = false;
 
   const bool separateUnorderedApproximations = packedFlagGet(resolveMode, resolveModeSeparateUnorderedApproximations);
 
@@ -954,7 +951,6 @@ void resolveVertexUnorderedParticles<
 #endif
 
   uint step = 0;
-
   for (; step < kMaxUnorderedResolveSteps && rayQuery.Proceed(); step++)
   {
     RayHitInfo rayHitInfo;
@@ -1076,11 +1072,10 @@ void resolveVertexUnorderedParticles<
     // Note: Read alongside the Surface rather than after the vertex fetch so the two loads overlap.
     const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
 
-    // Decals are handled by the decal resolve; skip them before paying for the vertex fetch.
+    // Decals are left to the deferred decal pass, which only needs to know one may cover the surface.
     if (isTriangle && surfaceIsDecal(surface))
     {
-      decalCandidatePresent = true;
-
+      decalCandidateSeen = true;
       continue;
     }
 
@@ -1209,10 +1204,10 @@ void resolveVertexUnorderedParticles<
     numInteractions += 1;
   }
 
-  // The candidate limit ended the traversal: whatever remained, decals included, was never seen.
+  // Candidates past the step budget went unvisited, so one of them may be a decal.
   if (step == kMaxUnorderedResolveSteps)
   {
-    decalCandidatePresent = true;
+    decalCandidateSeen = true;
   }
 
 #ifdef RAY_TRACING_PRIMARY_RAY
@@ -1492,7 +1487,9 @@ void resolveVertexUnordered<
     }
 
     if (isTriangle)
+    {
       surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
+    }
 
     // Test the hit surface against view distance and ignored surface clipping
 

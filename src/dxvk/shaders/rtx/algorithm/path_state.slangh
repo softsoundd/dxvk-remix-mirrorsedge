@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include "rtx/pass/sharc/sharc.slangh"
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #include "rtx/utility/packing.slangh"
 #include "rtx/algorithm/resolve_expanded.slangh"
@@ -87,6 +88,10 @@ struct PathState : IBasePayloadState
   u16vec2 _pixelCoordinate;
 
 #if ENABLE_NRC
+
+  // Holds NRC's path buffer index, which is the compacted coordinate for a query path.
+  // It is the training-space coordinate for a training path.
+  u16vec2 _nrcPixelIndex;
 
   uint nrcData0;  // NrcQuery:
                   //  uint packedPrefixThroughput
@@ -222,7 +227,8 @@ struct PathState : IBasePayloadState
       }
       else
       {
-        return Nrc::calculateUpdatePixelCoordinateFromCombinedCoordinate(getDispatchRaysIndex().xy, cb);
+        // A training path's own coordinate is the one NRC indexes it by, so the two coincide.
+        return _nrcPixelIndex;
       }
     }
 
@@ -230,6 +236,12 @@ struct PathState : IBasePayloadState
     { 
       _pixelCoordinate = newValue; 
     }
+  }
+
+  property u16vec2 nrcPixelIndex
+  {
+    get { return _nrcPixelIndex; }
+    set { _nrcPixelIndex = newValue; }
   }
 
   property uint8_t pathMaxBounces
@@ -292,6 +304,29 @@ struct PathState : IBasePayloadState
     {
       return cb.russianRouletteMode;
     }
+  }
+#endif
+
+#if SHARC_QUERY
+  float prevPerceptualRoughness;
+#endif
+
+#if SHARC_UPDATE
+  SharcState sharcState;
+#endif 
+
+#if SHARC_UPDATE && SHARC_QUERY
+  // Update paths leave prevPerceptualRoughness unused, so a negative value marks them.
+  property bool isSharcUpdate
+  {
+    get { return prevPerceptualRoughness < 0.0f; }
+    set { prevPerceptualRoughness = newValue ? -1.0f : 0.0f; }
+  }
+#else
+  property bool isSharcUpdate
+  {
+    get { return SHARC_UPDATE != 0; }
+    set { }
   }
 #endif
 
@@ -465,6 +500,12 @@ struct PathState : IBasePayloadState
       useRussianRoulette = useRussianRoulette && cb.nrcArgs.updateAllowRussianRoulette;
     }
 #endif    
+#if SHARC_UPDATE
+    if (isSharcUpdate)
+    {
+      useRussianRoulette = useRussianRoulette && cb.sharcArgs.updateAllowRussianRoulette;
+    }
+#endif
 
     return useRussianRoulette;
   }
@@ -510,6 +551,9 @@ struct PathState : IBasePayloadState
 #if ENABLE_NRC
     // Note: it is slightly more performant to have the NRC mode hint second
     addCoherenceHintAsLeastImportant1Bit(isNrcUpdate, coherenceHints, numCoherenceHints);
+#endif
+#if SHARC_UPDATE && SHARC_QUERY
+    addCoherenceHintAsLeastImportant1Bit(isSharcUpdate, coherenceHints, numCoherenceHints);
 #endif
     return true;
   }

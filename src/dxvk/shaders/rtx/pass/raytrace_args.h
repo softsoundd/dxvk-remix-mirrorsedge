@@ -32,6 +32,7 @@
 
 #include "rtx/pass/nrd_args.h"
 #include "rtx/pass/nrc_args.h"
+#include "rtx/pass/sharc_args.h"
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/material_args.h"
 #include "rtx/pass/view_distance_args.h"
@@ -162,6 +163,7 @@ struct RaytraceArgs {
   NeeCacheArgs neeCacheArgs;
   DomeLightArgs domeLightArgs;
   NrcArgs nrcArgs;
+  SharcArgs sharcArgs;
   SssArgs sssArgs;
   AtmosphereArgs atmosphereArgs;
   CloudArgs cloudArgs;
@@ -208,7 +210,7 @@ struct RaytraceArgs {
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
   float secondarySpecularFireflyFilteringThreshold;
-  uint secondarySignalPadding;
+  float primaryIndirectSpecularFireflyFilteringThreshold;
 
   // Note: Packed as float16, uses uint16_t due to being shared on C++ side
   uint16_t emissiveBlendOverrideEmissiveIntensity;
@@ -365,7 +367,6 @@ struct RaytraceArgs {
   uint enableReSTIRGIDiscardEnlargedPixels;
   float reSTIRGIHistoryDiscardStrength;
   uint enableReSTIRGITemporalJacobian;
-  float reSTIRGIFireflyThreshold;
   float reSTIRGIRoughnessClamp;
   float reSTIRGIMISRoughness;
   float reSTIRGIMISParallaxAmount;
@@ -426,6 +427,10 @@ struct RaytraceArgs {
   // Debug override to disallow NRC training when it is enabled in the first place,
   // hence why it is not named enableNrcTraining here
   uint allowNrcTraining;
+
+  // SHaRC enablement is controlled by global macros being defined.
+  // When macros are not used (i.e. in some passes) this variable controls the SHaRC enablement
+  uint enableSharc;
 
   float vertexColorStrength;
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface

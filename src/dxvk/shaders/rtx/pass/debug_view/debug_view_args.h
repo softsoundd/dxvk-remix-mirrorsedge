@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -83,7 +83,9 @@ struct DebugViewArgs {
   VolumeArgs volumeArgs;
   NrdArgs nrd;
   NrcArgs nrcArgs;
+  SharcArgs sharcArgs;
   AccumulationArgs accumulationArgs;
+  SparseRenderingArgs sparseRenderingArgs;
 
   uint debugViewIdx;
   int colorCodeRadius;

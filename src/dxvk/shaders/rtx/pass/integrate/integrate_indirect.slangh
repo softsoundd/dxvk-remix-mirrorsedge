@@ -33,20 +33,20 @@
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 
-// Returns true for query pixels and for training cells that have a path to trace this frame. A cell that has
-// none is invalidated here, since nothing downstream would write its TrainingPathInfo slot.
+// Maps cache-update dispatch coordinates to query pixels and leaves query launches locally compacted.
+// Empty NRC reservoirs are invalidated before returning.
 bool nrcCombinedToGbufferPixelCoordinate(
   uvec2 combinedNrcCoordinate,
   out uvec2 gbufferPixelCoordinate,
-  out bool isNrcUpdate)
+  out bool isCacheUpdate)
 {
-  isNrcUpdate = false; 
+  isCacheUpdate = false;
   
 #if ENABLE_NRC
   // Identify which NRC mode this thread index corresponds to
-  isNrcUpdate = Nrc::isUpdatePixel(combinedNrcCoordinate, cb);
+  isCacheUpdate = Nrc::isUpdatePixel(combinedNrcCoordinate, cb);
     
-  if (isNrcUpdate)
+  if (isCacheUpdate)
   {
     const uvec2 nrcUpdatePixelCoordinate = Nrc::calculateUpdatePixelCoordinateFromCombinedCoordinate(combinedNrcCoordinate, cb);
 
@@ -60,7 +60,7 @@ bool nrcCombinedToGbufferPixelCoordinate(
     {
       // An empty reservoir means no active pixel was selected for this training cell, so skip its training path.
       if (!Nrc::calculateNrcTrainingQueryPixel(
-            nrcUpdatePixelCoordinate, NrcTrainingQueryReservoir, cb.nrcArgs, gbufferPixelCoordinate))
+            nrcUpdatePixelCoordinate, RadianceCacheUpdateQueryReservoir, cb.nrcArgs, gbufferPixelCoordinate))
       {
         Nrc::invalidateNrcTrainingPath(nrcUpdatePixelCoordinate);
 
@@ -73,22 +73,50 @@ bool nrcCombinedToGbufferPixelCoordinate(
       // Reached only when sparse rendering is inactive, so every lattice pixel has a current GBuffer.
       gbufferPixelCoordinate = Nrc::calculateTrainingPixelCoordinateInQuerySpace(nrcUpdatePixelCoordinate, cb.nrcArgs);
     }
-
-    // Update rows skip the query-space bounds check the caller runs, so a cell whose coordinate lands outside the
-    // render extent has to be invalidated here rather than read out of bounds.
-    if (any(gbufferPixelCoordinate >= cb.camera.resolution))
-    {
-      Nrc::invalidateNrcTrainingPath(nrcUpdatePixelCoordinate);
-
-      gbufferPixelCoordinate = uvec2(-1, -1);
-      return false;
-    }
   }
   else
   {
     gbufferPixelCoordinate = combinedNrcCoordinate;
     gbufferPixelCoordinate.y -= cb.nrcArgs.numRowsForUpdate;
   }
+
+#elif SHARC_UPDATE
+  // Calculate the GBuffer pixel coordinate for this SHaRC update pixel
+  uvec2 sharcUpdatePixelCoordinate = combinedNrcCoordinate;
+  isCacheUpdate = true;
+
+#if SHARC_QUERY
+  if (!Sharc::isUpdatePixel(combinedNrcCoordinate, cb.sharcArgs))
+  {
+    isCacheUpdate = false;
+    gbufferPixelCoordinate = uvec2(combinedNrcCoordinate.x, combinedNrcCoordinate.y - cb.sharcArgs.numRowsForUpdate);
+    return true;
+  }
+
+  sharcUpdatePixelCoordinate = Sharc::calculateUpdatePixelCoordinateFromCombinedCoordinate(
+    combinedNrcCoordinate, cb.camera.resolution.x, cb.sharcArgs);
+#endif
+
+  // Reject padded compute threads before reading the update reservoir.
+  if (any(sharcUpdatePixelCoordinate >= uvec2(cb.sharcArgs.activeUpdateDimensions)))
+  {
+    gbufferPixelCoordinate = uvec2(-1, -1);
+    return false;
+  }
+
+  if (cb.sparseRenderingArgs.resampledSharcUpdatePaths)
+  {
+    if (!Sharc::calculateSparseUpdateQueryPixel(
+          sharcUpdatePixelCoordinate, RadianceCacheUpdateQueryReservoir, cb.sharcArgs, gbufferPixelCoordinate))
+    {
+      return false;
+    }
+  }
+  else
+  {
+    gbufferPixelCoordinate = Sharc::calculateQueryPixelCoordinate(sharcUpdatePixelCoordinate, cb.sharcArgs);
+  }
+
 #else
   gbufferPixelCoordinate = combinedNrcCoordinate;
 #endif
@@ -98,52 +126,90 @@ bool nrcCombinedToGbufferPixelCoordinate(
 
 // Returns true if this is an active pixel
 // Returns false if the thread should terminate
-bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool isNrcUpdate)
+// The dispatch index is in cache-update or NRC combined space, not necessarily screen space.
+bool initPixelCoordinateOnLaunch(inout uvec2 gbufferPixelCoordinate, out bool isCacheUpdate, out uvec2 compactedCoordinate)
 {
+  compactedCoordinate = gbufferPixelCoordinate;
+  const uvec2 dispatchCoordinate = gbufferPixelCoordinate;
+
   if (!nrcCombinedToGbufferPixelCoordinate(
+      dispatchCoordinate,
       gbufferPixelCoordinate,
-      gbufferPixelCoordinate,
-      isNrcUpdate))
+      isCacheUpdate))
   {
     return false;
   }
 
-  // NRC training threads have dedicated valid coords (already validated against activeTrainingDimensions)
-  // that are not remapped on sparse rendering
-  if (isNrcUpdate)
+  if (isCacheUpdate)
   {
+    // Bounds-check raw query pixels before looking up their compacted storage.
+    bool hasGBufferSlot = false;
+    if (all(gbufferPixelCoordinate < cb.camera.resolution))
+    {
+      hasGBufferSlot = compactedCoordinateFromPixelIfActive(
+        CompactedPixelIndices, TileActiveCounts, gbufferPixelCoordinate, cb.sparseRenderingArgs, compactedCoordinate);
+    }
+
+    // The reservoir is filled before compaction and can select a capacity-dropped pixel.
+    if (!hasGBufferSlot)
+    {
+#if ENABLE_NRC
+      const uvec2 nrcUpdatePixelCoordinate =
+        Nrc::calculateUpdatePixelCoordinateFromCombinedCoordinate(dispatchCoordinate, cb);
+      Nrc::invalidateNrcTrainingPath(nrcUpdatePixelCoordinate);
+#endif
+      return false;
+    }
+
     return true;
   }
 
-  // Bounds-check before any per-pixel texture reads
-  if (any(gbufferPixelCoordinate >= cb.camera.resolution))
-  {
-    return false;
-  }
-
-  return loadPixelCoordinate(gbufferPixelCoordinate, ActiveLocalPixelCoords,
-                             cb.camera.resolution, cb.sparseRenderingArgs, gbufferPixelCoordinate);
+  // Query pixels are resolved lazily after reading their compacted GBuffer.
+  return loadCompactedCoordinateFromDispatchIndex(
+    TileActiveCounts, gbufferPixelCoordinate, cb.camera.resolution, cb.sparseRenderingArgs, compactedCoordinate);
 }
 
 void integrate_indirect_pass(uvec2 threadIndex)
 {
   uvec2 gbufferPixelCoordinate = threadIndex;
 
-  bool isNrcUpdate = false;
+  bool isCacheUpdate = false;
+  uvec2 compactedCoordinate;
 
-  if (!initPixelCoordinateOnLaunch(gbufferPixelCoordinate, isNrcUpdate))
+  if (!initPixelCoordinateOnLaunch(gbufferPixelCoordinate, isCacheUpdate, compactedCoordinate))
   {
     return;
   }
 
+  // Query paths address NRC at their compacted coordinate.
+  // Training paths address NRC at their training-space coordinate.
+  uvec2 nrcPixelIndex = compactedCoordinate;
+
+#if ENABLE_NRC
+  if (isCacheUpdate)
+  {
+    nrcPixelIndex = Nrc::calculateUpdatePixelCoordinateFromCombinedCoordinate(threadIndex, cb);
+  }
+#endif
+
+  uvec2 cacheUpdatePixelCoordinate = threadIndex;
+
+#if SHARC_UPDATE && SHARC_QUERY
+  if (isCacheUpdate)
+  {
+    cacheUpdatePixelCoordinate = Sharc::calculateUpdatePixelCoordinateFromCombinedCoordinate(
+      threadIndex, cb.camera.resolution.x, cb.sharcArgs);
+  }
+#endif
+
   // Deserialize flags
 
-  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(gbufferPixelCoordinate, SharedFlags);
+  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(ivec2(compactedCoordinate), SharedFlags);
 
   // Check if the GBuffer was hit on the Primary and Secondary surfaces
 
-  const bool primaryGBufferMiss = isGBufferMiss(gbufferPixelCoordinate, PrimaryConeRadius);
-  const bool secondaryGBufferMiss = isGBufferMiss(gbufferPixelCoordinate, SecondaryConeRadius);
+  const bool primaryGBufferMiss = isGBufferMiss(ivec2(compactedCoordinate), PrimaryConeRadius);
+  const bool secondaryGBufferMiss = isGBufferMiss(ivec2(compactedCoordinate), SecondaryConeRadius);
 
   // Write out empty data
   // Note: This should hopefully prevent any weird undefined data from bleeding into pixels actually being denoised, but
@@ -157,40 +223,48 @@ void integrate_indirect_pass(uvec2 threadIndex)
   // Note: Early out if no more work on the active surface is needed.
   if (gbufferMissOfASelectedIntegrationSurface)
   {
-    if (isNrcUpdate)
+    if (isCacheUpdate)
     {
       // IndirectRadianceHitDistance is not used for update pixels, so no need to write it out
       return;
     }
 
-    IndirectRadianceHitDistance[gbufferPixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
+    IndirectRadianceHitDistance[compactedCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
 
     return;
   }
 
   // Read the medium material index
 
-  const uint mediumMaterialIndex = SharedMediumMaterialIndex[gbufferPixelCoordinate];
+  const uint mediumMaterialIndex = SharedMediumMaterialIndex[compactedCoordinate];
 
   // Load state data carried over from the direct integration pass
 
-  const vec4 rayOriginDirection = RayOriginDirection[gbufferPixelCoordinate];
-  const vec4 throughputConeRadius = ThroughputConeRadius[gbufferPixelCoordinate];
+  const vec4 rayOriginDirection = RayOriginDirection[compactedCoordinate];
+  const vec4 throughputConeRadius = ThroughputConeRadius[compactedCoordinate];
   IndirectSampleData indirectSampleData;
-  indirectSampleData.load(gbufferPixelCoordinate, FirstSampledLobeData);
+  indirectSampleData.load(compactedCoordinate, FirstSampledLobeData);
 
   const vec3 rayOrigin = rayOriginDirection.xyz;
   const vec3 rayDirection = signedOctahedralToSphereDirection(snorm2x16ToFloat2x32(floatBitsToUint(rayOriginDirection.w)));
   const vec3 throughput = throughputConeRadius.xyz;
   const float coneRadius = throughputConeRadius.w;
-  const float firstHitPerceptualRoughness = FirstHitPerceptualRoughness[gbufferPixelCoordinate];
+  const float firstHitPerceptualRoughness = FirstHitPerceptualRoughness[compactedCoordinate];
   const float firstSampledLobePdf = indirectSampleData.firstSampledLobePdf;
   const float firstSampledSolidAnglePdf = indirectSampleData.firstSampledSolidAnglePdf;
 
   const float gbufferSurfaceHitDistance = calculateSelectedIntegrationSurfaceHitDistance(
-    ivec2(gbufferPixelCoordinate), geometryFlags, PrimaryHitDistance, SecondaryHitDistance);
+    ivec2(compactedCoordinate), geometryFlags, PrimaryHitDistance, SecondaryHitDistance);
 
   // Integrate the Indirect portion of the Path
+
+  // Query threads resolve their pixel coordinate at its first use.
+  // Training threads already hold theirs.
+  if (!isCacheUpdate)
+  {
+    gbufferPixelCoordinate = loadLocalPixelCoordinate(
+      ActiveLocalPixelCoords, gbufferPixelCoordinate, cb.sparseRenderingArgs);
+  }
 
   IndirectPathTextures indirectPathTextures;
 
@@ -198,8 +272,9 @@ void integrate_indirect_pass(uvec2 threadIndex)
   indirectPathTextures.IndirectRadianceHitDistance = IndirectRadianceHitDistance;
   
   integrateIndirectPath(
-    gbufferPixelCoordinate, INTEGRATE_INDIRECT_SBT_OFFSET_STANDARD, indirectPathTextures,
+    u16vec2(gbufferPixelCoordinate), u16vec2(cacheUpdatePixelCoordinate), u16vec2(compactedCoordinate), u16vec2(nrcPixelIndex),
+    INTEGRATE_INDIRECT_SBT_OFFSET_STANDARD, indirectPathTextures,
     geometryFlags, mediumMaterialIndex, rayOrigin, rayDirection,
     throughput, coneRadius, firstHitPerceptualRoughness,
-    firstSampledLobePdf, firstSampledSolidAnglePdf, gbufferSurfaceHitDistance, isNrcUpdate);
+    firstSampledLobePdf, firstSampledSolidAnglePdf, gbufferSurfaceHitDistance, isCacheUpdate);
 }

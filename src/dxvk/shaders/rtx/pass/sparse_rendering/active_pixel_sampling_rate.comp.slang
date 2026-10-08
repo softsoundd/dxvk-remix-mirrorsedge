@@ -23,9 +23,7 @@
 #include "rtx/pass/sparse_rendering/active_pixel_mask_binding_indices.h"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/per_pixel_rate.slangh"
-#include "rtx/utility/geometry_flags.slangh"
-#include "rtx/utility/gbuffer_helpers.slangh"
-#include "rtx/utility/debug_view_helpers.slangh" // Resolves gbuffer_helpers.slangh's debug paths, unused here
+#include "rtx/pass/sharc/sharc_update_grid.slangh"
 
 // Returns the per-pixel sampling rate in [0,1] for the active sparse rendering mode.
 float calculatePixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingArgs args)
@@ -41,21 +39,10 @@ float calculatePixelSamplingRate(uvec2 pixelCoordinate, SparseRenderingArgs args
   }
 }
 
-// Inputs
-
-layout(binding = ACTIVE_PIXEL_MASK_BINDING_SHARED_FLAGS_INPUT)
-Texture2D<uint16_t> SharedFlags;
-
-layout(binding = ACTIVE_PIXEL_MASK_BINDING_PRIMARY_CONE_RADIUS_INPUT)
-Texture2D<float> PrimaryConeRadius;
-
-layout(binding = ACTIVE_PIXEL_MASK_BINDING_SECONDARY_CONE_RADIUS_INPUT)
-Texture2D<float> SecondaryConeRadius;
-
 // Input-Outputs
 
-layout(r32ui, binding = ACTIVE_PIXEL_MASK_BINDING_NRC_TRAINING_QUERY_RESERVOIR_INPUT_OUTPUT)
-RWTexture2D<uint> NrcTrainingQueryReservoir;
+layout(r32ui, binding = ACTIVE_PIXEL_MASK_BINDING_RADIANCE_CACHE_UPDATE_QUERY_RESERVOIR_INPUT_OUTPUT)
+RWTexture2D<uint> RadianceCacheUpdateQueryReservoir;
 
 // Outputs
 
@@ -72,18 +59,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
     return;
   }
 
-  float rate = 1.f;
-
-  // Force pixels whose selected integration surface is the secondary surface to full rate.
-  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(ivec2(pixelCoordinate), SharedFlags);
-  const bool isSecondaryFullRate = geometryFlags.secondarySurfaceMask &&
-                                   !geometryFlags.primarySelectedIntegrationSurface;
-
-  // Calculate sampling rate for the inactive ones
-  if (!isSecondaryFullRate)
-  {
-    rate = calculatePixelSamplingRate(pixelCoordinate, cb.sparseRenderingArgs);
-  }
+  const float rate = calculatePixelSamplingRate(pixelCoordinate, cb.sparseRenderingArgs);
 
   // The rate is stored in an R8_UNORM texture (8-bit / 256 levels). Hardware UNORM
   // rounding is implementation-defined, so explicitly round-to-nearest here. This ensures the
@@ -95,10 +71,9 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
 
   // Enter this active candidate into its training cell's reservoir, carrying the pixel that drew the key.
   // The quantized rate keeps the active test matched to the one the mask pass runs.
-  // Disregard misses for integration selected surface to avoid wasting a training path activation there
-  if (cb.sparseRenderingArgs.resampledNrcTrainingPaths &&
-      isActivePixelFromSamplingRate(pixelCoordinate, quantizedRate, cb.sparseRenderingArgs, cb.frameIdx) &&
-      !isSelectedIntegrationSurfaceGBufferMiss(ivec2(pixelCoordinate), geometryFlags, PrimaryConeRadius, SecondaryConeRadius))
+  const bool isCacheUpdateCandidate =
+    isActivePixelFromSamplingRate(pixelCoordinate, quantizedRate, cb.sparseRenderingArgs, cb.frameIdx);
+  if (cb.sparseRenderingArgs.resampledNrcTrainingPaths && isCacheUpdateCandidate)
   {
     const uvec2 trainingPixelCoordinate = Nrc::calculateTrainingPixelCoordinate(pixelCoordinate, cb.nrcArgs);
     if (all(trainingPixelCoordinate < uvec2(cb.nrcArgs.activeTrainingDimensions)))
@@ -113,8 +88,26 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
       {
         const uint key = calculateNrcTrainingQueryKey(pixelCoordinate, cb.frameIdx, quantizedRate);
 
-        InterlockedMax(NrcTrainingQueryReservoir[trainingPixelCoordinate],
+        InterlockedMax(RadianceCacheUpdateQueryReservoir[trainingPixelCoordinate],
           Nrc::packNrcTrainingQueryReservoirEntry(key, queryPixelOffsetInCell));
+      }
+    }
+  }
+
+  if (cb.sparseRenderingArgs.resampledSharcUpdatePaths && isCacheUpdateCandidate)
+  {
+    const uvec2 updatePixelCoordinate = Sharc::calculateUpdatePixelCoordinate(pixelCoordinate, cb.sharcArgs);
+    if (all(updatePixelCoordinate < uvec2(cb.sharcArgs.activeUpdateDimensions)))
+    {
+      const uvec2 cellOrigin = Sharc::calculateUpdateCellOriginInQuerySpace(updatePixelCoordinate, cb.sharcArgs);
+      const uvec2 queryPixelOffsetInCell = pixelCoordinate - cellOrigin;
+
+      // Being unsigned, the offset also fails this when the separately rounded scales put the cell origin past the pixel.
+      if (isCacheUpdateQueryPixelOffsetRepresentable(queryPixelOffsetInCell))
+      {
+        const uint key = calculateNrcTrainingQueryKey(pixelCoordinate, cb.frameIdx, quantizedRate);
+        InterlockedMax(RadianceCacheUpdateQueryReservoir[updatePixelCoordinate],
+          packCacheUpdateQueryReservoirEntry(key, queryPixelOffsetInCell));
       }
     }
   }

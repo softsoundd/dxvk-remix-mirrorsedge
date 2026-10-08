@@ -20,6 +20,14 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
+//!variant integrate_nee.comp
+//!>       INTEGRATE_NEE_RESTIR_GI=0
+
+//!variant integrate_nee_restir_gi.comp
+//!>       INTEGRATE_NEE_RESTIR_GI=1
+
+//!end-variants
+
 #define RAB_HAS_CURRENT_GBUFFER 1
 #define RAB_HAS_RESTIR_GI_RESERVOIRS 1
 #define OPAQUE_MATERIAL_USE_POM 1
@@ -76,46 +84,46 @@ void addRadianceToNrcTrainingPathVertex(
   Nrc::debugRegisterNrcRadiance(trainingPixelCoordinate, true, bounceIndex, radiance, dummyThroughput, cb.debugView);
 }
 
+#if (INTEGRATE_NEE_THREADS_DISPATCH_WIDTH * INTEGRATE_NEE_THREADS_DISPATCH_HEIGHT) != COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE
+#error "A compacted launch needs COMPACT_ACTIVE_PIXELS_CONSUMER_GROUP_SIZE threads per group."
+#endif
+
 [shader("compute")]
 [numthreads(INTEGRATE_NEE_THREADS_DISPATCH_WIDTH, INTEGRATE_NEE_THREADS_DISPATCH_HEIGHT, 1)]
-void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupThreadID)
+void main(uint2 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint groupIndex : SV_GroupIndex)
 {
-  if (any(threadIndex >= cb.camera.resolution))
+  uint2 threadIndex;
+  uvec2 compactedCoordinate;
+  if (!loadCompactedCoordinate(dispatchThreadId, groupId.x, groupIndex, ActivePixelCount,
+                              cb.camera.resolution, cb.sparseRenderingArgs, threadIndex, compactedCoordinate))
   {
     return;
   }
 
-  uvec2 pixelCoordinate;
-  if (!loadPixelCoordinate(threadIndex, ActiveLocalPixelCoords,
-                           cb.camera.resolution, cb.sparseRenderingArgs, pixelCoordinate))
-  {
-    return;
-  }
-
-  const bool gBufferMiss = isGBufferMiss(pixelCoordinate, PrimaryConeRadius);
+  const bool gBufferMiss = isGBufferMiss(compactedCoordinate, PrimaryConeRadius);
 
   // Early out if the primary surface was a miss or if the indirect integrator was not selected
   // to output indirect lighting information
   if (gBufferMiss)
   {
     // Make sure to clear out pixels we're skipping over since NRC resolve pass reads from all the output pixels after this pass
-    PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
-    PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
+    PrimaryIndirectDiffuseLobeRadianceHitDistance[compactedCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
+    PrimaryIndirectSpecularLobeRadianceHitDistance[compactedCoordinate] = vec4(vec3(0), kEmptyPixelHitDistance);
 
     return;
   }
 
-  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(pixelCoordinate, SharedFlags);
+  const GeometryFlags geometryFlags = geometryFlagsReadFromGBuffer(compactedCoordinate, SharedFlags);
 
   vec4 indirectDiffuseOutput = vec4(0);
   vec4 indirectSpecularOutput = vec4(0);
   if (geometryFlags.primarySelectedIntegrationSurface)
   {
-    const vec4 indirectRadianceHitDistance = IndirectRadianceHitDistance[pixelCoordinate];   
+    const vec4 indirectRadianceHitDistance = IndirectRadianceHitDistance[compactedCoordinate];
     if (geometryFlags.firstSampledLobeIsSpecular) 
     {
       indirectSpecularOutput = indirectRadianceHitDistance;
-      indirectSpecularOutput.xyz = clamp(indirectSpecularOutput.xyz, 0, cb.reSTIRGIFireflyThreshold);
+      indirectSpecularOutput.xyz = clamp(indirectSpecularOutput.xyz, 0, cb.primaryIndirectSpecularFireflyFilteringThreshold);
     }
     else
     {
@@ -126,23 +134,23 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
   // Early out in case when NEE cache is disabled.
   if (!cb.neeCacheArgs.enable)
   {
-    PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = indirectDiffuseOutput;
-    PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = indirectSpecularOutput;
+    PrimaryIndirectDiffuseLobeRadianceHitDistance[compactedCoordinate] = indirectDiffuseOutput;
+    PrimaryIndirectSpecularLobeRadianceHitDistance[compactedCoordinate] = indirectSpecularOutput;
     return;
   }
+
+  // Everything above is addressed by the compacted coordinate, so the pixel coordinate is deferred past both early-outs.
+  const uvec2 pixelCoordinate = loadLaunchPixelCoordinate(threadIndex, ActivePixelCoords, cb.sparseRenderingArgs);
 
   // Note: Re-derive the original primary ray direction.
   const Ray originalPrimaryRay = rayCreatePrimaryFromPixel(cb.camera, pixelCoordinate);
 
   RAB_RandomSamplerState rtxdiRNG = RAB_InitRandomSampler(pixelCoordinate, cb.frameIdx, 7);
 
-  // Only ReSTIR GI's target PDF needs the full surface, so skip the GBuffer loads otherwise.
-  RAB_Surface surface = RAB_EmptySurface();
-
-  if (cb.enableReSTIRGI)
-  {
-    surface = RAB_GetGBufferSurface(pixelCoordinate, false);
-  }
+#if INTEGRATE_NEE_RESTIR_GI
+  // Only ReSTIR GI's target PDF needs the full surface.
+  const RAB_Surface surface = RAB_GetGBufferSurface(pixelCoordinate, false, compactedCoordinate);
+#endif
 
   // Deserialize the Ray
   GBufferMemoryMinimalRay gBufferMemoryMinimalRay;
@@ -153,21 +161,24 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
 
   // Deserialize the Ray Interaction
   MinimalRayInteraction minimalRayInteraction = minimalRayInteractionReadFromGBuffer(
-    originalPrimaryRay, pixelCoordinate, PrimaryViewDirection, PrimaryConeRadius);
+    originalPrimaryRay, compactedCoordinate, PrimaryViewDirection, PrimaryConeRadius);
 
   // Deserialize the Surface Interaction
   MinimalSurfaceInteraction minimalSurfaceInteraction = minimalSurfaceInteractionReadFromGBufferWithError(
-    pixelCoordinate, PrimaryWorldPositionWorldTriangleNormal, PrimaryPositionError);
+    compactedCoordinate, PrimaryWorldPositionWorldTriangleNormal, PrimaryPositionError);
 
   // Deserialize the Surface Material Interaction
   PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction = polymorphicSurfaceMaterialInteractionReadFromGBuffer(
-    pixelCoordinate, PrimaryWorldShadingNormal, PrimaryPerceptualRoughness, PrimaryAlbedo, PrimaryBaseReflectivity,
+    pixelCoordinate, compactedCoordinate, pixelCoordinate,
+    PrimaryWorldShadingNormal, PrimaryPerceptualRoughness, PrimaryAlbedo, PrimaryBaseReflectivity,
     SharedMaterialData0, SharedMaterialData1, SharedSurfaceIndex, SharedSubsurfaceData, SharedSubsurfaceDiffusionProfileData);
 
   // Perform next event estimation on cached emissive triangle list
   // Also add NEE sample to sample reservoir
   // ToDo - calculate non-Restir GI portion to secondary signal as well
+#if INTEGRATE_NEE_RESTIR_GI
   ReSTIRGI_Reservoir resultReservoir = ReSTIRGI_Reservoir.createEmpty();
+#endif
   if (cb.neeCacheArgs.enable && cb.neeCacheArgs.enableOnFirstBounce &&
       polymorphicSurfaceMaterialInteractionGetTypeHelper(polymorphicSurfaceMaterialInteraction) == surfaceMaterialTypeOpaque)
   {
@@ -234,7 +245,9 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
           lightSample, invalidRayPortalIndex, geometryFlags.portalSpace, rayMask, pomOpaqueSurfaceEncountered,
           geometryFlags.isViewModel, primaryRay,
           minimalRayInteraction, minimalSurfaceInteraction, opaqueSurfaceMaterialInteraction,
-          diffuseLight, specularLight, SharedSurfaceIndex[pixelCoordinate], SharedTextureCoord[pixelCoordinate]);
+          diffuseLight, specularLight,
+          SharedSurfaceIndex[compactedCoordinate],
+          SharedTextureCoord[compactedCoordinate]);
 
         // Coordinate of a training path in NRC training pixel coordinate space
         uvec2 nrcTrainingPixelCoordinate;
@@ -275,7 +288,8 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
           addRadianceToNrcTrainingPathVertex(nrcTrainingPixelCoordinate, bounceIndex, neeRadiance);
         }
 
-        if (cb.enableReSTIRGI && isVisible)
+#if INTEGRATE_NEE_RESTIR_GI
+        if (isVisible)
         {
           ReSTIRGI_Reservoir neeSample = ReSTIRGI_Reservoir.createEmpty();
           neeSample.M = 1;
@@ -293,15 +307,15 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 LocalIndex : SV_GroupTh
           float wi = RAB_GetGITargetPdfForSurface(neeSample.radiance, neeSample.position, surface);
           resultReservoir.update(wi, neeSample, 0.5);
         }
+#endif
       }
     }
   }
 
-  if (cb.enableReSTIRGI)
-  {
-    RAB_StoreGIReservoir(resultReservoir, pixelCoordinate, ReSTIRGI_GetInitSamplePage());
-  }
+#if INTEGRATE_NEE_RESTIR_GI
+  RAB_StoreGIReservoir(resultReservoir, pixelCoordinate, ReSTIRGI_GetInitSamplePage());
+#endif
 
-  PrimaryIndirectDiffuseLobeRadianceHitDistance[pixelCoordinate] = indirectDiffuseOutput;
-  PrimaryIndirectSpecularLobeRadianceHitDistance[pixelCoordinate] = indirectSpecularOutput;
+  PrimaryIndirectDiffuseLobeRadianceHitDistance[compactedCoordinate] = indirectDiffuseOutput;
+  PrimaryIndirectSpecularLobeRadianceHitDistance[compactedCoordinate] = indirectSpecularOutput;
 }
