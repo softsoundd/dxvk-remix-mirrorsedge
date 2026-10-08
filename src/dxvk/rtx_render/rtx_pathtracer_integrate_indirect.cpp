@@ -186,6 +186,7 @@ namespace dxvk {
 
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT)
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT)
+        RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_CLOUD_GLOSSY_RAY_OUTPUT)
         RW_STRUCTURED_BUFFER(INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RESERVOIR_OUTPUT)
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_RESTIR_GI_RADIANCE_OUTPUT)
         RW_TEXTURE2D(INTEGRATE_INDIRECT_BINDING_RESTIR_GI_HIT_GEOMETRY_OUTPUT)
@@ -495,6 +496,8 @@ namespace dxvk {
 
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_INDIRECT_RADIANCE_HIT_DISTANCE_OUTPUT, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::Write), nullptr);
     ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT, rtOutput.m_indirectReflectionSegment.view, nullptr);
+    // Null until the clouds first run, where the shader also leaves it alone.
+    ctx->bindResourceView(INTEGRATE_INDIRECT_BINDING_CLOUD_GLOSSY_RAY_OUTPUT, ctx->getClouds().getGlossyRayView(), nullptr);
     
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(INTEGRATE_INSTRUMENTATION, debugView.getInstrumentation(), nullptr);

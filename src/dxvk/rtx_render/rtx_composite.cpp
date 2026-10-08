@@ -132,6 +132,9 @@ namespace dxvk {
         TEXTURE2D(COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_AEROSOL_PHASE_INPUT)
+        TEXTURE2D(COMPOSITE_CLOUD_LAYER_INPUT)
+        TEXTURE2D(COMPOSITE_CLOUD_REFLECTION_INPUT)
+        TEXTURE2D(COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -419,6 +422,12 @@ namespace dxvk {
     ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AEROSOL_PHASE_INPUT,
       ctx->getAtmosphereAerosolPhaseLutView(), nullptr);
 
+    // Null when the clouds did not render this frame, where the shader also skips it (cloudArgs.enabled).
+    const Rc<DxvkImageView> cloudLayer = ctx->getClouds().getLayerView();
+    ctx->bindResourceView(COMPOSITE_CLOUD_LAYER_INPUT, cloudLayer, nullptr);
+    ctx->bindResourceView(COMPOSITE_CLOUD_REFLECTION_INPUT, ctx->getClouds().getReflectionView(), nullptr);
+    ctx->bindResourceView(COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT, ctx->getAtmosphereSkyViewLutView(), nullptr);
+
     compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
     compositeArgs.frameIdx = frameIdx;
 
@@ -457,6 +466,10 @@ namespace dxvk {
     compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
     compositeArgs.atmosphereArgs = rtOutput.m_raytraceArgs.atmosphereArgs;
+    compositeArgs.cloudArgs = rtOutput.m_raytraceArgs.cloudArgs;
+    if (cloudLayer == nullptr) {
+      compositeArgs.cloudArgs.enabled = 0;
+    }
 
     Vector3 unoccludedSunRadiance(0.0f, 0.0f, 0.0f);
     Vector3 unoccludedSunDirection(0.0f, 0.0f, 0.0f);
@@ -479,6 +492,7 @@ namespace dxvk {
     ctx->getDenoiseArgs(primaryDirectNrdArgs, primaryIndirectNrdArgs, secondaryNrdArgs);
 
     compositeArgs.primaryDirectMissLinearViewZ = primaryDirectNrdArgs.missLinearViewZ;
+    compositeArgs.secondaryCombinedMissLinearViewZ = secondaryNrdArgs.missLinearViewZ;
 
     const bool useDenoisedInputs = settings.isNRDPreCompositionDenoiserEnabled && !ctx->useRayReconstruction();
 

@@ -134,3 +134,17 @@ Texture2D AtmosphereSkyViewLut;
 
 layout(binding = BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT)
 Texture2D AtmosphereAerosolPhaseLut;
+
+// Volumetric clouds: the sun optical depth grid and far field shadow map (cloud shadows), the reflection dome
+// (the layer over the sky on misses), and the repeating sampler they are read through.
+layout(binding = BINDING_CLOUD_SUN_GRID)
+Texture3D<float4> CloudSunGrid;
+
+layout(binding = BINDING_CLOUD_DOME)
+Texture2D<float4> CloudDome;
+
+layout(binding = BINDING_CLOUD_SHADOW_MAP)
+Texture2D<float> CloudShadowMap;
+
+layout(binding = BINDING_CLOUD_SAMPLER)
+SamplerState CloudSampler;

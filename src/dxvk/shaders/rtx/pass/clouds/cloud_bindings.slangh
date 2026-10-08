@@ -1,0 +1,78 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Inputs of the passes that march the cloud layer (the dome, the screen, the reference). Each pass binds these
+// plus its own outputs; the march and lighting headers read them by name.
+
+#include "rtx/pass/clouds/cloud_binding_indices.h"
+#include "rtx/pass/clouds/cloud_args.h"
+
+layout(binding = CLOUD_BINDING_CONSTANTS)
+ConstantBuffer<CloudConstants> CloudCb;
+
+layout(binding = CLOUD_BINDING_VOLUME_SAMPLER)
+SamplerState CloudVolumeSampler;
+
+layout(binding = CLOUD_BINDING_LUT_SAMPLER)
+SamplerState CloudLutSampler;
+
+layout(binding = CLOUD_BINDING_NVDF)
+Texture3D<float> CloudNvdf;
+
+layout(binding = CLOUD_BINDING_DETAIL_NOISE)
+Texture3D<float4> CloudDetailNoise;
+
+layout(binding = CLOUD_BINDING_SUN_GRID)
+Texture3D<float4> CloudSunGrid;
+
+layout(binding = CLOUD_BINDING_AMBIENT_GRID)
+Texture3D<float2> CloudAmbientGrid;
+
+// The fluence of the sunlight the clouds scatter, per unit sun irradiance (cloud_diffusion).
+layout(binding = CLOUD_BINDING_DIFFUSION_GRID)
+Texture3D<float> CloudDiffusionGrid;
+
+// The same three over the far cascade's window, for distant clouds.
+layout(binding = CLOUD_BINDING_SUN_GRID_FAR)
+Texture3D<float4> CloudSunGridFar;
+
+layout(binding = CLOUD_BINDING_AMBIENT_GRID_FAR)
+Texture3D<float2> CloudAmbientGridFar;
+
+layout(binding = CLOUD_BINDING_DIFFUSION_GRID_FAR)
+Texture3D<float> CloudDiffusionGridFar;
+
+layout(binding = CLOUD_BINDING_TRANSMITTANCE_LUT)
+Texture2D CloudTransmittanceLut;
+
+layout(binding = CLOUD_BINDING_PHASE_LUT)
+Texture2D<float4> CloudPhaseLut;
+
+layout(binding = CLOUD_BINDING_SKY_AP_INSCATTER)
+Texture3D<float4> CloudSkyApInscatter;
+
+layout(binding = CLOUD_BINDING_SKY_AP_TRANSMITTANCE)
+Texture3D<float4> CloudSkyApTransmittance;
+
+layout(binding = CLOUD_BINDING_SKY_SH)
+Texture2D<float4> CloudSkySh;

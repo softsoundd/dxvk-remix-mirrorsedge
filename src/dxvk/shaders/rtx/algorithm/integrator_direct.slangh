@@ -36,6 +36,7 @@
 #include "rtx/algorithm/resolve.slangh"
 #include "rtx/algorithm/visibility.slangh"
 #include "rtx/algorithm/rtxcr/rtxcr_material.slangh"
+#include "rtx/algorithm/cloud_lighting_helpers.slangh"
 #include "integrator.slangh"
 
 // From 'Predictable and Targeted Softening of the Shadow Terminator'.
@@ -457,6 +458,11 @@ void integrateDirectPath(
     }
 
     const bool isDiffusionProfileSss = (cb.sssArgs.enableDiffusionProfile && isSubsurfaceDiffusionProfileMaterial(opaqueSurfaceMaterialInteraction));
+
+    if (rtxdiLightSampleValid || risLightSampleValid)
+    {
+      applyCloudShadowToLightSample(lightSample, lightIdx, primarySurfaceInteraction.position);
+    }
 
     // Evaluate NEE
     if (rtxdiLightSampleValid || risLightSampleValid || isDiffusionProfileSss)

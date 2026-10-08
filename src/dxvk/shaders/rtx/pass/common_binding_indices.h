@@ -56,6 +56,12 @@
 #define BINDING_ATMOSPHERE_SKY_VIEW_LUT          202
 #define BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT     203
 
+// Volumetric clouds (rtx_clouds.cpp): what the path tracer needs of the layer.
+#define BINDING_CLOUD_SUN_GRID                   204
+#define BINDING_CLOUD_DOME                       205
+#define BINDING_CLOUD_SHADOW_MAP                 206
+#define BINDING_CLOUD_SAMPLER                    207
+
 #define COMMON_MAX_BINDING                       BINDING_LIGHT_IDENTITY_BUFFER
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 
@@ -111,6 +117,10 @@
   TEXTURE2D(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)                   \
   TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
   TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)                        \
-  TEXTURE2D(BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT)
+  TEXTURE2D(BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT)                   \
+  TEXTURE3D(BINDING_CLOUD_SUN_GRID)                                 \
+  TEXTURE2D(BINDING_CLOUD_DOME)                                     \
+  TEXTURE2D(BINDING_CLOUD_SHADOW_MAP)                               \
+  SAMPLER(BINDING_CLOUD_SAMPLER)
 
 #endif

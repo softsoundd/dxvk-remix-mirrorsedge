@@ -114,6 +114,14 @@ layout(binding = COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT)
 Texture2D AtmosphereMultiscatteringLut;
 layout(binding = COMPOSITE_ATMOSPHERE_AEROSOL_PHASE_INPUT)
 Texture2D AtmosphereAerosolPhaseLut;
+// The cloud screen pass's layer: premultiplied radiance and transmittance (cloud_march.slangh).
+layout(binding = COMPOSITE_CLOUD_LAYER_INPUT)
+Texture2D<float4> CloudLayer;
+// The cloud layer along mirrors' and glass's first reflections that reach the sky.
+layout(binding = COMPOSITE_CLOUD_REFLECTION_INPUT)
+Texture2D<float4> CloudReflection;
+layout(binding = COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT)
+Texture2D AtmosphereSkyViewLut;
 
 layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
 Texture2D<uint> SparseRenderingActivePixelMask;

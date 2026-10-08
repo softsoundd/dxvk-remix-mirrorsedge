@@ -364,6 +364,23 @@ namespace dxvk {
                                                                  "Physical Atmosphere only. Mean transmittance applied to the primary hit radiance (1 = no haze).\n"
                                                                  "White on primary misses." },
 
+        {DEBUG_VIEW_CLOUD_LAYER_RADIANCE,         "Clouds Layer Radiance",
+                                                  "The cloud layer's premultiplied radiance along each camera ray, with the air in front of it, after\n"
+                                                  "the temporal filter. What composite adds over the transmitted background." },
+        {DEBUG_VIEW_CLOUD_LAYER_TRANSMITTANCE,    "Clouds Layer Transmittance", "Fraction of the background the cloud layer passes (1 = clear)." },
+        {DEBUG_VIEW_CLOUD_FIRST_HIT_DISTANCE,     "Clouds First Hit Distance", "Distance in km to the nearest sample carrying cloud density; 0 for none." },
+        {DEBUG_VIEW_CLOUD_MEAN_DEPTH,             "Clouds Mean Depth", "Contribution weighted mean distance in km of the cloud along each ray; 0 for none." },
+        {DEBUG_VIEW_CLOUD_SAMPLE_COUNT,           "Clouds Sample Count", "Density evaluations of the march per pixel." },
+        {DEBUG_VIEW_CLOUD_DOME,                   "Clouds Reflection Dome", "The dome reflections and indirect sky light read, looked up in the view direction." },
+        {DEBUG_VIEW_CLOUD_SCENE_SHADOW,           "Clouds Scene Shadow", "Cloud transmittance of the sun at each primary hit (1 = unshadowed)." },
+        {DEBUG_VIEW_CLOUD_SKY_AP_INSCATTER,       "Clouds Sky Aerial Perspective In-Scatter", "The sky aerial perspective LUT's in-scatter at each ray's cloud depth (12 km without cloud)." },
+        {DEBUG_VIEW_CLOUD_SKY_AP_TRANSMITTANCE,   "Clouds Sky Aerial Perspective Transmittance", "The sky aerial perspective LUT's transmittance at each ray's cloud depth." },
+        {DEBUG_VIEW_CLOUD_SUN_OPTICAL_DEPTH,      "Clouds Sun Optical Depth", "The sun grid's optical depth (density x km) toward the sun at each ray's first cloud sample." },
+        {DEBUG_VIEW_CLOUD_HISTORY_WEIGHT,         "Clouds History Weight", "Weight of the reprojected history in the cloud layer (0 = none)." },
+        {DEBUG_VIEW_CLOUD_DIFFUSION_FLUENCE,      "Clouds Diffusion Fluence", "Fluence of the scattered sunlight per unit sun irradiance at each ray's contribution weighted mean depth." },
+        {DEBUG_VIEW_CLOUD_REFERENCE,              "Clouds Reference", "The path traced reference's layer radiance (requires Path Traced Reference)." },
+        {DEBUG_VIEW_CLOUD_REFERENCE_ERROR,        "Clouds Reference Error", "The march against the reference, by luminance over each 4x4 tile's paths: red where the march is brighter, blue darker (1 = 100%)." },
+
         {DEBUG_VIEW_SHADOW_TERMINATOR_OFFSET, "Shadow Terminator Offset"},
       };
 

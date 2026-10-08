@@ -39,6 +39,7 @@
 #include "rtx/algorithm/resolve.slangh"
 #include "rtx/algorithm/volume_lighting.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/algorithm/cloud_lighting_helpers.slangh"
 #include "rtx/pass/post_fx/post_fx_motion_blur_geometry_flags.slangh"
 #include "rtx/algorithm/nee_cache_light.slangh"
 #include "rtx/utility/gpu_printing.slangh"
@@ -2605,9 +2606,49 @@ void geometryPSRResolverVertex(
       // Physical atmosphere mode.
       vec3 skyRadiance = sampleSkyViewLutRadiance(AtmosphereSkyViewLut, ray.direction, cb.atmosphereArgs, cb.isZUp != 0);
 
-      // Mirror-like PSR paths never run NEE either, so without this a mirror reflecting the sky
-      // shows no sun.
-      skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
+      // The sky's clouds, and the sun behind them, from the dome, except on rays the cloud screen pass marches per
+      // pixel: a mirror's first reflection (the pixel's only PSR surface), glass's first reflection (its secondary
+      // surface, whose direction goes in the view direction a missed surface leaves free) and the sky straight
+      // through glass. Composite lays those clouds and the sun over this sky at the throughput stored here as the
+      // chain's attenuation, which a miss otherwise leaves unwritten; the sun is left to it, since taken back out at
+      // the attenuation's few mantissa bits it would trace through clouds that hide it. Other glass misses store zero.
+      bool cloudsMarchedPerPixel = false;
+      if (cb.cloudArgs.enabled && (cb.cloudArgs.flags & CLOUD_FLAG_PSR_REFLECTIONS) != 0)
+      {
+        const ivec2 pixel = ivec2(geometryPSRResolverState.pixelCoordinate);
+        const vec3 skyThroughput = radianceAttenuation * geometryPSRResolverState.attenuation;
+        if (geometryPSRResolverState.isTransmissionPSR)
+        {
+          const vec3 cameraDirection = cameraPixelCoordinateToDirection(cb.camera, pixel).worldDirection;
+          cloudsMarchedPerPixel = dot(ray.direction, cameraDirection) > kCloudStraightThroughCosine;
+          imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(cloudsMarchedPerPixel ? skyThroughput : vec3(0.0f)));
+        }
+        else if (geometryPSRResolverState.primarySurface)
+        {
+          cloudsMarchedPerPixel = geometryPSRResolverState.bounceIteration == 1
+            && !geometryFlagsReadFromGBuffer(geometryPSRResolverState.pixelCoordinate, SharedFlags).secondarySurfaceMask;
+          if (cloudsMarchedPerPixel)
+          {
+            imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(skyThroughput));
+          }
+        }
+        else
+        {
+          cloudsMarchedPerPixel = geometryPSRResolverState.bounceIteration == 1;
+          imageStore(SecondaryAttenuation, pixel, colorToR11G11B10(cloudsMarchedPerPixel ? skyThroughput : vec3(0.0f)));
+          if (cloudsMarchedPerPixel)
+          {
+            SecondaryViewDirection[pixel] = sphereDirectionToSignedOctahedral(ray.direction);
+          }
+        }
+      }
+      if (!cloudsMarchedPerPixel)
+      {
+        // Mirror-like PSR paths never run NEE either, so without this a mirror reflecting the sky
+        // shows no sun.
+        skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
+        skyRadiance = cloudSkyRadianceOnMiss(skyRadiance, ray.direction);
+      }
 
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }

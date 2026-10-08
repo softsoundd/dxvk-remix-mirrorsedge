@@ -1,0 +1,427 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// The cloud density field, after Schneider's Nubis Cubed (SIGGRAPH 2023): a body signed distance field baked
+// from a placement map and a per-column model, sampled through a hex lattice that hides its tile, with its
+// level set shifted by the live coverage and displaced and eroded by a periodic detail volume. One sampler
+// serves the march and every optical depth bake, so the clouds rendered and the shadows they cast are the same
+// field.
+//
+// Included only by the cloud passes, never by the path tracer.
+
+#include "rtx/pass/clouds/cloud_common.slangh"
+#include "rtx/pass/clouds/cloud_noise.slangh"
+
+// Schneider's value erosion: erode value from below by erosion, renormalised so what survives still reaches 1.
+float cloudValueErosion(float value, float erosion) {
+  return saturate((value - erosion) / max(1.0f - erosion, 1e-4f));
+}
+
+// Detail volume mip whose texels match a footprint (km) at a tap's frequency (cycles per km), so content finer
+// than a pixel is filtered rather than aliased. A zero footprint (the bakes) reads the full resolution.
+float cloudDetailMip(float freqPerKm, float footprintKm, CloudArgs cloud) {
+  if (footprintKm <= 0.0f) {
+    return 0.0f;
+  }
+  const float texelsPerFootprint = footprintKm * freqPerKm * float(CLOUD_DETAIL_NOISE_SIZE);
+  return clamp(log2(max(texelsPerFootprint, 1.0f)) + cloud.detailLodBias, 0.0f, float(CLOUD_DETAIL_NOISE_MIP_COUNT - 1));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Hex lattice de-tiling (Heitz and Neyret 2018's triangle grid with distance preserving tile transforms, so the
+// blended signed distance stays metric enough to step by).
+
+struct CloudHexTile {
+  float w1;
+  float w2;
+  float w3;
+  vec2 uv1;
+  vec2 uv2;
+  vec2 uv3;
+  float boundaryKm;  // Distance to the nearest triangle edge, past which another vertex may enter the blend
+};
+
+vec2 cloudTileUv(vec2 tileUv, vec2 vertex) {
+  const uint orientation = uint(cloudLatticeHash(vertex, 37.1f) * 8.0f);
+  if ((orientation & 1u) != 0u) {
+    tileUv = tileUv.yx;
+  }
+  if ((orientation & 2u) != 0u) {
+    tileUv.x = -tileUv.x;
+  }
+  if ((orientation & 4u) != 0u) {
+    tileUv.y = -tileUv.y;
+  }
+  return frac(tileUv + vec2(cloudLatticeHash(vertex, 7.31f), cloudLatticeHash(vertex, 19.77f)));
+}
+
+CloudHexTile cloudComputeHexTile(vec2 xzKm, CloudArgs cloud) {
+  // The lattice is a little smaller than the tile so a tile never repeats within one patch.
+  const float latticeKm = max(cloud.tileKm * 0.8f, 1e-3f);
+  const vec2 uv = xzKm / latticeKm;
+
+  const vec2 skewed = vec2(uv.x - 0.57735027f * uv.y, uv.y * 1.15470054f);
+  const vec2 baseId = floor(skewed);
+  const vec2 fr = frac(skewed);
+
+  vec3 w;
+  vec2 v1, v2, v3;
+  const float lower = 1.0f - fr.x - fr.y;
+  if (lower > 0.0f) {
+    w = vec3(lower, fr.y, fr.x);
+    v1 = baseId;
+    v2 = baseId + vec2(0.0f, 1.0f);
+    v3 = baseId + vec2(1.0f, 0.0f);
+  } else {
+    w = vec3(-lower, 1.0f - fr.y, 1.0f - fr.x);
+    v1 = baseId + vec2(1.0f, 1.0f);
+    v2 = baseId + vec2(1.0f, 0.0f);
+    v3 = baseId + vec2(0.0f, 1.0f);
+  }
+
+  const float boundaryKm = min(w.x, min(w.y, w.z)) * latticeKm * 0.8660254f;
+
+  // Narrow blends keep individual silhouettes intact.
+  w = w * w;
+  w = w * w;
+  w /= (w.x + w.y + w.z);
+
+  // The dominant vertex first: the coarse optical depth taps read only it.
+  if (w.y > w.x) {
+    const float t = w.x; w.x = w.y; w.y = t;
+    const vec2 tv = v1; v1 = v2; v2 = tv;
+  }
+  if (w.z > w.x) {
+    const float t = w.x; w.x = w.z; w.z = t;
+    const vec2 tv = v1; v1 = v3; v3 = tv;
+  }
+
+  CloudHexTile hex;
+  hex.w1 = w.x;
+  hex.w2 = w.y;
+  hex.w3 = w.z;
+  const vec2 tileUv = frac(xzKm / max(cloud.tileKm, 1e-3f));
+  hex.uv1 = cloudTileUv(tileUv, v1);
+  hex.uv2 = cloudTileUv(tileUv, v2);
+  hex.uv3 = cloudTileUv(tileUv, v3);
+  hex.boundaryKm = max(boundaryKm, 0.0f);
+  return hex;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Per-column body model the occupancy bake voxelises: each cloud has its own base, top and presence, so a
+// column carries a complete rise, bulk and top at its own height rather than every cloud sharing one profile.
+
+struct CloudColumn {
+  float presence;  // 0: no cloud in this column, 1: solid core
+  float baseFrac;
+  float topFrac;
+};
+
+CloudColumn cloudComputeColumn(vec4 placement, float coverage, CloudArgs cloud) {
+  CloudColumn column;
+  const float band = max(cloud.columnFeather, 0.02f);
+  column.presence = saturate((placement.r - (1.0f - coverage)) / band);
+  column.baseFrac = saturate(placement.b * cloud.columnBaseVariation);
+  const float topJitter = lerp(1.0f - saturate(cloud.columnTopVariation), 1.0f, saturate(placement.g));
+  column.topFrac = column.baseFrac
+    + (1.0f - column.baseFrac) * pow(column.presence, max(cloud.columnTopShape, 0.05f)) * topJitter;
+  // Stratiform layers stop at a common inversion rather than each cloud finding its own top.
+  column.topFrac = min(column.topFrac, column.baseFrac + (1.0f - column.baseFrac) * saturate(cloud.columnTopFlatten));
+  return column;
+}
+
+// Live type (erosion character) and coverage at a horizontal position, carried by the wind with the clouds, so
+// each keeps its character as it drifts.
+vec2 cloudControls(vec2 xzKm, CloudArgs cloud) {
+  const vec2 fieldXz = cloudFieldXz(xzKm, cloud);
+  float typeNoise = 0.5f;
+  float coverageNoise = 0.5f;
+  if (cloud.typeSpread != 0.0f) {
+    typeNoise = cloudControlField2D(fieldXz * cloud.typeSpreadFrequency, 200.0f);
+  }
+  if (cloud.coverageSpread != 0.0f) {
+    coverageNoise = cloudControlField2D(fieldXz * cloud.coverageSpreadFrequency, 250.0f);
+  }
+  return vec2(
+    saturate(cloud.cloudType + (typeNoise - 0.5f) * cloud.typeSpread),
+    saturate(cloud.coverage + (coverageNoise - 0.5f) * cloud.coverageSpread));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Vertical extinction profile. In an adiabatic parcel the liquid water grows linearly with height above the base
+// and the droplet number stays constant, so the extinction grows as height^(2/3) (Brenguier et al. 2000): flat,
+// translucent bases and dense, sharply bounded tops. Normalised to 1 km above the base, where extinctionKm
+// applies.
+float cloudVerticalProfile(float heightFraction, CloudArgs cloud) {
+  const float heightKm = max(heightFraction * cloud.thicknessKm, 1e-3f);
+  return clamp(pow(heightKm, cloud.adiabaticExponent), cloud.adiabaticFloor, cloud.adiabaticMax);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The density sampler.
+
+struct CloudDensitySample {
+  float density;    // [0, 1]: the local fraction of the profile's liquid water
+  float emptyKm;    // Conservative radius around the sample guaranteed to be empty
+  float surfaceKm;  // Signed distance to the displaced surface, as far as the sampler resolved it (not a bound)
+};
+
+// positionKm: cloud frame position (x / z world, y altitude). cameraDistKm drives the near-camera detail; the
+// bakes pass a huge value so they never depend on the camera. footprintKm is the pixel footprint the detail
+// taps filter to, zero for none. coarse drops the hex blend and the de-tiling tap, for live optical depth taps
+// that cannot see either.
+CloudDensitySample cloudSampleDensity(
+  vec3 positionKm, float heightFraction, float typeLocal, float coverageLocal, float cameraDistKm, float footprintKm,
+  bool coarse, CloudArgs cloud, Texture3D<float> nvdfSdf, Texture3D<float4> detailNoise, SamplerState volumeSampler)
+{
+  CloudDensitySample result;
+  result.density = 0.0f;
+  result.emptyKm = 0.0f;
+  result.surfaceKm = 0.0f;
+
+  // Wind translates the field: density(x) = field(x - offset) moves it along the wind.
+  const vec3 windOffset = vec3(cloud.windOffsetKm.x, 0.0f, cloud.windOffsetKm.y);
+  const vec3 perturbed = vec3(positionKm.x, positionKm.y, positionKm.z) - windOffset;
+
+  // The body field: the vertical texel band is clamped so the wrapping sampler never mixes base and top.
+  const float halfTexelV = 0.5f / float(CLOUD_NVDF_SIZE_Y);
+  const float v = clamp(heightFraction, halfTexelV, 1.0f - halfTexelV);
+
+  float sdfKm;
+  float sdfMinKm;
+  float tileBoundaryKm = 100.0f;
+  if ((cloud.flags & CLOUD_FLAG_HEX_TILING) != 0) {
+    const CloudHexTile hex = cloudComputeHexTile(perturbed.xz, cloud);
+    const float s1 = nvdfSdf.SampleLevel(volumeSampler, vec3(hex.uv1.x, v, hex.uv1.y), 0);
+    if (coarse) {
+      sdfKm = s1;
+      sdfMinKm = s1;
+    } else {
+      const float s2 = nvdfSdf.SampleLevel(volumeSampler, vec3(hex.uv2.x, v, hex.uv2.y), 0);
+      const float s3 = nvdfSdf.SampleLevel(volumeSampler, vec3(hex.uv3.x, v, hex.uv3.y), 0);
+      sdfKm = hex.w1 * s1 + hex.w2 * s2 + hex.w3 * s3;
+      sdfMinKm = min(s1, min(s2, s3));
+    }
+    tileBoundaryKm = hex.boundaryKm;
+  } else {
+    const vec2 tileUv = frac(perturbed.xz / max(cloud.tileKm, 1e-3f));
+    sdfKm = nvdfSdf.SampleLevel(volumeSampler, vec3(tileUv.x, v, tileUv.y), 0);
+    sdfMinKm = sdfKm;
+  }
+
+  // Coverage as a live level set offset against the coverage the body was baked at.
+  const float offsetKm = (coverageLocal - cloud.nvdfNominalCoverage) * cloud.nvdfCoverageOffsetKm;
+  float sdfLive = sdfKm - offsetKm;
+
+  // Both level set displacements below can push the surface out by at most half their amplitude.
+  const float wobbleKm = max(cloud.wobbleStrength, 0.0f) * 0.6f;
+  const float maxOutwardKm = 0.5f * (wobbleKm + cloud.shapeVarietyKm);
+  result.emptyKm = min(sdfMinKm - offsetKm - maxOutwardKm, tileBoundaryKm);
+  result.surfaceKm = sdfLive - maxOutwardKm;
+  if (sdfLive >= maxOutwardKm) {
+    return result;
+  }
+
+  // Detail drift: convective rise everywhere plus a downwind shear growing with height, so tops stream downwind
+  // while bases stay put. Smaller scales evolve faster. Like the wind's, the drift moves the detail along itself.
+  const vec3 windDir = vec3(cloud.windDirection.x, 0.0f, cloud.windDirection.y);
+  const vec3 driftUnit = vec3(0.0f, cloud.evolutionRiseKm, 0.0f) + windDir * (cloud.evolutionShearKm * heightFraction);
+  const vec3 baseShear = windDir * ((1.0f - heightFraction) * cloud.detailBaseShearKm);
+  vec3 boilPos = perturbed - driftUnit + baseShear;
+  const vec3 boilPosMid = perturbed - driftUnit * 0.2f + baseShear;
+  vec3 boilPosFine = perturbed - driftUnit * 1.8f + baseShear;
+
+  // The detail taps wrap in fp32 before the sampler: the drift offsets grow without bound over a session.
+  const float detailFreq = cloud.detailScale / max(cloud.tileKm, 1e-3f);
+  const float profileProv = saturate(-sdfLive / max(cloud.nvdfProfileDepthKm, 1e-3f));
+
+  // Real cumulus erodes wispy at the base and billowy at the top.
+  const float typeShaped = saturate(saturate(typeLocal) + (smoothstep(0.1f, 0.8f, heightFraction) - 0.5f) * 0.5f);
+
+  // Mid frequency lobes at an absolute wavelength (two incommensurate scales), which carve km scale bodies into
+  // varied clusters.
+  const float midFreq = 1.0f / (6.0f * max(cloud.shapeVarietyWavelengthKm, 0.05f));
+  const vec4 noiseMidA = detailNoise.SampleLevel(volumeSampler, frac(boilPosMid * midFreq + vec3(0.71f, 0.29f, 0.53f)),
+    cloudDetailMip(midFreq, footprintKm, cloud));
+  const vec4 noiseMidB = detailNoise.SampleLevel(volumeSampler,
+    frac(vec3(boilPosMid.z, boilPosMid.y, -boilPosMid.x) * (midFreq * 0.7548777f) + vec3(0.17f, 0.83f, 0.41f)),
+    cloudDetailMip(midFreq * 0.7548777f, footprintKm, cloud));
+  const vec4 noiseMid = saturate(0.5f + (lerp(noiseMidA, noiseMidB, 0.4f) - 0.5f) * 1.3867505f);
+  const float wobbleMid = lerp(noiseMid.r - 0.5f, noiseMid.b * 0.3f - 0.15f, typeShaped);
+
+  // Conservative surface gate on the mid tap alone: the base tap wobble below moves the surface out by at most
+  // 0.3 x wobbleKm.
+  const float sdfAfterMid = sdfLive - 0.4f * wobbleMid * wobbleKm - wobbleMid * cloud.shapeVarietyKm;
+  result.surfaceKm = sdfAfterMid - 0.3f * wobbleKm;
+  if (sdfAfterMid >= 0.3f * wobbleKm) {
+    return result;
+  }
+
+  // Domain warp of the erosion field (Schneider and Vos 2015's curl distortion), strongest toward the base where
+  // turbulence shreds the cloud. The mid taps' spare channels supply the vector field, so it costs no tap.
+  if (cloud.curlStrengthKm > 0.0f) {
+    const vec3 warp = (vec3(noiseMidA.g, noiseMidB.r, noiseMidA.a) - 0.5f)
+      * (2.0f * cloud.curlStrengthKm * (1.0f - 0.7f * heightFraction));
+    boilPos += warp;
+    boilPosFine += warp;
+  }
+
+  // Two-scale de-tiling of the detail volume, which the hex lattice does not cover.
+  const vec4 noiseA = detailNoise.SampleLevel(volumeSampler, frac(boilPos * detailFreq),
+    cloudDetailMip(detailFreq, footprintKm, cloud));
+  vec4 noise;
+  if (coarse) {
+    noise = noiseA;
+  } else {
+    const vec4 noiseB = detailNoise.SampleLevel(volumeSampler,
+      frac(boilPos * (detailFreq * 0.531f) + vec3(0.37f, 0.61f, 0.13f)),
+      cloudDetailMip(detailFreq * 0.531f, footprintKm, cloud));
+    noise = saturate(0.5f + (lerp(noiseA, noiseB, 0.4f) - 0.5f) * 1.35f);
+  }
+
+  float wispyNoise = lerp(noise.r, noise.g, profileProv);
+  const float billowyNoise = lerp(noise.b * 0.3f, noise.a * 0.3f, pow(profileProv, 0.25f));
+  float noiseComposite = lerp(wispyNoise, billowyNoise, typeShaped);
+
+  // Fly-through detail: twice folded noise replaces a slice of the erosion within 0.6 km.
+  if (cloud.hfDetailStrength > 0.0f && cameraDistKm < 0.6f) {
+    const float hhfWispy = 1.0f - pow(abs(abs(noise.g * 2.0f - 1.0f) * 2.0f - 1.0f), 4.0f);
+    const float hhfBillowy = pow(abs(abs(noise.a * 2.0f - 1.0f) * 2.0f - 1.0f), 2.0f);
+    const float hhfNoise = saturate(lerp(hhfWispy, hhfBillowy, typeShaped));
+    const float hfFloor = 1.0f - 0.1f * cloud.hfDetailStrength;
+    const float blender = lerp(hfFloor, 1.0f, saturate((cameraDistKm - 0.1f) / 0.5f));
+    noiseComposite = lerp(hhfNoise, noiseComposite, blender);
+  }
+
+  // Zero mean silhouette wobble: moves the surface both ways, knuckles out and crevices in.
+  const float wispyWobble = lerp(noise.r, noise.g, 0.5f) - 0.5f;
+  const float billowyWobble = lerp(noise.b, noise.a, 0.5f) * 0.3f - 0.15f;
+  float wobbleSignal = lerp(wispyWobble, billowyWobble, typeShaped);
+  wobbleSignal = wobbleSignal * 0.6f + wobbleMid * 0.4f;
+
+  sdfLive -= wobbleSignal * wobbleKm + wobbleMid * cloud.shapeVarietyKm;
+  result.surfaceKm = sdfLive;
+
+  // The profile gate on the displaced surface.
+  if (sdfLive >= 0.0f) {
+    return result;
+  }
+  const float profile = saturate(-sdfLive / max(cloud.nvdfProfileDepthKm, 1e-3f));
+
+  // Fine band at 2.11x the detail frequency, faded out between 3 and 9 km where it would only alias.
+  float fineMix = 0.0f;
+  float fineInteriorNoise = 0.5f;
+  if (cloud.fineDetailStrength > 0.0f && cameraDistKm < 9.0f) {
+    const float fineFade = saturate(1.0f - (cameraDistKm - 3.0f) / 6.0f);
+    const vec4 noiseFine = detailNoise.SampleLevel(volumeSampler,
+      frac(boilPosFine * (detailFreq * 2.11f) + vec3(0.17f, 0.83f, 0.47f)),
+      cloudDetailMip(detailFreq * 2.11f, footprintKm, cloud));
+    const float fineWispy = lerp(noiseFine.r, noiseFine.g, 0.5f);
+    const float fineBillowy = lerp(noiseFine.b, noiseFine.a, 0.5f) * 0.3f;
+    fineMix = saturate(cloud.fineDetailStrength * 0.35f) * fineFade;
+    noiseComposite = lerp(noiseComposite, lerp(fineWispy, fineBillowy, typeShaped), fineMix);
+    wispyNoise = lerp(wispyNoise, fineWispy, fineMix);
+    fineInteriorNoise = lerp(lerp(noiseFine.r, noiseFine.g, 0.5f), lerp(noiseFine.b, noiseFine.a, 0.5f), typeShaped);
+  }
+
+  // Near-camera octave at 4.37x the detail frequency: the detail volume's finest content is tens of metres, but
+  // a pixel looking up at a cloud base a kilometre or two away covers one or two. Faded out by
+  // nearDetailRangeKm, beyond which it is sub-pixel.
+  if (cloud.nearDetailStrength > 0.0f && cameraDistKm < cloud.nearDetailRangeKm) {
+    const float nearFade = saturate(1.0f - cameraDistKm / max(cloud.nearDetailRangeKm, 1e-3f));
+    const vec4 noiseNear = detailNoise.SampleLevel(volumeSampler,
+      frac(boilPosFine * (detailFreq * 4.37f) + vec3(0.61f, 0.07f, 0.29f)),
+      cloudDetailMip(detailFreq * 4.37f, footprintKm, cloud));
+    const float nearComposite = lerp(lerp(noiseNear.r, noiseNear.g, 0.5f), lerp(noiseNear.b, noiseNear.a, 0.5f) * 0.3f, typeShaped);
+    const float nearMix = saturate(cloud.nearDetailStrength * 0.3f) * nearFade;
+    noiseComposite = lerp(noiseComposite, nearComposite, nearMix);
+    wispyNoise = lerp(wispyNoise, lerp(noiseNear.r, noiseNear.g, 0.5f), nearMix);
+  }
+
+  float erosion = noiseComposite * max(cloud.erosionStrength, 0.0f);
+
+  // Edge wisp cut: strand cores cut through the outer shell.
+  if (cloud.edgeErosion > 0.0f) {
+    erosion += wispyNoise * wispyNoise * cloud.edgeErosion * saturate(1.0f - profile) * 1.5f;
+  }
+
+  float density = cloudValueErosion(profile, erosion);
+
+  // Sharpen: a sub-1 exponent lifts low densities, defining wisps and edges.
+  if (cloud.sharpenStrength > 0.0f && density > 0.0f) {
+    density = pow(density, lerp(1.0f, 0.6f, saturate(cloud.sharpenStrength)));
+  }
+
+  // Interior texture: density proportional to the detail field throughout the body, not only at the skin.
+  if (cloud.interiorTexture > 0.0f) {
+    float interiorNoise = lerp(lerp(noise.r, noise.g, 0.5f), lerp(noise.b, noise.a, 0.5f), typeShaped);
+    const float midMix = 0.35f * saturate(cloud.shapeVarietyKm * 2.0f);
+    interiorNoise = lerp(interiorNoise, lerp(noiseMid.r, noiseMid.b, typeShaped), midMix);
+    interiorNoise = lerp(interiorNoise, fineInteriorNoise, 0.5f * fineMix);
+    density *= lerp(1.0f, 0.25f + 1.5f * interiorNoise, saturate(cloud.interiorTexture));
+  }
+
+  // Near-camera soften, the companion of the fly-through detail.
+  if (cloud.hfDetailStrength > 0.0f && cameraDistKm < 0.6f) {
+    const float softenBlend = saturate((cameraDistKm - 0.1f) / 0.5f);
+    density = pow(max(density, 0.0f), lerp(0.5f, 1.0f, softenBlend)) * lerp(0.666f, 1.0f, softenBlend);
+  }
+
+  result.density = saturate(density);
+  return result;
+}
+
+// Extinction weighted density (field density times the vertical profile) at a position, the integrand of every
+// optical depth bake and tap. Multiply by extinctionKm for km^-1. emptyKm: the radius around the sample the
+// field is provably empty within (0 where it is not empty, and outside the slab, where the body field says
+// nothing).
+float cloudSampleExtinctionDensity(
+  vec3 positionKm, float typeLocal, float coverageLocal, bool coarse, float footprintKm,
+  CloudArgs cloud, Texture3D<float> nvdfSdf, Texture3D<float4> detailNoise, SamplerState volumeSampler, out float emptyKm)
+{
+  emptyKm = 0.0f;
+  const float heightFraction = cloudHeightFraction(positionKm.y, cloud);
+  if (positionKm.y <= cloud.baseAltitudeKm || positionKm.y >= cloud.baseAltitudeKm + cloud.thicknessKm) {
+    return 0.0f;
+  }
+  const CloudDensitySample s = cloudSampleDensity(
+    positionKm, heightFraction, typeLocal, coverageLocal, 1e6f, footprintKm, coarse, cloud, nvdfSdf, detailNoise, volumeSampler);
+  emptyKm = s.density > 0.0f ? 0.0f : max(s.emptyKm, 0.0f);
+  return s.density * cloudVerticalProfile(heightFraction, cloud);
+}
+
+float cloudSampleExtinctionDensity(
+  vec3 positionKm, float typeLocal, float coverageLocal, bool coarse,
+  CloudArgs cloud, Texture3D<float> nvdfSdf, Texture3D<float4> detailNoise, SamplerState volumeSampler, out float emptyKm)
+{
+  return cloudSampleExtinctionDensity(positionKm, typeLocal, coverageLocal, coarse, 0.0f, cloud, nvdfSdf, detailNoise, volumeSampler, emptyKm);
+}
+
+float cloudSampleExtinctionDensity(
+  vec3 positionKm, float typeLocal, float coverageLocal, bool coarse,
+  CloudArgs cloud, Texture3D<float> nvdfSdf, Texture3D<float4> detailNoise, SamplerState volumeSampler)
+{
+  float emptyKm;
+  return cloudSampleExtinctionDensity(positionKm, typeLocal, coverageLocal, coarse, cloud, nvdfSdf, detailNoise, volumeSampler, emptyKm);
+}

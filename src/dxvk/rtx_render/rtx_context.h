@@ -26,6 +26,7 @@
 #include "rtx_asset_exporter.h"
 #include "rtx_camera_manager.h"
 #include "rtx_atmosphere.h"
+#include "rtx_clouds.h"
 #include "rtx/pass/nrd_args.h"
 
 #include <cstdint>
@@ -170,10 +171,13 @@ namespace dxvk {
     /** 1x1 sky-view LUT hemisphere mean, or nullptr before atmosphere init. */
     Rc<DxvkImageView> getSkyHemisphereMeanView() const;
 
-    /** Atmosphere transmittance / multiscattering / aerosol phase LUTs, or nullptr before atmosphere init. */
+    /** Atmosphere transmittance / multiscattering / aerosol phase / sky-view LUTs, or nullptr before atmosphere init. */
     Rc<DxvkImageView> getAtmosphereTransmittanceLutView() const;
     Rc<DxvkImageView> getAtmosphereMultiscatteringLutView() const;
     Rc<DxvkImageView> getAtmosphereAerosolPhaseLutView() const;
+    Rc<DxvkImageView> getAtmosphereSkyViewLutView() const;
+
+    RtxClouds& getClouds() const { return *m_clouds; }
 
 #ifdef REMIX_DEVELOPMENT
     /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */
@@ -284,6 +288,7 @@ namespace dxvk {
     SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
 
     std::unique_ptr<RtxAtmosphere> m_atmosphere;
+    std::unique_ptr<RtxClouds> m_clouds;
 
     bool shouldUseDLSS() const;
     bool shouldUseRayReconstruction() const;

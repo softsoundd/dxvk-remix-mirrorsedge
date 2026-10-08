@@ -1,0 +1,71 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// The cloud layer as the path tracer sees it, through the common bindings: its shadow on the atmosphere's sun
+// for next event estimation, and the layer over the sky on misses (the reflection dome).
+
+#include "rtx/pass/clouds/cloud_common.slangh"
+
+// Attenuates a light sample of the atmosphere's sun by the cloud layer above a world position. Only the
+// atmosphere's sun carries the flag, so game lights and dome lights are untouched.
+void applyCloudShadowToLightSample(inout LightSample lightSample, uint16_t lightIdx, vec3 worldPosition)
+{
+  if (!cb.cloudArgs.enabled || (cb.cloudArgs.flags & CLOUD_FLAG_SUN_SHADOWS) == 0 || lightIdx == uint16_t(0xffff))
+  {
+    return;
+  }
+
+  const DecodedPolymorphicLight light = decodePolymorphicLight(lights[lightIdx]);
+  if (!decodedPolymorphicLightIsCloudShadowed(light))
+  {
+    return;
+  }
+
+  lightSample.radiance *= cloudSunTransmittance(CloudSunGrid, CloudShadowMap, CloudSampler, worldPosition, cb.cloudArgs, cb.atmosphereArgs);
+}
+
+// Glass whose transmitted ray leaves within this cosine of the camera's ray shows the clouds the camera ray meets:
+// thin-walled and flat panes, which do not bend it. About a quarter of a degree, a few pixels of the clouds.
+static const float kCloudStraightThroughCosine = 0.99999f;
+
+// Specular reflections smoother than kCloudGlossyMarchRoughness (isotropic roughness) take their sky's clouds from
+// a march along the reflected ray (cloud_glossy.comp.slang), fading back to the dome by kCloudGlossyDomeRoughness,
+// where the reflection's lobe spans several of the dome's texels.
+static const float kCloudGlossyMarchRoughness = 0.01f;
+static const float kCloudGlossyDomeRoughness = 0.03f;
+
+float cloudGlossyReflectionWeight(float isotropicRoughness)
+{
+  return saturate((kCloudGlossyDomeRoughness - isotropicRoughness) / (kCloudGlossyDomeRoughness - kCloudGlossyMarchRoughness));
+}
+
+// Sky radiance seen along a world direction on a miss, with the cloud layer composited over it.
+vec3 cloudSkyRadianceOnMiss(vec3 skyRadiance, vec3 worldDirection)
+{
+  if (!cb.cloudArgs.enabled)
+  {
+    return skyRadiance;
+  }
+  const vec3 dirYUp = normalize(cloudWorldToYUp(worldDirection, cb.isZUp != 0));
+  return cloudCompositeOverSky(cloudSampleDome(CloudDome, CloudSampler, dirYUp, cb.cloudArgs), skyRadiance);
+}

@@ -1,0 +1,242 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// The view march through the cloud layer, shared by the screen pass and the reflection dome.
+//
+// Output is the layer as premultiplied radiance C and transmittance T, defined so the background composites
+// as C + T B with B the radiance the atmosphere alone gives that pixel (the sky-view LUT's sky, or the scene
+// with its aerial perspective). For a step at distance t losing dT of transmittance, with S_air(t) and
+// T_air(t) the air's in-scatter and transmittance from the camera to t:
+//   C += dT (T_air(t) albedo S + S_air(t))
+// The first term is the cloud's light seen through the air in front of it. The second is that air itself,
+// which B counts at full weight but which, in front of a cloud, is seen at the weight the cloud hides:
+// integrating B's air in-scatter against the cloud's transmittance by parts gives T B + sum S_air(t_i) dT_i.
+//
+// A step grows as the square root of distance (finer near the camera, where a pixel covers less) and is sphere
+// traced past provably empty air with the body distance field, anchored to the cursor so the trace stops at the
+// surface rather than past it. Inside cloud a step is further held to opticalDepthPerStep of optical depth. In a
+// cloud's fringes, near its displaced surface where the last sample was optically thin, a step lands in or
+// misses a wisp by chance, which a lit edge shows as grain and, at long steps, as flicker; fringeStepScale
+// shortens steps there. A ray that exhausts its budget integrates the rest in four coarse steps.
+
+#include "rtx/pass/clouds/cloud_lighting.slangh"
+
+struct CloudAirSegment {
+  vec3 inScatter;
+  vec3 transmittance;
+};
+
+CloudAirSegment cloudSampleSkyAp(vec2 directionUv, float distanceKm, CloudArgs cloud) {
+  CloudAirSegment air;
+  air.inScatter = vec3(0.0f);
+  air.transmittance = vec3(1.0f);
+  if ((cloud.flags & CLOUD_FLAG_SKY_AERIAL_PERSPECTIVE) == 0) {
+    return air;
+  }
+  const vec3 uvw = vec3(directionUv, cloudClampToTexelCentres(cloudSkyApDistanceToW(distanceKm), float(CLOUD_SKY_AP_LUT_DEPTH)));
+  air.inScatter = max(CloudSkyApInscatter.SampleLevel(CloudVolumeSampler, uvw, 0).rgb, vec3(0.0f));
+  air.transmittance = saturate(CloudSkyApTransmittance.SampleLevel(CloudVolumeSampler, uvw, 0).rgb);
+  return air;
+}
+
+struct CloudMarchSettings {
+  uint maxSamples;
+  float stepKm;         // Step at 12 km, the square root law's reference distance
+  float minStepKm;      // Floor of the step, which near the camera it reaches
+  float maxDistanceKm;  // Where the ray meets the scene, or the march's range
+  float footprintPerKm; // Pixel footprint per km of distance, for the detail volume's filtering
+  uint fineShadowTaps;
+  bool cameraDetail;    // Near camera detail, which the dome does not want
+  float fringeStepScale; // Step scale in a cloud's fringes, 1 = none
+};
+
+// A step's optical depth below which a fringe step is refined.
+static const float kFringeOpticalDepth = 0.1f;
+
+struct CloudMarchResult {
+  vec3 radiance;
+  float transmittance;
+  float firstHitKm;   // Nearest sample carrying density, -1 for none
+  float meanDepthKm;  // Contribution weighted mean distance, -1 for none
+  float sampleCount;
+};
+
+// One march sample of length stepKm at tSample. Returns the sample's extinction (0 when empty), its
+// conservative empty radius and its distance to the displaced surface.
+float cloudMarchSample(
+  float tSample, float stepKm, float tEntry, float tExit, vec2 controlsEntry, vec2 controlsExit, vec2 apUv,
+  float jitter, CloudMarchSettings settings, CloudRayContext ray, CloudArgs cloud, AtmosphereArgs atmosphere,
+  inout CloudMarchResult result, inout float transmittance, inout float sumWeight, inout float sumWeightedDistance,
+  out float emptyKm, out float surfaceKm)
+{
+  const float planetRadiusKm = atmosphere.planetRadius;
+  const vec3 rel = ray.dirYUp * tSample;
+  const float altitude = cloudRayAltitudeKm(ray.dirYUp, tSample, cloud, planetRadiusKm);
+  const vec3 positionKm = vec3(cloud.cameraPositionKm.x + rel.x, altitude, cloud.cameraPositionKm.z + rel.z);
+  const float heightFraction = cloudHeightFraction(altitude, cloud);
+  const float rayFraction = saturate((tSample - tEntry) / max(tExit - tEntry, 1e-6f));
+  const vec2 controls = lerp(controlsEntry, controlsExit, rayFraction);
+
+  result.sampleCount += 1.0f;
+  emptyKm = 0.0f;
+  surfaceKm = 1e9f;
+  if (altitude <= cloud.baseAltitudeKm || altitude >= cloud.baseAltitudeKm + cloud.thicknessKm) {
+    return 0.0f;
+  }
+
+  const CloudDensitySample s = cloudSampleDensity(
+    positionKm, heightFraction, controls.x, controls.y, settings.cameraDetail ? tSample : 1e6f,
+    tSample * settings.footprintPerKm, false, cloud, CloudNvdf, CloudDetailNoise, CloudVolumeSampler);
+  emptyKm = s.emptyKm;
+  surfaceKm = s.surfaceKm;
+  if (s.density < 0.001f) {
+    return 0.0f;
+  }
+
+  const float extinctionDensity = s.density * cloudVerticalProfile(heightFraction, cloud);
+  const float extinction = cloud.extinctionKm * extinctionDensity;
+  const float stepTransmittance = exp(-extinction * stepKm);
+  const float weight = transmittance * (1.0f - stepTransmittance);
+
+  if (result.firstHitKm < 0.0f) {
+    result.firstHitKm = tSample;
+  }
+
+  const vec3 atmospherePosition = vec3(0.0f, max(cloud.cameraPositionKm.y, kPlanetRadiusOffset), 0.0f) + rel;
+  const vec3 source = cloudEvalSource(
+    positionKm, atmospherePosition, heightFraction, extinctionDensity, controls, jitter, settings.fineShadowTaps,
+    ray, cloud, atmosphere);
+
+  const CloudAirSegment air = cloudSampleSkyAp(apUv, tSample, cloud);
+  const vec3 contribution = weight * (air.transmittance * source * cloud.albedoTint + air.inScatter);
+  if (all(isfinite(contribution))) {
+    result.radiance += contribution;
+  }
+  sumWeightedDistance += tSample * weight;
+  sumWeight += weight;
+  transmittance *= stepTransmittance;
+  return extinction;
+}
+
+CloudMarchResult cloudMarch(vec3 dirYUp, CloudMarchSettings settings, float jitter, CloudArgs cloud, AtmosphereArgs atmosphere) {
+  CloudMarchResult result;
+  result.radiance = vec3(0.0f);
+  result.transmittance = 1.0f;
+  result.firstHitKm = -1.0f;
+  result.meanDepthKm = -1.0f;
+  result.sampleCount = 0.0f;
+
+  if (!cloud.enabled) {
+    return result;
+  }
+
+  const CloudRayContext ray = cloudBeginRay(dirYUp, cloud, atmosphere);
+  vec2 apUv = cloudDirectionToSkyUv(dirYUp);
+  apUv.y = cloudClampToTexelCentres(apUv.y, float(CLOUD_SKY_AP_LUT_HEIGHT));
+
+  const float planetRadiusKm = atmosphere.planetRadius;
+  const float exitTransmittance = cloud.exitTransmittance;
+  float transmittance = 1.0f;
+  float sumWeight = 0.0f;
+  float sumWeightedDistance = 0.0f;
+  float lastSampleKm = 0.0f;
+
+  for (int piece = 0; piece < 2; ++piece) {
+    float tEntry, tExit;
+    if (!cloudSlabSpan(dirYUp, cloud, planetRadiusKm, piece, tEntry, tExit)) {
+      continue;
+    }
+    tExit = min(tExit, min(settings.maxDistanceKm, cloud.maxMarchKm));
+    if (tExit <= tEntry || transmittance <= exitTransmittance) {
+      continue;
+    }
+
+    // The coverage and type fields vary over tens of km, so the slab's entry and exit bound them along the ray.
+    const vec3 entryKm = cloud.cameraPositionKm + dirYUp * tEntry;
+    const vec3 exitKm = cloud.cameraPositionKm + dirYUp * tExit;
+    const vec2 controlsEntry = cloudControls(entryKm.xz, cloud);
+    const vec2 controlsExit = cloudControls(exitKm.xz, cloud);
+
+    float t = tEntry;
+    float tEmptyUntil = tEntry;
+    float lastExtinction = 0.0f;
+    float lastSurfaceKm = 1e9f;
+    uint iteration = 0u;
+    while (t < tExit && iteration < settings.maxSamples && transmittance > exitTransmittance) {
+      ++iteration;
+      const float baseStepKm = clamp(settings.stepKm * sqrt(t * (1.0f / 12.0f)), settings.minStepKm, 4.0f * settings.stepKm);
+      float stepKm = baseStepKm;
+      if (cloud.nvdfStepScale > 0.0f) {
+        stepKm = max(stepKm, (tEmptyUntil - t) * cloud.nvdfStepScale);
+      }
+      if (lastExtinction > 0.0f && cloud.opticalDepthPerStep > 0.0f) {
+        stepKm = min(stepKm, max(cloud.opticalDepthPerStep / lastExtinction, 0.25f * settings.minStepKm));
+      }
+      if (tEmptyUntil <= t && lastSurfaceKm < baseStepKm && lastExtinction * stepKm < kFringeOpticalDepth) {
+        stepKm = min(stepKm, max(baseStepKm * settings.fringeStepScale, settings.minStepKm));
+      }
+      stepKm = min(stepKm, tExit - t);
+      if (stepKm <= 1e-5f) {
+        break;
+      }
+
+      const float tSample = t + jitter * stepKm;
+      float emptyKm;
+      lastExtinction = cloudMarchSample(
+        tSample, stepKm, tEntry, tExit, controlsEntry, controlsExit, apUv, jitter, settings, ray, cloud, atmosphere,
+        result, transmittance, sumWeight, sumWeightedDistance, emptyKm, lastSurfaceKm);
+      if (lastExtinction > 0.0f) {
+        lastSampleKm = tSample;
+      }
+      tEmptyUntil = tSample + emptyKm;
+      t += stepKm;
+    }
+
+    // The budget should cost detail, not cloud: what is left integrates in four long steps.
+    if (t < tExit && transmittance > exitTransmittance) {
+      const float tailStepKm = (tExit - t) * 0.25f;
+      for (int tail = 0; tail < 4 && transmittance > exitTransmittance; ++tail) {
+        const float tSample = t + (float(tail) + 0.5f) * tailStepKm;
+        float emptyKm;
+        float surfaceKm;
+        if (cloudMarchSample(
+              tSample, tailStepKm, tEntry, tExit, controlsEntry, controlsExit, apUv, jitter, settings, ray, cloud, atmosphere,
+              result, transmittance, sumWeight, sumWeightedDistance, emptyKm, surfaceKm) > 0.0f) {
+          lastSampleKm = tSample;
+        }
+      }
+    }
+  }
+
+  // The march stops once the transmittance falls below exitTransmittance, so transmittance is reported on the
+  // scale whose zero is that threshold: a ray the march declared opaque leaks none of a bright background (the
+  // sun's aureole would otherwise show through at up to the threshold's weight). The background share given up
+  // is replaced by the air in front of the last sample, which is what the cloud really shows there.
+  const float reported = saturate((transmittance - exitTransmittance) / max(1.0f - exitTransmittance, 1e-4f));
+  if (reported < transmittance && lastSampleKm > 0.0f) {
+    result.radiance += (transmittance - reported) * cloudSampleSkyAp(apUv, lastSampleKm, cloud).inScatter;
+  }
+  result.transmittance = reported;
+  result.meanDepthKm = sumWeight > 0.0f ? sumWeightedDistance / sumWeight : -1.0f;
+  return result;
+}

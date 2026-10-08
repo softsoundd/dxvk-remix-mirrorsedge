@@ -40,6 +40,7 @@ struct CompositeArgs {
   SparseRenderingArgs sparseRenderingArgs;
   // Needed for the aerial perspective volume's frustum basis and depth range.
   AtmosphereArgs atmosphereArgs;
+  CloudArgs cloudArgs;
 
   // -- Struct objects should go above this line to preserve alignment --
 
@@ -113,7 +114,8 @@ struct CompositeArgs {
 
   // Unoccluded distant-sun illuminance and world direction for reflection-segment fog.
   vec3 unoccludedSunRadiance;
-  float padUnoccludedSun;
+  // Linear view Z the secondary surface reads on a miss, which marks glass whose reflection reached the sky.
+  float secondaryCombinedMissLinearViewZ;
   vec3 unoccludedSunDirection;
   float padUnoccludedDir;
 };

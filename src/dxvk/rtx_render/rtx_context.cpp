@@ -205,6 +205,7 @@ namespace dxvk {
 
     // Initialize atmosphere system.
     m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
+    m_clouds = std::make_unique<RtxClouds>(m_device.ptr());
   }
 
   RtxContext::~RtxContext() {
@@ -372,6 +373,16 @@ namespace dxvk {
     }
 
     const Resources::Resource lut = m_atmosphere->getAerosolPhaseLut();
+
+    return lut.isValid() ? lut.view : nullptr;
+  }
+
+  Rc<DxvkImageView> RtxContext::getAtmosphereSkyViewLutView() const {
+    if (!m_atmosphere) {
+      return nullptr;
+    }
+
+    const Resources::Resource lut = m_atmosphere->getSkyViewLut();
 
     return lut.isValid() ? lut.view : nullptr;
   }
@@ -823,6 +834,9 @@ namespace dxvk {
           takeScreenshot("denoisedDiffuse", rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read));
           takeScreenshot("denoisedSpecular", rtOutput.m_primaryDirectSpecularRadiance.image(Resources::AccessType::Read));
         }
+
+        // The cloud layer along every camera ray, bounded by the scene the G-buffer pass found.
+        m_clouds->dispatchScreen(*this, rtOutput);
 
         // Aerial perspective volume, bounded by the primary hits the G-buffer pass produced; kept out of
         // the path tracing / NRC sequence and dispatched right before its consumer.
@@ -1660,6 +1674,9 @@ namespace dxvk {
       m_atmosphere->syncDistantSunLight(*this, constants.atmosphereArgs);
     }
 
+    // The cloud layer's bakes read the atmosphere's LUTs, so they follow them.
+    constants.cloudArgs = m_clouds->update(*this, constants.atmosphereArgs, cameraManager.getMainCamera(), downscaledExtent, constants.debugView);
+
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
@@ -1801,6 +1818,14 @@ namespace dxvk {
     if (aerosolPhaseLut.isValid()) {
       bindResourceView(BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT, aerosolPhaseLut.view, nullptr);
     }
+
+    // Likewise the clouds' resources, which stay valid (and inert) while the clouds are off.
+    m_clouds->initialize(this);
+    bindResourceView(BINDING_CLOUD_SUN_GRID, m_clouds->getSunGridView(), nullptr);
+    bindResourceView(BINDING_CLOUD_DOME, m_clouds->getDomeView(), nullptr);
+    bindResourceView(BINDING_CLOUD_SHADOW_MAP, m_clouds->getShadowMapView(), nullptr);
+    bindResourceSampler(BINDING_CLOUD_SAMPLER,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT));
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)
@@ -1890,6 +1915,9 @@ namespace dxvk {
       
       m_common->metaPathtracerIntegrateIndirect().dispatch(this, rtOutput);
     }
+
+    // The clouds of near-mirror reflections into the sky, in the indirect radiance before anything carries it on.
+    m_clouds->dispatchGlossyReflections(*this, rtOutput);
 
     // Integrate indirect - NEE Cache pass
     m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);

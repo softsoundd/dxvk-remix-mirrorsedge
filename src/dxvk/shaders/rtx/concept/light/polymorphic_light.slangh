@@ -81,6 +81,12 @@ DecodedPolymorphicLight decodePolymorphicLight(MemoryPolymorphicLight memoryPoly
   return decodedPolymorphicLight;
 }
 
+// The Physical Atmosphere's sun, which the cloud layer shadows (flag bit 2, rtx_lights.cpp).
+bool decodedPolymorphicLightIsCloudShadowed(DecodedPolymorphicLight decodedPolymorphicLight)
+{
+  return uint(decodedPolymorphicLight.polymorphicType) == lightTypeDistant && (decodedPolymorphicLight.data3.w & (1u << 2)) != 0u;
+}
+
 LightSample decodedPolymorphicLightSampleArea(
   DecodedPolymorphicLight decodedPolymorphicLight, vec2 sampleCoordinates,
   MinimalSurfaceInteraction viewSurfaceInteraction)

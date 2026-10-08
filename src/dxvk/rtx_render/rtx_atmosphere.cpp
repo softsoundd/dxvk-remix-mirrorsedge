@@ -121,6 +121,10 @@ namespace dxvk {
         RW_TEXTURE3D(3)
         TEXTURE2D(4)
         TEXTURE2D(5)
+        CONSTANT_BUFFER(6)
+        TEXTURE3D(7)
+        TEXTURE2D(8)
+        SAMPLER(9)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
@@ -1193,6 +1197,14 @@ void RtxAtmosphere::dispatchAerialPerspectiveLut(RtxContext& ctx, const Atmosphe
   ctx.bindResourceView(4, tileDepth.view, nullptr);
   ctx.bindResourceView(5, m_aerosolPhaseLut.view, nullptr);
 
+  // The cloud layer's shadow on the air: its constants' leading CloudArgs, its sun grid and shadow map.
+  RtxClouds& clouds = ctx.getClouds();
+  clouds.initialize(&ctx);
+  ctx.bindResourceBuffer(6, DxvkBufferSlice(clouds.getConstantsBuffer(), 0, sizeof(CloudArgs)));
+  ctx.bindResourceView(7, clouds.getSunGridView(), nullptr);
+  ctx.bindResourceView(8, clouds.getShadowMapView(), nullptr);
+  ctx.bindResourceSampler(9, ctx.getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT));
+
   ctx.getCommandList()->trackResource<DxvkAccess::Read>(m_transmittanceLut.image);
   ctx.getCommandList()->trackResource<DxvkAccess::Read>(m_multiscatteringLut.image);
   ctx.getCommandList()->trackResource<DxvkAccess::Read>(tileDepth.image);
@@ -1350,6 +1362,7 @@ void RtxAtmosphere::syncDistantSunLight(RtxContext& ctx, const AtmosphereArgs& a
   if (!dl) {
     return;
   }
+  dl->setAtmosphereCloudShadowed(true);
 
   RtLight rtl(*dl);
   rtl.isDynamic = true; // Keep sun direction updating each frame.

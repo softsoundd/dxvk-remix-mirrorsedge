@@ -669,6 +669,24 @@ rtx.atmosphere.sunRotation = 145
 rtx.atmosphere.sunIlluminance = 20, 18.5, 16
 ```
 
+Cloud options work the same way. A map under a stratocumulus deck blowing in off the water would add:
+
+```ini
+rtx.clouds.genus = 4
+rtx.clouds.windSpeed = 8
+rtx.clouds.windDirection = 200
+```
+
+and a map with a nearly clear sky would set the shape itself, since a genus preset overrides the shape options it carries:
+
+```ini
+rtx.clouds.genus = 0
+rtx.clouds.coverage = 0.15
+rtx.clouds.cellSizeKm = 2
+```
+
+A change of genus or shape re-bakes the clouds' body field over the few frames after the load, behind the game's fade in, while the previous map's field keeps rendering; a change of coverage shows at once. `rtx.clouds.enable` and `rtx.clouds.quality` are user settings: the developer menu saves them to `user.conf` even while it edits a map's file, and `user.conf` overrides the map files.
+
 Each file is an option layer at priority 1000: above `rtx.conf`, and below Remix Logic's default (10000), so a Logic graph can still override a map's settings in one area of it. `user.conf` and the graphics presets override map files as they do `rtx.conf`. Settings read only at startup cannot change per map, and an option flagged `NoReset` keeps a map's value after the map unloads. Lines setting `rtx.d3d9.ue3EngineMode` or the two options above are ignored with a warning, since a map file switching map settings off would unload itself and so switch them back on.
 
 ### Editing a map's settings

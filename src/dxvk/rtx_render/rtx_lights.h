@@ -437,6 +437,11 @@ struct RtDistantLight {
   float getVolumetricRadianceScale() const {
     return m_volumetricRadianceScale;
   }
+
+  // The Physical Atmosphere's sun, which the cloud layer shadows (the light's GPU flag bit 2).
+  void setAtmosphereCloudShadowed(bool cloudShadowed) {
+    m_atmosphereCloudShadowed = cloudShadowed;
+  }
 private:
   static constexpr float kVolumetricRadianceScaleDefaultValue{ 1.0f };
   static constexpr XXH64_hash_t kForceHashDefaultValue{ kEmptyHash };
@@ -458,6 +463,7 @@ private:
   float m_sinHalfAngle;
 
   XXH64_hash_t m_cachedHash;
+  bool m_atmosphereCloudShadowed = false;
 };
 
 struct DomeLight {

@@ -1,0 +1,143 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Integer lattice hashes and the periodic noises the cloud bakes are built from. Everything a bake samples is
+// periodic in its own domain, so the textures tile.
+
+#include "rtx/utility/shader_types.h"
+
+float cloudHash31(vec3 p) {
+  uint3 q = uint3(int3(int(p.x * 1597.0f), int(p.y * 2549.0f), int(p.z * 3571.0f)));
+  uint n = (q.x ^ q.y ^ q.z) * 2654435761u;
+  n = (n >> 16u) ^ n;
+  return float(n) / 4294967296.0f;
+}
+
+// Coordinates are mixed separately so mirrored lattice ids do not share a value.
+float cloudLatticeHash(vec2 cell, float seed) {
+  uint n = uint(int(cell.x)) * 0x9e3779b9u
+         + uint(int(cell.y)) * 0x85ebca6bu + uint(int(seed * 3571.0f)) * 0xc2b2ae35u;
+  n ^= n >> 16u;
+  n *= 0x7feb352du;
+  n ^= n >> 15u;
+  n *= 0x846ca68bu;
+  n ^= n >> 16u;
+  return float(n >> 8u) * (1.0f / 16777216.0f);
+}
+
+// Ken Perlin's 12 cube edge gradients.
+vec3 cloudPerlinGradient(vec3 ip) {
+  const uint h = uint(cloudHash31(ip) * 12.0f);
+  switch (h) {
+  case 0u: return vec3( 1.0f,  1.0f,  0.0f);
+  case 1u: return vec3(-1.0f,  1.0f,  0.0f);
+  case 2u: return vec3( 1.0f, -1.0f,  0.0f);
+  case 3u: return vec3(-1.0f, -1.0f,  0.0f);
+  case 4u: return vec3( 1.0f,  0.0f,  1.0f);
+  case 5u: return vec3(-1.0f,  0.0f,  1.0f);
+  case 6u: return vec3( 1.0f,  0.0f, -1.0f);
+  case 7u: return vec3(-1.0f,  0.0f, -1.0f);
+  case 8u: return vec3( 0.0f,  1.0f,  1.0f);
+  case 9u: return vec3( 0.0f, -1.0f,  1.0f);
+  case 10u: return vec3( 0.0f,  1.0f, -1.0f);
+  default: return vec3( 0.0f, -1.0f, -1.0f);
+  }
+}
+
+// Floor based modulo, so negative lattice ids wrap onto the same cells as their positive images.
+vec3 cloudWrapLattice(vec3 cell, vec3 period) {
+  return cell - period * floor(cell / period);
+}
+
+// Perlin gradient noise in about [-1, 1], periodic: the lattice corners wrap to period (integer per axis).
+float cloudPerlinNoisePeriodic(vec3 p, vec3 period) {
+  const vec3 pi = floor(p);
+  const vec3 pf = p - pi;
+  const vec3 f = pf * pf * (3.0f - 2.0f * pf);
+
+  const float n000 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(0, 0, 0), period)), pf - vec3(0, 0, 0));
+  const float n100 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(1, 0, 0), period)), pf - vec3(1, 0, 0));
+  const float n010 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(0, 1, 0), period)), pf - vec3(0, 1, 0));
+  const float n110 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(1, 1, 0), period)), pf - vec3(1, 1, 0));
+  const float n001 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(0, 0, 1), period)), pf - vec3(0, 0, 1));
+  const float n101 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(1, 0, 1), period)), pf - vec3(1, 0, 1));
+  const float n011 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(0, 1, 1), period)), pf - vec3(0, 1, 1));
+  const float n111 = dot(cloudPerlinGradient(cloudWrapLattice(pi + vec3(1, 1, 1), period)), pf - vec3(1, 1, 1));
+
+  const float nx00 = lerp(n000, n100, f.x);
+  const float nx10 = lerp(n010, n110, f.x);
+  const float nx01 = lerp(n001, n101, f.x);
+  const float nx11 = lerp(n011, n111, f.x);
+  return lerp(lerp(nx00, nx10, f.y), lerp(nx01, nx11, f.y), f.z);
+}
+
+// Periodic Perlin FBM: lacunarity 2, gain 0.5, the period doubling with the frequency.
+float cloudFbmPeriodic(vec3 p, int octaves, float seed, vec3 basePeriod) {
+  float value = 0.0f;
+  float amplitude = 0.5f;
+  vec3 period = basePeriod;
+  for (int i = 0; i < octaves && i < 6; ++i) {
+    // A shift of the sample position decorrelates the octaves and keeps each one periodic.
+    const float seedOffset = seed + float(i) * 17.31f;
+    const vec3 octaveOffset = vec3(seedOffset * 1.7f, seedOffset * 2.3f, seedOffset * 3.1f);
+    value += amplitude * cloudPerlinNoisePeriodic(p + octaveOffset, period);
+    p *= 2.0f;
+    period *= 2.0f;
+    amplitude *= 0.5f;
+  }
+  return value;
+}
+
+// 2D Worley feature point inside a unit cell.
+vec2 cloudWorleyFeaturePoint2D(vec2 cellId, float seed) {
+  const uint3 q = uint3(int3(int(cellId.x * 1597.0f), int(cellId.y * 2549.0f), int(seed * 3571.0f)));
+  const uint n = (q.x ^ q.y ^ q.z) * 2654435761u;
+  const uint na = (n >> 16u) ^ n;
+  uint nb = na * 2654435761u + 1013904223u;
+  nb = (nb >> 16u) ^ nb;
+  return vec2(float(na) / 4294967296.0f, float(nb) / 4294967296.0f);
+}
+
+// 2D Worley F1 in about [0, 1] over unit cells. Extrema sit at random positions inside each cell, so the field
+// has no grid of maxima at any scale.
+float cloudWorleyNoise2D(vec2 p, float seed) {
+  const vec2 sp = p + vec2(seed * 13.7f, seed * 7.3f);
+  const vec2 cell = floor(sp);
+  const vec2 f = sp - cell;
+  float minDistSq = 4.0f;
+  [unroll]
+  for (int dy = -1; dy <= 1; ++dy) {
+    [unroll]
+    for (int dx = -1; dx <= 1; ++dx) {
+      const vec2 offset = vec2(float(dx), float(dy));
+      const vec2 d = (offset + cloudWorleyFeaturePoint2D(cell + offset, seed)) - f;
+      minDistSq = min(minDistSq, dot(d, d));
+    }
+  }
+  return saturate(sqrt(minDistSq));
+}
+
+// Weather scale control field in [0, 1], mean about 0.5: high at cluster centres, low in the gaps between.
+float cloudControlField2D(vec2 p, float seed) {
+  return saturate(1.0f - cloudWorleyNoise2D(p, seed));
+}

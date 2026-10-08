@@ -1,0 +1,371 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Light scattered by a cloud sample toward the eye, as a source function S: radiance per unit of scattering,
+// so a march step adds albedo x S x (1 - its transmittance).
+//
+// Higher orders follow the delta-M scaled problem (Wiscombe 1977): the forward diffraction peak, a fraction f of
+// the scattered light within a degree or two, is treated as unscattered, leaving extinction (1 - f) sigma and a
+// truncated phase of asymmetry g'. Single scattering takes the droplets' tabulated Mie phase (disc convolved,
+// per channel) under that scaled extinction toward the sun, Nakajima and Tanaka 1988's TMS correction. The
+// higher orders are a Wrenninge 2013 octave series on the scaled problem, octave i seeing the sun grid's mip i
+// as the laterally spread light deep orders really receive, floored by the diffusion field of the scattered
+// sunlight, which the exponential octaves underestimate deep inside thick cloud: P1 diffusion solved through the
+// clouds over the grids' windows (cloud_diffusion), a two-stream slab along the sun beyond them (Meador and Weaver
+// 1980). Sky and ground light come from L2 spherical harmonics of the sky at cloud altitude,
+// convolved with the truncated phase's Legendre moments and passed through the cloud above and below by the
+// two-stream diffuse transmittance 1 / (1 + k (1 - g) tau), floored by the diffusion field of the light each
+// hemisphere lets in.
+
+#include "rtx/pass/clouds/cloud_bindings.slangh"
+#include "rtx/pass/clouds/cloud_field.slangh"
+
+static const float kCloudInv4Pi = 0.0795774715f;
+
+float cloudHgPhase(float cosTheta, float g) {
+  const float g2 = g * g;
+  const float denominator = 1.0f + g2 - 2.0f * g * cosTheta;
+  return (1.0f - g2) * kCloudInv4Pi / pow(max(denominator, 1e-5f), 1.5f);
+}
+
+// The droplet distribution's Mie phase. Rows are effective radii; texel i holds theta = pi u^2 at its centre
+// u = (i + 0.5) / N, which gives the diffraction peak most of the texels.
+vec3 cloudMiePhase(float cosTheta, CloudArgs cloud) {
+  const float theta = acos(clamp(cosTheta, -1.0f, 1.0f));
+  const float u = sqrt(theta / kPi);
+  const float v = (cloud.phaseLutRow + 0.5f) / float(CLOUD_PHASE_LUT_RADII);
+  return max(CloudPhaseLut.SampleLevel(CloudLutSampler, vec2(u, v), 0).rgb, vec3(0.0f));
+}
+
+// Per ray constants of the lighting.
+struct CloudRayContext {
+  vec3 dirYUp;
+  float cosTheta;     // View direction against the sun: 1 looking into it
+  vec3 phase;         // The droplets' Mie phase at this scattering angle
+  vec4 phaseOctaves;  // HG(g' c^i) for octaves 1 to 4
+  vec3 ambientUp[CLOUD_SKY_SH_ALTITUDES];       // Phase convolved radiance of the upper hemisphere, by altitude
+  vec3 ambientDown[CLOUD_SKY_SH_ALTITUDES];     // ... of the lower hemisphere (the ground and the sky below the horizon)
+  vec3 irradianceUp[CLOUD_SKY_SH_ALTITUDES];    // The upper hemisphere's irradiance on a face looking up
+  vec3 irradianceDown[CLOUD_SKY_SH_ALTITUDES];  // The lower hemisphere's on a face looking down
+};
+
+// Sky harmonics texel: coefficient m of altitude a's hemisphere h (0 above the horizon, 1 below).
+vec3 cloudLoadSkySh(int coefficient, int altitudeIndex, int hemisphere) {
+  return CloudSkySh.Load(int3(coefficient, altitudeIndex * 2 + hemisphere, 0)).rgb;
+}
+
+CloudRayContext cloudBeginRay(vec3 dirYUp, CloudArgs cloud, AtmosphereArgs atmosphere) {
+  CloudRayContext ray;
+  ray.dirYUp = dirYUp;
+  ray.cosTheta = dot(dirYUp, normalize(atmosphere.sunDirection));
+  ray.phase = cloudMiePhase(ray.cosTheta, cloud);
+  float g = cloud.truncatedAsymmetry;
+  [unroll]
+  for (int i = 0; i < 4; ++i) {
+    g *= cloud.msPhaseFalloff;
+    ray.phaseOctaves[i] = cloudHgPhase(ray.cosTheta, g);
+  }
+
+  // The sky harmonics convolved with the phase (Funk-Hecke: band l scales by the phase's Legendre moment) and
+  // evaluated toward the eye, for each altitude and hemisphere.
+  float basis[CLOUD_SKY_SH_COEFFICIENTS];
+  cloudShBasis(dirYUp, basis);
+  const vec3 bandWeight = vec3(1.0f, cloud.phaseLegendre.x, cloud.phaseLegendre.y);
+  [unroll]
+  for (int a = 0; a < CLOUD_SKY_SH_ALTITUDES; ++a) {
+    vec3 up = vec3(0.0f);
+    vec3 down = vec3(0.0f);
+    [unroll]
+    for (int m = 0; m < CLOUD_SKY_SH_COEFFICIENTS; ++m) {
+      const float weight = (m == 0 ? bandWeight.x : (m < 4 ? bandWeight.y : bandWeight.z)) * basis[m];
+      up += cloudLoadSkySh(m, a, 0) * weight;
+      down += cloudLoadSkySh(m, a, 1) * weight;
+    }
+    ray.ambientUp[a] = max(up, vec3(0.0f));
+    ray.ambientDown[a] = max(down, vec3(0.0f));
+
+    // Irradiance on a horizontal face: the harmonics through the clamped cosine's bands (pi, 2 pi / 3, pi / 4),
+    // which at the poles leave only the zonal coefficients 0, 1 and 6.
+    const float band0 = kPi * 0.282095f;
+    const float band1 = (2.0f * kPi / 3.0f) * 0.488603f;
+    const float band2 = (kPi / 4.0f) * 0.630783f;
+    ray.irradianceUp[a] = max(
+      cloudLoadSkySh(0, a, 0) * band0 + cloudLoadSkySh(1, a, 0) * band1 + cloudLoadSkySh(6, a, 0) * band2, vec3(0.0f));
+    ray.irradianceDown[a] = max(
+      cloudLoadSkySh(0, a, 1) * band0 - cloudLoadSkySh(1, a, 1) * band1 + cloudLoadSkySh(6, a, 1) * band2, vec3(0.0f));
+  }
+
+  return ray;
+}
+
+// The ray context's hemisphere irradiances at a height fraction, piecewise linear like the ambient.
+void cloudIrradianceAtHeight(CloudRayContext ray, float heightFraction, out vec3 up, out vec3 down) {
+  const float x = saturate(heightFraction) * float(CLOUD_SKY_SH_ALTITUDES - 1);
+  const int i0 = min(int(x), CLOUD_SKY_SH_ALTITUDES - 2);
+  const float w = x - float(i0);
+  up = lerp(ray.irradianceUp[i0], ray.irradianceUp[i0 + 1], w);
+  down = lerp(ray.irradianceDown[i0], ray.irradianceDown[i0 + 1], w);
+}
+
+// The ray context's ambient at a height fraction, piecewise linear between the base, middle and top.
+void cloudAmbientAtHeight(CloudRayContext ray, float heightFraction, out vec3 up, out vec3 down) {
+  const float x = saturate(heightFraction) * float(CLOUD_SKY_SH_ALTITUDES - 1);
+  const int i0 = min(int(x), CLOUD_SKY_SH_ALTITUDES - 2);
+  const float w = x - float(i0);
+  up = lerp(ray.ambientUp[i0], ray.ambientUp[i0 + 1], w);
+  down = lerp(ray.ambientDown[i0], ray.ambientDown[i0 + 1], w);
+}
+
+// The near sun grid at a level of its mip chain, the vertical axis clamped to that level's texel centres.
+vec4 cloudSampleSunGrid(vec3 uvw, uint mip) {
+  uvw.y = cloudClampToTexelCentres(uvw.y, float(uint(CLOUD_GRID_SIZE_Y) >> mip));
+  return CloudSunGrid.SampleLevel(CloudVolumeSampler, uvw, float(mip));
+}
+
+// Optical depth (extinction weighted density x km) from a cloud frame position toward the sun, by a few live
+// coarse taps: for positions the grids' windows do not cover.
+float cloudLiveSunOpticalDepth(vec3 positionKm, vec3 sunDir, vec2 controls, float jitter, CloudArgs cloud, float planetRadiusKm) {
+  const float tExit = cloudSlabExitDistance(positionKm.y, sunDir.y, cloud, planetRadiusKm);
+  if (tExit <= 0.0f) {
+    return kCloudOccludedOpticalDepth;
+  }
+  const int taps = 6;
+  const float span = min(tExit, 6.0f);
+  const float dt = span / float(taps);
+  float opticalDepth = 0.0f;
+  for (int i = 0; i < taps; ++i) {
+    const float t = (float(i) + jitter) * dt;
+    const vec3 p = vec3(positionKm.x + sunDir.x * t, cloudAltitudeAlong(positionKm.y, sunDir.y, t, planetRadiusKm), positionKm.z + sunDir.z * t);
+    opticalDepth += cloudSampleExtinctionDensity(p, controls.x, controls.y, true, cloud, CloudNvdf, CloudDetailNoise, CloudVolumeSampler) * dt;
+  }
+  return opticalDepth;
+}
+
+// Optical depth toward the sun from a sample: fine live taps over the first shadowTapRangeKm, which resolve the
+// self-shadowing finer than a grid texel, then the grids (or the live fallback beyond their windows) from the
+// end of that range, each window passing to what lies beyond it over its edge band. outEndUvw is where the near
+// grid was read, for the octaves' coarser mips, outNearWeight that grid's share, and outFineOpticalDepth the fine
+// taps' share.
+float cloudSampleSunOpticalDepth(
+  vec3 positionKm, vec3 sunDir, vec2 controls, float jitter, uint fineTaps, CloudArgs cloud, float planetRadiusKm,
+  out vec3 outEndUvw, out float outNearWeight, out float outFineOpticalDepth)
+{
+  float opticalDepth = 0.0f;
+  vec3 endKm = positionKm;
+  if (fineTaps > 0u && cloud.shadowTapRangeKm > 0.0f) {
+    const float dt = cloud.shadowTapRangeKm / float(fineTaps);
+    for (uint i = 0u; i < fineTaps; ++i) {
+      const vec3 p = positionKm + sunDir * ((float(i) + jitter) * dt);
+      opticalDepth += cloudSampleExtinctionDensity(p, controls.x, controls.y, true, cloud, CloudNvdf, CloudDetailNoise, CloudVolumeSampler) * dt;
+    }
+    endKm = positionKm + sunDir * cloud.shadowTapRangeKm;
+  }
+  outFineOpticalDepth = opticalDepth;
+
+  outEndUvw = cloudGridUvw(endKm, cloud);
+  outNearWeight = 0.0f;
+  if (endKm.y >= cloud.baseAltitudeKm + cloud.thicknessKm) {
+    return opticalDepth;
+  }
+  outNearWeight = cloudNearWindowWeight(endKm.xz, cloud);
+  if (outNearWeight > 0.0f) {
+    opticalDepth += outNearWeight * CloudSunGrid.SampleLevel(CloudVolumeSampler, outEndUvw, 0).x;
+  }
+  if (outNearWeight < 1.0f) {
+    const float farWeight = cloudFarWindowWeight(endKm.xz, cloud);
+    float beyond = 0.0f;
+    if (farWeight > 0.0f) {
+      beyond += farWeight * CloudSunGridFar.SampleLevel(CloudVolumeSampler, cloudFarGridUvw(endKm, cloud), 0).x;
+    }
+    if (farWeight < 1.0f) {
+      beyond += (1.0f - farWeight) * cloudLiveSunOpticalDepth(endKm, sunDir, controls, jitter, cloud, planetRadiusKm);
+    }
+    opticalDepth += (1.0f - outNearWeight) * beyond;
+  }
+  return opticalDepth;
+}
+
+// Optical depths up and down to the slab's top and base, from the ambient grid's cascades, or estimated from the
+// height and the local density beyond their windows, passing from one to the next over the windows' edge bands.
+vec2 cloudVerticalOpticalDepth(vec3 positionKm, float heightFraction, float localDensity, CloudArgs cloud) {
+  const float nearWeight = cloudNearWindowWeight(positionKm.xz, cloud);
+  vec2 opticalDepths = vec2(0.0f);
+  if (nearWeight > 0.0f) {
+    opticalDepths += nearWeight * CloudAmbientGrid.SampleLevel(CloudVolumeSampler, cloudGridUvw(positionKm, cloud), 0);
+  }
+  if (nearWeight < 1.0f) {
+    const float farWeight = cloudFarWindowWeight(positionKm.xz, cloud);
+    vec2 beyond = vec2(0.0f);
+    if (farWeight > 0.0f) {
+      beyond += farWeight * CloudAmbientGridFar.SampleLevel(CloudVolumeSampler, cloudFarGridUvw(positionKm, cloud), 0);
+    }
+    if (farWeight < 1.0f) {
+      beyond += (1.0f - farWeight) * vec2(1.0f - heightFraction, heightFraction) * cloud.thicknessKm * (0.5f * localDensity);
+    }
+    opticalDepths += (1.0f - nearWeight) * beyond;
+  }
+  return opticalDepths;
+}
+
+// A diffusion grid's fluence per unit sun irradiance.
+float cloudDiffusionFluence(Texture3D<float> grid, vec3 uvw) {
+  uvw.y = cloudClampToTexelCentres(uvw.y, float(CLOUD_GRID_SIZE_Y));
+  return max(grid.SampleLevel(CloudVolumeSampler, uvw, 0), 0.0f);
+}
+
+// Eddington's radiance of a diffusion grid's field toward the eye, (phi + 3 D grad(phi) . v) / (4 pi) for an eye
+// looking along v, D = 1 / (3 sigma_tr) of the sample, the flux term clamped where P1 would turn negative. The
+// gradient is needed only along v: a central difference a cell either side.
+float cloudDiffusionRadiance(
+  Texture3D<float> grid, vec3 uvw, float windowExtentKm, float localDensity, float transport, vec3 viewDir, CloudArgs cloud)
+{
+  const float fluence = cloudDiffusionFluence(grid, uvw);
+  if (fluence <= 0.0f) {
+    return 0.0f;
+  }
+  const vec3 extentKm = vec3(windowExtentKm, cloud.thicknessKm, windowExtentKm);
+  const float stepKm = min(windowExtentKm / float(CLOUD_GRID_SIZE_XZ), cloud.thicknessKm / float(CLOUD_GRID_SIZE_Y));
+  const vec3 offset = viewDir * stepKm / extentKm;
+  const float alongView = (cloudDiffusionFluence(grid, uvw + offset) - cloudDiffusionFluence(grid, uvw - offset)) / (2.0f * stepKm);
+  const float threeD = 1.0f / (transport * max(localDensity, 1e-3f));
+  const float flux = clamp(threeD * alongView / fluence, -1.0f, 1.0f);
+  return fluence * kCloudInv4Pi * max(1.0f + cloud.msFloorAnisotropy * flux, 0.0f);
+}
+
+// The diffusion floor within the far window: the near window's field where it holds the sample, passing to the far
+// cascade's over the near window's edge band.
+float cloudDiffusionFloor(vec3 positionKm, float localDensity, float transport, vec3 viewDir, CloudArgs cloud) {
+  const float nearWeight = cloudNearWindowWeight(positionKm.xz, cloud);
+  float radiance = 0.0f;
+  if (nearWeight > 0.0f) {
+    radiance += nearWeight * cloudDiffusionRadiance(
+      CloudDiffusionGrid, cloudGridUvw(positionKm, cloud), cloud.gridExtentKm, localDensity, transport, viewDir, cloud);
+  }
+  if (nearWeight < 1.0f) {
+    radiance += (1.0f - nearWeight) * cloudDiffusionRadiance(
+      CloudDiffusionGridFar, cloudFarGridUvw(positionKm, cloud), cloud.farGridExtentKm, localDensity, transport, viewDir, cloud);
+  }
+  return radiance;
+}
+
+// Sun light reaching a sample before the cloud: the beam's illuminance through the atmosphere, with the planet's
+// shadow. atmospherePosition is the sample in the atmosphere frame (origin on the ground under the camera).
+vec3 cloudSunIrradiance(vec3 atmospherePosition, AtmosphereArgs atmosphere) {
+  const vec3 shadowing = evalSunShadowing(atmospherePosition, normalize(atmosphere.sunDirection), CloudTransmittanceLut, atmosphere);
+  return atmosphere.sunDiscIlluminance * atmosphere.sunRayBrightness * shadowing;
+}
+
+// localDensity is the sample's extinction weighted density; fineShadowTaps the full resolution taps toward the sun.
+vec3 cloudEvalSource(
+  vec3 positionKm, vec3 atmospherePosition, float heightFraction, float localDensity, vec2 controls, float jitter,
+  uint fineShadowTaps, CloudRayContext ray, CloudArgs cloud, AtmosphereArgs atmosphere)
+{
+  vec3 source = vec3(0.0f);
+  const vec3 sunDir = normalize(atmosphere.sunDirection);
+  const float sigma = cloud.extinctionKm;
+  const float f = cloud.forwardPeakFraction;
+  const float sigmaScaled = sigma * (1.0f - f);
+  const float transport = (1.0f - cloud.asymmetry) * sigma;
+  const vec2 odVertical = cloudVerticalOpticalDepth(positionKm, heightFraction, localDensity, cloud);
+
+  const vec3 sunIrradiance = cloudSunIrradiance(atmospherePosition, atmosphere);
+  if (any(sunIrradiance > vec3(0.0f))) {
+    vec3 endUvw;
+    float nearWeight;
+    float odFine;
+    const float odSun = cloudSampleSunOpticalDepth(
+      positionKm, sunDir, controls, jitter, fineShadowTaps, cloud, atmosphere.planetRadius, endUvw, nearWeight, odFine);
+
+    // Single scattering with the TMS correction: the exact phase under the delta-M scaled attenuation, since
+    // light scattered within the diffraction peak still travels sunward.
+    vec3 sun = ray.phase * exp(-sigmaScaled * odSun);
+
+    // Scattering orders 2 and up: octaves of the delta-M scaled problem.
+    float octaves = 0.0f;
+    float energy = 1.0f;
+    float extinction = 1.0f;
+    const uint octaveCount = min(cloud.msOctaves, 4u);
+    for (uint i = 0u; i < octaveCount; ++i) {
+      energy *= cloud.msEnergyFalloff;
+      extinction *= cloud.msExtinctionFalloff;
+      const uint mip = min(i + 1u, uint(CLOUD_SUN_GRID_MIP_COUNT - 1));
+      const float odOctave = nearWeight > 0.0f ? lerp(odSun, odFine + cloudSampleSunGrid(endUvw, mip).x, nearWeight) : odSun;
+      octaves += energy * ray.phaseOctaves[i] * exp(-extinction * sigmaScaled * odOctave);
+    }
+    octaves *= 1.0f - f;
+
+    // The diffusion floor: within the grids' windows the P1 diffusion of the scattered sunlight, solved over the
+    // clouds in 3D (cloud_diffusion). Beyond them a two-stream slab along the sun stands in: the fluence falls
+    // linearly with transport depth from the lit side, Eddington's radiance toward the eye
+    // I = (T E / 4 pi)(2 + 3 (tau0 - tau) + 3 mu) with total transmission T = (5 / 3) / (4 / 3 + tau0), the column
+    // taken as the live taps' depth either side of the sample. The slab receives the beam as E cos i, the ratio of
+    // the vertical to the sun's optical depth telling a deck (mu0, flux down) from a lone cloud (about 1, flux
+    // along the sun). Diffusion holds only in a column thick enough to diffuse. The one passes to the other over the
+    // far window's edge band.
+    const float farWeight = cloudFarWindowWeight(positionKm.xz, cloud);
+    float diffuse = 0.0f;
+    if (farWeight > 0.0f) {
+      diffuse += farWeight * cloudDiffusionFloor(positionKm, localDensity, transport, ray.dirYUp, cloud);
+    }
+    if (farWeight < 1.0f) {
+      const float tau = transport * odSun;
+      const float tau0 = 2.0f * tau;
+      const float mu0 = max(sunDir.y, 0.05f);
+      const float obliquity = clamp(odVertical.x / max(odSun, 1e-4f), mu0, 1.0f);
+      const float sunward = saturate((obliquity - mu0) / max(1.0f - mu0, 1e-3f));
+      const float fluxCosine = lerp(ray.dirYUp.y, ray.cosTheta, sunward);
+      diffuse += (1.0f - farWeight) * (5.0f / 3.0f) / (4.0f / 3.0f + tau0) * kCloudInv4Pi * obliquity * (1.0f - exp(-tau0))
+        * max(2.0f + 3.0f * tau + 3.0f * cloud.msFloorAnisotropy * fluxCosine, 0.0f);
+    }
+
+    sun += vec3(max(octaves, cloud.msFloorWeight * diffuse));
+    source += sunIrradiance * sun;
+  }
+
+  // Sky and ground light: singly scattered through the cloud above and below it, floored like the sun's by the
+  // two-stream diffusion field of the light each hemisphere lets in through the column's top or base (a thick
+  // cloud's face reflects most of its light, which a single scatter of the forward peaked phase barely turns
+  // back). Diffuse incidence takes T = 1.5 / (4 / 3 + tau0).
+  const float k = cloud.diffuseTransmissionK * transport;
+  const float transmissionUp = 1.0f / (1.0f + k * odVertical.x);
+  const float transmissionDown = 1.0f / (1.0f + k * odVertical.y);
+  vec3 ambientUp;
+  vec3 ambientDown;
+  cloudAmbientAtHeight(ray, heightFraction, ambientUp, ambientDown);
+  vec3 irradianceUp;
+  vec3 irradianceDown;
+  cloudIrradianceAtHeight(ray, heightFraction, irradianceUp, irradianceDown);
+
+  const float tauToTop = transport * odVertical.x;
+  const float tauToBase = transport * odVertical.y;
+  const float tau0Vertical = tauToTop + tauToBase;
+  const float diffuseFactor = 1.5f / (4.0f / 3.0f + tau0Vertical) * kCloudInv4Pi * (1.0f - exp(-tau0Vertical));
+  // Sky light enters by the top and its flux runs down; the ground's by the base, its flux up.
+  const float fromSky = diffuseFactor * max(2.0f + 3.0f * tauToBase + 3.0f * cloud.msFloorAnisotropy * ray.dirYUp.y, 0.0f);
+  const float fromGround = diffuseFactor * max(2.0f + 3.0f * tauToTop - 3.0f * cloud.msFloorAnisotropy * ray.dirYUp.y, 0.0f);
+  source += cloud.ambientStrength * (
+    max(transmissionUp * ambientUp, cloud.msFloorWeight * fromSky * irradianceUp) +
+    max(transmissionDown * ambientDown, cloud.msFloorWeight * fromGround * irradianceDown));
+
+  return source;
+}

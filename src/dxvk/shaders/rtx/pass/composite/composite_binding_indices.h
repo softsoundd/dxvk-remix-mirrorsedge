@@ -74,6 +74,10 @@
 #define COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT                    63
 #define COMPOSITE_ATMOSPHERE_MULTISCATTERING_INPUT                  64
 #define COMPOSITE_ATMOSPHERE_AEROSOL_PHASE_INPUT                    65
+#define COMPOSITE_CLOUD_LAYER_INPUT                                 66
+#define COMPOSITE_CLOUD_REFLECTION_INPUT                            67
+// The sky the cloud layer replaces where a mirror reflects it or glass shows it.
+#define COMPOSITE_ATMOSPHERE_SKY_VIEW_INPUT                         68
 
 // Inputs/Outputs
 

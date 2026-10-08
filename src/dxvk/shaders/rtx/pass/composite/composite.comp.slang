@@ -771,10 +771,13 @@ void applyAerialPerspective(
   float3 reflectionDirection,
   float reflectedSegmentLength,
   vec3 reflectedSegmentThroughput,
-  inout vec3 radianceOutput)
+  inout vec3 radianceOutput,
+  // Of the camera's segment, which all light from past the PSR surface is seen through.
+  out float cameraSegmentTransmittance)
 {
   vec3 inScatter = vec3(0.0f);
   float transmittance = 1.0f;
+  cameraSegmentTransmittance = 1.0f;
 
   if (aerialPerspectiveActive() && !primaryMiss && hitDistance > 0.0f)
   {
@@ -796,6 +799,7 @@ void applyAerialPerspective(
     float cameraTransmittance;
     evalCameraSegmentAerialPerspective(pixelCoordinate, hitDistance, cameraInScatter, cameraTransmittance);
     cameraInScatter *= volumeAttenuation;
+    cameraSegmentTransmittance = cameraTransmittance;
 
     radianceOutput = radianceOutput * cameraTransmittance + cameraInScatter;
 
@@ -871,6 +875,17 @@ float calculateVolumetricRadianceScale(uint2 pixelCoordinate, bool pixelIsActive
   }
 
   return calculateRadianceScaleFromSamplingRate(SparseRenderingPixelSamplingRate[pixelCoordinate]);
+}
+
+// What a cloud layer along a direction makes of the sky a PSR miss took there, the sky-view LUT's alone
+// (geometry_resolver.slangh): its own light and the sun's through it, less the sky it covers.
+vec3 evalCloudOverMissSky(vec4 cloudLayer, vec3 worldDirection)
+{
+  const bool isZUp = cb.atmosphereArgs.isZUp != 0;
+  const float transmittance = saturate(cloudLayer.a);
+  const vec3 sky = sampleSkyViewLutRadiance(AtmosphereSkyViewLut, worldDirection, cb.atmosphereArgs, isZUp);
+  const vec3 sun = evalSunDisk(worldDirection, AtmosphereTransmittanceLut, cb.atmosphereArgs, isZUp);
+  return max(cloudLayer.rgb, vec3(0.0f)) + sun * transmittance - sky * (1.0f - transmittance);
 }
 
 vec4 compositeResult(
@@ -1029,17 +1044,64 @@ vec4 compositeResult(
   // indirect integrator produced shares its buffers with the surface's own lighting.
   const bool psrReflectedGeometry = performedPsr && geometryFlags.performPSRR && psrReflectionSegmentSigned > 0.0f;
   const float3 psrMirrorPosition = cameraGetWorldPosition(cb.camera) + primaryRayDirections.worldDirection * max(psrFirstHitDistance, 0.0f);
+  float aerialPerspectiveTransmittance;
   applyAerialPerspective(
     pixelCoordinate, primaryMiss, volumeHitDistance, volumeAttenuation,
     psrMirrorPosition, psrReflectionDirection, psrReflectedGeometry ? psrReflectionSegmentSigned : 0.0f, primaryAttenuation,
-    radianceOutput);
+    radianceOutput, aerialPerspectiveTransmittance);
+
+  // The cloud layer lies behind the froxel fog and in front of whatever the pixel shows, the screen pass having
+  // stopped each ray there, so the fog's in-scatter F stays on top: F + T_cloud (radiance - F) + T_fog C.
+  // A PSR chain whose miss the screen pass marched instead (a mirror's or glass's first reflection, the sky straight
+  // through glass) has its sky replaced in place: by the clouds and the sun through them, at the chain's
+  // attenuation the PSR resolver stored and through the fog and air its sky was seen through.
+  float cloudLayerTransmittance = 1.0f;
+  if (cb.cloudArgs.enabled && cb.volumeArgs.physicalAtmosphereEnabled)
+  {
+    const bool cloudsMarchedPerPixel = (cb.cloudArgs.flags & CLOUD_FLAG_PSR_REFLECTIONS) != 0 && !cb.domeLightArgs.active;
+    const bool psrTransmittedSky = cloudsMarchedPerPixel && geometryFlags.performPSTR
+      && primaryLinearViewZ == cb.primaryDirectMissLinearViewZ;
+    const vec4 cloudLayer = CloudLayer[pixelCoordinate];
+    const vec3 fogInScatter = volumetricPreintegratedRadiance * volumetricRadianceScale;
+    const vec3 fogTransmittance = attenuateSharedAsSky ? skyVolumeAttenuation : volumeAttenuation;
+
+    if (cloudsMarchedPerPixel && psrReflectionSkyMiss)
+    {
+      radianceOutput += fogTransmittance * aerialPerspectiveTransmittance * primaryAttenuation
+        * evalCloudOverMissSky(CloudReflection[pixelCoordinate], psrReflectionDirection);
+    }
+
+    // Glass's reflected sky, a miss of its secondary surface, which the fog leaves alone like the sky through it.
+    if (cloudsMarchedPerPixel && geometryFlags.secondarySurfaceMask
+      && PsrReflectionSegmentLength[pixelCoordinate] == cb.secondaryCombinedMissLinearViewZ)
+    {
+      const vec3 glassReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[pixelCoordinate]);
+      radianceOutput += aerialPerspectiveTransmittance * secondaryAttenuation
+        * evalCloudOverMissSky(CloudReflection[pixelCoordinate], glassReflectionDirection);
+    }
+
+    if (psrTransmittedSky)
+    {
+      // The layer is the clouds behind the glass, which take no fog, as the sky the glass shows took none.
+      radianceOutput += aerialPerspectiveTransmittance * primaryAttenuation
+        * evalCloudOverMissSky(cloudLayer, primaryRayDirections.worldDirection);
+    }
+    else
+    {
+      cloudLayerTransmittance = saturate(cloudLayer.a);
+      // Sparse misses carry their sky at the sampling rate's scale; the clouds over it follow.
+      const float cloudRadianceScale = primaryMiss ? radianceScale : 1.0f;
+      radianceOutput = fogInScatter + (radianceOutput - fogInScatter) * cloudLayerTransmittance
+        + fogTransmittance * max(cloudLayer.rgb, vec3(0.0f)) * cloudRadianceScale;
+    }
+  }
 
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
   // Apply fog
   const float fogTransmittance = applyFog(viewDistance, radianceScale, radianceOutput);
   controlMaskTransmittance = calcBt709Luminance(saturate(controlMaskVolumeAttenuation));
-  controlMaskTransmittance *= fogTransmittance * backgroundAlpha;
+  controlMaskTransmittance *= fogTransmittance * backgroundAlpha * cloudLayerTransmittance;
 
   // Combine the alpha-blended foreground with the background before upscaling.
   return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);

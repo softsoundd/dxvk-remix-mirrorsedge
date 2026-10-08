@@ -1,0 +1,71 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// The body signed distance field's bake chain (occupancy, jump flooding, signed resolve). The texture's axes are
+// u = world x (tile wrapped), v = height fraction in the slab (clamped), w = world z (tile wrapped).
+
+#include "rtx/pass/clouds/cloud_args.h"
+
+// A seed is the voxel coordinate of a boundary voxel (occupied, with an empty face neighbour), packed
+// x | y << 8 | z << 16; the ranges keep it below 0x00FF3FFF, so all ones means no seed yet.
+static const uint kCloudNvdfSeedInvalid = 0xFFFFFFFFu;
+
+// Distance of voxels no body reaches: far above any distance within the slab, far below fp16's range.
+static const float kCloudNvdfEmptyKm = 100.0f;
+
+uint cloudNvdfPackSeed(uint3 voxel) {
+  return voxel.x | (voxel.y << 8u) | (voxel.z << 16u);
+}
+
+uint3 cloudNvdfUnpackSeed(uint seed) {
+  return uint3(seed & 0xFFu, (seed >> 8u) & 0xFFu, (seed >> 16u) & 0xFFu);
+}
+
+// Distance in km between two voxel centres: the horizontal axes wrap (the field tiles) and each axis converts
+// to km before the norm, so the nearest seed is nearest in space even when the voxels are not cubes.
+float cloudNvdfVoxelDistanceKm(uint3 a, uint3 b, float tileKm, float thicknessKm) {
+  const float sizeXZ = float(CLOUD_NVDF_SIZE_XZ);
+  const float voxelXZKm = max(tileKm, 1e-3f) / sizeXZ;
+  const float voxelYKm = max(thicknessKm, 0.05f) / float(CLOUD_NVDF_SIZE_Y);
+
+  float dx = abs(float(a.x) - float(b.x));
+  dx = min(dx, sizeXZ - dx);
+  float dz = abs(float(a.z) - float(b.z));
+  dz = min(dz, sizeXZ - dz);
+  const float dy = abs(float(a.y) - float(b.y));
+
+  return length(vec3(dx * voxelXZKm, dy * voxelYKm, dz * voxelXZKm));
+}
+
+int cloudNvdfWrapXZ(int c) {
+  const int n = int(CLOUD_NVDF_SIZE_XZ);
+  return ((c % n) + n) % n;
+}
+
+vec2 cloudNvdfVoxelToTileUv(uint3 voxel) {
+  return (vec2(voxel.xz) + 0.5f) / float(CLOUD_NVDF_SIZE_XZ);
+}
+
+float cloudNvdfVoxelToHeightFraction(uint3 voxel) {
+  return (float(voxel.y) + 0.5f) / float(CLOUD_NVDF_SIZE_Y);
+}

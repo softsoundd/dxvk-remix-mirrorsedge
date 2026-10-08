@@ -3525,6 +3525,9 @@ namespace dxvk {
           }
 
           ImGui::Separator();
+          RtxClouds::showImguiSettings(uint32_t(sliderFlags), uint32_t(collapsingHeaderClosedFlags));
+
+          ImGui::Separator();
 
           if (RemixGui::CollapsingHeader("Advanced Atmosphere Parameters", collapsingHeaderClosedFlags)) {
             ImGui::Indent();

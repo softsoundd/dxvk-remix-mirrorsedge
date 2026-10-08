@@ -36,6 +36,7 @@
 #include "rtx/pass/nrc/nrc_integrator_utilities.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/algorithm/cloud_lighting_helpers.slangh"
 
 // Input specular signal of low roughness material into restir gi
 static const uint kRestirGIAcceptLowRoughnessInput = false;
@@ -202,6 +203,34 @@ NrcProgressState updateNrcOnHit(
 #endif
 
   return nrcProgressState;
+}
+
+// A near-mirror's first bounce into the sky, whose dome clouds cloud_glossy.comp.slang replaces in this pixel's
+// indirect radiance. The path's radiance keeps them, since ReSTIR GI may share it with other pixels.
+void stashCloudGlossyRay(PathState pathState, vec3 radianceAttenuation)
+{
+  if (!cb.cloudArgs.enabled || (cb.cloudArgs.flags & CLOUD_FLAG_GLOSSY_REFLECTIONS) == 0 || pathState.bounceIteration != 1)
+  {
+    return;
+  }
+
+#if ENABLE_NRC
+  // For update paths pathState.pixelCoordinate indexes the update domain rather than the screen.
+  if (pathState.isNrcUpdate)
+  {
+    return;
+  }
+#endif
+
+  const float weight = cloudGlossyReflectionWeight(calcRoughness(pathState.gbufferPerceptualRoughness));
+  if (weight <= 0.0f || !geometryFlagsReadFromGBuffer(pathState.pixelCoordinate, SharedFlags).firstSampledLobeIsSpecular)
+  {
+    return;
+  }
+
+  CloudGlossyRay[pathState.pixelCoordinate] = uint2(
+    colorToR11G11B10(vec3(pathState.throughput) * radianceAttenuation * weight),
+    sphereDirectionToSnorm2x16(pathState.direction));
 }
 
 // Integrate Path Vertex Functions
@@ -405,6 +434,8 @@ void integratePathVertex(
       // Physical atmosphere mode. Note: no sun disc here. The sun is an RtDistantLight sampled by
       // NEE at the previous path vertex, so adding the disc would double count it.
       skyRadiance = sampleSkyViewLutRadiance(AtmosphereSkyViewLut, pathState.direction, cb.atmosphereArgs, cb.isZUp != 0);
+      skyRadiance = cloudSkyRadianceOnMiss(skyRadiance, pathState.direction);
+      stashCloudGlossyRay(pathState, radianceAttenuation);
     }
 #endif
     else
@@ -700,6 +731,11 @@ void integratePathVertex(
         }
       }
 
+
+      if (lightSampleValid)
+      {
+        applyCloudShadowToLightSample(lightSample, lightIdx, surfaceInteraction.position);
+      }
 
       lightSample.solidAnglePdf = invSelectionPdf > 0 ? lightSample.solidAnglePdf / invSelectionPdf : 0.0;
       vec3 diffuseLight, specularLight;

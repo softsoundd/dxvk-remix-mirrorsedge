@@ -1,0 +1,342 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// The light part of the cloud layer: frames, the slab's geometry, and the lookups the path tracer, the
+// composite and the volumetrics read (scene shadows, the reflection dome). Textures are parameters so this
+// compiles wherever the cloud resources are bound under whatever name.
+
+#include "rtx/pass/clouds/cloud_args.h"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
+
+// Optical depth beyond which a point is dark to the sun for any extinction a cloud has.
+static const float kCloudOccludedOpticalDepth = 60.0f;
+
+// Extinction weighted density below which a grid cell is clear air to the diffusion of the scattered sunlight.
+static const float kCloudDiffusionMinDensity = 0.02f;
+
+// Y-up direction of a world space direction.
+vec3 cloudWorldToYUp(vec3 v, bool isZUp) {
+  return isZUp ? vec3(v.x, v.z, v.y) : v;
+}
+
+// Cloud frame position (km) of a world position near the camera: absolute x / z, altitude above sea level in y.
+// The altitude takes the camera's own altitude plus the height difference along the world's up axis, which is
+// exact to the curvature of the planet over the few kilometres scene geometry spans.
+vec3 cloudWorldPositionToKm(vec3 worldPosition, CloudArgs cloud, AtmosphereArgs atmosphere) {
+  const vec3 yUp = cloudWorldToYUp(worldPosition, atmosphere.isZUp != 0) / max(cloud.worldUnitsPerKm, 1e-6f);
+  return vec3(yUp.x, cloud.cameraPositionKm.y + (yUp.y - cloud.cameraWorldHeightKm), yUp.z);
+}
+
+// Altitude above sea level of the point at distance t along a Y-up ray from the eye, on the atmosphere's planet.
+float cloudRayAltitudeKm(vec3 dirYUp, float t, CloudArgs cloud, float planetRadiusKm) {
+  const vec3 fromCenter = vec3(dirYUp.x * t, planetRadiusKm + cloud.cameraPositionKm.y + dirYUp.y * t, dirYUp.z * t);
+  return length(fromCenter) - planetRadiusKm;
+}
+
+// Slab span along a Y-up ray from the eye at any altitude, clipped against the planet. Piece 0 is the near
+// crossing; piece 1, which exists only when the eye is above the base and looks down through the layer, is
+// the far one.
+bool cloudSlabSpan(vec3 dirYUp, CloudArgs cloud, float planetRadiusKm, int piece, out float tEntry, out float tExit) {
+  tEntry = 0.0f;
+  tExit = -1.0f;
+
+  const vec3 center = vec3(0.0f, -(planetRadiusKm + cloud.cameraPositionKm.y), 0.0f);
+  const float baseRadius = planetRadiusKm + cloud.baseAltitudeKm;
+  const float topRadius = baseRadius + cloud.thicknessKm;
+
+  float t0Top, t1Top;
+  if (!intersectSphere(vec3(0.0f), dirYUp, center, topRadius, t0Top, t1Top) || t1Top <= 0.0f) {
+    return false;
+  }
+
+  float t0Base, t1Base;
+  const bool hitsBase = intersectSphere(vec3(0.0f), dirYUp, center, baseRadius, t0Base, t1Base);
+
+  if (!hitsBase || t1Base <= 0.0f) {
+    if (piece != 0) {
+      return false;
+    }
+    tEntry = max(t0Top, 0.0f);
+    tExit = t1Top;
+  } else if (t0Base > 0.0f) {
+    if (piece == 0) {
+      tEntry = max(t0Top, 0.0f);
+      tExit = t0Base;
+    } else {
+      tEntry = max(t1Base, 0.0f);
+      tExit = t1Top;
+    }
+  } else {
+    if (piece != 0) {
+      return false;
+    }
+    tEntry = max(t1Base, 0.0f);
+    tExit = t1Top;
+  }
+
+  float tPlanet0, tPlanet1;
+  if (intersectSphere(vec3(0.0f), dirYUp, center, planetRadiusKm, tPlanet0, tPlanet1) && tPlanet0 > 0.0f) {
+    tExit = min(tExit, tPlanet0);
+  }
+
+  return tExit > tEntry && tExit > 0.0f;
+}
+
+// Height fraction within the slab of an altitude.
+float cloudHeightFraction(float altitudeKm, CloudArgs cloud) {
+  return saturate((altitudeKm - cloud.baseAltitudeKm) / max(cloud.thicknessKm, 1e-3f));
+}
+
+// The texel along an interleaved bake's axis that thread i bakes. Above period 1 a frame refreshes every
+// period-th block of 8 texels, a workgroup's width, so neighbouring threads bake neighbouring texels and share
+// what they read; at period 1, phase is the first texel.
+uint cloudInterleavedTexel(uint i, uint period, uint phase) {
+  return period > 1u ? ((i / 8u) * period + phase) * 8u + i % 8u : i + phase;
+}
+
+// Every cloud texture is read through one repeating sampler; axes that do not wrap clamp to their outer texel
+// centres here, so filtering never blends across the edge.
+float cloudClampToTexelCentres(float coordinate, float size) {
+  const float halfTexel = 0.5f / size;
+  return clamp(coordinate, halfTexel, 1.0f - halfTexel);
+}
+
+// A cloud frame position's horizontal coordinates in the field's own frame, which the wind carries. The grids
+// and the shadow map are anchored to it, so what a bake holds stays true as the clouds drift.
+vec2 cloudFieldXz(vec2 xzKm, CloudArgs cloud) {
+  return xzKm - cloud.windOffsetKm;
+}
+
+// Grid UVW of a cloud frame position. The horizontal axes are toroidal in the field's frame, so a texel keeps
+// its meaning as the grid's window (gridExtentKm about gridOriginKm.xy, in that frame) follows the camera and
+// only the strip entering the window needs a new bake. Vertical is the slab's height fraction.
+vec3 cloudWindowUvw(vec3 positionKm, float extentKm, CloudArgs cloud) {
+  const float invExtent = 1.0f / max(extentKm, 1e-3f);
+  const vec2 fieldXz = cloudFieldXz(positionKm.xz, cloud);
+  return vec3(
+    frac(fieldXz.x * invExtent),
+    cloudClampToTexelCentres(cloudHeightFraction(positionKm.y, cloud), float(CLOUD_GRID_SIZE_Y)),
+    frac(fieldXz.y * invExtent));
+}
+
+vec3 cloudGridUvw(vec3 positionKm, CloudArgs cloud) {
+  return cloudWindowUvw(positionKm, cloud.gridExtentKm, cloud);
+}
+
+// The far cascade's, over its coarser window.
+vec3 cloudFarGridUvw(vec3 positionKm, CloudArgs cloud) {
+  return cloudWindowUvw(positionKm, cloud.farGridExtentKm, cloud);
+}
+
+// Field frame km of the periodic image of a window's texel centre's horizontal coordinate that lies inside it.
+float cloudWindowTexelToFieldKm(float texelCentreU, float windowOriginKm, float extentKm) {
+  const float windowStartKm = windowOriginKm - 0.5f * extentKm;
+  return windowStartKm + frac(texelCentreU - windowStartKm / max(extentKm, 1e-3f)) * extentKm;
+}
+
+// Distance along a direction of local vertical cosine mu, from altitude altitudeKm, to the shell at
+// shellAltitudeKm: the near crossing ahead, or -1 for none.
+float cloudShellDistance(float altitudeKm, float mu, float shellAltitudeKm, float planetRadiusKm) {
+  const float r = planetRadiusKm + altitudeKm;
+  const float shellRadius = planetRadiusKm + shellAltitudeKm;
+  const float b = r * mu;
+  const float discriminant = b * b - (r * r - shellRadius * shellRadius);
+  if (discriminant < 0.0f) {
+    return -1.0f;
+  }
+  const float s = sqrt(discriminant);
+  const float t0 = -b - s;
+  const float t1 = -b + s;
+  return t0 > 0.0f ? t0 : (t1 > 0.0f ? t1 : -1.0f);
+}
+
+// Altitude after distance t along a direction of local vertical cosine mu.
+float cloudAltitudeAlong(float altitudeKm, float mu, float t, float planetRadiusKm) {
+  const float r = planetRadiusKm + altitudeKm;
+  return sqrt(max(r * r + 2.0f * r * t * mu + t * t, 0.0f)) - planetRadiusKm;
+}
+
+// Distance from a point inside the slab to where a direction leaves it: through the base when it descends
+// into it, else through the top. Negative when the direction meets the planet first.
+float cloudSlabExitDistance(float altitudeKm, float mu, CloudArgs cloud, float planetRadiusKm) {
+  if (mu < 0.0f) {
+    const float tBase = cloudShellDistance(altitudeKm, mu, cloud.baseAltitudeKm, planetRadiusKm);
+    if (tBase > 0.0f) {
+      return tBase;
+    }
+  }
+  return cloudShellDistance(altitudeKm, mu, cloud.baseAltitudeKm + cloud.thicknessKm, planetRadiusKm);
+}
+
+// Whether a cloud frame position lies within the grid's box around its origin, where the wrapped lookup is the
+// field the march renders rather than a periodic image of it.
+bool cloudGridContains(vec2 xzKm, CloudArgs cloud) {
+  const vec2 rel = abs(cloudFieldXz(xzKm, cloud) - cloud.gridOriginKm.xy);
+  return all(rel < vec2(0.5f * cloud.gridExtentKm));
+}
+
+bool cloudFarGridContains(vec2 xzKm, CloudArgs cloud) {
+  const vec2 rel = abs(cloudFieldXz(xzKm, cloud) - cloud.farGridOriginKm);
+  return all(rel < vec2(0.5f * cloud.farGridExtentKm));
+}
+
+// Bands inside the near and far windows' edges over which what a window holds passes to what lies beyond it.
+static const float kCloudNearWindowBandKm = 1.0f;
+static const float kCloudFarWindowBandKm = 4.0f;
+
+// Weight of a window's contents at a cloud frame position: 1 well inside, falling to 0 over its band at the edge.
+// Measured from the camera rather than the window's texel snapped origin, whose every snap would move the edge a
+// texel across the clouds at once. It ends half a texel inside, the furthest the snapped window sits off the camera.
+float cloudWindowWeight(vec2 xzKm, float extentKm, float bandKm, CloudArgs cloud) {
+  const vec2 offset = abs(xzKm - cloud.cameraPositionKm.xz);
+  const float halfTexelKm = 0.5f * extentKm / float(CLOUD_GRID_SIZE_XZ);
+  return saturate((0.5f * extentKm - halfTexelKm - max(offset.x, offset.y)) / bandKm);
+}
+
+float cloudNearWindowWeight(vec2 xzKm, CloudArgs cloud) {
+  return cloudWindowWeight(xzKm, cloud.gridExtentKm, kCloudNearWindowBandKm, cloud);
+}
+
+float cloudFarWindowWeight(vec2 xzKm, CloudArgs cloud) {
+  return cloudWindowWeight(xzKm, cloud.farGridExtentKm, kCloudFarWindowBandKm, cloud);
+}
+
+// Shadow map coordinate of a position on the slab's base, or false outside its window (shadowMapExtentKm about
+// gridOriginKm.zw). Toroidal in the field's frame like the grids.
+bool cloudShadowMapUv(vec2 xzKm, CloudArgs cloud, out vec2 uv) {
+  const float extent = max(cloud.shadowMapExtentKm, 1e-3f);
+  const vec2 fieldXz = cloudFieldXz(xzKm, cloud);
+  uv = frac(fieldXz / extent);
+  const vec2 rel = abs(fieldXz - cloud.gridOriginKm.zw);
+  return all(rel < vec2(0.5f * extent));
+}
+
+// Optical depth (density x km, multiply by an extinction) along the sun through the slab, from a cloud frame
+// position below or inside the layer. Zero when the sun is below the horizon or the point is above the layer.
+float cloudSunOpticalDepth(
+  Texture3D<float4> sunGrid, Texture2D<float> shadowMap, SamplerState volumeSampler,
+  vec3 positionKm, vec3 sunDirYUp, CloudArgs cloud)
+{
+  const float topAltitudeKm = cloud.baseAltitudeKm + cloud.thicknessKm;
+  if (positionKm.y >= topAltitudeKm || sunDirYUp.y <= 1e-3f) {
+    return 0.0f;
+  }
+
+  // Below the layer the sun ray enters at the base: the grid's bottom row there holds the whole column.
+  vec3 entryKm = positionKm;
+  if (positionKm.y < cloud.baseAltitudeKm) {
+    const float t = (cloud.baseAltitudeKm - positionKm.y) / sunDirYUp.y;
+    entryKm = positionKm + sunDirYUp * t;
+  }
+
+  if (cloudGridContains(entryKm.xz, cloud)) {
+    return sunGrid.SampleLevel(volumeSampler, cloudGridUvw(entryKm, cloud), 0).x;
+  }
+
+  vec2 uv;
+  if ((cloud.flags & CLOUD_FLAG_SHADOW_MAP_VALID) != 0 && positionKm.y < cloud.baseAltitudeKm && cloudShadowMapUv(entryKm.xz, cloud, uv)) {
+    return shadowMap.SampleLevel(volumeSampler, uv, 0);
+  }
+
+  return 0.0f;
+}
+
+// Fraction of the sun a cloud shadow of this optical depth passes. The forward diffraction peak is counted as
+// transmitted (the delta-M scaled extinction), since that light still arrives from within a degree of the sun.
+float cloudShadowTransmittance(float opticalDepth, CloudArgs cloud) {
+  return lerp(1.0f, exp(-opticalDepth * cloud.shadowExtinctionKm), saturate(cloud.shadowStrength));
+}
+
+// Fraction of the sun the cloud layer passes to a world position. Callers test the flag of what they shadow:
+// CLOUD_FLAG_SUN_SHADOWS for the scene, CLOUD_FLAG_FOG_SHADOWS for the air.
+float cloudSunTransmittance(
+  Texture3D<float4> sunGrid, Texture2D<float> shadowMap, SamplerState volumeSampler,
+  vec3 worldPosition, CloudArgs cloud, AtmosphereArgs atmosphere)
+{
+  if (!cloud.enabled) {
+    return 1.0f;
+  }
+
+  const vec3 positionKm = cloudWorldPositionToKm(worldPosition, cloud, atmosphere);
+  return cloudShadowTransmittance(cloudSunOpticalDepth(sunGrid, shadowMap, volumeSampler, positionKm, atmosphere.sunDirection, cloud), cloud);
+}
+
+// Real orthonormal spherical harmonics to band 2, polar axis y: the basis of the sky harmonics.
+void cloudShBasis(vec3 d, out float basis[CLOUD_SKY_SH_COEFFICIENTS]) {
+  basis[0] = 0.282095f;
+  basis[1] = 0.488603f * d.y;
+  basis[2] = 0.488603f * d.z;
+  basis[3] = 0.488603f * d.x;
+  basis[4] = 1.092548f * d.x * d.z;
+  basis[5] = 1.092548f * d.y * d.z;
+  basis[6] = 0.315392f * (3.0f * d.y * d.y - 1.0f);
+  basis[7] = 1.092548f * d.x * d.y;
+  basis[8] = 0.546274f * (d.x * d.x - d.z * d.z);
+}
+
+// UV of a Y-up direction in the sky-view LUT's parameterisation (absolute azimuth, horizon compressed
+// elevation), shared by every cloud direction LUT.
+vec2 cloudDirectionToSkyUv(vec3 dirYUp) {
+  const float elevation = asin(clamp(dirYUp.y, -1.0f, 1.0f));
+  float azimuth = atan2(dirYUp.z, dirYUp.x);
+  if (azimuth < 0.0f) {
+    azimuth += 2.0f * kPi;
+  }
+  return vec2(azimuth / (2.0f * kPi), skyViewLutElevationToV(elevation));
+}
+
+vec3 cloudSkyUvToDirection(vec2 uv) {
+  const float azimuth = uv.x * 2.0f * kPi;
+  const float elevation = skyViewLutVToElevation(uv.y);
+  const float cosElevation = cos(elevation);
+  return vec3(cosElevation * cos(azimuth), sin(elevation), cosElevation * sin(azimuth));
+}
+
+// The sky aerial perspective LUT's depth: log spaced distance slices between CLOUD_SKY_AP_MIN_DISTANCE_KM and
+// CLOUD_SKY_AP_MAX_DISTANCE_KM.
+float cloudSkyApDistanceToW(float distanceKm) {
+  const float range = log(CLOUD_SKY_AP_MAX_DISTANCE_KM / CLOUD_SKY_AP_MIN_DISTANCE_KM);
+  return saturate(log(max(distanceKm, CLOUD_SKY_AP_MIN_DISTANCE_KM) / CLOUD_SKY_AP_MIN_DISTANCE_KM) / range);
+}
+
+float cloudSkyApWToDistance(float w) {
+  return CLOUD_SKY_AP_MIN_DISTANCE_KM * pow(CLOUD_SKY_AP_MAX_DISTANCE_KM / CLOUD_SKY_AP_MIN_DISTANCE_KM, saturate(w));
+}
+
+// The cloud layer over the sky seen along a Y-up direction from near the camera: premultiplied radiance in rgb,
+// transmittance in a. The dome carries the air in front of the clouds (see the composite in cloud_march), so
+// it composites over the atmosphere's sky radiance in that direction as is.
+vec4 cloudSampleDome(Texture2D<float4> dome, SamplerState volumeSampler, vec3 dirYUp, CloudArgs cloud) {
+  if (!cloud.enabled || (cloud.flags & CLOUD_FLAG_DOME) == 0) {
+    return vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  }
+  uint width, height;
+  dome.GetDimensions(width, height);
+  vec2 uv = cloudDirectionToSkyUv(dirYUp);
+  uv.y = cloudClampToTexelCentres(uv.y, float(height));
+  return dome.SampleLevel(volumeSampler, uv, 0);
+}
+
+vec3 cloudCompositeOverSky(vec4 layer, vec3 skyRadiance) {
+  return layer.rgb + saturate(layer.a) * skyRadiance;
+}

@@ -32,11 +32,13 @@
 #include "rtx/pass/atmosphere/aerial_perspective_binding_indices.h"
 
 #include "rtx/utility/common.slangh"
+#include "rtx/utility/color.slangh"
 #include "rtx/utility/noise.slangh"
 #include "rtx/utility/sampling.slangh"
 #include "rtx/concept/ray/ray.slangh"
 #include "rtx/algorithm/visibility.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/clouds/cloud_common.slangh"
 
 layout(binding = AERIAL_PERSPECTIVE_BINDING_PREV_LUT_INPUT)
 Texture3D<float4> PrevAerialPerspectiveLut;
@@ -68,6 +70,22 @@ vec3 evalSceneVisibility(vec3 worldPosition, vec3 directionWorld, AtmosphereArgs
     visibilityRay, rayMask, invalidRayPortalIndex, portalSpace);
 
   return visibility.hasOpaqueHit ? vec3(0.0f) : saturate(visibility.attenuation);
+}
+
+// How much brighter (or darker) the sky is along a world direction with the cloud layer over it, from the
+// dome: the multiple scattering term stands for the sky's light, which an overcast deck replaces with the
+// light of its base.
+float evalCloudySkyRatio(vec3 directionWorld, AtmosphereArgs args)
+{
+  if (!cb.cloudArgs.enabled)
+  {
+    return 1.0f;
+  }
+  const vec3 dirYUp = normalize(cloudWorldToYUp(directionWorld, args.isZUp != 0));
+  const vec3 sky = sampleSkyAmbientForVolume(dirYUp, args, AtmosphereSkyViewLut);
+  const vec4 layer = cloudSampleDome(CloudDome, CloudSampler, dirYUp, cb.cloudArgs);
+  const float skyLuminance = calcBt709Luminance(sky);
+  return skyLuminance > 1e-6f ? clamp(calcBt709Luminance(cloudCompositeOverSky(layer, sky)) / skyLuminance, 0.0f, 4.0f) : 1.0f;
 }
 
 // Cosine weighted direction over the sky hemisphere, i.e. around the world up axis.
@@ -181,17 +199,22 @@ void main(uint3 threadId : SV_DispatchThreadID) {
       const vec3 samplePos = rayOrigin + rayDir * t;
       const vec3 sampleWorldPosition = args.cameraPosition + rayDirWorld * (t * args.worldUnitsPerKilometer);
 
-      // Atmospheric shadowing of the sun, then the scene's.
+      // Atmospheric shadowing of the sun, then the scene's and the cloud layer's.
       vec3 sunShadowing = evalSunShadowing(samplePos, args.sunDirection, AtmosphereTransmittanceLut, args);
       if (any(sunShadowing > vec3(0.0f))) {
         sunShadowing *= evalSceneVisibility(sampleWorldPosition, sunDirectionWorld, args);
+        if ((cb.cloudArgs.flags & CLOUD_FLAG_FOG_SHADOWS) != 0) {
+          sunShadowing *= cloudSunTransmittance(CloudSunGrid, CloudShadowMap, CloudSampler, sampleWorldPosition, cb.cloudArgs, args);
+        }
       }
 
-      // One sky direction per step, so the accumulation converges to the sky fraction the step sees.
+      // One sky direction per step, so the accumulation converges to the sky fraction the step sees, through
+      // the clouds over it.
       const vec2 skySample = vec2(
         randomFloat(uint4(threadId, args.aerialPerspectiveFrameIndex * kMaxShadowSteps + i)),
         randomFloat(uint4(threadId.yzx, args.aerialPerspectiveFrameIndex * kMaxShadowSteps + i + 1u)));
-      const vec3 skyVisibility = evalSceneVisibility(sampleWorldPosition, sampleSkyDirection(skySample, args), args);
+      const vec3 skyDirection = sampleSkyDirection(skySample, args);
+      const vec3 skyVisibility = evalSceneVisibility(sampleWorldPosition, skyDirection, args) * evalCloudySkyRatio(skyDirection, args);
 
       vec3 sampleTransmittance;
       const vec3 contribution = transmittance * integrateAtmosphereStep(

@@ -877,7 +877,9 @@ void RtDistantLight::writeGPUData(unsigned char* data, std::size_t& offset) cons
 
   // Note: Distant light type (4)
   // Todo: Ideally match this with GPU light type constants
-  writeGPUHelper(data, offset, static_cast<uint32_t>(lightTypeDistant << 29));
+  uint32_t flags = static_cast<uint32_t>(lightTypeDistant << 29);
+  flags |= m_atmosphereCloudShadowed ? 1u << 2 : 0u; // Shadowed by the cloud layer at bit 2
+  writeGPUHelper(data, offset, flags);
 
   assert(offset - oldOffset == kLightGPUSize);
 }

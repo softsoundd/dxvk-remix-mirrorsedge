@@ -36,6 +36,7 @@
 #include "rtx/pass/material_args.h"
 #include "rtx/pass/view_distance_args.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h"
+#include "rtx/pass/clouds/cloud_args.h"
 #include "rtx/concept/light/light_types.h"
 #include "rtx/concept/surface/surface_shared.h"
 #include "rtx/algorithm/nee_cache_data.h"
@@ -163,6 +164,7 @@ struct RaytraceArgs {
   NrcArgs nrcArgs;
   SssArgs sssArgs;
   AtmosphereArgs atmosphereArgs;
+  CloudArgs cloudArgs;
   EyeArgs eyeArgs;
   ShadowTerminatorArgs shadowTerminatorArgs;
 

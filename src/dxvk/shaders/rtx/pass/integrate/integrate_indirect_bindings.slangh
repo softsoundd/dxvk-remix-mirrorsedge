@@ -173,6 +173,10 @@ RWTexture2D<float4> IndirectRadianceHitDistance;
 layout(r32f, binding = INTEGRATE_INDIRECT_BINDING_REFLECTION_SEGMENT_OUTPUT)
 RWTexture2D<float> ReflectionSegment;
 
+// Near-mirrors' first bounces into the sky (stashCloudGlossyRay, cloud_glossy.comp.slang).
+layout(rg32ui, binding = INTEGRATE_INDIRECT_BINDING_CLOUD_GLOSSY_RAY_OUTPUT)
+RWTexture2D<uint2> CloudGlossyRay;
+
 layout(binding = INTEGRATE_INDIRECT_BINDING_NEE_CACHE)
 ByteAddressBuffer NeeCache;
 
