@@ -2608,11 +2608,13 @@ void geometryPSRResolverVertex(
 
       // The sky's clouds, and the sun behind them, from the dome, except on rays the cloud screen pass marches per
       // pixel: a mirror's first reflection (the pixel's only PSR surface), glass's first reflection (its secondary
-      // surface, whose direction goes in the view direction a missed surface leaves free) and the sky straight
-      // through glass. Composite lays those clouds and the sun over this sky at the throughput stored here as the
-      // chain's attenuation, which a miss otherwise leaves unwritten; the sun is left to it, since taken back out at
-      // the attenuation's few mantissa bits it would trace through clouds that hide it. Other glass misses store zero.
-      bool cloudsMarchedPerPixel = false;
+      // surface, whose direction goes in the view direction a missed surface leaves free) and the sky through glass,
+      // which blends the march into the dome by how far the glass bends the ray (cloudGlassTransmissionWeight).
+      // Composite lays the marched clouds and the sun over this sky at the throughput stored here: the chain's
+      // attenuation, which a miss otherwise leaves unwritten, times the march's share. The sun is left to it, since
+      // taken back out at the attenuation's few mantissa bits it would trace through clouds that hide it. Other glass
+      // misses store zero.
+      float marchedShare = 0.0f;
       if (cb.cloudArgs.enabled && (cb.cloudArgs.flags & CLOUD_FLAG_PSR_REFLECTIONS) != 0)
       {
         const ivec2 pixel = ivec2(geometryPSRResolverState.pixelCoordinate);
@@ -2620,34 +2622,34 @@ void geometryPSRResolverVertex(
         if (geometryPSRResolverState.isTransmissionPSR)
         {
           const vec3 cameraDirection = cameraPixelCoordinateToDirection(cb.camera, pixel).worldDirection;
-          cloudsMarchedPerPixel = dot(ray.direction, cameraDirection) > kCloudStraightThroughCosine;
-          imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(cloudsMarchedPerPixel ? skyThroughput : vec3(0.0f)));
+          marchedShare = cloudGlassTransmissionWeight(dot(ray.direction, cameraDirection));
+          imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(skyThroughput * marchedShare));
         }
         else if (geometryPSRResolverState.primarySurface)
         {
-          cloudsMarchedPerPixel = geometryPSRResolverState.bounceIteration == 1
-            && !geometryFlagsReadFromGBuffer(geometryPSRResolverState.pixelCoordinate, SharedFlags).secondarySurfaceMask;
-          if (cloudsMarchedPerPixel)
+          if (geometryPSRResolverState.bounceIteration == 1
+            && !geometryFlagsReadFromGBuffer(geometryPSRResolverState.pixelCoordinate, SharedFlags).secondarySurfaceMask)
           {
+            marchedShare = 1.0f;
             imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(skyThroughput));
           }
         }
         else
         {
-          cloudsMarchedPerPixel = geometryPSRResolverState.bounceIteration == 1;
-          imageStore(SecondaryAttenuation, pixel, colorToR11G11B10(cloudsMarchedPerPixel ? skyThroughput : vec3(0.0f)));
-          if (cloudsMarchedPerPixel)
+          marchedShare = geometryPSRResolverState.bounceIteration == 1 ? 1.0f : 0.0f;
+          imageStore(SecondaryAttenuation, pixel, colorToR11G11B10(skyThroughput * marchedShare));
+          if (marchedShare > 0.0f)
           {
             SecondaryViewDirection[pixel] = sphereDirectionToSignedOctahedral(ray.direction);
           }
         }
       }
-      if (!cloudsMarchedPerPixel)
+      if (marchedShare < 1.0f)
       {
         // Mirror-like PSR paths never run NEE either, so without this a mirror reflecting the sky
         // shows no sun.
-        skyRadiance += evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
-        skyRadiance = cloudSkyRadianceOnMiss(skyRadiance, ray.direction);
+        const vec3 sun = evalSunDisk(ray.direction, AtmosphereTransmittanceLut, cb.atmosphereArgs, cb.isZUp != 0);
+        skyRadiance = lerp(cloudSkyRadianceOnMiss(skyRadiance + sun, ray.direction), skyRadiance, marchedShare);
       }
 
       emissiveRadiance += skyRadiance * radianceAttenuation;

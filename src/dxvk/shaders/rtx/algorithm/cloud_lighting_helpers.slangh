@@ -44,9 +44,17 @@ void applyCloudShadowToLightSample(inout LightSample lightSample, uint16_t light
   lightSample.radiance *= cloudSunTransmittance(CloudSunGrid, CloudShadowMap, CloudSampler, worldPosition, cb.cloudArgs, cb.atmosphereArgs);
 }
 
-// Glass whose transmitted ray leaves within this cosine of the camera's ray shows the clouds the camera ray meets:
-// thin-walled and flat panes, which do not bend it. About a quarter of a degree, a few pixels of the clouds.
-static const float kCloudStraightThroughCosine = 0.99999f;
+// Glass whose transmitted ray leaves within 2 degrees (kCloudGlassMarchCosine) of the camera's ray shows the clouds
+// the camera ray meets, fading to the dome's along the bent ray by 5 degrees (kCloudGlassDomeCosine). Thin-walled
+// panes do not bend it, and panes with parallel faces only where their normal maps tilt the exit face against the
+// entry, by about a degree; lenses bend it further.
+static const float kCloudGlassMarchCosine = 0.99939f;
+static const float kCloudGlassDomeCosine = 0.99619f;
+
+float cloudGlassTransmissionWeight(float cosine)
+{
+  return saturate((cosine - kCloudGlassDomeCosine) / (kCloudGlassMarchCosine - kCloudGlassDomeCosine));
+}
 
 // Specular reflections smoother than kCloudGlossyMarchRoughness (isotropic roughness) take their sky's clouds from
 // a march along the reflected ray (cloud_glossy.comp.slang), fading back to the dome by kCloudGlossyDomeRoughness,
