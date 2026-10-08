@@ -45,6 +45,7 @@
 
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/clouds/cloud_march.slangh"
+#include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 #include "rtx/utility/geometry_flags.slangh"
 #include "rtx/utility/debug_view_indices.h"
 
@@ -57,6 +58,14 @@ Texture2D<float> PrimaryLinearViewZ;
 layout(r32f, binding = CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE)
 Texture2D<float> PsrFirstHitDistance;
 
+// Under sparse rendering the PSR output above sits at an active pixel's compacted slot, which these resolve.
+layout(binding = CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
+Texture2D<uint16_t> CompactedPixelIndices;
+
+layout(binding = CLOUD_BINDING_TILE_ACTIVE_COUNTS)
+Texture2D<uint2> TileActiveCounts;
+
+// Read by pixel: the compacted GBuffer's dense copy, which inactive pixels have too.
 layout(r16ui, binding = CLOUD_BINDING_SHARED_FLAGS)
 Texture2D<uint16_t> SharedFlags;
 
@@ -289,9 +298,15 @@ bool startPath(uint2 pixel, CloudArgs cloud, AtmosphereArgs atmosphere, inout Re
   const float kmPerWorldUnit = 1.0f / max(cloud.worldUnitsPerKm, 1e-6f);
   float sceneDistanceKm = 1e9f;
   if (performedPsr && !transmittedSky) {
-    const float firstHit = PsrFirstHitDistance[pixel];
+    uvec2 psrCoordinate;
+    const bool hasPsrOutputs = compactedCoordinateFromPixelIfActive(
+      CompactedPixelIndices, TileActiveCounts, pixel, cb.sparseRenderingArgs, psrCoordinate);
+    const float firstHit = hasPsrOutputs ? PsrFirstHitDistance[psrCoordinate] : 0.0f;
     if (firstHit > 0.0f) {
       sceneDistanceKm = firstHit * kmPerWorldUnit;
+    } else if (!hasPsrOutputs) {
+      // A mirror at an inactive pixel is at no known distance, so it takes no layer, as in the screen pass.
+      sceneDistanceKm = 0.0f;
     }
   } else if (!primaryMiss && !transmittedSky) {
     sceneDistanceKm = length(cameraReconstructViewPosition(cb.camera, directions.viewDirection, linearViewZ)) * kmPerWorldUnit;

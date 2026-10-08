@@ -28,6 +28,7 @@
 
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/clouds/cloud_march.slangh"
+#include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 #include "rtx/utility/packing.slangh"
 
 layout(binding = CLOUD_BINDING_CAMERA)
@@ -47,8 +48,15 @@ Texture2D SkyViewLut;
 layout(binding = CLOUD_BINDING_GLOSSY_RAY, rg32ui)
 RWTexture2D<uint2> CloudGlossyRay;
 
+// Under sparse rendering at the pixel's compacted slot, which the two maps below resolve.
 layout(binding = CLOUD_BINDING_INDIRECT_RADIANCE, rgba16f)
 RWTexture2D<float4> IndirectRadianceHitDistance;
+
+layout(binding = CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
+Texture2D<uint16_t> CompactedPixelIndices;
+
+layout(binding = CLOUD_BINDING_TILE_ACTIVE_COUNTS)
+Texture2D<uint2> TileActiveCounts;
 
 static const uint kTileSize = 16;
 static const uint kThreads = 64;
@@ -59,6 +67,11 @@ groupshared uint tileRayCount;
 groupshared uint2 tileRays[kTileSize * kTileSize];
 
 void replaceDomeClouds(uint2 pixel, uint2 ray, CloudArgs cloud, AtmosphereArgs atmosphere) {
+  uvec2 radianceCoordinate;
+  if (!compactedCoordinateFromPixelIfActive(CompactedPixelIndices, TileActiveCounts, pixel, cb.sparseRenderingArgs, radianceCoordinate)) {
+    return;
+  }
+
   const vec3 worldDirection = snorm2x16ToSphereDirection(ray.y);
   const vec3 dirYUp = normalize(cloudWorldToYUp(worldDirection, atmosphere.isZUp != 0));
 
@@ -80,9 +93,9 @@ void replaceDomeClouds(uint2 pixel, uint2 ray, CloudArgs cloud, AtmosphereArgs a
   const vec3 dome = cloudCompositeOverSky(cloudSampleDome(CloudDome, CloudVolumeSampler, dirYUp, cloud), sky);
   const vec3 clouds = cloudCompositeOverSky(vec4(marched.radiance, marched.transmittance), sky);
 
-  vec4 radiance = IndirectRadianceHitDistance[pixel];
+  vec4 radiance = IndirectRadianceHitDistance[radianceCoordinate];
   radiance.rgb = max(radiance.rgb + r11g11b10ToColor(ray.x) * (clouds - dome), vec3(0.0f));
-  IndirectRadianceHitDistance[pixel] = radiance;
+  IndirectRadianceHitDistance[radianceCoordinate] = radiance;
 }
 
 [shader("compute")]

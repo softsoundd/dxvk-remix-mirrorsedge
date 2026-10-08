@@ -251,6 +251,8 @@ namespace dxvk {
         TEXTURE2D(CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE)
         TEXTURE2D(CLOUD_BINDING_PSR_REFLECTION_SEGMENT)
         TEXTURE2D(CLOUD_BINDING_PSR_REFLECTION_DIRECTION)
+        TEXTURE2D(CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
+        TEXTURE2D(CLOUD_BINDING_TILE_ACTIVE_COUNTS)
         TEXTURE2D(CLOUD_BINDING_SHARED_FLAGS)
         TEXTURE2D(CLOUD_BINDING_HISTORY)
         TEXTURE2D(CLOUD_BINDING_HISTORY_AGE)
@@ -278,6 +280,8 @@ namespace dxvk {
         TEXTURE2D(CLOUD_BINDING_SKY_VIEW_LUT)
         RW_TEXTURE2D(CLOUD_BINDING_GLOSSY_RAY)
         RW_TEXTURE2D(CLOUD_BINDING_INDIRECT_RADIANCE)
+        TEXTURE2D(CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
+        TEXTURE2D(CLOUD_BINDING_TILE_ACTIVE_COUNTS)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudGlossyShader);
@@ -290,6 +294,8 @@ namespace dxvk {
         CONSTANT_BUFFER(CLOUD_BINDING_CAMERA)
         TEXTURE2D(CLOUD_BINDING_PRIMARY_LINEAR_VIEW_Z)
         TEXTURE2D(CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE)
+        TEXTURE2D(CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
+        TEXTURE2D(CLOUD_BINDING_TILE_ACTIVE_COUNTS)
         TEXTURE2D(CLOUD_BINDING_SHARED_FLAGS)
         TEXTURE2D(CLOUD_BINDING_HISTORY)
         TEXTURE2D(CLOUD_BINDING_PHASE_CDF)
@@ -332,6 +338,20 @@ namespace dxvk {
     // The atmosphere's camera independent leading fields, the ones its own LUTs rebake on.
     uint64_t hashAtmosphere(const AtmosphereArgs& atmosphere, uint64_t hash) {
       return hashBytes(&atmosphere, offsetof(AtmosphereArgs, aerialPerspectiveLutSize), hash);
+    }
+
+    // Under the compacted GBuffer only active pixels hold the PSR outputs and the indirect radiance the passes read,
+    // at the slots these maps resolve.
+    void bindSparseRenderingPixelMaps(Rc<DxvkContext>& ctx, const Resources::RaytracingOutput& rtOutput) {
+      ctx->bindResourceView(CLOUD_BINDING_COMPACTED_PIXEL_INDICES, rtOutput.m_sparseRenderingCompactedPixelIndices.view, nullptr);
+      ctx->bindResourceView(CLOUD_BINDING_TILE_ACTIVE_COUNTS, rtOutput.m_sparseRenderingTileActiveCounts.view, nullptr);
+    }
+
+    // The passes read the flags by pixel, which under the compacted GBuffer only its dense copy holds for every pixel.
+    void bindSharedFlagsByPixel(Rc<DxvkContext>& ctx, const Resources::RaytracingOutput& rtOutput) {
+      const bool compactedGBuffer = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
+      ctx->bindResourceView(CLOUD_BINDING_SHARED_FLAGS,
+        compactedGBuffer ? rtOutput.m_sharedFlagsDense.view(Resources::AccessType::Read) : rtOutput.m_sharedFlags.view, nullptr);
     }
 
     // Jump flooding schedule over the 256 voxel torus, then one more unit pass (JFA+1), which catches most of
@@ -1571,7 +1591,8 @@ namespace dxvk {
     ctx->bindResourceView(CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE, rtOutput.m_secondaryHitDistance.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_PSR_REFLECTION_SEGMENT, rtOutput.m_secondaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_PSR_REFLECTION_DIRECTION, rtOutput.m_secondaryViewDirection.view(Resources::AccessType::Read), nullptr);
-    ctx->bindResourceView(CLOUD_BINDING_SHARED_FLAGS, rtOutput.m_sharedFlags.view, nullptr);
+    bindSparseRenderingPixelMaps(ctx, rtOutput);
+    bindSharedFlagsByPixel(ctx, rtOutput);
     ctx->bindResourceView(CLOUD_BINDING_HISTORY, m_layer[history].view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_HISTORY_AGE, m_layerAge[history].view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_DOME_LUT, m_dome[m_domeIndex].view, nullptr);
@@ -1635,6 +1656,7 @@ namespace dxvk {
     ctx->bindResourceView(CLOUD_BINDING_SKY_VIEW_LUT, rtxCtx.getAtmosphereSkyViewLutView(), nullptr);
     ctx->bindResourceView(CLOUD_BINDING_GLOSSY_RAY, m_glossyRay.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_INDIRECT_RADIANCE, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::ReadWrite), nullptr);
+    bindSparseRenderingPixelMaps(ctx, rtOutput);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_glossyRay.image);
 
     // A group per 16x16 tile (cloud_glossy.comp.slang).
@@ -1752,7 +1774,8 @@ namespace dxvk {
     ctx->bindResourceBuffer(CLOUD_BINDING_CAMERA, DxvkBufferSlice(raytraceConstants, 0, raytraceConstants->info().size));
     ctx->bindResourceView(CLOUD_BINDING_PRIMARY_LINEAR_VIEW_Z, rtOutput.m_primaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE, rtOutput.m_secondaryHitDistance.view, nullptr);
-    ctx->bindResourceView(CLOUD_BINDING_SHARED_FLAGS, rtOutput.m_sharedFlags.view, nullptr);
+    bindSparseRenderingPixelMaps(ctx, rtOutput);
+    bindSharedFlagsByPixel(ctx, rtOutput);
     ctx->bindResourceView(CLOUD_BINDING_HISTORY, m_compositeLayer.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_PHASE_CDF, m_phaseCdf.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_REFERENCE_ACCUMULATION, m_referenceAccumulation.view, nullptr);

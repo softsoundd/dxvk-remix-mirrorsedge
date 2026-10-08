@@ -37,6 +37,7 @@
 
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/clouds/cloud_march.slangh"
+#include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 #include "rtx/utility/geometry_flags.slangh"
 #include "rtx/utility/packing.slangh"
 #include "rtx/utility/debug_view_indices.h"
@@ -61,6 +62,14 @@ Texture2D<float> PsrReflectionSegmentLength;
 layout(binding = CLOUD_BINDING_PSR_REFLECTION_DIRECTION)
 Texture2D<float2> PsrReflectionDirection;
 
+// Under sparse rendering the three PSR outputs above sit at an active pixel's compacted slot, which these resolve.
+layout(binding = CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
+Texture2D<uint16_t> CompactedPixelIndices;
+
+layout(binding = CLOUD_BINDING_TILE_ACTIVE_COUNTS)
+Texture2D<uint2> TileActiveCounts;
+
+// Read by pixel: the compacted GBuffer's dense copy, which inactive pixels have too.
 layout(r16ui, binding = CLOUD_BINDING_SHARED_FLAGS)
 Texture2D<uint16_t> SharedFlags;
 
@@ -257,11 +266,17 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
   const bool perPixelPsr = (cloud.flags & CLOUD_FLAG_PSR_REFLECTIONS) != 0 && !cb.domeLightArgs.active;
   const bool transmittedSky = perPixelPsr && geometryFlags.performPSTR && linearViewZ == cb.primaryDirectMissLinearViewZ;
   const float kmPerWorldUnit = 1.0f / max(cloud.worldUnitsPerKm, 1e-6f);
+  uvec2 psrCoordinate;
+  const bool hasPsrOutputs = compactedCoordinateFromPixelIfActive(
+    CompactedPixelIndices, TileActiveCounts, pixel, cb.sparseRenderingArgs, psrCoordinate);
   float sceneDistanceKm = 1e9f;
   if (performedPsr && !transmittedSky) {
-    const float firstHit = PsrFirstHitDistance[pixel];
+    const float firstHit = hasPsrOutputs ? PsrFirstHitDistance[psrCoordinate] : 0.0f;
     if (firstHit > 0.0f) {
       sceneDistanceKm = firstHit * kmPerWorldUnit;
+    } else if (!hasPsrOutputs) {
+      // A mirror at an inactive pixel is at no known distance, so it takes no layer and ray reconstruction fills it in.
+      sceneDistanceKm = 0.0f;
     }
   } else if (!primaryMiss && !transmittedSky) {
     sceneDistanceKm = length(cameraReconstructViewPosition(cb.camera, directions.viewDirection, linearViewZ)) * kmPerWorldUnit;
@@ -332,16 +347,16 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
   // A mirror or glass (its reflection being its secondary surface) whose first reflection reached the sky takes
   // that sky's clouds along the exact reflected ray rather than from the dome, which the PSR miss left out. Only
   // glass's first reflection carries the throughput composite applies; its later ones carry none.
-  const bool mirrorReflectedSky = performedPsr && geometryFlags.performPSRR && PsrFirstHitDistance[pixel] > 0.0f
-    && PsrReflectionSegmentLength[pixel] < 0.0f;
+  const bool mirrorReflectedSky = performedPsr && geometryFlags.performPSRR && PsrFirstHitDistance[psrCoordinate] > 0.0f
+    && PsrReflectionSegmentLength[psrCoordinate] < 0.0f;
   const bool glassReflectedSky = geometryFlags.secondarySurfaceMask
-    && PsrReflectionSegmentLength[pixel] == cb.secondaryCombinedNrd.missLinearViewZ;
-  const bool reflectsSky = perPixelPsr && (mirrorReflectedSky || glassReflectedSky);
+    && PsrReflectionSegmentLength[psrCoordinate] == cb.secondaryCombinedNrd.missLinearViewZ;
+  const bool reflectsSky = perPixelPsr && hasPsrOutputs && (mirrorReflectedSky || glassReflectedSky);
   vec4 reflection = vec4(0.0f, 0.0f, 0.0f, 1.0f);
   float reflectionDepthKm = kReprojectionFallbackKm;
   if (reflectsSky)
   {
-    const vec3 reflectedWorld = signedOctahedralToSphereDirection(PsrReflectionDirection[pixel]);
+    const vec3 reflectedWorld = signedOctahedralToSphereDirection(PsrReflectionDirection[psrCoordinate]);
     CloudMarchSettings reflectionSettings = settings;
     reflectionSettings.maxDistanceKm = 1e9f;
     reflectionSettings.cameraDetail = false;

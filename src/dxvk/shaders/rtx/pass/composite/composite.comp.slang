@@ -951,10 +951,11 @@ vec4 compositeResult(
   float psrFirstHitDistance = -1.0f;
   float psrReflectionSegmentSigned = 0.0f;
   float3 psrReflectionDirection = float3(0.0f, 0.0f, 0.0f);
+  // The PSR inputs are secondary GBuffer outputs, which only active pixels store; inactive ones take default flags.
   const bool performedPsr = geometryFlags.performedAnyPSR() && !geometryFlags.secondarySurfaceMask;
   if (performedPsr)
   {
-    const float firstHit = PsrFirstHitDistance[pixelCoordinate];
+    const float firstHit = PsrFirstHitDistance[compactedCoordinate];
     if (firstHit > 0.0f)
     {
       volumeHitDistance = firstHit;
@@ -963,8 +964,8 @@ vec4 compositeResult(
       if (geometryFlags.performPSRR)
       {
         psrFirstHitDistance = firstHit;
-        psrReflectionSegmentSigned = PsrReflectionSegmentLength[pixelCoordinate];
-        psrReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[pixelCoordinate]);
+        psrReflectionSegmentSigned = PsrReflectionSegmentLength[compactedCoordinate];
+        psrReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[compactedCoordinate]);
       }
     }
   }
@@ -981,7 +982,7 @@ vec4 compositeResult(
     if (indirectSegment != 0.0f && reflectionFogReflectance >= cb.volumeArgs.reflectionFogMinSpecularAlbedo)
     {
       const float3 shadingNormal =
-        PrimaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].xyz * 2.0f - 1.0f;
+        PrimaryVirtualWorldNormalPerceptualRoughness[compactedCoordinate].xyz * 2.0f - 1.0f;
 
       psrFirstHitDistance = viewDistance;
       psrReflectionSegmentSigned = indirectSegment;
@@ -1001,7 +1002,14 @@ vec4 compositeResult(
   vec3 radianceOutput;
   vec3 sharedFinalOutput;
 
-  const float radianceScale = calculateRadianceScale(pixelCoordinate, pixelIsActive, primaryMiss);
+  // Primary misses only carry sky in SharedRadiance when the atmosphere supplied it; skybox and
+  // dome light misses are composited later from the sky matte and must stay pre-attenuated.
+  const bool primarySkyMiss = primaryMiss
+    && cb.volumeArgs.physicalAtmosphereEnabled
+    && !cb.domeLightArgs.active;
+
+  // The GBuffer resolves that sky at every pixel, active or not, so what composites over it stays at full scale too.
+  const float radianceScale = primarySkyMiss ? 1.0f : calculateRadianceScale(pixelCoordinate, pixelIsActive, primaryMiss);
   const float volumetricRadianceScale = calculateVolumetricRadianceScale(pixelCoordinate, pixelIsActive, primaryMiss);
 
   // Load Input Radiance
@@ -1034,11 +1042,6 @@ vec4 compositeResult(
   const bool psrReflectionSkyMiss = geometryFlags.performPSRR
     && !geometryFlags.secondarySurfaceMask
     && psrReflectionSegmentSigned < 0.0f;
-  // Primary misses only carry sky in SharedRadiance when the atmosphere supplied it; skybox and
-  // dome light misses are composited later from the sky matte and must stay pre-attenuated.
-  const bool primarySkyMiss = primaryMiss
-    && cb.volumeArgs.physicalAtmosphereEnabled
-    && !cb.domeLightArgs.active;
   const bool attenuateSharedAsSky = primarySkyMiss || psrReflectionSkyMiss;
   vec3 skyVolumeAttenuation = volumeAttenuation;
   if (attenuateSharedAsSky && cb.volumeArgs.physicalAtmosphereEnabled)
@@ -1086,9 +1089,9 @@ vec4 compositeResult(
 
     // Glass's reflected sky, a miss of its secondary surface, which the fog leaves alone like the sky through it.
     if (cloudsMarchedPerPixel && geometryFlags.secondarySurfaceMask
-      && PsrReflectionSegmentLength[pixelCoordinate] == cb.secondaryCombinedMissLinearViewZ)
+      && PsrReflectionSegmentLength[compactedCoordinate] == cb.secondaryCombinedMissLinearViewZ)
     {
-      const vec3 glassReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[pixelCoordinate]);
+      const vec3 glassReflectionDirection = signedOctahedralToSphereDirection(PsrReflectionDirection[compactedCoordinate]);
       radianceOutput += aerialPerspectiveTransmittance * secondaryAttenuation
         * evalCloudOverMissSky(CloudReflection[pixelCoordinate], glassReflectionDirection);
     }

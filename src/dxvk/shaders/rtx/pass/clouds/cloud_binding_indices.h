@@ -89,3 +89,7 @@
 
 // The screen pass's layer along mirrors' and glass's reflections a frame ago.
 #define CLOUD_BINDING_REFLECTION_HISTORY         51
+
+// Sparse rendering's map from a pixel to the compacted slot that holds its secondary GBuffer and indirect radiance.
+#define CLOUD_BINDING_COMPACTED_PIXEL_INDICES    52
+#define CLOUD_BINDING_TILE_ACTIVE_COUNTS         53

@@ -2941,9 +2941,10 @@ void geometryPSRResolverVertex(
       // Composite lays the marched clouds and the sun over this sky at the throughput stored here: the chain's
       // attenuation, which a miss otherwise leaves unwritten, times the march's share. The sun is left to it, since
       // taken back out at the attenuation's few mantissa bits it would trace through clouds that hide it. Other glass
-      // misses store zero.
+      // misses store zero. A pixel without a GBuffer slot has nowhere to store the throughput, so it keeps the dome.
       float marchedShare = 0.0f;
-      if (cb.cloudArgs.enabled && (cb.cloudArgs.flags & CLOUD_FLAG_PSR_REFLECTIONS) != 0)
+      const uvec2 compactedCoordinate = geometryPSRResolverState.compactedCoordinate;
+      if (cb.cloudArgs.enabled && (cb.cloudArgs.flags & CLOUD_FLAG_PSR_REFLECTIONS) != 0 && hasGBufferSlot(compactedCoordinate))
       {
         const ivec2 pixel = ivec2(geometryPSRResolverState.pixelCoordinate);
         const vec3 skyThroughput = radianceAttenuation * geometryPSRResolverState.attenuation;
@@ -2951,24 +2952,24 @@ void geometryPSRResolverVertex(
         {
           const vec3 cameraDirection = cameraPixelCoordinateToDirection(cb.camera, pixel).worldDirection;
           marchedShare = cloudGlassTransmissionWeight(dot(ray.direction, cameraDirection));
-          imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(skyThroughput * marchedShare));
+          imageStore(PrimaryAttenuation, ivec2(compactedCoordinate), colorToR11G11B10(skyThroughput * marchedShare));
         }
         else if (geometryPSRResolverState.primarySurface)
         {
           if (geometryPSRResolverState.bounceIteration == 1
-            && !geometryFlagsReadFromGBuffer(geometryPSRResolverState.pixelCoordinate, SharedFlags).secondarySurfaceMask)
+            && !geometryResolverReadFlags(geometryPSRResolverState.pixelCoordinate).secondarySurfaceMask)
           {
             marchedShare = 1.0f;
-            imageStore(PrimaryAttenuation, pixel, colorToR11G11B10(skyThroughput));
+            imageStore(PrimaryAttenuation, ivec2(compactedCoordinate), colorToR11G11B10(skyThroughput));
           }
         }
         else
         {
           marchedShare = geometryPSRResolverState.bounceIteration == 1 ? 1.0f : 0.0f;
-          imageStore(SecondaryAttenuation, pixel, colorToR11G11B10(skyThroughput * marchedShare));
+          imageStore(SecondaryAttenuation, ivec2(compactedCoordinate), colorToR11G11B10(skyThroughput * marchedShare));
           if (marchedShare > 0.0f)
           {
-            SecondaryViewDirection[pixel] = sphereDirectionToSignedOctahedral(ray.direction);
+            SecondaryViewDirection[compactedCoordinate] = sphereDirectionToSignedOctahedral(ray.direction);
           }
         }
       }
@@ -2994,10 +2995,10 @@ void geometryPSRResolverVertex(
   // Bounce 1 stashes reflection segment length + direction for composite froxel integrate.
   // Do not use SecondaryWorldPosition (aliased with IndirectRayOriginDirection).
   // bounceIteration is 1-based after the loop increment.
-  if (geometryPSRResolverState.bounceIteration == 1 && !geometryPSRResolverState.isTransmissionPSR)
+  if (geometryPSRResolverState.bounceIteration == 1 && !geometryPSRResolverState.isTransmissionPSR &&
+      hasGBufferSlot(geometryPSRResolverState.compactedCoordinate))
   {
-    const GeometryFlags gf = geometryFlagsReadFromGBuffer(
-      geometryPSRResolverState.pixelCoordinate, SharedFlags);
+    const GeometryFlags gf = geometryResolverReadFlags(geometryPSRResolverState.pixelCoordinate);
     if (!gf.secondarySurfaceMask)
     {
       const bool reflHit = rayInteractionHasHit(rayInteraction);
@@ -3005,9 +3006,9 @@ void geometryPSRResolverVertex(
         ? geometryPSRResolverState.segmentHitDistance
         : cb.volumeArgs.froxelMaxDistance;
       // Negative length ⇒ reflection sky miss (infinite froxel/atmosphere tail).
-      SecondaryLinearViewZ[geometryPSRResolverState.pixelCoordinate] =
+      SecondaryLinearViewZ[geometryPSRResolverState.compactedCoordinate] =
         reflHit ? segmentLength : -segmentLength;
-      SecondaryViewDirection[geometryPSRResolverState.pixelCoordinate] =
+      SecondaryViewDirection[geometryPSRResolverState.compactedCoordinate] =
         sphereDirectionToSignedOctahedral(geometryPSRResolverState.direction);
     }
   }

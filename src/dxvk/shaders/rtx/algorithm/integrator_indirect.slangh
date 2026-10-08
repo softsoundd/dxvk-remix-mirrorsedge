@@ -36,6 +36,7 @@
 #include "rtx/pass/nrc/nrc_integrator_utilities.slangh"
 #include "rtx/pass/sharc/sharc_integrator_utilities.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
+#include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/algorithm/cloud_lighting_helpers.slangh"
 
@@ -208,6 +209,15 @@ NrcProgressState updateNrcOnHit(
   return nrcProgressState;
 }
 
+// The flags of the primary surface a query path starts from, which the compacted GBuffer stores at its pixel's slot.
+GeometryFlags loadPathPrimaryGeometryFlags(PathState pathState)
+{
+  const uvec2 compactedCoordinate = compactedCoordinateFromPixel(
+    CompactedPixelIndices, TileActiveCounts, pathState.pixelCoordinate, cb.sparseRenderingArgs);
+
+  return geometryFlagsReadFromGBuffer(ivec2(compactedCoordinate), SharedFlags);
+}
+
 // A near-mirror's first bounce into the sky, whose dome clouds cloud_glossy.comp.slang replaces in this pixel's
 // indirect radiance. The path's radiance keeps them, since ReSTIR GI may share it with other pixels.
 void stashCloudGlossyRay(PathState pathState, vec3 radianceAttenuation)
@@ -232,7 +242,7 @@ void stashCloudGlossyRay(PathState pathState, vec3 radianceAttenuation)
   }
 
   const float weight = cloudGlossyReflectionWeight(calcRoughness(pathState.gbufferPerceptualRoughness));
-  if (weight <= 0.0f || !geometryFlagsReadFromGBuffer(pathState.pixelCoordinate, SharedFlags).firstSampledLobeIsSpecular)
+  if (weight <= 0.0f || !loadPathPrimaryGeometryFlags(pathState).firstSampledLobeIsSpecular)
   {
     return;
   }
@@ -402,8 +412,7 @@ void integratePathVertex(
 
   if (stashReflectionSegment)
   {
-    const GeometryFlags primaryGeometryFlags =
-      geometryFlagsReadFromGBuffer(pathState.pixelCoordinate, SharedFlags);
+    const GeometryFlags primaryGeometryFlags = loadPathPrimaryGeometryFlags(pathState);
 
     if (!primaryGeometryFlags.performedAnyPSR() && !primaryGeometryFlags.secondarySurfaceMask)
     {
