@@ -509,6 +509,10 @@ namespace dxvk {
     // Destroy all OMM requests associated with the instance
     XXH64_hash_t ommSrcHash = getOpacityMicromapHash(instance);
     if (ommSrcHash != kEmptyHash) {
+      // A staged request that no instance repeats would otherwise keep its slot, and once maxRequests are staged no new
+      // request is accepted. Other instances sharing the hash restage it on their next request.
+      m_ommBuildRequestStatistics.erase(ommSrcHash);
+
       auto instanceOmmRequestsIter = m_instanceOmmRequests.find(ommSrcHash);
 
       if (instanceOmmRequestsIter != m_instanceOmmRequests.end()) {
@@ -1002,6 +1006,29 @@ namespace dxvk {
 
   void OpacityMicromapManager::onInstanceDestroyed(const RtInstance& instance) {
     destroyInstance(instance);
+  }
+
+  void OpacityMicromapManager::markOmmsUsed(Rc<DxvkContext> ctx, const std::vector<XXH64_hash_t>& ommSrcHashes) {
+    const uint32_t currentFrameIndex = m_device->getCurrentFrameId();
+
+    for (const XXH64_hash_t ommSrcHash : ommSrcHashes) {
+      auto ommCacheItemIter = m_ommCache.find(ommSrcHash);
+      if (ommCacheItemIter == m_ommCache.end()) {
+        continue;
+      }
+
+      OpacityMicromapCacheItem& ommCacheItem = ommCacheItemIter->second;
+      if (ommCacheItem.lastUseFrameIndex == currentFrameIndex) {
+        continue;
+      }
+
+      ommCacheItem.lastUseFrameIndex = currentFrameIndex;
+      m_leastRecentlyUsedList.splice(m_leastRecentlyUsedList.end(), m_leastRecentlyUsedList, ommCacheItem.leastRecentlyUsedListIter);
+
+      if (ommCacheItem.blasOmmBuffers.ptr()) {
+        ctx->getCommandList()->trackResource<DxvkAccess::Read>(ommCacheItem.blasOmmBuffers);
+      }
+    }
   }
 
   bool OpacityMicromapManager::calculateInstanceUsesOpacityMicromap(const RtInstance& instance) {
@@ -2533,6 +2560,11 @@ namespace dxvk {
             }
 
             const uint32_t cacheItemUsageFrameAge = currentFrameIndex - cacheItemIter->second.lastUseFrameIndex;
+
+            // Every item from here on was used in this frame or the previous one, whose BLASes a previous TLAS still
+            // references, so none may be evicted, even when the budget shrank.
+            if (cacheItemUsageFrameAge <= 1)
+              break;
 
             // Stop eviction once an item is recent enough
             if (cacheItemUsageFrameAge < OpacityMicromapOptions::Cache::minUsageFrameAgeBeforeEviction() &&

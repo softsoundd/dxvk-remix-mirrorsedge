@@ -251,6 +251,8 @@ namespace dxvk {
         TEXTURE2D(CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE)
         TEXTURE2D(CLOUD_BINDING_PSR_REFLECTION_SEGMENT)
         TEXTURE2D(CLOUD_BINDING_PSR_REFLECTION_DIRECTION)
+        TEXTURE2D(CLOUD_BINDING_PRIMARY_ATTENUATION)
+        TEXTURE2D(CLOUD_BINDING_SECONDARY_ATTENUATION)
         TEXTURE2D(CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
         TEXTURE2D(CLOUD_BINDING_TILE_ACTIVE_COUNTS)
         TEXTURE2D(CLOUD_BINDING_SHARED_FLAGS)
@@ -441,11 +443,13 @@ namespace dxvk {
 
   uint64_t RtxClouds::computeInputsKey(const CloudArgs& args, const AtmosphereArgs& atmosphere) {
     // The frame's own fields (index, history flags, debug view, pixel footprint, motion steps), the per pixel
-    // reflection paths no bake reads, the camera's and the windows' positions, which the bakes track themselves,
-    // and the wind's offset, which carries the field and the bakes anchored to it alike.
+    // reflection paths and the screen march's checkerboard, which no bake reads, the camera's and the windows'
+    // positions, which the bakes track themselves, and the wind's offset, which carries the field and the bakes
+    // anchored to it alike.
     CloudArgs invariant = args;
     invariant.frameIndex = 0;
-    invariant.flags &= ~(CLOUD_FLAG_HISTORY_VALID | CLOUD_FLAG_SHADOW_MAP_VALID | CLOUD_FLAG_PSR_REFLECTIONS | CLOUD_FLAG_GLOSSY_REFLECTIONS);
+    invariant.flags &= ~(CLOUD_FLAG_HISTORY_VALID | CLOUD_FLAG_SHADOW_MAP_VALID | CLOUD_FLAG_PSR_REFLECTIONS | CLOUD_FLAG_GLOSSY_REFLECTIONS |
+                         CLOUD_FLAG_CHECKERBOARD);
     invariant.debugView = 0;
     invariant.cameraPositionKm = Vector3(0.0f);
     invariant.cameraWorldHeightKm = 0.0f;
@@ -811,6 +815,7 @@ namespace dxvk {
     a.flags |= reflectionDome() ? CLOUD_FLAG_DOME : 0u;
     a.flags |= mirrorReflectionMarch() ? CLOUD_FLAG_PSR_REFLECTIONS : 0u;
     a.flags |= glossyReflectionMarch() ? CLOUD_FLAG_GLOSSY_REFLECTIONS : 0u;
+    a.flags |= checkerboardMarch() ? CLOUD_FLAG_CHECKERBOARD : 0u;
     a.flags |= hexTiling() ? CLOUD_FLAG_HEX_TILING : 0u;
     a.flags |= m_screenHistoryValid ? CLOUD_FLAG_HISTORY_VALID : 0u;
     a.flags |= m_shadowMapState.valid ? CLOUD_FLAG_SHADOW_MAP_VALID : 0u;
@@ -1603,6 +1608,8 @@ namespace dxvk {
     ctx->bindResourceView(CLOUD_BINDING_PSR_FIRST_HIT_DISTANCE, rtOutput.m_secondaryHitDistance.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_PSR_REFLECTION_SEGMENT, rtOutput.m_secondaryLinearViewZ.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_PSR_REFLECTION_DIRECTION, rtOutput.m_secondaryViewDirection.view(Resources::AccessType::Read), nullptr);
+    ctx->bindResourceView(CLOUD_BINDING_PRIMARY_ATTENUATION, rtOutput.m_primaryAttenuation.view, nullptr);
+    ctx->bindResourceView(CLOUD_BINDING_SECONDARY_ATTENUATION, rtOutput.m_secondaryAttenuation.view, nullptr);
     bindSparseRenderingPixelMaps(ctx, rtOutput);
     bindSharedFlagsByPixel(ctx, rtOutput);
     ctx->bindResourceView(CLOUD_BINDING_HISTORY, m_layer[history].view, nullptr);

@@ -62,7 +62,14 @@ Texture2D<float> PsrReflectionSegmentLength;
 layout(binding = CLOUD_BINDING_PSR_REFLECTION_DIRECTION)
 Texture2D<float2> PsrReflectionDirection;
 
-// Under sparse rendering the three PSR outputs above sit at an active pixel's compacted slot, which these resolve.
+// Composite scales a mirror's reflected clouds by the primary attenuation and glass's by the secondary.
+layout(binding = CLOUD_BINDING_PRIMARY_ATTENUATION)
+Texture2D<uint> PrimaryAttenuation;
+
+layout(binding = CLOUD_BINDING_SECONDARY_ATTENUATION)
+Texture2D<uint> SecondaryAttenuation;
+
+// Under sparse rendering the PSR outputs above sit at an active pixel's compacted slot, which these resolve.
 layout(binding = CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
 Texture2D<uint16_t> CompactedPixelIndices;
 
@@ -121,6 +128,12 @@ static const float kHiddenMark = -1.0f;
 
 // Frames of history past which the age is not counted: well past where the tiers' blend weights take over.
 static const float kMaxHistoryAge = 64.0f;
+
+// A reflection whose throughput is at most this marches at cloudReflectionMarchSettings,
+// which near-mirrors use at full weight in cloud_glossy.comp.slang.
+// Composite scales the layer by the throughput, which dims the coarser march's grain with it.
+// Glass short of grazing falls below this, while mirrors keep the view's settings.
+static const float kDimReflectionThroughput = 0.5f;
 
 // A history at uv, bilinearly over the texels that carry a layer, and with withAge the frames it holds there.
 // weight: those texels' share of the footprint.
@@ -293,12 +306,25 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
   settings.fringeStepScale = 0.5f;
 
   const float jitter = BlueNoise[uint3(pixel & 127u, cloud.frameIndex & 63u)].x;
-  const CloudMarchResult result = cloudMarch(dirYUp, settings, jitter, cloud, atmosphere);
-  const vec4 current = vec4(result.radiance, result.transmittance);
-  const bool hidden = sceneDistanceKm < 1e8f && result.firstHitKm < 0.0f;
+
+  // Half the rays into the layer march each frame, alternating in a checkerboard. The others keep their history,
+  // which is the filtered layer of their last march, until their next march clamps it to the current frame again.
+  // A ray with no history, such as one into sky just uncovered, marches anyway.
+  // The cloud debug views show the march's own result, so every ray marches while one is active.
+  const bool historyEnabled = (cloud.flags & CLOUD_FLAG_HISTORY_VALID) != 0 && cloud.historyBlend < 1.0f;
+  const bool cloudDebugView = cloud.debugView >= DEBUG_VIEW_CLOUD_MIN && cloud.debugView <= DEBUG_VIEW_CLOUD_MAX;
+  const bool rests = (cloud.flags & CLOUD_FLAG_CHECKERBOARD) != 0 && historyEnabled && !cloudDebugView
+    && ((pixel.x + pixel.y + cloud.frameIndex) & 1u) != 0u
+    && cloudRayEntersLayer(dirYUp, sceneDistanceKm, cloud, atmosphere);
+  CloudMarchResult result = cloudEmptyMarchResult();
+  if (!rests) {
+    result = cloudMarch(dirYUp, settings, jitter, cloud, atmosphere);
+  }
+  vec4 current = vec4(result.radiance, result.transmittance);
+  bool hidden = !rests && sceneDistanceKm < 1e8f && result.firstHitKm < 0.0f;
 
   // Neighbourhood of the current frame within the tile, the range the history is clamped to.
-  tileLayer[localId.y][localId.x] = hidden ? vec4(0.0f, 0.0f, 0.0f, kHiddenMark) : current;
+  tileLayer[localId.y][localId.x] = hidden || rests ? vec4(0.0f, 0.0f, 0.0f, kHiddenMark) : current;
   tileDepth[localId.y][localId.x] = vec2(result.meanDepthKm, result.meanDepthKm > 0.0f ? 1.0f - result.transmittance : 0.0f);
   GroupMemoryBarrierWithGroupSync();
   vec4 neighbourhoodMin = current;
@@ -318,15 +344,38 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
       neighbourhoodDepth += vec2(depth.x * depth.y, depth.y);
     }
   }
+  const float neighbourhoodDepthKm = neighbourhoodDepth.y > 1e-4f
+    ? neighbourhoodDepth.x / neighbourhoodDepth.y
+    : kReprojectionFallbackKm;
   const vec3 pixelDirection = cameraPixelCoordinateToDirection(cb.camera, ivec2(pixel), false).worldDirection;
-
-  // A ray that met no cloud has exactly no layer, which no history may blur onto it.
-  const bool reachedClouds = result.firstHitKm >= 0.0f;
 
   vec4 filtered = current;
   float historyWeight = 0.0f;
   float age = 1.0f;
-  if ((cloud.flags & CLOUD_FLAG_HISTORY_VALID) != 0 && cloud.historyBlend < 1.0f && reachedClouds) {
+  if (rests) {
+    // The history is reprojected at the marching neighbours' cloud depth.
+    const float reprojectionKm = min(neighbourhoodDepthKm, sceneDistanceKm);
+    const vec3 worldPosition = cloudPreviousWorldPosition(pixelDirection, reprojectionKm, cloud, atmosphere);
+    const vec2 previousUv = cameraNDCToScreenUV(cb.camera, cameraWorldPosToPrevNDC(cb.camera, worldPosition));
+    float footprint = 0.0f;
+    float historyAge = 0.0f;
+    const vec4 history = sampleHistory(CloudLayerHistory, true, previousUv, footprint, historyAge);
+    if (all(previousUv > vec2(0.0f)) && all(previousUv < vec2(1.0f)) && footprint > 0.0f) {
+      filtered = history;
+      historyWeight = 1.0f;
+      age = historyAge;
+    } else {
+      result = cloudMarch(dirYUp, settings, jitter, cloud, atmosphere);
+      current = vec4(result.radiance, result.transmittance);
+      hidden = sceneDistanceKm < 1e8f && result.firstHitKm < 0.0f;
+      filtered = current;
+    }
+  }
+
+  // A ray that met no cloud has exactly no layer, which no history may blur onto it.
+  const bool reachedClouds = result.firstHitKm >= 0.0f;
+
+  if (!rests && historyEnabled && reachedClouds) {
     // The pixel's centre, without this frame's jitter, at the cloud's depth, back where the cloud was a frame ago.
     const float reprojectionKm = min(result.meanDepthKm > 0.0f ? result.meanDepthKm : kReprojectionFallbackKm, sceneDistanceKm);
     const vec3 worldPosition = cloudPreviousWorldPosition(pixelDirection, reprojectionKm, cloud, atmosphere);
@@ -357,9 +406,16 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
   if (reflectsSky)
   {
     const vec3 reflectedWorld = signedOctahedralToSphereDirection(PsrReflectionDirection[psrCoordinate]);
-    CloudMarchSettings reflectionSettings = settings;
-    reflectionSettings.maxDistanceKm = 1e9f;
-    reflectionSettings.cameraDetail = false;
+    const uint packedThroughput = glassReflectedSky
+      ? SecondaryAttenuation[psrCoordinate]
+      : PrimaryAttenuation[psrCoordinate];
+    const vec3 throughput = r11g11b10ToColor(packedThroughput);
+    CloudMarchSettings reflectionSettings = cloudReflectionMarchSettings(cloud);
+    if (max(throughput.r, max(throughput.g, throughput.b)) > kDimReflectionThroughput) {
+      reflectionSettings = settings;
+      reflectionSettings.maxDistanceKm = 1e9f;
+      reflectionSettings.cameraDetail = false;
+    }
     const CloudMarchResult reflected = cloudMarch(
       normalize(cloudWorldToYUp(reflectedWorld, atmosphere.isZUp != 0)), reflectionSettings, jitter, cloud, atmosphere);
     reflection = vec4(reflected.radiance, reflected.transmittance);
@@ -413,14 +469,14 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
   // cloud each sample met, which a thin edge's own sample often misses; faded in over the first tenth of cover.
   const float motionWeight = smoothstep(0.0f, 0.1f, 1.0f - saturate(filtered.a));
   if ((primaryMiss || transmittedSky) && motionWeight > 0.0f) {
-    const float depthKm = neighbourhoodDepth.y > 1e-4f ? neighbourhoodDepth.x / neighbourhoodDepth.y : kReprojectionFallbackKm;
-    const vec2 previousNdc = cameraWorldPosToPrevNDC(cb.camera, cloudPreviousWorldPosition(pixelDirection, depthKm, cloud, atmosphere));
+    const vec3 previousPosition = cloudPreviousWorldPosition(pixelDirection, neighbourhoodDepthKm, cloud, atmosphere);
+    const vec2 previousNdc = cameraWorldPosToPrevNDC(cb.camera, previousPosition);
     const vec2 cloudMotion = cameraCalcMotionVectorPixel(cb.camera, cameraPixelCoordinateToNDC(cb.camera, ivec2(pixel)), previousNdc);
     PrimaryScreenSpaceMotionVector[pixel] = lerp(PrimaryScreenSpaceMotionVector[pixel], cloudMotion, motionWeight);
     PrimaryScreenSpaceMotionVectorDLSSRR[pixel] = lerp(PrimaryScreenSpaceMotionVectorDLSSRR[pixel], cloudMotion, motionWeight);
   }
 
-  if (cloud.debugView >= DEBUG_VIEW_CLOUD_MIN && cloud.debugView <= DEBUG_VIEW_CLOUD_MAX) {
+  if (cloudDebugView) {
     writeDebugView(pixel, result, filtered, historyWeight, dirYUp, directions.worldDirection, sceneDistanceKm, cloud, atmosphere);
   }
 }

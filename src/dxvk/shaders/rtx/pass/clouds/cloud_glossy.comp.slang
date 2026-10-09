@@ -75,16 +75,7 @@ void replaceDomeClouds(uint2 pixel, uint2 ray, CloudArgs cloud, AtmosphereArgs a
   const vec3 worldDirection = snorm2x16ToSphereDirection(ray.y);
   const vec3 dirYUp = normalize(cloudWorldToYUp(worldDirection, atmosphere.isZUp != 0));
 
-  // From the eye, like the mirrors' march, at the dome's settings for reflections but the pixel's footprint.
-  CloudMarchSettings settings;
-  settings.maxSamples = max(cloud.viewSamplesMax / 2u, 32u);
-  settings.stepKm = max(cloud.viewStepKm * 2.0f, 0.2f);
-  settings.minStepKm = max(cloud.adaptiveStepKm * 4.0f, 0.1f);
-  settings.maxDistanceKm = 1e9f;
-  settings.footprintPerKm = cloud.pixelAngle;
-  settings.fineShadowTaps = min(cloud.shadowTaps, 1u);
-  settings.cameraDetail = false;
-  settings.fringeStepScale = 1.0f;
+  const CloudMarchSettings settings = cloudReflectionMarchSettings(cloud);
   const float jitter = BlueNoise[uint3(pixel & 127u, cloud.frameIndex & 63u)].y;
   const CloudMarchResult marched = cloudMarch(dirYUp, settings, jitter, cloud, atmosphere);
 

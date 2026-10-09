@@ -60,6 +60,7 @@ class AccelManager : public CommonDeviceObject {
     bool usesUnorderedApproximations = false;
     uint32_t reorderedSurfacesOffset = UINT32_MAX;
     bool hasOmmInstances = false;
+    std::vector<XXH64_hash_t> boundOmmHashes {};  // Lists each OMM bound to the bucket's geometries once.
     bool hasSssInstances = false;
     // NV-DXVK start: churn-aware bucketing
     // Buckets holding instances that move or animate every frame are kept apart from the static
@@ -279,6 +280,8 @@ private:
     std::vector<uint32_t> indexOffsets;
     // The PooledBlas assigned to this bucket (kept alive via Rc)
     Rc<PooledBlas> assignedBlas;
+    // Lists the OMMs the assigned BLAS was built with, which it references until it is rebuilt.
+    std::vector<XXH64_hash_t> boundOmmHashes;
     // TLAS instance template (surface offset must be adjusted each frame)
     VkAccelerationStructureInstanceKHR tlasInstance {};
     // Which TLAS type(s) this bucket was emitted to

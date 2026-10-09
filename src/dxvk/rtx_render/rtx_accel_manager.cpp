@@ -565,6 +565,14 @@ namespace dxvk {
     auto& instances = instanceManager.getInstanceTable();
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
+    // Cached merged BLASes are reused without rebinding their OMMs, so the OMMs are marked as used before the OMM
+    // manager's frame start evicts unused ones.
+    if (opacityMicromapManager) {
+      for (const CachedBucketState& cachedBucket : m_cachedBuckets) {
+        opacityMicromapManager->markOmmsUsed(ctx, cachedBucket.boundOmmHashes);
+      }
+    }
+
     // --- Full-skip fast path ---
     // If no scene changes occurred since the last build, we can reuse all cached
     // BLAS/TLAS data and skip the expensive per-instance iteration, bucket merging,
@@ -1281,6 +1289,7 @@ namespace dxvk {
         }
         cached.surfaces = bucket->originalInstances;
         cached.indexOffsets = bucket->indexOffsets;
+        cached.boundOmmHashes = bucket->boundOmmHashes;
         cached.isUnordered = bucket->usesUnorderedApproximations;
         cached.hasSssInstances = bucket->hasSssInstances;
         cached.churning = bucket->churning;
@@ -2072,6 +2081,10 @@ namespace dxvk {
                                                          blasBucket->geometries[i], instanceManager);
           if (ommSourceHash != kEmptyHash) {
             blasBucket->hasOmmInstances = true;
+            std::vector<XXH64_hash_t>& bound = blasBucket->boundOmmHashes;
+            if (std::find(bound.begin(), bound.end(), ommSourceHash) == bound.end()) {
+              bound.push_back(ommSourceHash);
+            }
           }
         }
       }

@@ -70,6 +70,21 @@ struct CloudMarchSettings {
   float fringeStepScale; // Step scale in a cloud's fringes, 1 = none
 };
 
+// Returns the settings of a reflection's march from the eye.
+// They are the dome's reflection settings, but at the pixel's footprint.
+CloudMarchSettings cloudReflectionMarchSettings(CloudArgs cloud) {
+  CloudMarchSettings settings;
+  settings.maxSamples = max(cloud.viewSamplesMax / 2u, 32u);
+  settings.stepKm = max(cloud.viewStepKm * 2.0f, 0.2f);
+  settings.minStepKm = max(cloud.adaptiveStepKm * 4.0f, 0.1f);
+  settings.maxDistanceKm = 1e9f;
+  settings.footprintPerKm = cloud.pixelAngle;
+  settings.fineShadowTaps = min(cloud.shadowTaps, 1u);
+  settings.cameraDetail = false;
+  settings.fringeStepScale = 1.0f;
+  return settings;
+}
+
 // A step's optical depth below which a fringe step is refined.
 static const float kFringeOpticalDepth = 0.1f;
 
@@ -141,13 +156,35 @@ float cloudMarchSample(
   return extinction;
 }
 
-CloudMarchResult cloudMarch(vec3 dirYUp, CloudMarchSettings settings, float jitter, CloudArgs cloud, AtmosphereArgs atmosphere) {
+// Returns whether a ray enters the layer within maxDistanceKm, the bound cloudMarch applies.
+bool cloudRayEntersLayer(vec3 dirYUp, float maxDistanceKm, CloudArgs cloud, AtmosphereArgs atmosphere) {
+  if (!cloud.enabled) {
+    return false;
+  }
+  for (int piece = 0; piece < 2; ++piece) {
+    float tEntry;
+    float tExit;
+    if (cloudSlabSpan(dirYUp, cloud, atmosphere.planetRadius, piece, tEntry, tExit)
+        && min(tExit, min(maxDistanceKm, cloud.maxMarchKm)) > tEntry) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Returns the result of a ray that meets no cloud.
+CloudMarchResult cloudEmptyMarchResult() {
   CloudMarchResult result;
   result.radiance = vec3(0.0f);
   result.transmittance = 1.0f;
   result.firstHitKm = -1.0f;
   result.meanDepthKm = -1.0f;
   result.sampleCount = 0.0f;
+  return result;
+}
+
+CloudMarchResult cloudMarch(vec3 dirYUp, CloudMarchSettings settings, float jitter, CloudArgs cloud, AtmosphereArgs atmosphere) {
+  CloudMarchResult result = cloudEmptyMarchResult();
 
   if (!cloud.enabled) {
     return result;

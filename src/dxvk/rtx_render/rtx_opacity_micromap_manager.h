@@ -469,6 +469,10 @@ namespace dxvk {
     // meaning affected BLASes should be rebuilt to bind them.
     bool hasNewlyBuiltOmms() const { return m_hasNewlyBuiltOmms; }
 
+    // Marks the OMMs a BLAS was built with as used this frame, for a BLAS that is reused without rebinding them.
+    // The BLAS references them on the GPU until it is rebuilt, so they must stay alive and must not be evicted.
+    void markOmmsUsed(Rc<DxvkContext> ctx, const std::vector<XXH64_hash_t>& ommSrcHashes);
+
     // Returns true if OMM option changes require all BLASes to be rebuilt
     // (e.g. binding or building options toggled).  Cleared after reading.
     bool consumeNeedsBlasRebuild() {

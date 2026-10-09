@@ -93,3 +93,7 @@
 // Sparse rendering's map from a pixel to the compacted slot that holds its secondary GBuffer and indirect radiance.
 #define CLOUD_BINDING_COMPACTED_PIXEL_INDICES    52
 #define CLOUD_BINDING_TILE_ACTIVE_COUNTS         53
+
+// The screen pass weighs the clouds it marches along reflections by these.
+#define CLOUD_BINDING_PRIMARY_ATTENUATION        54
+#define CLOUD_BINDING_SECONDARY_ATTENUATION      55

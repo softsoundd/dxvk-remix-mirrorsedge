@@ -244,6 +244,7 @@ public:
   RTX_OPTION("rtx.clouds", bool, reflectionDome, true, "Clouds in sky reflections and indirect sky light, from a dome rendered from the camera.");
   RTX_OPTION("rtx.clouds", bool, mirrorReflectionMarch, true, "March the clouds per pixel along mirrors' and glass's first reflections into the sky, and past glass the sky is seen straight through, instead of reading the dome.");
   RTX_OPTION("rtx.clouds", bool, glossyReflectionMarch, true, "March the clouds per pixel along near-mirrors' reflections into the sky (surfaces a little too rough for PSR, such as polished floors and curtain walls), instead of reading the dome. Costs a march for each such pixel.");
+  RTX_OPTION("rtx.clouds", bool, checkerboardMarch, true, "March half of the view's rays into the layer each frame, alternating in a checkerboard. The others keep their filtered history, and march where they have none, such as sky just uncovered. Halves the cost of the view's march, and its history takes twice as many frames to converge.");
   RTX_OPTION("rtx.clouds", float, maxMarchKm, 160.0f, "Longest distance the march follows a ray through the layer.");
 private:
   struct TierSettings {

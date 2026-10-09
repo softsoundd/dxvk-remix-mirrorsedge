@@ -82,6 +82,7 @@
 #define CLOUD_FLAG_REFERENCE              (1u << 7)
 #define CLOUD_FLAG_HISTORY_VALID          (1u << 8)
 #define CLOUD_FLAG_GLOSSY_REFLECTIONS     (1u << 9)
+#define CLOUD_FLAG_CHECKERBOARD           (1u << 10)
 
 struct CloudArgs {
   uint enabled;  // Non-zero when the layer renders this frame

@@ -66,6 +66,8 @@ namespace dxvk {
 
     cloudQualityCombo.getKey(&qualityObject());
     RemixGui::SetTooltipToLastWidgetOnHover("Step budget and length of the march, full resolution shadow taps, scattering octaves, how often the\noptical depth grids rebake and the reflection dome's resolution.");
+    RemixGui::Checkbox("Checkerboard March", &checkerboardMarchObject());
+    RemixGui::SetTooltipToLastWidgetOnHover("March half of the view's rays into the layer each frame, alternating in a checkerboard, while the others\nkeep their history. Halves the cost of the view's march, and its history takes twice as many frames to settle.");
 
     cloudGenusCombo.getKey(&genusObject());
     RemixGui::SetTooltipToLastWidgetOnHover("Shape and microphysics presets after the WMO genera. Custom exposes the layer and microphysics options.");
