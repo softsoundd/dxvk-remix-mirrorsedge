@@ -77,7 +77,17 @@ namespace dxvk {
     PREWARM_SHADER_PIPELINE(CompositeShader);
   }
   
-  DxvkBloom::DxvkBloom(DxvkDevice* device): RtxPass(device), m_vkd(device->vkd()) {
+  namespace {
+    RemixGui::ComboWithKey<BloomMode> bloomModeCombo {
+      "Mode##bloom",
+      RemixGui::ComboWithKey<BloomMode>::ComboEntries { {
+        { BloomMode::MipChain, "Mip Chain" },
+        { BloomMode::Convolution, "Convolution (FFT)" },
+      } }
+    };
+  }
+
+  DxvkBloom::DxvkBloom(DxvkDevice* device): RtxPass(device), m_vkd(device->vkd()), m_convolution(device) {
   }
   
   DxvkBloom::~DxvkBloom()  {
@@ -87,20 +97,36 @@ namespace dxvk {
     ImGui::Indent();
     RemixGui::Checkbox("Bloom Enabled", &enableObject());
     ImGui::Indent();
-    RemixGui::DragFloat("Intensity##bloom", &burnIntensityObject(), 0.05f, 0.f, 5.f, "%.2f");
-    RemixGui::DragFloat("Threshold##bloom", &luminanceThresholdObject(), 0.05f, 0.f, 100.f, "%.2f");
-    RemixGui::SliderInt("Radius##bloom", &stepsObject(), 4, MaxBloomSteps);
+    bloomModeCombo.getKey(&modeObject());
+    RemixGui::SetTooltipToLastWidgetOnHover("Mip Chain adds a thresholded glow on top of the image. Convolution spreads every pixel's light through\nthe observer's point spread function, the camera's lens or the eye, conserving energy.");
+
+    if (mode() == BloomMode::Convolution) {
+      m_convolution.showImguiSettings();
+    } else {
+      RemixGui::DragFloat("Intensity##bloom", &burnIntensityObject(), 0.05f, 0.f, 5.f, "%.2f");
+      RemixGui::DragFloat("Threshold##bloom", &luminanceThresholdObject(), 0.05f, 0.f, 100.f, "%.2f");
+      RemixGui::SliderInt("Radius##bloom", &stepsObject(), 4, MaxBloomSteps);
+    }
+
     ImGui::Unindent();
     ImGui::Unindent();
   }
 
   void DxvkBloom::dispatch(Rc<RtxContext> ctx, 
                            Rc<DxvkSampler> linearSampler,
-                           const Resources::Resource& inOutColorBuffer) {
+                           const Resources::Resource& inOutColorBuffer,
+                           const RtxSunProbe* pSunProbe) {
     ScopedGpuProfileZone(ctx, "Bloom");
     ctx->setFramePassStage(RtxFramePassStage::Bloom);
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+
+    if (mode() == BloomMode::Convolution) {
+      m_convolution.dispatch(ctx, inOutColorBuffer, pSunProbe);
+      return;
+    }
+
+    m_convolution.releaseResources();
 
     const Resources::Resource* res[] = {
       &inOutColorBuffer,
@@ -232,6 +258,18 @@ namespace dxvk {
   }
 
   bool DxvkBloom::isEnabled() const {
-    return enable() && burnIntensity() > 0.f;
+    if (!enable()) {
+      return false;
+    }
+
+    if (mode() == BloomMode::Convolution) {
+      return BloomConvolution::hasKernel();
+    }
+
+    return burnIntensity() > 0.f;
+  }
+
+  void DxvkBloom::onDeactivation() {
+    m_convolution.releaseResources();
   }
 }

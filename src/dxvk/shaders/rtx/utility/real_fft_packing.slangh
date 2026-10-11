@@ -1,0 +1,71 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Two real signals a and b transformed together as one complex signal z = a + i b (Press et al., Numerical Recipes,
+// section 12.3). Their spectra separate using the mirrored frequency N - k:
+// A(k) = (Z(k) + conj(Z(N - k))) / 2, B(k) = (Z(k) - conj(Z(N - k))) / 2i.
+// An image packs four channels into two complex values per texel: R + iG and B + iA.
+
+float2 complexConjugate(float2 z)
+{
+  return float2(z.x, -z.y);
+}
+
+float2 complexMultiply(float2 a, float2 b)
+{
+  return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+void unpackRealPair(float2 zk, float2 zNk, out float2 a, out float2 b)
+{
+  const float2 mirrored = complexConjugate(zNk);
+  const float2 difference = zk - mirrored;
+
+  a = 0.5f * (zk + mirrored);
+  // Dividing by i rotates by -90 degrees.
+  b = 0.5f * float2(difference.y, -difference.x);
+}
+
+float2 packRealPair(float2 a, float2 b)
+{
+  return a + float2(-b.y, b.x);
+}
+
+// The spectrum of a packed image convolved with a packed real kernel, channel by channel: each channel's kernel is
+// scaled by scale, less centerTap times a delta. zk and mk are taken at frequency k, zNk and mNk at N - k.
+float4 convolveRealPairs(float4 zk, float4 zNk, float4 mk, float4 mNk, float4 scale, float4 centerTap)
+{
+  float2 r, g, b, a;
+  float2 kernelR, kernelG, kernelB, kernelA;
+  unpackRealPair(zk.xy, zNk.xy, r, g);
+  unpackRealPair(zk.zw, zNk.zw, b, a);
+  unpackRealPair(mk.xy, mNk.xy, kernelR, kernelG);
+  unpackRealPair(mk.zw, mNk.zw, kernelB, kernelA);
+
+  r = complexMultiply(r, kernelR) * scale.x - centerTap.x * r;
+  g = complexMultiply(g, kernelG) * scale.y - centerTap.y * g;
+  b = complexMultiply(b, kernelB) * scale.z - centerTap.z * b;
+  a = complexMultiply(a, kernelA) * scale.w - centerTap.w * a;
+
+  return float4(packRealPair(r, g), packRealPair(b, a));
+}

@@ -51,6 +51,8 @@
 #include "rtx_render/rtx_ue3_tone_mapping.h"
 #include "rtx_render/rtx_ue3_map_settings.h"
 #include "rtx_render/rtx_bloom.h"
+#include "rtx_render/rtx_sun_probe.h"
+#include "rtx_render/rtx_lens_flare.h"
 #include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_image_utils.h"
 #include "rtx_render/rtx_postFx.h"
@@ -284,6 +286,14 @@ namespace dxvk {
       return m_bloom.get();
     }
 
+    RtxSunProbe& metaSunProbe() {
+      return m_sunProbe.get();
+    }
+
+    RtxLensFlare& metaLensFlare() {
+      return m_lensFlare.get();
+    }
+
     RtxGeometryUtils& metaGeometryUtils() {
       return m_geometryUtils.get();
     }
@@ -431,6 +441,8 @@ namespace dxvk {
     Active<DxvkUe3ToneMapping>              m_ue3ToneMapping;
     Active<Ue3MapSettings>                  m_ue3MapSettings;
     Active<DxvkBloom>                       m_bloom;
+    Active<RtxSunProbe>                     m_sunProbe;
+    Active<RtxLensFlare>                    m_lensFlare;
     Active<RtxGeometryUtils>                m_geometryUtils;
     Active<RtxImageUtils>                   m_imageUtils;
     Active<DxvkPostFx>                      m_postFx;

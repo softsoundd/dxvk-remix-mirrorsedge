@@ -24,10 +24,17 @@
 #include "dxvk_include.h"
 #include "dxvk_context.h"
 #include "rtx_resources.h"
+#include "rtx_bloom_convolution.h"
 
 namespace dxvk {
 
   class DxvkDevice;
+  class RtxSunProbe;
+
+  enum class BloomMode : int {
+    MipChain = 0,
+    Convolution,
+  };
 
   class DxvkBloom: public RtxPass {
     
@@ -40,12 +47,16 @@ namespace dxvk {
     DxvkBloom& operator=(const DxvkBloom&) = delete;
     DxvkBloom& operator=(DxvkBloom&&) noexcept = delete;
 
+    // pSunProbe may be null. The convolution mode reads it for the sun's glare.
     void dispatch(
       Rc<RtxContext> ctx,
       Rc<DxvkSampler> linearSampler,
-      const Resources::Resource& inOutColorBuffer);
+      const Resources::Resource& inOutColorBuffer,
+      const RtxSunProbe* pSunProbe);
 
     void showImguiSettings();
+
+    bool isConvolutionActive() const { return isActive() && mode() == BloomMode::Convolution; }
 
   private:
     void dispatchDownsampleStep(
@@ -71,6 +82,7 @@ namespace dxvk {
     virtual void releaseTargetResource() override;
 
     virtual bool isEnabled() const override;
+    virtual void onDeactivation() override;
 
     Rc<vk::DeviceFn> m_vkd;
 
@@ -78,7 +90,13 @@ namespace dxvk {
     // Each image is 1/2 resolution of the previous.
     Resources::Resource m_bloomBuffer[MaxBloomSteps] = {};
 
+    BloomConvolution m_convolution;
+
     RTX_OPTION_ENV("rtx.bloom", bool, enable, true, "RTX_BLOOM_ENABLE", "Enable bloom - glowing halos around intense, bright areas.");
+    RTX_OPTION("rtx.bloom", BloomMode, mode, BloomMode::MipChain,
+               "Bloom technique: 0: Mip Chain (a threshold and a chain of blurred mips, added on top of the image), 1: Convolution\n"
+               "(the image convolved with the observer's point spread function through the FFT, see rtx.lens.* and the\n"
+               "rtx.bloom.convolution* and kernel options).");
     RTX_OPTION("rtx.bloom", float, burnIntensity, 1.0f, "Amount of bloom to add to the final image.");
     RTX_OPTION("rtx.bloom", float, luminanceThreshold, 0.25f,
                "Adjust the bloom threshold to suppress blooming of the dim areas. "

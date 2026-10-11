@@ -568,6 +568,8 @@ namespace dxvk {
     m_ue3ToneMapping(device),
     m_ue3MapSettings(device),
     m_bloom(device),
+    m_sunProbe(device),
+    m_lensFlare(device),
     m_geometryUtils(device),
     m_imageUtils(device),
     m_postFx(device),

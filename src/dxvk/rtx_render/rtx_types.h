@@ -1181,6 +1181,7 @@ enum class RtxFramePassStage {
   DustParticles,
   Bloom,
   PostFX,
+  LensFlare,
   AutoExposure_Histogram,
   AutoExposure_Exposure,
   ToneMapping,

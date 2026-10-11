@@ -248,8 +248,10 @@ namespace dxvk {
     bool dispatchDlssNR(const Resources::RaytracingOutput& rtOutput);
     // allowDither: nothing runs between tone mapping and the final dither, so a tonemapper may apply it.
     void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool updateAutoExposure, bool allowDither);
+    void dispatchSunProbe(const Resources::RaytracingOutput& rtOutput);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
+    void dispatchLensFlare(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
     void dispatchSRGBDither(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);

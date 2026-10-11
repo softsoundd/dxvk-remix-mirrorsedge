@@ -895,10 +895,16 @@ namespace dxvk {
 
         const bool dlssNrEnabled = dispatchDlssNR(rtOutput);
 
+        // Measures the sun's visibility for its glare and the lens flare, before bloom spreads its disc.
+        dispatchSunProbe(rtOutput);
+
         dispatchBloom(rtOutput);
 
         // Motion blur runs before tonemapping while the image is still in linear HDR space.
         dispatchPostFxMotionBlur(rtOutput);
+
+        // After motion blur, as the scene's motion vectors do not describe how the ghosts move.
+        dispatchLensFlare(rtOutput);
 
         if (m_pendingInjectFinish.canvas != nullptr) {
           stageHdrCanvas(rtOutput, targetImage, !dlssNrEnabled, captureScreenImage, captureDebugImage);
@@ -2281,6 +2287,18 @@ namespace dxvk {
     }
   }
 
+  void RtxContext::dispatchSunProbe(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    const DxvkBloom& bloom = m_common->metaBloom();
+    const bool sunGlare = bloom.isConvolutionActive() && BloomConvolution::wantsSunVisibility();
+    const bool measure = RtxLensFlare::isEnabled() || sunGlare;
+
+    this->spillRenderPass(false);
+    this->unbindComputePipeline();
+
+    m_common->metaSunProbe().dispatch(*this, rtOutput, measure);
+  }
+
   void RtxContext::dispatchBloom(const Resources::RaytracingOutput& rtOutput) {
     ScopedCpuProfileZone();
     DxvkBloom& bloom = m_common->metaBloom();
@@ -2294,7 +2312,20 @@ namespace dxvk {
 
     bloom.dispatch(this,
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
-      rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite));
+      rtOutput.m_finalOutput.resource(Resources::AccessType::ReadWrite),
+      &m_common->metaSunProbe());
+  }
+
+  void RtxContext::dispatchLensFlare(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    if (!RtxLensFlare::isEnabled()) {
+      return;
+    }
+
+    this->spillRenderPass(false);
+    this->unbindComputePipeline();
+
+    m_common->metaLensFlare().dispatch(*this, m_state, rtOutput, m_common->metaSunProbe());
   }
 
   void RtxContext::dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput) {

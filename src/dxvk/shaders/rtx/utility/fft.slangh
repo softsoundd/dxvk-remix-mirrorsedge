@@ -1,0 +1,170 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/utility/math.slangh"
+
+// A line FFT in shared memory, by the Stockham autosort algorithm (Van Loan, "Computational Frameworks for the Fast
+// Fourier Transform", SIAM 1992) in the GPU formulation of Govindaraju et al., "High Performance Discrete Fourier
+// Transforms on Graphics Processors" (SC 2008). Radix 4 stages follow a radix 2 stage when log2(N) is odd, and the
+// result comes out in natural order. A workgroup of kFftThreads threads transforms one line of FFT_SIZE complex
+// values held in g_fftLine, kFftElements of them per thread. The forward transform takes exp(-i 2 pi n k / N), and
+// neither direction is scaled.
+//
+// The includer defines FFT_SIZE, a power of two from 128 to 4096.
+
+#if FFT_SIZE == 128
+#define FFT_RADIX2_STAGE 1
+#define FFT_RADIX4_STAGES 3
+#elif FFT_SIZE == 256
+#define FFT_RADIX2_STAGE 0
+#define FFT_RADIX4_STAGES 4
+#elif FFT_SIZE == 512
+#define FFT_RADIX2_STAGE 1
+#define FFT_RADIX4_STAGES 4
+#elif FFT_SIZE == 1024
+#define FFT_RADIX2_STAGE 0
+#define FFT_RADIX4_STAGES 5
+#elif FFT_SIZE == 2048
+#define FFT_RADIX2_STAGE 1
+#define FFT_RADIX4_STAGES 5
+#elif FFT_SIZE == 4096
+#define FFT_RADIX2_STAGE 0
+#define FFT_RADIX4_STAGES 6
+#else
+#error "FFT_SIZE must be a power of two from 128 to 4096."
+#endif
+
+static const uint kFftElements = 16;
+static const uint kFftThreads = FFT_SIZE / kFftElements;
+
+groupshared float2 g_fftLine[FFT_SIZE];
+
+float2 fftMultiply(float2 a, float2 b)
+{
+  return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+float2 fftTwiddle(float angle)
+{
+  float2 twiddle;
+  sincos(angle, twiddle.y, twiddle.x);
+  return twiddle;
+}
+
+// One radix 2 stage over sub-transforms of size ns. Every thread reads all of its inputs before any thread writes.
+void fftStageRadix2(uint thread, uint ns, float sign)
+{
+  static const uint kButterflies = kFftElements / 2;
+  float2 v[kFftElements];
+
+  [unroll]
+  for (uint i = 0; i < kButterflies; i++)
+  {
+    const uint b = thread + i * kFftThreads;
+    const float angle = sign * twoPi * float(b % ns) / float(2 * ns);
+
+    v[2 * i] = g_fftLine[b];
+    v[2 * i + 1] = fftMultiply(g_fftLine[b + FFT_SIZE / 2], fftTwiddle(angle));
+  }
+
+  GroupMemoryBarrierWithGroupSync();
+
+  [unroll]
+  for (uint i = 0; i < kButterflies; i++)
+  {
+    const uint b = thread + i * kFftThreads;
+    const uint destination = (b / ns) * ns * 2 + (b % ns);
+
+    g_fftLine[destination] = v[2 * i] + v[2 * i + 1];
+    g_fftLine[destination + ns] = v[2 * i] - v[2 * i + 1];
+  }
+
+  GroupMemoryBarrierWithGroupSync();
+}
+
+// One radix 4 stage over sub-transforms of size ns.
+void fftStageRadix4(uint thread, uint ns, float sign)
+{
+  static const uint kButterflies = kFftElements / 4;
+  float2 v[kFftElements];
+
+  [unroll]
+  for (uint i = 0; i < kButterflies; i++)
+  {
+    const uint b = thread + i * kFftThreads;
+    const float angle = sign * twoPi * float(b % ns) / float(4 * ns);
+
+    [unroll]
+    for (uint r = 0; r < 4; r++)
+    {
+      const float2 value = g_fftLine[b + r * (FFT_SIZE / 4)];
+      v[4 * i + r] = r == 0 ? value : fftMultiply(value, fftTwiddle(float(r) * angle));
+    }
+  }
+
+  GroupMemoryBarrierWithGroupSync();
+
+  [unroll]
+  for (uint i = 0; i < kButterflies; i++)
+  {
+    const uint b = thread + i * kFftThreads;
+    const uint destination = (b / ns) * ns * 4 + (b % ns);
+    const float2 a = v[4 * i];
+    const float2 c = v[4 * i + 2];
+    const float2 sumAC = a + c;
+    const float2 differenceAC = a - c;
+    const float2 sumBD = v[4 * i + 1] + v[4 * i + 3];
+    const float2 differenceBD = v[4 * i + 1] - v[4 * i + 3];
+    // The fourth root of unity of the transform's sign, times (b - d).
+    const float2 rotated = sign * float2(-differenceBD.y, differenceBD.x);
+
+    g_fftLine[destination] = sumAC + sumBD;
+    g_fftLine[destination + ns] = differenceAC + rotated;
+    g_fftLine[destination + 2 * ns] = sumAC - sumBD;
+    g_fftLine[destination + 3 * ns] = differenceAC - rotated;
+  }
+
+  GroupMemoryBarrierWithGroupSync();
+}
+
+// Transforms the line in g_fftLine in place. thread is the thread's index in its workgroup, and every thread of the
+// workgroup must call this together after writing its part of the line.
+void fftLine(uint thread, bool forward)
+{
+  const float sign = forward ? -1.0f : 1.0f;
+  uint ns = 1;
+
+  GroupMemoryBarrierWithGroupSync();
+
+#if FFT_RADIX2_STAGE
+  fftStageRadix2(thread, ns, sign);
+  ns *= 2;
+#endif
+
+  [unroll]
+  for (uint stage = 0; stage < FFT_RADIX4_STAGES; stage++)
+  {
+    fftStageRadix4(thread, ns, sign);
+    ns *= 4;
+  }
+}

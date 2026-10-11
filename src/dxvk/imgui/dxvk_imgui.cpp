@@ -500,6 +500,7 @@ namespace dxvk {
       { RtxFramePassStage::DustParticles, "DustParticles" },
       { RtxFramePassStage::Bloom, "Bloom" },
       { RtxFramePassStage::PostFX, "PostFX" },
+      { RtxFramePassStage::LensFlare, "LensFlare" },
       { RtxFramePassStage::AutoExposure_Histogram, "AutoExposure_Histogram" },
       { RtxFramePassStage::AutoExposure_Exposure, "AutoExposure_Exposure" },
       { RtxFramePassStage::ToneMapping, "ToneMapping" },
@@ -4743,6 +4744,12 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Bloom", collapsingHeaderClosedFlags))
         common->metaBloom().showImguiSettings();
+
+      if (RemixGui::CollapsingHeader("Lens Flare", collapsingHeaderClosedFlags))
+        common->metaLensFlare().showImguiSettings();
+
+      if (RemixGui::CollapsingHeader("Sun Visibility", collapsingHeaderClosedFlags))
+        common->metaSunProbe().showImguiSettings();
 
       if (RemixGui::CollapsingHeader("Auto Exposure", collapsingHeaderClosedFlags))
         common->metaAutoExposure().showImguiSettings();

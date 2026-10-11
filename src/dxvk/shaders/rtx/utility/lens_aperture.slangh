@@ -1,0 +1,178 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/utility/math.slangh"
+
+// The camera's iris (rtx.lens.*, see rtx_lens_aperture.h): `blades` arcs, each the edge of a disc, whose
+// intersection is the opening. curvature is the opening's inradius over the arcs' radius: 0 for straight blades, 1 for
+// a circle. The corners lie on the unit circle at rotation + j * 2 pi / blades. Fewer than 3 blades make it the circle.
+//
+// Each blade sits slightly off its regular place, as its mount does: side j's normal, at rotation + (j + 1 / 2) 2 pi /
+// blades, turns by angleJitter and its distance from the centre changes by distanceJitter in units of the inradius,
+// each times a fixed spread of unit variance hashed from the side. LensAperture::getSides places them the same way.
+
+// Corner radius of the iris in units of its inradius. Stable as the curvature goes to 0.
+float lensApertureCornerRadius(uint blades, float curvature)
+{
+  const float halfSector = pi / float(blades);
+  const float straightness = 1.0f - curvature;
+  const float sine = straightness * sin(halfSector);
+
+  return (2.0f - curvature) / (sqrt(max(1.0f - sine * sine, 0.0f)) + straightness * cos(halfSector));
+}
+
+uint lensApertureHash(uint value)
+{
+  value ^= value >> 16;
+  value *= 0x7feb352du;
+  value ^= value >> 15;
+  value *= 0x846ca68bu;
+  value ^= value >> 16;
+  return value;
+}
+
+float lensApertureHashUnit(uint value)
+{
+  return float(lensApertureHash(value)) / 4294967295.0f;
+}
+
+// Side j's spreads of unit variance, triangular, for its normal's angle and its distance from the centre.
+vec2 lensApertureSideSpread(uint side)
+{
+  const float angle = lensApertureHashUnit(side * 4u + 1u) + lensApertureHashUnit(side * 4u + 2u) - 1.0f;
+  const float distance = lensApertureHashUnit(side * 4u + 3u) + lensApertureHashUnit(side * 4u + 4u) - 1.0f;
+
+  return vec2(angle, distance) * sqrt(6.0f);
+}
+
+// Signed distance to the iris edge, in units of its regular corner radius, negative inside. It is the distance to the
+// nearest side's arc, which equals the true distance everywhere except outside the corners. With the blades off their
+// regular places the nearest side is the regular one's or a neighbour.
+float lensApertureSignedDistance(vec2 p, uint blades, float curvature, float rotation, float distanceJitter, float angleJitter)
+{
+  const float radius = length(p);
+
+  if (blades < 3 || curvature >= 1.0f)
+  {
+    return radius - 1.0f;
+  }
+
+  const float sector = twoPi / float(blades);
+  const float angle = atan2(p.y, p.x) - rotation;
+  const float nearest = floor(angle / sector);
+  // Angle from the regular normal of the nearest side, which lies halfway between two corners.
+  const float fromNormal = angle - sector * (nearest + 0.5f);
+  const bool jittered = distanceJitter > 0.0f || angleJitter > 0.0f;
+
+  const float q = saturate(curvature);
+  const float cornerRadius = lensApertureCornerRadius(blades, q);
+  const float r = radius * cornerRadius;
+  float distance = -1e30f;
+
+  [unroll]
+  for (int k = -1; k <= 1; k++)
+  {
+    if (!jittered && k != 0)
+    {
+      continue;
+    }
+
+    // The angle is within two turns either way, so the side's index stays positive.
+    const uint side = uint(int(nearest) + k + 4 * int(blades)) % blades;
+    const vec2 spread = jittered ? lensApertureSideSpread(side) : vec2(0.0f);
+    const float alongNormal = r * cos(fromNormal - float(k) * sector - spread.x * angleJitter);
+    const float d = 1.0f + spread.y * distanceJitter;
+
+    // In units of the inradius, the side's disc has radius 1 / q and its centre lies (1 / q - d) behind the origin.
+    // |p - centre| - 1 / q, multiplied through by q to stay finite for straight blades.
+    const float numerator = q * (r * r - 2.0f * d * alongNormal + d * d) + 2.0f * (alongNormal - d);
+    const float centre = q * d - 1.0f;
+    const float denominator = sqrt(max(q * q * r * r - 2.0f * q * centre * alongNormal + centre * centre, 0.0f)) + 1.0f;
+    distance = max(distance, numerator / denominator);
+  }
+
+  return distance / cornerRadius;
+}
+
+// Distance from the centre of the iris's farthest corner, in units of its regular corner radius: 1 for the regular
+// iris, and a little more or less with its blades off their places. Where two sides meet, as the C++'s
+// LensAperture::getSides finds it.
+float lensApertureCornerReach(uint blades, float curvature, float rotation, float distanceJitter, float angleJitter)
+{
+  if (blades < 3 || curvature >= 1.0f || (distanceJitter <= 0.0f && angleJitter <= 0.0f))
+  {
+    return 1.0f;
+  }
+
+  const float sector = twoPi / float(blades);
+  const float q = saturate(curvature);
+  const float cornerRadius = lensApertureCornerRadius(blades, q);
+  float reach = 0.0f;
+
+  for (uint j = 0; j < blades; j++)
+  {
+    const uint i = (j + blades - 1u) % blades;
+    const vec2 spreadI = lensApertureSideSpread(i);
+    const vec2 spreadJ = lensApertureSideSpread(j);
+    const float angleI = rotation + (float(i) + 0.5f) * sector + spreadI.x * angleJitter;
+    const float angleJ = rotation + (float(j) + 0.5f) * sector + spreadJ.x * angleJitter;
+    const vec2 normalI = vec2(cos(angleI), sin(angleI));
+    const vec2 normalJ = vec2(cos(angleJ), sin(angleJ));
+    const float dI = 1.0f + spreadI.y * distanceJitter;
+    const float dJ = 1.0f + spreadJ.y * distanceJitter;
+    vec2 corner;
+
+    if (q <= 1e-4f)
+    {
+      // Straight sides meet where normalI . p = dI and normalJ . p = dJ.
+      const float determinant = normalI.x * normalJ.y - normalI.y * normalJ.x;
+      corner = vec2(dI * normalJ.y - dJ * normalI.y, normalI.x * dJ - normalJ.x * dI) / determinant;
+    }
+    else
+    {
+      // The two sides' discs of radius 1 / q meet at the point beyond their centres' midpoint toward the corner.
+      const float arcRadius = 1.0f / q;
+      const vec2 centreI = (dI - arcRadius) * normalI;
+      const vec2 centreJ = (dJ - arcRadius) * normalJ;
+      const vec2 gap = centreJ - centreI;
+      const float gapLength = length(gap);
+      const float across = sqrt(max(arcRadius * arcRadius - 0.25f * gapLength * gapLength, 0.0f));
+      const vec2 perpendicular = vec2(-gap.y, gap.x) / gapLength;
+      const vec2 middle = 0.5f * (centreI + centreJ);
+      const vec2 toward = vec2(cos(rotation + float(j) * sector), sin(rotation + float(j) * sector));
+      corner = middle + perpendicular * (dot(perpendicular, toward) >= 0.0f ? across : -across);
+    }
+
+    reach = max(reach, length(corner));
+  }
+
+  return reach / cornerRadius;
+}
+
+// Fraction of the iris covering p, blended over an edge of edgeWidth, in units of the iris radius.
+float lensApertureCoverage(vec2 p, uint blades, float curvature, float rotation, float distanceJitter, float angleJitter, float edgeWidth)
+{
+  const float distance = lensApertureSignedDistance(p, blades, curvature, rotation, distanceJitter, angleJitter);
+
+  return saturate(0.5f - distance / max(edgeWidth, 1e-6f));
+}

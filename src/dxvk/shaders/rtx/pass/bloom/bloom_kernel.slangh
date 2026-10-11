@@ -1,0 +1,321 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// The analytic parts of the observer's point spread function, as each near buffer texel's share of the light: the
+// diffraction far field past the aperture spectrum's reach, and the scatter. Offsets and radii are in near buffer
+// texels, angles run with y up. The includer declares kernelArgs, the ConstantBuffer<BloomKernelArgs>.
+
+#include "rtx/pass/bloom/bloom.h"
+#include "rtx/utility/math.slangh"
+
+// 1 inside half the window radius, easing to 0 at it.
+float kernelWindow(float radius, float windowRadius)
+{
+  return 1.0f - smoothstep(0.5f * windowRadius, windowRadius, radius);
+}
+
+// Cumulative distribution of a unit area tent of radius r, per channel.
+vec3 tentCdf(float u, vec3 r)
+{
+  const vec3 t = clamp(vec3(u), -r, r);
+
+  return select(t <= 0.0f, (t + r) * (t + r) / (2.0f * r * r), 1.0f - (r - t) * (r - t) / (2.0f * r * r));
+}
+
+// A unit area box of half width halfWidth, blurred by a unit area tent of radius r per channel, at d.
+vec3 blurredBox(float d, float halfWidth, vec3 r)
+{
+  if (halfWidth < 1e-4f)
+  {
+    return max(1.0f - abs(d) / r, 0.0f) / r;
+  }
+
+  return (tentCdf(d + halfWidth, r) - tentCdf(d - halfWidth, r)) / (2.0f * halfWidth);
+}
+
+// The streaks a blade's rough edge leaves across the light it diffracts, as a factor on it, fromCentre radians from
+// the middle of its side's fan. The edge's waves sum to the contrast's RMS, each softened by the angular spread blur.
+// The factor depends on the direction alone, so the streaks run along the spike, the same both ways.
+static const float kStreakLowestFrequency = 360.0f / BLOOM_STREAK_LONGEST_PERIOD_DEGREES;
+
+float edgeStreaks(uint side, float fromCentre, float blur)
+{
+  const float contrast = kernelArgs.apertureStreakContrast;
+
+  // Near the sun its disc blurs every wave away.
+  if (contrast <= 0.0f || kStreakLowestFrequency * blur > 3.0f)
+  {
+    return 1.0f;
+  }
+
+  float sum = 0.0f;
+
+  [unroll]
+  for (uint w = 0; w < BLOOM_STREAK_WAVES / 2; w++)
+  {
+    const vec4 waves = kernelArgs.apertureStreakWaves[side * (BLOOM_STREAK_WAVES / 2) + w];
+    const vec2 softened = waves.xz * blur;
+    sum += cos(waves.x * fromCentre + waves.y) * exp(-0.5f * softened.x * softened.x);
+    sum += cos(waves.z * fromCentre + waves.w) * exp(-0.5f * softened.y * softened.y);
+  }
+
+  return max(1.0f + contrast * sqrt(2.0f / float(BLOOM_STREAK_WAVES)) * sum, 0.0f);
+}
+
+// Edge diffraction past the core, by stationary phase, for a pattern scale per channel: each side of length l sends
+// sigma * l / (4 pi^2 a X^2) of the light per texel of radius X into the directions its normals turn through, both
+// ways, where a is the aperture's area. Across, the variances of the side's own diffraction width, half the Fresnel
+// zone of an arc's ends, sqrt(X sigma / arc radius), and the caller's spreadVariance in texels squared add, carried by a
+// tent of the same variance. The channels share each side's streaks.
+vec3 diffractionFarFieldChannels(float radius, float angle, vec3 sigma, float spreadVariance)
+{
+  if (kernelArgs.apertureBlades == 0)
+  {
+    return 2.0f * sigma / (4.0f * pi * pi * pi * radius * radius * radius);
+  }
+
+  vec3 sum = vec3(0.0f);
+
+  for (uint side = 0; side < kernelArgs.apertureBlades; side++)
+  {
+    const vec4 sideArgs = kernelArgs.apertureSides[side];
+    const float halfRange = sideArgs.y;
+    const float length = sideArgs.z;
+    const vec3 sideWidth = sigma / length;
+    vec3 variance = spreadVariance + sideWidth * sideWidth / 6.0f;
+
+    if (halfRange > 0.0f)
+    {
+      const float arcRadius = length / (2.0f * halfRange);
+      variance += 0.25f * radius * sigma / arcRadius / 6.0f;
+    }
+
+    const vec3 width = sqrt(6.0f * variance);
+    const float reach = radius * halfRange + max(width.x, max(width.y, width.z));
+
+    [unroll]
+    for (uint flip = 0; flip < 2; flip++)
+    {
+      // Angle from the middle of the side's fan, within half a turn.
+      float fromCentre = angle + float(flip) * pi - sideArgs.x;
+      fromCentre -= twoPi * floor(fromCentre / twoPi + 0.5f);
+
+      if (abs(radius * fromCentre) < reach)
+      {
+        const vec3 profile = blurredBox(radius * fromCentre, radius * halfRange, width);
+        sum += length * profile * edgeStreaks(side, fromCentre, sqrt(variance.y) / radius);
+      }
+    }
+  }
+
+  return sigma * sum / (4.0f * pi * pi * kernelArgs.apertureArea * radius * radius);
+}
+
+float diffractionFarField(float radius, float angle, float sigma, float spreadVariance)
+{
+  return diffractionFarFieldChannels(radius, angle, vec3(sigma), spreadVariance).x;
+}
+
+// The far field across the visible spectrum: each wavelength's pattern scales with the wavelength.
+vec3 diffractionFarFieldSpectral(float radius, float angle, float spreadVariance)
+{
+  vec3 result = vec3(0.0f);
+
+  for (uint i = 0; i < BLOOM_KERNEL_SPECTRAL_SAMPLES; i++)
+  {
+    const BloomKernelSpectralSample spectralSample = kernelArgs.spectralSamples[i];
+
+    result += spectralSample.weight * diffractionFarField(radius, angle, kernelArgs.sigmaTexels / spectralSample.scale, spreadVariance);
+  }
+
+  return result;
+}
+
+// The far field of each colour channel at the channel's mean pattern scale. The far field's light grows linearly with
+// the scale, so this matches diffractionFarFieldSpectral but for the spikes' slight widening with the wavelength.
+vec3 diffractionFarFieldChannels(float radius, float angle, float spreadVariance)
+{
+  vec3 sigma = vec3(0.0f);
+
+  for (uint i = 0; i < BLOOM_KERNEL_SPECTRAL_SAMPLES; i++)
+  {
+    sigma += kernelArgs.spectralSamples[i].weight * (kernelArgs.sigmaTexels / kernelArgs.spectralSamples[i].scale);
+  }
+
+  return diffractionFarFieldChannels(radius, angle, sigma, spreadVariance);
+}
+
+// The veil's density in mm^-2 on the sensor. The table's last entry is zero, so it ramps out.
+float veilDensity(float radiusMm)
+{
+  const float position = log(max(radiusMm, 1e-6f) / kernelArgs.veilMinRadiusMm) / kernelArgs.veilLogStep;
+
+  if (position >= float(BLOOM_VEIL_TABLE_SIZE - 1))
+  {
+    return 0.0f;
+  }
+
+  const float clamped = max(position, 0.0f);
+  const uint index = uint(clamped);
+  const float t = clamped - float(index);
+  const float a = kernelArgs.veilTable[index / 4][index % 4];
+  const float b = kernelArgs.veilTable[(index + 1) / 4][(index + 1) % 4];
+
+  return lerp(a, b, t);
+}
+
+// An ABg lobe per steradian (Harvey 1976; Pfisterer's ABg model): flat inside the shoulder and falling as
+// theta^-slope past it, over the whole hemisphere.
+float abgLobe(float theta, float shoulder, float slope, float norm)
+{
+  return 1.0f / (norm * (pow(shoulder, slope) + pow(theta, slope)));
+}
+
+// Radians of the observer's angle per near texel: the camera's on its sensor, through its focal length, and the
+// eye's directly.
+float anglePerNearTexel()
+{
+  return kernelArgs.observer == BLOOM_OBSERVER_EYE ? kernelArgs.physicalPerTexel : kernelArgs.physicalPerTexel / kernelArgs.focalLengthMm;
+}
+
+// The camera lens's scatter per steradian, theta radians off the source: the inter-reflection veil of all its ghosts,
+// the halo of its surfaces' roughness and the veil of its barrel, edges and dust. The veil lies on the sensor, f tan
+// theta out, where a steradian covers f^2 / cos^3 theta of it. veilScale leaves out the ghosts drawn on their own.
+vec3 cameraScatterDensity(float theta, vec3 veilScale)
+{
+  const float clampedTheta = min(theta, 1.55f);
+  const float cosTheta = cos(clampedTheta);
+  const float f = kernelArgs.focalLengthMm;
+  const float sensorAreaPerSteradian = f * f / (cosTheta * cosTheta * cosTheta);
+
+  return kernelArgs.scatterShare0 * veilScale * veilDensity(f * tan(clampedTheta)) * sensorAreaPerSteradian
+       + kernelArgs.scatterShare1 * abgLobe(theta, kernelArgs.roughnessShoulder, kernelArgs.roughnessSlope, kernelArgs.roughnessNorm)
+       + kernelArgs.scatterShare2 * abgLobe(theta, kernelArgs.mechanicalShoulder, kernelArgs.mechanicalSlope, kernelArgs.mechanicalNorm);
+}
+
+// CIE 135/1-6 general disability glare equation (Vos and van den Berg 1999) per steradian, valid from 0.1 to 100
+// degrees, eased out over its last ten. Inside 0.1 degrees the eye's own optics take over, which the diffraction
+// part carries.
+float cieGlare(float thetaRadians)
+{
+  const float theta = degrees(thetaRadians);
+
+  if (theta < 0.1f || theta >= 100.0f)
+  {
+    return 0.0f;
+  }
+
+  const float glare = 10.0f / (theta * theta * theta)
+    + (5.0f / (theta * theta) + 0.1f * kernelArgs.ciePigmentation / theta) * kernelArgs.cieAgeFactor
+    + 0.0025f * kernelArgs.ciePigmentation;
+
+  return glare * (1.0f - smoothstep(90.0f, 100.0f, theta));
+}
+
+// The eye's scatter per steradian, theta radians off the source: the CIE glare, and the lenticular halo, the first
+// order of the lens fibres' grating, a ring whose angle scales with the wavelength, red outside.
+vec3 eyeScatterDensity(float theta)
+{
+  vec3 halo = vec3(0.0f);
+
+  for (uint i = 0; i < BLOOM_KERNEL_SPECTRAL_SAMPLES; i++)
+  {
+    const BloomKernelSpectralSample spectralSample = kernelArgs.spectralSamples[i];
+    const float ringAngle = kernelArgs.haloAngle / spectralSample.scale;
+    const float ringWidth = kernelArgs.haloWidth / spectralSample.scale;
+    const float u = (theta - ringAngle) / ringWidth;
+    // A unit energy ring is a normalised Gaussian across it, over the ring's circumference.
+    const float density = exp(-0.5f * u * u) / (sqrt(twoPi) * ringWidth * twoPi * max(sin(theta), 1e-6f));
+
+    halo += spectralSample.weight * density;
+  }
+
+  return kernelArgs.scatterShare0 * (cieGlare(theta) / kernelArgs.cieNorm)
+       + kernelArgs.scatterShare1 * halo;
+}
+
+vec3 observerScatterDensity(float theta, vec3 veilScale = vec3(1.0f))
+{
+  return kernelArgs.observer == BLOOM_OBSERVER_EYE ? eyeScatterDensity(theta) : cameraScatterDensity(theta, veilScale);
+}
+
+// The scatter per near texel radius texels from the source, on the image plane: theta = atan(radius p), where a texel
+// covers p^2 cos^3 theta steradians.
+vec3 observerScatter(float radius)
+{
+  const float p = anglePerNearTexel();
+  const float theta = atan(radius * p);
+  const float cosTheta = cos(theta);
+
+  return observerScatterDensity(theta) * (p * p * cosTheta * cosTheta * cosTheta);
+}
+
+// rtx.bloom.spikeBoost scales the diffraction past the pattern's core and leaves the core as it is.
+float spikeBoostAt(float radius)
+{
+  const float core = kernelArgs.coreRadiusTexels;
+
+  return lerp(1.0f, kernelArgs.spikeBoost, smoothstep(core, 2.0f * core, radius));
+}
+
+// The scatter integrated over a texel, finely near the centre where it changes fastest.
+vec3 observerScatterTexel(vec2 offset)
+{
+  const float radius = length(offset);
+
+  if (radius >= 8.0f)
+  {
+    return observerScatter(radius);
+  }
+
+  vec3 sum = vec3(0.0f);
+
+  [unroll]
+  for (uint j = 0; j < 4; j++)
+  {
+    [unroll]
+    for (uint i = 0; i < 4; i++)
+    {
+      sum += observerScatter(length(offset + (vec2(float(i), float(j)) + 0.5f) / 4.0f - 0.5f));
+    }
+  }
+
+  return sum / 16.0f;
+}
+
+// Share of the light the diffraction part keeps: what the scatter does not take.
+vec3 diffractionShare()
+{
+  return max(vec3(1.0f) - kernelArgs.scatterShare0 - kernelArgs.scatterShare1 - kernelArgs.scatterShare2, vec3(0.0f));
+}
+
+// The analytic far part of the kernel at an offset, per near texel: the diffraction far field and the scatter, its
+// spikes spread across over a texel texelWidth near texels wide.
+vec3 kernelFarPart(vec2 offset, float texelWidth)
+{
+  const float radius = max(length(offset), 1e-3f);
+  const float angle = atan2(-offset.y, offset.x);
+
+  return diffractionShare() * diffractionFarFieldSpectral(radius, angle, texelWidth * texelWidth / 12.0f) * spikeBoostAt(radius)
+       + observerScatter(radius);
+}
