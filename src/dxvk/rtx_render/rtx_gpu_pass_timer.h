@@ -191,7 +191,8 @@ namespace dxvk {
     RTX_OPTION("rtx.gpuPassTimings", bool, sweepScreenshots, false,
                "Captures Remix's output at the end of each sweep step, as the screenshot hotkey does, while the step is still applied, "
                "so the steps' images can be compared alongside their timings. The capture follows the step's timing table, so its "
-               "readback does not count towards it.");
+               "readback does not count towards it. With the camera animation on (rtx.shakeCamera), it waits for a frame at the "
+               "animation's rest pose, so that every step's image shows the same view in the same motion.");
 
     RTX_OPTION("rtx.gpuPassTimings", bool, enable, false,
                "Enables built-in per-pass GPU timings. Every GPU profile zone (the same markers Tracy and Nsight see) is bracketed with timestamp queries "
@@ -325,9 +326,10 @@ namespace dxvk {
       std::vector<SweepStep> steps;
       std::chrono::steady_clock::time_point stepStart;
       bool stepApplied = false;
-      // Set once the step's table is logged; with sweepScreenshots the step then stays applied
-      // until the capture requested in screenshotFrameId has been rendered.
+      // Set once the step's table is logged. With sweepScreenshots the step then stays applied until its capture has
+      // been requested and the frame in screenshotFrameId has been rendered.
       bool tableLogged = false;
+      bool screenshotRequested = false;
       std::uint32_t screenshotFrameId = 0;
     };
     static constexpr std::uint32_t kSweepScreenshotFrames = 2;

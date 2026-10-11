@@ -41,15 +41,20 @@ namespace dxvk {
     ~DxvkPostFx();
 
     // Motion blur phase. Runs before tonemapping while the image is still in linear HDR space.
-    // Reads m_finalOutput, writes back to m_finalOutput (via intermediate texture).
-    void dispatchMotionBlur(
+    // Reads m_finalOutput, blurs it into the intermediate texture and copies that back to m_finalOutput.
+    // With leaveInIntermediate set it skips the copy, which a later pass or resolveMotionBlur then makes.
+    // Returns whether the blurred image was left in the intermediate texture.
+    bool dispatchMotionBlur(
       Rc<RtxContext> ctx,
       Rc<DxvkSampler> nearestSampler,
       Rc<DxvkSampler> linearSampler,
       const uvec2& mainCameraResolution,
       const uint32_t frameIdx,
       const Resources::RaytracingOutput& rtOutput,
-      const bool cameraCutDetected);
+      const bool cameraCutDetected,
+      const bool leaveInIntermediate);
+
+    void resolveMotionBlur(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput);
 
     // Lens effects phase (chromatic aberration + vignette). Runs after tonemapping
     // so it operates on post-tonemap LDR data — these are display-space lens artifacts.
@@ -89,6 +94,8 @@ namespace dxvk {
     RTX_OPTION("rtx.postfx", bool, desaturateOthersOnHighlight, true, "If true, desaturare all objects that are not highlighted.");
 
   private:
+    void copyBlurredImage(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput);
+
     Rc<vk::DeviceFn> m_vkd;
     Rc<DxvkBuffer> m_highlightingValues;
 

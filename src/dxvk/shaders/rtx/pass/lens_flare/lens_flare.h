@@ -23,9 +23,11 @@
 
 #include "rtx/utility/shader_types.h"
 
-// The fast, paraxial ghosts.
+// The fast, paraxial ghosts. With separateInput set, they read the image from LENS_FLARE_COLOR_INPUT.
+// Otherwise they add to LENS_FLARE_COLOR_INPUT_OUTPUT in place.
 #define LENS_FLARE_GHOSTS_INPUT         0
 #define LENS_FLARE_SUN_VISIBILITY_INPUT 1
+#define LENS_FLARE_COLOR_INPUT          2
 #define LENS_FLARE_COLOR_INPUT_OUTPUT   10
 
 // The ray traced ghosts, whose passes search for each grid's domain, trace it, give it its irradiance, then rasterise
@@ -152,7 +154,7 @@ struct LensFlareArgs {
   // The iris blades' spreads off their regular places (see lens_aperture.slangh).
   float apertureDistanceJitter;
   float apertureAngleJitter;
-  uint pad0;
+  uint separateInput;
 };
 
 // A surface of the lens for the ray traced ghosts, its vertex z, radius (0 for flat) and clear radius in mm.

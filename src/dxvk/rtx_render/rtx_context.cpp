@@ -900,11 +900,17 @@ namespace dxvk {
 
         dispatchBloom(rtOutput);
 
-        // Motion blur runs before tonemapping while the image is still in linear HDR space.
-        dispatchPostFxMotionBlur(rtOutput);
+        // Motion blur runs before tonemapping while the image is still in linear HDR space. Ahead of the fast lens
+        // flare, it leaves its result in the intermediate texture, which the flare writes on to the final output.
+        const bool flareReadsBlur = RtxLensFlare::isEnabled() && RtxLensFlare::quality() == LensFlareQuality::Fast;
+        const bool blurPending = dispatchPostFxMotionBlur(rtOutput, flareReadsBlur);
 
         // After motion blur, as the scene's motion vectors do not describe how the ghosts move.
-        dispatchLensFlare(rtOutput);
+        const bool blurResolved = dispatchLensFlare(rtOutput, blurPending);
+
+        if (blurPending && !blurResolved) {
+          m_common->metaPostFx().resolveMotionBlur(this, rtOutput);
+        }
 
         if (m_pendingInjectFinish.canvas != nullptr) {
           stageHdrCanvas(rtOutput, targetImage, !dlssNrEnabled, captureScreenImage, captureDebugImage);
@@ -2316,33 +2322,34 @@ namespace dxvk {
       &m_common->metaSunProbe());
   }
 
-  void RtxContext::dispatchLensFlare(const Resources::RaytracingOutput& rtOutput) {
+  bool RtxContext::dispatchLensFlare(const Resources::RaytracingOutput& rtOutput, bool readIntermediate) {
     ScopedCpuProfileZone();
     if (!RtxLensFlare::isEnabled()) {
-      return;
+      return false;
     }
 
     this->spillRenderPass(false);
     this->unbindComputePipeline();
 
-    m_common->metaLensFlare().dispatch(*this, m_state, rtOutput, m_common->metaSunProbe());
+    return m_common->metaLensFlare().dispatch(*this, m_state, rtOutput, m_common->metaSunProbe(), readIntermediate);
   }
 
-  void RtxContext::dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput) {
+  bool RtxContext::dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput, bool leaveInIntermediate) {
     ScopedCpuProfileZone();
     DxvkPostFx& postFx = m_common->metaPostFx();
     const RtCamera& mainCamera = getSceneManager().getCamera();
     if (!postFx.enable()) {
-      return;
+      return false;
     }
 
-    postFx.dispatchMotionBlur(this,
+    return postFx.dispatchMotionBlur(this,
       getResourceManager().getSampler(VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       mainCamera.getShaderConstants().resolution,
       RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0,
       rtOutput,
-      mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId()));
+      mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId()),
+      leaveInIntermediate);
   }
 
   void RtxContext::dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput) {

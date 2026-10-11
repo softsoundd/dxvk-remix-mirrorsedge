@@ -82,7 +82,8 @@
 #define CLOUD_FLAG_REFERENCE              (1u << 7)
 #define CLOUD_FLAG_HISTORY_VALID          (1u << 8)
 #define CLOUD_FLAG_GLOSSY_REFLECTIONS     (1u << 9)
-#define CLOUD_FLAG_CHECKERBOARD           (1u << 10)
+#define CLOUD_FLAG_HALF_RATE_MARCH        (1u << 10)
+#define CLOUD_FLAG_QUARTER_RATE_MARCH     (1u << 11)
 
 struct CloudArgs {
   uint enabled;  // Non-zero when the layer renders this frame
@@ -217,7 +218,7 @@ struct CloudArgs {
   float horizonBiasShiftKm;
 
   float edgeDetailStrength;  // Displacement of the eroded edge by a finer detail octave near the camera, 0 = none
-  uint pad1;
+  float glossyShareCosine;   // Cosine within which a glossy ray takes its 2x2 block's first ray's clouds, above 1 for none
   uint pad2;
   uint pad3;
 };

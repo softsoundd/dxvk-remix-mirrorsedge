@@ -171,6 +171,10 @@ static const float kReflectionHistoryBlend = 0.1f;
 // Distance a pixel whose ray found no cloud reprojects at: the middle of the cloud layer's typical range.
 static const float kReprojectionFallbackKm = 12.0f;
 
+// The pixel of each 2x2 block, as x + 2y, that marches in each of four frames at quarter rate. Consecutive frames
+// take opposite corners.
+static const uint kQuarterRateOrder[4] = { 0u, 3u, 1u, 2u };
+
 // Where the cloud at distanceKm along a pixel's unjittered ray was a frame ago, in world units: the clouds move
 // by the wind, and their detail drifts on it by the convective rise and, growing with height, the shear.
 vec3 cloudPreviousWorldPosition(vec3 pixelDirectionWorld, float distanceKm, CloudArgs cloud, AtmosphereArgs atmosphere) {
@@ -307,14 +311,19 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
 
   const float jitter = BlueNoise[uint3(pixel & 127u, cloud.frameIndex & 63u)].x;
 
-  // Half the rays into the layer march each frame, alternating in a checkerboard. The others keep their history,
-  // which is the filtered layer of their last march, until their next march clamps it to the current frame again.
+  // At half rate, half the rays into the layer march each frame, alternating in a checkerboard. At quarter rate, one
+  // pixel of each 2x2 block marches each frame, in turn. The others keep their history, which is the filtered layer
+  // of their last march, until their next march clamps it to the current frame again.
   // A ray with no history, such as one into sky just uncovered, marches anyway.
   // The cloud debug views show the march's own result, so every ray marches while one is active.
+  const bool quarterRate = (cloud.flags & CLOUD_FLAG_QUARTER_RATE_MARCH) != 0;
+  const bool interleaved = quarterRate || (cloud.flags & CLOUD_FLAG_HALF_RATE_MARCH) != 0;
   const bool historyEnabled = (cloud.flags & CLOUD_FLAG_HISTORY_VALID) != 0 && cloud.historyBlend < 1.0f;
   const bool cloudDebugView = cloud.debugView >= DEBUG_VIEW_CLOUD_MIN && cloud.debugView <= DEBUG_VIEW_CLOUD_MAX;
-  const bool rests = (cloud.flags & CLOUD_FLAG_CHECKERBOARD) != 0 && historyEnabled && !cloudDebugView
-    && ((pixel.x + pixel.y + cloud.frameIndex) & 1u) != 0u
+  const bool marchesThisFrame = quarterRate
+    ? (pixel.x & 1u) + 2u * (pixel.y & 1u) == kQuarterRateOrder[cloud.frameIndex & 3u]
+    : ((pixel.x + pixel.y + cloud.frameIndex) & 1u) == 0u;
+  const bool rests = interleaved && historyEnabled && !cloudDebugView && !marchesThisFrame
     && cloudRayEntersLayer(dirYUp, sceneDistanceKm, cloud, atmosphere);
   CloudMarchResult result = cloudEmptyMarchResult();
   if (!rests) {
@@ -323,17 +332,22 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
   vec4 current = vec4(result.radiance, result.transmittance);
   bool hidden = !rests && sceneDistanceKm < 1e8f && result.firstHitKm < 0.0f;
 
-  // Neighbourhood of the current frame within the tile, the range the history is clamped to.
+  // Neighbourhood of the current frame within the tile, the range the history is clamped to. At quarter rate it spans
+  // 5x5, the smallest window around a marching pixel that holds others.
   tileLayer[localId.y][localId.x] = hidden || rests ? vec4(0.0f, 0.0f, 0.0f, kHiddenMark) : current;
   tileDepth[localId.y][localId.x] = vec2(result.meanDepthKm, result.meanDepthKm > 0.0f ? 1.0f - result.transmittance : 0.0f);
   GroupMemoryBarrierWithGroupSync();
+  const int neighbourhoodRadius = quarterRate ? 2 : 1;
   vec4 neighbourhoodMin = current;
   vec4 neighbourhoodMax = current;
   vec2 neighbourhoodDepth = vec2(0.0f);
   [unroll]
-  for (int dy = -1; dy <= 1; ++dy) {
+  for (int dy = -2; dy <= 2; ++dy) {
     [unroll]
-    for (int dx = -1; dx <= 1; ++dx) {
+    for (int dx = -2; dx <= 2; ++dx) {
+      if (max(abs(dx), abs(dy)) > neighbourhoodRadius) {
+        continue;
+      }
       const int2 neighbour = clamp(int2(localId) + int2(dx, dy), int2(0), int2(7));
       const vec4 value = tileLayer[neighbour.y][neighbour.x];
       if (value.a >= 0.0f) {

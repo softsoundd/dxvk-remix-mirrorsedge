@@ -59,6 +59,7 @@ namespace dxvk {
       BEGIN_PARAMETER()
         STRUCTURED_BUFFER(LENS_FLARE_GHOSTS_INPUT)
         TEXTURE2D(LENS_FLARE_SUN_VISIBILITY_INPUT)
+        RW_TEXTURE2D(LENS_FLARE_COLOR_INPUT)
         RW_TEXTURE2D(LENS_FLARE_COLOR_INPUT_OUTPUT)
       END_PARAMETER()
     };
@@ -357,7 +358,8 @@ namespace dxvk {
     m_surfaceVersion = m_lensVersion;
   }
 
-  void RtxLensFlare::dispatch(RtxContext& ctx, DxvkContextState& state, const Resources::RaytracingOutput& rtOutput, const RtxSunProbe& sunProbe) {
+  bool RtxLensFlare::dispatch(RtxContext& ctx, DxvkContextState& state, const Resources::RaytracingOutput& rtOutput, const RtxSunProbe& sunProbe,
+                              bool readIntermediate) {
     ScopedCpuProfileZone();
 
     const RtxSunProbe::State& sun = sunProbe.getState();
@@ -365,7 +367,7 @@ namespace dxvk {
     if (!isEnabled() || !sun.active || !sun.measured || sunProbe.getVisibilityView() == nullptr) {
       m_drawnGhostCount = 0;
       m_levelGhostCounts.fill(0);
-      return;
+      return false;
     }
 
     if (LensAperture::updateLensSystem(m_lensSystem)) {
@@ -395,8 +397,11 @@ namespace dxvk {
     const double selectionMinSensorFromPupil =
       kMinGhostRadius * double(LensAperture::getSensorHalfHeightMm(sun.aspectRatio)) / m_entrancePupilRadius;
 
-    if (m_selectionVersion != m_lensVersion || m_selectionMinSensorFromPupil != float(selectionMinSensorFromPupil) ||
-        m_selectionMaxGhosts != maxGhosts()) {
+    // The camera's aspect ratio varies in its last bits from frame to frame, which must not reselect the ghosts.
+    const bool selectionThresholdMoved =
+      std::abs(m_selectionMinSensorFromPupil - float(selectionMinSensorFromPupil)) > 1e-3f * float(selectionMinSensorFromPupil);
+
+    if (m_selectionVersion != m_lensVersion || selectionThresholdMoved || m_selectionMaxGhosts != maxGhosts()) {
       selectGhosts(selectionMinSensorFromPupil);
       m_selectionVersion = m_lensVersion;
       m_selectionMinSensorFromPupil = float(selectionMinSensorFromPupil);
@@ -801,7 +806,7 @@ namespace dxvk {
     m_drawnInstanceCount = static_cast<uint32_t>(traced ? instances.size() : fastGhosts.size());
 
     if (m_drawnInstanceCount == 0) {
-      return;
+      return false;
     }
 
     ScopedGpuProfileZone(&ctx, "Lens Flare");
@@ -852,8 +857,9 @@ namespace dxvk {
       rasterArgs.apertureCornerReach = LensAperture::getSides(curvature, apertureDistanceJitter, apertureAngleJitter).cornerReach;
       rasterArgs.imageSize = Vector2(float(extent.width), float(extent.height));
 
+      assert(!readIntermediate);
       dispatchRayTraced(ctx, state, color, traceArgs, rasterArgs, instances, levelStarts, sunProbe);
-      return;
+      return false;
     }
 
     LensFlareArgs args = {};
@@ -871,12 +877,17 @@ namespace dxvk {
     args.apertureDistanceJitter = apertureDistanceJitter;
     args.apertureAngleJitter = apertureAngleJitter;
     args.debugView = static_cast<uint32_t>(debugView());
+    args.separateInput = readIntermediate ? 1u : 0u;
 
-    dispatchFast(ctx, color, args, fastGhosts, sunProbe);
+    const Resources::Resource& input = readIntermediate
+      ? rtOutput.m_postFxIntermediateTexture.resource(Resources::AccessType::Read)
+      : color;
+    dispatchFast(ctx, input, color, args, fastGhosts, sunProbe);
+    return readIntermediate;
   }
 
-  void RtxLensFlare::dispatchFast(RtxContext& ctx, const Resources::Resource& color, const LensFlareArgs& args,
-                                  const std::vector<LensFlareGhost>& ghosts, const RtxSunProbe& sunProbe) {
+  void RtxLensFlare::dispatchFast(RtxContext& ctx, const Resources::Resource& input, const Resources::Resource& color,
+                                  const LensFlareArgs& args, const std::vector<LensFlareGhost>& ghosts, const RtxSunProbe& sunProbe) {
     ensureBuffer<LensFlareGhost>(m_device, m_ghostBuffer, LENS_FLARE_MAX_GHOSTS,
       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -887,6 +898,7 @@ namespace dxvk {
     ctx.pushConstants(0, sizeof(args), &args);
     ctx.bindResourceBuffer(LENS_FLARE_GHOSTS_INPUT, DxvkBufferSlice(m_ghostBuffer, 0, m_ghostBuffer->info().size));
     ctx.bindResourceView(LENS_FLARE_SUN_VISIBILITY_INPUT, sunProbe.getVisibilityView(), nullptr);
+    ctx.bindResourceView(LENS_FLARE_COLOR_INPUT, input.view, nullptr);
     ctx.bindResourceView(LENS_FLARE_COLOR_INPUT_OUTPUT, color.view, nullptr);
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, LensFlareShader::getShader());
 

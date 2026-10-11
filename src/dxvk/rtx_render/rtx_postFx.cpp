@@ -258,20 +258,21 @@ namespace dxvk {
     }
   }
 
-  void DxvkPostFx::dispatchMotionBlur(
+  bool DxvkPostFx::dispatchMotionBlur(
     Rc<RtxContext> ctx,
     Rc<DxvkSampler> nearestSampler,
     Rc<DxvkSampler> linearSampler,
     const uvec2& mainCameraResolution,
     const uint32_t frameIdx,
     const Resources::RaytracingOutput& rtOutput,
-    const bool cameraCutDetected)
+    const bool cameraCutDetected,
+    const bool leaveInIntermediate)
   {
     if (!enable()) {
-      return;
+      return false;
     }
     if (cameraCutDetected || !isMotionBlurEnabled()) {
-      return;
+      return false;
     }
 
     assert(motionBlurSampleCount() <= 10);
@@ -313,15 +314,30 @@ namespace dxvk {
       rtOutput,
       inOutColorTexture, postFxIntermediateTexture);
 
-    // Copy the blurred result back into the final output so downstream passes can read it.
+    if (leaveInIntermediate) {
+      return true;
+    }
+
+    copyBlurredImage(ctx, rtOutput);
+    return false;
+  }
+
+  void DxvkPostFx::resolveMotionBlur(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput) {
+    ScopedGpuProfileZone(ctx, "PostFx Motion Blur Copy");
+    copyBlurredImage(ctx, rtOutput);
+  }
+
+  void DxvkPostFx::copyBlurredImage(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput) {
+    const Resources::Resource& finalOutput = rtOutput.m_finalOutput.resource(Resources::AccessType::Write);
+
     ctx->copyImage(
-      inOutColorTexture.image,
+      finalOutput.image,
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
       rtOutput.m_postFxIntermediateTexture.image(Resources::AccessType::Read),
       { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
       { 0, 0, 0 },
-      inputSize);
+      finalOutput.image->info().extent);
   }
 
   void DxvkPostFx::dispatchLensEffects(

@@ -35,6 +35,15 @@ namespace dxvk {
       } }
     };
 
+    RemixGui::ComboWithKey<CloudMarchRate> cloudMarchRateCombo {
+      "March Rate",
+      RemixGui::ComboWithKey<CloudMarchRate>::ComboEntries { {
+          {CloudMarchRate::Full, "Full"},
+          {CloudMarchRate::Half, "Half"},
+          {CloudMarchRate::Quarter, "Quarter"}
+      } }
+    };
+
     RemixGui::ComboWithKey<CloudGenus> cloudGenusCombo {
       "Genus",
       RemixGui::ComboWithKey<CloudGenus>::ComboEntries { {
@@ -66,8 +75,8 @@ namespace dxvk {
 
     cloudQualityCombo.getKey(&qualityObject());
     RemixGui::SetTooltipToLastWidgetOnHover("Step budget and length of the march, full resolution shadow taps, scattering octaves, how often the\noptical depth grids rebake and the reflection dome's resolution.");
-    RemixGui::Checkbox("Checkerboard March", &checkerboardMarchObject());
-    RemixGui::SetTooltipToLastWidgetOnHover("March half of the view's rays into the layer each frame, alternating in a checkerboard, while the others\nkeep their history. Halves the cost of the view's march, and its history takes twice as many frames to settle.");
+    cloudMarchRateCombo.getKey(&marchRateObject());
+    RemixGui::SetTooltipToLastWidgetOnHover("Share of the view's rays into the layer that march each frame, half in a checkerboard or a quarter in 2x2\nblocks, while the others keep their history. Each halving halves the cost of the view's march, and its\nhistory takes twice as many frames to settle.");
 
     cloudGenusCombo.getKey(&genusObject());
     RemixGui::SetTooltipToLastWidgetOnHover("Shape and microphysics presets after the WMO genera. Custom exposes the layer and microphysics options.");
@@ -166,6 +175,10 @@ namespace dxvk {
     RemixGui::SetTooltipToLastWidgetOnHover("March the clouds per pixel along mirrors' and glass's reflections into the sky, and past glass the sky is\nseen straight through, instead of the dome.");
     RemixGui::Checkbox("Sharp Near-Mirror Clouds", &glossyReflectionMarchObject());
     RemixGui::SetTooltipToLastWidgetOnHover("March the clouds per pixel along the reflections of surfaces a little too rough for PSR (polished floors,\ncurtain walls), instead of the dome, whose coarse texels flicker in them as the clouds drift.");
+    if (glossyReflectionMarch()) {
+      RemixGui::DragFloat("Near-Mirror Sharing Angle", &glossyShareAngleDegreesObject(), 0.1f, 0.0f, 180.0f, "%.1f deg", sliderFlags);
+      RemixGui::SetTooltipToLastWidgetOnHover("A near-mirror reflection within this angle of the first in its 2x2 block of pixels takes the clouds that\none marched instead of marching its own. 0 marches every reflection.");
+    }
     RemixGui::Checkbox("Path Traced Reference", &referenceObject());
     RemixGui::SetTooltipToLastWidgetOnHover("Replace the cloud layer with a progressive path traced reference to judge the march's lighting by\n(debug views Clouds Reference / Clouds Reference Error). Very expensive; the wind stops while it accumulates.");
     if (reference()) {

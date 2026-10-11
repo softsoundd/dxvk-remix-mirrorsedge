@@ -62,7 +62,10 @@ namespace dxvk {
 
     // Adds the flare to rtOutput's final output. Runs after motion blur and before tone mapping. The ray traced ghosts'
     // raster pass changes the context's state, which it restores from state.
-    void dispatch(RtxContext& ctx, DxvkContextState& state, const Resources::RaytracingOutput& rtOutput, const RtxSunProbe& sunProbe);
+    // With readIntermediate set, which only the fast path accepts, the image comes from the post effects' intermediate
+    // texture instead. Returns whether the flare wrote it to the final output.
+    bool dispatch(RtxContext& ctx, DxvkContextState& state, const Resources::RaytracingOutput& rtOutput, const RtxSunProbe& sunProbe,
+                  bool readIntermediate);
 
     // The ghosts the flare draws itself, whose light the sun's veil leaves out.
     const std::vector<LensSystem::Ghost>& getDrawnGhosts() const {
@@ -105,8 +108,8 @@ namespace dxvk {
     static constexpr uint32_t kRasterLevels = 3;
 
     void selectGhosts(double minSensorFromPupil);
-    void dispatchFast(RtxContext& ctx, const Resources::Resource& color, const LensFlareArgs& args,
-                      const std::vector<LensFlareGhost>& ghosts, const RtxSunProbe& sunProbe);
+    void dispatchFast(RtxContext& ctx, const Resources::Resource& input, const Resources::Resource& color,
+                      const LensFlareArgs& args, const std::vector<LensFlareGhost>& ghosts, const RtxSunProbe& sunProbe);
     // Each resolution's instances lie in turn, those of level l from levelStarts[l] up to levelStarts[l + 1].
     void dispatchRayTraced(RtxContext& ctx, DxvkContextState& state, const Resources::Resource& color,
                            const LensFlareTraceArgs& traceArgs, const LensFlareRasterArgs& rasterArgs,

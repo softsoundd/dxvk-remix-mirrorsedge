@@ -443,13 +443,13 @@ namespace dxvk {
 
   uint64_t RtxClouds::computeInputsKey(const CloudArgs& args, const AtmosphereArgs& atmosphere) {
     // The frame's own fields (index, history flags, debug view, pixel footprint, motion steps), the per pixel
-    // reflection paths and the screen march's checkerboard, which no bake reads, the camera's and the windows'
+    // reflection paths and the screen march's rate, which no bake reads, the camera's and the windows'
     // positions, which the bakes track themselves, and the wind's offset, which carries the field and the bakes
     // anchored to it alike.
     CloudArgs invariant = args;
     invariant.frameIndex = 0;
     invariant.flags &= ~(CLOUD_FLAG_HISTORY_VALID | CLOUD_FLAG_SHADOW_MAP_VALID | CLOUD_FLAG_PSR_REFLECTIONS | CLOUD_FLAG_GLOSSY_REFLECTIONS |
-                         CLOUD_FLAG_CHECKERBOARD);
+                         CLOUD_FLAG_HALF_RATE_MARCH | CLOUD_FLAG_QUARTER_RATE_MARCH);
     invariant.debugView = 0;
     invariant.cameraPositionKm = Vector3(0.0f);
     invariant.cameraWorldHeightKm = 0.0f;
@@ -460,6 +460,7 @@ namespace dxvk {
     invariant.windStepKm = Vector2(0.0f);
     invariant.riseStepKm = 0.0f;
     invariant.shearStepKm = 0.0f;
+    invariant.glossyShareCosine = 0.0f;
     return hashAtmosphere(atmosphere, hashBytes(&invariant, sizeof(invariant), kHashBasis));
   }
 
@@ -815,7 +816,8 @@ namespace dxvk {
     a.flags |= reflectionDome() ? CLOUD_FLAG_DOME : 0u;
     a.flags |= mirrorReflectionMarch() ? CLOUD_FLAG_PSR_REFLECTIONS : 0u;
     a.flags |= glossyReflectionMarch() ? CLOUD_FLAG_GLOSSY_REFLECTIONS : 0u;
-    a.flags |= checkerboardMarch() ? CLOUD_FLAG_CHECKERBOARD : 0u;
+    a.flags |= marchRate() == CloudMarchRate::Half ? CLOUD_FLAG_HALF_RATE_MARCH : 0u;
+    a.flags |= marchRate() == CloudMarchRate::Quarter ? CLOUD_FLAG_QUARTER_RATE_MARCH : 0u;
     a.flags |= hexTiling() ? CLOUD_FLAG_HEX_TILING : 0u;
     a.flags |= m_screenHistoryValid ? CLOUD_FLAG_HISTORY_VALID : 0u;
     a.flags |= m_shadowMapState.valid ? CLOUD_FLAG_SHADOW_MAP_VALID : 0u;
@@ -885,6 +887,7 @@ namespace dxvk {
     a.edgeErosion = std::clamp(edgeErosion(), 0.0f, 3.0f);
     a.fineDetailStrength = std::clamp(fineDetailStrength(), 0.0f, 2.0f);
     a.edgeDetailStrength = std::clamp(edgeDetail(), 0.0f, 2.0f);
+    a.glossyShareCosine = glossyShareAngleDegrees() > 0.0f ? std::cos(glossyShareAngleDegrees() * kCloudPi / 180.0f) : 2.0f;
     a.shapeVarietyWavelengthKm = std::max(shapeVarietyWavelengthKm(), 0.05f);
     // A level set displaced by more than about wavelength / pi peak to peak folds into detached sheets.
     a.shapeVarietyKm = std::min(std::clamp(shapeVarietyKm(), 0.0f, 1.5f), 0.65f * a.shapeVarietyWavelengthKm);

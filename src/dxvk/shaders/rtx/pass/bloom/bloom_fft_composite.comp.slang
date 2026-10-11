@@ -22,7 +22,7 @@
 
 // Adds the convolved image to the scene. The buffers hold only the light the kernel spreads away from each pixel, and
 // each pixel keeps the centre tap's share of its own at full resolution, so the result is the image convolved with the
-// kernel without the buffers' blur.
+// kernel without the buffers' blur. The sun's glare follows in the same pass.
 
 #include "rtx/pass/bloom/bloom.h"
 
@@ -36,11 +36,26 @@ Texture2D<float4> InCenterTap;
 layout(binding = BLOOM_FFT_COMPOSITE_COARSE_BLOOM_INPUT)
 Sampler2D<float4> InCoarseBloom;
 
+layout(binding = BLOOM_FFT_COMPOSITE_KERNEL_CONSTANTS_INPUT)
+ConstantBuffer<BloomKernelArgs> kernelArgs;
+
+layout(binding = BLOOM_FFT_COMPOSITE_SUN_GLARE_CONSTANTS_INPUT)
+ConstantBuffer<BloomSunGlareArgs> sunGlare;
+
+layout(binding = BLOOM_FFT_COMPOSITE_SUN_PSF_INPUT)
+Sampler2D<float4> InSunPsf;
+
+layout(binding = BLOOM_FFT_COMPOSITE_SUN_VISIBILITY_INPUT)
+Texture2D<float4> InSunVisibility;
+
 layout(binding = BLOOM_FFT_COMPOSITE_COLOR_INPUT_OUTPUT)
 RWTexture2D<float4> InOutColor;
 
 layout(push_constant)
 ConstantBuffer<BloomFftCompositeArgs> cb;
+
+#include "rtx/pass/bloom/bloom_kernel.slangh"
+#include "rtx/pass/bloom/bloom_sun_glare.slangh"
 
 // Uniform cubic B-spline over 4x4 texels, which smooths away the buffer's texels without ringing. Each pair of taps
 // along an axis is one bilinear tap between them, weighted by their sum, so four bilinear taps cover all sixteen
@@ -117,6 +132,17 @@ void main(uint2 pixel : SV_DispatchThreadID)
   color.rgb = cb.debugView == BLOOM_FFT_DEBUG_VIEW_BLOOM_ONLY
     ? bloom
     : color.rgb + cb.intensity * (bloom - (1.0f - kept) * color.rgb);
+
+  if (cb.sunGlareEnabled && !any(isnan(color.rgb)) && !any(isinf(color.rgb)))
+  {
+    const vec3 radiancePerShare = sunGlare.radiancePerShare * InSunVisibility.Load(int3(0, 0, 0)).rgb;
+
+    // An occluded sun casts no glare. The branch is uniform across the dispatch.
+    if (any(radiancePerShare > vec3(0.0f)))
+    {
+      color.rgb = addSunGlare(pixel, color.rgb, sunGlare, radiancePerShare, InSunPsf);
+    }
+  }
 
   InOutColor[pixel] = color;
 }

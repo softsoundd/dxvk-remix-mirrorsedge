@@ -57,6 +57,7 @@
 #include <map>
 #include <atomic>
 #include <array>
+#include <memory>
 #include <vector>
 
 using namespace Commands;
@@ -141,14 +142,77 @@ struct SentryShutdownOnExit {
 
 bool gOverwriteConditionAlreadyActive = false;
 
+// Maps client handles to server objects. The client takes every handle from one counter and never reuses them, so
+// they index pages of a flat table, which the per-command lookups reach without hashing. Reading a handle with no
+// object leaves its slot null, and pages stay allocated once a handle within them has been seen.
+template<typename T>
+class HandleTable {
+public:
+  T*& operator[](uint32_t handle) {
+    const size_t pageIndex = handle >> kPageBits;
+    if (pageIndex >= m_pages.size()) {
+      m_pages.resize(pageIndex + 1);
+    }
+    std::unique_ptr<Page>& pPage = m_pages[pageIndex];
+    if (pPage == nullptr) {
+      pPage = std::make_unique<Page>();
+    }
+    return (*pPage)[handle & kPageMask];
+  }
+
+  size_t erase(uint32_t handle) {
+    const size_t pageIndex = handle >> kPageBits;
+    if (pageIndex >= m_pages.size() || m_pages[pageIndex] == nullptr) {
+      return 0;
+    }
+    T*& slot = (*m_pages[pageIndex])[handle & kPageMask];
+    const size_t erased = slot != nullptr ? 1 : 0;
+    slot = nullptr;
+    return erased;
+  }
+
+  template<typename F>
+  void forEach(const F& f) const {
+    for (size_t pageIndex = 0; pageIndex < m_pages.size(); ++pageIndex) {
+      if (m_pages[pageIndex] == nullptr) {
+        continue;
+      }
+      for (uint32_t i = 0; i < kPageSize; ++i) {
+        T* const pObject = (*m_pages[pageIndex])[i];
+        if (pObject != nullptr) {
+          f(uint32_t(pageIndex << kPageBits) | i, pObject);
+        }
+      }
+    }
+  }
+
+  size_t size() const {
+    size_t count = 0;
+    forEach([&count](uint32_t, T*) { ++count; });
+    return count;
+  }
+
+  bool empty() const {
+    return size() == 0;
+  }
+
+private:
+  static constexpr uint32_t kPageBits = 12;
+  static constexpr uint32_t kPageSize = 1u << kPageBits;
+  static constexpr uint32_t kPageMask = kPageSize - 1;
+  using Page = std::array<T*, kPageSize>;
+
+  std::vector<std::unique_ptr<Page>> m_pages;
+};
+
 // Mapping between client and server pointer addresses
-std::unordered_map<uint32_t, IDirect3DDevice9*> gpD3DDevices;
-std::unordered_map<uint32_t, IDirect3DResource9*> gpD3DResources; // For Textures, Buffers, and Surfaces
+HandleTable<IDirect3DDevice9> gpD3DDevices;
+HandleTable<IDirect3DResource9> gpD3DResources; // For Textures, Buffers, and Surfaces
 std::unordered_map<uint32_t, IDirect3DVolume9*> gpD3DVolumes;
-std::unordered_map<uint32_t, IDirect3DVertexDeclaration9*> gpD3DVertexDeclarations;
+HandleTable<IDirect3DVertexDeclaration9> gpD3DVertexDeclarations;
 std::unordered_map<uint32_t, IDirect3DStateBlock9*> gpD3DStateBlocks;
-std::unordered_map<uint32_t, IDirect3DVertexShader9*> gpD3DVertexShaders;
-std::unordered_map<uint32_t, IDirect3DPixelShader9*> gpD3DPixelShaders;
+HandleTable<IDirect3DVertexShader9> gpD3DVertexShaders;
+HandleTable<IDirect3DPixelShader9> gpD3DPixelShaders;
 std::unordered_map<uint32_t, IDirect3DSwapChain9*> gpD3DSwapChains;
 std::unordered_map<uint32_t, IDirect3DQuery9*> gpD3DQuery;
 std::unordered_map<uint32_t, void*> gMapRemixApi;
@@ -268,6 +332,19 @@ static bool dumpLeakedObjects(const char* name, const T& map) {
     for (auto& [handle, obj] : map) {
       bridge_util::Logger::err(format_string("\t%x -> %p", handle, obj));
     }
+    return true;
+  }
+  return false;
+}
+
+template<typename T>
+static bool dumpLeakedObjects(const char* name, const HandleTable<T>& table) {
+  if (!table.empty()) {
+    bridge_util::Logger::err(format_string("%zd objects discovered in %s map at "
+                              "Direct3D module eviction:", table.size(), name));
+    table.forEach([](uint32_t handle, T* obj) {
+      bridge_util::Logger::err(format_string("\t%x -> %p", handle, obj));
+    });
     return true;
   }
   return false;

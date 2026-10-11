@@ -23,89 +23,51 @@
 // The glare of the sun's light that its rendered disc lacks, at full resolution and with no limit on its reach, on or
 // off the screen. Near the sun the diffraction comes from the PSF texture filtered by the sun's disc, and past it from
 // the analytic far field, spread across by the disc. The scatter is analytic throughout.
+// The includer declares kernelArgs and includes bloom_kernel.slangh first.
 
 #include "rtx/pass/bloom/bloom.h"
-#include "rtx/utility/math.slangh"
 
-layout(binding = BLOOM_SUN_GLARE_CONSTANTS_INPUT)
-ConstantBuffer<BloomKernelArgs> kernelArgs;
-
-layout(binding = BLOOM_SUN_GLARE_PSF_INPUT)
-Sampler2D<float4> InSunPsf;
-
-layout(binding = BLOOM_SUN_GLARE_SUN_VISIBILITY_INPUT)
-Texture2D<float4> InSunVisibility;
-
-layout(binding = BLOOM_SUN_GLARE_COLOR_INPUT_OUTPUT)
-RWTexture2D<float4> InOutColor;
-
-layout(push_constant)
-ConstantBuffer<BloomSunGlareArgs> cb;
-
-#include "rtx/pass/bloom/bloom_kernel.slangh"
-
-[shader("compute")]
-[numthreads(16, 16, 1)]
-void main(uint2 pixel : SV_DispatchThreadID)
+// Returns color with the glare at pixel added. radiancePerShare carries the sun's visibility.
+vec3 addSunGlare(uint2 pixel, vec3 color, BloomSunGlareArgs glare, vec3 radiancePerShare, Sampler2D<float4> sunPsf)
 {
-  if (any(pixel >= cb.imageSize))
-  {
-    return;
-  }
-
-  float4 color = InOutColor[pixel];
-
-  if (any(isnan(color.rgb)) || any(isinf(color.rgb)))
-  {
-    return;
-  }
-
-  const vec3 radiancePerShare = cb.radiancePerShare * InSunVisibility.Load(int3(0, 0, 0)).rgb;
-
-  if (all(radiancePerShare <= vec3(0.0f)))
-  {
-    return;
-  }
-
   // The pixel's true angle from the sun, as a radius in near texels and on axis pixels.
   const vec2 ndc = vec2(
-    (float(pixel.x) + 0.5f) / float(cb.imageSize.x) * 2.0f - 1.0f,
-    1.0f - (float(pixel.y) + 0.5f) / float(cb.imageSize.y) * 2.0f);
-  const vec3 pixelDirection = normalize(vec3(ndc * cb.tanHalfFov, 1.0f));
-  const vec3 sunDirection = normalize(vec3(cb.sunTan, 1.0f));
+    (float(pixel.x) + 0.5f) / float(glare.imageSize.x) * 2.0f - 1.0f,
+    1.0f - (float(pixel.y) + 0.5f) / float(glare.imageSize.y) * 2.0f);
+  const vec3 pixelDirection = normalize(vec3(ndc * glare.tanHalfFov, 1.0f));
+  const vec3 sunDirection = normalize(vec3(glare.sunTan, 1.0f));
   const float theta = atan2(length(cross(pixelDirection, sunDirection)), dot(pixelDirection, sunDirection));
-  const float radius = max(theta / cb.anglePerNearTexel, 1e-3f);
-  const float radiusPixels = radius / cb.nearTexelsPerPixel;
+  const float radius = max(theta / glare.anglePerNearTexel, 1e-3f);
+  const float radiusPixels = radius / glare.nearTexelsPerPixel;
 
-  const vec2 offset = vec2(pixel) + 0.5f - cb.sunPixel;
+  const vec2 offset = vec2(pixel) + 0.5f - glare.sunPixel;
   const float offsetLength = length(offset);
   const vec2 onAxis = (offsetLength > 1e-4f ? offset / offsetLength : vec2(1.0f, 0.0f)) * radiusPixels;
   // An output pixel's area in near texels.
-  const float pixelArea = cb.nearTexelsPerPixel * cb.nearTexelsPerPixel;
+  const float pixelArea = glare.nearTexelsPerPixel * glare.nearTexelsPerPixel;
 
   vec3 diffraction = vec3(0.0f);
-  const float farBlend = cb.psfEnabled ? smoothstep(0.8f * cb.psfRadiusPixels, cb.psfRadiusPixels, radiusPixels) : 1.0f;
+  const float farBlend = glare.psfEnabled ? smoothstep(0.8f * glare.psfRadiusPixels, glare.psfRadiusPixels, radiusPixels) : 1.0f;
 
   if (farBlend < 1.0f)
   {
     const vec2 uv = onAxis / (kernelArgs.sunPsfPixelsPerTexel * float(kernelArgs.sunPsfSize)) + 0.5f;
-    diffraction += (1.0f - farBlend) * InSunPsf.SampleLevel(uv, 0.0f).rgb;
+    diffraction += (1.0f - farBlend) * sunPsf.SampleLevel(uv, 0.0f).rgb;
   }
 
   if (farBlend > 0.0f)
   {
     // The spikes spread across over the sun's disc and the output pixel.
     const float angle = atan2(-onAxis.y, onAxis.x);
-    const float spreadVariance = cb.discVarianceTexels + pixelArea / 12.0f;
+    const float spreadVariance = glare.discVarianceTexels + pixelArea / 12.0f;
     const vec3 farField = diffractionShare() * diffractionFarFieldChannels(radius, angle, spreadVariance) * spikeBoostAt(radius);
 
     diffraction += farBlend * farField * pixelArea;
   }
 
   // Per steradian at the pixel's true angle, over an on axis pixel's solid angle.
-  const vec3 scatter = observerScatterDensity(theta, cb.veilScale) * (cb.anglePerNearTexel * cb.anglePerNearTexel * pixelArea);
+  const vec3 scatter = observerScatterDensity(theta, glare.veilScale) * (glare.anglePerNearTexel * glare.anglePerNearTexel * pixelArea);
 
   // Kept within the output's range, which the glare at the disc's centre far exceeds.
-  color.rgb = max(color.rgb, min(color.rgb + radiancePerShare * (diffraction + scatter), vec3(cb.maxRadiance)));
-  InOutColor[pixel] = color;
+  return max(color, min(color + radiancePerShare * (diffraction + scatter), vec3(glare.maxRadiance)));
 }

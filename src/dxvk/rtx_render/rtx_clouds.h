@@ -43,6 +43,13 @@ enum class CloudQuality : int {
   Ultra,
 };
 
+// Share of the view's rays into the layer that march each frame (rtx.clouds.marchRate).
+enum class CloudMarchRate : int {
+  Full = 0,
+  Half,
+  Quarter,
+};
+
 // rtx.clouds.genus: shape and microphysics presets. Custom uses the individual options.
 enum class CloudGenus : int {
   Custom = 0,
@@ -244,7 +251,14 @@ public:
   RTX_OPTION("rtx.clouds", bool, reflectionDome, true, "Clouds in sky reflections and indirect sky light, from a dome rendered from the camera.");
   RTX_OPTION("rtx.clouds", bool, mirrorReflectionMarch, true, "March the clouds per pixel along mirrors' and glass's first reflections into the sky, and past glass the sky is seen straight through, instead of reading the dome.");
   RTX_OPTION("rtx.clouds", bool, glossyReflectionMarch, true, "March the clouds per pixel along near-mirrors' reflections into the sky (surfaces a little too rough for PSR, such as polished floors and curtain walls), instead of reading the dome. Costs a march for each such pixel.");
-  RTX_OPTION("rtx.clouds", bool, checkerboardMarch, true, "March half of the view's rays into the layer each frame, alternating in a checkerboard. The others keep their filtered history, and march where they have none, such as sky just uncovered. Halves the cost of the view's march, and its history takes twice as many frames to converge.");
+  RTX_OPTION_ARGS("rtx.clouds", float, glossyShareAngleDegrees, 4.0f,
+                  "Angle in degrees within which a near-mirror's reflection takes the clouds the first reflection of its 2x2 block of pixels\n"
+                  "marched, instead of marching its own. 0 marches every reflection.",
+                  args.minValue = 0.0f, args.maxValue = 180.0f);
+  RTX_OPTION("rtx.clouds", CloudMarchRate, marchRate, CloudMarchRate::Quarter,
+             "Share of the view's rays into the layer that march each frame: 0: Full, 1: Half (alternating in a checkerboard), 2: Quarter\n"
+             "(one pixel of each 2x2 block in turn). The others keep their filtered history, and march where they have none, such as\n"
+             "sky just uncovered. Each halving halves the cost of the view's march and doubles the frames its history takes to converge.");
   RTX_OPTION("rtx.clouds", float, maxMarchKm, 160.0f, "Longest distance the march follows a ray through the layer.");
 private:
   struct TierSettings {

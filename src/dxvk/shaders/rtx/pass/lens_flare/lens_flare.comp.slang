@@ -34,6 +34,9 @@ StructuredBuffer<LensFlareGhost> Ghosts;
 layout(binding = LENS_FLARE_SUN_VISIBILITY_INPUT)
 Texture2D<float4> InSunVisibility;
 
+layout(binding = LENS_FLARE_COLOR_INPUT)
+RWTexture2D<float4> InColor;
+
 layout(binding = LENS_FLARE_COLOR_INPUT_OUTPUT)
 RWTexture2D<float4> InOutColor;
 
@@ -94,6 +97,19 @@ bool ghostOverlapsRect(uint ghostIndex, vec2 rectMin, vec2 rectMax)
 [numthreads(kTileSize, kTileSize, 1)]
 void main(uint2 pixel : SV_DispatchThreadID, uint2 groupId : SV_GroupID, uint threadIndex : SV_GroupIndex)
 {
+  const vec3 visibility = InSunVisibility.Load(int3(0, 0, 0)).rgb;
+
+  // An occluded sun casts no ghosts, so the image only passes through. The branch is uniform across the dispatch.
+  if (all(visibility <= vec3(0.0f)) && cb.debugView == LENS_FLARE_DEBUG_VIEW_NONE)
+  {
+    if (cb.separateInput && all(pixel < cb.imageSize))
+    {
+      InOutColor[pixel] = InColor[pixel];
+    }
+
+    return;
+  }
+
   if (threadIndex == 0)
   {
     g_tileGhostCount = 0;
@@ -150,9 +166,9 @@ void main(uint2 pixel : SV_DispatchThreadID, uint2 groupId : SV_GroupID, uint th
     }
   }
 
-  flare *= cb.sourceIlluminance * InSunVisibility.Load(int3(0, 0, 0)).rgb;
+  flare *= cb.sourceIlluminance * visibility;
 
-  vec4 color = InOutColor[pixel];
+  vec4 color = cb.separateInput ? InColor[pixel] : InOutColor[pixel];
 
   if (cb.debugView == LENS_FLARE_DEBUG_VIEW_FLARE_ONLY)
   {
