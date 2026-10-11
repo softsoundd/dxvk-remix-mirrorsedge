@@ -154,7 +154,8 @@ namespace dxvk {
     // its file was read stay removed and hash sets are not merged with the file's. Expects the update mutex to be
     // held.
     void restoreLayerValues(const RtxOptionLayer& layer, const Config& values) {
-      for (const auto& [hash, pOption] : RtxOptionImpl::getGlobalOptionMap()) {
+      const auto globalRtxOptions = RtxOptionImpl::getGlobalOptionMap();
+      for (const auto& [hash, pOption] : *globalRtxOptions) {
         // RtxOptionManager::writeOptions leaves these out of the values, so the file's stand.
         if ((pOption->getFlags() & static_cast<uint32_t>(RtxOptionFlags::NoSave)) != 0) {
           continue;

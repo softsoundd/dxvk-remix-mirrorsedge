@@ -41,6 +41,9 @@
 #include "rtx_pathtracer_integrate_direct.h"
 #include "rtx_pathtracer_integrate_indirect.h"
 #include "rtx_dlss.h"
+#include "rtx_gpu_overrides.h"
+#include "rtx_gpu_profile.h"
+#include "rtx_graphics_preset.h"
 #include "rtx_materials.h"
 #include "rtx/pass/material_args.h"
 #include "rtx_option.h"
@@ -70,17 +73,6 @@ namespace dxvk {
     NIS,
     TAAU,
     XeSS
-  };
-
-  enum class GraphicsPreset : int {
-    Ultra = 0,
-    High,
-    Medium,
-    Low,
-    Custom,
-    // Note: Used to automatically have the graphics preset set on initialization, not used beyond this case
-    // as it should be overridden by one of the other values by the time any other code uses it.
-    Auto
   };
 
   enum class RaytraceModePreset {
@@ -1777,6 +1769,9 @@ namespace dxvk {
       if (env::getEnvVar("DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD") == "1") {
         RtxOptionManager::writeMarkdownDocumentation("RtxOptions.md");
       }
+
+      // Registered before layers load so their keys are created as the layers are applied.
+      GpuOverrides::registerNamespaces();
 
       // Initialize all system layers (creates layers from config files)
       RtxOptionLayer::initializeSystemLayers();
