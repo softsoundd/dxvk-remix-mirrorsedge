@@ -451,6 +451,12 @@ namespace dxvk {
                "matrix register to match the CTAB ViewProjectionMatrix symbol, which together prove the register "
                "holds a world position; draws failing either check fall back to unprojecting "
                "(see rtx.d3d9.ue3RequireExactVertexCapture).");
+    RTX_OPTION("rtx.d3d9", bool, ue3DeriveCameraPositionFromViewProjection, false,
+               "UE3 compat: let draws whose vertex shader CTAB names ViewProjectionMatrix but no camera position "
+               "update the main camera, solving the camera position from the matrix itself (the point that projects "
+               "to clip x = y = w = 0) instead of reading the camera position register. For UE3 builds whose base "
+               "pass shaders were compiled without CameraPosition / WorldCameraPosition (e.g. Transformers: War for "
+               "Cybertron), where only particles and decals would otherwise steer the camera.");
     RTX_OPTION("rtx.d3d9", bool, ue3RequireExactVertexCapture, false,
                "UE3 compat: drop draws from the ray-traced scene when neither exact position source applies, rather "
                "than falling back to clip-space reconstruction. This makes distance-dependent vertex distortion "
@@ -1580,6 +1586,7 @@ namespace dxvk {
       bool ue3StaticGeometryHashMemoization = false;
       uint32_t ue3GeometryMemoSelfCheckFrames = 0;
       bool ue3ExactVertexCapture = false;
+      bool ue3DeriveCameraPositionFromViewProjection = false;
       bool ue3RequireExactVertexCapture = false;
       Ue3CapturePositionSourceOverride ue3VertexCaptureSourceOverride = Ue3CapturePositionSourceOverride::Auto;
       bool ue3NativeLocalMeshVertexCapture = false;

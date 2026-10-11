@@ -262,10 +262,12 @@ namespace dxvk {
   void logUe3HighlightPairsOnce(const XXH64_hash_t psHash, const XXH64_hash_t shaderIdentitySeed,
                                 const std::vector<uint8_t>& bytecode, const Ue3PsMaterialIdentityInfo& info);
 
+  // With deriveCameraPosition, viewOriginRegister is ignored and the position is solved from the matrix.
   bool extractUe3CameraMatrices(
     const D3D9ShaderConstantsVSSoftware& vsConsts,
     const uint32_t viewProjRegisterBase,
     const uint32_t viewOriginRegister,
+    const bool deriveCameraPosition,
     Matrix4& outWorldToView,
     Matrix4& outViewToProjection,
     bool* outUsedTranspose = nullptr,
