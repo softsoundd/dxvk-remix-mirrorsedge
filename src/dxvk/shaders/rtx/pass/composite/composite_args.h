@@ -110,6 +110,7 @@ struct CompositeArgs {
   float postFilterThreshold;
   uint writeRayReconstructionHitDistance;
   uint timeSinceStartMS;
+
   uint enableDlssNrVolumetricControlMask;
 
   // Unoccluded distant-sun illuminance and world direction for reflection-segment fog.
@@ -118,6 +119,12 @@ struct CompositeArgs {
   float secondaryCombinedMissLinearViewZ;
   vec3 unoccludedSunDirection;
   float padUnoccludedDir;
+
+  uint stochasticAlphaBlendAverageSearchMatches;
+  uint skyUseProbeForPrimaryRays;
+  // Two pads keep CompositeArgs 16-byte aligned after the upstream flags.
+  uint padCompositeTail0;
+  uint padCompositeTail1;
 };
 
 #ifdef __cplusplus

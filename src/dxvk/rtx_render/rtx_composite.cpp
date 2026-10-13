@@ -130,6 +130,7 @@ namespace dxvk {
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
+        SAMPLERCUBE(COMPOSITE_SKY_PROBE_TEXTURE)
         TEXTURE3D(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT)
         TEXTURE2D(COMPOSITE_SKY_HEMISPHERE_MEAN_INPUT)
         TEXTURE2D(COMPOSITE_ATMOSPHERE_TRANSMITTANCE_INPUT)
@@ -172,6 +173,7 @@ namespace dxvk {
       RemixGui::Checkbox("Use Neighbor Search", &stochasticAlphaBlendUseNeighborSearchObject());
       RemixGui::Checkbox("Search The Same Object", &stochasticAlphaBlendSearchTheSameObjectObject());
       RemixGui::Checkbox("Share Search Result", &stochasticAlphaBlendShareNeighborsObject());
+      RemixGui::Checkbox("Average Search Matches", &stochasticAlphaBlendAverageSearchMatchesObject());
       RemixGui::DragInt("Search Iterations", &stochasticAlphaBlendSearchIterationObject(), 0.1f, 1, 20, "%d", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Initial Search Radius", &stochasticAlphaBlendInitialSearchRadiusObject(), 0.01f, 1.0f, 20.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
       RemixGui::DragFloat("Radius Expand Factor", &stochasticAlphaBlendRadiusExpandFactorObject(), 0.01f, 1.0f, 5.f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
@@ -414,6 +416,8 @@ namespace dxvk {
     } else {
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, ctx->getResourceManager().getSkyMatte(ctx).view, nullptr);
     }
+    ctx->bindResourceView(COMPOSITE_SKY_PROBE_TEXTURE, ctx->getResourceManager().getSkyProbe(ctx).view, nullptr);
+    ctx->bindResourceSampler(COMPOSITE_SKY_PROBE_TEXTURE, linearSampler);
     // Null outside of Physical Atmosphere, where the shader also skips sampling it.
     ctx->bindResourceView(COMPOSITE_ATMOSPHERE_AERIAL_PERSPECTIVE_INPUT,
       ctx->getAerialPerspectiveLutView(), nullptr);
@@ -529,6 +533,7 @@ namespace dxvk {
     compositeArgs.stochasticAlphaBlendInitialSearchRadius = stochasticAlphaBlendInitialSearchRadius();
     compositeArgs.stochasticAlphaBlendRadiusExpandFactor = stochasticAlphaBlendRadiusExpandFactor();
     compositeArgs.stochasticAlphaBlendShareNeighbors = stochasticAlphaBlendShareNeighbors();
+    compositeArgs.stochasticAlphaBlendAverageSearchMatches = stochasticAlphaBlendAverageSearchMatches();
     compositeArgs.stochasticAlphaBlendNormalSimilarity = stochasticAlphaBlendNormalSimilarity();
     compositeArgs.stochasticAlphaBlendDepthDifference = stochasticAlphaBlendDepthDifference();
     compositeArgs.stochasticAlphaBlendPlanarDifference = stochasticAlphaBlendPlanarDifference();
@@ -553,6 +558,7 @@ namespace dxvk {
 
     compositeArgs.domeLightArgs = domeLightArgs;
     compositeArgs.skyBrightness = RtxOptions::skyBrightness();
+    compositeArgs.skyUseProbeForPrimaryRays = skyUseProbeForPrimaryRays();
 
     const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
 

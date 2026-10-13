@@ -35,6 +35,7 @@
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_spatially_hashed_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
+#include "rtx_sparse_rendering.h"
 #include "../util/util_global_time.h"
 
 #include "dxvk_device.h"
@@ -488,7 +489,7 @@ namespace dxvk {
       postFx.enable.setDeferred(false);
     };
 
-    auto applyIndirectPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset) {
+    auto applyIndirectPreset = [&](NeuralRadianceCache::QualityPreset nrcPreset, SpatiallyHashedRadianceCache::QualityPreset sharcPreset) {
       // Preserve ReSTIR GI selected by a cache support fallback.
       if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
         return;
@@ -504,10 +505,21 @@ namespace dxvk {
         }
       } else if (SpatiallyHashedRadianceCache::checkIsSupported(device)) {
         RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::SHaRC);
+        using SharcOptions = SpatiallyHashedRadianceCache::SharcOptions;
+        SharcOptions::qualityPreset.setImmediately(sharcPreset);
+        SharcOptions::onQualityPresetChanged(device);
       } else {
         Logger::warn("[RTX] SHaRC requires shaderInt64 and shaderBufferInt64Atomics. Switching to ReSTIR GI.");
         RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI);
       }
+    };
+
+    auto applySparseRenderingPreset = [](const float samplingRate,
+                                         const float samplingRateResolutionExponent,
+                                         const bool enableSparseAwareAlphaBlendSearch) {
+      SparseRendering::Options::samplingRate.setDeferred(samplingRate);
+      SparseRendering::Options::samplingRateResolutionExponent.setDeferred(samplingRateResolutionExponent);
+      SparseRendering::Options::enableSparseAwareAlphaBlendSearch.setDeferred(enableSparseAwareAlphaBlendSearch);
     };
 
     assert(graphicsPreset() != GraphicsPreset::Auto);
@@ -533,7 +545,8 @@ namespace dxvk {
       postFx.enable.setDeferred(true);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Ultra);
-      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Ultra);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Ultra, SpatiallyHashedRadianceCache::QualityPreset::Ultra);
+      applySparseRenderingPreset(0.357f, 0.69f, true);
 
     } else if (graphicsPreset() == GraphicsPreset::High) {
       pathMinBounces.setDeferred(0);
@@ -554,7 +567,8 @@ namespace dxvk {
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.6f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::High);
-      applyIndirectPreset(NeuralRadianceCache::QualityPreset::High);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::High, SpatiallyHashedRadianceCache::QualityPreset::High);
+      applySparseRenderingPreset(0.228f, 0.83f, true);
 
     } else if (graphicsPreset() == GraphicsPreset::Medium) {
       lowGraphicsPresetCommonSettings();
@@ -563,7 +577,8 @@ namespace dxvk {
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Medium);
-      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Medium);
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Medium, SpatiallyHashedRadianceCache::QualityPreset::Medium);
+      applySparseRenderingPreset(0.125f, 0.83f, false);
     } else if (graphicsPreset() == GraphicsPreset::Low) {
       lowGraphicsPresetCommonSettings();
 
@@ -571,8 +586,9 @@ namespace dxvk {
       russianRoulette1stBounceMinContinueProbability.setDeferred(0.4f);
 
       volumetrics.setQualityLevel(RtxGlobalVolumetrics::Low);
-      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Medium);
-      
+      applyIndirectPreset(NeuralRadianceCache::QualityPreset::Medium, SpatiallyHashedRadianceCache::QualityPreset::Medium);
+      applySparseRenderingPreset(0.1f, 0.91f, false);
+
     }
 
     // Ensure we are using auto DLSS profile since we will be relying on quality downgrades for Medium/Low settings

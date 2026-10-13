@@ -557,18 +557,28 @@ void applyVolumetricLighting(
     }
     controlMaskVolumeAttenuation = volumeAttenuation;
   }
-  else if (cb.enableDlssNrVolumetricControlMask)
+  else
   {
     // The control mask remains dense when volumetric radiance integration uses sparse pixels.
-    RNG controlMaskRandomState = randomState;
-    controlMaskVolumeAttenuation = integrateVolumetricTransmittance(
-      controlMaskRandomState,
-      cb.volumeArgs,
-      cb.timeSinceStartMS,
-      primaryMiss,
-      cameraGetWorldPosition(cb.camera),
-      viewDistance,
-      primaryRayDirections.worldDirection);
+    // Dense sky composition also needs the transmittance at inactive misses, since the sky is attenuated by it.
+    const bool denseSky = primaryMiss && !cb.sparseRenderingArgs.enableSparsePrimaryRayMissComposition;
+    if (cb.enableDlssNrVolumetricControlMask || denseSky)
+    {
+      RNG transmittanceRandomState = randomState;
+      const vec3 transmittance = integrateVolumetricTransmittance(
+        transmittanceRandomState,
+        cb.volumeArgs,
+        cb.timeSinceStartMS,
+        primaryMiss,
+        cameraGetWorldPosition(cb.camera),
+        viewDistance,
+        primaryRayDirections.worldDirection);
+      controlMaskVolumeAttenuation = transmittance;
+      if (denseSky)
+      {
+        volumeAttenuation = transmittance;
+      }
+    }
   }
 
   // Stochastic alpha blend
@@ -718,6 +728,10 @@ void applySkyContribution(
   if (cb.domeLightArgs.active)
   {
     skyContribution = cb.domeLightArgs.radiance * sampleDomeLightTexture(SkyLight, primaryRayDirections.worldDirection, cb.domeLightArgs.worldToLightTransform) * volumeAttenuation;
+  }
+  else if (cb.skyUseProbeForPrimaryRays)
+  {
+    skyContribution = cb.skyBrightness * SkyProbe.SampleLevel(primaryRayDirections.worldDirection, 0) * volumeAttenuation;
   }
   else
   {
