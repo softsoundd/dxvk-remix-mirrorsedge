@@ -44,6 +44,7 @@ namespace dxvk {
   class SceneManager;
   class TerrainBaker;
   struct ExternalDrawState;
+  struct Ue3CompositeBakeRequest;
   struct Ue3ToneMapCapture;
 
   struct D3D9RtxVertexCaptureData;
@@ -269,6 +270,11 @@ namespace dxvk {
     TryHandleSkyResult tryHandleSky(const DrawParameters* originalParams, DrawCallState* originalDrawCallState /* can be std::move-d */);
 
     void bakeTerrain(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData** outOverrideMaterialData);
+
+    // Binds the draw's composite bake (rtx.ue3CompositeMaterialTextures), and bakes it first from the draw's
+    // own state when it has none.
+    void bakeUe3Composite(DrawCallState& drawCallState);
+    bool bakeUe3CompositeNow(const Ue3CompositeBakeRequest& request);
 
     InternalUpscaler getCurrentFrameUpscaler();
 

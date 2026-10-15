@@ -131,6 +131,7 @@ namespace {
       std::cout << std::endl << "Begin DXSO UV dataflow tests" << std::endl;
       test_plainInterpolant();
       test_constantTiling();
+      test_readsBeforeWrites();
       test_selfAdd();
       test_panner();
       test_rotatorDp2add();
@@ -168,6 +169,20 @@ namespace {
       expectString(ps.origin(),
                    "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=1 U=[uv*c3.x+0] V=[uv*c3.y+0]",
                    "constant tiling");
+    }
+
+    // An instruction reads every operand before it writes any lane. Escape_p's carpet scales both
+    // lanes by r0.x while writing r0.xy, which the second lane must still read as the tiling.
+    static void test_readsBeforeWrites() {
+      std::cout << "  test_readsBeforeWrites" << std::endl;
+      PsShader ps;
+      ps.op1(DxsoOpcode::Mov, rd(0, MaskX), c(4, kXXXX))
+        .op3(DxsoOpcode::Mad, rd(0, MaskXY), r(0, kXXXX), v(0), c(5, kXXXX, kModNeg))
+        .texld(rd(0), r(0), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(0));
+      expectString(ps.origin(),
+                   "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=1 U=[uv*c4.x+c5.x*-1] V=[uv*c4.x+c5.x*-1]",
+                   "mad r0.xy, r0.x, v0, -c5.x");
     }
 
     static void test_selfAdd() {

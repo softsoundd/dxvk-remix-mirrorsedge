@@ -98,7 +98,9 @@ struct OpaqueSurfaceMaterial
 
   // 26
   uint16_t samplerFeedbackStamp;
-  uint16_t data0;
+  // 27
+  // Indexes a MaskLayerMaterial in surfaceMaterialExtensions when OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER is set.
+  uint16_t maskLayerIndex;
 
   // 28-29
   uint dlssControlMask;
@@ -178,6 +180,27 @@ struct SubsurfaceMaterial
 
   float16_t maxSampleRadius;
   
+  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
+  uint16_t data[19];
+};
+
+// Describes a mask a UE3 composite bake leaves out of its repeat. The albedo blends towards the bake with the
+// mask at 1 by one channel of the mask, read at its own tiling, and through the bake at 1/2 for a quadratic mask.
+struct MaskLayerMaterial
+{
+  uint16_t flags;
+
+  uint16_t maskedAlbedoTextureIndex;
+  uint16_t maskTextureIndex;
+  // Holds the mask channel and the MASK_LAYER_MATERIAL_FLAG_* bits.
+  uint16_t maskChannelAndFlags;
+
+  // These map the surface's texture coordinates to the mask's, as coordinates * maskScale + maskOffset.
+  vec2 maskScale;
+  vec2 maskOffset;
+
+  uint16_t maskedHalfAlbedoTextureIndex;
+
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
   uint16_t data[19];
 };

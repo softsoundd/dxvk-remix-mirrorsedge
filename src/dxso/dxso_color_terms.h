@@ -114,6 +114,9 @@ namespace dxvk {
     std::array<uint8_t, kDxsoColorTermMaxConstRegs>          constReach = {};
     // Distinct literal component values read by the shader, in first-read order.
     std::vector<DxsoColorTermLiteral> literals;
+    // Holds the interpolants read as a DxsoColorTermFactor_Interpolant (vertex lightmap) factor.
+    // Bits 0..15 are v# registers and bits 16..31 are ps_2_x t# registers.
+    uint32_t interpolantFactorInputs = 0;
     // Per sampler, tracked or not, over the coordinate lanes it reads across all its samples:
     // every non-literal constant register the coordinate is built from (transitively, through
     // temporaries, dot products, matrix rows and dependent reads), the DxsoCoordExpr bits, and

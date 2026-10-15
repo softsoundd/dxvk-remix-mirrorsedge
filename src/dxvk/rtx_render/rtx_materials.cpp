@@ -40,6 +40,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
     XXH64_hash_t colorTextureDescriptorHash1;
     XXH64_hash_t highlightGlowTextureHash;
     XXH64_hash_t highlightGlowTextureDescriptorHash;
+    XXH64_hash_t compositeIdentity;
     XXH64_hash_t samplerHash0;
     XXH64_hash_t samplerHash1;
     uint32_t alphaTestCompareOp;
@@ -100,6 +101,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   data.colorTextureDescriptorHash1 = textureVariantHash(colorTextures[1]);
   data.highlightGlowTextureHash = ue3HighlightGlowTexture.getImageHash();
   data.highlightGlowTextureDescriptorHash = textureVariantHash(ue3HighlightGlowTexture);
+  data.compositeIdentity = ue3CompositeIdentity;
   data.samplerHash0 = samplers[0].ptr() != nullptr ? samplers[0]->info().calculateHash() : kEmptyHash;
   data.samplerHash1 = samplers[1].ptr() != nullptr ? samplers[1]->info().calculateHash() : kEmptyHash;
   data.alphaTestCompareOp = static_cast<uint32_t>(alphaTestCompareOp);
@@ -131,6 +133,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
       &LegacyMaterialIdentityHashData::colorTextureDescriptorHash1,
       &LegacyMaterialIdentityHashData::highlightGlowTextureHash,
       &LegacyMaterialIdentityHashData::highlightGlowTextureDescriptorHash,
+      &LegacyMaterialIdentityHashData::compositeIdentity,
       &LegacyMaterialIdentityHashData::samplerHash0,
       &LegacyMaterialIdentityHashData::samplerHash1,
       &LegacyMaterialIdentityHashData::alphaTestCompareOp,
@@ -204,7 +207,7 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   opaqueMat.batchSet([this](OpaqueMaterialData& mat) {
     setLegacyMaterialDefaults(mat);
     if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
-      mat.setAlbedoOpacityTexture(getColorTexture());
+      mat.setAlbedoOpacityTexture(ue3CompositeAlbedo.isValid() ? ue3CompositeAlbedo : getColorTexture());
     }
     // UE3 constant-color materials carry their color in UniformVector_* shader constants;
     // without this they render plain white. Opacity stays at the default - the vector's
@@ -219,12 +222,18 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     if (getColorTexture2().isValid()) {
       mat.setSecondaryTexture(getColorTexture2());
     }
-    if (ue3HighlightGlowTexture.isValid()) {
+    if (ue3CompositeEmissive.isValid()) {
+      mat.setEmissiveColorTexture(ue3CompositeEmissive);
+      mat.setEnableEmission(true);
+      mat.setEmissiveIntensity(ue3CompositeEmissiveIntensity);
+    } else if (ue3HighlightGlowTexture.isValid()) {
       mat.setEmissiveColorTexture(ue3HighlightGlowTexture);
     }
   });
   // Indicate that we have an exact sampler to use on this material, directly from game
-  if (getSampler().ptr()) {
+  if (ue3CompositeSampler.ptr()) {
+    opaqueMat.setSamplerOverride(ue3CompositeSampler);
+  } else if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());
   }
   // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures' 

@@ -280,6 +280,11 @@ namespace dxvk::dxso_symbolic {
     }
   }
 
+  bool Evaluator::isModulator(const Symbol& symbol) const {
+    return isModulatorKind(symbol.kind) ||
+           (symbol.kind == SymbolKind::Sample && symbol.reg < 32u && ((m_options.modulatorSamplerMask >> symbol.reg) & 1u) != 0);
+  }
+
   // --- symbols ------------------------------------------------------------------------
 
   uint16_t Evaluator::makeSymbol(const uint64_t key, const Symbol& proto) {
@@ -319,7 +324,7 @@ namespace dxvk::dxso_symbolic {
     for (const Term& t : p) {
       for (uint32_t i = 0; i < t.count; i++) {
         const uint16_t s = t.syms[i];
-        if (isModulatorKind(m_symbols[s].kind)) {
+        if (isModulator(m_symbols[s])) {
           modulators.push_back(s);
         } else if (m_symbols[s].kind == SymbolKind::Atom) {
           const auto it = m_atomModulators.find(s);
@@ -435,7 +440,7 @@ namespace dxvk::dxso_symbolic {
     for (const Term& t : value) {
       for (uint32_t i = 0; i < t.count; i++) {
         const Symbol& sym = m_symbols[t.syms[i]];
-        materialSymbol |= isModulatorKind(sym.kind);
+        materialSymbol |= isModulator(sym);
         s.lighting |= sym.lighting;
         s.color |= sym.color;
         s.material |= sym.material;

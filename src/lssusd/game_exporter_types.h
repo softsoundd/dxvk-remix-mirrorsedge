@@ -118,6 +118,11 @@ struct Material {
   bool         hasAlbedoConstant = false;
   pxr::GfVec3f albedoConstant{ 1.f, 1.f, 1.f };
   bool        enableOpacity = false;
+
+  // These hold the emission a UE3 composite bake separates (rtx.ue3CompositeMaterialTextures).
+  std::string emissiveTexPath;
+  float       emissiveIntensity = 1.f;
+
   struct Sampler {
     VkSamplerAddressMode addrModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
     VkSamplerAddressMode addrModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;

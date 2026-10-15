@@ -243,10 +243,38 @@ namespace dxvk {
     return &entry;
   }
 
+  // Resolves an affine term (imm + const*factor + const2*factor2) against the draw's live pixel shader
+  // constants. An absent term resolves to its identity value.
+  bool D3D9Rtx::resolveUe3PsAffineTerm(const UvAffineTerm& term, const float identity, float& outValue) const {
+    outValue = identity;
+    if (term.inexact) {
+      return false;
+    }
+    if (!uvAffineTermPresent(term)) {
+      return true;
+    }
+    float value = term.immValid ? term.imm : 0.0f;
+    if (term.constReg >= 0) {
+      if (uint32_t(term.constReg) >= caps::MaxFloatConstantsPS) {
+        return false;
+      }
+      value += d3d9State().psConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
+    }
+    if (term.constReg2 >= 0) {
+      if (uint32_t(term.constReg2) >= caps::MaxFloatConstantsPS) {
+        return false;
+      }
+      value += d3d9State().psConsts.fConsts[uint32_t(term.constReg2)][term.constComp2 & 0x3u] * term.factor2;
+    }
+    outValue = value;
+    return std::isfinite(outValue);
+  }
+
   // UE3's deterministic UV resolution: the texcoord set and components the surface reads, proven
   // from the pixel and vertex shader bytecode where possible.
   void D3D9Rtx::resolveUe3Texcoords(Ue3TextureState& ue3, const uint32_t firstStage, const uint32_t stageStateIdx,
                                     uint32_t& texcoordIdx, uint32_t& iaTexcoordIdx) {
+    m_ue3UvFacts = Ue3UvFacts {};
     const D3D9CommonShader*& inferredPs = ue3.inferredPs;
     XXH64_hash_t& inferredPsHash = ue3.inferredPsHash;
     PsSamplerTexcoordEntry*& inferredPsEntry = ue3.inferredPsEntry;
@@ -286,33 +314,6 @@ namespace dxvk {
       }
 
       return &entry;
-    };
-
-    // resolves an affine term (imm + const*factor + const2*factor2 sum) against live
-    // draw-time shader constants; an absent term resolves to its identity value
-    auto resolvePsAffineTermValue = [&](const UvAffineTerm& term, const float identity, float& outValue) -> bool {
-      outValue = identity;
-      if (term.inexact) {
-        return false;
-      }
-      if (!uvAffineTermPresent(term)) {
-        return true;
-      }
-      float value = term.immValid ? term.imm : 0.0f;
-      if (term.constReg >= 0) {
-        if (uint32_t(term.constReg) >= caps::MaxFloatConstantsPS) {
-          return false;
-        }
-        value += d3d9State().psConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
-      }
-      if (term.constReg2 >= 0) {
-        if (uint32_t(term.constReg2) >= caps::MaxFloatConstantsPS) {
-          return false;
-        }
-        value += d3d9State().psConsts.fConsts[uint32_t(term.constReg2)][term.constComp2 & 0x3u] * term.factor2;
-      }
-      outValue = value;
-      return std::isfinite(outValue);
     };
 
     auto resolveVsAffineTermValue = [&](const UvAffineTerm& term, const float identity, float& outValue) -> bool {
@@ -525,6 +526,12 @@ namespace dxvk {
             iaTexcoordIdx = texcoordIdx;
           }
 
+          m_ue3UvFacts.vsAffineFold = vsAffineFold;
+          m_ue3UvFacts.vsScaleU = vsScaleU;
+          m_ue3UvFacts.vsScaleV = vsScaleV;
+          m_ue3UvFacts.vsOffsetU = vsOffsetU;
+          m_ue3UvFacts.vsOffsetV = vsOffsetV;
+
           // exact UV transform: sampledUv = psAffine(interpolant),
           // interpolant = vsAffine(iaUv) when the IA path is used. Resolves to
           // U' = aU + bV + tx, V' = cU + dV + ty, where an axis-aligned transform
@@ -546,10 +553,10 @@ namespace dxvk {
             float psOffsetV = 0.0f;
             psAffineResolved =
               uvOrigin.affineExact &&
-              resolvePsAffineTermValue(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
-              resolvePsAffineTermValue(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
-              resolvePsAffineTermValue(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
-              resolvePsAffineTermValue(uvOrigin.affineV.offset, 0.0f, psOffsetV);
+              resolveUe3PsAffineTerm(uvOrigin.affineU.scale, 1.0f, psScaleU) &&
+              resolveUe3PsAffineTerm(uvOrigin.affineU.offset, 0.0f, psOffsetU) &&
+              resolveUe3PsAffineTerm(uvOrigin.affineV.scale, 1.0f, psScaleV) &&
+              resolveUe3PsAffineTerm(uvOrigin.affineV.offset, 0.0f, psOffsetV);
             if (!psAffineResolved) {
               psScaleU = 1.0f;
               psScaleV = 1.0f;
@@ -570,8 +577,8 @@ namespace dxvk {
               if (!aff.hasCross) {
                 float scale = 1.0f;
                 float offset = 0.0f;
-                if (!resolvePsAffineTermValue(aff.scale, 1.0f, scale) ||
-                    !resolvePsAffineTermValue(aff.offset, 0.0f, offset)) {
+                if (!resolveUe3PsAffineTerm(aff.scale, 1.0f, scale) ||
+                    !resolveUe3PsAffineTerm(aff.offset, 0.0f, offset)) {
                   return false;
                 }
                 outCoeffU = scaleAppliesToU ? scale : 0.0f;
@@ -582,9 +589,9 @@ namespace dxvk {
               float scale = 1.0f;
               float cross = 0.0f;
               float offset = 0.0f;
-              if (!resolvePsAffineTermValue(aff.scale, 1.0f, scale) ||
-                  !resolvePsAffineTermValue(aff.cross, 0.0f, cross) ||
-                  !resolvePsAffineTermValue(aff.offset, 0.0f, offset)) {
+              if (!resolveUe3PsAffineTerm(aff.scale, 1.0f, scale) ||
+                  !resolveUe3PsAffineTerm(aff.cross, 0.0f, cross) ||
+                  !resolveUe3PsAffineTerm(aff.offset, 0.0f, offset)) {
                 return false;
               }
               outCoeffU = 0.0f;

@@ -211,6 +211,15 @@ namespace dxvk {
                   "Textures that should be strongly preferred as the primary albedo when bound to a draw.\n"
                   "Use this to override the albedo sampler inference for D3D9 shader path draws where the heuristics pick "
                   "the wrong texture (e.g. a specular or normal map is selected instead of the intended diffuse).");
+    RTX_OPTION("rtx", fast_unordered_set, ue3CompositeMaterialTextures, {},
+                  "UE3 compat: materials rendered from a bake of their own pixel shader rather than from one picked texture. "
+                  "A tag matches the draw's material hash, its textureSet+shader hash, its albedo pick or any texture layer of "
+                  "the material. Use it for materials built from several texture layers at different tilings, or a texture "
+                  "tinted by material constants, which no single picked texture can stand in for. The surface's UV transform "
+                  "becomes the bake's repeat, which captures and replacements are authored over, so a replacement authored "
+                  "against the pick's tiling has to be re-authored. A tint mask whose tiling would lengthen the repeat is "
+                  "blended in at render time, and is missing from captures. Material and texture hashes do not change. "
+                  "Requires rtx.d3d9.ue3EngineMode. See documentation/UE3Compatibility.md, \"Composite materials\".");
     RTX_OPTION("rtx", fast_unordered_set, skyBoxTextures, {},
                   "Textures on draw calls used for the sky or are otherwise intended to be very far away from the camera at all times (no parallax).\n"
                   "Any draw calls using a texture in this list will be treated as sky and rendered as such in a manner different from typical geometry.");    

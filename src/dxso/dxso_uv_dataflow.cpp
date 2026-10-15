@@ -781,13 +781,17 @@ namespace dxvk {
         return;
       }
 
+      // Every lane reads the operands as they were before the instruction, which may write one of them.
+      // For example, `mad r0.xy, r0.x, v0, c` scales both lanes by the old r0.x.
+      std::array<UvExactComponentOrigin, 4> origins;
+      std::array<UvConstComponentRef, 4> constExprs;
       for (uint32_t c = 0; c < 4u; c++) {
         if (!ctx.dst.mask[c]) {
           continue;
         }
 
-        UvExactComponentOrigin origin;
-        UvConstComponentRef constExpr;
+        UvExactComponentOrigin& origin = origins[c];
+        UvConstComponentRef& constExpr = constExprs[c];
         // predicated writes are conditional - the resulting value origin is unknowable
         if (!ctx.instruction.predicated) {
           origin = traceComponent(ctx, c);
@@ -823,12 +827,17 @@ namespace dxvk {
             }
           }
         }
+      }
 
+      for (uint32_t c = 0; c < 4u; c++) {
+        if (!ctx.dst.mask[c]) {
+          continue;
+        }
         if (dstIsTemp) {
-          m_tempOrigins[ctx.dst.id.num][c] = origin;
-          m_tempConstExprs[ctx.dst.id.num][c] = constExpr;
+          m_tempOrigins[ctx.dst.id.num][c] = origins[c];
+          m_tempConstExprs[ctx.dst.id.num][c] = constExprs[c];
         } else {
-          m_outputOrigins[c] = origin;
+          m_outputOrigins[c] = origins[c];
         }
       }
     }

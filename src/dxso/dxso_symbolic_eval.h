@@ -112,6 +112,9 @@ namespace dxvk {
       // Treat min and max against a literal bound outside [0, 1] as the identity, as _sat already is:
       // such a clamp leaves an opacity or a colour within that range unchanged.
       bool rangeClampsAreIdentity = false;
+      // Lists the samplers whose samples count as modulators, as material parameters do. They are never folded
+      // into an atom and are recorded in every atom computed from them, so a proof sees everywhere they reach.
+      uint32_t modulatorSamplerMask = 0;
     };
 
     class Evaluator {
@@ -153,6 +156,7 @@ namespace dxvk {
     private:
       void fail(DxsoHighlightFailure failure);
 
+      bool isModulator(const Symbol& symbol) const;
       uint16_t makeSymbol(uint64_t key, const Symbol& proto);
       uint16_t makeAtom(uint64_t key, const Symbol& proto, std::initializer_list<const Poly*> inputs);
       void collectModulators(const Poly& p, std::vector<uint16_t>& modulators) const;

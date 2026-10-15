@@ -3,6 +3,7 @@
 #include "d3d9_state.h"
 #include "d3d9_rtx_ue3.h"
 #include "../dxvk/dxvk_buffer.h"
+#include "../dxvk/dxvk_shader.h"
 #include "../util/util_threadpool.h"
 
 #include <array>
@@ -17,6 +18,7 @@ namespace dxvk {
   struct D3D9BufferSlice;
   class DxvkDevice;
   class D3D9CommonTexture;
+  struct Ue3CompositeBakeRequest;
 
   enum class D3D9RtxFlag : uint32_t {
     DirtyLights,
@@ -579,6 +581,32 @@ namespace dxvk {
                "(pixel shader, bound texture set, sRGB states, vertex factory) key: texture hash, dimensions, sRGB state, "
                "sample count, semantic/expression flags, final score, and the winning stages. Use this to diagnose draws "
                "where the wrong texture (e.g. a normal or specular map) is chosen as the ray-traced albedo.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3CompositeMaxResolution, 4096,
+               "UE3 compat (rtx.ue3CompositeMaterialTextures): the largest side of a composite material bake, in texels. "
+               "A bake covers one repeat of every layer at the density of its finest one, so a material that tiles a "
+               "128px detail texture 32 times per repeat needs 4096 to keep that layer sharp. Lower values trade its "
+               "detail for memory.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3CompositeVramBudgetMB, 1024,
+               "UE3 compat: video memory kept for composite material bakes. Above it, bakes no draw has used for 120 "
+               "frames are released at the end of a frame, oldest first, and bake again when next drawn.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3CompositeMaxBakesPerFrame, 2,
+               "UE3 compat: composite material bakes run per frame. A bake runs the material's pixel shader over every "
+               "texel of the bake up to four times. A material waiting for its bake renders its albedo pick meanwhile.");
+    RTX_OPTION("rtx.d3d9", bool, ue3CompositeEmission, false,
+               "UE3 compat: keeps the emission a composite material bake separates from its colour, the unlit part of the "
+               "game's output, as the surface's emissive texture, and exports it in captures. The bake takes it out of the "
+               "albedo either way. UE3 materials emit for lights, but also for lifts that fake bounce light, which a path "
+               "tracer would add to its own, so emission is best authored per material in the Toolkit. Turning this on for "
+               "a capture gives a material's lights as a starting point.");
+    RTX_OPTION_ARGS("rtx.d3d9", float, ue3CompositeEmissiveIntensity, 1.0f,
+                    "UE3 compat: scale on the emission composite bakes keep while rtx.d3d9.ue3CompositeEmission is on. "
+                    "It is also scaled by rtx.emissiveIntensity.",
+                    args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+    RTX_OPTION("rtx.d3d9", bool, ue3LogCompositeMaterials, false,
+               "UE3 compat diagnostics: logs [UE3-Composite] lines. Each material tagged in rtx.ue3CompositeMaterialTextures "
+               "logs its layers with their tiling and the repeat and size of its bake, or why it cannot be baked. Every "
+               "other material logs once if it is built from layers at different tilings, which makes it a candidate for "
+               "the list. Bakes log their size and memory as they run and as they are released.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
                "UE3 compat: log vertex capture precision diagnostics - the resolved position source per unique "
                "(vertex shader, vertex factory) with the reason any draw fell back to clip-space reconstruction, "
@@ -1338,7 +1366,36 @@ namespace dxvk {
     void computeUe3MaterialIdentity(Ue3TextureState& ue3, uint32_t firstStage);
     void registerUe3TexturelessMaterial();
     void markUe3MovieTextureMaterial(const Ue3TextureState& ue3, XXH64_hash_t materialHash, XXH64_hash_t textureHash);
+    bool resolveUe3PsAffineTerm(const UvAffineTerm& term, float identity, float& outValue) const;
     void resolveUe3Texcoords(Ue3TextureState& ue3, uint32_t firstStage, uint32_t stageStateIdx, uint32_t& texcoordIdx, uint32_t& iaTexcoordIdx);
+    // Is set by resolveUe3Texcoords for the draw being prepared.
+    Ue3UvFacts m_ue3UvFacts;
+
+    // The members below implement rtx.ue3CompositeMaterialTextures. See "Composite materials" in UE3Compatibility.md.
+    // Returns the stage whose UV set the surface reads, which is a tagged composite's diffuse layers' or the pick's.
+    uint32_t selectUe3CompositeUvStage(const Ue3TextureState& ue3, uint32_t pickStage);
+    bool isUe3CompositeTagged(const fast_unordered_set& tags, const Ue3TextureState& ue3);
+    // Returns true when the draw renders from a bake.
+    bool resolveUe3Composite(const Ue3TextureState& ue3, uint32_t texcoordIdx);
+    // Is set by selectUe3CompositeUvStage for the draw being prepared.
+    bool m_ue3CompositeTagged = false;
+    const DxsoUe3CompositeShaderInfo& getOrAnalyzeUe3CompositeShader(XXH64_hash_t psHash, const D3D9CommonShader* pixelShader);
+    // Returns nullptr when the draw can be baked.
+    // Returns the kind of reason it cannot otherwise, which `refusal` spells out when `describe` is set.
+    // `describe` also fills the domain's description. Only the log and a new request read either.
+    const char* solveUe3CompositeDomain(const Ue3TextureState& ue3, const DxsoUe3CompositeShaderInfo& info, uint32_t texcoordIdx,
+                                        bool describe, Ue3CompositeDomain& domain, std::string& refusal) const;
+    std::shared_ptr<const Ue3CompositeBakeRequest> buildUe3CompositeRequest(const Ue3TextureState& ue3,
+                                                                            const DxsoUe3CompositeShaderInfo& info,
+                                                                            const Ue3CompositeDomain& domain,
+                                                                            uint32_t texcoordIdx, XXH64_hash_t key);
+    // `vertexLightmap` is the value of the simple vertex lightmap compile's lighting interpolant.
+    Rc<DxvkShader> getOrBuildUe3CompositeVertexShader(const D3D9CommonShader* pixelShader, const DxsoUe3CompositeShaderInfo& info,
+                                                      const Ue3CompositeDomain& domain, uint32_t texcoordIdx, float vertexLightmap);
+    fast_unordered_cache<DxsoUe3CompositeShaderInfo> m_ue3CompositeShaders;
+    fast_unordered_cache<std::shared_ptr<const Ue3CompositeBakeRequest>> m_ue3CompositeRequests;
+    fast_unordered_cache<Rc<DxvkShader>> m_ue3CompositeVertexShaders;
+    fast_unordered_cache<Ue3CompositeMaterialState> m_ue3CompositeMaterials;
 
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
 
@@ -1602,6 +1659,9 @@ namespace dxvk {
       bool ue3LogUvResolution = false;
       bool ue3LogUvAffineDetail = false;
       bool ue3LogAlbedoSelection = false;
+      uint32_t ue3CompositeMaxResolution = 0;
+      bool ue3CompositeEmission = false;
+      bool ue3LogCompositeMaterials = false;
       bool ue3LogCapturePrecision = false;
       bool ue3LogInstancedDraws = false;
       bool deferredUiReplay = false;
@@ -1641,6 +1701,7 @@ namespace dxvk {
       const fast_unordered_set* lightmapTextures = nullptr;
       const fast_unordered_set* neverAlbedoTextures = nullptr;
       const fast_unordered_set* preferredAlbedoTextures = nullptr;
+      const fast_unordered_set* ue3CompositeMaterialTextures = nullptr;
       const fast_unordered_set* smoothNormalsTextures = nullptr;
       const fast_unordered_set* ignoreBakedLightingTextures = nullptr;
       const fast_unordered_set* raytracedRenderTargetTextures = nullptr;
@@ -1665,6 +1726,7 @@ namespace dxvk {
       fast_unordered_set lightmapTextures;
       fast_unordered_set neverAlbedoTextures;
       fast_unordered_set preferredAlbedoTextures;
+      fast_unordered_set ue3CompositeMaterialTextures;
       fast_unordered_set smoothNormalsTextures;
       fast_unordered_set ignoreBakedLightingTextures;
       fast_unordered_set raytracedRenderTargetTextures;

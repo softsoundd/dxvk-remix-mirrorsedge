@@ -458,6 +458,108 @@ A Remix surface carries a single texcoord buffer, and the UV set it uses is reso
 
 No scoring threshold resolves this - it is one UV set for two demands. `rtx.d3d9.ue3LogUvResolution` identifies it: two lines for the same pixel shader with different `iaSet=` values means that material has the conflict, and the `stage=` on each says which texture claims which set. Choose which texture should be correct with `rtx.preferredAlbedoTextures`, and expect the other layer to be mapped wrongly.
 
+## Composite materials
+
+A Remix surface renders one colour texture, and [albedo selection](#albedo-selection-and-the-texture-spread-cache) picks it from the material's samplers. A material built from several layers at different tilings has no texture that stands for it. The Escape_p office ceiling samples six textures from `TEXCOORD0` at 1, 4 and 32 repeats per UV: the 1x layer masks the panels and vents, and three of the layers carry the lights. Whichever one is picked, the surface renders that layer alone, at its own tiling. A single texture the shader tints with its material constants loses the tint the same way: Escape_p's RPA lobby floor multiplies a light carpet texture by a dark `UniformVector`, so its pick renders it light.
+
+`rtx.ue3CompositeMaterialTextures` ("UE3 Composite Material" in the texture list) has such a material render a bake of its own pixel shader instead. Like the other categories it matches the material hash, the textureSet+shader hash or the albedo pick's texture hash, and unlike them also any of the material's layer textures. Tagging a texture therefore opts in every material it is a layer of, including those where another layer won the pick: a building texture tagged in Escape_p, where it is the pick, also composites Scraper_p's buildings, whose material picks one of its emissive layers instead. Only what the surface renders changes: the pick is still picked, and is still the texture every tag, category and replacement tier keys on. A decal category on the same draw keeps the bake, and only changes how the surface layers over the one beneath.
+
+### What the bake renders
+
+Under `viewmode unlit`, UE3 draws every opaque surface with no lightmap and `AmbientColorAndSkyFactor = (1,1,1,0)`, so its base pass outputs the material's `Emissive + Diffuse`: the whole expression network, masks and tilings included. The bake re-runs the game's own pixel shader, with the draw's own textures, samplers and constants, into an offscreen target covering one repeat of every layer. A vertex shader generated for the pixel shader's input signature stands in for the mesh. It writes a UV ramp over the repeat into the lanes the layers read, the camera and sky vectors face-on (`(0,0,1)` in tangent space), a white vertex colour (the tangent basis under `WORLD_COORDS`), and 1 into the `PixelPosition.w` the alpha output copies.
+
+The lighting the shader was compiled against is overridden, with the sky colours zeroed throughout. Its constants are found by name in the constant table, and the vertex lightmap's interpolant is the one `TEXCOORD` the colour-term analysis finds multiplying the diffuse as a vector:
+
+| Compile | First pass: `Emissive + Diffuse` | Second pass: `Emissive` |
+| --- | --- | --- |
+| Ambient (the unlit view, movable meshes, directional lightmaps) | `AmbientColorAndSkyFactor = (1,1,1,0)`, `LightMapScale = 0` | `AmbientColorAndSkyFactor = 0` |
+| Simple lightmap | a white lightmap at `LightMapScale = 1` | `LightMapScale = 0` |
+| Simple vertex lightmap (vertex-lit static meshes, such as Scraper_p's buildings) | the lighting interpolant white | the lighting interpolant black |
+| Unlit material | the output as it is, as albedo | none |
+
+UE3 keeps these compiles under `viewmode unlit`: a static mesh is drawn with the lightmap policy it was lit with, so one material can draw through several of them in a level, and each bakes separately.
+
+When the shader has an emissive term, the albedo is the difference of the two passes, clamped to [0, 1]. The second pass only becomes the surface's emissive texture with `rtx.d3d9.ue3CompositeEmission` on, at `rtx.d3d9.ue3CompositeEmissiveIntensity`. UE3 materials emit for lights, but also for lifts that fake the bounce light the game cannot compute, such as the slight glow of Mirror's Edge's billboard materials. A path tracer adds its own bounce light on top of such a lift, and the bake cannot tell a lift from a light, so emission is off by default and is best authored per material in the Toolkit. A material that `clip()`s keeps its coverage in the albedo's alpha, since a clipped texel keeps the target's cleared alpha of 0. Albedo is stored as RGBA8 and emission as B10G11R11 float, since it can exceed 1. Both are gamma encoded, fully mipped and sampled linearly with wrap.
+
+### The repeat
+
+The bake covers the UV set the material's diffuse layers read, and the surface reads that set too, even where the pick reads another: Scraper_p's buildings pick an emissive layer on the mesh's first UV channel, while their colour is on the second. Where diffuse layers read several UV sets and the pick is one of them, the pick's set is the one baked. Every layer's coordinate has to be that UV set through an exact axis-aligned tiling: a scale and offset, no rotation. It is resolved per draw with the same live-constant folding that resolves the surface's texture transform.
+
+A colour layer on another of the mesh's UV channels has no one place in a repeat of this one, so the bake samples it at its average: its coordinate lanes get a ramp far too steep for its mips, which reads its smallest. Boat_p's hull multiplies its logo and stripe mask on one channel by a white panel texture on another. The bake keeps the mask and the green the material tints it with, and averages the panels' seams and grime away (logged as `averaged`). An emitting layer on another channel is left out of the emission rather than glowing evenly. It is the same in both passes, so it cancels out of the albedo (logged as `emission left out`). A layer that masks the output or moves another layer's coordinate cannot be averaged, and the material is refused.
+
+The repeat P along each axis is the smallest multiple k = 1..32 of the coarsest layer's period over which every layer repeats a whole number of times, to within a thousandth of a repeat where the bake wraps. The ceiling's 1, 4 and 32 repeat every 1 UV. Layers at 1 and 1.5 repeat every 2. A long repeat costs detail rather than memory, since it is baked at the capped resolution: a Stormdrain_p material with layers at 0.025, 1 and 4.2 repeats every 40 UV, 102 texels per UV at 4096. A mask whose tiling would lengthen the repeat is left out of it instead (see [Masks](#masks)). The surface's texture transform becomes `scale(1/P)`, after the vertex shader's own UV affine where the surface reads its IA set through one, so the bake tiles over the surface exactly as its layers did.
+
+The bake's resolution along each axis is the most texels any layer spans over one repeat, rounded up to a power of two and capped by `rtx.d3d9.ue3CompositeMaxResolution`. That includes layers that only steer another layer's coordinate, whose detail shows through what they steer. The tiles of Stormdrain's tiled walls exist only in a normal map that bends a cube map reflection, so the wall bakes its 1 UV repeat at the normal map's 1024. The ceiling's 32x layers are 128 texels wide, so it needs 4096. A lower cap keeps the bake smaller at the cost of the finest layer's detail.
+
+### Masks
+
+A layer that only blends the colour, such as a tint or stripe mask, can set the repeat for everything else. Boat_p's deck stripes tile at 0.85 beside layers at 1 and 6, so all of them repeat together only every 20 UV, which at 4096 leaves 205 texels per UV where the 6x layer wants 1536. The Stormdrain wall's 0.25x blue mask makes its repeat 4 UV.
+
+The bake leaves such a layer out when both of these hold:
+- The colour output is provably a polynomial of degree 1 or 2 in one channel `m` of the layer's only read: `oC0.rgb = P + m * S`, or `P + m * S + m² * Q`. Nothing else reads the texture, no higher power of `m` appears, and nothing the analysis cannot expand is computed from it.
+- `m` reaches neither the alpha, a texture coordinate nor, in a lit compile, the emission. The game samples the layer with wrap addressing, and leaving it out shortens the repeat.
+
+The repeat is then solved over the other layers, and the mask is bound black for the bake's passes. A third pass renders the first again with it bound white, and the encode keeps that as a second albedo. The surface renders `lerp(albedo, albedo at 1, m)`, reading `m` from the game's own texture at its own tiling relative to the bake. The material's log line marks the layer `mask .x, blended at render time`. Because the output is affine in `m` the blend is exact, including terms the mask does not touch, such as the deck's reflection. It runs in linear, as the game's does, and the mask keeps its own resolution and filtering. The deck bakes 2048 over 1 UV at its layers' full detail, and the wall 1024 over 1 UV.
+
+A quadratic mask (`quadratic mask .x` in the log) has a fourth pass with it bound to exactly 1/2. The surface interpolates through the three albedos: `f(m) = f(0)·(1 - m)(1 - 2m) + f(1/2)·4m(1 - m) + f(1)·m(2m - 1)`, which is exact for a colour quadratic in `m`. Escape_p's RPA corridor carpet lerps between two tints of its 1x pattern by a 0.1x border mask that also scales the second tint, so `m` arrives squared. Left in, the mask would set a 10 UV repeat, capped at 4096 with 410 texels per UV where the pattern has 512. Lifted, the carpet bakes three 512 albedos over 1 UV.
+
+The extra textures reach the surface material through an extension record, and apply only while the surface renders the bake's own albedo. A capture exports the albedo with the mask at 0, so the Toolkit shows the material without it, and the UVs cover the shorter repeat.
+
+### What cannot be baked
+
+A tagged material that cannot be baked renders its albedo pick, as an untagged one does, and logs why once as an `[RTX-Compatibility][UE3-Composite]` warning:
+
+- The draw is blended (translucent, additive or modulated), is tagged sky, particle, beam, terrain, world UI or water, or uses a vertex factory other than local, skinned, foliage or instanced mesh.
+- A layer that masks the output or moves another layer's coordinate reads another UV set, a colour layer reads other lanes of the baked set or a coordinate that cannot be proven, a layer is rotated, or the layers share no repeat within 32 of the coarsest one's.
+- The colour reads a vertex colour, an engine texture (scene colour or depth, light attenuation, ...) or a volume texture.
+- The shader is the directional vertex lightmap compile, whose diffuse arrives through several lighting interpolants weighted by the normal.
+- The shader `clip()`s, but its alpha output is not an interpolant the bake can mark coverage with.
+- An input animates. The live constants that reach an output are part of a bake's key, so a material drawn with more than 8 different values of them is taken to be animating (a panner, a time-driven tint) and renders its pick for the rest of the session. Layer textures and their mips are part of the key too, but a streamed-in mip only re-bakes the material.
+
+View-dependent terms (Fresnel, reflection vectors, cube maps) are baked as seen face-on, which the material's log line notes.
+
+### Hashes and replacements
+
+For a tagged material, these are unchanged:
+- `mat_*`, the textureSet+shader hash and the pick's texture hash, so every tag, category and texture-tier anchor still matches.
+- Both `.cache` files.
+- The geometry and mesh replacement hashes.
+- Capture prim names.
+
+These change:
+- The rendered albedo, and the emission with `rtx.d3d9.ue3CompositeEmission` on.
+- The surface's texture transform, which becomes the repeat rather than the pick's own tiling.
+- A capture's albedo DDS, which is the bake with any lifted mask at 0.
+- A capture's UVs, which follow the surface's transform and so cover the bake's repeat.
+- With `rtx.d3d9.ue3CompositeEmission` on, a capture also exports the emission as a `_emissive` DDS, with emission enabled. Turning it on for one capture gives a material's lights as a starting point for authoring them.
+
+A replacement authored against the material before it was tagged was authored in the pick's tiling, so it has to be re-authored over the repeat. A replacement that authors its own albedo keeps the repeat but skips the bake and its memory, and with it a lifted mask. The mask does not tile with the repeat, so the replacement cannot paint it in either. One that leaves the albedo out renders over the bake, mask included. Either way the replacement decides the emission, since the bake's own never reaches it. Material identity leaves tiling parameters out, so two materials that differ only in their tiling share one `mat_*` and one replacement. A material drawn with two different repeats is warned about once.
+
+### Performance
+
+A bake is one to four full-target passes of the game's pixel shader, an encode pass per albedo and mips, and runs once per key. It is timed as `UE3 Composite Bake` in `rtx.gpuPassTimings`. The passes share one float target, plus a second for emission that varies over the bake, so a bake briefly needs 8 or 16 bytes per texel on top of its textures. At most `rtx.d3d9.ue3CompositeMaxBakesPerFrame` run per frame, and a draw whose first bake has not landed yet renders its pick. Once baked, a surface costs what it did before: one albedo fetch, plus emission where it keeps some, plus the mask and one or two more albedos where a mask is lifted.
+
+Memory is 4 bytes per texel per texture, plus mips: about 21 MB at 2048 and 85 MB at 4096, and as much again for each further albedo of a lifted mask, and for kept emission that a texture layer carries. Emission that comes from the material's constants alone is the same everywhere, so it is rendered and stored as a single texel. UE3 streams a material's layers in a mip at a time while a level loads, and each step is a new key. A material already baked through the same shader and UV set keeps rendering that bake until its newest key has been drawn for about a second, then bakes that once. The bake it replaces is released when no draw has used it for 120 frames, while the bakes of the material's other lightmap compiles stay. Above `rtx.d3d9.ue3CompositeVramBudgetMB`, bakes no draw has used for 120 frames are released too, oldest first, and bake again when next drawn.
+
+### Diagnostics
+
+`rtx.d3d9.ue3LogCompositeMaterials` logs `[RTX-Compatibility][UE3-Composite]` lines:
+- For each tagged material and bake key: its lighting compile, whether its emission is uniform or comes from a texture and whether the bake keeps it, its layers with sizes, tilings and roles (and any mask left out of the repeat), the repeat, the bake's size and memory, and the UV transform.
+- One line for each bake that lands, and one for each bake released, with the reason.
+- For untagged materials: a `Candidate` line for each eligible material whose colour layers tile differently, naming the hashes to tag. A bake capped below the resolution its finest layer needs says so.
+
+The dev menu's "UE3 Composite Materials" section holds the options, a list of the current bakes with their memory, and "Re-bake All". The unit test `tests/rtx/unit/test_dxso_ue3_composite.cpp` covers the shader analysis, the mask proof and the repeat solver. Invoked with `.dxso` files from `DXVK_SHADER_DUMP_PATH`, it prints each shader's lighting compile, its layers with their roles, UV origins and tilings, its masks and their degree, and its repeat with and without them.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.ue3CompositeMaterialTextures` | | Materials (material, textureSet+shader, albedo pick or layer texture hash) rendered from a bake of their own pixel shader |
+| `rtx.d3d9.ue3CompositeMaxResolution` | 4096 | Largest side of a bake, in texels |
+| `rtx.d3d9.ue3CompositeVramBudgetMB` | 1024 | Memory above which idle bakes are released |
+| `rtx.d3d9.ue3CompositeMaxBakesPerFrame` | 2 | Bakes run per frame |
+| `rtx.d3d9.ue3CompositeEmission` | False | Keep the emission a bake separates as the surface's emissive texture, and export it in captures |
+| `rtx.d3d9.ue3CompositeEmissiveIntensity` | 1 | Scale on the kept emission |
+| `rtx.d3d9.ue3LogCompositeMaterials` | False | Log each material's decision, its bakes and the candidates |
+
 ## Rotators and UV matrices
 
 UE3's `MaterialExpressionRotator` never appears by that name at D3D9. `CenterX` / `CenterY` / `Speed` and the optional `Time` pin are evaluated on the CPU each draw (default `Time` is `GameTime`; `Speed` is radians per second, with no 2π scale) and uploaded as a 2x2 matrix in a `UniformVector_*` register pair, recognisable in the logged values as `(cos,-sin)` and `(sin,cos)`. `Center` arrives as a compile-time origin, either `def` immediates around the rotation or a translation uniform `Origin - R·Origin`. `Coordinate` is whatever UV feeds the expression - `TexCoord0` by default, or a panner or tiled chain.

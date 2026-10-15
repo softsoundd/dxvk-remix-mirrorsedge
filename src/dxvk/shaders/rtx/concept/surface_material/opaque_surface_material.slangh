@@ -69,6 +69,11 @@ SubsurfaceMaterial subsurfaceMaterialCreate(const SubsurfaceMaterialInteraction 
   return subsurfaceMaterial;
 }
 
+MaskLayerMaterial maskLayerMaterialCreate(MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial)
+{
+  return reinterpret<MaskLayerMaterial>(memoryPolymorphicSurfaceMaterial);
+}
+
 uint getSubsurfaceMaterialIndex(const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial, inout uint16_t samplerIndex)
 {
   OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);

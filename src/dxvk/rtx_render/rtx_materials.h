@@ -592,6 +592,7 @@ enum class RtSurfaceMaterialType {
 
   // Extensions
   Subsurface,
+  MaskLayer,
 
   Count
 };
@@ -613,7 +614,8 @@ struct RtOpaqueSurfaceMaterial {
     float dlssControlMaskStructuralStrength,
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget, bool isHairCard,
     uint16_t samplerFeedbackStamp,
-    uint32_t secondaryTextureIndex = 0
+    uint32_t secondaryTextureIndex = 0,
+    uint32_t maskLayerIndex = SURFACE_INDEX_INVALID
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -630,7 +632,7 @@ struct RtOpaqueSurfaceMaterial {
     m_dlssControlMaskToneStrength{ dlssControlMaskToneStrength },
     m_dlssControlMaskStructuralStrength{ dlssControlMaskStructuralStrength },
     m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp }
+    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp }, m_maskLayerIndex{ maskLayerIndex }
   {
     updateCachedData();
     updateCachedHash();
@@ -665,6 +667,12 @@ struct RtOpaqueSurfaceMaterial {
 
     if (m_isHairCard) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+    }
+
+    // data[27] holds the mask layer's extension index in 16 bits, so a mask layer indexed past them is left off.
+    const bool hasMaskLayer = m_maskLayerIndex < BINDING_INDEX_INVALID;
+    if (hasMaskLayer) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -725,7 +733,8 @@ struct RtOpaqueSurfaceMaterial {
 
     // data[26]
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
-    writeGPUPadding<2>(data, offset);
+    // data[27]
+    writeGPUHelperExplicit<2>(data, offset, hasMaskLayer ? m_maskLayerIndex : 0u);
 
     writeGPUHelper(data, offset, m_cachedDLSSControlMask);
 
@@ -826,6 +835,10 @@ struct RtOpaqueSurfaceMaterial {
     return m_subsurfaceMaterialIndex;
   }
 
+  uint32_t getMaskLayerIndex() const {
+    return m_maskLayerIndex;
+  }
+
   uint32_t getIsRaytracedRenderTarget() const {
     return m_isRaytracedRenderTarget;
   }
@@ -845,7 +858,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 144,
+      sizeof(*this) == 152,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -876,6 +889,7 @@ private:
       uint32_t isHairCard;                // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
+      uint32_t maskLayerIndex;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     HashStruct hashData = HashStruct{
@@ -906,6 +920,7 @@ private:
       m_isHairCard,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
+      m_maskLayerIndex,
     };
     m_cachedHash = hashStructByMemory<HashStruct,
       &HashStruct::albedoOpacityTextureIndex,
@@ -934,7 +949,8 @@ private:
       &HashStruct::isRaytracedRenderTarget,
       &HashStruct::isHairCard,
       &HashStruct::samplerFeedbackStamp,
-      &HashStruct::secondaryTextureIndex>(hashData);
+      &HashStruct::secondaryTextureIndex,
+      &HashStruct::maskLayerIndex>(hashData);
   }
 
   void updateCachedData() {
@@ -993,6 +1009,9 @@ private:
   bool m_isHairCard;
 
   uint16_t m_samplerFeedbackStamp;
+
+  // Indexes an RtMaskLayerMaterial in the surface material extensions, or is SURFACE_INDEX_INVALID.
+  uint32_t m_maskLayerIndex;
 
   XXH64_hash_t m_cachedHash;
 
@@ -1534,6 +1553,119 @@ private:
   XXH64_hash_t m_cachedHash;
 };
 
+// Describes a mask a UE3 composite bake (rtx.ue3CompositeMaterialTextures) leaves out of its repeat.
+// The surface blends its albedo towards the bake rendered with the mask at 1, by one channel of the mask read
+// at its own tiling. For a quadratic mask it interpolates through the bake with the mask at 1/2 as well.
+struct RtMaskLayerMaterial {
+  RtMaskLayerMaterial(
+    const uint32_t maskedAlbedoTextureIndex,
+    const uint32_t maskedHalfAlbedoTextureIndex,
+    const uint32_t maskTextureIndex,
+    const Vector4& maskTransform,
+    const uint32_t maskChannel,
+    const bool maskIsSrgb)
+    : m_maskedAlbedoTextureIndex { maskedAlbedoTextureIndex },
+      m_maskedHalfAlbedoTextureIndex { maskedHalfAlbedoTextureIndex },
+      m_maskTextureIndex { maskTextureIndex },
+      m_maskTransform { maskTransform },
+      m_maskChannel { maskChannel & MASK_LAYER_MATERIAL_CHANNEL_MASK },
+      m_maskIsSrgb { maskIsSrgb ? 1u : 0u } {
+    updateCachedHash();
+  }
+
+  void writeGPUData(unsigned char* data, std::size_t& offset) const {
+    [[maybe_unused]] const std::size_t oldOffset = offset;
+
+    // For decode process, see surface_material.h
+    // this data is accessed from uint16_t data[32], so data[n] refers to a pair of bytes.
+
+    // data[0]
+    const uint16_t flags = 0;
+    writeGPUHelperExplicit<2>(data, offset, flags);
+
+    // data[1 - 2]
+    writeGPUHelperExplicit<2>(data, offset, m_maskedAlbedoTextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, m_maskTextureIndex);
+
+    // data[3]
+    const bool quadratic = m_maskedHalfAlbedoTextureIndex != kSurfaceMaterialInvalidTextureIndex;
+    const uint16_t maskChannelAndFlags = uint16_t(m_maskChannel |
+                                                  (m_maskIsSrgb ? MASK_LAYER_MATERIAL_FLAG_SRGB : 0) |
+                                                  (quadratic ? MASK_LAYER_MATERIAL_FLAG_QUADRATIC : 0));
+    writeGPUHelper(data, offset, maskChannelAndFlags);
+
+    // data[4 - 11]
+    writeGPUHelper(data, offset, m_maskTransform.x);
+    writeGPUHelper(data, offset, m_maskTransform.y);
+    writeGPUHelper(data, offset, m_maskTransform.z);
+    writeGPUHelper(data, offset, m_maskTransform.w);
+
+    // data[12]
+    writeGPUHelperExplicit<2>(data, offset, m_maskedHalfAlbedoTextureIndex);
+
+    // data[13 - 31]
+    writeGPUPadding<38>(data, offset);
+    assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+  }
+
+  bool operator==(const RtMaskLayerMaterial& r) const {
+    return m_cachedHash == r.m_cachedHash;
+  }
+
+  bool validate() const {
+    return m_maskedAlbedoTextureIndex != kSurfaceMaterialInvalidTextureIndex &&
+           m_maskTextureIndex != kSurfaceMaterialInvalidTextureIndex;
+  }
+
+  XXH64_hash_t getHash() const {
+    return m_cachedHash;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_maskedAlbedoTextureIndex);
+    fn(m_maskedHalfAlbedoTextureIndex);
+    fn(m_maskTextureIndex);
+  }
+
+private:
+  void updateCachedHash() {
+    static_assert(
+      sizeof(*this) == 48,
+      "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
+    );
+    struct HashStruct {
+      uint32_t maskedAlbedoTextureIndex;
+      uint32_t maskedHalfAlbedoTextureIndex;
+      uint32_t maskTextureIndex;
+      Vector4 maskTransform;
+      uint32_t maskChannel;
+      uint32_t maskIsSrgb;
+      // NOTE: There must be NO padding between members, as the struct is used for hashing
+    };
+    static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
+    const HashStruct hashData = HashStruct {
+      m_maskedAlbedoTextureIndex,
+      m_maskedHalfAlbedoTextureIndex,
+      m_maskTextureIndex,
+      m_maskTransform,
+      m_maskChannel,
+      m_maskIsSrgb,
+    };
+    m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
+  }
+
+  uint32_t m_maskedAlbedoTextureIndex;
+  // Is kSurfaceMaterialInvalidTextureIndex unless the mask is quadratic.
+  uint32_t m_maskedHalfAlbedoTextureIndex;
+  uint32_t m_maskTextureIndex;
+  Vector4 m_maskTransform;
+  uint32_t m_maskChannel;
+  uint32_t m_maskIsSrgb;
+
+  XXH64_hash_t m_cachedHash;
+};
+
 struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtOpaqueSurfaceMaterial& opaqueSurfaceMaterial) :
     m_type{ RtSurfaceMaterialType::Opaque },
@@ -1550,6 +1682,10 @@ struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtSubsurfaceMaterial& subsurfaceMaterial) :
     m_type { RtSurfaceMaterialType::Subsurface },
     m_subsurfaceMaterial { subsurfaceMaterial } {}
+
+  RtSurfaceMaterial(const RtMaskLayerMaterial& maskLayerMaterial) :
+    m_type { RtSurfaceMaterialType::MaskLayer },
+    m_maskLayerMaterial { maskLayerMaterial } {}
 
   RtSurfaceMaterial(const RtSurfaceMaterial& surfaceMaterial) :
     m_type{ surfaceMaterial.m_type } {
@@ -1569,6 +1705,9 @@ struct RtSurfaceMaterial {
       break;
     case RtSurfaceMaterialType::Subsurface:
       new (&m_subsurfaceMaterial) RtSubsurfaceMaterial { surfaceMaterial.m_subsurfaceMaterial };
+      break;
+    case RtSurfaceMaterialType::MaskLayer:
+      new (&m_maskLayerMaterial) RtMaskLayerMaterial { surfaceMaterial.m_maskLayerMaterial };
       break;
     }
   }
@@ -1591,6 +1730,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.~RtSubsurfaceMaterial();
       break;
+    case RtSurfaceMaterialType::MaskLayer:
+      m_maskLayerMaterial.~RtMaskLayerMaterial();
+      break;
     }
   }
 
@@ -1612,6 +1754,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.writeGPUData(data, offset);
       break;
+    case RtSurfaceMaterialType::MaskLayer:
+      m_maskLayerMaterial.writeGPUData(data, offset);
+      break;
     }
   }
 
@@ -1629,6 +1774,8 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial.validate();
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial.validate();
+    case RtSurfaceMaterialType::MaskLayer:
+      return m_maskLayerMaterial.validate();
     }
 
     return false;
@@ -1655,6 +1802,9 @@ struct RtSurfaceMaterial {
       case RtSurfaceMaterialType::Subsurface:
         m_subsurfaceMaterial = rtSurfaceMaterial.m_subsurfaceMaterial;
         break;
+      case RtSurfaceMaterialType::MaskLayer:
+        m_maskLayerMaterial = rtSurfaceMaterial.m_maskLayerMaterial;
+        break;
       }
     }
 
@@ -1680,6 +1830,8 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial == rhs.m_rayPortalSurfaceMaterial;
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial == rhs.m_subsurfaceMaterial;
+    case RtSurfaceMaterialType::MaskLayer:
+      return m_maskLayerMaterial == rhs.m_maskLayerMaterial;
     }
   }
 
@@ -1697,6 +1849,8 @@ struct RtSurfaceMaterial {
       return m_rayPortalSurfaceMaterial.getHash();
     case RtSurfaceMaterialType::Subsurface:
       return m_subsurfaceMaterial.getHash();
+    case RtSurfaceMaterialType::MaskLayer:
+      return m_maskLayerMaterial.getHash();
     }
   }
 
@@ -1747,6 +1901,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::Subsurface:
       m_subsurfaceMaterial.forEachTextureIndex(fn);
       break;
+    case RtSurfaceMaterialType::MaskLayer:
+      m_maskLayerMaterial.forEachTextureIndex(fn);
+      break;
     }
   }
 
@@ -1759,6 +1916,7 @@ private:
     RtTranslucentSurfaceMaterial m_translucentSurfaceMaterial;
     RtRayPortalSurfaceMaterial m_rayPortalSurfaceMaterial;
     RtSubsurfaceMaterial m_subsurfaceMaterial;
+    RtMaskLayerMaterial m_maskLayerMaterial;
   };
 };
 
@@ -1944,6 +2102,26 @@ struct LegacyMaterialData {
   // rtx.d3d9.ue3ParticleVertexColor: the opacity carries the per-particle alpha, which animates
   // per vertex while the geometry the opacity micromap cache keys on does not.
   bool ue3AnimatedVertexOpacity = false;
+  // These hold the bake of the material's own pixel shader (rtx.ue3CompositeMaterialTextures), which the
+  // surface renders with in place of colorTextures[0]. colorTextures[0] stays the albedo pick that every hash,
+  // tag and replacement tier keys on. RtxContext::bakeUe3Composite sets them per draw on the CS thread, and
+  // they never reach getHash().
+  TextureRef ue3CompositeAlbedo;
+  TextureRef ue3CompositeEmissive;
+  Rc<DxvkSampler> ue3CompositeSampler;
+  // Hashes the bake's key and generation, so the preserve path rebinds when a bake lands or lands again.
+  XXH64_hash_t ue3CompositeIdentity = kEmptyHash;
+  float ue3CompositeEmissiveIntensity = 1.0f;
+  // These describe a mask the bake leaves out of its repeat. The surface blends towards the albedo baked with
+  // the mask at 1, or interpolates through the one baked at 1/2 as well for a quadratic mask. It reads one
+  // channel of the mask, a unorm view decoded when the game samples it as sRGB, through the bake UV to mask UV
+  // transform (scale U, scale V, offset U, offset V). The bake's identity covers them.
+  TextureRef ue3CompositeMaskedAlbedo;
+  TextureRef ue3CompositeMaskedHalfAlbedo;
+  TextureRef ue3CompositeMask;
+  Vector4 ue3CompositeMaskTransform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
+  uint8_t ue3CompositeMaskChannel = 0;
+  bool ue3CompositeMaskIsSrgb = false;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;
@@ -2173,10 +2351,15 @@ struct MaterialData {
       using T = std::decay_t<decltype(mat)>;
       if constexpr (std::is_same_v<T, OpaqueMaterialData>) {
         OpaqueMaterialData tmp;
-        tmp.getAlbedoOpacityTexture() = input.getColorTexture();
+        tmp.getAlbedoOpacityTexture() = input.ue3CompositeAlbedo.isValid()
+          ? input.ue3CompositeAlbedo
+          : input.getColorTexture();
         if (!mat.getEnableEmission())
           tmp.getEmissiveColorTexture() = input.ue3HighlightGlowTexture;
-        if (auto s = input.getSampler().ptr()) {
+        const Rc<DxvkSampler>& sampler = input.ue3CompositeSampler.ptr() != nullptr
+          ? input.ue3CompositeSampler
+          : input.getSampler();
+        if (auto s = sampler.ptr()) {
           tmp.getFilterMode() = lss::Mdl::Filter::vkToMdl(s->info().magFilter);
           tmp.getWrapModeU() = lss::Mdl::WrapMode::vkToMdl(s->info().addressModeU);
           tmp.getWrapModeV() = lss::Mdl::WrapMode::vkToMdl(s->info().addressModeV);

@@ -63,6 +63,7 @@ struct AssetReplacement;
 struct AssetReplacer;
 class OpacityMicromapManager;
 class TerrainBaker;
+class Ue3CompositeBaker;
 
 // The resource cache can be *searched* by other users
 class ResourceCache {
@@ -181,6 +182,7 @@ public:
   GraphManager& getGraphManager() { return m_graphManager; }
   std::unique_ptr<AssetReplacer>& getAssetReplacer() { return m_pReplacer; }
   TerrainBaker& getTerrainBaker() { return *m_terrainBaker.get(); }
+  Ue3CompositeBaker& getUe3CompositeBaker() { return *m_ue3CompositeBaker.get(); }
 
   // Scene utility functions
   static Vector3 getSceneUp();
@@ -408,6 +410,8 @@ private:
   std::unique_ptr<AssetReplacer> m_pReplacer;
 
   std::unique_ptr<TerrainBaker> m_terrainBaker;
+
+  std::unique_ptr<Ue3CompositeBaker> m_ue3CompositeBaker;
 
   FogState m_fog;
   fast_unordered_cache<FogState> m_fogStates;

@@ -678,6 +678,61 @@ vec3 opaqueSurfaceMaterialHighlightGlow(Surface surface, vec3 albedo, vec4 emiss
   return surface.highlightGlow * albedo;
 }
 
+// Blends the albedo towards the bake with a lifted mask at 1 (rtx.ue3CompositeMaterialTextures),
+// or interpolates through the bakes at 0, 1/2 and 1 when the colour is quadratic in the mask.
+// The game computes in linear, and the bakes are gamma encoded as legacy albedo is.
+void opaqueSurfaceMaterialApplyMaskLayer(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  SurfaceInteraction surfaceInteraction,
+  float lodBias,
+  inout vec3 albedo)
+{
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER) == 0)
+  {
+    return;
+  }
+
+  const MaskLayerMaterial maskLayer = maskLayerMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.maskLayerIndex]);
+  vec4 maskedAlbedoSample;
+  if (!surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, maskedAlbedoSample, lodBias))
+  {
+    return;
+  }
+
+  SurfaceInteraction maskInteraction = surfaceInteraction;
+  maskInteraction.textureCoordinates = surfaceInteraction.textureCoordinates * maskLayer.maskScale + maskLayer.maskOffset;
+  maskInteraction.textureGradientX = surfaceInteraction.textureGradientX * maskLayer.maskScale;
+  maskInteraction.textureGradientY = surfaceInteraction.textureGradientY * maskLayer.maskScale;
+  vec4 maskSample;
+  if (!surfaceMaterialInteractionTextureReadHelper(maskLayer.maskTextureIndex, opaqueSurfaceMaterial.samplerIndex, maskInteraction, maskSample, lodBias))
+  {
+    return;
+  }
+
+  // The mask is decoded as the game samples it. Alpha never is.
+  const uint channel = maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_CHANNEL_MASK;
+  float mask = maskSample[channel];
+  if ((maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_SRGB) != 0 && channel != 3)
+  {
+    mask = pow(mask, kSRGBGamma);
+  }
+  mask = saturate(mask);
+
+  vec4 maskedHalfAlbedoSample;
+  if ((maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_QUADRATIC) != 0 &&
+      surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedHalfAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, maskedHalfAlbedoSample, lodBias))
+  {
+    // Lagrange interpolation through the bakes at 0, 1/2 and 1 is exact for a colour quadratic in the mask.
+    const vec3 interpolated = gammaToLinear(albedo) * ((1.0f - mask) * (1.0f - 2.0f * mask)) +
+                              gammaToLinear(maskedHalfAlbedoSample.rgb) * (4.0f * mask * (1.0f - mask)) +
+                              gammaToLinear(maskedAlbedoSample.rgb) * (mask * (2.0f * mask - 1.0f));
+    albedo = linearToGamma(saturate(interpolated));
+    return;
+  }
+
+  albedo = linearToGamma(mix(gammaToLinear(albedo), gammaToLinear(maskedAlbedoSample.rgb), mask));
+}
+
 // Particle path
 //
 // The unordered particle resolve consumes only a hit's albedo, opacity and emissive radiance (see
@@ -746,6 +801,8 @@ void opaqueSurfaceMaterialParticleResolve(
   if (samples.albedoOpacityLoaded)
   {
     albedo = samples.albedoOpacity.rgb;
+    const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, surfaceInteraction, isHairCardMaterial ? cb.hairCardMipBias : 0.0f, albedo);
     opacity = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS) ? float(1.0f) : samples.albedoOpacity.a;
   }
 
@@ -911,6 +968,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (albedoOpacityLoaded)
   {
     albedo = albedoOpacitySample.rgb;
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, surfaceInteraction, materialLodBias, albedo);
 
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the

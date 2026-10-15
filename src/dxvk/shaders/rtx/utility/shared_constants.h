@@ -45,6 +45,15 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(3))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(4))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(5))
+// Is set when maskLayerIndex names a MaskLayerMaterial in the surface material extensions.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
+
+// MaskLayerMaterial::maskChannelAndFlags holds the mask channel in its low bits and these flags above it.
+#define MASK_LAYER_MATERIAL_CHANNEL_MASK 0x3
+// Is set when the game samples the mask as sRGB.
+#define MASK_LAYER_MATERIAL_FLAG_SRGB (1 << 2)
+// Is set when the colour is quadratic in the mask, so the surface interpolates through the bake at 1/2.
+#define MASK_LAYER_MATERIAL_FLAG_QUADRATIC (1 << 3)
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

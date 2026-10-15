@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,6 +35,7 @@
 #include "../util/util_fast_cache.h"
 #include "../dxso/dxso_material_fades.h"
 #include "../dxso/dxso_sampler_inference.h"
+#include "../dxso/dxso_ue3_composite.h"
 #include "../dxso/dxso_ue3_material_identity.h"
 #include "../dxso/dxso_uv_dataflow.h"
 
@@ -572,6 +574,72 @@ namespace dxvk {
 
   private:
     fast_unordered_cache<std::shared_ptr<Ue3GeometryMemoEntry>> m_entries;
+  };
+
+  // Holds the vertex shader half of the UV resolution behind a surface's texcoords.
+  // The interpolant the pixel shader reads is vsScale * IA texcoord + vsOffset when vsAffineFold is set.
+  struct Ue3UvFacts {
+    bool vsAffineFold = false;
+    float vsScaleU = 1.0f;
+    float vsScaleV = 1.0f;
+    float vsOffsetU = 0.0f;
+    float vsOffsetV = 0.0f;
+  };
+
+  // Describes one repeat of every layer of a composite material (rtx.ue3CompositeMaterialTextures), as solved
+  // for one draw against its live constants and bound textures.
+  struct Ue3CompositeDomain {
+    // Is measured in the interpolant UV the pixel shader reads.
+    Vector2 period = Vector2(1.0f, 1.0f);
+    uint32_t width = 0;
+    uint32_t height = 0;
+    // Is the resolution the finest layer needs, before rtx.d3d9.ue3CompositeMaxResolution caps it.
+    uint32_t neededWidth = 0;
+    uint32_t neededHeight = 0;
+    // Maps mesh UV to bake UV.
+    Matrix4 transform;
+    // Is set for two or more colour layers at different tilings, which no single picked texture can stand in for.
+    bool layered = false;
+    // Is set when the bake keeps its emission as the surface's emissive texture, which needs rtx.d3d9.ue3CompositeEmission.
+    // It is not when an emissive layer reads another UV set or a coordinate the bake cannot place.
+    bool storeEmission = false;
+    // Lists the interpolant lanes of colour layers on another UV set, which the bake samples at their average.
+    struct AveragedLanes {
+      uint8_t semanticIndex;
+      uint8_t compU;
+      uint8_t compV;
+    };
+    std::vector<AveragedLanes> averagedLanes;
+    // Describes a mask layer the repeat leaves out because its tiling would lengthen it. See "Masks" in
+    // UE3Compatibility.md.
+    struct LiftedMask {
+      uint8_t stage = 0;
+      uint8_t channel = 0;
+      // Is 2 when the colour is quadratic in the mask.
+      uint8_t degree = 1;
+      // Maps bake UV to the mask's UV as (scale U, scale V, offset U, offset V).
+      Vector4 transform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
+    };
+    std::optional<LiftedMask> mask;
+    // Hashes the bound layer textures and their sampler states.
+    XXH64_hash_t texturesHash = kEmptyHash;
+    // Lists the layers with their tilings and roles, for the log and the dev menu.
+    std::string description;
+  };
+
+  // Tracks a composite material across draws (rtx.ue3CompositeMaterialTextures).
+  struct Ue3CompositeMaterialState {
+    // Holds the distinct values of the material constants its bakes ran with. Streamed-in mips mint new bakes
+    // too, but only a constant that keeps changing means an animating input.
+    fast_unordered_set constantSets;
+    bool animated = false;
+    bool hasDomain = false;
+    Vector2 period = Vector2(1.0f, 1.0f);
+    Matrix4 domainTransform;
+    bool domainConflictWarned = false;
+    // Untagged materials are checked for the candidate log once.
+    bool candidateChecked = false;
+    XXH64_hash_t loggedRefusal = kEmptyHash;
   };
 
   // Per-draw state shared by the UE3 texture hooks of processTextures.

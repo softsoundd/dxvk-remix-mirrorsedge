@@ -39,6 +39,7 @@
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
 #include "rtx_texture.h"
+#include "rtx_ue3_composite.h"
 #include "rtx_xess.h"
 
 #include <assert.h>
@@ -149,6 +150,7 @@ namespace dxvk {
     , m_bindlessResourceManager(device)
     , m_pReplacer(new AssetReplacer())
     , m_terrainBaker(new TerrainBaker())
+    , m_ue3CompositeBaker(new Ue3CompositeBaker())
     , m_cameraManager(device)
     , m_uniqueObjectSearchDistance(RtxOptions::uniqueObjectDistance()) {
     InstanceEventHandler instanceEvents(this);
@@ -630,6 +632,7 @@ namespace dxvk {
     }
 
     m_terrainBaker->onFrameEnd(ctx);
+    m_ue3CompositeBaker->onFrameEnd(ctx, m_device->getCurrentFrameId());
 
     if (m_opacityMicromapManager) {
       m_opacityMicromapManager->onFrameEnd();
@@ -1714,6 +1717,12 @@ namespace dxvk {
           else if (radiusScale < 0.0f) ++m_thinOpaqueCount;
         }
       }
+      const uint32_t maskLayerIdx = opaque.getMaskLayerIndex();
+      if (maskLayerIdx != SURFACE_INDEX_INVALID && maskLayerIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
+        m_surfaceMaterialExtensionCache.getObjectTable()[maskLayerIdx].forEachTextureIndex([&](uint32_t texIdx) {
+          textureManager.retainTexture(texIdx);
+        });
+      }
     }
   }
 
@@ -1764,6 +1773,12 @@ namespace dxvk {
             }
           }
         }
+      }
+      const uint32_t maskLayerIdx = opaque.getMaskLayerIndex();
+      if (maskLayerIdx != SURFACE_INDEX_INVALID && maskLayerIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
+        m_surfaceMaterialExtensionCache.getObjectTable()[maskLayerIdx].forEachTextureIndex([&](uint32_t texIdx) {
+          textureManager.releaseTexture(texIdx);
+        });
       }
     }
   }
@@ -2302,6 +2317,33 @@ namespace dxvk {
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
 
+      // A UE3 composite's mask layer only applies over its own bake, not over an albedo a replacement authored.
+      uint32_t maskLayerIndex = SURFACE_INDEX_INVALID;
+      const LegacyMaterialData& legacyMaterial = drawCallState.getMaterialData();
+      if (!RtxOptions::useWhiteMaterialMode() && legacyMaterial.ue3CompositeMaskedAlbedo.isValid() &&
+          legacyMaterial.ue3CompositeMask.isValid() &&
+          opaqueMaterialData.getAlbedoOpacityTexture().getImageHash() == legacyMaterial.ue3CompositeAlbedo.getImageHash()) {
+        uint32_t maskedAlbedoTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+        uint32_t maskedHalfAlbedoTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+        uint32_t maskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+        trackTexture(legacyMaterial.ue3CompositeMaskedAlbedo, maskedAlbedoTextureIndex, hasTexcoords, true);
+        if (legacyMaterial.ue3CompositeMaskedHalfAlbedo.isValid()) {
+          trackTexture(legacyMaterial.ue3CompositeMaskedHalfAlbedo, maskedHalfAlbedoTextureIndex, hasTexcoords, true);
+        }
+        trackTexture(legacyMaterial.ue3CompositeMask, maskTextureIndex, hasTexcoords, true);
+        const RtMaskLayerMaterial maskLayerMaterial {
+          maskedAlbedoTextureIndex,
+          maskedHalfAlbedoTextureIndex,
+          maskTextureIndex,
+          legacyMaterial.ue3CompositeMaskTransform,
+          legacyMaterial.ue3CompositeMaskChannel,
+          legacyMaterial.ue3CompositeMaskIsSrgb,
+        };
+        if (maskLayerMaterial.validate()) {
+          maskLayerIndex = m_surfaceMaterialExtensionCache.track(maskLayerMaterial);
+        }
+      }
+
       const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
         tangentTextureIndex, heightTextureIndex, roughnessTextureIndex,
@@ -2318,7 +2360,8 @@ namespace dxvk {
         opaqueMaterialData.getDLSSControlMaskStructuralStrength(),
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget, isHairCard,
         samplerFeedbackStamp,
-        secondaryTextureIndex
+        secondaryTextureIndex,
+        maskLayerIndex
       };
 
       surfaceMaterial.emplace(opaqueSurfaceMaterial);

@@ -177,6 +177,9 @@ namespace dxvk {
     o.ue3LogUvResolution = ue3LogUvResolutionObject().get();
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
     o.ue3LogAlbedoSelection = ue3LogAlbedoSelectionObject().get();
+    o.ue3CompositeMaxResolution = ue3CompositeMaxResolutionObject().get();
+    o.ue3CompositeEmission = ue3CompositeEmissionObject().get();
+    o.ue3LogCompositeMaterials = ue3LogCompositeMaterialsObject().get();
     o.ue3LogCapturePrecision = ue3LogCapturePrecisionObject().get();
     o.ue3LogInstancedDraws = ue3LogInstancedDrawsObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
@@ -211,6 +214,7 @@ namespace dxvk {
     o.lightmapTextures = &s.lightmapTextures;
     o.neverAlbedoTextures = &s.neverAlbedoTextures;
     o.preferredAlbedoTextures = &s.preferredAlbedoTextures;
+    o.ue3CompositeMaterialTextures = &s.ue3CompositeMaterialTextures;
     o.smoothNormalsTextures = &s.smoothNormalsTextures;
     o.ignoreBakedLightingTextures = &s.ignoreBakedLightingTextures;
     o.raytracedRenderTargetTextures = &s.raytracedRenderTargetTextures;
@@ -241,6 +245,7 @@ namespace dxvk {
       { &s.lightmapTextures, &RtxOptions::lightmapTexturesObject().get() },
       { &s.neverAlbedoTextures, &RtxOptions::neverAlbedoTexturesObject().get() },
       { &s.preferredAlbedoTextures, &RtxOptions::preferredAlbedoTexturesObject().get() },
+      { &s.ue3CompositeMaterialTextures, &RtxOptions::ue3CompositeMaterialTexturesObject().get() },
       { &s.smoothNormalsTextures, &RtxOptions::smoothNormalsTexturesObject().get() },
       { &s.ignoreBakedLightingTextures, &RtxOptions::ignoreBakedLightingTexturesObject().get() },
       { &s.raytracedRenderTargetTextures, &RtxOptions::raytracedRenderTargetTexturesObject().get() },
@@ -653,6 +658,8 @@ namespace dxvk {
     // m_activeDrawCallState is reused across draws, so these fields need an explicit per-draw reset
     m_activeDrawCallState.allowMainCameraUpdate = true;
     m_activeDrawCallState.programmableVertexShaderBytecodeHash = 0;
+    m_activeDrawCallState.ue3CompositeRequest = nullptr;
+    m_activeDrawCallState.ue3CompositeDrawStateApplied = false;
     m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
     m_activeDrawCallState.isUe3ForegroundDpg = m_ue3ForegroundDpgActive;
 
@@ -1449,6 +1456,7 @@ namespace dxvk {
     return finishPrepare(
       PrepareDrawFlag::CommitToRayTracing |
       (m_activeDrawCallState.testCategoryFlags(CATEGORIES_REQUIRE_DRAW_CALL_STATE) ? PrepareDrawFlag::ApplyDrawState : 0) |
+      (m_activeDrawCallState.ue3CompositeDrawStateApplied ? PrepareDrawFlag::ApplyDrawState : 0) |
       (preserveOriginalDraw ? PrepareDrawFlag::PreserveDrawCallAndItsState : 0));
   }
 
@@ -1978,7 +1986,23 @@ namespace dxvk {
     }();
 
     if constexpr (!FixedFunction) {
-      resolveUe3Texcoords(ue3, firstStage, stageStateIdx, texcoordIdx, iaTexcoordIdx);
+      const uint32_t uvStage = selectUe3CompositeUvStage(ue3, firstStage);
+      const uint32_t tssTexcoordIdx = texcoordIdx;
+      const uint32_t tssIaTexcoordIdx = iaTexcoordIdx;
+      const uint8_t tssCompU = m_texcoordCompU;
+      const uint8_t tssCompV = m_texcoordCompV;
+      const Matrix4 shaderTextureTransform = m_activeDrawCallState.transformData.textureTransform;
+      resolveUe3Texcoords(ue3, uvStage, stageStateIdx, texcoordIdx, iaTexcoordIdx);
+      if (!resolveUe3Composite(ue3, texcoordIdx) && uvStage != firstStage) {
+        // The composite does not apply after all, so the surface renders its pick through the pick's own UVs.
+        texcoordIdx = tssTexcoordIdx;
+        iaTexcoordIdx = tssIaTexcoordIdx;
+        m_texcoordCompU = tssCompU;
+        m_texcoordCompV = tssCompV;
+        m_uvResolutionMode = UvResolutionMode::LegacyTss;
+        m_activeDrawCallState.transformData.textureTransform = shaderTextureTransform;
+        resolveUe3Texcoords(ue3, firstStage, stageStateIdx, texcoordIdx, iaTexcoordIdx);
+      }
     }
 
     m_texcoordIndex = texcoordIdx;

@@ -88,6 +88,12 @@ namespace dxvk {
   bool g_forceKeepObjectPickingImage = false;
 
   void RtxContext::takeScreenshot(std::string imageName, Rc<DxvkImage> image) {
+    // rtx.captureDebugImage also names targets that are only allocated while their pass is enabled
+    // (the subsurface buffers).
+    if (image == nullptr) {
+      return;
+    }
+
     // NOTE: Improve this, I'd like all textures from the same frame to have the same time code...  Currently sampling the time on each "dump op" results in different timecodes.
     auto t = std::time(nullptr);
     auto tm = *std::localtime(&t);
@@ -1230,6 +1236,7 @@ namespace dxvk {
       const MaterialData* overrideMaterialData = nullptr;
       bakeTerrain(params, drawCallState, &overrideMaterialData);
 
+      bakeUe3Composite(drawCallState);
     
       // An attempt to resolve cases where games pre-combine view and world matrices
       if (RtxOptions::resolvePreCombinedMatrices() &&

@@ -339,6 +339,9 @@ enum Enum {
   FilterMode,
   WrapModeU,
   WrapModeV,
+  EmissiveTex,
+  EnableEmission,
+  EmissiveIntensity,
 };
 static std::unordered_map<Enum,std::string> attrNames {
   {OutputsOut,       "outputs:out"},
@@ -351,6 +354,9 @@ static std::unordered_map<Enum,std::string> attrNames {
   {FilterMode,       "filter_mode"},
   {WrapModeU,        "wrap_mode_u"},
   {WrapModeV,        "wrap_mode_v"},
+  {EmissiveTex,      "inputs:emissive_mask_texture"},
+  {EnableEmission,   "inputs:enable_emission"},
+  {EmissiveIntensity,"inputs:emissive_intensity"},
 };
 static std::unordered_map<Enum,AttrDesc> attrDescs{
   AttrDescMapEntry(OutputsOut,       Token, false, Varying),
@@ -363,6 +369,9 @@ static std::unordered_map<Enum,AttrDesc> attrDescs{
   AttrDescMapEntry(FilterMode,        UInt, false, Uniform),
   AttrDescMapEntry(WrapModeU,         UInt, false, Uniform),
   AttrDescMapEntry(WrapModeV,         UInt, false, Uniform),
+  AttrDescMapEntry(EmissiveTex,       Asset, false, Varying),
+  AttrDescMapEntry(EnableEmission,    Bool, false, Uniform),
+  AttrDescMapEntry(EmissiveIntensity, Float, false, Varying),
 };
 }
 }
@@ -411,6 +420,10 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
       if (attrEnum == ShaderAttr::DiffuseConstant && !matData.hasAlbedoConstant) {
         continue;
       }
+      if ((attrEnum == ShaderAttr::EmissiveTex || attrEnum == ShaderAttr::EnableEmission ||
+           attrEnum == ShaderAttr::EmissiveIntensity) && matData.emissiveTexPath.empty()) {
+        continue;
+      }
       shaderAttrs[attrEnum] =
         shaderPrim.CreateAttribute(desc.attrName, desc.typeName, desc.custom, desc.sdfVariability);
       // Cannot assert. Attr "outputs:out" asserts false, but authoring + Setting works just fine.
@@ -437,6 +450,15 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
 
     if (matData.hasAlbedoConstant) {
       ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::DiffuseConstant].Set(matData.albedoConstant));
+    }
+
+    if (!matData.emissiveTexPath.empty()) {
+      const auto relToMaterialsTexPath =
+        std::filesystem::relative(computeLocalPath(matData.emissiveTexPath), fullMaterialBasePath).string();
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::EmissiveTex].Set(pxr::SdfAssetPath(relToMaterialsTexPath)));
+      shaderAttrs[ShaderAttr::EmissiveTex].SetColorSpace(pxr::TfToken("auto"));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::EnableEmission].Set(true));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::EmissiveIntensity].Set(matData.emissiveIntensity));
     }
 
     // Create and set OmniPBR MDL boilerplate attributes on shader

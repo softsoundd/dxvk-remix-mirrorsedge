@@ -94,6 +94,7 @@ d3d9_src = [
   'd3d9_rtx_ue3_albedo.cpp',
   'd3d9_rtx_ue3_camera.cpp',
   'd3d9_rtx_ue3_classify.cpp',
+  'd3d9_rtx_ue3_composite.cpp',
   'd3d9_rtx_ue3_diagnostics.cpp',
   'd3d9_rtx_ue3_geometry_hash.cpp',
   'd3d9_rtx_ue3_instancing.cpp',

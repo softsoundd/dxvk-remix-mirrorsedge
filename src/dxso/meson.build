@@ -19,6 +19,7 @@ dxso_src = files([
   'dxso_uv_dataflow.cpp',
   'dxso_sampler_inference.cpp',
   'dxso_ue3_material_identity.cpp',
+  'dxso_ue3_composite.cpp',
   'dxso_compiler.cpp',
   'dxso_enums.cpp'
 ])

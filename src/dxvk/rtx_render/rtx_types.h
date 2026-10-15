@@ -52,6 +52,7 @@ struct DrawCallState;
 struct AssetReplacement;
 struct ReplacementBucket;
 struct ReplacementInstance;
+struct Ue3CompositeBakeRequest;
 
 using RasterBuffer = GeometryBuffer<Raster>;
 using RaytraceBuffer = GeometryBuffer<Raytrace>;
@@ -815,6 +816,12 @@ struct DrawCallState {
   // Used by tryHandleSky to optionally bypass cubemap rasterization for autoDetected sky,
   // since it may be world geometry that should go through reprojection instead.
   bool skyAutoDetected = false;
+
+  // Names the composite bake this draw's material renders from (rtx.ue3CompositeMaterialTextures), and is
+  // null unless the material is tagged and can be baked. Baking needs the draw's own state bound, which only
+  // draws that request it (PrepareDrawFlag::ApplyDrawState) have.
+  std::shared_ptr<const Ue3CompositeBakeRequest> ue3CompositeRequest;
+  bool ue3CompositeDrawStateApplied = false;
 
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();

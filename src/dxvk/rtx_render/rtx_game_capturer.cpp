@@ -562,18 +562,31 @@ namespace dxvk {
     // Resolve material name
     const std::string matName = dxvk::hashToString(materialData.getHash());
     lssMat.matName = matName;
+    // A UE3 composite bake (rtx.ue3CompositeMaterialTextures) is what the surface renders, and the
+    // captured UVs already span its repeat, so it is what the stage shows.
+    const bool composite =
+      materialData.ue3CompositeAlbedo.getImageView() != nullptr && materialData.ue3CompositeSampler.ptr() != nullptr;
+    const TextureRef& albedoTexture = composite ? materialData.ue3CompositeAlbedo : materialData.getColorTexture();
+    const Rc<DxvkSampler>& albedoSampler = composite ? materialData.ue3CompositeSampler : materialData.getSampler();
     // Export Textures
-    const bool hasColorTexture =
-      materialData.getColorTexture().getImageView() != nullptr && materialData.getSampler().ptr() != nullptr;
+    const bool hasColorTexture = albedoTexture.getImageView() != nullptr && albedoSampler.ptr() != nullptr;
     if (hasColorTexture) {
       const std::string albedoTexFilename(matName + lss::ext::dds);
       m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
                                  albedoTexFilename,
-                                 materialData.getColorTexture().getImageView()->image());
+                                 albedoTexture.getImageView()->image());
       const std::string albedoTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, albedoTexFilename);
       lssMat.albedoTexPath = albedoTexPath;
+      if (composite && materialData.ue3CompositeEmissive.getImageView() != nullptr) {
+        const std::string emissiveTexFilename(matName + "_emissive" + lss::ext::dds);
+        m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
+                                   emissiveTexFilename,
+                                   materialData.ue3CompositeEmissive.getImageView()->image());
+        lssMat.emissiveTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, emissiveTexFilename);
+        lssMat.emissiveIntensity = materialData.ue3CompositeEmissiveIntensity;
+      }
       // Collect sampler info
-      const auto& samplerCreateInfo = materialData.getSampler()->info();
+      const auto& samplerCreateInfo = albedoSampler->info();
       lssMat.sampler.addrModeU = samplerCreateInfo.addressModeU;
       lssMat.sampler.addrModeV = samplerCreateInfo.addressModeV;
       lssMat.sampler.filter = samplerCreateInfo.magFilter;

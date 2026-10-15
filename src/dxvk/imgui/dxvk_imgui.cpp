@@ -55,6 +55,7 @@
 #include "rtx_render/rtx_gpu_overrides.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_terrain_baker.h"
+#include "rtx_render/rtx_ue3_composite.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
 #include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_ray_reconstruction.h"
@@ -225,7 +226,8 @@ namespace dxvk {
     {"particleemittertextures","Particle Emitters (optional)", &RtxOptions::particleEmitterTexturesObject()},
     {"smoothnormalstextures","Smooth Normals (optional)", &RtxOptions::smoothNormalsTexturesObject()},
     {"preferredalbedotextures","Prefer As Albedo (optional)", &RtxOptions::preferredAlbedoTexturesObject()},
-    {"neveralbedotextures","Never Albedo (optional)", &RtxOptions::neverAlbedoTexturesObject()}
+    {"neveralbedotextures","Never Albedo (optional)", &RtxOptions::neverAlbedoTexturesObject()},
+    {"ue3compositematerialtextures","UE3 Composite Material (optional)", &RtxOptions::ue3CompositeMaterialTexturesObject()}
   };
 
   // Geometry-hash categories (no thumbnails) — prefer when the first- and third-person meshes share materials.
@@ -5281,6 +5283,36 @@ namespace dxvk {
         RemixGui::CollapsingHeader("Mirror's Edge Map Settings", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       common->metaUe3MapSettings().showImguiSettings();
+      ImGui::Unindent();
+    }
+
+    if (D3D9Rtx::ue3EngineMode() &&
+        RemixGui::CollapsingHeader("UE3 Composite Materials", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("Materials tagged \"UE3 Composite Material\" in the texture list render a bake of their own "
+                         "pixel shader over one repeat of all their layers, instead of their albedo pick.");
+      RemixGui::DragInt("Max Bake Resolution", &D3D9Rtx::ue3CompositeMaxResolutionObject(), 16.f, 64, 8192, "%d", sliderFlags);
+      RemixGui::DragInt("VRAM Budget (MB)", &D3D9Rtx::ue3CompositeVramBudgetMBObject(), 16.f, 0, 16384, "%d", sliderFlags);
+      RemixGui::DragInt("Max Bakes Per Frame", &D3D9Rtx::ue3CompositeMaxBakesPerFrameObject(), 0.1f, 1, 16, "%d", sliderFlags);
+      RemixGui::Checkbox("Keep Emission", &D3D9Rtx::ue3CompositeEmissionObject());
+      RemixGui::DragFloat("Emissive Intensity", &D3D9Rtx::ue3CompositeEmissiveIntensityObject(), 0.01f, 0.f, 1000.f);
+      RemixGui::Checkbox("Log Composite Materials", &D3D9Rtx::ue3LogCompositeMaterialsObject());
+
+      const std::vector<Ue3CompositeBaker::Status> bakes = Ue3CompositeBaker::getStatus();
+      ImGui::Text("Bakes: %zu, %.1f MB", bakes.size(), double(Ue3CompositeBaker::getTotalBytes()) / (1024.0 * 1024.0));
+      if (ImGui::Button("Re-bake All")) {
+        Ue3CompositeBaker::requestClear();
+      }
+      RemixGui::SetTooltipToLastWidgetOnHover("Releases every bake at the end of the frame. Each bakes again when next drawn.");
+      for (const Ue3CompositeBaker::Status& bake : bakes) {
+        ImGui::Text("mat_%016llX  pick %016llX  %ux%u  repeat (%g, %g)%s  %.1f MB",
+                    static_cast<unsigned long long>(bake.materialHash),
+                    static_cast<unsigned long long>(bake.pickTextureHash),
+                    bake.width, bake.height, bake.period.x, bake.period.y,
+                    bake.hasEmission ? "  emissive" : "",
+                    double(bake.bytes) / (1024.0 * 1024.0));
+        RemixGui::SetTooltipToLastWidgetOnHover(bake.description.c_str());
+      }
       ImGui::Unindent();
     }
 

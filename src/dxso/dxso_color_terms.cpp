@@ -333,6 +333,7 @@ namespace dxvk {
           result.constTerms[reg] = idx >= 0 ? m_colorTerms[size_t(idx)] : 0;
           result.constReach[reg] = idx >= 0 ? m_reach[size_t(idx)] : 0;
         }
+        result.interpolantFactorInputs = m_interpolantFactorInputs;
         result.literals.reserve(m_literalBits.size());
         for (uint32_t i = 0; i < m_literalBits.size(); i++) {
           result.literals.push_back({ m_literalBits[i], m_colorTerms[kLiteralSourceBase + i] });
@@ -395,6 +396,7 @@ namespace dxvk {
               (m_normalizedInputs & bit) == 0 &&
               popCount4(readComps) >= 2) {
             v.factor |= DxsoColorTermFactor_Interpolant;
+            m_interpolantFactorInputs |= bit;
           }
           break;
         }
@@ -863,6 +865,8 @@ namespace dxvk {
             }
           }
         }
+        // Every lane reads the operands as they were before the instruction, which may write one of them.
+        std::array<Value, 4> results;
         for (uint32_t lane = 0; lane < 4; lane++) {
           if (!ctx.dst.mask[lane]) {
             continue;
@@ -871,7 +875,12 @@ namespace dxvk {
           for (uint32_t i = 0; i < srcCount && i < 3; i++) {
             src[i] = readComponent(ctx.src[i], ctx.src[i].swizzle[scalar ? 0 : lane], readComps[i]);
           }
-          writeResult(ctx.dst, lane, combine(op, src, srcCount, false));
+          results[lane] = combine(op, src, srcCount, false);
+        }
+        for (uint32_t lane = 0; lane < 4; lane++) {
+          if (ctx.dst.mask[lane]) {
+            writeResult(ctx.dst, lane, results[lane]);
+          }
         }
       }
 
@@ -897,6 +906,7 @@ namespace dxvk {
       TermRow                            m_colorTerms = {};
       std::array<uint8_t, kMaxSources>   m_reach = {};
       uint8_t                            m_outputFactor = 0;
+      uint32_t                           m_interpolantFactorInputs = 0;
       std::array<ConstDepSet, kDxsoColorTermMaxSamplers> m_samplerCoordConstDeps = {};
       std::array<uint8_t, kDxsoColorTermMaxSamplers>     m_samplerCoordExpr = {};
       std::array<uint16_t, kDxsoColorTermMaxSamplers>    m_samplerSampleCount = {};
