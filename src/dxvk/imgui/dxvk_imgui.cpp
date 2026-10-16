@@ -1592,7 +1592,7 @@ namespace dxvk {
       }
       ImGui::EndDisabled();
 #else
-      ImGui::TextWrapped("Nsight Graphics capture is supported only by x64 builds. See the build instructions in README.md.");
+      ImGui::TextWrapped("Nsight Graphics capture requires an x64 or ARM64EC build. See the build instructions in README.md.");
 #endif
 
       ImGui::Unindent();
