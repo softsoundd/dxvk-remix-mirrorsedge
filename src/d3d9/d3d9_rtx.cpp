@@ -155,6 +155,7 @@ namespace dxvk {
     o.ue3StaticGeometryHashMemoization = ue3StaticGeometryHashMemoizationObject().get();
     o.ue3GeometryMemoSelfCheckFrames = ue3GeometryMemoSelfCheckFramesObject().get();
     o.ue3ExactVertexCapture = ue3ExactVertexCaptureObject().get();
+    o.ue3DeriveCameraPositionFromViewProjection = ue3DeriveCameraPositionFromViewProjectionObject().get();
     o.ue3RequireExactVertexCapture = ue3RequireExactVertexCaptureObject().get();
     o.ue3VertexCaptureSourceOverride = ue3VertexCaptureSourceOverrideObject().get();
     o.ue3NativeLocalMeshVertexCapture = ue3NativeLocalMeshVertexCaptureObject().get();

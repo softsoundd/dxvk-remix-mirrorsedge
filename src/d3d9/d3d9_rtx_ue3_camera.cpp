@@ -60,10 +60,50 @@
 
 namespace dxvk {
 
+  // Solves the view origin of a perspective world-to-projection matrix,
+  // which is the point that projects to clip x = y = w = 0.
+  static bool solveUe3CameraPositionFromViewProjection(const Matrix4& worldToProjection, Vector3& outPos) {
+    const uint32_t rows[3] = { 0, 1, 3 };
+    double m[3][4];
+    for (uint32_t r = 0; r < 3; r++) {
+      for (uint32_t c = 0; c < 4; c++) {
+        m[r][c] = worldToProjection[c][rows[r]];
+      }
+    }
+    auto det3 = [](const double a[3][3]) {
+      return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) -
+             a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+             a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    };
+    double a[3][3];
+    for (uint32_t r = 0; r < 3; r++) {
+      for (uint32_t c = 0; c < 3; c++) {
+        a[r][c] = m[r][c];
+      }
+    }
+    const double det = det3(a);
+    if (!std::isfinite(det) || std::abs(det) < 1e-18) {
+      return false;
+    }
+    double solution[3];
+    for (uint32_t i = 0; i < 3; i++) {
+      double ai[3][3];
+      for (uint32_t r = 0; r < 3; r++) {
+        for (uint32_t c = 0; c < 3; c++) {
+          ai[r][c] = (c == i) ? -m[r][3] : m[r][c];
+        }
+      }
+      solution[i] = det3(ai) / det;
+    }
+    outPos = Vector3(static_cast<float>(solution[0]), static_cast<float>(solution[1]), static_cast<float>(solution[2]));
+    return std::isfinite(outPos.x) && std::isfinite(outPos.y) && std::isfinite(outPos.z);
+  }
+
   bool extractUe3CameraMatrices(
     const D3D9ShaderConstantsVSSoftware& vsConsts,
     const uint32_t viewProjRegisterBase,
     const uint32_t viewOriginRegister,
+    const bool deriveCameraPosition,
     Matrix4& outWorldToView,
     Matrix4& outViewToProjection,
     bool* outUsedTranspose,
@@ -75,7 +115,7 @@ namespace dxvk {
     if (viewProjRegisterBase + 3 >= caps::MaxFloatConstantsSoftware) {
       return false;
     }
-    if (viewOriginRegister >= caps::MaxFloatConstantsSoftware) {
+    if (!deriveCameraPosition && viewOriginRegister >= caps::MaxFloatConstantsSoftware) {
       return false;
     }
 
@@ -85,7 +125,9 @@ namespace dxvk {
     worldToProjection[2] = vsConsts.fConsts[viewProjRegisterBase + 2];
     worldToProjection[3] = vsConsts.fConsts[viewProjRegisterBase + 3];
 
-    const Vector3 camPos = vsConsts.fConsts[viewOriginRegister].xyz();
+    // A derived position is solved per candidate orientation inside tryBuild.
+    const Vector3 registerCamPos =
+      deriveCameraPosition ? Vector3(0.0f, 0.0f, 0.0f) : vsConsts.fConsts[viewOriginRegister].xyz();
 
     // Quick reject: all-zero matrices show up during some initialization paths
     constexpr float kEps = 1e-6f;
@@ -137,6 +179,11 @@ namespace dxvk {
     };
 
     auto tryBuild = [&](const Matrix4& candidateWorldToProjection, Matrix4& outWorldToViewLocal, Matrix4& outViewToProjectionLocal) -> bool {
+      Vector3 camPos = registerCamPos;
+      if (deriveCameraPosition && !solveUe3CameraPositionFromViewProjection(candidateWorldToProjection, camPos)) {
+        return false;
+      }
+
       // avoid attempting to invert singular matrices
       {
         constexpr double kDetEps = 1e-24;
@@ -629,6 +676,13 @@ namespace dxvk {
         }
       }
 
+      // Shaders that name ViewProjectionMatrix but no camera position get the position from the matrix.
+      const bool deriveCameraPosition =
+        m_frameOptions.ue3DeriveCameraPositionFromViewProjection &&
+        ue3CtabInfoPtr != nullptr &&
+        ue3CtabInfoPtr->hasViewProjectionMatrix &&
+        !ue3CtabInfoPtr->hasCameraPosition;
+
       // cache by raw constant values to avoid repeated heavy extraction work per draw call
       struct Ue3CameraConstsKey {
         uint32_t viewProjReg;
@@ -637,18 +691,20 @@ namespace dxvk {
       };
 
       auto tryApplyFromConstants = [&](Matrix4& outWorldToView, Matrix4& outViewToProjection, bool& outUsedTranspose, float& outReconstructionError) -> bool {
-        if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware) {
+        if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware ||
+            (!deriveCameraPosition && viewOriginReg >= caps::MaxFloatConstantsSoftware)) {
           return false;
         }
 
         Ue3CameraConstsKey key {};
         key.viewProjReg = viewProjReg;
-        key.viewOriginReg = viewOriginReg;
+        // A derived position depends on the matrix alone, so it is keyed apart from register-based entries.
+        key.viewOriginReg = deriveCameraPosition ? UINT32_MAX : viewOriginReg;
         key.regs[0] = d3d9State().vsConsts.fConsts[viewProjReg + 0];
         key.regs[1] = d3d9State().vsConsts.fConsts[viewProjReg + 1];
         key.regs[2] = d3d9State().vsConsts.fConsts[viewProjReg + 2];
         key.regs[3] = d3d9State().vsConsts.fConsts[viewProjReg + 3];
-        key.regs[4] = d3d9State().vsConsts.fConsts[viewOriginReg];
+        key.regs[4] = deriveCameraPosition ? Vector4(0.0f, 0.0f, 0.0f, 0.0f) : d3d9State().vsConsts.fConsts[viewOriginReg];
 
         const XXH64_hash_t constantsHash = XXH3_64bits(&key, sizeof(key));
 
@@ -670,7 +726,8 @@ namespace dxvk {
         bool usedTranspose = false;
         float reconstructionError = 0.0f;
         const bool extracted = extractUe3CameraMatrices(
-            d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError);
+            d3d9State().vsConsts, viewProjReg, viewOriginReg, deriveCameraPosition,
+            ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError);
 
         Ue3CameraConstantsCache& slot = m_ue3CameraConstantsCache[m_ue3CameraConstantsCacheNextSlot];
         m_ue3CameraConstantsCacheNextSlot = (m_ue3CameraConstantsCacheNextSlot + 1u) % kUe3CameraConstantsCacheSlots;
@@ -699,11 +756,13 @@ namespace dxvk {
 
       // Only draws whose CTAB explicitly names both camera constants may update the Main camera.
       // Fallback-register extractions can be light-space matrices from engine utility shaders
-      // (e.g. shadow depth) that still reconstruct as a plausible camera.
+      // (e.g. shadow depth) that still reconstruct as a plausible camera. With
+      // ue3DeriveCameraPositionFromViewProjection a named ViewProjectionMatrix alone is enough, since the
+      // position then comes from that matrix rather than from an unverified register.
       const bool ctabVerifiedCamera =
         ue3CtabInfoPtr != nullptr &&
         ue3CtabInfoPtr->hasViewProjectionMatrix &&
-        ue3CtabInfoPtr->hasCameraPosition;
+        (ue3CtabInfoPtr->hasCameraPosition || deriveCameraPosition);
 
       // Reflect and portal probes render through mirrored or obliquely clipped views the viewport heuristic
       // cannot see, and their geometry is unusable. CTAB-verified cameras only: fallback registers can hold
