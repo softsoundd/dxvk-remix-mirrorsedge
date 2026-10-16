@@ -104,11 +104,17 @@ namespace dxvk {
     // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
     // the albedo score or the header changes, so a build re-derives instead of serving decisions
     // its own scoring would no longer make.
-    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 6;
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 7;
 
     // How many loaded picks to re-score and check against current scoring per session. A scoring
     // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
     constexpr uint32_t kUe3DiffuseSelectionAuditCount = 32;
+
+    // Rewards a diffuse anchor (kPsSamplerExprDiffuseAnchor).
+    constexpr int64_t kUe3DiffuseAnchorScore = 2'500'000;
+    // Penalises a texture many shaders sample, such as a shared detail or tint sheet. It stays below the
+    // anchor's reward, so a shared anchor still out-ranks an otherwise comparable unlit layer.
+    constexpr int64_t kUe3SharedTextureScorePenalty = kUe3DiffuseAnchorScore - 100'000;
   }
 
   fast_unordered_set s_loggedNonPrimaryRtDescHashes;
@@ -950,7 +956,7 @@ namespace dxvk {
       // only a high spread is directional: mid spreads (3-7) are just as often a legitimately
       // reused diffuse (e.g. common city wall/plaster sheets) as a shared overlay
       if (materialSpread >= 8) {
-        score -= 2'600'000;
+        score -= kUe3SharedTextureScorePenalty;
       }
       // tiny ramp/tint lookups (gradients, palettes) are material parameters, not albedo
       score -= (area > 0 && area <= 1'024) ? 350'000 : 0;
@@ -986,7 +992,7 @@ namespace dxvk {
       // Only the diffuse expression is multiplied by the lightmap or the ambient and sky constants. Render
       // targets are excluded: light attenuation buffers multiply into those terms too.
       score += (looksExpressionDrivenMaterial && !normalDecodeActive && !isRenderTarget &&
-                inferredSamplerExprDiffuseAnchor) ? 2'500'000 : 0;
+                inferredSamplerExprDiffuseAnchor) ? kUe3DiffuseAnchorScore : 0;
       // A sampler whose UV origin is unprovable must not win on size: the transform is taken
       // from the winner only, so promoting one drops the surface to raw interpolant UVs.
       // Flat, so a shader where no sampler resolves is left unaffected.
