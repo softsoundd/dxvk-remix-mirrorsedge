@@ -21,12 +21,14 @@
  */
 #include "d3d9_device_base.h"
 
+#include "client_options.h"
 #include "d3d9_lss.h"
 #include "window.h"
 
 #include "util_modulecommand.h"
 
 #include <d3d9.h>
+#include <sstream>
 
 BaseDirect3DDevice9Ex_LSS::BaseDirect3DDevice9Ex_LSS(const bool bExtended,
                                                      Direct3D9Ex_LSS* const pDirect3D,
@@ -46,6 +48,11 @@ BaseDirect3DDevice9Ex_LSS::BaseDirect3DDevice9Ex_LSS(const bool bExtended,
 
   //Setting default value
   m_maxFrameLatency = 3;
+
+  // Validation needs the sent state too, so it implies tracking it.
+  m_validateDroppedState = ClientOptions::getValidateDroppedState();
+  m_dropRedundantState = ClientOptions::getDropRedundantState() || m_validateDroppedState;
+  m_stateStatsInterval = ClientOptions::getStateStatsIntervalFrames();
 
   // D3D9 seems to inialize its state to this
   memset(&m_state.renderStates[0], 0xBAADCAFE, sizeof(m_state.renderStates));
@@ -129,4 +136,46 @@ void BaseDirect3DDevice9Ex_LSS::InitRamp() {
     m_gammaRamp.green[i] = identity;
     m_gammaRamp.blue[i] = identity;
   }
+}
+
+void BaseDirect3DDevice9Ex_LSS::reportStateStats(const uint32_t commandsThisFrame) {
+  if (m_stateStatsInterval == 0) {
+    return;
+  }
+  m_statsCommands += commandsThisFrame;
+  if (++m_statsFrames < m_stateStatsInterval) {
+    return;
+  }
+
+  const uint64_t frames = m_statsFrames;
+  const auto perFrame = [frames](const uint64_t count) {
+    return (count + frames / 2) / frames;
+  };
+  uint64_t sent = 0;
+  uint64_t dropped = 0;
+  std::ostringstream perSetter;
+  const std::string prefix = "IDirect3DDevice9Ex_";
+  for (size_t i = 0; i < kNumCommands; ++i) {
+    if (m_settersSent[i] == 0 && m_settersDropped[i] == 0) {
+      continue;
+    }
+    sent += m_settersSent[i];
+    dropped += m_settersDropped[i];
+    std::string name = Commands::toString(Commands::D3D9Command(i));
+    if (name.compare(0, prefix.size(), prefix) == 0) {
+      name.erase(0, prefix.size());
+    }
+    perSetter << " " << name << " " << perFrame(m_settersSent[i]) << "/" << perFrame(m_settersDropped[i]) << ".";
+  }
+
+  std::ostringstream message;
+  message << "Per frame over the last " << frames << " frames: " << perFrame(m_statsCommands) << " commands, "
+          << perFrame(sent) << " setters sent and " << perFrame(dropped) << " dropped as redundant. Sent/dropped by setter:"
+          << perSetter.str();
+  Logger::info(message.str());
+
+  m_settersSent.fill(0);
+  m_settersDropped.fill(0);
+  m_statsCommands = 0;
+  m_statsFrames = 0;
 }

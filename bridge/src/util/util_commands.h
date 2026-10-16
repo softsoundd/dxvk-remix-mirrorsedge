@@ -874,6 +874,8 @@ namespace Commands {
                                     // and only allocation id(s) is transferred on the queue
     DataIsReserved   = 0b00000010,  // Data was already reserved in data queue and only its
                                     // offset is transferred
+    RedundantStateCheck = 0b00000100,  // The client would have dropped this setter as redundant, so
+                                       // the server checks that its device already holds the value.
   };
 
   inline bool IsDataInSharedHeap(Flags flags) {
@@ -882,6 +884,10 @@ namespace Commands {
 
   inline bool IsDataReserved(Flags flags) {
     return (flags & FlagBits::DataIsReserved) != 0;
+  }
+
+  inline bool IsRedundantStateCheck(Flags flags) {
+    return (flags & FlagBits::RedundantStateCheck) != 0;
   }
 }
 

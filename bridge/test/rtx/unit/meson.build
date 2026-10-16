@@ -12,6 +12,17 @@ test('command_history', cmd_history_exe)
 tests += cmd_history_exe
 endif
 
+# Sent State Test
+if (cpu_family == 'x86_64')
+sent_state_exe = executable(
+    'sent_state',  files('test_sent_state.cpp'),
+    include_directories : [ util_include_path, include_directories('../../../src/client') ],
+    dependencies : util_dep,
+    win_subsystem : 'console')
+test('sent_state', sent_state_exe)
+tests += sent_state_exe
+endif
+
 # Remix API Serializing Test
 if (cpu_family == 'x86_64')
     name_suff = 'x64'

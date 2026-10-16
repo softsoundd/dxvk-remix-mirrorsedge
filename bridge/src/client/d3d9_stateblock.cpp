@@ -208,9 +208,12 @@ HRESULT Direct3DStateBlock9_LSS::Capture() {
 
 HRESULT Direct3DStateBlock9_LSS::Apply() {
   LogFunctionCall();
+  BRIDGE_PARENT_DEVICE_LOCKGUARD();
   StateTransfer(m_dirtyFlags, m_captureState, m_pDevice->m_state);
   {
     ClientMessage { Commands::IDirect3DStateBlock9_Apply, getId() };
   }
+  // The server's device now holds the block's values, which the sent state does not follow.
+  m_pDevice->invalidateSentState();
   return S_OK;
 }

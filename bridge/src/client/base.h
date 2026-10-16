@@ -301,6 +301,15 @@ static inline D3DAutoPtr MakeD3DAutoPtr(T* obj) {
   return D3DAutoPtr(static_cast<D3DRefCounted*>(obj));
 }
 
+// Points ptr at obj, leaving the reference counts alone when it already points there.
+template<typename T>
+static inline void SetD3DAutoPtr(D3DAutoPtr& ptr, T* obj) {
+  D3DRefCounted* const ref = static_cast<D3DRefCounted*>(obj);
+  if (*ptr != ref) {
+    ptr.reset(ref);
+  }
+}
+
 class D3dBaseIdFactory {
 private:
   static std::atomic<uintptr_t> id_counter;

@@ -134,10 +134,14 @@ HRESULT Direct3DQuery9_LSS::GetData(void* pData, DWORD dwSize, DWORD dwGetDataFl
 
   WAIT_FOR_SERVER_RESPONSE("Direct3DQuery9_LSS::GetData()", D3DERR_INVALIDCALL, currentUID);
   HRESULT hresult = DeviceBridge::get_data();
-  if (SUCCEEDED(hresult) && dwSize > 0 && pData != NULL) {
+  // The server sends the data whenever the call succeeded and dwSize > 0, so it is read even without pData to keep
+  // the response data in step.
+  if (SUCCEEDED(hresult) && dwSize > 0) {
     void* pDataReturned = NULL;
     DeviceBridge::get_data(&pDataReturned);
-    memcpy(pData, pDataReturned, dwSize);
+    if (pData != NULL && pDataReturned != NULL) {
+      memcpy(pData, pDataReturned, dwSize);
+    }
   }
 
   DeviceBridge::pop_front();

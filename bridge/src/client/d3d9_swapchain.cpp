@@ -158,6 +158,10 @@ HRESULT Direct3DSwapChain9_LSS::Present(CONST RECT* pSourceRect, CONST RECT* pDe
 #ifdef ENABLE_PRESENT_SEMAPHORE_TRACE
   Logger::trace(format_string("Present(): ClientMessage counter is at %d.", ClientMessage::get_counter()));
 #endif
+  {
+    BRIDGE_PARENT_DEVICE_LOCKGUARD();
+    m_pDevice->reportStateStats((uint32_t) ClientMessage::get_counter());
+  }
   ClientMessage::reset_counter();
   gSceneState = WaitBeginScene;
 

@@ -252,6 +252,65 @@ static inline void safeDestroy(IUnknown* obj, uint32_t x86handle) {
   while (obj && static_cast<LONG>(obj->Release()) > 0);
 }
 
+// The client does not wait for buffer creates (see Direct3DDevice9Ex_LSS::CreateVertexBuffer), so a failure is only
+// visible here. The buffer's handle stays unmapped and the commands that use it skip it.
+static void logBufferCreateFailure(const char* api, const HRESULT hresult, const uint32_t handle) {
+  static uint32_t failures = 0;
+  ++failures;
+  if (failures <= 8 || failures % 1024 == 0) {
+    Logger::err(format_string("%s failed (0x%08x) for handle %u, %u failed buffer creates so far. Uploads to it are skipped.",
+                              api, (unsigned) hresult, handle, failures));
+  }
+}
+
+static uint64_t gRedundantStateChecks = 0;
+static uint64_t gRedundantStateMismatches = 0;
+
+// Checks that the device already holds the value of a setter the client flagged as redundant.
+// held() reads the value back and compares it, and runs only for flagged setters (client.validateDroppedState).
+// Logs the first mismatch of each setter with its index arguments.
+template<typename Held>
+static void checkRedundantState(const Header& rpcHeader, const uint32_t index0, const uint32_t index1, Held&& held) {
+  if (!Commands::IsRedundantStateCheck(rpcHeader.flags)) {
+    return;
+  }
+  static std::array<bool, size_t(Commands::IDirect3DQuery9_GetData) + 1> s_reported = {};
+  ++gRedundantStateChecks;
+  if (held()) {
+    return;
+  }
+  ++gRedundantStateMismatches;
+  if (rpcHeader.command < s_reported.size() && !s_reported[rpcHeader.command]) {
+    s_reported[rpcHeader.command] = true;
+    Logger::err(format_string("Redundant state check failed for %s (%u, %u): the client would have dropped it as already "
+                              "held, but the device holds a different value.",
+                              Commands::toString(rpcHeader.command).c_str(), index0, index1));
+  }
+}
+
+// Returns whether the object a Get* call returned is the expected one, and releases the reference the call added.
+template<typename T>
+static bool isHeldObject(T* const held, const T* const expected) {
+  const bool same = held == expected;
+  if (held != nullptr) {
+    held->Release();
+  }
+  return same;
+}
+
+// Logs the redundant state checks every 1000 frames while client.validateDroppedState sends any.
+static void reportRedundantStateChecks() {
+  static uint32_t s_frames = 0;
+  if (gRedundantStateChecks == 0 || ++s_frames < 1000) {
+    return;
+  }
+  Logger::info(format_string("Redundant state checks over the last %u frames: %llu, of which %llu mismatched.", s_frames,
+                             (unsigned long long) gRedundantStateChecks, (unsigned long long) gRedundantStateMismatches));
+  s_frames = 0;
+  gRedundantStateChecks = 0;
+  gRedundantStateMismatches = 0;
+}
+
 D3DPRESENT_PARAMETERS getPresParamFromRaw(const uint32_t* rawPresentationParameters) {
   D3DPRESENT_PARAMETERS presParam;
   // Set up presentation parameters. We can't just directly cast the structure because the hDeviceWindow
@@ -804,6 +863,7 @@ void ProcessDeviceCommandQueue() {
           ss << "Present() failed! Check all logs for reported errors.";
           Logger::err(ss.str());
         }
+        reportRedundantStateChecks();
 
         // If we're syncing with the client on Present() then trigger the semaphore now
         if (GlobalOptions::getPresentSemaphoreEnabled()) {
@@ -925,6 +985,8 @@ void ProcessDeviceCommandQueue() {
         const auto hresult = pD3DDevice->CreateVertexBuffer(IN Length, IN Usage, IN FVF, IN Pool, OUT & pVertexBuffer, IN nullptr);
         if (SUCCEEDED(hresult)) {
           gpD3DResources[pHandle] = pVertexBuffer;
+        } else {
+          logBufferCreateFailure("CreateVertexBuffer", hresult, pHandle);
         }
         assert(SUCCEEDED(hresult));
         // The client does not wait for buffer creates (see Direct3DDevice9Ex_LSS::CreateVertexBuffer).
@@ -943,6 +1005,8 @@ void ProcessDeviceCommandQueue() {
         const auto hresult = pD3DDevice->CreateIndexBuffer(IN Length, IN Usage, IN Format, IN Pool, OUT & pIndexBuffer, IN nullptr);
         if (SUCCEEDED(hresult)) {
           gpD3DResources[pHandle] = pIndexBuffer;
+        } else {
+          logBufferCreateFailure("CreateIndexBuffer", hresult, pHandle);
         }
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1190,6 +1254,10 @@ void ProcessDeviceCommandQueue() {
         PULL(D3DTRANSFORMSTATETYPE, State);
         D3DMATRIX* pMatrix = nullptr;
         PULL_DATA(sizeof(D3DMATRIX), pMatrix);
+        checkRedundantState(rpcHeader, State, 0, [&] {
+          D3DMATRIX held;
+          return SUCCEEDED(pD3DDevice->GetTransform(State, &held)) && memcmp(&held, pMatrix, sizeof(held)) == 0;
+        });
         const auto hresult = pD3DDevice->SetTransform(State, pMatrix);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1203,6 +1271,10 @@ void ProcessDeviceCommandQueue() {
       {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL_OBJ(D3DVIEWPORT9, pViewport);
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          D3DVIEWPORT9 held;
+          return SUCCEEDED(pD3DDevice->GetViewport(&held)) && memcmp(&held, pViewport, sizeof(held)) == 0;
+        });
         const auto hresult = pD3DDevice->SetViewport(pViewport);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1215,6 +1287,10 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         D3DMATERIAL9* pMaterial = nullptr;
         PULL_DATA(sizeof(D3DMATERIAL9), pMaterial);
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          D3DMATERIAL9 held;
+          return SUCCEEDED(pD3DDevice->GetMaterial(&held)) && memcmp(&held, pMaterial, sizeof(held)) == 0;
+        });
         const auto hresult = pD3DDevice->SetMaterial(IN pMaterial);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1265,6 +1341,10 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL(D3DRENDERSTATETYPE, State);
         PULL_D(Value);
+        checkRedundantState(rpcHeader, State, 0, [&] {
+          DWORD held = 0;
+          return SUCCEEDED(pD3DDevice->GetRenderState(State, &held)) && held == Value;
+        });
         const auto hresult = pD3DDevice->SetRenderState(IN State, IN Value);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1323,6 +1403,10 @@ void ProcessDeviceCommandQueue() {
           pTexture = (IDirect3DBaseTexture9*) gpD3DResources[pHandle];
           assert(pTexture != nullptr);
         }
+        checkRedundantState(rpcHeader, Stage, 0, [&] {
+          IDirect3DBaseTexture9* held = nullptr;
+          return SUCCEEDED(pD3DDevice->GetTexture(Stage, &held)) && isHeldObject(held, pTexture);
+        });
         const auto hresult = pD3DDevice->SetTexture(IN Stage, IN pTexture);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1336,6 +1420,10 @@ void ProcessDeviceCommandQueue() {
         PULL_D(Stage);
         PULL(D3DTEXTURESTAGESTATETYPE, Type);
         PULL_D(Value);
+        checkRedundantState(rpcHeader, Stage, Type, [&] {
+          DWORD held = 0;
+          return SUCCEEDED(pD3DDevice->GetTextureStageState(Stage, Type, &held)) && held == Value;
+        });
         const auto hresult = pD3DDevice->SetTextureStageState(IN Stage, IN Type, IN Value);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1349,6 +1437,10 @@ void ProcessDeviceCommandQueue() {
         PULL_D(Sampler);
         PULL(D3DSAMPLERSTATETYPE, Type);
         PULL_D(Value);
+        checkRedundantState(rpcHeader, Sampler, Type, [&] {
+          DWORD held = 0;
+          return SUCCEEDED(pD3DDevice->GetSamplerState(Sampler, Type, &held)) && held == Value;
+        });
         const auto hresult = pD3DDevice->SetSamplerState(IN Sampler, IN Type, IN Value);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1368,6 +1460,10 @@ void ProcessDeviceCommandQueue() {
       {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL_OBJ(RECT, pRect);
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          RECT held;
+          return SUCCEEDED(pD3DDevice->GetScissorRect(&held)) && memcmp(&held, pRect, sizeof(held)) == 0;
+        });
         const auto hresult = pD3DDevice->SetScissorRect(pRect);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1500,6 +1596,10 @@ void ProcessDeviceCommandQueue() {
         if (pHandle != NULL) {
           pVertexDecl = (IDirect3DVertexDeclaration9*) gpD3DVertexDeclarations[pHandle];
         }
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          IDirect3DVertexDeclaration9* held = nullptr;
+          return SUCCEEDED(pD3DDevice->GetVertexDeclaration(&held)) && isHeldObject(held, pVertexDecl);
+        });
         const auto hresult = pD3DDevice->SetVertexDeclaration(IN pVertexDecl);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1511,6 +1611,10 @@ void ProcessDeviceCommandQueue() {
       {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL_D(FVF);
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          DWORD held = 0;
+          return SUCCEEDED(pD3DDevice->GetFVF(&held)) && held == FVF;
+        });
         const auto hresult = pD3DDevice->SetFVF(IN FVF);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1542,6 +1646,10 @@ void ProcessDeviceCommandQueue() {
         if (pHandle != NULL) {
           pShader = gpD3DVertexShaders[pHandle];
         }
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          IDirect3DVertexShader9* held = nullptr;
+          return SUCCEEDED(pD3DDevice->GetVertexShader(&held)) && isHeldObject(held, pShader);
+        });
         const auto hresult = pD3DDevice->SetVertexShader(IN pShader);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1556,6 +1664,12 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Count);
         float* pConstantData = nullptr;
         PULL_DATA(Count * sizeof(float) * 4, pConstantData);
+        checkRedundantState(rpcHeader, StartRegister, Count, [&] {
+          // Registers past the device's limit are left as copied, so they compare equal.
+          std::vector<float> held(pConstantData, pConstantData + Count * 4);
+          return SUCCEEDED(pD3DDevice->GetVertexShaderConstantF(StartRegister, held.data(), Count)) &&
+                 memcmp(held.data(), pConstantData, held.size() * sizeof(float)) == 0;
+        });
         const auto hresult = pD3DDevice->SetVertexShaderConstantF(IN StartRegister, IN pConstantData, IN Count);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1570,6 +1684,11 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Count);
         int* pConstantData = nullptr;
         PULL_DATA(Count * sizeof(int) * 4, pConstantData);
+        checkRedundantState(rpcHeader, StartRegister, Count, [&] {
+          std::vector<int> held(pConstantData, pConstantData + Count * 4);
+          return SUCCEEDED(pD3DDevice->GetVertexShaderConstantI(StartRegister, held.data(), Count)) &&
+                 memcmp(held.data(), pConstantData, held.size() * sizeof(int)) == 0;
+        });
         const auto hresult = pD3DDevice->SetVertexShaderConstantI(IN StartRegister, IN pConstantData, IN Count);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1584,6 +1703,11 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Count);
         BOOL* pConstantData = nullptr;
         PULL_DATA(Count * sizeof(BOOL), pConstantData);
+        checkRedundantState(rpcHeader, StartRegister, Count, [&] {
+          std::vector<BOOL> held(pConstantData, pConstantData + Count);
+          return SUCCEEDED(pD3DDevice->GetVertexShaderConstantB(StartRegister, held.data(), Count)) &&
+                 memcmp(held.data(), pConstantData, held.size() * sizeof(BOOL)) == 0;
+        });
         const auto hresult = pD3DDevice->SetVertexShaderConstantB(IN StartRegister, IN pConstantData, IN Count);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1602,6 +1726,17 @@ void ProcessDeviceCommandQueue() {
         if (pHandle != NULL) {
           pStreamData = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
         }
+        checkRedundantState(rpcHeader, StreamNumber, 0, [&] {
+          IDirect3DVertexBuffer9* held = nullptr;
+          UINT heldOffset = 0;
+          UINT heldStride = 0;
+          if (FAILED(pD3DDevice->GetStreamSource(StreamNumber, &held, &heldOffset, &heldStride))) {
+            return false;
+          }
+          // A stream without a buffer has no meaningful offset and stride.
+          return isHeldObject(held, pStreamData) &&
+                 (pStreamData == nullptr || (heldOffset == OffsetInBytes && heldStride == Stride));
+        });
         const auto hresult = pD3DDevice->SetStreamSource(IN StreamNumber, IN pStreamData, IN OffsetInBytes, IN Stride);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1614,6 +1749,10 @@ void ProcessDeviceCommandQueue() {
         GET_RES(pD3DDevice, gpD3DDevices);
         PULL_U(StreamNumber);
         PULL_U(Divider);
+        checkRedundantState(rpcHeader, StreamNumber, 0, [&] {
+          UINT held = 0;
+          return SUCCEEDED(pD3DDevice->GetStreamSourceFreq(StreamNumber, &held)) && held == Divider;
+        });
         const auto hresult = pD3DDevice->SetStreamSourceFreq(StreamNumber, Divider);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1629,6 +1768,10 @@ void ProcessDeviceCommandQueue() {
         if (pHandle != NULL) {
           pIndexData = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
         }
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          IDirect3DIndexBuffer9* held = nullptr;
+          return SUCCEEDED(pD3DDevice->GetIndices(&held)) && isHeldObject(held, pIndexData);
+        });
         const auto hresult = pD3DDevice->SetIndices(IN pIndexData);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1660,6 +1803,10 @@ void ProcessDeviceCommandQueue() {
         if (pHandle != NULL) {
           pShader = gpD3DPixelShaders[pHandle];
         }
+        checkRedundantState(rpcHeader, 0, 0, [&] {
+          IDirect3DPixelShader9* held = nullptr;
+          return SUCCEEDED(pD3DDevice->GetPixelShader(&held)) && isHeldObject(held, pShader);
+        });
         const auto hresult = pD3DDevice->SetPixelShader(IN pShader);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1674,6 +1821,11 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Count);
         float* pConstantData = nullptr;
         PULL_DATA(Count * sizeof(float) * 4, pConstantData);
+        checkRedundantState(rpcHeader, StartRegister, Count, [&] {
+          std::vector<float> held(pConstantData, pConstantData + Count * 4);
+          return SUCCEEDED(pD3DDevice->GetPixelShaderConstantF(StartRegister, held.data(), Count)) &&
+                 memcmp(held.data(), pConstantData, held.size() * sizeof(float)) == 0;
+        });
         const auto hresult = pD3DDevice->SetPixelShaderConstantF(IN StartRegister, IN pConstantData, IN Count);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1688,6 +1840,11 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Count);
         int* pConstantData = nullptr;
         PULL_DATA(Count * sizeof(int) * 4, pConstantData);
+        checkRedundantState(rpcHeader, StartRegister, Count, [&] {
+          std::vector<int> held(pConstantData, pConstantData + Count * 4);
+          return SUCCEEDED(pD3DDevice->GetPixelShaderConstantI(StartRegister, held.data(), Count)) &&
+                 memcmp(held.data(), pConstantData, held.size() * sizeof(int)) == 0;
+        });
         const auto hresult = pD3DDevice->SetPixelShaderConstantI(IN StartRegister, IN pConstantData, IN Count);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1702,6 +1859,11 @@ void ProcessDeviceCommandQueue() {
         PULL_U(Count);
         BOOL* pConstantData = nullptr;
         PULL_DATA(Count * sizeof(BOOL), pConstantData);
+        checkRedundantState(rpcHeader, StartRegister, Count, [&] {
+          std::vector<BOOL> held(pConstantData, pConstantData + Count);
+          return SUCCEEDED(pD3DDevice->GetPixelShaderConstantB(StartRegister, held.data(), Count)) &&
+                 memcmp(held.data(), pConstantData, held.size() * sizeof(BOOL)) == 0;
+        });
         const auto hresult = pD3DDevice->SetPixelShaderConstantB(IN StartRegister, IN pConstantData, IN Count);
         assert(SUCCEEDED(hresult));
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
@@ -1855,6 +2017,7 @@ void ProcessDeviceCommandQueue() {
           std::stringstream ss;
           ss << "Present() failed! Check all logs for reported errors.";
         }
+        reportRedundantStateChecks();
 
         // If we're syncing with the client on Present() then trigger the semaphore now
         if (GlobalOptions::getPresentSemaphoreEnabled()) {
@@ -2433,7 +2596,9 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
-        pVertexBuffer->AddRef();
+        if (pVertexBuffer != nullptr) {
+          pVertexBuffer->AddRef();
+        }
         break;
       }
       case IDirect3DVertexBuffer9_Destroy:
@@ -2476,12 +2641,7 @@ void ProcessDeviceCommandQueue() {
         PULL_D(Flags);
         const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
 
-        // Now lock the buffer so we can copy the data into it
-        void* pbData = nullptr;
-        auto hresult = pVertexBuffer->Lock(IN OffsetToLock, IN SizeToLock, IN & pbData, IN Flags);
-        assert(S_OK == hresult);
-
-        // Copy the data over
+        // The data is consumed even when the upload is skipped, so later commands read from the right position.
         void* data = nullptr;
         if (Commands::IsDataReserved(rpcHeader.flags)) {
           PULL_D(DataOffset);
@@ -2493,10 +2653,20 @@ void ProcessDeviceCommandQueue() {
           const auto size = DeviceBridge::get_data(&data);
           assert(SizeToLock == size);
         }
-        memcpy(pbData, data, SizeToLock);
-        hresult = pVertexBuffer->Unlock();
-        assert(SUCCEEDED(hresult));
 
+        // A buffer whose create failed has no server object (see logBufferCreateFailure).
+        if (pVertexBuffer == nullptr) {
+          break;
+        }
+
+        void* pbData = nullptr;
+        auto hresult = pVertexBuffer->Lock(IN OffsetToLock, IN SizeToLock, IN & pbData, IN Flags);
+        assert(S_OK == hresult);
+        if (SUCCEEDED(hresult) && pbData != nullptr) {
+          memcpy(pbData, data, SizeToLock);
+          hresult = pVertexBuffer->Unlock();
+          assert(SUCCEEDED(hresult));
+        }
         break;
       }
       case IDirect3DVertexBuffer9_GetDesc:
@@ -2504,9 +2674,11 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_OBJ(D3DVERTEXBUFFER_DESC, orig_desc);
         const auto& pVertexBuffer = (IDirect3DVertexBuffer9*) gpD3DResources[pHandle];
-        D3DVERTEXBUFFER_DESC pDesc;
-        const auto hresult = pVertexBuffer->GetDesc(OUT & pDesc);
-        assert(SUCCEEDED(hresult));
+        if (pVertexBuffer != nullptr) {
+          D3DVERTEXBUFFER_DESC pDesc;
+          const auto hresult = pVertexBuffer->GetDesc(OUT & pDesc);
+          assert(SUCCEEDED(hresult));
+        }
         break;
       }
 
@@ -2519,7 +2691,9 @@ void ProcessDeviceCommandQueue() {
       {
         GET_HND(pHandle);
         const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
-        pIndexBuffer->AddRef();
+        if (pIndexBuffer != nullptr) {
+          pIndexBuffer->AddRef();
+        }
         break;
       }
       case IDirect3DIndexBuffer9_Destroy:
@@ -2562,12 +2736,7 @@ void ProcessDeviceCommandQueue() {
         PULL_D(Flags);
         const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
 
-        // Now lock the buffer so we can copy the data into it
-        void* pbData = nullptr;
-        auto hresult = pIndexBuffer->Lock(IN OffsetToLock, IN SizeToLock, IN & pbData, IN Flags);
-        assert(S_OK == hresult);
-
-        // Copy the data over
+        // The data is consumed even when the upload is skipped, so later commands read from the right position.
         void* data = nullptr;
         if (Commands::IsDataReserved(rpcHeader.flags)) {
           PULL_D(DataOffset);
@@ -2579,9 +2748,20 @@ void ProcessDeviceCommandQueue() {
           const auto size = DeviceBridge::get_data(&data);
           assert(SizeToLock == size);
         }
-        memcpy(pbData, data, SizeToLock);
-        hresult = pIndexBuffer->Unlock();
-        assert(SUCCEEDED(hresult));
+
+        // A buffer whose create failed has no server object (see logBufferCreateFailure).
+        if (pIndexBuffer == nullptr) {
+          break;
+        }
+
+        void* pbData = nullptr;
+        auto hresult = pIndexBuffer->Lock(IN OffsetToLock, IN SizeToLock, IN & pbData, IN Flags);
+        assert(S_OK == hresult);
+        if (SUCCEEDED(hresult) && pbData != nullptr) {
+          memcpy(pbData, data, SizeToLock);
+          hresult = pIndexBuffer->Unlock();
+          assert(SUCCEEDED(hresult));
+        }
         break;
       }
       case IDirect3DIndexBuffer9_GetDesc:
@@ -2589,9 +2769,11 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL_OBJ(D3DINDEXBUFFER_DESC, orig_desc);
         const auto& pIndexBuffer = (IDirect3DIndexBuffer9*) gpD3DResources[pHandle];
-        D3DINDEXBUFFER_DESC pDesc;
-        const auto hresult = pIndexBuffer->GetDesc(OUT & pDesc);
-        assert(SUCCEEDED(hresult));
+        if (pIndexBuffer != nullptr) {
+          D3DINDEXBUFFER_DESC pDesc;
+          const auto hresult = pIndexBuffer->GetDesc(OUT & pDesc);
+          assert(SUCCEEDED(hresult));
+        }
         break;
       }
 
@@ -2810,7 +2992,8 @@ void ProcessDeviceCommandQueue() {
         GET_HND(pHandle);
         PULL(DWORD, dwIssueFlags);
         const auto &pQuery = gpD3DQuery[pHandle];
-        const auto hresult = pQuery->Issue(dwIssueFlags);
+        // CreateQuery is not answered, so a query whose create failed reaches here without a server object.
+        const HRESULT hresult = pQuery != nullptr ? pQuery->Issue(dwIssueFlags) : D3DERR_INVALIDCALL;
         SEND_OPTIONAL_SERVER_RESPONSE(hresult, currentUID);
         break;
       }
@@ -2824,7 +3007,7 @@ void ProcessDeviceCommandQueue() {
         if (dwSize > 0) {
           pData = new char[dwSize];
         }
-        const auto hresult = pQuery->GetData(pData, dwSize, dwGetDataFlags);
+        const HRESULT hresult = pQuery != nullptr ? pQuery->GetData(pData, dwSize, dwGetDataFlags) : D3DERR_INVALIDCALL;
 
         ServerMessage c(Commands::Bridge_Response, currentUID);
         c.send_data(hresult);
@@ -3273,11 +3456,17 @@ void ProcessDeviceCommandQueue() {
       }
     }
 
-    // Ensure the data position between client and server is in sync after processing the command
-    if (!CHECK_DATA_OFFSET)       {
-      Logger::warn("Data not in sync");
+    // A command that read more or fewer data words than the client wrote leaves every later read out of step,
+    // so the bridge stops here and names the command.
+    if (!CHECK_DATA_OFFSET) {
+      Logger::err(format_string("Data out of step after %s: the server read up to word %u, the client wrote up to word %u. "
+                                "Client and server disagree on this command's arguments, stopping the bridge.",
+                                Commands::toString(rpcHeader.command).c_str(), (unsigned) DeviceBridge::get_data_pos(),
+                                (unsigned) rpcHeader.dataOffset));
+      gbBridgeRunning = false;
+      done = true;
+      break;
     }
-    assert(CHECK_DATA_OFFSET);
     *DeviceBridge::getReaderChannel().serverDataPos = DeviceBridge::get_data_pos();
     DeviceBridge::getReaderChannel().serverProcessedUid->store(processedUid, std::memory_order_release);
     // Check if overwrite condition was met

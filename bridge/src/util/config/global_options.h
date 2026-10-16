@@ -249,10 +249,6 @@ public:
     return get().exposeRemixApi;
   }
 
-  static bool getEliminateRedundantSetterCalls() {
-    return get().eliminateRedundantSetterCalls;
-  }
-
   static bool getEventQueryServerCompletion() {
     return get().eventQueryServerCompletion;
   }
@@ -436,10 +432,6 @@ private:
   
     exposeRemixApi = bridge_util::Config::getOption<bool>("exposeRemixApi", false);
 
-    // If set, the bridge client will not send certain setter calls to the bridge server if the client knows the setter is writing
-    // the the same value that is currently stored.
-    eliminateRedundantSetterCalls = bridge_util::Config::getOption<bool>("eliminateRedundantSetterCalls", false);
-
     // If set, an event query (D3DQUERYTYPE_EVENT) completes once the server has processed its Issue, and the client
     // answers GetData without the round trip, which waits for the server to work through every command queued before
     // it (UE3 polls its FrameSyncEvent every frame). Only for games that do not rely on events for other
@@ -496,6 +488,5 @@ private:
   uint32_t threadSafetyPolicy;
   bool alwaysCopyEntireStaticBuffer;
   bool exposeRemixApi;
-  bool eliminateRedundantSetterCalls;
   bool eventQueryServerCompletion;
 };

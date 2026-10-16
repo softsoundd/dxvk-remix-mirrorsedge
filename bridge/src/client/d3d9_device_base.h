@@ -22,13 +22,16 @@
 #pragma once
 
 #include "util_common.h"
+#include "util_commands.h"
 #include "util_scopedlock.h"
 
 #include "d3d9.h"
 #include "base.h"
+#include "d3d9_sent_state.h"
 #include "shadow_map.h"
 
 #include <array>
+#include <optional>
 
 class Direct3D9Ex_LSS;
 class Direct3DSwapChain9_LSS;
@@ -292,4 +295,47 @@ protected:
 
   State m_state;
   Direct3DStateBlock9_LSS* m_stateRecording = nullptr;
+
+  // These record what the server's device holds (d3d9_sent_state.h), and the options read at device creation.
+  SentState m_sentState;
+  bool m_dropRedundantState = false;
+  bool m_validateDroppedState = false;
+  uint32_t m_stateStatsInterval = 0;
+
+  // These count the setters sent and dropped per command, the commands and the frames since the last stats report.
+  static constexpr size_t kNumCommands = size_t(Commands::IDirect3DQuery9_GetData) + 1;
+  std::array<uint32_t, kNumCommands> m_settersSent = {};
+  std::array<uint32_t, kNumCommands> m_settersDropped = {};
+  uint64_t m_statsCommands = 0;
+  uint32_t m_statsFrames = 0;
+
+  // Returns the header flags to send a setter with.
+  // Returns nothing when the server's device already holds the value.
+  // Setters recorded into a state block are always sent, because recording leaves the server's device state alone.
+  // Call under the device lock, and keep it until the setter is sent.
+  template<typename Check>
+  std::optional<Commands::Flags> filterRedundantState(const Commands::D3D9Command command, Check&& check) {
+    if (m_stateRecording != nullptr || !m_dropRedundantState || check(m_sentState)) {
+      if (m_stateStatsInterval != 0) {
+        ++m_settersSent[command];
+      }
+      return Commands::Flags(0);
+    }
+    if (m_stateStatsInterval != 0) {
+      ++m_settersDropped[command];
+    }
+    if (m_validateDroppedState) {
+      return Commands::Flags(Commands::FlagBits::RedundantStateCheck);
+    }
+    return std::nullopt;
+  }
+
+public:
+  // Call when the server's device state changes without a setter from here, as on a state block Apply or a reset.
+  void invalidateSentState() {
+    m_sentState.invalidateAll();
+  }
+
+  // Called at every Present with the frame's command count. Logs averages every client.stateStatsIntervalFrames frames.
+  void reportStateStats(const uint32_t commandsThisFrame);
 };

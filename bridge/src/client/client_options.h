@@ -82,4 +82,20 @@ namespace ClientOptions {
   inline bool getOptimizedDynamicLock() {
     return bridge_util::Config::getOption<bool>("client.optimizedDynamicLock", false);
   }
+
+  // If set, state setters writing a value the server's device already holds are not sent (d3d9_sent_state.h).
+  inline bool getDropRedundantState() {
+    return bridge_util::Config::getOption<bool>("client.dropRedundantState", true);
+  }
+
+  // If set, the setters client.dropRedundantState would drop are sent anyway, flagged for the server to check that
+  // its device already holds their values.
+  inline bool getValidateDroppedState() {
+    return bridge_util::Config::getOption<bool>("client.validateDroppedState", false);
+  }
+
+  // Every this many frames, the client logs the setters sent and dropped per frame. 0 turns the report off.
+  inline uint32_t getStateStatsIntervalFrames() {
+    return bridge_util::Config::getOption<uint32_t>("client.stateStatsIntervalFrames", 0);
+  }
 }

@@ -134,7 +134,7 @@ namespace bridge_util {
 
   std::vector<Config::AppDefaultConfig> Config::appDefaultConfigs = {
     { "Source Engine", R"(\\hl2\.exe$)", {
-      { "presentSemaphoreMaxFrames ", "1" }
+      { "presentSemaphoreMaxFrames", "1" }
     }},
     // Polls UE3's FrameSyncEvent every frame and never locks with D3DLOCK_NOOVERWRITE; matches the
     // runtime's rtx.d3d9.eventQueryCsCompletion in its MirrorsEdge.exe profile.
