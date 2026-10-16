@@ -340,7 +340,7 @@ namespace dxvk
 
     static void showImguiSettings();
 
-    const RtCameraSetting& getSetting();
+    const RtCameraSetting& getSetting() const;
 
   private:
     Matrix4d getShakenViewToWorldMatrix(Matrix4d& viewToWorld, uint32_t flags);

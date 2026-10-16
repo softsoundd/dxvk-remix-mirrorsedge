@@ -59,7 +59,6 @@
 #include <rtx_shaders/bloom_kernel_reduce_total.h>
 #include <rtx_shaders/bloom_kernel_combine.h>
 #include <rtx_shaders/bloom_sun_psf_filter.h>
-#include <rtx_shaders/bloom_sun_glare.h>
 
 namespace dxvk {
 
@@ -121,6 +120,10 @@ namespace dxvk {
         SAMPLER2D(BLOOM_FFT_COMPOSITE_BLOOM_INPUT)
         TEXTURE2D(BLOOM_FFT_COMPOSITE_CENTER_TAP_INPUT)
         SAMPLER2D(BLOOM_FFT_COMPOSITE_COARSE_BLOOM_INPUT)
+        CONSTANT_BUFFER(BLOOM_FFT_COMPOSITE_KERNEL_CONSTANTS_INPUT)
+        CONSTANT_BUFFER(BLOOM_FFT_COMPOSITE_SUN_GLARE_CONSTANTS_INPUT)
+        SAMPLER2D(BLOOM_FFT_COMPOSITE_SUN_PSF_INPUT)
+        TEXTURE2D(BLOOM_FFT_COMPOSITE_SUN_VISIBILITY_INPUT)
         RW_TEXTURE2D(BLOOM_FFT_COMPOSITE_COLOR_INPUT_OUTPUT)
       END_PARAMETER()
     };
@@ -240,21 +243,6 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(BloomSunPsfFilterShader);
 
-    class BloomSunGlareShader : public ManagedShader {
-      SHADER_SOURCE(BloomSunGlareShader, VK_SHADER_STAGE_COMPUTE_BIT, bloom_sun_glare)
-
-      PUSH_CONSTANTS(BloomSunGlareArgs)
-
-      BEGIN_PARAMETER()
-        CONSTANT_BUFFER(BLOOM_SUN_GLARE_CONSTANTS_INPUT)
-        SAMPLER2D(BLOOM_SUN_GLARE_PSF_INPUT)
-        TEXTURE2D(BLOOM_SUN_GLARE_SUN_VISIBILITY_INPUT)
-        RW_TEXTURE2D(BLOOM_SUN_GLARE_COLOR_INPUT_OUTPUT)
-      END_PARAMETER()
-    };
-
-    PREWARM_SHADER_PIPELINE(BloomSunGlareShader);
-
     constexpr double kPiDouble = 3.14159265358979323846;
 
     // The camera's iris spans half of its spectrum's width, its corners kCameraApertureSize / 4 texels out. The eye's
@@ -352,9 +340,17 @@ namespace dxvk {
       return float(sum);
     }
 
-    // The field of view as the kernel follows it, rounded so that the game's zooms do not rebuild it every frame.
-    float roundTanHalfFovY(float tanHalfFovY) {
-      return std::round(tanHalfFovY * 200.0f) / 200.0f;
+    // The field of view as the kernel follows it, on a grid of 1/200 in its tangent, so that the game's zooms do not
+    // rebuild it every frame. It keeps the previous step until the tangent is most of a step away from it, as a tangent
+    // halfway between two steps, such as a 90 degree view's at 16:9, would round to either in alternate frames.
+    float snapTanHalfFovY(float tanHalfFovY, float previous) {
+      constexpr float kStepsPerUnit = 200.0f;
+
+      if (previous > 0.0f && std::abs(tanHalfFovY - previous) * kStepsPerUnit <= 0.75f) {
+        return previous;
+      }
+
+      return std::round(tanHalfFovY * kStepsPerUnit) / kStepsPerUnit;
     }
 
     // How far from its source the far field takes over for the reddest wavelength, in output pixels.
@@ -490,7 +486,7 @@ namespace dxvk {
     columnCount = uint32_t(std::clamp(right, float(firstColumn), float(fit.width))) - firstColumn;
   }
 
-  BloomConvolution::KernelKey BloomConvolution::makeKernelKey(const BufferFit& fit, const BufferFit& coarseFit, float tanHalfFovY, bool identity) const {
+  BloomConvolution::KernelKey BloomConvolution::makeKernelKey(const BufferFit& fit, const BufferFit& coarseFit, bool identity) const {
     const bool eye = LensAperture::isEye();
 
     KernelKey key;
@@ -516,7 +512,7 @@ namespace dxvk {
       scatterScale(),
       // The eye's kernel is angular, so it follows the field of view. The camera's follows only the image's extent on the
       // sensor, which the lens version carries and which stops changing once the view is wider than the lens covers.
-      eye ? roundTanHalfFovY(tanHalfFovY) : 0.0f,
+      eye ? m_kernelTanHalfFovY : 0.0f,
       eye ? 0.0f : LensAperture::fNumber(),
       eye ? 0.0f : LensAperture::apertureCircularFNumber(),
       eye ? 0.0f : LensAperture::apertureRotation(),
@@ -559,6 +555,8 @@ namespace dxvk {
     info.access = VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     info.size = sizeof(BloomKernelArgs);
     m_kernelConstants = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Convolution bloom kernel constants");
+    info.size = sizeof(BloomSunGlareArgs);
+    m_sunGlareConstants = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Convolution bloom sun glare constants");
 
     m_bufferExtent = bufferExtent;
     m_coarseExtent = coarseExtent;
@@ -604,6 +602,7 @@ namespace dxvk {
     m_sunPsfFiltered.reset();
     m_fieldLuminance.reset();
     m_kernelConstants = nullptr;
+    m_sunGlareConstants = nullptr;
     m_particleBuffer = nullptr;
     m_cellBuffer = nullptr;
     m_cellParticleBuffer = nullptr;
@@ -622,7 +621,7 @@ namespace dxvk {
     pupilRadius = std::min(stopRadius / m_lensSystem.getStopFromPupil(), m_lensSystem.getFrontRadius());
   }
 
-  bool BloomConvolution::updateLens(float tanHalfFovY, float aspectRatio) {
+  bool BloomConvolution::updateLens(float aspectRatio) {
     bool changed = LensAperture::updateLensSystem(m_lensSystem);
 
     if (changed) {
@@ -636,7 +635,7 @@ namespace dxvk {
 
     // The veil averages its sources over the image's extent on the sensor.
     const float imageHalfHeightMm =
-      LensAperture::getImageHalfHeightMm(aspectRatio, float(m_lensSystem.getFocalLength()), roundTanHalfFovY(tanHalfFovY));
+      LensAperture::getImageHalfHeightMm(aspectRatio, float(m_lensSystem.getFocalLength()), m_kernelTanHalfFovY);
 
     if (changed || m_veilStopRadius != float(stopRadius) || m_veilImageHalfHeightMm != imageHalfHeightMm || m_veilAspectRatio != aspectRatio) {
       m_veil = m_lensSystem.computeVeil(m_ghosts, stopRadius, imageHalfHeightMm, aspectRatio);
@@ -1150,7 +1149,10 @@ namespace dxvk {
 
   void BloomConvolution::dispatchComposite(Rc<RtxContext>& ctx, const Resources::Resource& color, const BufferFit& fit,
                                            const BufferFit& coarseFit, bool coarse, const Resources::Resource& bloom,
-                                           uint32_t debugView, float intensity, bool subtractCenter) {
+                                           uint32_t debugView, float intensity, bool subtractCenter,
+                                           const RtxSunProbe* pSunGlareProbe) {
+    ScopedGpuProfileZone(ctx, "Convolution Bloom Composite");
+
     const VkExtent3D imageExtent = color.image->info().extent;
 
     BloomFftCompositeArgs args = {};
@@ -1165,7 +1167,15 @@ namespace dxvk {
     args.coarseEnabled = coarse ? 1u : 0u;
     args.debugView = debugView;
     args.subtractCenter = subtractCenter ? 1u : 0u;
+    args.sunGlareEnabled = pSunGlareProbe != nullptr ? 1u : 0u;
     ctx->pushConstants(0, sizeof(args), &args);
+
+    const Rc<DxvkImageView> sunPsf = pSunGlareProbe != nullptr && m_sunPsfValid
+      ? m_sunPsfFiltered.view
+      : m_dummy.view;
+    const Rc<DxvkImageView> sunVisibility = pSunGlareProbe != nullptr
+      ? pSunGlareProbe->getVisibilityView()
+      : m_dummy.view;
 
     const Rc<DxvkSampler> linearSampler = ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     ctx->bindResourceView(BLOOM_FFT_COMPOSITE_BLOOM_INPUT, bloom.view, nullptr);
@@ -1173,6 +1183,11 @@ namespace dxvk {
     ctx->bindResourceView(BLOOM_FFT_COMPOSITE_CENTER_TAP_INPUT, m_centerTap.view, nullptr);
     ctx->bindResourceView(BLOOM_FFT_COMPOSITE_COARSE_BLOOM_INPUT, m_coarseBloom.view, nullptr);
     ctx->bindResourceSampler(BLOOM_FFT_COMPOSITE_COARSE_BLOOM_INPUT, linearSampler);
+    ctx->bindResourceBuffer(BLOOM_FFT_COMPOSITE_KERNEL_CONSTANTS_INPUT, DxvkBufferSlice(m_kernelConstants, 0, m_kernelConstants->info().size));
+    ctx->bindResourceBuffer(BLOOM_FFT_COMPOSITE_SUN_GLARE_CONSTANTS_INPUT, DxvkBufferSlice(m_sunGlareConstants, 0, m_sunGlareConstants->info().size));
+    ctx->bindResourceView(BLOOM_FFT_COMPOSITE_SUN_PSF_INPUT, sunPsf, nullptr);
+    ctx->bindResourceSampler(BLOOM_FFT_COMPOSITE_SUN_PSF_INPUT, linearSampler);
+    ctx->bindResourceView(BLOOM_FFT_COMPOSITE_SUN_VISIBILITY_INPUT, sunVisibility, nullptr);
     ctx->bindResourceView(BLOOM_FFT_COMPOSITE_COLOR_INPUT_OUTPUT, color.view, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BloomFftCompositeShader::getShader());
 
@@ -1205,16 +1220,13 @@ namespace dxvk {
     m_eye->readBackFieldLuminance(ctx.ptr(), m_fieldLuminance.image);
   }
 
-  void BloomConvolution::dispatchSunGlare(Rc<RtxContext>& ctx, const Resources::Resource& color, const BufferFit& fit,
-                                          const RtxSunProbe& sunProbe) {
-    ScopedGpuProfileZone(ctx, "Sun Glare");
-
+  bool BloomConvolution::computeSunGlareArgs(Rc<RtxContext>& ctx, const VkExtent3D& imageExtent, const BufferFit& fit,
+                                             const RtxSunProbe& sunProbe, BloomSunGlareArgs& args) {
     const RtxSunProbe::State& sun = sunProbe.getState();
-    const VkExtent3D imageExtent = color.image->info().extent;
     const Vector3 restored = sunProbe.getRestoredIlluminance();
 
     if (sRGBLuminance(restored) <= 0.0f) {
-      return;
+      return false;
     }
 
     const bool eye = LensAperture::isEye();
@@ -1242,7 +1254,7 @@ namespace dxvk {
     }
 
     if (acceptance <= 0.0f) {
-      return;
+      return false;
     }
 
     // The flare draws its brightest ghosts itself, so the sun's veil leaves their light out.
@@ -1268,7 +1280,7 @@ namespace dxvk {
     }
 
     // The game's tangents of the sun's direction are its aspect corrected NDC times the view's.
-    BloomSunGlareArgs args = {};
+    args = {};
     args.imageSize = { imageExtent.width, imageExtent.height };
     args.sunPixel = sun.pixel;
     args.sunTan = sun.ndcAspect * (tanHalfFovY * lensTanScale);
@@ -1285,18 +1297,7 @@ namespace dxvk {
     args.maxRadiance = kMaxSunGlareRadiance;
     args.veilScale = veilScale;
     args.psfEnabled = m_sunPsfValid ? 1u : 0u;
-    ctx->pushConstants(0, sizeof(args), &args);
-
-    ctx->bindResourceBuffer(BLOOM_SUN_GLARE_CONSTANTS_INPUT, DxvkBufferSlice(m_kernelConstants, 0, m_kernelConstants->info().size));
-    ctx->bindResourceView(BLOOM_SUN_GLARE_PSF_INPUT, m_sunPsfValid ? m_sunPsfFiltered.view : m_dummy.view, nullptr);
-    ctx->bindResourceSampler(BLOOM_SUN_GLARE_PSF_INPUT,
-      ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE));
-    ctx->bindResourceView(BLOOM_SUN_GLARE_SUN_VISIBILITY_INPUT, sunProbe.getVisibilityView(), nullptr);
-    ctx->bindResourceView(BLOOM_SUN_GLARE_COLOR_INPUT_OUTPUT, color.view, nullptr);
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, BloomSunGlareShader::getShader());
-
-    const VkExtent3D workgroups = util::computeBlockCount(imageExtent, VkExtent3D { 16, 16, 1 });
-    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    return true;
   }
 
   void BloomConvolution::dispatch(Rc<RtxContext> ctx, const Resources::Resource& inOutColorBuffer, const RtxSunProbe* pSunProbe) {
@@ -1316,6 +1317,7 @@ namespace dxvk {
     const RtCamera& camera = ctx->getSceneManager().getCamera();
     const float tanHalfFovY = std::tan(0.5f * camera.getFov());
     const float tanHalfFovX = tanHalfFovY * fit.aspectRatio;
+    m_kernelTanHalfFovY = snapTanHalfFovY(tanHalfFovY, m_kernelTanHalfFovY);
     const BloomConvolutionDebugView view = debugView();
     const bool identity = view == BloomConvolutionDebugView::IdentityKernel;
     const bool eye = LensAperture::isEye();
@@ -1335,7 +1337,7 @@ namespace dxvk {
       if (m_eye->update(deltaSeconds, fieldAreaDeg2)) {
         m_eyeVersion++;
       }
-    } else if (updateLens(tanHalfFovY, fit.aspectRatio)) {
+    } else if (updateLens(fit.aspectRatio)) {
       m_lensVersion++;
     }
 
@@ -1359,7 +1361,7 @@ namespace dxvk {
       return;
     }
 
-    const KernelKey key = makeKernelKey(fit, coarseFit, tanHalfFovY, identity);
+    const KernelKey key = makeKernelKey(fit, coarseFit, identity);
 
     if (!m_kernelValid || !(key == m_kernelKey)) {
       buildKernel(ctx, fit, coarseFit, tanHalfFovY, identity, coarse, m_kernel, m_coarseKernel, m_centerTap, true, sunGlareActive);
@@ -1372,12 +1374,15 @@ namespace dxvk {
     }
 
     // Fills the near buffer from the image, and the coarse one from the near buffer before its transform.
-    dispatchSetup(ctx, inOutColorBuffer, { imageExtent.width, imageExtent.height }, m_spectrum, fit, fit.texelsPerPixel, fit.bufferOffset);
+    {
+      ScopedGpuProfileZone(ctx, "Convolution Bloom Setup");
+      dispatchSetup(ctx, inOutColorBuffer, { imageExtent.width, imageExtent.height }, m_spectrum, fit, fit.texelsPerPixel, fit.bufferOffset);
 
-    if (coarse) {
-      const float coarseTexelsPerNearTexel = coarseFit.texelsPerPixel / fit.texelsPerPixel;
-      dispatchSetup(ctx, m_spectrum, m_bufferExtent, m_coarseSpectrum, coarseFit, coarseTexelsPerNearTexel,
-                    coarseFit.bufferOffset - fit.bufferOffset * coarseTexelsPerNearTexel);
+      if (coarse) {
+        const float coarseTexelsPerNearTexel = coarseFit.texelsPerPixel / fit.texelsPerPixel;
+        dispatchSetup(ctx, m_spectrum, m_bufferExtent, m_coarseSpectrum, coarseFit, coarseTexelsPerNearTexel,
+                      coarseFit.bufferOffset - fit.bufferOffset * coarseTexelsPerNearTexel);
+      }
     }
 
     if (eye && !identity) {
@@ -1414,10 +1419,14 @@ namespace dxvk {
 
     // The identity view shows the image's whole round trip through the buffer, so it keeps the centre tap in.
     const bool subtractCenter = !identity;
-    dispatchConvolve(ctx, m_spectrum, m_kernel, m_bloom, m_bufferExtent, subtractCenter);
 
-    if (coarse) {
-      dispatchConvolve(ctx, m_coarseSpectrum, m_coarseKernel, m_coarseBloom, m_coarseExtent, false);
+    {
+      ScopedGpuProfileZone(ctx, "Convolution Bloom Convolve");
+      dispatchConvolve(ctx, m_spectrum, m_kernel, m_bloom, m_bufferExtent, subtractCenter);
+
+      if (coarse) {
+        dispatchConvolve(ctx, m_coarseSpectrum, m_coarseKernel, m_coarseBloom, m_coarseExtent, false);
+      }
     }
 
     {
@@ -1431,14 +1440,17 @@ namespace dxvk {
       }
     }
 
+    BloomSunGlareArgs sunGlareArgs;
+    const bool sunGlare = sunGlareActive && computeSunGlareArgs(ctx, imageExtent, fit, *pSunProbe, sunGlareArgs);
+
+    if (sunGlare) {
+      ctx->updateBuffer(m_sunGlareConstants, 0, sizeof(sunGlareArgs), &sunGlareArgs);
+    }
+
     const bool bloomOnly = identity || view == BloomConvolutionDebugView::BloomOnly;
     dispatchComposite(ctx, inOutColorBuffer, fit, coarseFit, coarse && !identity, m_bloom,
                       bloomOnly ? BLOOM_FFT_DEBUG_VIEW_BLOOM_ONLY : BLOOM_FFT_DEBUG_VIEW_NONE,
-                      convolutionIntensity(), subtractCenter);
-
-    if (sunGlareActive) {
-      dispatchSunGlare(ctx, inOutColorBuffer, fit, *pSunProbe);
-    }
+                      convolutionIntensity(), subtractCenter, sunGlare ? pSunProbe : nullptr);
   }
 
   void BloomConvolution::showImguiSettings() {

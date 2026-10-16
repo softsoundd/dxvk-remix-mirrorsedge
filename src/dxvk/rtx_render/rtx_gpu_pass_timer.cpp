@@ -540,26 +540,40 @@ namespace dxvk {
       const std::string reason = str::format("sweep step ", m_sweep.stepIndex + 1, "/", m_sweep.steps.size(), ": ", step.label);
       logTimingsLocked(reason.c_str());
       m_sweep.tableLogged = true;
+    }
 
-      if (sweepScreenshots()) {
+    if (sweepScreenshots()) {
+      if (!m_sweep.screenshotRequested) {
+        const RtCamera& camera = m_device->getCommon()->getSceneManager().getCamera();
+
+        // With the camera animation on, the capture waits for a frame rendered at the animation's rest pose, which it
+        // passes at full speed, so that every step's image shows the same view in the same motion.
+        // The camera's update for this frame has already advanced the animation past the pose it rendered.
+        if (RtxOptions::shakeCamera() && camera.getSetting().cameraShakeFrameCount != 1) {
+          return;
+        }
+
         // This runs at the start of the frame's rendering injectFrame call, so the capture lands in this frame.
         RtxContext::triggerScreenshot();
+        m_sweep.screenshotRequested = true;
         m_sweep.screenshotFrameId = currentFrameId;
         // The camera, so a comparison of the steps' images can tell when the view itself moved.
-        const RtCamera& camera = m_device->getCommon()->getSceneManager().getCamera();
         const Vector3 position = camera.getPosition();
         const Vector3 direction = camera.getDirection();
         Logger::info(str::format("[GPU Pass Timings] Sweep step ", m_sweep.stepIndex + 1, "/", m_sweep.steps.size(), " screenshot: ", step.label,
                                  " (camera ", position.x, ",", position.y, ",", position.z, " facing ", direction.x, ",", direction.y, ",", direction.z, ")"));
         return;
       }
-    } else if (currentFrameId - m_sweep.screenshotFrameId < kSweepScreenshotFrames) {
-      return;
+
+      if (currentFrameId - m_sweep.screenshotFrameId < kSweepScreenshotFrames) {
+        return;
+      }
     }
 
     restoreSweepStep(step);
     m_sweep.stepApplied = false;
     m_sweep.tableLogged = false;
+    m_sweep.screenshotRequested = false;
     ++m_sweep.stepIndex;
 
     if (m_sweep.stepIndex >= m_sweep.steps.size()) {

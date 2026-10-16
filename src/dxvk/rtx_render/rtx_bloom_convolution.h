@@ -29,8 +29,9 @@
 #include "rtx_option.h"
 #include "rtx_lens_system.h"
 
-// The kernel's constants, shared with the shaders in rtx/pass/bloom/bloom.h.
+// The kernel's and the sun glare's constants, shared with the shaders in rtx/pass/bloom/bloom.h.
 struct BloomKernelArgs;
+struct BloomSunGlareArgs;
 
 namespace dxvk {
 
@@ -165,15 +166,15 @@ namespace dxvk {
     // The buffer's columns within reach of the image's resampling filters. The image's transform is zero in the others
     // going forward, and the composite reads none of them back.
     static void getImageColumns(const BufferFit& fit, uint32_t& firstColumn, uint32_t& columnCount);
-    KernelKey makeKernelKey(const BufferFit& fit, const BufferFit& coarseFit, float tanHalfFovY, bool identity) const;
+    KernelKey makeKernelKey(const BufferFit& fit, const BufferFit& coarseFit, bool identity) const;
 
     void createResources(Rc<DxvkContext> ctx, const VkExtent2D& bufferExtent);
     void ensureApertureResources(Rc<DxvkContext> ctx, uint32_t size);
     void ensureSunPsfResources(Rc<DxvkContext> ctx);
 
-    // The camera's lens system, its ghosts and their veil for the current settings and the image's extent. Returns
-    // whether they changed.
-    bool updateLens(float tanHalfFovY, float aspectRatio);
+    // The camera's lens system, its ghosts and their veil for the current settings and the image's extent at
+    // m_kernelTanHalfFovY. Returns whether they changed.
+    bool updateLens(float aspectRatio);
     // The stop's radius the f-number opens it to, up to its clear aperture, and the entrance pupil's, in mm.
     void getStop(double& stopRadius, double& pupilRadius) const;
     LensScatter computeLensScatter() const;
@@ -203,13 +204,15 @@ namespace dxvk {
                        const Vector2& offset);
     void dispatchConvolve(Rc<RtxContext>& ctx, const Resources::Resource& spectrum, const Resources::Resource& kernel,
                           const Resources::Resource& output, const VkExtent2D& extent, bool subtractCenter);
+    // Adds the sun's glare as well when pSunGlareProbe is set, from the arguments in m_sunGlareConstants.
     void dispatchComposite(Rc<RtxContext>& ctx, const Resources::Resource& color, const BufferFit& fit,
                            const BufferFit& coarseFit, bool coarse, const Resources::Resource& bloom, uint32_t debugView,
-                           float intensity, bool subtractCenter);
+                           float intensity, bool subtractCenter, const RtxSunProbe* pSunGlareProbe = nullptr);
     void dispatchFieldLuminance(Rc<RtxContext>& ctx, const BufferFit& coarseFit, const RtxSunProbe* pSunProbe,
                                 float sunLuminance);
-    void dispatchSunGlare(Rc<RtxContext>& ctx, const Resources::Resource& color, const BufferFit& fit,
-                          const RtxSunProbe& sunProbe);
+    // Fills args with the sun's glare over an image of imageExtent. Returns false when there is no glare to add.
+    bool computeSunGlareArgs(Rc<RtxContext>& ctx, const VkExtent3D& imageExtent, const BufferFit& fit,
+                             const RtxSunProbe& sunProbe, BloomSunGlareArgs& args);
 
     DxvkDevice* m_device;
 
@@ -236,12 +239,15 @@ namespace dxvk {
     Resources::Resource m_sunPsfFiltered;
     Resources::Resource m_fieldLuminance;
     Rc<DxvkBuffer> m_kernelConstants;
+    Rc<DxvkBuffer> m_sunGlareConstants;
     Rc<DxvkBuffer> m_particleBuffer;
     Rc<DxvkBuffer> m_cellBuffer;
     Rc<DxvkBuffer> m_cellParticleBuffer;
 
     KernelKey m_kernelKey;
     bool m_kernelValid = false;
+    // The tangent of half the vertical field of view that the kernel and the veil follow, snapped to a grid.
+    float m_kernelTanHalfFovY = 0.0f;
     bool m_sunPsfValid = false;
     // What the sun's filtered PSF texture was built for: the disc's radius on the axis and its limb darkening, and the
     // scale its diffraction was built at, 0 when stale.

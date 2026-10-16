@@ -46,10 +46,15 @@
 #define BLOOM_FFT_CONVOLVE_CENTER_TAP_INPUT 2
 #define BLOOM_FFT_CONVOLVE_OUTPUT           20
 
-#define BLOOM_FFT_COMPOSITE_BLOOM_INPUT        0
-#define BLOOM_FFT_COMPOSITE_CENTER_TAP_INPUT   1
-#define BLOOM_FFT_COMPOSITE_COARSE_BLOOM_INPUT 2
-#define BLOOM_FFT_COMPOSITE_COLOR_INPUT_OUTPUT 10
+// The composite adds the sun's glare from inputs 3 to 6 when sunGlareEnabled is set.
+#define BLOOM_FFT_COMPOSITE_BLOOM_INPUT               0
+#define BLOOM_FFT_COMPOSITE_CENTER_TAP_INPUT          1
+#define BLOOM_FFT_COMPOSITE_COARSE_BLOOM_INPUT        2
+#define BLOOM_FFT_COMPOSITE_KERNEL_CONSTANTS_INPUT    3
+#define BLOOM_FFT_COMPOSITE_SUN_GLARE_CONSTANTS_INPUT 4
+#define BLOOM_FFT_COMPOSITE_SUN_PSF_INPUT             5
+#define BLOOM_FFT_COMPOSITE_SUN_VISIBILITY_INPUT      6
+#define BLOOM_FFT_COMPOSITE_COLOR_INPUT_OUTPUT        10
 
 #define BLOOM_KERNEL_APERTURE_PARTICLES_INPUT      0
 #define BLOOM_KERNEL_APERTURE_CELLS_INPUT          1
@@ -79,11 +84,6 @@
 
 #define BLOOM_SUN_PSF_FILTER_INPUT  0
 #define BLOOM_SUN_PSF_FILTER_OUTPUT 20
-
-#define BLOOM_SUN_GLARE_CONSTANTS_INPUT      0
-#define BLOOM_SUN_GLARE_PSF_INPUT            1
-#define BLOOM_SUN_GLARE_SUN_VISIBILITY_INPUT 2
-#define BLOOM_SUN_GLARE_COLOR_INPUT_OUTPUT   10
 
 #define BLOOM_KERNEL_REDUCE_GROUP_SIZE 256
 
@@ -170,6 +170,11 @@ struct BloomFftCompositeArgs {
   uint coarseEnabled;
   uint debugView;
   uint subtractCenter;
+
+  uint sunGlareEnabled;
+  uint pad0;
+  uint pad1;
+  uint pad2;
 };
 
 // The aperture rasterised for its far field pattern, in units of its corner radius (the camera's iris) or its radius

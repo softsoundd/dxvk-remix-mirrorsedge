@@ -393,7 +393,7 @@ namespace dxvk
     return customTransform;
   }
 
-  const RtCamera::RtCameraSetting& RtCamera::getSetting() {
+  const RtCamera::RtCameraSetting& RtCamera::getSetting() const {
     return m_context;
   }
 
