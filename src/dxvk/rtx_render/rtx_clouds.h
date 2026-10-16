@@ -255,7 +255,7 @@ public:
                   "Angle in degrees within which a near-mirror's reflection takes the clouds the first reflection of its 2x2 block of pixels\n"
                   "marched, instead of marching its own. 0 marches every reflection.",
                   args.minValue = 0.0f, args.maxValue = 180.0f);
-  RTX_OPTION("rtx.clouds", CloudMarchRate, marchRate, CloudMarchRate::Quarter,
+  RTX_OPTION("rtx.clouds", CloudMarchRate, marchRate, CloudMarchRate::Half,
              "Share of the view's rays into the layer that march each frame: 0: Full, 1: Half (alternating in a checkerboard), 2: Quarter\n"
              "(one pixel of each 2x2 block in turn). The others keep their filtered history, and march where they have none, such as\n"
              "sky just uncovered. Each halving halves the cost of the view's march and doubles the frames its history takes to converge.");
