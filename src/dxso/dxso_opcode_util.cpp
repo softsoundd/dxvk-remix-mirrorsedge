@@ -63,10 +63,13 @@ namespace dxvk {
 
   // How many of DxsoInstructionContext::src an opcode actually reads. The decoder overwrites
   // that array in order and leaves the rest holding whatever the previous instruction put
-  // there, so anything reading a slot the opcode does not use gets a stale register. The
-  // existing coordinate heuristics tolerate that (an extra provenance bit only nudges
-  // scoring); constant-dependency tracking cannot, because a stale constant would be dropped
-  // from material identity and merge materials that a tint tells apart.
+  // there, or r0 if no instruction has, so anything reading a slot the opcode does not use
+  // gets a stale register. The sampler inference's coordinate and value tracking reads every
+  // slot anyway. That tracking is per register, so a partial write drops a value still live
+  // in the other lanes, and the stale slots keep more such values alive than they invent.
+  // getPsSamplerFlagsRuledOutByLanes rules out the ones they invent. Constant-dependency
+  // tracking cannot tolerate a stale slot, because a stale constant would be dropped from
+  // material identity and merge materials that a tint tells apart.
   //
   // Unknown opcodes report 0 so the tracking fails closed: a missed dependency leaves an
   // identity that churns and says so through [RTX-MicChurn], whereas an invented one silently

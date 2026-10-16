@@ -108,6 +108,18 @@ namespace dxvk {
   // and how the sampled value is used.
   PsSamplerTexcoordInference inferPixelShaderTexcoordForSampler(const DxsoShaderView& pixelShader, uint32_t samplerIdx);
 
+  struct DxsoColorTermResult;
+
+  // Runs the colour-term analysis getPsSamplerFlagsRuledOutByLanes reads. It tracks every sampler,
+  // with the lightmap samplers and lighting constants the inference anchors on as factors.
+  DxsoColorTermResult analyzePsSamplerLanes(const DxsoShaderView& pixelShader);
+
+  // Returns the expression flags in `inferred` that `laneFacts`, from analyzePsSamplerLanes on the
+  // same shader, shows to be impossible for the sampler. The inference follows registers and the
+  // colour-term analysis follows lanes, which can rule a flag out but never in.
+  uint16_t getPsSamplerFlagsRuledOutByLanes(const PsSamplerTexcoordInference& inferred,
+                                            const DxsoColorTermResult& laneFacts, uint32_t samplerIdx);
+
   bool isUe3LightingInputSampler(const PsSamplerTexcoordInference& inferred);
 
 }

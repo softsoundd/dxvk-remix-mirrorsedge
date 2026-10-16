@@ -1383,8 +1383,10 @@ namespace dxvk {
     // Returns nullptr when the draw can be baked.
     // Returns the kind of reason it cannot otherwise, which `refusal` spells out when `describe` is set.
     // `describe` also fills the domain's description. Only the log and a new request read either.
+    // `materialLightingScales` are the material's recorded lighting-only layer tilings (Ue3CompositeMaterialState).
     const char* solveUe3CompositeDomain(const Ue3TextureState& ue3, const DxsoUe3CompositeShaderInfo& info, uint32_t texcoordIdx,
-                                        bool describe, Ue3CompositeDomain& domain, std::string& refusal) const;
+                                        const std::vector<Vector2>& materialLightingScales, bool describe,
+                                        Ue3CompositeDomain& domain, std::string& refusal) const;
     std::shared_ptr<const Ue3CompositeBakeRequest> buildUe3CompositeRequest(const Ue3TextureState& ue3,
                                                                             const DxsoUe3CompositeShaderInfo& info,
                                                                             const Ue3CompositeDomain& domain,

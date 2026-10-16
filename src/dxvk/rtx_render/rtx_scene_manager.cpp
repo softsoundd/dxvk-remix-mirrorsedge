@@ -418,8 +418,11 @@ namespace dxvk {
       // This is a geometry we've seen before, that requires updating
       //  'inOutGeometry' has valid historical data
       if (input.hashes[HashComponents::Indices] == inOutGeometry.hashes[HashComponents::Indices]) {
-        // Check if the vertex positions have changed, requiring a BVH refit
+        // Check if the vertex positions have changed, requiring a BVH refit. Texture coordinates live in the
+        // same vertex buffer, and the draw call cache can reuse an entry for a draw whose texture coordinates
+        // alone changed, so new ones take this path too.
         if (input.hashes[HashComponents::VertexPosition] == inOutGeometry.hashes[HashComponents::VertexPosition]
+         && input.hashes[HashComponents::VertexTexcoord] == inOutGeometry.hashes[HashComponents::VertexTexcoord]
          && input.hashes[HashComponents::VertexShader] == inOutGeometry.hashes[HashComponents::VertexShader]
          && drawCallState.getSkinningState().boneHash == inOutGeometry.lastBoneHash) {
           result = ObjectCacheState::kUpdateInstance;
@@ -1852,6 +1855,9 @@ namespace dxvk {
         if (previousHashes[HashComponents::VertexPosition] != geometry.hashes[HashComponents::VertexPosition]) {
           ++stat.positionChanges;
         }
+        if (previousHashes[HashComponents::VertexTexcoord] != geometry.hashes[HashComponents::VertexTexcoord]) {
+          ++stat.texcoordChanges;
+        }
         if (previousHashes[HashComponents::VertexShader] != geometry.hashes[HashComponents::VertexShader]) {
           ++stat.vertexShaderChanges;
         }
@@ -1894,14 +1900,15 @@ namespace dxvk {
         << std::fixed << std::setprecision(1)
         << (static_cast<float>(m_dynamicGeometryStatsTotalBuilds + m_dynamicGeometryStatsTotalUpdates) / static_cast<float>(frames))
         << " per frame) across " << ordered.size() << " geometries. Top entries (events per frame):\n";
-    out << "  per-frm  bld  upd |  pos   vs bone  idx |    vtx    idx bones smth dcmp  pass                   vs hash            material           indices\n";
+    out << "  per-frm  bld  upd |  pos   uv   vs bone  idx |    vtx    idx bones smth dcmp  pass                   vs hash            material           indices\n";
 
     constexpr size_t kMaxRows = 40;
     for (size_t i = 0; i < std::min(ordered.size(), kMaxRows); ++i) {
       const DynamicGeometryStat& s = *ordered[i].second;
       out << "  " << std::setw(7) << std::setprecision(2) << (static_cast<float>(s.builds + s.updates) / static_cast<float>(frames))
           << ' ' << std::setw(4) << s.builds << ' ' << std::setw(4) << s.updates
-          << " | " << std::setw(4) << s.positionChanges << ' ' << std::setw(4) << s.vertexShaderChanges
+          << " | " << std::setw(4) << s.positionChanges << ' ' << std::setw(4) << s.texcoordChanges
+          << ' ' << std::setw(4) << s.vertexShaderChanges
           << ' ' << std::setw(4) << s.boneChanges << ' ' << std::setw(4) << s.indexChanges
           << " | " << std::setw(6) << s.vertexCount << ' ' << std::setw(6) << s.indexCount
           << ' ' << std::setw(5) << s.numBones << ' ' << std::setw(4) << (s.smoothNormals ? 'y' : '.')

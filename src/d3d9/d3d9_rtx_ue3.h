@@ -297,8 +297,8 @@ namespace dxvk {
     std::array<PsSamplerUvOrigin, caps::MaxTexturesPS> samplerUvOrigin;
     // statistical inference below is used for diffuse-sampler *scoring* only
     std::array<PsSamplerTexcoordInference, caps::MaxTexturesPS> samplers;
-    // expression flags the register-granular inference derived that the lane-precise
-    // coordinate analysis showed to be impossible on the sampler's own lanes (diagnostic)
+    // Holds the flags getPsSamplerFlagsRuledOutByLanes cleared from `samplers`, which
+    // ue3LogAlbedoSelection reports.
     std::array<uint16_t, caps::MaxTexturesPS> samplerExpressionFlagsCleared = {};
     // Sampler registers holding UE3 lightmap machinery (LightMapTextures[] coefficients and
     // the bicubic B-spline weight LUT). Their count is a function of the DirectionalLightmaps
@@ -621,6 +621,8 @@ namespace dxvk {
       Vector4 transform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
     };
     std::optional<LiftedMask> mask;
+    // Lists the absolute tilings of the draw's lighting-only layers, such as normal maps, on the surface's UV set.
+    std::vector<Vector2> lightingScales;
     // Hashes the bound layer textures and their sampler states.
     XXH64_hash_t texturesHash = kEmptyHash;
     // Lists the layers with their tilings and roles, for the log and the dev menu.
@@ -632,6 +634,9 @@ namespace dxvk {
     // Holds the distinct values of the material constants its bakes ran with. Streamed-in mips mint new bakes
     // too, but only a constant that keeps changing means an animating input.
     fast_unordered_set constantSets;
+    // Holds the lighting-only layer tilings any compile of the material has drawn with. Every compile extends its
+    // repeat by them, because the simple lightmap compiles strip the normal map that the directional ones sample.
+    std::vector<Vector2> lightingScales;
     bool animated = false;
     bool hasDomain = false;
     Vector2 period = Vector2(1.0f, 1.0f);

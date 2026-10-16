@@ -212,6 +212,42 @@ namespace dxvk {
              ((inputMask >> (16 + element.semantic.usageIndex)) & 1u) != 0;
     }
 
+    const char* describeBlendFactor(const DWORD factor) {
+      switch (factor) {
+      case D3DBLEND_ZERO: return "ZERO";
+      case D3DBLEND_ONE: return "ONE";
+      case D3DBLEND_SRCCOLOR: return "SRCCOLOR";
+      case D3DBLEND_INVSRCCOLOR: return "INVSRCCOLOR";
+      case D3DBLEND_SRCALPHA: return "SRCALPHA";
+      case D3DBLEND_INVSRCALPHA: return "INVSRCALPHA";
+      case D3DBLEND_DESTALPHA: return "DESTALPHA";
+      case D3DBLEND_INVDESTALPHA: return "INVDESTALPHA";
+      case D3DBLEND_DESTCOLOR: return "DESTCOLOR";
+      case D3DBLEND_INVDESTCOLOR: return "INVDESTCOLOR";
+      case D3DBLEND_SRCALPHASAT: return "SRCALPHASAT";
+      case D3DBLEND_BOTHSRCALPHA: return "BOTHSRCALPHA";
+      case D3DBLEND_BOTHINVSRCALPHA: return "BOTHINVSRCALPHA";
+      case D3DBLEND_BLENDFACTOR: return "BLENDFACTOR";
+      case D3DBLEND_INVBLENDFACTOR: return "INVBLENDFACTOR";
+      default: return "?";
+      }
+    }
+
+    bool blendFactorReadsAlpha(const DWORD factor) {
+      switch (factor) {
+      case D3DBLEND_SRCALPHA:
+      case D3DBLEND_INVSRCALPHA:
+      case D3DBLEND_DESTALPHA:
+      case D3DBLEND_INVDESTALPHA:
+      case D3DBLEND_SRCALPHASAT:
+      case D3DBLEND_BOTHSRCALPHA:
+      case D3DBLEND_BOTHINVSRCALPHA:
+        return true;
+      default:
+        return false;
+      }
+    }
+
     std::string formatBakeSize(const Ue3CompositeDomain& domain) {
       std::string size = str::format(domain.width, "x", domain.height);
       if (domain.width < domain.neededWidth || domain.height < domain.neededHeight) {
@@ -232,8 +268,8 @@ namespace dxvk {
   }
 
   const char* D3D9Rtx::solveUe3CompositeDomain(const Ue3TextureState& ue3, const DxsoUe3CompositeShaderInfo& info,
-                                               const uint32_t texcoordIdx, const bool describe, Ue3CompositeDomain& domain,
-                                               std::string& refusal) const {
+                                               const uint32_t texcoordIdx, const std::vector<Vector2>& materialLightingScales,
+                                               const bool describe, Ue3CompositeDomain& domain, std::string& refusal) const {
     auto refuse = [&](const char* reason, const auto&... details) -> const char* {
       if (describe) {
         if constexpr (sizeof...(details) == 0) {
@@ -249,11 +285,17 @@ namespace dxvk {
       const char* reason = describeDxsoUe3CompositeRefusal(info.refusal);
       return info.refusalDetail.empty() ? refuse(reason) : refuse(reason, reason, " (", info.refusalDetail, ")");
     }
-    if (d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]) {
-      return refuse("the draw is blended (translucent, additive or modulated)");
+    // Remix derives a blend by colour alone, such as a modulated or additive one, from the surface colour,
+    // which the bake supplies. A blend by alpha would need the shader's alpha, which the bake keeps only as coverage.
+    const bool blended = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE];
+    const DWORD srcBlend = d3d9State().renderStates[D3DRS_SRCBLEND];
+    const DWORD dstBlend = d3d9State().renderStates[D3DRS_DESTBLEND];
+    if (blended && (blendFactorReadsAlpha(srcBlend) || blendFactorReadsAlpha(dstBlend))) {
+      return refuse("alpha blend", "the draw blends by alpha (", describeBlendFactor(srcBlend), ", ",
+                    describeBlendFactor(dstBlend), "), and the bake keeps its alpha only as coverage");
     }
     // Decals are not among them: a decal category only changes how the surface layers over the one
-    // beneath, and a decal the game blends is refused above.
+    // beneath, and a decal the game blends by alpha is refused above.
     if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::Sky, InstanceCategories::Particle, InstanceCategories::Beam,
                                                 InstanceCategories::Terrain, InstanceCategories::WorldUI,
                                                 InstanceCategories::WorldMatte, InstanceCategories::AnimatedWater)) {
@@ -357,6 +399,14 @@ namespace dxvk {
         // A layer on the mesh's other UV channel has no one place in a repeat of this one, so the bake
         // samples it at its average, through a ramp too steep for its mips. Its emission is left out
         // rather than glowing evenly. It is the same in both passes, so it cancels out of the albedo.
+        // The ramp only averages a texture, so colour math on the channel's coordinate itself is refused.
+        const uint8_t averagedLanes = uint8_t((1u << (origin.compU & 3u)) | (1u << (origin.compV & 3u)));
+        if (origin.semanticIndex < info.colorTexcoordLanes.size() &&
+            (info.colorTexcoordLanes[origin.semanticIndex] & averagedLanes)) {
+          return refuse("averaged UV set in the colour", "the colour computes with TEXCOORD", uint32_t(origin.semanticIndex),
+                        " itself as well as through layer s", stage, " (", layer.name,
+                        "), and the bake can only average that UV set");
+        }
         domain.averagedLanes.push_back({ origin.semanticIndex, origin.compU, origin.compV });
         emissionLeftOut |= emits;
         describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", roles, " on another UV set (",
@@ -396,11 +446,14 @@ namespace dxvk {
       }
 
       // The surface reads a lifted mask through a wrapping sampler, so only a mask the game wraps is lifted.
+      // A blended draw keeps its masks in the bake, since its opacity follows the albedo and opacity
+      // micromaps read only the baked one.
       const auto mask = std::find_if(info.maskLayers.begin(), info.maskLayers.end(),
                                      [&](const DxsoUe3CompositeMaskLayer& m) { return m.sampler == stage; });
       const bool maskWraps = d3d9State().samplerStates[stage][D3DSAMP_ADDRESSU] == D3DTADDRESS_WRAP &&
                              d3d9State().samplerStates[stage][D3DSAMP_ADDRESSV] == D3DTADDRESS_WRAP;
-      if (mask != info.maskLayers.end() && maskWraps && !maskCandidate.has_value() && getRemixSampleView(texture, false) != nullptr) {
+      if (mask != info.maskLayers.end() && maskWraps && !blended && !maskCandidate.has_value() &&
+          getRemixSampleView(texture, false) != nullptr) {
         colorScales.push_back(Vector2(scaleU, scaleV));
         describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", TilingText { scaleU, scaleV }, " ", roles);
         maskCandidate = MaskCandidate { uint8_t(stage), mask->channel, mask->degree, scaleU, scaleV, offsetU, offsetV,
@@ -421,8 +474,35 @@ namespace dxvk {
       describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", TilingText { scaleU, scaleV }, " ", roles);
     }
 
+    // A lighting-only layer never refuses a bake. One that is not a plain tiling of the surface's UV set is left out.
+    for (const DxsoUe3CompositeLightingLayer& layer : info.lightingLayers) {
+      const uint32_t stage = layer.sampler;
+      D3D9CommonTexture* texture = stage < SamplerCount && d3d9State().textures[stage] != nullptr
+        ? GetCommonTexture(d3d9State().textures[stage])
+        : nullptr;
+      if (texture == nullptr) {
+        continue;
+      }
+      const PsSamplerUvOrigin& origin = entry.samplerUvOrigin[stage];
+      float scaleU = 1.0f;
+      float scaleV = 1.0f;
+      const bool tilesSurfaceUvSet =
+        origin.originValid && origin.sitesAgree && origin.semanticIndex == texcoordIdx &&
+        origin.compU == m_texcoordCompU && origin.compV == m_texcoordCompV &&
+        origin.affineExact && !origin.affineU.hasCross && !origin.affineV.hasCross &&
+        resolveUe3PsAffineTerm(origin.affineU.scale, 1.0f, scaleU) && resolveUe3PsAffineTerm(origin.affineV.scale, 1.0f, scaleV);
+      if (!tilesSurfaceUvSet) {
+        describeLayer("s", stage, " ", layer.name, " lighting (not a tiling of the surface's UV set)");
+        continue;
+      }
+      domain.lightingScales.push_back(Vector2(std::abs(scaleU), std::abs(scaleV)));
+      describeLayer("s", stage, " ", layer.name, " ", texture->Desc()->Width, "x", texture->Desc()->Height, " ",
+                    TilingText { scaleU, scaleV }, " lighting");
+    }
+
     float periodU = scalesU.empty() ? 0.0f : solveUe3CompositePeriod(scalesU.data(), uint32_t(scalesU.size()));
     float periodV = scalesV.empty() ? 0.0f : solveUe3CompositePeriod(scalesV.data(), uint32_t(scalesV.size()));
+    bool liftMask = false;
     if (maskCandidate.has_value()) {
       std::vector<float> withMaskU = scalesU;
       std::vector<float> withMaskV = scalesV;
@@ -430,10 +510,8 @@ namespace dxvk {
       withMaskV.push_back(std::abs(maskCandidate->scaleV));
       const float fullU = solveUe3CompositePeriod(withMaskU.data(), uint32_t(withMaskU.size()));
       const float fullV = solveUe3CompositePeriod(withMaskV.data(), uint32_t(withMaskV.size()));
-      if (periodU > 0.0f && periodV > 0.0f && (fullU <= 0.0f || fullV <= 0.0f || periodU < fullU || periodV < fullV)) {
-        domain.mask = Ue3CompositeDomain::LiftedMask {
-          maskCandidate->stage, maskCandidate->channel, maskCandidate->degree,
-          Vector4(maskCandidate->scaleU * periodU, maskCandidate->scaleV * periodV, maskCandidate->offsetU, maskCandidate->offsetV) };
+      liftMask = periodU > 0.0f && periodV > 0.0f && (fullU <= 0.0f || fullV <= 0.0f || periodU < fullU || periodV < fullV);
+      if (liftMask) {
         if (describe) {
           description.insert(maskCandidate->descriptionEnd,
                              str::format(maskCandidate->degree == 2 ? " (quadratic mask ." : " (mask .",
@@ -456,17 +534,54 @@ namespace dxvk {
       return refuse("no common repeat", "the layer tilings do not repeat together within ", kUe3CompositeMaxPeriodMultiple,
                     " repeats of the coarsest [", description, "]");
     }
-    for (float& texels : texelsU) {
-      texels *= periodU;
-    }
-    for (float& texels : texelsV) {
-      texels *= periodV;
-    }
 
     const uint32_t maxResolution = std::max(m_frameOptions.ue3CompositeMaxResolution, kUe3CompositeMinResolution);
-    constexpr uint32_t kUncapped = 1u << 15;
-    domain.neededWidth = solveUe3CompositeResolution(texelsU.data(), uint32_t(texelsU.size()), kUe3CompositeMinResolution, kUncapped);
-    domain.neededHeight = solveUe3CompositeResolution(texelsV.data(), uint32_t(texelsV.size()), kUe3CompositeMinResolution, kUncapped);
+    // Returns the resolution the layers need along one axis to cover `period`, before the cap.
+    auto neededResolution = [](std::vector<float> texelsPerUv, const float period) {
+      constexpr uint32_t kUncapped = 1u << 15;
+      for (float& texels : texelsPerUv) {
+        texels *= period;
+      }
+      return solveUe3CompositeResolution(texelsPerUv.data(), uint32_t(texelsPerUv.size()), kUe3CompositeMinResolution, kUncapped);
+    };
+
+    // The repeat also covers the material's lighting-only layers where they share one with the others and the bake
+    // still fits under the resolution cap, so a normal map authored over the bake lines up with the game's.
+    // Covering them never costs the baked layers any detail.
+    std::vector<Vector2> lightingScales = materialLightingScales;
+    for (const Vector2& scale : domain.lightingScales) {
+      if (std::find(lightingScales.begin(), lightingScales.end(), scale) == lightingScales.end()) {
+        lightingScales.push_back(scale);
+      }
+    }
+    if (!lightingScales.empty()) {
+      std::vector<float> coveringU = scalesU;
+      std::vector<float> coveringV = scalesV;
+      for (const Vector2& scale : lightingScales) {
+        coveringU.push_back(scale.x);
+        coveringV.push_back(scale.y);
+      }
+      const float coveredU = solveUe3CompositePeriod(coveringU.data(), uint32_t(coveringU.size()));
+      const float coveredV = solveUe3CompositePeriod(coveringV.data(), uint32_t(coveringV.size()));
+      const bool fits = coveredU > 0.0f && coveredV > 0.0f &&
+                        neededResolution(texelsU, coveredU) <= maxResolution &&
+                        neededResolution(texelsV, coveredV) <= maxResolution;
+      if (fits) {
+        periodU = coveredU;
+        periodV = coveredV;
+      } else if (describe) {
+        description += ", lighting layers left out of the repeat";
+      }
+    }
+
+    if (liftMask) {
+      domain.mask = Ue3CompositeDomain::LiftedMask {
+        maskCandidate->stage, maskCandidate->channel, maskCandidate->degree,
+        Vector4(maskCandidate->scaleU * periodU, maskCandidate->scaleV * periodV, maskCandidate->offsetU, maskCandidate->offsetV) };
+    }
+
+    domain.neededWidth = neededResolution(std::move(texelsU), periodU);
+    domain.neededHeight = neededResolution(std::move(texelsV), periodV);
     domain.width = std::min(domain.neededWidth, maxResolution);
     domain.height = std::min(domain.neededHeight, maxResolution);
     domain.period = Vector2(periodU, periodV);
@@ -754,7 +869,7 @@ namespace dxvk {
     std::string refusal;
 
     if (!tagged) {
-      if (solveUe3CompositeDomain(ue3, info, texcoordIdx, true, domain, refusal) == nullptr && domain.layered) {
+      if (solveUe3CompositeDomain(ue3, info, texcoordIdx, state.lightingScales, true, domain, refusal) == nullptr && domain.layered) {
         Logger::info(str::format(
           "[RTX-Compatibility][UE3-Composite] Candidate materialHash=0x", std::hex, materialHash,
           " textureSetShader=0x", textureSetShaderHash, " pick=0x", pickHash, std::dec,
@@ -766,18 +881,31 @@ namespace dxvk {
     }
 
     // Only the log and a new request read the descriptions, so the draws of a known key solve without them.
-    if (const char* reason = solveUe3CompositeDomain(ue3, info, texcoordIdx, false, domain, refusal)) {
+    if (const char* reason = solveUe3CompositeDomain(ue3, info, texcoordIdx, state.lightingScales, false, domain, refusal)) {
       const XXH64_hash_t refusalKey = XXH3_64bits(reason, std::strlen(reason));
       if (state.loggedRefusal != refusalKey) {
         state.loggedRefusal = refusalKey;
         Ue3CompositeDomain described;
-        solveUe3CompositeDomain(ue3, info, texcoordIdx, true, described, refusal);
+        solveUe3CompositeDomain(ue3, info, texcoordIdx, state.lightingScales, true, described, refusal);
         Logger::warn(str::format(
           "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash, " pick=0x", pickHash, std::dec,
           " is tagged in rtx.ue3CompositeMaterialTextures but cannot be baked: ", refusal,
           ". It renders its albedo pick."));
       }
       return false;
+    }
+
+    // A compile that samples a lighting layer the material has not drawn with before moves every compile's repeat,
+    // which is not a conflict between two materials sharing one hash.
+    bool newLightingScale = false;
+    for (const Vector2& scale : domain.lightingScales) {
+      if (std::find(state.lightingScales.begin(), state.lightingScales.end(), scale) == state.lightingScales.end()) {
+        state.lightingScales.push_back(scale);
+        newLightingScale = true;
+      }
+    }
+    if (newLightingScale) {
+      state.hasDomain = false;
     }
 
     // A bake is only current for the material constant values it ran with, so they are part of its key.
@@ -853,12 +981,19 @@ namespace dxvk {
     std::shared_ptr<const Ue3CompositeBakeRequest>& request = m_ue3CompositeRequests[key];
     if (request == nullptr) {
       Ue3CompositeDomain described;
-      solveUe3CompositeDomain(ue3, info, texcoordIdx, true, described, refusal);
+      solveUe3CompositeDomain(ue3, info, texcoordIdx, state.lightingScales, true, described, refusal);
       request = buildUe3CompositeRequest(ue3, info, described, texcoordIdx, key);
       if (logging) {
         const double textures = 1.0 + (request->mask.has_value() ? double(request->mask->degree) : 0.0) +
                                 (request->storeEmission && !request->uniformEmission ? 1.0 : 0.0);
         const double megabytes = double(domain.width) * double(domain.height) * 4.0 * (4.0 / 3.0) * textures / (1024.0 * 1024.0);
+        std::string constants;
+        for (const uint32_t reg : info.materialConstantRegisters) {
+          if (reg < caps::MaxFloatConstantsPS) {
+            const Vector4& value = d3d9State().psConsts.fConsts[reg];
+            constants += str::format(constants.empty() ? "" : " ", "c", reg, "=(", value.x, ",", value.y, ",", value.z, ",", value.w, ")");
+          }
+        }
         Logger::info(str::format(
           "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash,
           " textureSetShader=0x", textureSetShaderHash, " pick=0x", pickHash, " key=0x", key, std::dec,
@@ -866,8 +1001,12 @@ namespace dxvk {
           " emission=", !request->emissivePass ? "none" : request->uniformEmission ? "uniform" : "textured",
           request->emissivePass && !request->storeEmission ? " (taken out of the albedo only)" : "",
           " coverage=", request->coverageFromAlpha ? 1 : 0,
+          d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]
+            ? str::format(" blend=(", describeBlendFactor(d3d9State().renderStates[D3DRS_SRCBLEND]), ", ",
+                          describeBlendFactor(d3d9State().renderStates[D3DRS_DESTBLEND]), ")")
+            : std::string(),
           info.viewDependent ? " view-dependent terms baked face-on" : "",
-          " layers=[", described.description, "] repeat=(", domain.period.x, ",", domain.period.y, ")",
+          " layers=[", described.description, "] constants=[", constants, "] repeat=(", domain.period.x, ",", domain.period.y, ")",
           " bake=", formatBakeSize(domain), " (~", megabytes, " MB)",
           " uvTransform=(", domain.transform[0].x, ",", domain.transform[1].y, ",",
           domain.transform[3].x, ",", domain.transform[3].y, ")"));

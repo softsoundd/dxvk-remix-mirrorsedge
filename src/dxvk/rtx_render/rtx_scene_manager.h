@@ -488,6 +488,7 @@ private:
     uint32_t builds = 0;
     uint32_t updates = 0;
     uint32_t positionChanges = 0;
+    uint32_t texcoordChanges = 0;
     uint32_t vertexShaderChanges = 0;
     uint32_t boneChanges = 0;
     uint32_t indexChanges = 0;

@@ -387,6 +387,86 @@ namespace {
     check(emitting.maskLayers.empty(), "an emitting mask is not lifted out of a lit compile");
   }
 
+  void testLightingLayers() {
+    // RPA_Lower's white paint in its directional lightmap compile weights the lightmap by a normal map at 1x and
+    // tints its paint at 2x. The normal map only feeds the lighting, so the bake leaves it out of what it renders.
+    DxsoTestShader ps(kPs30Header);
+    ps.ctab({
+        { "UniformVector_1", kFloat4, 2 },
+        { "AmbientColorAndSkyFactor", kFloat4, 3 },
+        { "Texture2D_0", kSampler, 0 },
+        { "Texture2D_1", kSampler, 1 },
+      })
+      .def(1, 2.0f, -1.0f, 0.0f, 0.0f)
+      .def(5, -0.707106769f, -0.408248305f, 0.577350259f, 0.0f)
+      .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+      .dclInput(DxsoUsage::Texcoord, 2, 1, MaskXYZ)
+      .dclSampler(0)
+      .dclSampler(1)
+      .texld(rd(0), v(0), 0)
+      .op3(DxsoOpcode::Mad, rd(0, MaskXYZ), r(0), c(1, kXXXX), c(1, kYYYY))
+      .op1(DxsoOpcode::Nrm, rd(1, MaskXYZ), r(0))
+      .op2(DxsoOpcode::Dp3, rdSat(2, MaskX), r(1), c(5))
+      .op2(DxsoOpcode::Mul, rd(2, MaskX), r(2, kXXXX), r(2, kXXXX))
+      .op2(DxsoOpcode::Add, rd(3, MaskXY), v(0), v(0))
+      .texld(rd(4), r(3), 1)
+      .op2(DxsoOpcode::Mul, rd(4, MaskXYZ), r(4), c(2))
+      .op2(DxsoOpcode::Mul, rd(5, MaskXYZ), r(2, kXXXX), v(1))
+      .op2(DxsoOpcode::Mul, rd(5, MaskXYZ), r(5), r(4))
+      .op3(DxsoOpcode::Mad, oC0(MaskXYZ), r(4), c(3), r(5))
+      .op1(DxsoOpcode::Mov, oC0(MaskW), c(1, kZZZZ));
+    const DxsoUe3CompositeShaderInfo info = analyzeDxsoUe3CompositeShader(ps.view());
+    check(info.refusal == DxsoUe3CompositeRefusal::None, "the normal-mapped paint bakes");
+    check(info.lighting == DxsoUe3CompositeLighting::AmbientConstant, "its ambient term carries the paint");
+    check(info.layers.size() == 1 && info.layers[0].sampler == 1 && info.layers[0].diffuse, "only the paint is a baked layer");
+    check(info.lightingLayers.size() == 1 && info.lightingLayers[0].sampler == 0 && info.lightingLayers[0].name == "Texture2D_0",
+          "the normal map is a lighting layer");
+
+    // The paint at 2x repeats every 0.5 UV, and covering the normal map at 1x makes that 1.
+    const float paint[] = { 2.0f };
+    const float paintAndNormalMap[] = { 2.0f, 1.0f };
+    check(solveUe3CompositePeriod(paint, 1) == 0.5f && solveUe3CompositePeriod(paintAndNormalMap, 2) == 1.0f,
+          "covering the normal map doubles the repeat");
+  }
+
+  void testTexcoordInColor() {
+    // Escape_p's Avenue overpass tints its floor tile yellow or blue by which half of TEXCOORD2 it is on, and a
+    // mask on TEXCOORD2 fades the tint out between them. Only TEXCOORD2.y feeds the colour other than as a
+    // coordinate, and the normalised camera vector is a direction rather than a coordinate.
+    DxsoTestShader ps(kPs30Header);
+    ps.ctab({
+        { "UniformVector_1", kFloat4, 2 },
+        { "UniformVector_2", kFloat4, 3 },
+        { "AmbientColorAndSkyFactor", kFloat4, 4 },
+        { "Texture2D_1", kSampler, 0 },
+        { "Texture2D_2", kSampler, 1 },
+      })
+      .def(1, 256.0f, -128.0f, 0.5f, 1.0f)
+      .dclInput(DxsoUsage::Texcoord, 1, 1, MaskZW)
+      .dclInput(DxsoUsage::Texcoord, 2, 2, MaskXY)
+      .dclInput(DxsoUsage::Texcoord, 6, 3, MaskXYZ)
+      .dclSampler(0)
+      .dclSampler(1)
+      .texld(rd(0), v(1, swz(3, 2, 2, 3)), 0)
+      .op3(DxsoOpcode::Mad, rdSat(1, MaskW), v(2, kYYYY), c(1, kXXXX), c(1, kYYYY))
+      .op1(DxsoOpcode::Mov, rd(2, MaskXYZ), c(2))
+      .op2(DxsoOpcode::Add, rd(2, MaskXYZ), r(2, kXYZW, kModNeg), c(3))
+      .op3(DxsoOpcode::Mad, rd(2, MaskXYZ), r(1, kWWWW), r(2), c(2))
+      .op2(DxsoOpcode::Mul, rd(3, MaskXYZ), r(0), r(2))
+      .op3(DxsoOpcode::Mad, rd(4, MaskXYZ), r(2), r(0, kXYZW, kModNeg), r(0))
+      .texld(rd(5), v(2), 1)
+      .op3(DxsoOpcode::Mad, rd(4, MaskXYZ), r(5, kXXXX), r(4), r(3))
+      .op1(DxsoOpcode::Nrm, rd(6, MaskXYZ), v(3))
+      .op2(DxsoOpcode::Mul, rd(4, MaskXYZ), r(4), r(6, kZZZZ))
+      .op2(DxsoOpcode::Mul, oC0(MaskXYZ), r(4), c(4))
+      .op1(DxsoOpcode::Mov, oC0(MaskW), c(1, kWWWW));
+    const DxsoUe3CompositeShaderInfo info = analyzeDxsoUe3CompositeShader(ps.view());
+    check(info.refusal == DxsoUe3CompositeRefusal::None, "the overpass floor is analysed");
+    check(info.colorTexcoordLanes[2] == MaskY, "the colour reads TEXCOORD2.y by arithmetic");
+    check(info.colorTexcoordLanes[1] == 0, "the tile's coordinate reaches the colour only through its sample");
+    check(info.colorTexcoordLanes[6] == 0, "the normalised camera vector is not a coordinate the colour reads");
+  }
+
   void testRefusals() {
     {
       // A vertex colour blend has no value over a texture repeat.
@@ -476,6 +556,17 @@ namespace {
               << " lightMapScale=c" << info.lightMapScaleRegister << "+" << info.lightMapScaleCount
               << " lightmapSamplers=0x" << std::hex << info.lightmapTextureSamplerMask
               << " vertexLightmapInputs=0x" << info.vertexLightmapInputMask << std::dec << "\n";
+    for (uint32_t t = 0; t < info.colorTexcoordLanes.size(); t++) {
+      if (info.colorTexcoordLanes[t]) {
+        std::cout << "   colour computes with TEXCOORD" << t << ".";
+        for (uint32_t lane = 0; lane < 4; lane++) {
+          if ((info.colorTexcoordLanes[t] >> lane) & 1u) {
+            std::cout << "xyzw"[lane];
+          }
+        }
+        std::cout << "\n";
+      }
+    }
     for (const DxsoUe3CompositeMaskLayer& mask : info.maskLayers) {
       std::cout << "   mask s" << uint32_t(mask.sampler) << "." << "xyzw"[mask.channel & 3u]
                 << (mask.degree == 2 ? " (quadratic)" : "") << "\n";
@@ -512,12 +603,31 @@ namespace {
         unmaskedScalesV.push_back(scalesV.back());
       }
     }
+    std::vector<float> coveringScalesU = scalesU;
+    std::vector<float> coveringScalesV = scalesV;
+    for (const DxsoUe3CompositeLightingLayer& layer : info.lightingLayers) {
+      const PsSamplerUvOrigin& origin = origins[layer.sampler];
+      std::cout << "   lighting s" << uint32_t(layer.sampler) << " " << layer.name
+                << " origin=" << origin.originValid << " sem=" << uint32_t(origin.semanticIndex)
+                << " comps=(" << uint32_t(origin.compU) << "," << uint32_t(origin.compV) << ")"
+                << " exact=" << origin.affineExact
+                << " U=[" << formatUvComponentAffine(origin.affineU) << "] V=[" << formatUvComponentAffine(origin.affineV) << "]\n";
+      if (origin.affineExact && !origin.affineU.hasCross && !origin.affineV.hasCross &&
+          origin.affineU.scale.constReg < 0 && origin.affineV.scale.constReg < 0) {
+        coveringScalesU.push_back(origin.affineU.scale.immValid ? origin.affineU.scale.imm : 1.0f);
+        coveringScalesV.push_back(origin.affineV.scale.immValid ? origin.affineV.scale.imm : 1.0f);
+      }
+    }
     if (allImmediate && !scalesU.empty()) {
       std::cout << "   repeat=(" << solveUe3CompositePeriod(scalesU.data(), uint32_t(scalesU.size())) << ","
                 << solveUe3CompositePeriod(scalesV.data(), uint32_t(scalesV.size())) << ")";
       if (!unmaskedScalesU.empty() && unmaskedScalesU.size() < scalesU.size()) {
         std::cout << " without masks=(" << solveUe3CompositePeriod(unmaskedScalesU.data(), uint32_t(unmaskedScalesU.size())) << ","
                   << solveUe3CompositePeriod(unmaskedScalesV.data(), uint32_t(unmaskedScalesV.size())) << ")";
+      }
+      if (coveringScalesU.size() > scalesU.size()) {
+        std::cout << " covering lighting layers=(" << solveUe3CompositePeriod(coveringScalesU.data(), uint32_t(coveringScalesU.size())) << ","
+                  << solveUe3CompositePeriod(coveringScalesV.data(), uint32_t(coveringScalesV.size())) << ")";
       }
       std::cout << "\n";
     } else if (!scalesU.empty()) {
@@ -544,6 +654,8 @@ int main(int argc, char** argv) {
     testUnlit();
     testMasked();
     testMaskLayers();
+    testLightingLayers();
+    testTexcoordInColor();
     testRefusals();
     testPeriod();
     testResolution();

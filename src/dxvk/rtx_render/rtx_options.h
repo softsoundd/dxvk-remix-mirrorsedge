@@ -649,7 +649,7 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, logDynamicGeometryStats, false,
                "Diagnostics: log roughly every 5 seconds which geometries required a BLAS build or refit per frame "
                "(vertex/index counts, skinning, smooth-normals tagging, UE3 pass, shader and material hashes) and why "
-               "(new object, vertex positions, vertex shader constants, bones or indices changed). Per-frame BLAS refits, "
+               "(new object, vertex positions, texture coordinates, vertex shader constants, bones or indices changed). Per-frame BLAS refits, "
                "geometry re-interleaving and smooth normal regeneration all follow from these events. Also counts draws per "
                "frame by update path: the preserve path, or the first preserve condition that sent the draw down the "
                "dynamic path.");

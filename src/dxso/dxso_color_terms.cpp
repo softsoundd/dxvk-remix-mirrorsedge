@@ -62,6 +62,8 @@ namespace dxvk {
       // DxsoCoordExpr bits: the arithmetic this value has been through
       uint8_t  coordExpr = 0;
       uint32_t interpDeps = 0;
+      // Holds the v# lanes (bit 4 * register + lane) it derives from by arithmetic.
+      uint64_t interpLanes = 0;
       TermRow  terms = {};
       TouchSet touch = {};
       ConstDepSet constDeps = {};
@@ -82,6 +84,7 @@ namespace dxvk {
         sampled |= other.sampled;
         coordExpr |= other.coordExpr;
         interpDeps |= other.interpDeps;
+        interpLanes |= other.interpLanes;
         for (uint32_t i = 0; i < kMaxSources; i++) {
           terms[i] |= other.terms[i];
         }
@@ -334,6 +337,7 @@ namespace dxvk {
           result.constReach[reg] = idx >= 0 ? m_reach[size_t(idx)] : 0;
         }
         result.interpolantFactorInputs = m_interpolantFactorInputs;
+        result.colorInterpolantLanes = m_colorInterpolantLanes;
         result.literals.reserve(m_literalBits.size());
         for (uint32_t i = 0; i < m_literalBits.size(); i++) {
           result.literals.push_back({ m_literalBits[i], m_colorTerms[kLiteralSourceBase + i] });
@@ -391,6 +395,9 @@ namespace dxvk {
         case DxsoRegisterType::PixelTexcoord: {
           const uint32_t bit = inputBit(r);
           v.interpDeps = bit;
+          if (r.id.type == DxsoRegisterType::Input && r.id.num < 16) {
+            v.interpLanes = 1ull << (4u * r.id.num + (comp & 3u));
+          }
           if (m_pass == 2 && bit != 0 &&
               (m_nonUvTexcoordInputs & bit) != 0 &&
               (m_normalizedInputs & bit) == 0 &&
@@ -458,6 +465,7 @@ namespace dxvk {
 
       void writeColorOutput(const Value& value) {
         m_outputFactor |= value.factor;
+        m_colorInterpolantLanes |= value.interpLanes;
         orRow(m_colorTerms, value.terms);
         for (uint32_t i = 0; i < kMaxSources; i++) {
           if (value.terms[i] != 0) {
@@ -645,6 +653,7 @@ namespace dxvk {
         for (uint32_t i = 0; i < srcCount && i < 3; i++) {
           result.factor |= src[i].factor;
           result.interpDeps |= src[i].interpDeps;
+          result.interpLanes |= src[i].interpLanes;
           result.sampled |= src[i].sampled;
           result.coordExpr |= src[i].coordExpr;
           for (uint32_t w = 0; w < result.touch.size(); w++) {
@@ -833,6 +842,7 @@ namespace dxvk {
             // reflection vector built from it that ends up as a cube-map coordinate must not
             // turn the camera vector into a texture coordinate.
             result.interpDeps = 0;
+            result.interpLanes = 0;
           }
           // A matrix transform reads the rows after the one the operand names.
           const uint32_t matrixRows = matrixRowCount(op);
@@ -907,6 +917,7 @@ namespace dxvk {
       std::array<uint8_t, kMaxSources>   m_reach = {};
       uint8_t                            m_outputFactor = 0;
       uint32_t                           m_interpolantFactorInputs = 0;
+      uint64_t                           m_colorInterpolantLanes = 0;
       std::array<ConstDepSet, kDxsoColorTermMaxSamplers> m_samplerCoordConstDeps = {};
       std::array<uint8_t, kDxsoColorTermMaxSamplers>     m_samplerCoordExpr = {};
       std::array<uint16_t, kDxsoColorTermMaxSamplers>    m_samplerSampleCount = {};

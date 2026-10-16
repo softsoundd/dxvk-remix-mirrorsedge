@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -97,6 +98,13 @@ namespace dxvk {
     bool contributesColor() const { return emissive || diffuse; }
   };
 
+  // Describes a material sampler that only feeds the lighting, such as a normal map. The bake does not render it,
+  // but its repeat covers the layer's tiling where it can, so a normal map authored over the bake lines up with it.
+  struct DxsoUe3CompositeLightingLayer {
+    uint8_t sampler = 0;
+    std::string name;
+  };
+
   // Describes a colour layer the colour output is a polynomial of degree 1 or 2 in, as oC0.rgb = P + m * S (+ m^2 * Q).
   // Here m is one channel of the layer's only read, and none of P, S and Q reads its texture.
   // See "Masks" in UE3Compatibility.md.
@@ -112,6 +120,7 @@ namespace dxvk {
     std::string refusalDetail;
     DxsoUe3CompositeLighting lighting = DxsoUe3CompositeLighting::Unlit;
     std::vector<DxsoUe3CompositeLayer> layers;
+    std::vector<DxsoUe3CompositeLightingLayer> lightingLayers;
     // Lists the colour layers that are masks and reach neither the alpha, a coordinate nor, in a lit compile, the emission.
     std::vector<DxsoUe3CompositeMaskLayer> maskLayers;
     // Is set when some term reaches the colour output unlit, so a second pass with the lighting zeroed
@@ -135,6 +144,8 @@ namespace dxvk {
     // Holds the simple vertex lightmap compile's lighting interpolant, which is white in the diffuse pass and black
     // in the emission pass. It has the bit layout of DxsoColorTermResult::interpolantFactorInputs.
     uint32_t vertexLightmapInputMask = 0;
+    // Holds, per TEXCOORD index, the lanes the colour reads by arithmetic rather than only as a texture coordinate.
+    std::array<uint8_t, 8> colorTexcoordLanes = {};
     // Lists the UniformVector_* and UniformScalar_* registers that reach an output, whose live values make a bake current.
     std::vector<uint32_t> materialConstantRegisters;
   };

@@ -104,7 +104,7 @@ namespace dxvk {
     // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
     // the albedo score or the header changes, so a build re-derives instead of serving decisions
     // its own scoring would no longer make.
-    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 4;
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 6;
 
     // How many loaded picks to re-score and check against current scoring per session. A scoring
     // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
@@ -1123,14 +1123,16 @@ namespace dxvk {
         appendFlag(isRenderTarget, "RT");
         appendFlag(uvOriginPenaltyActive && !inferredSamplerUvOriginProvable, "NOUVORIGIN");
         appendFlag(inferredSamplerReadsPrimaryUvPair, "UV0XY");
-        // what the register-granular inference had derived that the coordinate lanes rule out
+        // Lists what the register-granular inference had derived that the lanes rule out.
         if (inferredPsEntry != nullptr && inferredPsEntry->samplerExpressionFlagsCleared[stage] != 0) {
           const uint16_t cleared = inferredPsEntry->samplerExpressionFlagsCleared[stage];
           std::string clearedList;
-          if (cleared & kPsSamplerExprUvTransform) clearedList += "UVXFORM ";
-          if (cleared & kPsSamplerExprUvOffset)    clearedList += "UVOFS ";
-          if (cleared & kPsSamplerExprUvAnimated)  clearedList += "UVANIM ";
-          if (cleared & kPsSamplerExprBlendMath)   clearedList += "BLEND ";
+          if (cleared & kPsSamplerExprUvTransform)         clearedList += "UVXFORM ";
+          if (cleared & kPsSamplerExprUvOffset)            clearedList += "UVOFS ";
+          if (cleared & kPsSamplerExprUvAnimated)          clearedList += "UVANIM ";
+          if (cleared & kPsSamplerExprBlendMath)           clearedList += "BLEND ";
+          if (cleared & kPsSamplerExprReachesOutputColor)  clearedList += "REACHESOC0 ";
+          if (cleared & kPsSamplerExprDiffuseAnchor)       clearedList += "ANCHOR ";
           appendFlag(true, str::format("LANECLEARED:", clearedList).c_str());
         }
 

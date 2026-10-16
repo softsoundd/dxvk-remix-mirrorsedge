@@ -201,42 +201,11 @@ namespace dxvk {
         }
       }
 
-      // Expression flags are tracked per register, so a sampler inherits what fxc packed into its register's
-      // spare lanes (the lightmap UV under TdBicubicFiltering). Flags the colour-term analysis shows to be
-      // impossible on the coordinate lanes are cleared, never added.
-      const std::vector<uint8_t>& bytecode = ps->GetBytecode();
-      const DxsoColorTermResult coordFacts = analyzeDxsoColorTerms(
-        reinterpret_cast<const uint32_t*>(bytecode.data()), bytecode.size() / sizeof(uint32_t), DxsoColorTermInputs {});
-      if (coordFacts.analyzed) {
-        for (uint32_t s = 0; s < caps::MaxTexturesPS && s < kDxsoColorTermMaxSamplers; s++) {
-          if (entry.samplers[s].sampleCount == 0 || coordFacts.samplerSampleCount[s] == 0) {
-            continue;
-          }
-          const uint8_t expr = coordFacts.samplerCoordExpr[s];
-          uint16_t& flags = entry.samplers[s].expressionFlags;
-          const uint16_t before = flags;
-          if ((expr & DxsoCoordExpr_Arith) == 0) {
-            // a plain interpolant read: the only transform it can carry is a non-.xy swizzle
-            flags &= ~uint16_t(kPsSamplerExprUvOffset | kPsSamplerExprUvAnimated | kPsSamplerExprBlendMath);
-            const bool swizzled =
-              entry.samplers[s].coordCompValid &&
-              (entry.samplers[s].coordCompU != 0 || entry.samplers[s].coordCompV != 1);
-            if (!swizzled) {
-              flags &= ~uint16_t(kPsSamplerExprUvTransform);
-            }
-          }
-          if ((expr & DxsoCoordExpr_Offset) == 0) {
-            flags &= ~uint16_t(kPsSamplerExprUvOffset);
-          }
-          const bool animatedPossible =
-            (expr & (DxsoCoordExpr_Wrap | DxsoCoordExpr_UnknownOffset)) != 0 ||
-            entry.samplers[s].sampleCount >= 2u ||
-            (flags & kPsSamplerExprUvTimeDriven) != 0;
-          if (!animatedPossible) {
-            flags &= ~uint16_t(kPsSamplerExprUvAnimated);
-          }
-          entry.samplerExpressionFlagsCleared[s] = uint16_t(before & ~flags);
-        }
+      const DxsoColorTermResult laneFacts = analyzePsSamplerLanes(psView);
+      for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+        const uint16_t ruledOut = getPsSamplerFlagsRuledOutByLanes(entry.samplers[s], laneFacts, s);
+        entry.samplers[s].expressionFlags &= ~ruledOut;
+        entry.samplerExpressionFlagsCleared[s] = ruledOut;
       }
     }
 

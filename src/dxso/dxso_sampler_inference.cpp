@@ -23,12 +23,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cmath>
 #include <initializer_list>
 #include <limits>
 #include <string>
 
 #include "dxso_code.h"
+#include "dxso_color_terms.h"
 #include "dxso_ctab.h"
 #include "../util/util_vector.h"
 
@@ -205,6 +207,53 @@ namespace dxvk {
     // Diffuse-anchor provenance, see kPsSamplerExprDiffuseAnchor.
     constexpr uint8_t kAnchorLightmapValue = 1u << 0;
     constexpr uint8_t kAnchorLightingConst = 1u << 1;
+
+    // Holds the lightmap samplers and lighting constants, which the UE3 base pass multiplies only the diffuse by.
+    struct AnchorSources {
+      uint32_t                              lightmapSamplerMask = 0;
+      std::bitset<kDxsoMaxPsFloatConstants> lightingConstRegs;
+    };
+
+    AnchorSources collectAnchorSources(const DxsoCtab& ctab) {
+      AnchorSources sources;
+      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
+        if (c.registerCount == 0) {
+          continue;
+        }
+        const std::string lowerName = toLowerAscii(c.name);
+        if (c.registerSet == kD3dxRegisterSetSampler) {
+          if (containsToken(lowerName, "lightmap")) {
+            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, 32u);
+            for (uint32_t reg = c.registerIndex; reg < end; reg++) {
+              sources.lightmapSamplerMask |= 1u << reg;
+            }
+          }
+        } else if (c.registerSet == kD3dxRegisterSetFloat4) {
+          // BasePassPixelShader.usf scales unlit and dynamic diffuse by AmbientColorAndSkyFactor.rgb,
+          // and sky-lit diffuse by UpperSkyColor and LowerSkyColor.
+          if (containsToken(lowerName, "ambientcolorandskyfactor") ||
+              containsToken(lowerName, "upperskycolor") ||
+              containsToken(lowerName, "lowerskycolor")) {
+            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, kDxsoMaxPsFloatConstants);
+            for (uint32_t reg = c.registerIndex; reg < end; reg++) {
+              sources.lightingConstRegs.set(reg);
+            }
+          }
+        }
+      }
+      return sources;
+    }
+
+    // Returns the colour-term signatures that carry a lightmap or lighting-constant factor.
+    constexpr DxsoColorTermSet anchoredTermSignatures() {
+      DxsoColorTermSet signatures = 0;
+      for (uint32_t s = 0; s < kDxsoColorTermSignatureCount; s++) {
+        if (s & (DxsoColorTermFactor_Lightmap | DxsoColorTermFactor_LightConst)) {
+          signatures |= 1u << s;
+        }
+      }
+      return signatures;
+    }
 
     constexpr uint8_t kCoordProvTexcoord    = 1u << 0;
     constexpr uint8_t kCoordProvNonTexcoord = 1u << 1;
@@ -400,7 +449,6 @@ namespace dxvk {
       bool applyOffsetFromConstant(const DxsoRegister& r, PsTexcoordScaleHint& inOutHint, float sign) const;
       bool applyOffset(const DxsoRegister& r, PsTexcoordScaleHint& inOutHint, float sign) const;
 
-      void collectAnchorSources(const DxsoCtab& ctab);
       void recordDefConstant(const DxsoInstructionContext& ctx);
       void detectDiffuseAnchor(const DxsoInstructionContext& ctx);
       void propagateConstDeps(const DxsoInstructionContext& ctx);
@@ -445,8 +493,7 @@ namespace dxvk {
       std::array<ConstDepSet, kTrackedTemps>         m_tempConstDeps = {};
 
       bool                                          m_anchorSourcesCollected = false;
-      uint32_t                                      m_anchorLightmapSamplerMask = 0;
-      std::array<uint8_t, kDxsoMaxPsFloatConstants> m_anchorLightingConstRegs = {};
+      AnchorSources                                 m_anchorSources;
 
       // `def` literals are bytecode, so never draw state.
       std::array<uint8_t, kDxsoMaxPsFloatConstants> m_defFloatConstValid = {};
@@ -491,7 +538,7 @@ namespace dxvk {
         // The CTAB comment precedes every instruction.
         if (!m_anchorSourcesCollected && m_decoder.getCtabInfo().m_size != 0) {
           m_anchorSourcesCollected = true;
-          collectAnchorSources(m_decoder.getCtabInfo());
+          m_anchorSources = collectAnchorSources(m_decoder.getCtabInfo());
         }
 
         recordDefConstant(ctx);
@@ -588,7 +635,7 @@ namespace dxvk {
       }
       if (isFloatConstantRegisterType(r.id.type) && !r.hasRelative) {
         const int32_t reg = getFloatConstantRegisterIndex(r);
-        if (reg >= 0 && reg < int32_t(m_anchorLightingConstRegs.size()) && m_anchorLightingConstRegs[reg]) {
+        if (reg >= 0 && reg < int32_t(kDxsoMaxPsFloatConstants) && m_anchorSources.lightingConstRegs.test(reg)) {
           return kAnchorLightingConst;
         }
       }
@@ -729,35 +776,6 @@ namespace dxvk {
         return true;
       }
       return false;
-    }
-
-    void SamplerUseAnalysis::collectAnchorSources(const DxsoCtab& ctab) {
-      for (const DxsoCtab::Constant& c : ctab.m_constantData) {
-        if (c.registerCount == 0) {
-          continue;
-        }
-        const std::string lowerName = toLowerAscii(c.name);
-        if (c.registerSet == kD3dxRegisterSetSampler) {
-          if (containsToken(lowerName, "lightmap")) {
-            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount, 32u);
-            for (uint32_t reg = c.registerIndex; reg < end; reg++) {
-              m_anchorLightmapSamplerMask |= 1u << reg;
-            }
-          }
-        } else if (c.registerSet == kD3dxRegisterSetFloat4) {
-          // BasePassPixelShader.usf scales unlit and dynamic diffuse by AmbientColorAndSkyFactor.rgb,
-          // and sky-lit diffuse by UpperSkyColor and LowerSkyColor.
-          if (containsToken(lowerName, "ambientcolorandskyfactor") ||
-              containsToken(lowerName, "upperskycolor") ||
-              containsToken(lowerName, "lowerskycolor")) {
-            const uint32_t end = std::min<uint32_t>(c.registerIndex + c.registerCount,
-                                                    uint32_t(m_anchorLightingConstRegs.size()));
-            for (uint32_t reg = c.registerIndex; reg < end; reg++) {
-              m_anchorLightingConstRegs[reg] = 1;
-            }
-          }
-        }
-      }
     }
 
     void SamplerUseAnalysis::recordDefConstant(const DxsoInstructionContext& ctx) {
@@ -1400,7 +1418,7 @@ namespace dxvk {
           m_tempSamplerValueState[dst] = 0;
         }
         m_tempAnchorBits[dst] =
-          (sample.sampler < 32u && ((m_anchorLightmapSamplerMask >> sample.sampler) & 1u) != 0)
+          (sample.sampler < 32u && ((m_anchorSources.lightmapSamplerMask >> sample.sampler) & 1u) != 0)
             ? kAnchorLightmapValue
             : 0u;
       }
@@ -1721,6 +1739,70 @@ namespace dxvk {
       return PsSamplerTexcoordInference();
     }
     return SamplerUseAnalysis(pixelShader, samplerIdx).run();
+  }
+
+  DxsoColorTermResult analyzePsSamplerLanes(const DxsoShaderView& pixelShader) {
+    if (pixelShader.tokens == nullptr || pixelShader.info == nullptr ||
+        pixelShader.info->type() != DxsoProgramTypes::PixelShader) {
+      return DxsoColorTermResult();
+    }
+
+    // The CTAB comment precedes every instruction.
+    DxsoDecodeContext decoder(*pixelShader.info);
+    DxsoCodeIter iter(pixelShader.tokens + 1);
+    while (decoder.getCtabInfo().m_size == 0 && decoder.decodeInstruction(iter)) {
+    }
+    const AnchorSources anchorSources = collectAnchorSources(decoder.getCtabInfo());
+
+    DxsoColorTermInputs inputs;
+    inputs.trackedSamplerMask = (1u << kDxsoColorTermMaxSamplers) - 1u;
+    inputs.lightmapSamplerMask = anchorSources.lightmapSamplerMask;
+    for (uint32_t reg = 0; reg < kDxsoMaxPsFloatConstants && reg < kDxsoColorTermMaxConstRegs; reg++) {
+      inputs.lightingConstRegs[reg] = anchorSources.lightingConstRegs[reg];
+    }
+    return analyzeDxsoColorTerms(pixelShader.tokens, pixelShader.tokenCount, inputs);
+  }
+
+  uint16_t getPsSamplerFlagsRuledOutByLanes(const PsSamplerTexcoordInference& inferred,
+                                            const DxsoColorTermResult& laneFacts, const uint32_t samplerIdx) {
+    if (!laneFacts.analyzed || samplerIdx >= kDxsoColorTermMaxSamplers ||
+        inferred.sampleCount == 0 || laneFacts.samplerSampleCount[samplerIdx] == 0) {
+      return 0;
+    }
+
+    // A coordinate inherits whatever fxc packed into its register's spare lanes, such as the
+    // lightmap UV under TdBicubicFiltering.
+    const uint8_t expr = laneFacts.samplerCoordExpr[samplerIdx];
+    uint16_t ruledOut = 0;
+    if ((expr & DxsoCoordExpr_Arith) == 0) {
+      // A plain interpolant read can carry no transform but a non-.xy swizzle.
+      ruledOut |= kPsSamplerExprUvOffset | kPsSamplerExprUvAnimated | kPsSamplerExprBlendMath;
+      const bool swizzled = inferred.coordCompValid && (inferred.coordCompU != 0 || inferred.coordCompV != 1);
+      if (!swizzled) {
+        ruledOut |= kPsSamplerExprUvTransform;
+      }
+    }
+    if ((expr & DxsoCoordExpr_Offset) == 0) {
+      ruledOut |= kPsSamplerExprUvOffset;
+    }
+    const bool animatedPossible =
+      (expr & (DxsoCoordExpr_Wrap | DxsoCoordExpr_UnknownOffset)) != 0 ||
+      inferred.sampleCount >= 2u ||
+      (inferred.expressionFlags & kPsSamplerExprUvTimeDriven) != 0;
+    if (!animatedPossible) {
+      ruledOut |= kPsSamplerExprUvAnimated;
+    }
+
+    // The inference also reads roles and anchor provenance from src slots an opcode does not use (see
+    // getDxsoSourceOperandCount, and "Albedo selection and the texture spread cache" in UE3Compatibility.md).
+    // The lanes show whether the value reaches the colour at all, and whether any of it is lit on the way.
+    if ((laneFacts.samplerReach[samplerIdx] & DxsoColorTermReach_Color) == 0) {
+      ruledOut |= kPsSamplerExprReachesOutputColor;
+    }
+    if ((laneFacts.samplerTerms[samplerIdx] & anchoredTermSignatures()) == 0) {
+      ruledOut |= kPsSamplerExprDiffuseAnchor;
+    }
+    return uint16_t(inferred.expressionFlags & ruledOut);
   }
 
   // A material input the base pass reads only for lighting. The simple-lightmap compile strips

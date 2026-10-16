@@ -306,6 +306,16 @@ namespace dxvk {
     if (!terms.analyzed) {
       return info;
     }
+    if (pixelShader.isgn != nullptr) {
+      for (uint32_t i = 0; i < pixelShader.isgn->elemCount; i++) {
+        const DxsoIsgnEntry& element = pixelShader.isgn->elems[i];
+        if (element.semantic.usage == DxsoUsage::Texcoord && element.regNumber < 16 &&
+            element.semantic.usageIndex < info.colorTexcoordLanes.size()) {
+          info.colorTexcoordLanes[element.semantic.usageIndex] |=
+            uint8_t((terms.colorInterpolantLanes >> (4u * element.regNumber)) & 0xFu);
+        }
+      }
+    }
     // A register that reaches no output cannot change a bake, and one that animates would otherwise
     // mint a bake every frame.
     info.materialConstantRegisters.erase(
@@ -330,6 +340,13 @@ namespace dxvk {
       const DxsoColorTermSet set = terms.samplerTerms[s];
       const uint8_t reach = terms.samplerReach[s];
       const DxsoColorTermRole role = classifyDxsoColorTermSource(set, reach, terms.hasLightConstTerm);
+      if (role == DxsoColorTermRole::Unused || role == DxsoColorTermRole::LightingOnly) {
+        if (((materialSamplerMask >> s) & 1u) != 0 && samplerTypes[s] == DxsoTextureType::Texture2D &&
+            terms.samplerSampleCount[s] > 0) {
+          info.lightingLayers.push_back({ uint8_t(s), samplerNames[s] });
+        }
+        continue;
+      }
       if (role != DxsoColorTermRole::Color && role != DxsoColorTermRole::Opacity &&
           role != DxsoColorTermRole::Coordinate) {
         continue;
