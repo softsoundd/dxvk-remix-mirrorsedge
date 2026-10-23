@@ -20,15 +20,17 @@
 * DEALINGS IN THE SOFTWARE.
 */
 
-// NGX passthrough mode, pre-post-process injection: combines the DLSS color output with
-// the game's original alpha channel before the result is written back over the scene
-// color. UE3's D3D9 path stores the scene depth in the scene color alpha (see UE3
-// Common.usf CalcSceneDepth: "depth stored in alpha" when depth textures are
-// unsupported); shadow projection, fog, and depth of field read it back, and DLSS output
-// alpha is undefined, so the write-back must carry the game's own alpha through.
+// Combines the DLSS colour output with the game's original alpha before write-back.
+// UE3's D3D9 path stores scene depth in scene-colour alpha.
+// Common.usf CalcSceneDepth calls this "depth stored in alpha" when depth textures are unsupported.
+// Shadow projection, fog, and depth of field read that alpha back.
+// DLSS output alpha is undefined.
+// Write-back carries the game's alpha through.
 //
-// Note: only used when render extent == display extent (the pre-post injection is
-// DLAA-only), so cb.resolution matches the output size and both inputs are 1:1.
+// cb.resolution is the render extent, where OriginalColor's alpha was rasterized.
+// cb.outputResolution is the display extent.
+// Pre-post Super Resolution upscales the scene subrect onto the full scene-colour target.
+// The two extents differ in that case.
 
 #include "rtx/pass/ngx_passthrough/ngx_passthrough_args.h"
 
@@ -54,9 +56,10 @@ void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
 
   float3 color = DlssColor[pixelCoordinate].rgb;
 
-  // The Super Resolution path replaces UE3's FinishRenderViewTarget composite, so that draw's
-  // own transform is reapplied here: it is the last thing between the post chain and the
-  // backbuffer, and skipping it leaves the frame un-gamma-corrected.
+  // Late Super Resolution replaces UE3's FinishRenderViewTarget composite.
+  // That draw's transform is reapplied here.
+  // It is the last step between the post chain and the backbuffer.
+  // Skipping it leaves the frame without the game's gamma.
   if (cb.outputTransformEnabled != 0) {
     color = lerp(color * cb.outputColorScaleAndGamma.rgb,
                  cb.outputOverlayColor.rgb,
@@ -64,19 +67,23 @@ void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
     color = pow(saturate(color), cb.outputColorScaleAndGamma.a);
   }
 
-  // OriginalColor is render-resolution, so it is only 1:1 with the output on the pre-post
-  // injection path - which is exactly where the game's alpha needs carrying through.
+  // OriginalColor is at render resolution.
+  // DLAA output matches it one to one.
+  // Pre-post Super Resolution maps this display pixel back into that grid.
   float alpha;
 
   if (cb.preserveOriginalAlpha != 0) {
-    // That alpha is scene depth, rasterized through the jittered viewport, while the colour it is
-    // being merged with has been resolved un-jittered. Buffer position q therefore holds the depth
-    // of un-jittered position q - jitter, so a straight load would pair each pixel's colour with
-    // depth from a slightly different place - one that moves every frame as the jitter does.
-    // Reconstructing at the pixel centre pins it, which matters because the game's post chain runs
-    // after this injection point and reads this depth for fog and depth of field.
-    const float2 maxCoordinate = cb.resolution - 1.0f;
-    const float2 samplePosition = clamp(float2(pixelCoordinate) + cb.jitter, float2(0.0f, 0.0f), maxCoordinate);
+    // That alpha is scene depth, rasterized through the jittered viewport.
+    // The colour merged with it has already been resolved unjittered.
+    // A load at the output pixel would read depth from a texel that slides with the jitter.
+    // The sample position follows the jitter.
+    // When the extents differ, the sample position is scaled from the display pixel into the render grid.
+    // The post chain reads this depth for fog and depth of field.
+    const float2 renderExtent = max(cb.resolution, float2(1.0f, 1.0f));
+    const float2 displayExtent = max(cb.outputResolution, float2(1.0f, 1.0f));
+    const float2 maxCoordinate = renderExtent - 1.0f;
+    const float2 samplePosition = clamp((float2(pixelCoordinate) + 0.5f) * (renderExtent / displayExtent) - 0.5f + cb.jitter,
+                                        float2(0.0f, 0.0f), maxCoordinate);
 
     const int2 corner00 = int2(floor(samplePosition));
     const int2 corner11 = int2(min(float2(corner00) + 1.0f, maxCoordinate));

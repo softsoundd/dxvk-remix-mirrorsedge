@@ -929,7 +929,6 @@ namespace dxvk {
                                    m_outputTransform.overlayColor[1],
                                    m_outputTransform.overlayColor[2],
                                    m_outputTransform.overlayColor[3]);
-
     ctx->updateBuffer(m_constantsBuffer, 0, sizeof(args), &args);
 
     const Resources::Resource& depthOutput = m_depthQueue.get();
@@ -1708,8 +1707,11 @@ namespace dxvk {
     // back over the same target, so it cannot be read in place)
     snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
 
-    // HDR content flag follows the color source: the pre-post-process injection point feeds
-    // the game's linear scene color (float target), the late one display-encoded LDR output
+    // The HDR flag follows the colour source.
+    // Pre-post feeds the game's linear float scene colour, with NGX auto-exposure.
+    // Late injection feeds display-encoded LDR.
+    // Compressing the linear image into the LDR feature leaves disocclusion ghosts.
+    // Pre-post uses the HDR feature.
     const bool contentHDR = isHDRColorFormat(colorSourceImage->info().format);
 
     // The two injection points alternate freely - whether the pre-post trigger fires depends on
@@ -1726,6 +1728,7 @@ namespace dxvk {
     }
 
     if (feature.initializedRenderPreset != dlssRenderPreset() ||
+        feature.initializedContentHDR != contentHDR ||
         feature.initializedInput[0] != m_renderExtent.width ||
         feature.initializedInput[1] != m_renderExtent.height ||
         feature.initializedOutput[0] != m_displayExtent.width ||
@@ -1736,6 +1739,7 @@ namespace dxvk {
     if (feature.needsInitialize) {
       feature.needsInitialize = false;
       feature.initializedRenderPreset = dlssRenderPreset();
+      feature.initializedContentHDR = contentHDR;
       feature.initializedInput[0] = m_renderExtent.width;
       feature.initializedInput[1] = m_renderExtent.height;
       feature.initializedOutput[0] = m_displayExtent.width;
@@ -2037,29 +2041,34 @@ namespace dxvk {
       m_hudlessQueue.next();
     }
 
-    // Super Resolution path: the game rendered its scene into a reduced subrect and the
-    // engine's stretch onto the target was suppressed; DLSS consumes the subrect and outputs
-    // at the target resolution. DLAA path: everything happens at the target resolution.
-    // Pre-post-process path: the target is the game's scene color and the subrect is the
-    // scene viewport rect within it; DLAA runs inside that rect (render == display size).
-    const bool superResolution = !prePostProcess && upscaleSourceImage != nullptr &&
-                                 sourceSubrect.extent.width > 0 && sourceSubrect.extent.height > 0;
-
-    const bool prePostSubrectValid = prePostProcess &&
-                                     sourceSubrect.extent.width > 0 && sourceSubrect.extent.height > 0;
-
     const VkExtent2D targetExtent = { targetImage->info().extent.width, targetImage->info().extent.height };
-    const VkExtent2D displayExtent = prePostSubrectValid ? sourceSubrect.extent : targetExtent;
-    const VkExtent2D renderExtent = superResolution ? sourceSubrect.extent : displayExtent;
-    const VkOffset2D subrectOffset = (superResolution || prePostSubrectValid) ? sourceSubrect.offset : VkOffset2D { 0, 0 };
-    const Rc<DxvkImage>& colorSourceImage = superResolution ? upscaleSourceImage : targetImage;
-    // Depth always reads at subrectOffset; colour may live elsewhere in its own image.
-    const VkOffset2D colorOffset = superResolution ? colorSourceOffset : subrectOffset;
+    const bool subrectValid = sourceSubrect.extent.width > 0 && sourceSubrect.extent.height > 0;
+    const bool subrectSmallerThanTarget = extentIsReducedSubrect(
+      sourceSubrect.extent.width, sourceSubrect.extent.height, targetExtent.width, targetExtent.height);
 
-    // Latched before the constant buffer is filled in generateMotionVectorsAndDepth. The engine
-    // composite only exists on the Super Resolution path; the pre-post injection leaves the
-    // game's own chain to run afterwards, so nothing has been replaced there.
-    m_outputTransform = superResolution ? outputTransform : NgxOutputTransform();
+    // Late Super Resolution reads post-processed colour from a replaced engine stretch.
+    // It also reads that colour when the runtime owns the upscale.
+    // Pre-post Super Resolution upscales the HDR scene subrect onto the whole scene-colour target.
+    const bool lateSuperResolution = !prePostProcess && upscaleSourceImage != nullptr && subrectValid;
+    const bool prePostSuperResolution = prePostProcess && subrectSmallerThanTarget;
+    const bool superResolution = lateSuperResolution || prePostSuperResolution;
+    const bool prePostInRect = prePostProcess && subrectValid && !prePostSuperResolution;
+
+    const VkExtent2D displayExtent = prePostSuperResolution ? targetExtent
+                                   : prePostInRect ? sourceSubrect.extent
+                                                   : targetExtent;
+    const VkExtent2D renderExtent = superResolution ? sourceSubrect.extent : displayExtent;
+    const VkOffset2D subrectOffset = (superResolution || prePostInRect) ? sourceSubrect.offset : VkOffset2D { 0, 0 };
+    const Rc<DxvkImage>& colorSourceImage = lateSuperResolution ? upscaleSourceImage : targetImage;
+
+    // Depth reads at subrectOffset.
+    // On the late path the colour can sit at a different offset in its own image.
+    const VkOffset2D colorOffset = lateSuperResolution ? colorSourceOffset : subrectOffset;
+
+    // Latched before generateMotionVectorsAndDepth fills the constant buffer.
+    // The engine output transform is applied only on late Super Resolution.
+    // Pre-post leaves the game's post chain, including its gamma, to run afterwards.
+    m_outputTransform = lateSuperResolution ? outputTransform : NgxOutputTransform();
     m_preserveOriginalAlpha = prePostProcess;
 
     Rc<DxvkContext> dxvkCtx = ctx;
@@ -2097,7 +2106,8 @@ namespace dxvk {
     bool upscalerActive = false;
 
     const bool preserveTargetAlpha = prePostProcess;
-    const VkOffset2D writebackOffset = prePostSubrectValid ? subrectOffset : VkOffset2D { 0, 0 };
+    // DLAA writes back into the scene rect. Pre-post Super Resolution fills the whole target.
+    const VkOffset2D writebackOffset = prePostInRect ? subrectOffset : VkOffset2D { 0, 0 };
 
     const bool canRunNis = RtxOptions::isNISEnabled();
     const bool canRunTaau = RtxOptions::isTAAEnabled() && haveDepthMvInputs;
@@ -2220,8 +2230,7 @@ namespace dxvk {
     // late-injection only), so the merged image is always the one that was written.
     if (wroteOutputToTarget && prePostProcess && mirrorTargetImage != nullptr &&
         mirrorTargetImage.ptr() != targetImage.ptr()) {
-      blitToTargetRect(ctx, m_mergedOutput.image, m_displayExtent, mirrorTargetImage,
-                       prePostSubrectValid ? subrectOffset : VkOffset2D { 0, 0 });
+      blitToTargetRect(ctx, m_mergedOutput.image, m_displayExtent, mirrorTargetImage, writebackOffset);
     }
 
     m_upscalerActive = upscalerActive;

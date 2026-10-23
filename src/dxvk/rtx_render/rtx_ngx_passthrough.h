@@ -225,21 +225,35 @@ namespace dxvk {
     // and compile with their full pipeline state on first use instead.
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
+    // Both axes at or below this percent of the target count as a ScreenPercentage subrect.
+    // One short axis is letterboxing, not a resolution preset.
+    // A zero extent is not a subrect.
+    static constexpr uint32_t kSubrectPercentOfTarget = 97;
+
+    static bool extentIsReducedSubrect(uint32_t width, uint32_t height,
+                                       uint32_t targetWidth, uint32_t targetHeight) {
+      return width != 0 && height != 0 && targetWidth != 0 && targetHeight != 0 &&
+             uint64_t(width) * 100 <= uint64_t(targetWidth) * kSubrectPercentOfTarget &&
+             uint64_t(height) * 100 <= uint64_t(targetHeight) * kSubrectPercentOfTarget;
+    }
+
     // Runs the passthrough pipeline at the injection point. targetImage is the game's color
     // target DLSS reads from and writes back to, sceneDepthImage the depth-stencil image
     // identified by the D3D9 layer as holding the scene depth this frame (may be null, in
     // which case DLSS/DLFG are skipped and the frame passes through untouched).
     //
-    // prePostProcess: the injection fired at the first post-process pass sampling the scene
-    // color; targetImage is the game's linear (typically HDR) scene color and sourceSubrect
-    // carries the scene viewport rect inside it. DLSS runs as DLAA within that rect and the
-    // game's post chain consumes the result. When false, targetImage is the final output
-    // (scene end, pre-UI) holding the post-processed LDR scene.
+    // prePostProcess is true when injection fired on scene colour before the post chain.
+    // targetImage is the game's linear scene colour, usually HDR,
+    // and sourceSubrect is the scene viewport inside it.
+    // Full resolution runs DLAA inside that rect.
+    // A lower preset upscales the rect onto the whole target.
+    // The post chain is retargeted onto that image.
+    // When prePostProcess is false, targetImage is the pre-UI backbuffer and holds the post-processed LDR scene.
     //
     // upscaleSourceImage/sourceSubrect describe the ScreenPercentage upscaling path: when
     // the game renders its scene into a reduced subrect (UE3 ScreenPercentage < 100), the
     // D3D9 layer suppresses the engine's bilinear stretch onto the primary target and hands
-    // over the stretch's source texture plus the scene subrect; DLSS then performs the
+    // over the stretch's source texture plus the scene subrect. DLSS then performs the
     // upscale to the target resolution instead (true Super Resolution). When
     // upscaleSourceImage is null the mode operates as DLAA at the target resolution.
     // colorSourceOffset is where that reduced colour sits inside upscaleSourceImage. It matches
@@ -382,10 +396,11 @@ namespace dxvk {
                "Runs the upscaler on the game's linear scene color before the game's post-process chain instead of on the final\n"
                "post-processed output, matching a native engine integration: bloom, tonemapping and color grading then operate\n"
                "on the anti-aliased, unjittered image rather than baking into the upscaler input (post effects sampling a jittered\n"
-               "scene wobble sub-pixel per frame, which temporal upscalers otherwise have to soften out). Also enables DLSS's HDR\n"
-               "input mode when the scene color is a floating point target and DLSS is selected. The injection triggers on the\n"
-               "first post-process pass sampling the identified scene color; frames where that never happens (e.g. the game's post\n"
-               "chain is disabled) fall back to the late injection point automatically.");
+               "scene wobble sub-pixel per frame, which temporal upscalers otherwise have to soften out). Floating-point scene\n"
+               "colour is passed to DLSS as linear HDR with NGX auto-exposure. At a lower preset the same point upscales that\n"
+               "HDR subrect onto the full scene-colour target.\n"
+               "The injection triggers on the first post-process pass sampling the identified scene color; frames where that never\n"
+               "happens (e.g. the game's post chain is disabled) fall back to the late injection point automatically.");
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocities, true,
                "Rasterizes true motion vectors for dynamic objects into the synthesized motion vector inputs, replacing the\n"
                "static-world camera reprojection where they land. Covers rigid movers (doors, elevators - draws whose transform\n"
@@ -603,6 +618,10 @@ namespace dxvk {
       int initializedRenderPreset = -1;
       uint32_t initializedInput[2] = { 0, 0 };
       uint32_t initializedOutput[2] = { 0, 0 };
+      // IsHDR value this feature was created with.
+      // A mismatch rebuilds it.
+      // The slot is never evaluated in the other colour space.
+      bool initializedContentHDR = false;
     };
     DlssFeature m_dlssFeatures[2];
     int m_dlssLastContentHDR = -1;

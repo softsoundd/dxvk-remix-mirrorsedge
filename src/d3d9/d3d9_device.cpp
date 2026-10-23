@@ -2685,6 +2685,8 @@ namespace dxvk {
       });
     }
 
+    m_rtx.FinishDeferredNgxPrePostInjection((drawPrepare & PrepareDrawFlag::OriginalDrawCall) != 0);
+
     TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
@@ -2740,6 +2742,8 @@ namespace dxvk {
       });
     }
 
+    m_rtx.FinishDeferredNgxPrePostInjection((drawPrepare & PrepareDrawFlag::OriginalDrawCall) != 0);
+
     TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
 
@@ -2773,6 +2777,7 @@ namespace dxvk {
     // NV-DXVK start: geometry processing
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, 0, 0, 0, 0, PrimitiveCount, FALSE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawUPGeometryForRT(false, upSlice, D3DFMT_UNKNOWN, 0, 0, dataSize, VertexStreamZeroStride, drawContext);
+    m_rtx.RetargetNgxUpscaledPostQuad(upSlice.mapPtr, drawInfo.vertexCount, VertexStreamZeroStride);
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
@@ -2803,6 +2808,8 @@ namespace dxvk {
       m_state.vertexBuffers[0].offset = 0;
       m_state.vertexBuffers[0].stride = 0;
     }
+
+    m_rtx.FinishDeferredNgxPrePostInjection((drawPrepare & PrepareDrawFlag::OriginalDrawCall) != 0);
 
     TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
@@ -2848,6 +2855,7 @@ namespace dxvk {
     // NV-DXVK start: geometry processing
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, 0, MinVertexIndex, NumVertices, 0, PrimitiveCount, TRUE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawUPGeometryForRT(true, upSlice, IndexDataFormat, indicesSize, vertexDataSize, vertexDataSize, VertexStreamZeroStride, drawContext);
+    m_rtx.RetargetNgxUpscaledPostQuad(upSlice.mapPtr, NumVertices, VertexStreamZeroStride);
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
@@ -2883,6 +2891,8 @@ namespace dxvk {
 
       m_state.indices = nullptr;
     }
+
+    m_rtx.FinishDeferredNgxPrePostInjection((drawPrepare & PrepareDrawFlag::OriginalDrawCall) != 0);
 
     TrackDrawBufferSequenceNumbers();
     // NV-DXVK end
@@ -6236,7 +6246,9 @@ namespace dxvk {
     // D3D9's coordinate system has its origin in the bottom left,
     // but the viewport coordinates are aligned to the top-left
     // corner so we can get away with flipping the viewport.
-    const D3DVIEWPORT9& vp = m_state.viewport;
+    D3DVIEWPORT9 vp = m_state.viewport;
+    const D3DVIEWPORT9 gameViewport = vp;
+    const bool ngxViewportExpanded = m_rtx.GetNgxPassthroughExpandedViewport(&vp);
 
     // Correctness Factor for 1/2 texel offset
     // We need to bias this slightly to make
@@ -6273,6 +6285,22 @@ namespace dxvk {
 
     if (enableScissorTest) {
       RECT sr = m_state.scissorRect;
+
+      // A scissor matching the reduced scene rect is expanded with the viewport.
+      // Left on the scene rect, it clips the expanded post quad.
+      const int32_t slack = int32_t(D3D9Rtx::kNgxViewportMatchPixels);
+      if (ngxViewportExpanded &&
+          sr.left >= int32_t(gameViewport.X) - slack &&
+          sr.top >= int32_t(gameViewport.Y) - slack &&
+          sr.right <= int32_t(gameViewport.X + gameViewport.Width) + slack &&
+          sr.bottom <= int32_t(gameViewport.Y + gameViewport.Height) + slack &&
+          sr.right >= int32_t(gameViewport.X + gameViewport.Width) - slack &&
+          sr.bottom >= int32_t(gameViewport.Y + gameViewport.Height) - slack) {
+        sr.left = int32_t(vp.X);
+        sr.top = int32_t(vp.Y);
+        sr.right = int32_t(vp.X + vp.Width);
+        sr.bottom = int32_t(vp.Y + vp.Height);
+      }
 
       VkOffset2D srPosA;
       srPosA.x = std::max<int32_t>(0, sr.left);

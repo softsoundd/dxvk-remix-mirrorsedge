@@ -548,6 +548,23 @@ namespace dxvk {
       */
     void PatchNgxScreenPositionScaleBias(DxsoProgramType stage, void* floatConstants, uint32_t floatConstantCount) const;
 
+    // Viewports and scissors within this many pixels of the scene rect are treated as that rect.
+    static constexpr uint32_t kNgxViewportMatchPixels = 4;
+
+    // Expands a viewport that matches the scene rect out to the bound render target.
+    // The game's D3D viewport is left unchanged.
+    bool GetNgxPassthroughExpandedViewport(D3DVIEWPORT9* viewport) const;
+
+    // Rewrites a four-vertex user-pointer quad laid out as float4 position, then float2 UV.
+    // A quad is rewritten only when its clip or UV bounds match the reduced scene rect.
+    void RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride) const;
+
+    // Called at the end of the draw that deferred injection.
+    // A queued draw is followed by DLSS on the image it wrote.
+    // A dropped draw cancels the deferral.
+    // A later draw then cannot inject against a stale target.
+    void FinishDeferredNgxPrePostInjection(bool drawWasIssued);
+
     /**
       * \brief: NGX passthrough mode: returns the texture LOD bias to fold into the current
       * draw's sampler keys, or 0 when out of scope. DLSS Super Resolution renders the scene
@@ -1115,14 +1132,36 @@ namespace dxvk {
     };
     fast_unordered_cache<NgxSpsbCtabReg> m_ngxSpsbCtabCache;
     NgxSpsbCtabReg scanNgxSpsbCtabReg(const std::vector<uint8_t>& bytecode) const;
+    NgxSpsbCtabReg lookupNgxSpsbCtabReg(const D3D9CommonShader* shader);
 
-    // Per-draw ScreenPositionScaleBias patch state, decided in prepareDrawForNgxPassthrough
-    // and consumed by the device's constant upload (cleared before the injection trigger
-    // draw: everything after the injection samples un-jittered DLSS output)
+    // Per-draw ScreenPositionScaleBias patch, decided in prepareDrawForNgxPassthrough
+    // and consumed when the device uploads constants.
+    // Cleared when injection commits.
+    // Later draws sample the unjittered output.
+    // m_ngxSpsbReplaceFull installs the full-buffer mapping and suppresses the jitter add.
     bool m_ngxSpsbPatchActive = false;
+    bool m_ngxSpsbReplaceFull = false;
     NgxSpsbCtabReg m_ngxSpsbPatchVs;
     NgxSpsbCtabReg m_ngxSpsbPatchPs;
     float m_ngxSpsbPatchAdd[2] = { 0.0f, 0.0f };
+
+    // This frame's pre-post evaluate upscaled the scene subrect onto the whole scene-colour target.
+    // Post draws stay retargeted until the first UI draw.
+    bool m_ngxPrePostUpscaled = false;
+    bool m_ngxLoggedPrePostUpscale = false;
+
+    // The bound viewport was expanded to the render target of that draw.
+    // The extent is remembered.
+    // A later expandable target of a different size rebinds.
+    bool m_ngxViewportExpandApplied = false;
+    uint32_t m_ngxExpandedViewportWidth = 0;
+    uint32_t m_ngxExpandedViewportHeight = 0;
+
+    // TdSunHaze matched the pre-post read.
+    // The draw is issued, then DLSS runs on the image it wrote.
+    bool m_ngxDeferPrePostInjection = false;
+    Rc<DxvkImage> m_ngxDeferredPrePostTarget;
+    D3DPRIMITIVETYPE m_ngxDeferredPrimitiveType = D3DPT_TRIANGLELIST;
 
     // Constant uploads only happen when the game dirties them; when the bound shader's
     // patch register differs from what the last upload patched (shader switch without a
@@ -1486,11 +1525,16 @@ namespace dxvk {
     void recordNgxPrePostSceneColorRead();
     void engageNgxPrePostInjection(const Rc<DxvkImage>& matchedTarget);
     Rc<DxvkImage> findNgxPrePostSceneColorFromSamplers(bool applyOrdinalGate, bool recordRead);
-    static bool ngxSceneViewportIsFullSize(const D3DVIEWPORT9& sceneViewport,
-                                           uint32_t backBufferWidth, uint32_t backBufferHeight);
     static bool ngxSceneViewportIsSubrect(const D3DVIEWPORT9& sceneViewport,
                                           uint32_t backBufferWidth, uint32_t backBufferHeight);
     static bool ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo);
+    static bool ngxShaderIsFinalBackbufferComposite(const Ue3ShaderFeatureInfo& psInfo);
+    bool ngxDrawIsUi(const DrawContext& drawContext);
+    bool ngxOffscreenPrePostShape(const DrawContext& drawContext);
+    void refreshNgxUe3VertexFactory();
+    void armNgxFullBufferScreenPositionScaleBias();
+    void noteNgxPostUpscaleViewport();
+    void commitNgxPrePostInjection(D3DPRIMITIVETYPE primitiveType);
 
     // Per-draw snapshot of the bound texture slots, used by UI classification.
     // Invalidated when the bound set changes; bindings cannot change within a draw.
