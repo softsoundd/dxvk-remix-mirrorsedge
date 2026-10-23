@@ -221,7 +221,7 @@ namespace dxvk {
     void onInjectRtxFrameEnd(bool raytracedThisFrame);
 
     void dispatchNgxPassthrough(Rc<DxvkImage> targetImage);
-    void updateMetrics(const float gpuIdleTimeMilliseconds) const;
+    void updateMetrics(const float gpuIdleTimeMilliseconds, bool raytracedThisFrame);
 
     InternalUpscaler getCurrentFrameUpscaler();
 
@@ -229,6 +229,9 @@ namespace dxvk {
     InternalUpscaler m_previousUpscaler = InternalUpscaler::None;
 
     uint32_t m_frameLastInjected = kInvalidFrameIndex;
+    uint32_t m_firstRaytracedFrameId = kInvalidFrameIndex;
+    uint32_t m_lastMetricsFrameId = kInvalidFrameIndex;
+    float m_metricsGpuIdleTimeMs = 0.0f;
     bool m_captureStateForRTX = true;
 
     Rc<DxvkImage> m_skyProbeImage;

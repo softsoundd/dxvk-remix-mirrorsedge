@@ -221,7 +221,6 @@ namespace dxvk {
         rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness.view,
         rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().view(Resources::AccessType::Read),
         rtOutput.m_primaryAlbedo.view,
-        rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Read),
         rtOutput.m_primaryWorldShadingNormalDLSSRR.view(Resources::AccessType::Read),
         rtOutput.m_primarySpecularAlbedo.view(Resources::AccessType::Read),
         rtOutput.m_primaryPerceptualRoughness.view,
@@ -234,7 +233,6 @@ namespace dxvk {
       }
 
       std::vector<Rc<DxvkImageView>> pOutputs = {
-        rtOutput.m_sharedBiasCurrentColorMask.view(Resources::AccessType::Write),
         rtOutput.m_finalOutput.view(Resources::AccessType::Write)
       };
 
@@ -293,11 +291,8 @@ namespace dxvk {
       buffers.pDepth = depthInput;
       buffers.pDiffuseAlbedo = &rtOutput.m_primaryAlbedo;
       buffers.pSpecularAlbedo = specularAlbedoInput;
-      buffers.pExposure = &autoExposure.getExposureTexture();
-      buffers.pPosition = &rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().resource(Resources::AccessType::Read);
       buffers.pNormals = normalsInput;
       buffers.pRoughness = &rtOutput.m_primaryPerceptualRoughness;
-      buffers.pBiasCurrentColorMask = &rtOutput.m_sharedBiasCurrentColorMask.resource(Resources::AccessType::Read);
       buffers.pHitDistance = useSpecularHitDistance() ? &rtOutput.m_rayReconstructionHitDistance.resource(Resources::AccessType::Read) : nullptr;
       buffers.pDisocclusionMask = enableDisocclusionMaskBlur()
         ? &rtOutput.m_primaryDisocclusionMaskForRR.resource(Resources::AccessType::Read)
@@ -305,13 +300,11 @@ namespace dxvk {
 
       NGXRayReconstructionContext::NGXSettings settings;
       settings.resetAccumulation = resetHistory;
-      settings.antiGhost = m_biasCurrentColorEnabled;
       settings.preExposure = mPreExposure;
       settings.jitterOffset[0] = jitterOffset[0];
       settings.jitterOffset[1] = jitterOffset[1];
       settings.motionVectorScale[0] = motionVectorScale[0];
       settings.motionVectorScale[1] = motionVectorScale[1];
-      settings.autoExposure = mAutoExposure;
       settings.frameTimeMilliseconds = frameTimeMilliseconds;
 
       m_rayReconstructionContext->evaluateRayReconstruction(ctx, buffers, settings);

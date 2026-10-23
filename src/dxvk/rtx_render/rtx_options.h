@@ -37,6 +37,9 @@
 #include "rtx_utils.h"
 #include "rtx/concept/ray_portal/ray_portal.h"
 #include "rtx_dlss.h"
+#include "rtx_gpu_overrides.h"
+#include "rtx_gpu_profile.h"
+#include "rtx_graphics_preset.h"
 #include "rtx_materials.h"
 #include "rtx/pass/material_args.h"
 #include "rtx_option.h"
@@ -61,17 +64,6 @@ namespace dxvk {
     NIS,
     TAAU,
     XeSS
-  };
-
-  enum class GraphicsPreset : int {
-    Ultra = 0,
-    High,
-    Medium,
-    Low,
-    Custom,
-    // Note: Used to automatically have the graphics preset set on initialization, not used beyond this case
-    // as it should be overridden by one of the other values by the time any other code uses it.
-    Auto
   };
 
   enum class DlssPreset : int {
@@ -156,7 +148,6 @@ namespace dxvk {
     ImportanceSampled = 0,   // Importance sampled integration - provides the noisiest output and used primarily for reference comparisons
     ReSTIRGI = 1,            // Importance Sampled + ReSTIR GI integrations
     NeuralRadianceCache = 2, // Implements a live trained neural network to provide a world space radiance cache and allow the pathtracer to terminate paths earlier into the cache.
-  
     Count
   };
 
@@ -375,6 +366,8 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx", float, emissiveIntensity, 1.0f, "A general scale factor on all emissive intensity values globally. Generally per-material emissive intensities should be used, but this option may be useful for debugging without needing to author materials.",
                     args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx", float, fireflyFilteringLuminanceThreshold, 1000.0f, "Maximum luminance threshold for the firefly filtering to clamp to.",
+                    args.minValue = 0.0f);
+    RTX_OPTION_ARGS("rtx", float, primaryIndirectSpecularFireflyFilteringThreshold, 50.0f, "Maximum per-channel radiance for the primary indirect specular signal to suppress fireflies.",
                     args.minValue = 0.0f);
     RTX_OPTION("rtx", float, secondarySpecularFireflyFilteringThreshold, 1000.0f, "Firefly luminance clamping threshold for secondary specular signal.");
     RTX_OPTION_ARGS("rtx", float, vertexColorStrength, 0.6f,
@@ -617,6 +610,14 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx", float, uniqueObjectDistance, 300.f, "The distance (in game units) that an object can move in a single frame before it is no longer considered the same object.\n"
                     "If this is too low, fast moving objects may flicker and have bad lighting.  If it's too high, repeated objects may flicker.\n"
                     "This does not account for sceneScale.", args.minValue = 0.f);
+
+    // Bounds the end-of-frame instance history repair, which scales cubically with cluster size.
+    RTX_OPTION_ARGS("rtx", uint32_t, maxInstanceHistoryRepairClusterSize, 1, "The largest cluster of interchangeable instances that end-of-frame instance history repair will process.\n"
+                   "Clusters above this size keep their as-submitted history, which may reintroduce draw-order-dependent identity swaps. Set to 0 to disable the repair pass entirely.", args.minValue = 0u);
+
+    // Restricts instance history repair to clusters whose count from its earlier count. Usually the clusters that have altered its size are the ones that are mismatched.
+    RTX_OPTION("rtx", bool, repairInstanceMatchOnlyWhenClusterChanges, true,
+               "Only run end-of-frame instance history repair on clusters whose instance count differs from its earlier count.\n");
 
     RTX_OPTION("rtx", bool, useNewGuiInputMethod, true, "Disables the previous method for getting mouse/keyboard input and enables a new method which should be more reliable.  If successful the old method will be deprecated.  This setting can't be changed at runtime, so it must be set in a .conf file.");
 
@@ -1348,6 +1349,9 @@ namespace dxvk {
       RTX_OPTION_FLAG_ENV("rtx.automation", bool, enableTestTrace, false, RtxOptionFlags::NoSave, "RTX_TEST_TRACE",
                           "Enables opt-in frame trace artifacts for automation-driven image tests.\n"
                           "When enabled, Remix records a bounded frame window around the configured screenshot frame, writes frame_trace.jsonl, and appends dxvk_trace_* summary fields to metrics.txt.");
+      RTX_OPTION_FLAG_ENV("rtx.automation", uint32_t, metricsWarmupFrames, 5, RtxOptionFlags::NoSave, "RTX_AUTOMATION_METRICS_WARMUP_FRAMES",
+                          "Number of frames, starting with the first ray traced frame, excluded as warmup from the averaged frame time, GPU idle time and memory usage in metrics.txt.\n"
+                          "Frames before the first ray traced frame are also excluded. 0 disables warmup, so every frame is averaged, including in runs that never ray trace. dxvk_warmup_time_ms reports the dxvk_total_time_ms clock at the last warmup sample.");
     };
 
   public:
@@ -1393,6 +1397,9 @@ namespace dxvk {
       if (env::getEnvVar("DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD") == "1") {
         RtxOptionManager::writeMarkdownDocumentation("RtxOptions.md");
       }
+
+      // Registered before layers load so their keys are created as the layers are applied.
+      GpuOverrides::registerNamespaces();
 
       // Initialize all system layers (creates layers from config files)
       RtxOptionLayer::initializeSystemLayers();

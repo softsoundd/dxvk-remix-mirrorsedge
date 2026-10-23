@@ -73,6 +73,7 @@ dxvk_is_msvc = dxvk_compiler.get_id() == 'msvc'
 dxvk_is_ninja = meson.backend() == 'ninja'
 dxvk_is_woa = target_machine.cpu() == 'armv8'
 dxvk_is_woa_ec = target_machine.cpu() == 'arm64ec'
+dxvk_is_x64 = not dxvk_is_woa and not dxvk_is_woa_ec
 enable_rtxio = get_option('enable_rtxio')
 
 external_dll_paths = []
@@ -102,6 +103,12 @@ if dxvk_is_msvc
     add_global_link_arguments('/OPT:REF', language : 'cpp')
     add_global_link_arguments('/OPT:ICF', language : 'cpp')
   endif
+endif
+
+# Passed per target because global link arguments do not always reach the VS backend targets (e.g. d3d9, HdRemix).
+dxvk_release_link_args = []
+if dxvk_is_msvc and dxvk_is_woa_ec and get_option('buildtype') == 'release'
+  dxvk_release_link_args = ['/DEBUG', '/OPT:REF', '/OPT:ICF']
 endif
 
 if enable_rtxio == true
@@ -191,7 +198,6 @@ if not dxvk_is_msvc
 endif
 
 remix_api_include_path = include_directories('./public/include')
-add_global_arguments('/DREMIX_LIBRARY_EXPORTS=1', language : 'cpp')
 
 if dxvk_is_woa
   nrc_include_path = 'external/nrc_arm64/include'
@@ -199,7 +205,7 @@ else
   nrc_include_path = 'submodules/nrc/include'
 endif
 
-nsight_graphics_capture_supported = target_machine.cpu_family() == 'x86_64'
+nsight_graphics_capture_supported = (target_machine.cpu_family() == 'x86_64') or dxvk_is_woa_ec
 if nsight_graphics_capture_supported
   add_project_arguments('-DDXVK_ENABLE_NSIGHT_GRAPHICS_CAPTURE=1', language : 'cpp')
 endif
@@ -611,7 +617,8 @@ if enable_tests
   subdir('tests')
 endif
 
-hdremix_outdir = join_paths(meson.current_source_dir(), 'nv-private', 'hdremix', 'bin', get_option('buildtype'))
+hdremix_arch_outdir = dxvk_is_woa_ec ? 'bin_a64ec' : 'bin'
+hdremix_outdir = join_paths(meson.current_source_dir(), 'nv-private', 'hdremix', hdremix_arch_outdir, get_option('buildtype'))
 
 # dict of "output" targets --- key is an output path, value is an optional executable inside that path,
 # which is used to run that "output" from the IDE
@@ -756,7 +763,8 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
     install_data(join_paths(dlss_bin_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
     install_data(join_paths(dlss_bin_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(dlss_bin_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix) 
+    install_data(join_paths(dlfg_bin_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix)
+    install_data(join_paths(dlnr_bin_path, 'nvngx_dlssnr.dll'), install_dir : output_path, install_tag: target_suffix)
 
     install_data(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'), install_dir : output_path, install_tag: target_suffix) 
 
@@ -791,7 +799,7 @@ if dxvk_is_ninja or dxvk_is_woa_ec
     if t != '_output'
       meson.add_install_script(
         join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
-        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9.dll'), output_path,
+        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9*.dll'), output_path,
         install_tag: target_suffix
       )
     endif
@@ -800,7 +808,7 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 	  # ensure we copy everything to these special targets, the PDB is important!
       meson.add_install_script(
         join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
-        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9.*'), output_path,
+        join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9*.*'), output_path,
         install_tag: target_suffix
       )
     endif

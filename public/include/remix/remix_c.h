@@ -38,14 +38,18 @@
 
 
 // __stdcall convention
-#define REMIXAPI_CALL __stdcall
+#ifndef REMIXAPI_CALL
+  #define REMIXAPI_CALL __stdcall
+#endif
 #define REMIXAPI_PTR  REMIXAPI_CALL
 
-#ifdef REMIX_LIBRARY_EXPORTS
-  #define REMIXAPI __declspec(dllexport)
-#else
-  #define REMIXAPI __declspec(dllimport)
-#endif // REMIX_LIBRARY_EXPORTS
+#ifndef REMIXAPI
+  #ifdef REMIX_LIBRARY_EXPORTS
+    #define REMIXAPI __declspec(dllexport)
+  #else
+    #define REMIXAPI __declspec(dllimport)
+  #endif
+#endif // REMIXAPI
 
 
 #define REMIXAPI_VERSION_MAKE(major, minor, patch) ( \
@@ -701,6 +705,9 @@ extern "C" {
     remixapi_LightHandle      lightHandle);
 
 
+  // Writes an RtxOption value to the user layer. Keys in a registered dynamic option namespace are
+  // validated immediately and applied at the next frame's option update. Returns INVALID_ARGUMENTS for an
+  // invalid key or value, GENERAL_FAILURE for an unknown key. See documentation/RemixConfig.md.
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetConfigVariable)(
     const char*               key,
     const char*               value);

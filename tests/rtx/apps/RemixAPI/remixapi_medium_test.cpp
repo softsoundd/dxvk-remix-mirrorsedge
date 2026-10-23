@@ -293,9 +293,11 @@ namespace {
 }
 
 int main(int argc, char* argv[]) {
+  // Zero or negative runs until closed; the test runner passes -1 for --doNotAutoTerminate.
   const int captureFrames = argc >= 2 ? std::atoi(argv[1]) : 0;
+  const bool runUntilClosed = captureFrames <= 0;
   constexpr int kDrainFrames = 8;
-  const int numFrames = captureFrames == 0 ? 0 : captureFrames + kDrainFrames;
+  const int numFrames = runUntilClosed ? 0 : captureFrames + kDrainFrames;
   const WNDCLASSEX windowClass = {
     .cbSize = sizeof(WNDCLASSEX),
     .style = CS_CLASSDC,
@@ -350,7 +352,7 @@ int main(int argc, char* argv[]) {
         GetClientRect(hwnd, &rect);
         const uint32_t width = static_cast<uint32_t>(std::max(0L, rect.right - rect.left));
         const uint32_t height = static_cast<uint32_t>(std::max(0L, rect.bottom - rect.top));
-        render(width, height, captureFrames == 0 || frameIndex < captureFrames);
+        render(width, height, runUntilClosed || frameIndex < captureFrames);
         frameIndex++;
       }
     }
@@ -359,7 +361,17 @@ int main(int argc, char* argv[]) {
     exitCode = EXIT_FAILURE;
   }
 
-  DestroyWindow(hwnd);
+  if (g_remix) {
+    const auto shutdownResult = remix::lib::shutdownAndUnloadRemixDll(*g_remix);
+    if (!shutdownResult) {
+      std::printf("FAILED: shutdownAndUnloadRemixDll() failed %d\n",
+      static_cast<int>(shutdownResult.status()));
+      exitCode = EXIT_FAILURE;
+    }
+    g_remix.reset();
+  }
+
   UnregisterClass(windowClass.lpszClassName, windowClass.hInstance);
+
   return exitCode;
 }

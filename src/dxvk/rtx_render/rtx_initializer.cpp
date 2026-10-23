@@ -38,6 +38,8 @@
 #include "rtx_ray_reconstruction.h"
 #include "rtx_ngx_passthrough.h"
 #include "rtx_postFx.h"
+#include "rtx_gpu_overrides.h"
+#include "rtx_gpu_profile.h"
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -59,6 +61,12 @@ namespace dxvk {
     DxvkObjects* pCommon = m_device->getCommon();
     pCommon->getTextureManager().startAsync();
 #endif
+
+    const VkPhysicalDeviceProperties& gpuProperties = m_device->adapter()->devicePropertiesExt().core.properties;
+    GpuOverrides::setCurrentGpu(gpuProperties.vendorID, gpuProperties.deviceID);
+    GpuProfile::detect(m_device->adapter()->devicePropertiesExt(), m_device->adapter()->memoryProperties(),
+                       m_device->adapter()->getMemoryHeapInfo());
+    GpuOverrides::logInvalidEntries();
 
     // Initialize RTX settings presets
     // Todo: Improve this preset override functionality [REMIX-1482]

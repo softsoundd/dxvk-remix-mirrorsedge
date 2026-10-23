@@ -206,8 +206,10 @@ struct ReplacementInstance {
   XXH64_hash_t legacyMaterialIdentityHash = kEmptyHash;
   XXH64_hash_t vertexPositionHash = kEmptyHash;
   Vector3 centroid = Vector3(0.f);
+  Vector3 prevCentroid = Vector3(0.f);
+  const void* sourceVertexBufferAddress = nullptr; // Address of DXVK buffer object mapped to source D3D9 VB (L2 match key)
   uint32_t frameCreated = 0;
-  uint32_t frameLastSeen = 0;
+  uint32_t frameLastSeen = UINT32_MAX;
   XXH64_hash_t spatialCacheTransformHash = kEmptyHash;
 
   // The replacement data this RI was set up with. Used to detect when replacements
@@ -396,6 +398,9 @@ struct RasterGeometry {
   RasterBuffer indexBuffer;
   RasterBuffer blendWeightBuffer;
   RasterBuffer blendIndicesBuffer;
+
+  // Address of DXVK buffer object mapped to source D3D9 VB (L2 match key) that is captured from drawCallState.Used in instance matching.
+  const void* sourceVertexBufferAddress = nullptr;
 
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;
@@ -1146,16 +1151,17 @@ enum class RtxFramePassStage {
   VolumeIntegrateRestirSpatialResampling,
   VolumeIntegrateRaytracing,
   GBufferPrimaryRays,
-  ReflectionPSR,
-  TransmissionPSR,
+  PSR,
   RTXDI_InitialTemporalReuse,
   RTXDI_SpatialReuse,
   NEE_Cache,
   DirectIntegration,
   RTXDI_ComputeGradients,
+  IndirectIntegrationUpdate,
   IndirectIntegration,
   NEE_Integration,
   NRC,
+  SHaRCUpdate,
   RTXDI_FilterGradients,
   RTXDI_ComputeConfidence,
   ReSTIR_GI_TemporalReuse,

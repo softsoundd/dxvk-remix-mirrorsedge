@@ -78,7 +78,6 @@ namespace dxvk {
   private:
     void initializeRayReconstruction(Rc<DxvkContext> pRenderContext);
 
-    bool                        m_biasCurrentColorEnabled = true;
     RayReconstructionPreset     m_prevPreset;
 
     Rc<DxvkBuffer> m_constants;

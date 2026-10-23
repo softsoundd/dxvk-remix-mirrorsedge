@@ -29,8 +29,11 @@
     <dependency name="nv_xxd" linkPath="external/nv_xxd">
         <package name="rtx-remix-nv_xxd" version="1" />
     </dependency>
+    <dependency name="ngx_sdk_dlfg" linkPath="external/ngx_sdk_dlfg">
+        <package name="rtx-remix-ngx_sdk_dlfg" version="5" />
+    </dependency>
     <dependency name="ngx_sdk_dlnr" linkPath="external/ngx_sdk_dlnr">
-        <package name="rtx-remix-ngx_sdk_dlnr" version="1" />
+        <package name="rtx-remix-ngx_sdk_dlnr" version="2" />
     </dependency>
 	<dependency name="nrd" linkPath="external/nrd">
 	    <package name="rtx-remix-nrd" version="4.13" />
@@ -61,7 +64,7 @@
         <package name="rtx-remix-reflex_arm64" version="1.8" />
     </dependency>
     <dependency name="rtxio_arm64" linkPath="external/rtxio_arm64">
-        <package name="rtx-remix-rtxio_arm64" version="1" />
+        <package name="rtx-remix-rtxio_arm64" version="3" />
     </dependency>
     <dependency name="sentry-native_arm64" linkPath="external/sentry-native_arm64">
         <package name="rtx-remix-sentry-native_arm64" version="0.15.3" />

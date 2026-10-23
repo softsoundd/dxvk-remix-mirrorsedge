@@ -217,8 +217,13 @@ dxvk_src = files([
   'rtx_render/rtx_terrain_baker.h',
   'rtx_render/rtx_gpu_crash_recorder.cpp',
   'rtx_render/rtx_gpu_crash_recorder.h',
+  'rtx_render/rtx_gpu_overrides.cpp',
+  'rtx_render/rtx_gpu_overrides.h',
   'rtx_render/rtx_gpu_pass_timer.cpp',
   'rtx_render/rtx_gpu_pass_timer.h',
+  'rtx_render/rtx_gpu_profile.cpp',
+  'rtx_render/rtx_gpu_profile.h',
+  'rtx_render/rtx_graphics_preset.h',
   'rtx_render/rtx_hashing.cpp',
   'rtx_render/rtx_hashing.h',
   'rtx_render/rtx_hash_collision_detection.cpp',
@@ -257,6 +262,8 @@ dxvk_src = files([
   'rtx_render/rtx_option.cpp',
   'rtx_render/rtx_option.h',
   'rtx_render/rtx_option_constants.h',
+  'rtx_render/rtx_option_dynamic.cpp',
+  'rtx_render/rtx_option_dynamic.h',
   'rtx_render/rtx_option_layer.cpp',
   'rtx_render/rtx_option_layer.h',
   'rtx_render/rtx_option_manager.cpp',
@@ -439,7 +446,7 @@ dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shader
   include_directories : [ dxvk_include_path, dxvk_shader_include_path, remix_api_include_path, rtxcr_include_path, submodules_include_path ],
   override_options    : ['cpp_std='+dxvk_cpp_std],
   # Force switch statements over enums to either cover all cases or have a default case.
-  cpp_args            : dxvk_is_msvc ? ['/we4062'] : ['-Wswitch'],
+  cpp_args            : dxvk_is_msvc ? ['/we4062', '/DREMIX_LIBRARY_EXPORTS=1'] : ['-Wswitch'],
   cpp_pch             : ['pch/dxvk.pch.h']
   )
 

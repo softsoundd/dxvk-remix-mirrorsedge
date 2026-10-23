@@ -82,8 +82,47 @@ This document outlines our project's C++ code formatting standards, commenting s
 
   Comparisons against a value other than zero, and bit tests such as `(flags & kSomeBit) != 0`, are unaffected.
 
+- **Shader Argument Flags**: When setting a `uint` flag in a shader constant buffer argument struct from a `bool`, assign the `bool` directly. The conversion already yields 1 or 0, so a ternary is redundant.
+
+  ```cpp
+  // Good
+  args.enableFeature = Options::enableFeature();
+
+  // Bad
+  args.enableFeature = Options::enableFeature() ? 1u : 0u;
+  ```
+
+- **Subject First**: Put the subject (the variable being tested) on the left of the operator.
+
+  ```cpp
+  // Good
+  if (pData == nullptr) {
+    // ...
+  }
+
+  // Bad
+  if (nullptr == pData) {
+    // ...
+  }
+  ```
+
+- **Long Ternaries**: When a ternary expression is complex or long, put the condition on the first line and the `?` and `:` branches on the two lines that follow, each indented one level. Short ternaries stay on one line.
+
+  ```cpp
+  // Good
+  const Resources::Resource& worldPosition = useCurrentFrame
+    ? rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal()
+    : rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal();
+
+  const float scale = isActive ? rate : 1.0f;
+
+  // Bad
+  const Resources::Resource& worldPosition = useCurrentFrame ? rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal() : rtOutput.getPreviousPrimaryWorldPositionWorldTriangleNormal();
+  ```
+
 ### Headers and Includes
 
+- **Location**: Place includes at the start of the file, after the copyright header and `#pragma once`. Do not place them partway through the code.
 - **Ordering**: Standard libraries first, followed by third-party libraries, and then local project headers.
 - **Separation**: Separate each group with a blank line.
 
@@ -121,6 +160,56 @@ This document outlines our project's C++ code formatting standards, commenting s
   int square(int num) {
     return num * num;
   }
+  ```
+
+- **Wording**: Write comments as proper sentences. Keep them concise, but not at the cost of complete sentences. Do not join clauses with semicolons, and do not use noun-phrase fragments, `Label: fragment` prefixes, or shorthand that leaves the reader to guess what is meant. A comment directly above or next to the function, variable or member it describes may leave that subject implied.
+
+  ```cpp
+  // Good
+  // Holds the previous frame's depth, which is read at reprojected coordinates, so it stays at full resolution.
+  Resource m_previousDepth;
+
+  // Bad
+  // Previous depth; read at reprojected coords, so full res.
+  Resource m_previousDepth;
+  ```
+
+- **Alternate Results**: When a comment lists alternate results or cases, give each its own sentence on its own line, like a list.
+
+  ```cpp
+  // Good
+  // Returns the texture's index in the bindless table.
+  // Returns BINDING_INDEX_INVALID when the texture is not loaded.
+  // Returns the fallback texture's index while the texture is still streaming in.
+
+  // Bad
+  // Returns the texture's index in the bindless table, or BINDING_INDEX_INVALID when the texture is not loaded, and
+  // otherwise the fallback texture's index.
+  ```
+
+- **Group Comments**: When a comment describes a group of declarations or statements inside a longer run of code, put an empty line above the comment and below the group, so it is clear where the comment's scope ends.
+
+  ```cpp
+  const VkExtent3D& getDownscaleDimensions() const { return m_downscaledExtent; }
+
+  // These report whether the RTXDI gradient resources exist and whether the current options need them.
+  bool areRtxdiGradientResourcesAllocated() const { return m_rtxdiGradientResourcesAllocated; }
+  bool needsRtxdiGradientResources() const;
+
+  bool areRtxdiIlluminanceResourcesAllocated() const { return m_rtxdiIlluminanceResourcesAllocated; }
+  ```
+
+- **Line Breaks**: Break comment lines at natural places whenever possible: after a period, after a comma, or where an idea is finished. Do not end a line with the first word or two of a new sentence, and never leave a single word of a sentence or clause on its own line or at the start of the next one. Prefer pulling the word up onto the previous line, even if it runs a few characters past the usual width. If that is too long, break earlier at the start of the clause.
+
+  ```cpp
+  // Good
+  // Skips pixels whose primary ray missed, because a miss stores no surface.
+  // Callers that already hold the hit distance pass it in.
+
+  // Bad
+  // Skips pixels whose primary ray missed, because a miss stores no surface. Callers
+  // that already hold the hit distance pass it
+  // in.
   ```
 
 - **Block Comments**: Use `/* */` for detailed explanations or temporarily commenting out code.
@@ -184,9 +273,22 @@ This document outlines our project's C++ code formatting standards, commenting s
   }
   ```
   
-## Changes to DXVK
+## Changes to Upstream-Derived DXVK Code
 
-- **Comment blocks**: Follow the pattern of comment blocking to define regions of code inside core DXVK files which are diverging from upstream DXVK.
+- **Scope**: Use NV-DXVK start/end blocks to mark Remix changes to upstream-derived DXVK code. This depends on the code's origin, not its directory. Mark every new change to upstream-derived code, including short changes, includes and declarations, even where older changes nearby are unmarked.
+
+- **Origin**: Check whether the file comes from the original DXVK project or a vendored library. Use the upstream source and file history when its origin is unclear. Files written for Remix, such as `src/d3d9/d3d9_rtx.cpp`, do not use NV-DXVK start/end blocks, wherever they are in the tree. An NVIDIA-only copyright header is a clue, not proof of Remix ownership: upstream-derived `src/d3d9/d3d9_device.cpp` and the vendored ImGui Win32 backend also have one.
+
+- **Existing blocks**: Keep changes inside an existing enclosing block without nesting another pair. If a change immediately next to a block belongs to the same divergence, extend that block and update its description as needed. Use a separate block for an unrelated change. Do not extend a block across unrelated upstream code just to combine regions.
+
+- **Scoped mixed-code conventions**:
+  - **Profiling instrumentation**: Keep standalone profiling macro calls unmarked where that is the local convention, as with `ScopedCpuProfileZone()` calls in `src/d3d9/d3d9_device.cpp`. This exception covers the profiling calls only, not surrounding logic, includes or declarations.
+  - **Application defaults**: Add or update entries in `g_appDefaults` in `src/util/config/config.cpp` without NV-DXVK start/end blocks. Follow the table's existing game comments and entry layout, as in the HL2 engine entry. Changes to configuration logic outside the table still use blocks.
+  - These exceptions apply only to the named instrumentation and table entries, not to other unmarked changes nearby.
+
+- **Vendored libraries**: Preserve the library's code style and use its established divergence-marker convention. For example, vendored ImGui code in `src/dxvk/imgui/imgui_impl_win32.cpp` uses NV-DXVK start/end blocks for Remix changes, such as the `DeltaTime` clamp. Use that convention for new changes to vendored ImGui code, rather than treating it as Remix-owned code.
+
+- **Block syntax**:
 
   ```cpp
   // NV-DXVK start: Diverging DXVK change to add new function

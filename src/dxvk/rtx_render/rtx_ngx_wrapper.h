@@ -28,14 +28,13 @@
 #include <nvsdk_ngx_defs.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
-#ifdef _M_X64
 #include <nvsdk_ngx_defs_dlssnr.h>
-#endif
 #endif
 
 #include <cstdint>
 #include <memory>
 #include "../util/rc/util_rc_ptr.h"
+#include "../util/util_export_macros.h"
 #include "rtx_semaphore.h"
 
 // run DLFG in graphics queue for debugging
@@ -260,22 +259,17 @@ namespace dxvk {
       const Resources::Resource* pDepth;
       const Resources::Resource* pDiffuseAlbedo;
       const Resources::Resource* pSpecularAlbedo;
-      const Resources::Resource* pExposure;
-      const Resources::Resource* pPosition;
       const Resources::Resource* pNormals;
       const Resources::Resource* pRoughness;
-      const Resources::Resource* pBiasCurrentColorMask;
       const Resources::Resource* pHitDistance;
       const Resources::Resource* pDisocclusionMask;
     };
 
     struct NGXSettings {
       bool resetAccumulation;
-      bool antiGhost;
       float preExposure;
       float jitterOffset[2];
       float motionVectorScale[2];
-      bool autoExposure;
       float frameTimeMilliseconds;
     };
 
@@ -341,11 +335,12 @@ namespace dxvk {
       Success,
     } EvaluateResult;
 
-    void initialize(
+    bool initialize(
       Rc<DxvkContext> renderContext,
       VkCommandBuffer commandList,
       uint32_t displayOutSize[2],
-      VkFormat outputFormat
+      VkFormat outputFormat,
+      bool litePreset
       );
 
     // interpolates one frame
@@ -407,7 +402,7 @@ namespace dxvk {
       float skinStructureStrength;
     };
 
-    void initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2]);
+    void initialize(Rc<DxvkContext> renderContext, const uint32_t displaySize[2], bool queryVramAllocation);
 
     bool evaluateNeuralRendering(Rc<DxvkContext> renderContext, const NGXNeuralRenderingBuffers& buffers, const NGXNeuralRenderingSettings& settings) const;
 
@@ -415,6 +410,14 @@ namespace dxvk {
 
     bool isNeuralRenderingInitialized() const {
       return m_initialized && m_neuralRenderingFeature != nullptr;
+    }
+
+    bool hasVramAllocation() const {
+      return m_hasVramAllocation;
+    }
+
+    uint64_t getVramAllocationBytes() const {
+      return m_vramAllocationBytes;
     }
 
   public:
@@ -429,10 +432,12 @@ namespace dxvk {
 
   private:
     bool m_initialized = false;
+    bool m_hasVramAllocation = false;
+    uint64_t m_vramAllocationBytes = 0;
     NVSDK_NGX_Handle* m_neuralRenderingFeature = nullptr;
   };
 #endif // NVSDK_NGX_DEFS_H
 }
 
 // -1 while NGX support is unknown, 0 when unavailable, and 1 when available.
-extern "C" __declspec(dllexport) int remixinternal_GetDlssNeuralRenderingStatus();
+extern "C" REMIXAPI int remixinternal_GetDlssNeuralRenderingStatus();
