@@ -802,6 +802,11 @@ if dxvk_is_ninja or dxvk_is_woa_ec
         join_paths(current_build_dir_norm, 'src/d3d9', 'd3d9*.dll'), output_path,
         install_tag: target_suffix
       )
+      meson.add_install_script(
+        join_paths(global_src_root_norm, 'scripts-common/install_file_in_dir.bat'),
+        join_paths(current_build_dir_norm, 'src/dxvk', 'nvngx.dll_dlssnr.dll'), output_path,
+        install_tag: target_suffix
+      )
     endif
 
     if requires_pdb

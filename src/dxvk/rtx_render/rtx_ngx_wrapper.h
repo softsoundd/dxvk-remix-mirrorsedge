@@ -112,6 +112,12 @@ namespace dxvk {
       return m_supportsDlssNeuralRendering;
     }
 
+    // The local nvngx_dlssnr.dll has no valid signature.
+    // Create, evaluate, and release go through nvngx.dll_dlssnr.dll.
+    bool useDirectDlssNeuralRendering() const {
+      return m_dlssNeuralRenderingDirectLoad;
+    }
+
     bool isDlssNeuralRenderingSupportChecked() const {
       return m_dlssNeuralRenderingSupportChecked;
     }
@@ -137,6 +143,7 @@ namespace dxvk {
     bool m_supportsRayReconstruction = false;
     bool m_supportsDlssNeuralRendering = false;
     bool m_dlssNeuralRenderingSupportChecked = false;
+    bool m_dlssNeuralRenderingDirectLoad = false;
 
     bool checkDLSSSupport(NVSDK_NGX_Parameter* params);
     bool checkDlssNeuralRenderingSupport(NVSDK_NGX_Parameter* params);
@@ -433,6 +440,9 @@ namespace dxvk {
   private:
     bool m_initialized = false;
     bool m_hasVramAllocation = false;
+    // The handle came from nvngx.dll_dlssnr.dll.
+    // Evaluate and release have to use that DLL.
+    bool m_directSnippet = false;
     uint64_t m_vramAllocationBytes = 0;
     NVSDK_NGX_Handle* m_neuralRenderingFeature = nullptr;
   };

@@ -255,7 +255,6 @@ namespace dxvk {
       RemixGui::Checkbox("Highlight Recovery", &DlssNeuralRendering::enableHighlightRecoveryObject());
       // Thresholds: (exposed HDR max-channel min/max, LDR max-channel min/max)
       RemixGui::DragFloat4("Highlight Recovery Thresholds", &DlssNeuralRendering::highlightRecoveryThresholdsObject(), 0.01f, 0.0f, 32.0f, "%.3f", flags);
-      RemixGui::Checkbox("Volumetric Improvement", &DlssNeuralRendering::enableVolumetricControlMaskObject());
       ImGui::Unindent();
     }
   }

@@ -89,8 +89,6 @@ namespace dxvk {
     RTX_OPTION("rtx.dlssNeuralRendering", bool,    enableHighlightRecovery, true, "Recover highlights compressed by DLSS 3D-Guided Neural Rendering's LDR-domain processing.");
     RTX_OPTION("rtx.dlssNeuralRendering", Vector4, highlightRecoveryThresholds, Vector4(1.0f, 8.0f, 0.75f, 0.99f), "Smoothstep edges for highlight recovery: (exposed HDR max-channel min, exposed HDR max-channel max, LDR max-channel min, LDR max-channel max).");
 
-    RTX_OPTION("rtx.dlssNeuralRendering", bool, enableVolumetricControlMask, true, "Modulate the DLSS 3D-Guided Neural Rendering control mask with fog, volumetric, and alpha-blended transmittance.");
-
     RTX_OPTION("rtx.dlssNeuralRendering", bool, showVramUsage, false,
                "Shows SDK VRAM allocation in the DLSS 3D-Guided Neural Rendering settings. Queries aggregate SDK allocation at feature creation; excludes Remix textures. Enable before activating the feature.");
 

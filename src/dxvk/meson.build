@@ -453,3 +453,12 @@ dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shader
 dxvk_dep = declare_dependency(
   link_with           : [ dxvk_lib ],
   include_directories : [ dxvk_include_path ])
+
+# The snippet rejects a caller whose module path does not contain "nvngx.dll".
+dlssnr_forwarder = shared_library(
+  'nvngx.dll_dlssnr',
+  files('rtx_render/nvngx_dlssnr_forwarder.cpp'),
+  name_prefix         : '',
+  dependencies        : [ lib_vulkan ],
+  include_directories : [ dlss_include_dirs, vk_include_path ],
+  override_options    : ['cpp_std='+dxvk_cpp_std])

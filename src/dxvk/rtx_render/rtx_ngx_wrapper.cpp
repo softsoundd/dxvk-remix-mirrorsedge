@@ -32,6 +32,9 @@
 #include <Winternl.h>
 #include <d3dkmthk.h>
 #include <d3dkmdt.h>
+#include <softpub.h>
+#include <wintrust.h>
+#pragma comment(lib, "wintrust")
 
 #include "rtx_ngx_wrapper.h"
 #include "rtx_matrix_helpers.h"
@@ -52,6 +55,7 @@
 
 #include <nvsdk_ngx_defs_dlssnr.h>
 #include <nvsdk_ngx_helpers_dlssnr_vk.h>
+#include "nvngx_dlssnr_forwarder.h"
 
 #include "rtx_resources.h"
 #include "rtx_semaphore.h"
@@ -121,6 +125,61 @@ namespace dxvk
 
       return ViewToResourceVK(tex->view, isUAV);
     }
+
+    // A snippet with an empty certificate directory is unsigned, so its body is not hashed.
+    // When a certificate is present, it is verified in full.
+    // Revocation is skipped, so a signed snippet still verifies while offline.
+    bool localDlssNrSnippetLacksValidSignature() {
+      const std::wstring path = str::tows((env::getDllDirectory() + "\\nvngx_dlssnr.dll").c_str());
+      const DWORD attributes = GetFileAttributesW(path.c_str());
+      if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return false;
+      }
+
+      HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+      DWORD certificateSize = 0;
+      bool readCertificateSize = false;
+      if (file != INVALID_HANDLE_VALUE) {
+        uint8_t bytes[4096];
+        DWORD read = 0;
+        if (ReadFile(file, bytes, sizeof(bytes), &read, nullptr) && read >= sizeof(IMAGE_DOS_HEADER)) {
+          const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
+          const size_t ntOffset = dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0
+            ? static_cast<size_t>(dos->e_lfanew) : 0;
+          if (ntOffset != 0 && ntOffset <= read && read - ntOffset >= sizeof(IMAGE_NT_HEADERS64)) {
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes + ntOffset);
+            if (nt->Signature == IMAGE_NT_SIGNATURE && nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+              certificateSize = nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_SECURITY
+                ? 0 : nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size;
+              readCertificateSize = true;
+            }
+          }
+        }
+        CloseHandle(file);
+      }
+      if (readCertificateSize && certificateSize == 0) {
+        return true;
+      }
+
+      WINTRUST_FILE_INFO fileInfo = {};
+      fileInfo.cbStruct = sizeof(fileInfo);
+      fileInfo.pcwszFilePath = path.c_str();
+
+      WINTRUST_DATA trustData = {};
+      trustData.cbStruct = sizeof(trustData);
+      trustData.dwUIChoice = WTD_UI_NONE;
+      trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+      trustData.dwUnionChoice = WTD_CHOICE_FILE;
+      trustData.pFile = &fileInfo;
+      trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+
+      GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+      const LONG status = WinVerifyTrust(static_cast<HWND>(nullptr), &action, &trustData);
+      trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+      WinVerifyTrust(static_cast<HWND>(nullptr), &action, &trustData);
+      return status != ERROR_SUCCESS;
+    }
   }
 
   void NVSDK_CONV NVSDK_NGX_AppLogCallback(const char* message, NVSDK_NGX_Logging_Level loggingLevel, NVSDK_NGX_Feature sourceComponent) {
@@ -148,6 +207,7 @@ namespace dxvk
     m_supportsRayReconstruction = false;
     m_supportsDlssNeuralRendering = false;
     m_dlssNeuralRenderingSupportChecked = false;
+    m_dlssNeuralRenderingDirectLoad = false;
 
     const std::string exePath = env::getExePath();
     const std::string exeFolder = exePath.substr(0, exePath.find_last_of("\\/"));
@@ -242,6 +302,7 @@ namespace dxvk
       }
       Logger::err(message);
       m_supportsDlssNeuralRendering = false;
+      m_dlssNeuralRenderingDirectLoad = false;
       s_dlssNeuralRenderingStatus.store(0, std::memory_order_release);
       return false;
     }
@@ -260,6 +321,7 @@ namespace dxvk
         ", feature initialization: ", resultToString(static_cast<NVSDK_NGX_Result>(featureInitResult)),
         ", feature initialization query: ", resultToString(featureInitResultQuery)));
       m_supportsDlssNeuralRendering = false;
+      m_dlssNeuralRenderingDirectLoad = false;
       s_dlssNeuralRenderingStatus.store(0, std::memory_order_release);
       return false;
     }
@@ -430,20 +492,38 @@ namespace dxvk
 
     int dlssNeuralRenderingAvailable = 0;
     result = params->Get(NVSDK_NGX_Parameter_DLSSNR_Available, &dlssNeuralRenderingAvailable);
-    if (NVSDK_NGX_FAILED(result) || !dlssNeuralRenderingAvailable) {
-      int featureInitResult = NVSDK_NGX_Result_Fail;
-      const NVSDK_NGX_Result featureInitResultQuery = params->Get(
-        NVSDK_NGX_Parameter_DLSSNR_FeatureInitResult,
-        &featureInitResult);
+    if (NVSDK_NGX_FAILED(result)) {
       Logger::warn(str::format(
-        "NVIDIA DLSS-NR not available on this hardware/platform. Available: ", dlssNeuralRenderingAvailable,
-        ", availability query: ", resultToString(result),
-        ", feature initialization: ", resultToString(static_cast<NVSDK_NGX_Result>(featureInitResult)),
-        ", feature initialization query: ", resultToString(featureInitResultQuery)));
+        "NVIDIA DLSS-NR availability query failed: ", resultToString(result)));
       return false;
     }
 
-    return true;
+    if (dlssNeuralRenderingAvailable) {
+      return true;
+    }
+
+    int featureInitResult = NVSDK_NGX_Result_Fail;
+    const NVSDK_NGX_Result featureInitResultQuery = params->Get(
+      NVSDK_NGX_Parameter_DLSSNR_FeatureInitResult,
+      &featureInitResult);
+
+    // The core will not map an unsigned snippet, so this bit stays clear.
+    if (localDlssNrSnippetLacksValidSignature()) {
+      m_dlssNeuralRenderingDirectLoad = true;
+      Logger::warn(str::format(
+        "NVIDIA DLSS-NR capability reports unavailable. Available: ", dlssNeuralRenderingAvailable,
+        ", feature initialization: ", resultToString(static_cast<NVSDK_NGX_Result>(featureInitResult)),
+        ", feature initialization query: ", resultToString(featureInitResultQuery),
+        ". The local snippet has no valid signature, so it will be loaded directly."));
+      return true;
+    }
+
+    Logger::warn(str::format(
+      "NVIDIA DLSS-NR not available on this hardware/platform. Available: ", dlssNeuralRenderingAvailable,
+      ", availability query: ", resultToString(result),
+      ", feature initialization: ", resultToString(static_cast<NVSDK_NGX_Result>(featureInitResult)),
+      ", feature initialization query: ", resultToString(featureInitResultQuery)));
+    return false;
   }
 
   static bool checkHardwareSchedulingEnabled(DxvkDevice* device) {
@@ -1085,6 +1165,149 @@ namespace dxvk
   }
 
 
+  namespace {
+    struct DlssNrForwarder {
+      HMODULE module = nullptr;
+      PFN_dlssnr_forwarder_last_error_message lastError = nullptr;
+      PFN_dlssnr_vulkan_init init = nullptr;
+      PFN_dlssnr_vulkan_create create = nullptr;
+      PFN_dlssnr_vulkan_evaluate evaluate = nullptr;
+      PFN_dlssnr_vulkan_release release = nullptr;
+      bool snippetInitialized = false;
+      bool loadAttempted = false;
+
+      bool load() {
+        if (loadAttempted) {
+          return module != nullptr && init != nullptr && create != nullptr && evaluate != nullptr && release != nullptr;
+        }
+        loadAttempted = true;
+
+        const std::string path = env::getDllDirectory() + "\\nvngx.dll_dlssnr.dll";
+        module = LoadLibraryW(str::tows(path.c_str()).c_str());
+        if (module == nullptr) {
+          Logger::warn(str::format("DLSS-NR forwarder was not loaded from ", path, " (", GetLastError(), ")"));
+          return false;
+        }
+
+        lastError = reinterpret_cast<PFN_dlssnr_forwarder_last_error_message>(GetProcAddress(module, "dlssnr_forwarder_last_error_message"));
+        init = reinterpret_cast<PFN_dlssnr_vulkan_init>(GetProcAddress(module, "dlssnr_vulkan_init"));
+        create = reinterpret_cast<PFN_dlssnr_vulkan_create>(GetProcAddress(module, "dlssnr_vulkan_create"));
+        evaluate = reinterpret_cast<PFN_dlssnr_vulkan_evaluate>(GetProcAddress(module, "dlssnr_vulkan_evaluate"));
+        release = reinterpret_cast<PFN_dlssnr_vulkan_release>(GetProcAddress(module, "dlssnr_vulkan_release"));
+        if (init == nullptr || create == nullptr || evaluate == nullptr || release == nullptr) {
+          Logger::err("DLSS-NR forwarder is missing an export");
+          return false;
+        }
+        return true;
+      }
+
+      const char* error() const {
+        return lastError != nullptr ? lastError() : "";
+      }
+
+      bool ensureSnippet(DxvkDevice* device, NVSDK_NGX_Parameter* parameters) {
+        if (!load()) {
+          return false;
+        }
+        if (snippetInitialized) {
+          return true;
+        }
+
+        const std::string exePath = env::getExePath();
+        const std::string exeFolder = exePath.substr(0, exePath.find_last_of("\\/"));
+        const std::wstring logFolder = str::tows(exeFolder.c_str());
+        const int result = init(
+          RtxOptions::applicationId(),
+          logFolder.c_str(),
+          device->instance()->handle(),
+          device->adapter()->handle(),
+          device->handle(),
+          nullptr,
+          nullptr,
+          static_cast<unsigned int>(NVSDK_NGX_Version_API),
+          parameters);
+        if (NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(result))) {
+          Logger::err(str::format(
+            "DLSS-NR snippet init failed: ", resultToString(static_cast<NVSDK_NGX_Result>(result)),
+            " ", error()));
+          return false;
+        }
+
+        snippetInitialized = true;
+        Logger::info("DLSS-NR snippet initialized directly.");
+        return true;
+      }
+    };
+
+    DlssNrForwarder& dlssNrForwarder() {
+      static DlssNrForwarder forwarder;
+      return forwarder;
+    }
+
+    // These writes match the SDK helper.
+    // They are used when the snippet is called directly.
+    void setDlssNrEvalParams(NVSDK_NGX_Parameter* parameters, const NVSDK_NGX_VK_DLSSNR_Eval_Params& evalParams) {
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_Color, evalParams.pInColor);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_Output, evalParams.pInOutput);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_Backbuffer, evalParams.pInBackbuffer);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_MVec, evalParams.pInMVec);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_Depth, evalParams.pInDepth);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionField, evalParams.pInBidirectionalDistortionField);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_ControlMask, evalParams.pInControlMask);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_UI, evalParams.pInUI);
+      NVSDK_NGX_Parameter_SetVoidPointer(parameters, NVSDK_NGX_Parameter_DLSSNR_UIAlpha, evalParams.pInUIAlpha);
+      NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_DLSSNR_LocalToneStrength, evalParams.InLocalToneStrength);
+      NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_DLSSNR_LocalStructureStrength, evalParams.InLocalStructureStrength);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_Style, evalParams.InStyle);
+      NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSSNR_UseAutoMask, evalParams.InUseAutoMask);
+      NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSSNR_MaskBlendMode, static_cast<int>(evalParams.InMaskBlendMode));
+      NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_DLSSNR_SkinStructureStrength, evalParams.InSkinStructureStrength);
+      NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSSNR_Reset, evalParams.InReset);
+      NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSSNR_DepthInverted, evalParams.InDepthInverted);
+      NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSSNR_Enabled, evalParams.InEnabled);
+      NVSDK_NGX_Parameter_SetI(parameters, NVSDK_NGX_Parameter_DLSSNR_UICorrection, evalParams.InUICorrection);
+      NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_DLSSNR_Intensity, evalParams.InIntensity);
+      NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_DLSSNR_MVecScaleX, evalParams.InMVecScaleX);
+      NVSDK_NGX_Parameter_SetF(parameters, NVSDK_NGX_Parameter_DLSSNR_MVecScaleY, evalParams.InMVecScaleY);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ColorSubrectBaseX, evalParams.InColorSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ColorSubrectBaseY, evalParams.InColorSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ColorSubrectWidth, evalParams.InColorSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ColorSubrectHeight, evalParams.InColorSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_OutputSubrectBaseX, evalParams.InOutputSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_OutputSubrectBaseY, evalParams.InOutputSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_OutputSubrectWidth, evalParams.InOutputSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_OutputSubrectHeight, evalParams.InOutputSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectBaseX, evalParams.InBackbufferSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectBaseY, evalParams.InBackbufferSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectWidth, evalParams.InBackbufferSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BackbufferSubrectHeight, evalParams.InBackbufferSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_MVecSubrectBaseX, evalParams.InMVecSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_MVecSubrectBaseY, evalParams.InMVecSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_MVecSubrectWidth, evalParams.InMVecSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_MVecSubrectHeight, evalParams.InMVecSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_DepthSubrectBaseX, evalParams.InDepthSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_DepthSubrectBaseY, evalParams.InDepthSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_DepthSubrectWidth, evalParams.InDepthSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_DepthSubrectHeight, evalParams.InDepthSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectBaseX, evalParams.InBidirectionalDistortionFieldSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectBaseY, evalParams.InBidirectionalDistortionFieldSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectWidth, evalParams.InBidirectionalDistortionFieldSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_BidirectionalDistortionFieldSubrectHeight, evalParams.InBidirectionalDistortionFieldSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectBaseX, evalParams.InControlMaskSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectBaseY, evalParams.InControlMaskSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectWidth, evalParams.InControlMaskSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_ControlMaskSubrectHeight, evalParams.InControlMaskSubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UISubrectBaseX, evalParams.InUISubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UISubrectBaseY, evalParams.InUISubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UISubrectWidth, evalParams.InUISubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UISubrectHeight, evalParams.InUISubrectSize.Height);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectBaseX, evalParams.InUIAlphaSubrectBase.X);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectBaseY, evalParams.InUIAlphaSubrectBase.Y);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectWidth, evalParams.InUIAlphaSubrectSize.Width);
+      NVSDK_NGX_Parameter_SetUI(parameters, NVSDK_NGX_Parameter_DLSSNR_UIAlphaSubrectHeight, evalParams.InUIAlphaSubrectSize.Height);
+    }
+  }
+
   // Neural Rendering
   NGXNeuralRenderingContext::NGXNeuralRenderingContext(DxvkDevice* device)
     : NGXFeatureContext(device) { }
@@ -1110,13 +1333,54 @@ namespace dxvk
       NVSDK_NGX_DLSSNR_Hint_Render_Preset_B);
 
     const VkCommandBuffer vkCommandBuffer = renderContext->getCommandList()->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer);
-    const NVSDK_NGX_Result result = NGX_CALL(NGX_VULKAN_CREATE_DLSSNR_EXT1(
-      m_device->handle(), vkCommandBuffer, 1, 1, &m_neuralRenderingFeature, m_parameters, &createParams));
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
 
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::err(str::format("Failed to create DLSS-NR feature: ", resultToString(result)));
-      releaseNGXFeature();
-      return;
+    // An unsigned snippet is created through nvngx.dll_dlssnr.dll.
+    // A signed snippet is created through the NGX core.
+    if (m_device->getCommon()->metaNGXContext().useDirectDlssNeuralRendering()) {
+      DlssNrForwarder& forwarder = dlssNrForwarder();
+      if (!NGX_CALL(forwarder.ensureSnippet(m_device, m_parameters))) {
+        releaseNGXFeature();
+        return;
+      }
+
+      NVSDK_NGX_Parameter_SetUI(m_parameters, NVSDK_NGX_Parameter_DLSSNR_Width, createParams.Width);
+      NVSDK_NGX_Parameter_SetUI(m_parameters, NVSDK_NGX_Parameter_DLSSNR_Height, createParams.Height);
+      void* created = nullptr;
+      std::string failure;
+      result = static_cast<NVSDK_NGX_Result>(ngxCall([&] {
+        const int createdResult = forwarder.create(
+          m_device->handle(),
+          vkCommandBuffer,
+          static_cast<int>(NVSDK_NGX_Feature_DLSSNR),
+          m_parameters,
+          &created);
+        if (NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(createdResult))) {
+          failure = forwarder.error();
+          if (created != nullptr) {
+            forwarder.release(created);
+            created = nullptr;
+          }
+        }
+        return createdResult;
+      }));
+      if (NVSDK_NGX_FAILED(result)) {
+        Logger::err(str::format(
+          "Failed to create DLSS-NR feature directly: ", resultToString(result),
+          " ", failure));
+        releaseNGXFeature();
+        return;
+      }
+      m_neuralRenderingFeature = static_cast<NVSDK_NGX_Handle*>(created);
+      m_directSnippet = true;
+    } else {
+      result = NGX_CALL(NGX_VULKAN_CREATE_DLSSNR_EXT1(
+        m_device->handle(), vkCommandBuffer, 1, 1, &m_neuralRenderingFeature, m_parameters, &createParams));
+      if (NVSDK_NGX_FAILED(result)) {
+        Logger::err(str::format("Failed to create DLSS-NR feature: ", resultToString(result)));
+        releaseNGXFeature();
+        return;
+      }
     }
 
     if (queryVramAllocation) {
@@ -1193,11 +1457,30 @@ namespace dxvk
     NVSDK_NGX_Parameter_SetF(m_parameters, NVSDK_NGX_Parameter_Jitter_Offset_X, settings.jitterOffset[0]);
     NVSDK_NGX_Parameter_SetF(m_parameters, NVSDK_NGX_Parameter_Jitter_Offset_Y, settings.jitterOffset[1]);
 
-    const NVSDK_NGX_Result result = NGX_CALL(
-      NGX_VULKAN_EVALUATE_DLSSNR_EXT(vkCommandbuffer, m_neuralRenderingFeature, m_parameters, &neuralRenderingEvalParams));
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::err(str::format("DLSS-NR evaluation failed: ", resultToString(result)));
-      return false;
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
+    if (m_directSnippet) {
+      setDlssNrEvalParams(m_parameters, neuralRenderingEvalParams);
+      DlssNrForwarder& forwarder = dlssNrForwarder();
+      std::string failure;
+      result = static_cast<NVSDK_NGX_Result>(ngxCall([&] {
+        const int evaluated = forwarder.evaluate(vkCommandbuffer, m_neuralRenderingFeature, m_parameters);
+        if (NVSDK_NGX_FAILED(static_cast<NVSDK_NGX_Result>(evaluated))) {
+          failure = forwarder.error();
+        }
+        return evaluated;
+      }));
+      if (NVSDK_NGX_FAILED(result)) {
+        Logger::err(str::format(
+          "DLSS-NR evaluation failed: ", resultToString(result), " ", failure));
+        return false;
+      }
+    } else {
+      result = NGX_CALL(
+        NGX_VULKAN_EVALUATE_DLSSNR_EXT(vkCommandbuffer, m_neuralRenderingFeature, m_parameters, &neuralRenderingEvalParams));
+      if (NVSDK_NGX_FAILED(result)) {
+        Logger::err(str::format("DLSS-NR evaluation failed: ", resultToString(result)));
+        return false;
+      }
     }
 
     return true;
@@ -1209,9 +1492,14 @@ namespace dxvk
     m_vramAllocationBytes = 0;
 
     if (m_neuralRenderingFeature) {
-      NGX_CALL(NVSDK_NGX_VULKAN_ReleaseFeature(m_neuralRenderingFeature));
+      if (m_directSnippet) {
+        NGX_CALL(dlssNrForwarder().release(m_neuralRenderingFeature));
+      } else {
+        NGX_CALL(NVSDK_NGX_VULKAN_ReleaseFeature(m_neuralRenderingFeature));
+      }
       m_neuralRenderingFeature = nullptr;
     }
+    m_directSnippet = false;
   }
 
 } // namespace dxvk
