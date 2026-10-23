@@ -8780,7 +8780,7 @@ namespace dxvk {
   }
 
   void D3D9Rtx::NotifyStretchRect(const Rc<DxvkImage>& sourceImage, const Rc<DxvkImage>& destImage) {
-    if (!m_frameOptions.ngxPassthroughMode)
+    if (m_passthroughSuspended || !m_frameOptions.ngxPassthroughMode)
       return;
 
     if (m_ngxPostChainDumpFramesLeft > 0 && m_ngxPostChainDumpLinesThisFrame < kNgxPostChainDumpMaxLinesPerFrame) {
@@ -8818,7 +8818,7 @@ namespace dxvk {
   }
 
   void D3D9Rtx::NotifyClear(DWORD clearFlags) {
-    if (!m_frameOptions.ngxPassthroughMode || m_rtxInjectTriggered)
+    if (m_passthroughSuspended || !m_frameOptions.ngxPassthroughMode || m_rtxInjectTriggered)
       return;
 
     if ((clearFlags & D3DCLEAR_ZBUFFER) == 0)
@@ -8863,7 +8863,7 @@ namespace dxvk {
   }
 
   bool D3D9Rtx::GetNgxPassthroughViewportJitter(float* pJitterX, float* pJitterY) const {
-    if (!m_frameOptions.ngxPassthroughMode || !m_ngxFrameJitterValid || m_rtxInjectTriggered)
+    if (m_passthroughSuspended || !m_frameOptions.ngxPassthroughMode || !m_ngxFrameJitterValid || m_rtxInjectTriggered)
       return false;
 
     if (m_ngxFrameJitter[0] == 0.0f && m_ngxFrameJitter[1] == 0.0f)
@@ -8907,7 +8907,7 @@ namespace dxvk {
   }
 
   float D3D9Rtx::GetNgxPassthroughSamplerLodBias() const {
-    if (!m_frameOptions.ngxPassthroughMode || m_rtxInjectTriggered)
+    if (m_passthroughSuspended || !m_frameOptions.ngxPassthroughMode || m_rtxInjectTriggered)
       return 0.0f;
 
     if (!m_ngxSceneViewportValid || m_ngxSceneColorImage == nullptr || !m_activePresentParams.has_value())
@@ -8996,7 +8996,7 @@ namespace dxvk {
   }
 
   void D3D9Rtx::PatchNgxScreenPositionScaleBias(DxsoProgramType stage, void* floatConstants, uint32_t floatConstantCount) const {
-    if (!m_ngxSpsbPatchActive)
+    if (m_passthroughSuspended || !m_ngxSpsbPatchActive)
       return;
 
     const NgxSpsbCtabReg& patch = stage == DxsoProgramTypes::VertexShader ? m_ngxSpsbPatchVs : m_ngxSpsbPatchPs;
@@ -9879,7 +9879,7 @@ namespace dxvk {
       refreshFrameOptionCache();
     }
 
-    if (!m_enableDrawCallConversion) {
+    if (!m_enableDrawCallConversion || m_passthroughSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
@@ -9906,7 +9906,7 @@ namespace dxvk {
       refreshFrameOptionCache();
     }
 
-    if (!m_enableDrawCallConversion) {
+    if (!m_enableDrawCallConversion || m_passthroughSuspended) {
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
@@ -10041,7 +10041,7 @@ namespace dxvk {
     d.zeroResultLogsRemaining = zeroLogs;
   }
 
-  void D3D9Rtx::EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx) {
+  void D3D9Rtx::EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx, bool countAsFrame) {
     refreshFrameOptionCache();
 
     // Update the effective settings before the next frame.
@@ -10092,7 +10092,11 @@ namespace dxvk {
     // Reset for the next frame
     m_rtxInjectTriggered = false;
     m_drawCallID = 0;
-    ++m_ue3FrameCounter;
+    // Minimized presents still reset the accumulators below, but a frozen counter keeps the
+    // object-velocity cache from aging out for the whole time the window is iconic.
+    if (countAsFrame) {
+      ++m_ue3FrameCounter;
+    }
 
     // NGX passthrough per-frame state
     m_ngxSpsbPatchActive = false;
@@ -10114,13 +10118,17 @@ namespace dxvk {
 
     // Object velocity per-frame state: rotate the accepted camera, drop uncaptured
     // leftovers, and bound the identity cache (level transitions leave stale entries
-    // behind; re-registration costs one frame of velocity)
-    if (m_ngxFrameCameraValid && m_ngxPrevCameraValid &&
-        m_ngxFrameCameraUsedTranspose != m_ngxPrevCameraUsedTranspose) {
-      m_ngxCameraTransposeFlips++;
+    // behind; re-registration costs one frame of velocity). A minimized present that does
+    // not count as a frame produced no camera, so copying it over the previous one would
+    // drop the history the frozen frame counter is keeping alive.
+    if (countAsFrame) {
+      if (m_ngxFrameCameraValid && m_ngxPrevCameraValid &&
+          m_ngxFrameCameraUsedTranspose != m_ngxPrevCameraUsedTranspose) {
+        m_ngxCameraTransposeFlips++;
+      }
+      m_ngxPrevCameraValid = m_ngxFrameCameraValid;
+      m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
     }
-    m_ngxPrevCameraValid = m_ngxFrameCameraValid;
-    m_ngxPrevCameraUsedTranspose = m_ngxFrameCameraUsedTranspose;
     m_ngxFrameCameraValid = false;
     m_ngxFrameCameraMatricesValid = false;
     // Settle on the best supported offset of the frame, which may be better supported than

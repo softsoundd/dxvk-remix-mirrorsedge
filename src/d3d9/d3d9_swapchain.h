@@ -194,7 +194,9 @@ namespace dxvk {
 
     bool                      m_dirty    = true;
     bool                      m_vsync    = true;
-    bool                      m_skippedPresentWhileIconic = false;
+    // NV-DXVK start: minimized window handling
+    bool                      m_minimized = false;
+    // NV-DXVK end
 
     bool                      m_dialog;
     bool                      m_lastDialog = false;
@@ -226,6 +228,14 @@ namespace dxvk {
 
     // NV-DXVK start: input-queue liveness ping
     void RunInputQueuePing();
+    // NV-DXVK end
+
+    // NV-DXVK start: frames that end without a Vulkan present
+    bool SkipPresentForMinimizedWindow(HWND window);
+
+    void EndFrameWithoutPresent(bool advanceFrameId);
+
+    void AdvanceFrameIdWithoutPresent();
     // NV-DXVK end
 
     void RecreateSwapChain(

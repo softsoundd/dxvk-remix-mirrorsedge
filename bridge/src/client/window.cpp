@@ -178,7 +178,6 @@ void windowMsg(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
           }
         }
       }
-      // No WM_SIZE -> WM_ACTIVATEAPP - that re-entry races Present under Bridge.
     }
   }
 }
@@ -283,7 +282,7 @@ LRESULT WINAPI RemixWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   const bool isUnicode = IsWindowUnicode(hWnd);
   LRESULT lresult = 0;
 
-  if (msg == WM_ACTIVATEAPP || msg == WM_SIZE || msg == WM_DESTROY) {
+  if (msg == WM_ACTIVATEAPP || msg == WM_DESTROY) {
     windowMsg(hWnd, msg, wParam, lParam);
   }
   const bool bSwallowMsg = remixMsg(hWnd, msg, wParam, lParam);

@@ -144,33 +144,23 @@ void GameOverlay::hide() {
 
   if (m_mouseInsideOverlay) {
     m_mouseInsideOverlay = false;
-    m_pendingImGuiMouseLeave.store(true, std::memory_order_release);
+    forwardToImGui(m_hwnd, WM_MOUSELEAVE, 0, 0);
   }
 
   SetWindowPos(m_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
   ShowWindow(m_hwnd, SW_HIDE);
 }
 
-void GameOverlay::flushPendingImGuiEvents() {
-  // ImGui context must be current (Present/render thread).
-  if (m_pendingImGuiMouseLeave.exchange(false, std::memory_order_acq_rel)) {
-    HWND hwnd = m_hwnd.load(std::memory_order_relaxed);
-    if (hwnd) {
-      ImGui_ImplWin32_WndProcHandler(hwnd, WM_MOUSELEAVE, 0, 0);
-    }
+LRESULT GameOverlay::forwardToImGui(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  LRESULT result = 0;
+
+  if (m_pImgui) {
+    m_pImgui->withInputLock([&] {
+      result = ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+    });
   }
 
-  const int focus = m_pendingImGuiFocus.exchange(-1, std::memory_order_acq_rel);
-  if (focus >= 0) {
-    HWND hwnd = m_hwnd.load(std::memory_order_relaxed);
-    if (hwnd) {
-      ImGui_ImplWin32_WndProcHandler(hwnd, focus ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
-    }
-  }
-
-  const ImVec2 disp = ImGui::GetIO().DisplaySize;
-  m_displaySizeX.store(disp.x, std::memory_order_relaxed);
-  m_displaySizeY.store(disp.y, std::memory_order_relaxed);
+  return result;
 }
 
 void GameOverlay::gameWndProcHandler(HWND gameHwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -326,7 +316,8 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
   case WM_REMIX_SHOW_OVERLAY: show(); return 0;
   case WM_REMIX_HIDE_OVERLAY: hide(); return 0;
   case WM_REMIX_UPDATE_INPUT_FOCUS:
-    m_pendingImGuiFocus.store(wParam ? 1 : 0, std::memory_order_release);
+    // The non-activating overlay does not receive focus messages itself.
+    forwardToImGui(hWnd, wParam ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
     return 0;
   case WM_DESTROY: PostQuitMessage(0); return 0;
 
@@ -352,20 +343,9 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (!isOurForeground()) {
       if (m_mouseInsideOverlay) { 
         m_mouseInsideOverlay = false;
-        m_pendingImGuiMouseLeave.store(true, std::memory_order_release);
+        forwardToImGui(m_hwnd, WM_MOUSELEAVE, 0, 0);
       }
       return 0;
-    }
-
-    // Scale from last DisplaySize published on the Present thread (not GetIO here).
-    float sx = 1.0f, sy = 1.0f;
-    if (m_w > 0 && m_h > 0) {
-      const float dispX = m_displaySizeX.load(std::memory_order_relaxed);
-      const float dispY = m_displaySizeY.load(std::memory_order_relaxed);
-      if (dispX > 0.0f && dispY > 0.0f) {
-        sx = dispX / (float) m_w;
-        sy = dispY / (float) m_h;
-      }
     }
 
     UINT size = 0;
@@ -399,9 +379,6 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
           m_mouseInsideOverlay = true;
         }
 
-        int x = std::clamp((int) std::lround(p.x * sx), -32768, 32768);
-        int y = std::clamp((int) std::lround(p.y * sy), -32768, 32768);
-       
         // Button mask for wParam
         WPARAM wp = 0;
         if (GetKeyState(VK_LBUTTON) & 0x8000) wp |= MK_LBUTTON;
@@ -412,42 +389,59 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (GetKeyState(VK_CONTROL) & 0x8000) wp |= MK_CONTROL;
         if (GetKeyState(VK_SHIFT) & 0x8000) wp |= MK_SHIFT;
 
-        LPARAM lp = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
-        ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEMOVE, wp, lp);
+        if (m_pImgui) {
+          m_pImgui->withInputLock([&] {
+            // Stable scale
+            float sx = 1.0f, sy = 1.0f;
+            if (m_w > 0 && m_h > 0) {
+              const ImVec2 disp = ImGui::GetIO().DisplaySize;
+              if (disp.x > 0.0f && disp.y > 0.0f) {
+                sx = disp.x / (float) m_w;
+                sy = disp.y / (float) m_h;
+              }
+            }
 
-        if (m.usButtonFlags) {
-          auto send_btn = [&](UINT msg, WPARAM w) {
+            int x = std::clamp((int) std::lround(p.x * sx), -32768, 32768);
+            int y = std::clamp((int) std::lround(p.y * sy), -32768, 32768);
+
             LPARAM lp = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
-            ImGui_ImplWin32_WndProcHandler(m_hwnd, msg, w, lp);
-          };
-          if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  send_btn(WM_LBUTTONDOWN, wp | MK_LBUTTON);
-          if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    send_btn(WM_LBUTTONUP, wp & ~MK_LBUTTON);
-          if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) send_btn(WM_RBUTTONDOWN, wp | MK_RBUTTON);
-          if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   send_btn(WM_RBUTTONUP, wp & ~MK_RBUTTON);
-          if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)send_btn(WM_MBUTTONDOWN, wp | MK_MBUTTON);
-          if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)  send_btn(WM_MBUTTONUP, wp & ~MK_MBUTTON);
-          if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)     send_btn(WM_XBUTTONDOWN, wp | MK_XBUTTON1);
-          if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)       send_btn(WM_XBUTTONUP, wp & ~MK_XBUTTON1);
-          if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)     send_btn(WM_XBUTTONDOWN, wp | MK_XBUTTON2);
-          if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)       send_btn(WM_XBUTTONUP, wp & ~MK_XBUTTON2);
-        }
+            ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEMOVE, wp, lp);
 
-        if (m.usButtonFlags & RI_MOUSE_WHEEL) {
-          SHORT d = (SHORT) m.usButtonData;
-          WPARAM w = MAKEWPARAM(wp & 0xFFFF, (UINT16) d);
-          LPARAM l = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
-          ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEWHEEL, w, l);
-        }
-        if (m.usButtonFlags & RI_MOUSE_HWHEEL) {
-          SHORT d = (SHORT) m.usButtonData;
-          WPARAM w = MAKEWPARAM(wp & 0xFFFF, (UINT16) d);
-          LPARAM l = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
-          ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEHWHEEL, w, l);
+            if (m.usButtonFlags) {
+              auto send_btn = [&](UINT msg, WPARAM w) {
+                LPARAM lp = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+                ImGui_ImplWin32_WndProcHandler(m_hwnd, msg, w, lp);
+              };
+              if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)  send_btn(WM_LBUTTONDOWN, wp | MK_LBUTTON);
+              if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)    send_btn(WM_LBUTTONUP, wp & ~MK_LBUTTON);
+              if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) send_btn(WM_RBUTTONDOWN, wp | MK_RBUTTON);
+              if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP)   send_btn(WM_RBUTTONUP, wp & ~MK_RBUTTON);
+              if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN)send_btn(WM_MBUTTONDOWN, wp | MK_MBUTTON);
+              if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP)  send_btn(WM_MBUTTONUP, wp & ~MK_MBUTTON);
+              if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)     send_btn(WM_XBUTTONDOWN, wp | MK_XBUTTON1);
+              if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP)       send_btn(WM_XBUTTONUP, wp & ~MK_XBUTTON1);
+              if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)     send_btn(WM_XBUTTONDOWN, wp | MK_XBUTTON2);
+              if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP)       send_btn(WM_XBUTTONUP, wp & ~MK_XBUTTON2);
+            }
+
+            if (m.usButtonFlags & RI_MOUSE_WHEEL) {
+              SHORT d = (SHORT) m.usButtonData;
+              WPARAM w = MAKEWPARAM(wp & 0xFFFF, (UINT16) d);
+              LPARAM l = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+              ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEWHEEL, w, l);
+            }
+            if (m.usButtonFlags & RI_MOUSE_HWHEEL) {
+              SHORT d = (SHORT) m.usButtonData;
+              WPARAM w = MAKEWPARAM(wp & 0xFFFF, (UINT16) d);
+              LPARAM l = MAKELPARAM((WORD) (SHORT) x, (WORD) (SHORT) y);
+              ImGui_ImplWin32_WndProcHandler(m_hwnd, WM_MOUSEHWHEEL, w, l);
+            }
+          });
         }
       } else {
         if (m_mouseInsideOverlay) {
           m_mouseInsideOverlay = false;
-          m_pendingImGuiMouseLeave.store(true, std::memory_order_release);
+          forwardToImGui(m_hwnd, WM_MOUSELEAVE, 0, 0);
         }
       }
 
@@ -460,7 +454,7 @@ LRESULT GameOverlay::overlayWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
   }
 
   // Let ImGui Win32 backend handle everything else (keyboard, etc.)
-  if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+  if (forwardToImGui(hWnd, msg, wParam, lParam))
     return 0;
 
   return DefWindowProcW(m_hwnd, msg, wParam, lParam);

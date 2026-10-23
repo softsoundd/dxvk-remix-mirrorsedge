@@ -492,8 +492,20 @@ namespace dxvk {
 
     /**
       * \brief: Signal that we've reached the end of the frame.
+      *
+      * \param [in] countAsFrame: When false, per-frame accumulators are still reset but the
+      * passthrough frame counter does not advance. Minimized presents use this so the
+      * object-velocity cache does not age out while the window is iconic.
       */
-    void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
+    void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true, bool countAsFrame = true);
+
+    /**
+      * \brief: While suspended, draws stay on the game's raster path. DLSS injection, jitter,
+      * velocity capture, and depth snapshots do not run.
+      */
+    void SetPassthroughSuspended(bool suspended) {
+      m_passthroughSuspended = suspended;
+    }
 
     /**
       * \brief: Signal that we're about to present the image.
@@ -589,6 +601,7 @@ namespace dxvk {
     uint32_t m_maxBone = 0;
 
     const bool m_enableDrawCallConversion;
+    bool m_passthroughSuspended = false;
     bool m_rtxInjectTriggered = false;
     DWORD m_texcoordIndex = 0;
     DWORD m_iaTexcoordIndex = 0;
