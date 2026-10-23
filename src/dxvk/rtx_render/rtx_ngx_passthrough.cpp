@@ -397,6 +397,25 @@ namespace dxvk {
     ONCE(Logger::info("[RTX NGX Passthrough] HUD-less frame generation input active."));
   }
 
+  void RtxNgxPassthrough::previewHudless(RtxContext* ctx, const Rc<DxvkImage>& backbufferImage) {
+    if (backbufferImage == nullptr) {
+      return;
+    }
+
+    const Resources::Resource& slot = m_hudlessQueue.get();
+    if (slot.image == nullptr ||
+        slot.image->info().format != backbufferImage->info().format ||
+        slot.image->info().extent.width != backbufferImage->info().extent.width ||
+        slot.image->info().extent.height != backbufferImage->info().extent.height) {
+      return;
+    }
+
+    const VkImageSubresourceLayers subresourceLayers = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    ctx->copyImage(backbufferImage, subresourceLayers, { 0, 0, 0 },
+                   slot.image, subresourceLayers, { 0, 0, 0 },
+                   slot.image->info().extent);
+  }
+
   uint32_t RtxNgxPassthrough::rasterizeObjectVelocities(RtxContext* ctx,
                                                         DxvkContextState& dxvkCtxState,
                                                         const std::vector<NgxVelocityDraw>& velocityDraws,
@@ -2328,22 +2347,22 @@ namespace dxvk {
         depthInput.image->info().layout,
         false,
         m_device->getCommon()->metaDLFG().getInterpolatedFrameCount(),
+        nullptr,
+        VK_IMAGE_LAYOUT_UNDEFINED,
       };
 
-      // HUD-less input: at the late injection point the target IS the pre-UI backbuffer,
-      // so this frame's slot can be captured right here; at the pre-post point the capture
-      // arrives later in the frame (first UI draw / frame end), filling the slot whose
-      // view is handed over now, before this frame's submit reaches the presenter.
+      // The view is recorded here, before present reads it.
+      // Pre-post injection fills that same slot later in the frame.
+      // The image matches the backbuffer size, which can differ from the scene-color target.
       if (dlfgHudlessInput()) {
         if (!prePostProcess) {
           captureHudless(ctx, targetImage);
         }
 
         const Resources::Resource& hudlessSlot = m_hudlessQueue.get();
-        if (hudlessSlot.view != nullptr &&
-            hudlessSlot.image->info().extent.width == targetExtent.width &&
-            hudlessSlot.image->info().extent.height == targetExtent.height) {
+        if (hudlessSlot.view != nullptr) {
           dlfgInfo.hudless = hudlessSlot.view;
+          dlfgInfo.hudlessLayout = hudlessSlot.image->info().layout;
         }
       }
 
@@ -2455,6 +2474,8 @@ namespace dxvk {
     // stay config-only: both default on and only serve as kill-switches
     RemixGui::Checkbox("Object Velocity Debug Freeze (zero motion)", &objectVelocityDebugFreezeObject());
     RemixGui::Checkbox("Frame Gen HUD-less UI Input", &dlfgHudlessInputObject());
+    IMGUI_ADD_TOOLTIP(RemixGui::Checkbox("Preview HUD-less Frame", &dlfgHudlessPreviewObject()),
+      "Presents the HUD-less copy in place of the finished frame. UI drawn after the capture is absent. Frame generation must be enabled.");
 
     int debugVisualizationValue = debugVisualization();
     if (ImGui::Combo("Debug Visualization", &debugVisualizationValue,

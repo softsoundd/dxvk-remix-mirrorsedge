@@ -1498,12 +1498,26 @@ namespace dxvk {
     std::array<Rc<DxvkImage>, 4> m_ngxSceneColorResolves;
     uint32_t m_ngxSceneColorResolveCount = 0;
 
-    // HUD-less capture for frame generation: when the injection ran pre-post-process, the
-    // pre-UI backbuffer state is captured at the first UI-classified backbuffer draw after
-    // the injection (or at frame end when no UI is drawn)
+    // Where this frame's HUD-less copy was taken.
+    enum class NgxHudlessCaptureSite {
+      AfterSceneComposite,
+      LateInjection,
+      FrameEnd,
+    };
+
+    // True after this frame's HUD-less copy has been recorded.
     bool m_ngxHudlessCapturedThisFrame = false;
+    // True after the scene blit has targeted the backbuffer.
+    // A copy before that blit reads the previous frame.
+    bool m_ngxHudlessSceneCompositeSeen = false;
+
+    bool m_ngxHudlessCaptureLogValid = false;
+    NgxHudlessCaptureSite m_ngxHudlessLoggedSite = NgxHudlessCaptureSite::AfterSceneComposite;
+    uint32_t m_ngxHudlessLastLogFrame = 0;
 
     void maybeCaptureNgxHudless(const DrawContext& drawContext);
+    bool ngxDrawIsBackbufferSceneComposite(const DrawContext& drawContext) const;
+    void noteNgxHudlessCapture(NgxHudlessCaptureSite site);
 
     // Diagnostic dump of the post-chain flow (draws sampling render targets, StretchRect
     // copies, render state): armed for the first frames after scene target identification
@@ -1579,6 +1593,7 @@ namespace dxvk {
       bool ngxPassthroughJitter = false;
       bool ngxPrePostProcess = false;
       bool ngxDlfgHudless = false;
+      bool ngxDlfgHudlessPreview = false;
       bool ngxObjectVelocities = false;
       int ngxDebugVisualization = 0;
 

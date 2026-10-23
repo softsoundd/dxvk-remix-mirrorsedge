@@ -4584,6 +4584,7 @@ namespace dxvk {
     o.ngxPrePostProcess = RtxNgxPassthrough::prePostProcess();
     o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && DxvkDLFG::enable() &&
                        m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
+    o.ngxDlfgHudlessPreview = RtxNgxPassthrough::dlfgHudlessPreview();
     o.ngxObjectVelocities = RtxNgxPassthrough::objectVelocities();
     o.ngxDebugVisualization = RtxNgxPassthrough::debugVisualization();
 
@@ -9188,10 +9189,80 @@ namespace dxvk {
     }
   }
 
-  // Detects the first UI-classified draw on the backbuffer after a pre-post-process
-  // injection and captures the backbuffer as this frame's HUD-less frame generation input
-  // (the game's post chain has written its final output by then, the UI has not). Uses the
-  // same UI classification as the late injection trigger.
+  // Returns true for the opaque fullscreen blit that lands the scene on the backbuffer.
+  // The source is the scene-color resolve, or any other full-frame target.
+  bool D3D9Rtx::ngxDrawIsBackbufferSceneComposite(const DrawContext& drawContext) const {
+    if (drawContext.PrimitiveCount == 0 || drawContext.PrimitiveCount > 4 ||
+        !m_activePresentParams.has_value() ||
+        d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE) {
+      return false;
+    }
+
+    const bool depthTestDisabled = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+                                   d3d9State().renderStates[D3DRS_ZFUNC] == D3DCMP_ALWAYS;
+    if (!depthTestDisabled || d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE) {
+      return false;
+    }
+
+    const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+    const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+    const D3DVIEWPORT9& vp = d3d9State().viewport;
+    if (backBufferWidth == 0 || backBufferHeight == 0 ||
+        vp.Width + 1 < backBufferWidth || vp.Height + 1 < backBufferHeight) {
+      return false;
+    }
+
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      if (texture == nullptr || texture->GetImage() == nullptr) {
+        continue;
+      }
+
+      const DxvkImage* sampledImage = texture->GetImage().ptr();
+      if (m_ngxFrameBackbufferImage != nullptr && sampledImage == m_ngxFrameBackbufferImage.ptr()) {
+        continue;
+      }
+
+      if (matchNgxSceneColorSample(sampledImage) != nullptr) {
+        return true;
+      }
+
+      const VkExtent3D& extent = sampledImage->info().extent;
+      if (extent.width + 1 >= backBufferWidth && extent.height + 1 >= backBufferHeight) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  // Logs a site change immediately.
+  // The same site repeats at most once every 300 frames.
+  void D3D9Rtx::noteNgxHudlessCapture(NgxHudlessCaptureSite site) {
+    constexpr uint32_t kNgxHudlessLogInterval = 300;
+    const bool siteChanged = !m_ngxHudlessCaptureLogValid || site != m_ngxHudlessLoggedSite;
+    if (!siteChanged && m_ue3FrameCounter - m_ngxHudlessLastLogFrame < kNgxHudlessLogInterval) {
+      return;
+    }
+
+    m_ngxHudlessCaptureLogValid = true;
+    m_ngxHudlessLoggedSite = site;
+    m_ngxHudlessLastLogFrame = m_ue3FrameCounter;
+
+    if (site == NgxHudlessCaptureSite::FrameEnd) {
+      Logger::info("[RTX NGX Passthrough] HUD-less capture at frame end. No draw followed the scene composite.");
+      return;
+    }
+
+    const char* where = site == NgxHudlessCaptureSite::LateInjection
+      ? "at late injection"
+      : "after the scene composite";
+    Logger::info(str::format(
+      "[RTX NGX Passthrough] HUD-less capture before draw ", m_drawCallID, ", ", where, "."));
+  }
+
+  // Copies the backbuffer on the first draw after the scene blit.
   void D3D9Rtx::maybeCaptureNgxHudless(const DrawContext& drawContext) {
     if (m_ngxHudlessCapturedThisFrame || !m_frameOptions.ngxDlfgHudless ||
         m_ngxFrameBackbufferImage == nullptr) {
@@ -9207,11 +9278,18 @@ namespace dxvk {
       return;
     }
 
-    if (!ngxDrawIsUi(drawContext)) {
+    // This draw is the scene blit, so the backbuffer does not hold it yet.
+    if (ngxDrawIsBackbufferSceneComposite(drawContext)) {
+      m_ngxHudlessSceneCompositeSeen = true;
+      return;
+    }
+
+    if (!m_ngxHudlessSceneCompositeSeen) {
       return;
     }
 
     m_ngxHudlessCapturedThisFrame = true;
+    noteNgxHudlessCapture(NgxHudlessCaptureSite::AfterSceneComposite);
 
     m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
       static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
@@ -9583,6 +9661,19 @@ namespace dxvk {
       if (drawTarget != nullptr && drawTarget->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr()) {
         m_ngxBackbufferDrawSeenThisFrame = true;
         m_ngxFrameFirstBackbufferDraw = m_drawCallID;
+      }
+    }
+
+    // Records the scene blit on every backbuffer draw, including the injection trigger.
+    // maybeCapture does not run until the following draw.
+    if (!m_ngxHudlessSceneCompositeSeen &&
+        m_ngxFrameBackbufferImage != nullptr &&
+        d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      D3D9CommonTexture* hudlessTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+      if (hudlessTarget != nullptr &&
+          hudlessTarget->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr() &&
+          ngxDrawIsBackbufferSceneComposite(drawContext)) {
+        m_ngxHudlessSceneCompositeSeen = true;
       }
     }
 
@@ -10091,10 +10182,13 @@ namespace dxvk {
       }
     }
 
-    // Late injection targets the pre-UI backbuffer, and the dispatch captures the HUD-less copy inline.
-    // Pre-post injection captures that copy later, at the first UI draw.
+    // Late injection copies the backbuffer in dispatch, before this draw.
+    // Pre-post injection copies it on the first draw after the scene blit.
     if (m_ngxColorTargetImage == nullptr) {
       m_ngxHudlessCapturedThisFrame = true;
+      if (m_frameOptions.ngxDlfgHudless) {
+        noteNgxHudlessCapture(NgxHudlessCaptureSite::LateInjection);
+      }
     }
 
     m_parent->PrepareDraw(primitiveType);
@@ -10315,15 +10409,23 @@ namespace dxvk {
       emitNgxPassthroughFrameData();
     }
 
-    // HUD-less fallback: the injection ran (pre-post-process) but no UI-classified draw
-    // followed, so the presented frame is its own HUD-less copy
+    // The presenter already holds this frame's slot.
+    // Leaving the slot unfilled repeats the previous frame.
     if (m_frameOptions.ngxPassthroughMode && m_rtxInjectTriggered && callInjectRtx &&
         m_frameOptions.ngxDlfgHudless && !m_ngxHudlessCapturedThisFrame &&
         m_ngxFrameBackbufferImage != nullptr) {
       m_ngxHudlessCapturedThisFrame = true;
+      noteNgxHudlessCapture(NgxHudlessCaptureSite::FrameEnd);
 
       m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
         static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
+      });
+    }
+
+    if (m_frameOptions.ngxPassthroughMode && m_frameOptions.ngxDlfgHudlessPreview &&
+        m_ngxHudlessCapturedThisFrame && m_ngxFrameBackbufferImage != nullptr) {
+      m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->previewNgxPassthroughHudless(cBackbuffer);
       });
     }
     m_parent->Flush();
@@ -10378,6 +10480,7 @@ namespace dxvk {
     updateNgxPrePostInjectionAim();
 
     m_ngxHudlessCapturedThisFrame = false;
+    m_ngxHudlessSceneCompositeSeen = false;
 
     // Object velocity per-frame state: rotate the accepted camera, drop uncaptured
     // leftovers, and bound the identity cache (level transitions leave stale entries

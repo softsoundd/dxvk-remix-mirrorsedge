@@ -112,10 +112,11 @@ namespace dxvk {
                                     const Matrix4& worldToView,
                                     const Matrix4& viewToProjection);
 
-    // NGX passthrough mode: copies the pre-UI backbuffer into the HUD-less frame generation
-    // input slot. Emitted by the D3D9 layer at the first UI-classified backbuffer draw
-    // after a pre-post-process injection (or at frame end when no UI was drawn).
+    // Copies the pre-UI backbuffer into the HUD-less slot. Emitted by the D3D9 layer.
     void captureNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage);
+
+    // Copies that slot onto the backbuffer for the developer preview.
+    void previewNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage);
 
     // NGX passthrough mode: copies the game's depth buffer into a runtime-owned snapshot.
     // Emitted by the D3D9 layer right before the game's first mid-scene depth clear (UE3

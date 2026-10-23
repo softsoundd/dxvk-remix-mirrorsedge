@@ -355,12 +355,14 @@ namespace dxvk {
     // generation.
     void captureDepthSnapshot(RtxContext* ctx, const Rc<DxvkImage>& sceneDepthImage);
 
-    // Copies the pre-UI backbuffer into this frame's HUD-less slot for frame generation
-    // (see dlfgHudlessInput). Called (via RtxContext) at the scene-end/UI boundary: from
-    // dispatch() directly at the late injection point, from the D3D9 layer's first
-    // UI-classified backbuffer draw when the injection ran pre-post-process, or at frame
-    // end when no UI was drawn at all (the presented frame is its own HUD-less copy then).
+    // Copies the pre-UI backbuffer into this frame's HUD-less slot.
+    // Late injection calls this from dispatch.
+    // Pre-post injection calls it on the first draw after the scene blit.
+    // Frame end calls it when that draw never comes.
     void captureHudless(RtxContext* ctx, const Rc<DxvkImage>& backbufferImage);
+
+    // Copies the HUD-less slot onto the backbuffer for the developer preview.
+    void previewHudless(RtxContext* ctx, const Rc<DxvkImage>& backbufferImage);
 
     // Diagnostic: counts frames where the injection ran but the main camera was not valid,
     // so the passthrough dispatch was skipped entirely (feeds the periodic summary log)
@@ -419,6 +421,9 @@ namespace dxvk {
                "rendering and the first UI draw) in addition to the presented backbuffer. The interpolator then knows exactly\n"
                "which pixels are UI instead of detecting them heuristically, which strongly reduces UI warping over busy\n"
                "moving backgrounds.");
+    RTX_OPTION("rtx.ngxPassthrough", bool, dlfgHudlessPreview, false,
+               "Presents the HUD-less copy in place of the finished frame.\n"
+               "UI drawn after the capture is absent. Requires frame generation and rtx.ngxPassthrough.dlfgHudlessInput.");
     RTX_OPTION("rtx.ngxPassthrough", bool, driveGameScreenPercentage, true,
                "Lets the Remix upscaler quality preset choose the game's effective render resolution.\n"
                "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); other tiers use the upscaler's\n"
@@ -697,9 +702,8 @@ namespace dxvk {
     float m_motionBlurNearPlane = 0.0f;
     float m_motionBlurFarPlane = 0.0f;
 
-    // HUD-less copies of the pre-UI backbuffer for frame generation (see dlfgHudlessInput).
-    // Created lazily to match the backbuffer format/extent; the current slot's view is
-    // handed to the DLFG presenter at dispatch and filled later the same frame.
+    // HUD-less copies of the pre-UI backbuffer, in the backbuffer's format.
+    // The current slot's view is handed to the presenter at dispatch and filled later that frame.
     Resources::ResourceQueue m_hudlessQueue;
 
     // Remix post-processing (rtx.postfx) inputs synthesized alongside the motion vectors:

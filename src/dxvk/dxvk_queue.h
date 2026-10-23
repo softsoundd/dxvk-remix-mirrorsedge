@@ -83,6 +83,7 @@ namespace dxvk {
     // optional (may be null): the composited color without the UI drawn, letting the
     // interpolator separate UI from scene exactly instead of heuristically detecting it
     Rc<DxvkImageView> hudless;
+    VkImageLayout     hudlessLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     
     bool valid() const {
       return motionVectors.ptr() &&
@@ -95,6 +96,8 @@ namespace dxvk {
       depth = nullptr;
       resetHistory = false;
       interpolatedFrameCount = 0;
+      hudless = nullptr;
+      hudlessLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
   };
   // NV-DXVK end

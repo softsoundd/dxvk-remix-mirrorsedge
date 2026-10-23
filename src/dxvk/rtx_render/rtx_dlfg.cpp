@@ -738,6 +738,15 @@ namespace dxvk {
                               present.frameInterpolation.depthLayout,
                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
+          if (present.frameInterpolation.hudless != nullptr) {
+            barriers.addBarrier(present.frameInterpolation.hudless->image()->handle(),
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_ACCESS_NONE,
+                                VK_ACCESS_SHADER_READ_BIT,
+                                present.frameInterpolation.hudlessLayout,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+          }
+
           barriers.record(m_device, *commandList, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         }
 
@@ -781,6 +790,15 @@ namespace dxvk {
                                 VK_ACCESS_SHADER_WRITE_BIT,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 present.frameInterpolation.depthLayout);
+
+            if (present.frameInterpolation.hudless != nullptr) {
+              barriers.addBarrier(present.frameInterpolation.hudless->image()->handle(),
+                                  VK_IMAGE_ASPECT_COLOR_BIT,
+                                  VK_ACCESS_SHADER_READ_BIT,
+                                  VK_ACCESS_SHADER_WRITE_BIT,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                  present.frameInterpolation.hudlessLayout);
+            }
 
             barriers.record(m_device, *commandList, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
           }

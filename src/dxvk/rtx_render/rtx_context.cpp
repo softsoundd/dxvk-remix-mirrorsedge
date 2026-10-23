@@ -687,6 +687,12 @@ namespace dxvk {
     m_common->metaNgxPassthrough().captureHudless(this, backbufferImage);
   }
 
+  void RtxContext::previewNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage) {
+    ScopedGpuProfileZone(this, "NGX Passthrough HUD-less Preview");
+    spillRenderPass(false);
+    m_common->metaNgxPassthrough().previewHudless(this, backbufferImage);
+  }
+
 
   void RtxContext::setNgxPassthroughFrameData(const Rc<DxvkImage>& sceneDepthImage,
                                               const Rc<DxvkImage>& colorTargetImage,
