@@ -141,7 +141,7 @@ namespace dxvk {
     inline bool isChromaticAberrationEnabled() const { return enable() && enableChromaticAberration() && chromaticAberrationAmount() > 0.0f; }
     inline bool isVignetteEnabled() const { return enable() && enableVignette() && vignetteIntensity() > 0.0f; }
 
-    RTX_OPTION_ARGS("rtx.postfx", bool, enable, true, "Enables post-processing effects.",
+    RTX_OPTION_ARGS("rtx.postfx", bool, enable, false, "Enables post-processing effects.",
                     args.environment = "RTX_POST_FX_ENABLE",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.postfx", bool, enableMotionBlur, true, "Enables motion blur post-processing effect.",

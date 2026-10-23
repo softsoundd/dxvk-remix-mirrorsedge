@@ -651,7 +651,7 @@ namespace dxvk {
                "example override: 'rtx.remixMenuKeyBinds = CTRL, SHIFT, Z'.\n"
                "Full list of key names available in `src/util/util_keybind.h`.");
 
-    RTX_OPTION_ARGS("rtx", DLSSProfile, qualityDLSS, DLSSProfile::Auto, "Adjusts internal DLSS scaling factor, trades quality for performance.",
+    RTX_OPTION_ARGS("rtx", DLSSProfile, qualityDLSS, DLSSProfile::FullResolution, "Adjusts internal DLSS scaling factor, trades quality for performance.",
                     args.environment = "RTX_QUALITY_DLSS",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, captureDebugImage, false, "");

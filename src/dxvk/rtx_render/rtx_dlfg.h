@@ -311,7 +311,7 @@ namespace dxvk {
     // returns the currently configured number of interpolated frames
     uint32_t getInterpolatedFrameCount();
 
-    RTX_OPTION_ARGS("rtx.dlfg", bool, enable, true, "Enables DLSS 3.0 frame generation which generates interpolated frames to increase framerate at the cost of slightly more latency.",
+    RTX_OPTION_ARGS("rtx.dlfg", bool, enable, false, "Enables DLSS 3.0 frame generation which generates interpolated frames to increase framerate at the cost of slightly more latency.",
                     args.environment = "RTX_DLFG_ENABLE",
                     args.flags = RtxOptionFlags::UserSetting); // note: always use DxvkDevice::isDLFGEnabled() to check if DLFG is enabled, not this option directly
     RTX_OPTION_ARGS("rtx.dlfg", uint32_t, maxInterpolatedFrames, 2, "For DLSS 4.5 frame generation, controls the number of interpolated frames for each rendered frame. Ignored for DLSS 3.0.",

@@ -381,10 +381,14 @@ namespace dxvk {
 
     DxvkPostFx& postFx = device->getCommon()->metaPostFx();
 
-    if (graphicsPreset() == GraphicsPreset::Ultra || graphicsPreset() == GraphicsPreset::High) {
-      postFx.enable.setDeferred(true);
-    } else if (graphicsPreset() == GraphicsPreset::Medium || graphicsPreset() == GraphicsPreset::Low) {
-      postFx.enable.setDeferred(false);
+    // NGX passthrough keeps its own DLSS, frame generation, and post effect defaults.
+    // Graphics presets only retune those for the path-traced pipeline.
+    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
+      if (graphicsPreset() == GraphicsPreset::Ultra || graphicsPreset() == GraphicsPreset::High) {
+        postFx.enable.setDeferred(true);
+      } else if (graphicsPreset() == GraphicsPreset::Medium || graphicsPreset() == GraphicsPreset::Low) {
+        postFx.enable.setDeferred(false);
+      }
     }
 
     {
@@ -396,7 +400,8 @@ namespace dxvk {
     }
 
     // Respect a user DLSS override. Otherwise stay on the auto profile.
-    if (dlssPreset() != DlssPreset::Custom) {
+    // NGX passthrough defaults to Full Resolution and must not be reset to Auto here.
+    if (!RtxNgxPassthrough::ngxPassthroughMode() && dlssPreset() != DlssPreset::Custom) {
       qualityDLSS.setDeferred(DLSSProfile::Auto);
     }
   }
