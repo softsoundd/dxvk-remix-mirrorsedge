@@ -64,9 +64,24 @@ namespace dxvk {
 
     explicit DxvkDLSS(DxvkDevice* device);
     ~DxvkDLSS();
-    // Note: using template to make this compilable when DLSS SDK types are not available.
+    // The caller supplies the NGX enum, which stays out of this header.
     template<typename NVSDK_NGX_T>
     static NVSDK_NGX_T profileToQuality(DLSSProfile profile);
+
+    // J, K, L, and M pass through.
+    // Any other value is returned as Default.
+    template<typename NgxPreset>
+    static NgxPreset presetToHint(DLSSPreset preset) {
+      switch (preset) {
+      case DLSSPreset::J:
+      case DLSSPreset::K:
+      case DLSSPreset::L:
+      case DLSSPreset::M:
+        return static_cast<NgxPreset>(preset);
+      default:
+        return static_cast<NgxPreset>(DLSSPreset::Default);
+      }
+    }
 
     bool supportsDLSS() const;
 

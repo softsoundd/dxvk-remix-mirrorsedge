@@ -55,6 +55,10 @@
 #include <rtx_shaders/ngx_passthrough_velocity_dynamic_vertex.h>
 #include <rtx_shaders/ngx_passthrough_velocity_fragment.h>
 
+namespace ImGui {
+  void TextSeparator(const char* text, float pre_width = 10.0f);
+}
+
 namespace dxvk {
   void RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough() {
     if (ngxPassthroughMode() && RtxOptions::enableRaytracing()) {
@@ -65,18 +69,6 @@ namespace dxvk {
   void RtxNgxPassthrough::ngxPassthroughModeOnChange(DxvkDevice* device) {
     (void)device;
     enforceRaytracingDisabledForPassthrough();
-  }
-
-  void RtxNgxPassthrough::dlssRenderPresetOnChange(DxvkDevice* device) {
-    if (device != nullptr) {
-      device->getCommon()->metaNgxPassthrough().invalidateDlssFeatures();
-    }
-  }
-
-  void RtxNgxPassthrough::invalidateDlssFeatures() {
-    for (DlssFeature& feature : m_dlssFeatures) {
-      feature.needsInitialize = true;
-    }
   }
 
   namespace {
@@ -1252,52 +1244,14 @@ namespace dxvk {
       }
     }
 
-    NVSDK_NGX_DLSS_Hint_Render_Preset renderPresetFromOption(int optionValue) {
-      switch (optionValue) {
-      case 1:
-      case 2:
-      case 3:
-      case 4:
-        // CNN presets A-D were removed from the DLSS 4.5 SDK; K is the documented replacement.
-        return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
-      case 5: return NVSDK_NGX_DLSS_Hint_Render_Preset_E;
-      case 6: return NVSDK_NGX_DLSS_Hint_Render_Preset_F;
-      case 7: return NVSDK_NGX_DLSS_Hint_Render_Preset_G;
-      case 8: return NVSDK_NGX_DLSS_Hint_Render_Preset_H_Reserved;
-      case 9: return NVSDK_NGX_DLSS_Hint_Render_Preset_I_Reserved;
-      case 10: return NVSDK_NGX_DLSS_Hint_Render_Preset_J;
-      case 11: return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
-      case 12: return NVSDK_NGX_DLSS_Hint_Render_Preset_L;
-      case 13: return NVSDK_NGX_DLSS_Hint_Render_Preset_M;
-      case 14: return NVSDK_NGX_DLSS_Hint_Render_Preset_N;
-      case 15: return NVSDK_NGX_DLSS_Hint_Render_Preset_O;
-      default: return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
-      }
-    }
-
-    const char* renderPresetOptionToString(int optionValue) {
-      switch (optionValue) {
-      case 1: return "A (CNN, legacy)";
-      case 2: return "B (CNN, legacy)";
-      case 3: return "C (CNN, legacy)";
-      case 4: return "D (CNN, legacy)";
-      case 5: return "E (CNN, legacy)";
-      case 6: return "F (CNN, legacy)";
-      case 7: return "G (reserved)";
-      case 8: return "H (reserved)";
-      case 9: return "I (reserved)";
-      case 10: return "J (transformer v1)";
-      case 11: return "K (transformer, recommended)";
-      case 12: return "L (transformer 4.5, ultra perf)";
-      case 13: return "M (transformer 4.5, perf)";
-      case 14: return "N (reserved)";
-      case 15: return "O (reserved)";
+    const char* renderPresetToString(NVSDK_NGX_DLSS_Hint_Render_Preset preset) {
+      switch (preset) {
+      case NVSDK_NGX_DLSS_Hint_Render_Preset_J: return "J";
+      case NVSDK_NGX_DLSS_Hint_Render_Preset_K: return "K";
+      case NVSDK_NGX_DLSS_Hint_Render_Preset_L: return "L";
+      case NVSDK_NGX_DLSS_Hint_Render_Preset_M: return "M";
       default: return "Default";
       }
-    }
-
-    const char* renderPresetToString(NVSDK_NGX_DLSS_Hint_Render_Preset preset) {
-      return renderPresetOptionToString(static_cast<int>(preset));
     }
 
     // At the pre-post-process injection point the color source is the game's scene color,
@@ -1746,7 +1700,9 @@ namespace dxvk {
       feature.needsInitialize = true;
     }
 
-    if (feature.initializedRenderPreset != dlssRenderPreset() ||
+    const DxvkDLSS::DLSSPreset selectedPreset = DxvkDLSS::preset();
+    const int selectedPresetValue = static_cast<int>(selectedPreset);
+    if (feature.initializedRenderPreset != selectedPresetValue ||
         feature.initializedContentHDR != contentHDR ||
         feature.initializedInput[0] != m_renderExtent.width ||
         feature.initializedInput[1] != m_renderExtent.height ||
@@ -1757,7 +1713,7 @@ namespace dxvk {
 
     if (feature.needsInitialize) {
       feature.needsInitialize = false;
-      feature.initializedRenderPreset = dlssRenderPreset();
+      feature.initializedRenderPreset = selectedPresetValue;
       feature.initializedContentHDR = contentHDR;
       feature.initializedInput[0] = m_renderExtent.width;
       feature.initializedInput[1] = m_renderExtent.height;
@@ -1773,7 +1729,8 @@ namespace dxvk {
 
       const float resolutionRatio = float(inputSize[0]) / float(std::max(outputSize[0], 1u));
       const NVSDK_NGX_PerfQuality_Value perfQuality = perfQualityFromResolutionRatio(resolutionRatio);
-      const NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset = renderPresetFromOption(feature.initializedRenderPreset);
+      const NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset =
+        DxvkDLSS::presetToHint<NVSDK_NGX_DLSS_Hint_Render_Preset>(selectedPreset);
 
       // Conventional (non-inverted) depth, NGX-internal auto exposure (Remix's auto exposure
       // pass never runs in this mode; for LDR content the exposure is ignored anyway).
@@ -1786,7 +1743,7 @@ namespace dxvk {
                                   perfQuality);
 
       m_dlssInitCount++;
-      m_activeRenderPreset = feature.initializedRenderPreset;
+      m_activeRenderPreset = static_cast<int>(renderPreset);
 
       Logger::info(str::format("[RTX NGX Passthrough] DLSS initialized: ", inputSize[0], "x", inputSize[1],
                                " -> ", outputSize[0], "x", outputSize[1],
@@ -2370,34 +2327,125 @@ namespace dxvk {
     }
   }
 
-  void RtxNgxPassthrough::showImguiStatusLine(bool includeInjectionPoint) {
-    if (m_upscalerActive) {
-      if (includeInjectionPoint) {
-        const char* injectionPoint = m_lastDispatchPrePost ? "pre-post-process" : "late injection";
-        ImGui::TextWrapped(str::format(m_statusReason, ": ",
-                                       m_renderExtent.width, "x", m_renderExtent.height,
-                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height,
-                                       ", ", injectionPoint).c_str());
-      } else {
-        ImGui::TextWrapped(str::format(m_statusReason, ": ",
-                                       m_renderExtent.width, "x", m_renderExtent.height,
-                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height).c_str());
-      }
-    } else if (m_postFxActive) {
-      if (includeInjectionPoint) {
-        const char* injectionPoint = m_lastDispatchPrePost ? "pre-post-process" : "late injection";
-        ImGui::TextWrapped(str::format(m_statusReason, ": ",
-                                       m_renderExtent.width, "x", m_renderExtent.height,
-                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height,
-                                       ", ", injectionPoint).c_str());
-      } else {
-        ImGui::TextWrapped(str::format(m_statusReason, ": ",
-                                       m_renderExtent.width, "x", m_renderExtent.height,
-                                       " -> ", m_displayExtent.width, "x", m_displayExtent.height).c_str());
-      }
-    } else {
-      ImGui::TextWrapped(str::format(upscalerModeLabel(), " inactive: ", m_statusReason).c_str());
+  void RtxNgxPassthrough::showImguiStatusLine() {
+    if (m_upscalerActive || m_postFxActive) {
+      ImGui::TextWrapped(str::format(m_statusReason, ": ",
+                                     m_renderExtent.width, "x", m_renderExtent.height,
+                                     " -> ", m_displayExtent.width, "x", m_displayExtent.height).c_str());
+      return;
     }
+
+    ImGui::TextWrapped(str::format(upscalerModeLabel(), " inactive: ", m_statusReason).c_str());
+  }
+
+  void RtxNgxPassthrough::showImguiDiagnostics() {
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    const NgxVelocityCaptureStats& stats = m_lastCaptureStats;
+
+    const std::string statusText = (m_upscalerActive || m_postFxActive)
+      ? std::string(m_statusReason)
+      : str::format(upscalerModeLabel(), " inactive: ", m_statusReason);
+    const char* presetText = m_activeRenderPreset >= 0
+      ? renderPresetToString(static_cast<NVSDK_NGX_DLSS_Hint_Render_Preset>(m_activeRenderPreset))
+      : "Not initialized";
+
+    auto statRow = [](const char* label, const std::string& value, const char* tooltip = nullptr) {
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::TextUnformatted(label);
+      if (tooltip != nullptr) {
+        RemixGui::SetTooltipToLastWidgetOnHover(tooltip);
+      }
+      ImGui::TableSetColumnIndex(1);
+      ImGui::TextUnformatted(value.c_str());
+    };
+
+    auto beginStatTable = [](const char* id) {
+      const ImGuiTableFlags flags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_PadOuterX;
+      if (!ImGui::BeginTable(id, 2, flags)) {
+        return false;
+      }
+      ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed);
+      ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+      return true;
+    };
+
+    ImGui::Indent();
+
+    ImGui::TextSeparator("Dispatch");
+    if (beginStatTable("##ngx_diag_dispatch")) {
+      statRow("Status", statusText);
+      statRow("Resolution", str::format(m_renderExtent.width, "x", m_renderExtent.height,
+                                        " -> ", m_displayExtent.width, "x", m_displayExtent.height));
+      statRow("Injection", m_lastDispatchPrePost ? "Pre-post-process" : "Late injection",
+              "Pre-post-process reads linear scene colour before the game's post chain. "
+              "Late injection reads the post-processed output.");
+      statRow("Last dispatch frame", str::format(m_lastDispatchFrameId),
+              "A value behind the current frame means that dispatch was skipped.");
+      statRow("Current frame", str::format(currentFrameId));
+      statRow("DLSS initializations", str::format(m_dlssInitCount),
+              "The HDR and LDR features are counted separately. A climb during play means DLSS history was reset.");
+      statRow("Submitted preset", presetText,
+              "Default leaves the model choice to NGX for the current quality mode.");
+      ImGui::EndTable();
+    }
+
+    ImGui::TextSeparator("Jitter");
+    if (beginStatTable("##ngx_diag_jitter")) {
+      statRow("X", str::format(m_lastJitter[0]),
+              "Sub-pixel viewport offset used while rasterizing the last frame. Zero means jitter is not engaging.");
+      statRow("Y", str::format(m_lastJitter[1]),
+              "Sub-pixel viewport offset used while rasterizing the last frame. Zero means jitter is not engaging.");
+      statRow("Dynamic object draws", str::format(m_lastVelocityDrawCount),
+              "Draws rasterized into the object-velocity buffer this frame.");
+      ImGui::EndTable();
+    }
+
+    ImGui::TextSeparator("Velocity Capture");
+    if (beginStatTable("##ngx_diag_velocity")) {
+      statRow("Captured", str::format(stats.captured));
+      statRow("Skinned", str::format(stats.capturedSkinned));
+      statRow("CPU mesh", str::format(stats.capturedDynamic),
+              "Motion taken from CPU-modified vertex positions.");
+      statRow("Foreground", str::format(stats.capturedForeground),
+              "Must be nonzero while first-person meshes render in SDPG_Foreground.");
+      statRow("Static matches", str::format(stats.exactMatches),
+              "Matched a previous sighting exactly and was treated as static.");
+      statRow("New registrations", str::format(stats.newRegistrations),
+              "No partner for the sighting, so that draw produced no velocity. A spike during motion means pairing is failing.");
+      statRow("New registrations, skinned", str::format(stats.newRegistrationsSkinned),
+              "Instanced static geometry can raise the total without a skinned miss. A skinned miss is a character or attachment losing a frame of velocity.");
+      statRow("Miss, no last frame", str::format(stats.missNoLastFrameSighting),
+              "That placement was not seen on the previous frame.");
+      statRow("Miss, beyond translation", str::format(stats.missBeyondTranslation),
+              "The previous sighting had moved too far to be the same object.");
+      statRow("Miss, beyond rotation", str::format(stats.missBeyondRotation),
+              "The previous sighting had rotated too far to be the same object.");
+      statRow("Claimed without velocity", str::format(stats.claimedWithoutVelocity),
+              "Paired, but the emission gate rejected the motion.");
+      statRow("Paired beyond bounds", str::format(stats.pairedBeyondBounds),
+              "Held for another confirming frame. A steady nonzero count while something moves means a real mover is waiting. A spike while turning the camera is a swap being refused.");
+      statRow("Skipped, no camera", str::format(stats.skippedNoCamera));
+      statRow("Skipped, budget", str::format(stats.skippedBudget),
+              "The per-frame capture budget was exhausted.");
+      statRow("Skipped, depth test off", str::format(stats.skippedZDisabled),
+              "A CPU-modified mesh rendered with the depth test disabled, so the capture cannot see it.");
+      statRow("Skipped, instance cap", str::format(stats.skippedInstanceCap),
+              "Every instance slot for that asset was already in use. A mover in that set gets no velocity.");
+      statRow("Skipped, dynamic buffer", str::format(stats.skippedDynamicBuffer),
+              "The buffer did not match the CPU-modified mesh shape. Ring-pool geometry lands here, and a mesh whose motion is in its vertices gets no velocity.");
+      statRow("Skipped, bone palette", str::format(stats.skippedBonePalette),
+              "The bone palette does not fit the capture cap, so every mesh on that rig gets no velocity.");
+      statRow("Frame camera", stats.frameCameraValid ? "Valid" : "Missing",
+              "Missing during a fullscreen movie or loading screen, where the last camera matrices are kept.");
+      statRow("Depth clears", str::format(stats.depthClears),
+              "Must be nonzero while first-person meshes render in SDPG_Foreground. Otherwise those draws are tagged as world-phase. Occlusion culling disabled leaves one clear. Occlusion culling enabled leaves two.");
+      statRow("Camera transpose flips", str::format(stats.cameraTransposeFlips),
+              "Must stay at zero. A flip means consecutive frames were read with different matrix conventions.");
+      ImGui::EndTable();
+    }
+
+    ImGui::Unindent();
   }
 
   void RtxNgxPassthrough::showImguiSettings() {
@@ -2405,70 +2453,9 @@ namespace dxvk {
     RemixGui::Checkbox("Pre-Post-Process Injection (DLSS before the game's post chain)", &prePostProcessObject());
     RemixGui::Checkbox("Bypass Upscaler (keep the reduced render, plain stretch)", &bypassUpscalerObject());
 
-    {
-      static const int kPresetOptionValues[] = { 0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13 };
-      static const char* kPresetLabels =
-        "Default\0"
-        "Preset A (CNN, legacy)\0"
-        "Preset B (CNN, legacy)\0"
-        "Preset C (CNN, legacy)\0"
-        "Preset D (CNN, legacy)\0"
-        "Preset E (CNN, legacy)\0"
-        "Preset F (CNN, legacy)\0"
-        "Preset J (Transformer v1)\0"
-        "Preset K (Transformer, recommended)\0"
-        "Preset L (Transformer 4.5, Ultra Perf)\0"
-        "Preset M (Transformer 4.5, Perf)\0";
-
-      int comboIndex = 0;
-      for (int i = 0; i < int(std::size(kPresetOptionValues)); i++) {
-        if (kPresetOptionValues[i] == dlssRenderPreset()) {
-          comboIndex = i;
-          break;
-        }
-      }
-
-      if (IMGUI_ADD_TOOLTIP(ImGui::Combo("DLSS Model Preset", &comboIndex, kPresetLabels),
-          "Selects the DLSS Super Resolution model passed to NGX as a render-preset hint. "
-          "K is the recommended general-purpose transformer preset. "
-          "L and M are DLSS 4.5 transformer models tuned for ultra performance and performance modes; "
-          "they are FP8-accelerated and can cost significantly more on RTX 20/30 GPUs without native FP8 support. "
-          "Changing the preset recreates the DLSS feature on the next frame.")) {
-        dlssRenderPresetObject().setDeferred(kPresetOptionValues[comboIndex]);
-      }
+    if (RemixGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_CollapsingHeader)) {
+      showImguiDiagnostics();
     }
-
-    showImguiStatusLine();
-
-    // Diagnostics: dispatch cadence (should track the current frame 1:1 during gameplay),
-    // DLSS feature re-initializations (should stay at 1 outside resolution changes), and the
-    // sub-pixel jitter the last frame was rasterized with (0,0 means jitter is not engaging)
-    const uint32_t currentFrameId = m_device->getCurrentFrameId();
-    if (m_activeRenderPreset >= 0) {
-      ImGui::TextWrapped(str::format("Active model preset: ",
-                                     renderPresetOptionToString(m_activeRenderPreset)).c_str());
-    }
-    ImGui::TextWrapped(str::format("Last dispatch: frame ", m_lastDispatchFrameId, " (current ", currentFrameId,
-                                   "), total DLSS initializations: ", m_dlssInitCount).c_str());
-    ImGui::TextWrapped(str::format("Jitter: ", m_lastJitter[0], ", ", m_lastJitter[1],
-                                   " | Dynamic object draws: ", m_lastVelocityDrawCount).c_str());
-
-    // Capture health (see NgxVelocityCaptureStats): new-registration or skip spikes
-    // during motion pinpoint where the capture chain loses movers
-    ImGui::TextWrapped(str::format("Velocity capture: ", m_lastCaptureStats.captured, " captured (",
-                                   m_lastCaptureStats.capturedSkinned, " skinned, ",
-                                   m_lastCaptureStats.capturedDynamic, " cpu-mesh, ",
-                                   m_lastCaptureStats.capturedForeground, " fg), ",
-                                   m_lastCaptureStats.exactMatches, " static, ",
-                                   m_lastCaptureStats.newRegistrations, " new, ",
-                                   m_lastCaptureStats.pairedBeyondBounds, " beyond-bounds, ",
-                                   m_lastCaptureStats.skippedNoCamera, " no-camera, ",
-                                   m_lastCaptureStats.skippedBudget, " budget, ",
-                                   m_lastCaptureStats.skippedZDisabled, " z-off, ",
-                                   m_lastCaptureStats.skippedInstanceCap, " inst-cap | frame camera: ",
-                                   m_lastCaptureStats.frameCameraValid ? "valid" : "missing",
-                                   " | depth clears: ", m_lastCaptureStats.depthClears,
-                                   " | transpose flips: ", m_lastCaptureStats.cameraTransposeFlips).c_str());
 
     // rtx.ngxPassthrough.motionBlurFirstPerson and rtx.ngxPassthrough.objectVelocities
     // stay config-only: both default on and only serve as kill-switches

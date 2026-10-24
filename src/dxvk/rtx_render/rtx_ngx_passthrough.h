@@ -123,62 +123,66 @@ namespace dxvk {
     bool enabled = false;
   };
 
-  // Per-frame diagnostics of the D3D9-side dynamic draw capture, shown in the developer
-  // menu. Healthy steady state: captured tracks the number of moving objects on screen
-  // (capturedSkinned of them skeletal, capturedForeground of them in the foreground DPG
-  // phase - must be nonzero whenever first person meshes render in SDPG_Foreground);
-  // newRegistrations ~0 (first sightings and claims without emission - spikes during
-  // motion mean sightings are failing to pair with their history); the skip counters ~0
-  // (each names the gate that rejected otherwise-qualifying scene draws); transpose
-  // flips 0 (the camera packing-convention tiebreaker must be stable).
+  // Holds the per-frame counters from the D3D9 dynamic-draw capture.
+  // The Diagnostics section shows them.
+  // Captured tracks how many movers are on screen.
+  // CapturedForeground must be nonzero while first-person meshes render in SDPG_Foreground.
+  // New registrations stay near zero.
+  // A spike during motion means sightings are failing to pair with their history.
+  // Skip counters stay near zero.
+  // Each skip counter names the gate that rejected an otherwise qualifying draw.
+  // Camera transpose flips stay at zero.
+  // A flip means the packing-convention tiebreaker changed between frames.
   struct NgxVelocityCaptureStats {
     uint32_t captured = 0;
     uint32_t capturedSkinned = 0;
     uint32_t capturedDynamic = 0;
     uint32_t capturedForeground = 0;
+    // Matched a previous sighting exactly and was treated as static.
     uint32_t exactMatches = 0;
-    // Sightings that found nothing to pair with, so produced no velocity: a one-frame dropout each.
-    // Broken down by why - no sighting of that placement last frame at all, or one that was there
-    // but too far in translation or in rotation to be believed the same object having moved.
+    // Found nothing to pair against, so the sighting produced no velocity.
+    // Each one is a one-frame dropout.
+    // The miss counters below split them by cause.
     uint32_t newRegistrations = 0;
-    // Of those, the skinned ones. The total is dominated by instanced level geometry, where a
-    // placement's nearest sibling is far enough away to refuse and emitting nothing is the right
-    // answer anyway; a skinned miss is a character or an attachment losing a frame of velocity.
+    // Counts the skinned new registrations.
+    // Instanced level geometry dominates the total, and refusing a distant sibling there is correct.
+    // A skinned miss is a character or an attachment losing a frame of velocity.
     uint32_t newRegistrationsSkinned = 0;
+    // The placement was not seen on the previous frame.
     uint32_t missNoLastFrameSighting = 0;
+    // The previous sighting had moved too far to be the same object.
     uint32_t missBeyondTranslation = 0;
+    // The previous sighting had rotated too far to be the same object.
     uint32_t missBeyondRotation = 0;
-    // Sightings that paired but whose motion the emission gate would not vouch for
+    // Paired, but the emission gate rejected the motion.
     uint32_t claimedWithoutVelocity = 0;
-    // Sightings paired only by elimination, beyond the per-frame motion bounds: a fast mover
-    // sustaining its delta, or one placement of an asset arriving as another leaves. Held to
-    // the repeat-confirmation path, so a steady nonzero count with content that visibly moves
-    // means real movers are being made to wait a frame; spikes as the camera turns are swaps
-    // being refused.
+    // Pairs only by elimination, past the per-frame motion bounds, and waits for another confirming frame.
+    // A steady nonzero count while something moves means a real mover is waiting.
+    // A spike as the camera turns is a swap being refused.
     uint32_t pairedBeyondBounds = 0;
-    // Sightings left untracked because every instance slot for their identity was already in
-    // use by a placement seen this frame or last. Nonzero means an asset has more copies on
-    // screen than kMaxInstancesPerIdentity holds: harmless for the static geometry that is
-    // usually instanced that heavily, but a mover among them would go without velocity.
+    // Goes untracked because every instance slot for that identity was already in use.
+    // Static geometry past kMaxInstancesPerIdentity is harmless.
+    // A mover in that set gets no velocity.
     uint32_t skippedInstanceCap = 0;
-    // Scene draws on dynamic buffers that did not match the CPU-modified-mesh shape, so nothing was
-    // captured for them - ring-pool geometry, whose allocations move every frame. A mesh that
-    // carries its motion in its vertex positions and lands here goes without velocity entirely.
+    // Did not match the CPU-modified mesh shape, so nothing was captured.
+    // Ring-pool geometry lands here because its allocation moves every frame.
+    // A mesh whose motion is in its vertex positions gets no velocity from this path.
     uint32_t skippedDynamicBuffer = 0;
-    // Skinned draws whose bone palette does not fit kNgxVelocityBonePaletteRegisters. Nonzero means
-    // a rig richer than the cap allows, and every mesh using it goes without velocity.
+    // The bone palette does not fit kNgxVelocityBonePaletteRegisters.
+    // Every mesh on that rig gets no velocity.
     uint32_t skippedBonePalette = 0;
     uint32_t skippedNoCamera = 0;
     uint32_t skippedBudget = 0;
-    // Scene draws with the CPU-modified-mesh buffer shape (dedicated dynamic VB, static
-    // IB) rejected by the depth-test-enable gate: nonzero means such meshes render with
-    // z-test disabled in some game state and are invisible to the capture
+    // Rejected because the depth test was disabled.
+    // Those meshes are invisible to the capture while that state lasts.
     uint32_t skippedZDisabled = 0;
+    // Stays false during a fullscreen movie or loading screen, where the last camera matrices are kept.
     bool frameCameraValid = false;
-    // Qualifying mid-scene depth clears this frame: must be nonzero whenever first person
-    // meshes render in SDPG_Foreground (or their draws get misclassified as world-phase).
-    // 1 with occlusion culling disabled (the foreground DPG boundary); 2 with it enabled
-    // (the engine issues an extra mid-scene clear ahead of the foreground DPG).
+    // Counts qualifying mid-scene depth clears.
+    // Must be nonzero while first-person meshes render in SDPG_Foreground.
+    // Otherwise those draws are tagged as world-phase.
+    // Occlusion culling disabled leaves one clear, at the foreground DPG boundary.
+    // Occlusion culling enabled leaves two, because the engine clears once more ahead of that boundary.
     uint32_t depthClears = 0;
     uint32_t cameraTransposeFlips = 0;
   };
@@ -344,9 +348,8 @@ namespace dxvk {
       m_sceneCameraFresh = fresh;
     }
 
-    // Single status line (upscaler state + resolutions), shared between the developer panel and
-    // the user menu (the stock DLSS object's state is meaningless while this mode is active)
-    void showImguiStatusLine(bool includeInjectionPoint = true);
+    // Shows the upscaler state and resolution in the user menu.
+    void showImguiStatusLine();
 
     // Copies the game's depth buffer into a runtime-owned snapshot. Called (via RtxContext)
     // right before the game's first mid-scene depth clear: UE3 clears the depth buffer
@@ -381,7 +384,6 @@ namespace dxvk {
     // Path tracing is incompatible with NGX passthrough; keep rtx.enableRaytracing off.
     static void enforceRaytracingDisabledForPassthrough();
     static void ngxPassthroughModeOnChange(DxvkDevice* device);
-    static void dlssRenderPresetOnChange(DxvkDevice* device);
 
     RTX_OPTION_ARGS("rtx", bool, ngxPassthroughMode, false,
                "Master toggle for the NGX passthrough mode: the game's original rasterized rendering is presented (no path tracing,\n"
@@ -453,12 +455,6 @@ namespace dxvk {
                "Escape hatch for titles where GSystemSettings cannot be located automatically: the RVA of\n"
                "FSystemSettings::ScreenPercentage within the game's main module. 0 leaves discovery\n"
                "automatic. The value is still proven by the behavioural probe before it is used.");
-    RTX_OPTION_ARGS("rtx.ngxPassthrough", int, dlssRenderPreset, 11,
-               "DLSS render preset (model selection) hint for the NGX feature. 0: Default (snippet/driver decides), 1-6:\n"
-               "presets A-F (legacy CNN models), 10: preset J (transformer v1), 11: preset K (transformer, recommended),\n"
-               "12: preset L (DLSS 4.5 transformer, ultra performance), 13: preset M (DLSS 4.5 transformer, performance).\n"
-               "Reserved values 7-9 and 14-15 revert to default per the NGX SDK. Changing this recreates the DLSS feature.",
-               args.onChangeCallback = &RtxNgxPassthrough::dlssRenderPresetOnChange);
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocityDebugFreeze, false,
                "Diagnostic for the object velocity pass: composes every captured draw's previous-frame side from the\n"
                "current frame's transforms and bone palettes (forcing the rasterized velocity to zero) and disables the\n"
@@ -503,6 +499,8 @@ namespace dxvk {
                "game's real compositing chain.");
 
   private:
+    void showImguiDiagnostics();
+
     void createResources(Rc<DxvkContext> ctx, const VkExtent2D& renderExtent, const VkExtent2D& displayExtent);
     bool generateMotionVectorsAndDepth(RtxContext* ctx,
                                        DxvkContextState& dxvkCtxState,
@@ -608,8 +606,6 @@ namespace dxvk {
 
     void copyColorInputToOutput(RtxContext* ctx);
 
-    void invalidateDlssFeatures();
-
     // Combines m_dlssOutput RGB with m_colorInput alpha into m_mergedOutput
     void dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers);
     void dispatchSceneColorDebug(RtxContext* ctx, DxvkBarrierSet& barriers);
@@ -620,6 +616,8 @@ namespace dxvk {
     struct DlssFeature {
       std::unique_ptr<NGXDLSSContext> context;
       bool needsInitialize = true;
+      // Stores the DxvkDLSS::DLSSPreset this feature was created with.
+      // Holds -1 until the first initialization.
       int initializedRenderPreset = -1;
       uint32_t initializedInput[2] = { 0, 0 };
       uint32_t initializedOutput[2] = { 0, 0 };
@@ -639,10 +637,14 @@ namespace dxvk {
     NgxOutputTransform m_outputTransform;
     bool m_preserveOriginalAlpha = false;
 
-    // Status/diagnostics for the developer menu (written on the CS thread, read for display)
+    // Written on the CS thread and read by the menus.
     const char* m_statusReason = "not dispatched yet";
     uint32_t m_lastDispatchFrameId = 0;
+    // Counts every DLSS feature rebuild.
+    // The HDR and LDR features are counted separately.
     uint32_t m_dlssInitCount = 0;
+    // Stores the NVSDK_NGX_DLSS_Hint_Render_Preset last passed to NGX.
+    // Holds -1 before the first initialization.
     int m_activeRenderPreset = -1;
     float m_lastJitter[2] = { 0.0f, 0.0f };
     bool m_lastDispatchPrePost = false;

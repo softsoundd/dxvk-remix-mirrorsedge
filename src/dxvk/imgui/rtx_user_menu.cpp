@@ -45,6 +45,7 @@ namespace dxvk {
 
   // Combo boxes shared with dxvk_imgui.cpp
   extern RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo;
+  extern RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset> dlssRenderPresetCombo;
   extern RemixGui::ComboWithKey<XeSSPreset> xessPresetCombo;
 
   // Combo boxes used only by the user menu
@@ -320,12 +321,12 @@ namespace dxvk {
 
       switch (RtxOptions::upscalerType()) {
         case UpscalerType::DLSS: {
-          // The DLSS mode selector maps to the game's ScreenPercentage
-          // (rtx.ngxPassthrough.driveGameScreenPercentage). Keep it live even when a
-          // non-Custom DLSS preset would gray the section out.
+          // Keep these editable when the combined DLSS preset grays the section out.
+          // The mode drives ScreenPercentage through rtx.ngxPassthrough.driveGameScreenPercentage.
           ImGui::EndDisabled();
+          dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
           dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-          common->metaNgxPassthrough().showImguiStatusLine(false);
+          common->metaNgxPassthrough().showImguiStatusLine();
           ImGui::BeginDisabled(disableNonPresetSettings);
           break;
         }

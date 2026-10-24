@@ -33,8 +33,8 @@ How it works:
 
 Notes and limitations:
 
-- Options under `rtx.ngxPassthrough.*`; Rendering -> General shows DLSS stats and depth/MV visualisers.
-- Default DLSS model is the transformer preset (`rtx.ngxPassthrough.dlssRenderPreset = 11`, preset K), which keeps more detail than NGX's default CNN presets; the developer menu can switch presets live (A-F legacy CNN, J/K transformer v1, L/M DLSS 4.5 transformer).
+- Options live under `rtx.ngxPassthrough.*`. Rendering, General shows depth and motion-vector views on Debug Visualization. Dispatch, jitter, and velocity-capture figures are under Diagnostics.
+- `rtx.dlss.preset` selects the DLSS model. The default is 0. Default lets the SDK pick the model for the quality mode. DLAA, Balanced, and Quality use K. Performance uses M. Ultra Performance uses L. The menu offers Default, J, K, L, and M.
 - Ghosting issues with particles and textures on transparent planes (chain link fences). Will investigate solutions for this in the future.
 - Separate existing issue with Mirror's Edge where sub-native render resolutions offsets the position of some effects like sun haze and first person self-shadowing. This is not Remix's doing.
 
