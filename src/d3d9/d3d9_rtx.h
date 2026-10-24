@@ -550,14 +550,18 @@ namespace dxvk {
 
     // Viewports and scissors within this many pixels of the scene rect are treated as that rect.
     static constexpr uint32_t kNgxViewportMatchPixels = 4;
+    // A scene viewport this close to backbuffer * ScreenPercentage / 100 is that rect.
+    static constexpr int32_t kNgxDrivenViewportTolerance = 16;
 
     // Expands a viewport that matches the scene rect out to the bound render target.
     // The game's D3D viewport is left unchanged.
     bool GetNgxPassthroughExpandedViewport(D3DVIEWPORT9* viewport) const;
 
     // Rewrites a four-vertex user-pointer quad laid out as float4 position, then float2 UV.
-    // A quad is rewritten only when its clip or UV bounds match the reduced scene rect.
-    void RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride) const;
+    // The DOF gather keeps its filter-buffer quad and reads the full upscaled scene.
+    // The separable blur stays on the downsampled region.
+    // A blend quad on the scene rect grows to the bound target, and its filter UVs stay put.
+    void RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride);
 
     // Called at the end of the draw that deferred injection.
     // A queued draw is followed by DLSS on the image it wrote.
@@ -1275,8 +1279,13 @@ namespace dxvk {
     bool m_ngxRuntimeOwnedUpscale = false;
     uint32_t m_ngxMissingEngineUpscaleFrames = 0;
 
-    // Scene-camera viewport gate; 0 = unknown.
+    // Scene-camera viewport gate. 0 means unknown.
     float m_ngxGameScreenPercentage = 0.0f;
+    // True after this frame records the ScreenPercentage view.
+    // A later full-surface draw is not that view.
+    // Rebinding scene colour leaves the viewport at the whole target.
+    // The picture stays in the recorded rect.
+    bool m_ngxReducedSceneViewportThisFrame = false;
     bool m_ngxPassthroughBootstrapped = false;
 
     // Latest UE3 camera matrices accepted this frame; replayed into the CS camera at injection
@@ -1541,10 +1550,23 @@ namespace dxvk {
     Rc<DxvkImage> findNgxPrePostSceneColorFromSamplers(bool applyOrdinalGate, bool recordRead);
     static bool ngxSceneViewportIsSubrect(const D3DVIEWPORT9& sceneViewport,
                                           uint32_t backBufferWidth, uint32_t backBufferHeight);
+    // True when the viewport is the rect produced by the driven ScreenPercentage.
+    bool ngxViewportMatchesDrivenScreenPercentage(const D3DVIEWPORT9& viewport) const;
     static bool ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo);
     static bool ngxShaderIsFinalBackbufferComposite(const Ue3ShaderFeatureInfo& psInfo);
     bool ngxDrawIsUi(const DrawContext& drawContext);
     bool ngxOffscreenPrePostShape(const DrawContext& drawContext);
+    // True for UE3's filter color target.
+    // Its size is the scene buffer divided by four, plus a two-pixel border.
+    bool ngxImageIsDofFilterBuffer(const DxvkImage* image) const;
+    bool ngxBoundImageIsDofFilterBuffer() const;
+    bool ngxDrawSamplesSceneColor() const;
+    bool tryGetBoundPixelFeatures(Ue3ShaderFeatureInfo& info);
+    // Requires DepthOfFieldCommon and a scene-color sample.
+    // Blur weights and BlurredImage belong to the other two passes.
+    bool ngxBoundPixelIsDofGather();
+    bool ngxBoundPixelIsDofBlend();
+    bool ngxDrawIsDofBloomGather();
     void refreshNgxUe3VertexFactory();
     void armNgxFullBufferScreenPositionScaleBias();
     void noteNgxPostUpscaleViewport();

@@ -5141,11 +5141,10 @@ namespace dxvk {
         return;
     }
 
-    // Only the main scene view may steer the main camera and scene targets. It renders at
-    // backbuffer * ScreenPercentage / 100 (full at 100), while auxiliary camera passes -
-    // shadow cascades, SceneCapture probes, velocity/blur - use unrelated sizes. Matching the
-    // viewport against the known ScreenPercentage separates them; a viewport-fraction gate
-    // cannot, since a low ScreenPercentage main view is as small as an auxiliary pass.
+    // Only the main scene view may steer the main camera and scene targets.
+    // It renders at backbuffer * ScreenPercentage / 100, or the full backbuffer at 100.
+    // Shadow cascades, scene captures, and velocity passes use other sizes.
+    // A low ScreenPercentage view is as small as those passes, so the match uses the known percentage.
     if (m_activePresentParams.has_value()) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
       const uint32_t bbW = m_activePresentParams->BackBufferWidth;
@@ -5154,24 +5153,27 @@ namespace dxvk {
       if (bbW != 0 && bbH != 0) {
         const float sp = m_ngxGameScreenPercentage;
         if (sp > 0.0f && sp <= 100.0f) {
-          const int32_t expectedW = int32_t(float(bbW) * sp / 100.0f);
-          const int32_t expectedH = int32_t(float(bbH) * sp / 100.0f);
-          const int32_t sizeTolerance = 16;
+          const bool viewportNearFullSize =
+            int32_t(vp.Width) >= int32_t(bbW) - kNgxDrivenViewportTolerance &&
+            int32_t(vp.Height) >= int32_t(bbH) - kNgxDrivenViewportTolerance;
           const bool viewportMatchesExpected =
-            int32_t(vp.Width)  >= expectedW - sizeTolerance && int32_t(vp.Width)  <= expectedW + sizeTolerance &&
-            int32_t(vp.Height) >= expectedH - sizeTolerance && int32_t(vp.Height) <= expectedH + sizeTolerance;
+            ngxViewportMatchesDrivenScreenPercentage(vp) ||
+            (sp >= 99.5f && viewportNearFullSize);
           if (!viewportMatchesExpected) {
-            // The D3D9 layer may have updated the isolated ScreenPercentage shadow before the
-            // game has consumed it (typically one frame). Accept the main view at full
-            // backbuffer size during that window so scene targets and the camera stay valid;
-            // once the viewport shrinks the gate enforces the reduced size and Super
-            // Resolution engages.
-            const bool viewportNearFullSize =
-              int32_t(vp.Width) >= int32_t(bbW) - sizeTolerance &&
-              int32_t(vp.Height) >= int32_t(bbH) - sizeTolerance;
+            // The ScreenPercentage shadow can move a frame before the game consumes it.
+            // A full-backbuffer view is accepted for that frame so the camera stays valid.
+            // After the viewport shrinks, only the reduced rect passes.
             const bool expectingReducedResolution = sp < 99.5f;
             if (!(expectingReducedResolution && viewportNearFullSize))
               return;
+
+            // A full-surface draw after the ScreenPercentage view is not the view.
+            // Rebinding scene colour leaves the viewport at the whole target.
+            // The picture stays in the recorded rect.
+            if (m_ngxReducedSceneViewportThisFrame) {
+              ONCE(Logger::info("[RTX NGX Passthrough] Kept the ScreenPercentage scene rect. A later full-target draw was not the view."));
+              return;
+            }
           }
         } else if (vp.Width * 2 < bbW || vp.Height * 2 < bbH) {
           // ScreenPercentage not resolved yet (first frame): fall back to the near-backbuffer
@@ -5224,6 +5226,9 @@ namespace dxvk {
         m_ngxSceneViewport = d3d9State().viewport;
         m_ngxSceneViewportValid = true;
         m_ngxSceneViewportLastValidFrame = m_ue3FrameCounter;
+        if (m_ngxGameScreenPercentage < 99.5f &&
+            ngxViewportMatchesDrivenScreenPercentage(m_ngxSceneViewport))
+          m_ngxReducedSceneViewportThisFrame = true;
 
         if (sceneTargetsChanged) {
           ONCE(Logger::info(str::format("[RTX NGX Passthrough] Scene color/depth targets identified. color=0x",
@@ -9107,7 +9112,7 @@ namespace dxvk {
     return true;
   }
 
-  void D3D9Rtx::RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride) const {
+  void D3D9Rtx::RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride) {
     if (!m_ngxPrePostUpscaled || vertices == nullptr || vertexCount != 4 || stride < 24 ||
         m_ngxSceneColorImage == nullptr || m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0) {
       return;
@@ -9174,6 +9179,26 @@ namespace dxvk {
       return newLo + (value - lo) / span * (newHi - newLo);
     };
 
+    // A filter-buffer quad and the scene subrect cover the same fraction of their targets.
+    // Positions stay put, so the blur kernel remains on the texels the gather wrote.
+    // The gather's scene UVs open onto the upscaled image.
+    // The blur keeps the downsampled rect.
+    if (ngxBoundImageIsDofFilterBuffer()) {
+      const bool dofGather = ngxBoundPixelIsDofGather();
+      if (dofGather && uvMatchesSubrect) {
+        for (Vertex* vertex : quad) {
+          vertex->u = remap(vertex->u, minU, maxU, 0.0f, 1.0f);
+          vertex->v = remap(vertex->v, minV, maxV, 0.0f, 1.0f);
+        }
+      } else if (dofGather) {
+        ONCE(Logger::info(str::format(
+          "[RTX NGX Passthrough] DOF/bloom gather UVs were not the scene subrect (uv ",
+          minU, "..", maxU, ", ", minV, "..", maxV,
+          ", scene ", u0, "..", u1, ", ", v0, "..", v1, ").")));
+      }
+      return;
+    }
+
     if (posMatchesSubrect) {
       for (Vertex* vertex : quad) {
         vertex->x = remap(vertex->x, minX, maxX, -1.0f, 1.0f);
@@ -9181,11 +9206,24 @@ namespace dxvk {
       }
     }
 
-    if (uvMatchesSubrect && (posMatchesSubrect || posFullscreen)) {
+    // The blend UV addresses the gathered filter texels.
+    // Those texels coincide with the scene subrect.
+    // Stretching them reads the rest of the filter buffer, which the gather leaves empty.
+    // Scene color comes from the clip position, so growing the quad is enough.
+    const bool dofBlend = ngxBoundPixelIsDofBlend();
+    if (!dofBlend && uvMatchesSubrect && (posMatchesSubrect || posFullscreen)) {
       for (Vertex* vertex : quad) {
         vertex->u = remap(vertex->u, minU, maxU, 0.0f, 1.0f);
         vertex->v = remap(vertex->v, minV, maxV, 0.0f, 1.0f);
       }
+    }
+
+    if (dofBlend && !posMatchesSubrect && !posFullscreen) {
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] DOF/bloom blend quad stayed on a reduced rect after the upscale (clip ",
+        minX, "..", maxX, ", ", minY, "..", maxY,
+        ", scene ", std::min(clipLeft, clipRight), "..", std::max(clipLeft, clipRight),
+        ", ", std::min(clipTop, clipBottom), "..", std::max(clipTop, clipBottom), ").")));
     }
   }
 
@@ -9462,6 +9500,27 @@ namespace dxvk {
       sceneViewport.Width, sceneViewport.Height, backBufferWidth, backBufferHeight);
   }
 
+  bool D3D9Rtx::ngxViewportMatchesDrivenScreenPercentage(const D3DVIEWPORT9& viewport) const {
+    if (!m_activePresentParams.has_value())
+      return false;
+
+    const float screenPercentage = m_ngxGameScreenPercentage;
+    if (!(screenPercentage > 0.0f && screenPercentage <= 100.0f))
+      return false;
+
+    const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+    const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+    if (backBufferWidth == 0 || backBufferHeight == 0)
+      return false;
+
+    const int32_t expectedWidth = int32_t(float(backBufferWidth) * screenPercentage / 100.0f);
+    const int32_t expectedHeight = int32_t(float(backBufferHeight) * screenPercentage / 100.0f);
+    return int32_t(viewport.Width) >= expectedWidth - kNgxDrivenViewportTolerance &&
+           int32_t(viewport.Width) <= expectedWidth + kNgxDrivenViewportTolerance &&
+           int32_t(viewport.Height) >= expectedHeight - kNgxDrivenViewportTolerance &&
+           int32_t(viewport.Height) <= expectedHeight + kNgxDrivenViewportTolerance;
+  }
+
   bool D3D9Rtx::ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo) {
     return psInfo.gammaInverseReg != Ue3ShaderFeatureInfo::kNgxNoRegister &&
            psInfo.hasSceneColorSampler &&
@@ -9506,6 +9565,84 @@ namespace dxvk {
             d3d9State().vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT));
   }
 
+  bool D3D9Rtx::ngxImageIsDofFilterBuffer(const DxvkImage* image) const {
+    if (image == nullptr || m_ngxSceneColorImage == nullptr || image == m_ngxSceneColorImage.ptr())
+      return false;
+
+    const VkExtent3D& filter = image->info().extent;
+    const VkExtent3D& scene = m_ngxSceneColorImage->info().extent;
+    if (filter.width < 8 || filter.height < 8 || scene.width < 16 || scene.height < 16)
+      return false;
+
+    const auto quarter = [](uint32_t filterDim, uint32_t sceneDim) {
+      const uint32_t scaled = filterDim * 4u;
+      return scaled >= sceneDim && scaled <= sceneDim + 24u && filterDim * 2u < sceneDim;
+    };
+    return quarter(filter.width, scene.width) && quarter(filter.height, scene.height);
+  }
+
+  bool D3D9Rtx::ngxBoundImageIsDofFilterBuffer() const {
+    if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return false;
+
+    D3D9CommonTexture* renderTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (renderTarget == nullptr || renderTarget->GetImage() == nullptr)
+      return false;
+
+    return ngxImageIsDofFilterBuffer(renderTarget->GetImage().ptr());
+  }
+
+  bool D3D9Rtx::ngxDrawSamplesSceneColor() const {
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      if (texture != nullptr && texture->GetImage() != nullptr &&
+          matchNgxSceneColorSample(texture->GetImage().ptr()) != nullptr) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool D3D9Rtx::tryGetBoundPixelFeatures(Ue3ShaderFeatureInfo& info) {
+    if (!m_parent->UseProgrammablePS() || d3d9State().pixelShader.ptr() == nullptr)
+      return false;
+
+    const D3D9CommonShader* shader = d3d9State().pixelShader->GetCommonShader();
+    if (shader == nullptr)
+      return false;
+
+    info = getUe3ShaderFeatureInfo(shader);
+    return true;
+  }
+
+  bool D3D9Rtx::ngxBoundPixelIsDofGather() {
+    Ue3ShaderFeatureInfo info;
+    if (!tryGetBoundPixelFeatures(info))
+      return false;
+
+    return info.hasDofPackedParameters && info.hasDofMinMaxBlurClamp &&
+           info.hasSceneColorSampler && !info.hasBlurredImageSampler &&
+           !info.hasFilterSampleWeights;
+  }
+
+  bool D3D9Rtx::ngxBoundPixelIsDofBlend() {
+    Ue3ShaderFeatureInfo info;
+    if (!tryGetBoundPixelFeatures(info))
+      return false;
+
+    return info.hasBlurredImageSampler &&
+           (info.hasDofPackedParameters || info.hasSceneColorSampler);
+  }
+
+  bool D3D9Rtx::ngxDrawIsDofBloomGather() {
+    if (!ngxBoundImageIsDofFilterBuffer() || !ngxBoundPixelIsDofGather() || !ngxDrawSamplesSceneColor())
+      return false;
+
+    ONCE(Logger::info("[RTX NGX Passthrough] DOF/bloom gather is a pre-post candidate (filter buffer)."));
+    return true;
+  }
+
   bool D3D9Rtx::ngxOffscreenPrePostShape(const DrawContext& drawContext) {
     if (!m_activePresentParams.has_value())
       return false;
@@ -9538,8 +9675,11 @@ namespace dxvk {
       vp.Width <= m_ngxSceneViewport.Width + 8 &&
       vp.Height <= m_ngxSceneViewport.Height + 8;
 
+    // The gather viewport is the filter buffer.
+    // It matches neither the scene rect nor the backbuffer.
+    // With sun haze off, this is the first scene-color read, and DLSS runs before it samples.
     if (!coversBackbuffer && !coversScene)
-      return false;
+      return ngxDrawIsDofBloomGather();
 
     const bool noBlend = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] == FALSE;
 
@@ -10461,6 +10601,7 @@ namespace dxvk {
     m_ngxSpsbReplaceFull = false;
     m_ngxPrePostUpscaled = false;
     m_ngxViewportExpandApplied = false;
+    m_ngxReducedSceneViewportThisFrame = false;
     m_ngxExpandedViewportWidth = 0;
     m_ngxExpandedViewportHeight = 0;
     m_ngxDeferPrePostInjection = false;
