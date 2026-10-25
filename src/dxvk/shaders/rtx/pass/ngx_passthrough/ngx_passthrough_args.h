@@ -70,6 +70,13 @@ struct NgxPassthroughArgs {
   // reconstructing a position from a pixel coordinate has to take it back out.
   vec2 jitter;
   vec2 jitterPad;
+
+  // 1 undoes outputColorScaleAndGamma on colour that is already encoded.
+  // The merge pass applies that curve again on the way out.
+  uint linearizeInput;
+  uint linearizePad0;
+  uint linearizePad1;
+  uint linearizePad2;
 };
 
 // Push constants for the object velocity raster pass: clip transforms composed from the

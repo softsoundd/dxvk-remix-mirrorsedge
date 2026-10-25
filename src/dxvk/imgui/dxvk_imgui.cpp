@@ -3266,7 +3266,7 @@ namespace dxvk {
       {
         IMGUI_ADD_TOOLTIP(
           RemixGui::Checkbox("NGX Passthrough Mode", &RtxNgxPassthrough::ngxPassthroughModeObject()),
-          "Presents the game's own rasterized rendering (no path tracing) with the selected upscaler, Frame Generation and Reflex on top.\nMust be enabled at launch for the game's depth buffer to be shader-readable.");
+          "Presents the game's own rasterized rendering (no path tracing) with the selected upscaler, Frame Generation and Reflex on top.\nA depth buffer created while the mode was off is promoted to a shader-readable layout. Multisampled depth still requires a restart after MSAA is refused.");
 
         if (RtxNgxPassthrough::ngxPassthroughMode()) {
           ImGui::Indent();

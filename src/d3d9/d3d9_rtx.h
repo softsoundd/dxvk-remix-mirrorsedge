@@ -1467,6 +1467,18 @@ namespace dxvk {
     // Qualifying mid-scene depth clears seen this frame (first = foreground DPG boundary,
     // second = occlusion query pass wiping the foreground depth)
     uint32_t m_ngxDepthClearsThisFrame = 0;
+    // Depth-writing draws since the latest counted clear.
+    uint32_t m_ngxDepthWritesAfterLastClear = 0;
+    // A compiled shader has haze constants.
+    // Distortion injection stays off.
+    bool m_ngxHazeShaderSeen = false;
+    // A compiled shader is the uber post blend.
+    // The bloom gather is the pre-post point from the next frame.
+    bool m_ngxUberPostShaderSeen = false;
+    // The late upscale runs after the uber pass is queued, before the HUD.
+    bool m_ngxDeferLateSubrectUpscale = false;
+    // The gather that engaged injection remaps its scene-colour UVs onto the full image.
+    bool m_ngxRetargetSceneColorUvs = false;
     XXH64_hash_t m_ngxLastCameraConstantsHash = 0;
 
     // The swapchain backbuffer image for this frame (backbuffers rotate every present).
@@ -1581,6 +1593,8 @@ namespace dxvk {
     bool ngxDepthTestDisabled() const;
     // The apply reads the offset field and scene colour through one coordinate.
     bool ngxBoundPixelIsDistortionApply();
+    // True after the foreground depth clear, once that depth has been written.
+    bool ngxDistortionApplyFollowsScene() const;
     // True for haze, depth of field, bloom, tonemap, and gamma.
     // Fog and other scene-colour quads come earlier.
     // Upscaling on those quads leaves the distortion stencil in the screen-percentage rect.
@@ -1589,12 +1603,6 @@ namespace dxvk {
     // Scales the screen-percentage offset field onto the full accumulation target.
     // The apply then reads that field on the same coordinates as the upscaled scene.
     bool stretchNgxDistortionField();
-    // True when one more scene-colour read would pass the ordinal gate.
-    bool ngxSceneColorReadIsAimed() const;
-    // True when this gather is the aimed scene-colour read.
-    // The scene viewport must be a reduced subrect of scene colour.
-    // No earlier post quad has qualified this frame.
-    bool ngxGatherIsReducedSubrectAimedRead();
     void refreshNgxUe3VertexFactory();
     void armNgxFullBufferScreenPositionScaleBias();
     void noteNgxPostUpscaleViewport();

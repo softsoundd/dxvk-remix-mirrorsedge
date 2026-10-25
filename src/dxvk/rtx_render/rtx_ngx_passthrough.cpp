@@ -297,10 +297,27 @@ namespace dxvk {
                              ", display ", displayExtent.width, "x", displayExtent.height));
   }
 
-  void RtxNgxPassthrough::captureDepthSnapshot(RtxContext* ctx, const Rc<DxvkImage>& sceneDepthImage) {
+  // Moves a single-sampled depth image into the layout the motion-vector pass samples.
+  // The image includes sampled usage.
+  // A multisampled image is left unchanged.
+
+  static bool promoteNgxDepthLayout(RtxContext* ctx, const Rc<DxvkImage>& sceneDepthImage) {
     if (sceneDepthImage == nullptr ||
         sceneDepthImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT ||
-        sceneDepthImage->info().layout != VK_IMAGE_LAYOUT_GENERAL) {
+        (sceneDepthImage->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0) {
+      return false;
+    }
+
+    if (sceneDepthImage->info().layout != VK_IMAGE_LAYOUT_GENERAL) {
+      ctx->changeImageLayout(sceneDepthImage, VK_IMAGE_LAYOUT_GENERAL);
+      ONCE(Logger::info("[RTX NGX Passthrough] Promoted the game depth buffer to a shader-readable layout."));
+    }
+
+    return sceneDepthImage->info().layout == VK_IMAGE_LAYOUT_GENERAL;
+  }
+
+  void RtxNgxPassthrough::captureDepthSnapshot(RtxContext* ctx, const Rc<DxvkImage>& sceneDepthImage) {
+    if (!promoteNgxDepthLayout(ctx, sceneDepthImage)) {
       return;
     }
 
@@ -795,7 +812,8 @@ namespace dxvk {
     }
 
     // Validate that the live buffer can be sampled; the snapshot (always shader-readable)
-    // substitutes as the sole source when it cannot
+    // substitutes as the sole source when it cannot.
+    // A single-sampled depth image created before the mode was enabled is promoted here.
     const char* liveFailureReason = nullptr;
 
     if (sceneDepthImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
@@ -803,12 +821,9 @@ namespace dxvk {
       ONCE(Logger::warn("[RTX NGX Passthrough] The game's depth buffer is multisampled, which cannot be "
                         "resolved for the NGX inputs. Leave rtx.ngxPassthrough.disableGameMsaa enabled so "
                         "multisampling is refused at creation, then restart."));
-    } else if (sceneDepthImage->info().layout != VK_IMAGE_LAYOUT_GENERAL) {
-      // Game depth-stencil images are created with a GENERAL layout when the mode is enabled
-      // at launch (see D3D9CommonTexture::CreateImage). Anything else means the image predates
-      // the mode being turned on and cannot be legally sampled.
-      liveFailureReason = "depth not shader-readable (enable mode at launch)";
-      ONCE(Logger::warn("[RTX NGX Passthrough] Game depth buffer is not shader-readable; rtx.ngxPassthroughMode must be set at launch (rtx.conf), not toggled at runtime."));
+    } else if (!promoteNgxDepthLayout(ctx, sceneDepthImage)) {
+      liveFailureReason = "depth not shader-readable";
+      ONCE(Logger::warn("[RTX NGX Passthrough] Game depth buffer cannot be sampled. It was created without shader read usage."));
     }
 
     const bool liveValid = liveFailureReason == nullptr;
@@ -1414,6 +1429,114 @@ namespace dxvk {
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_mergedOutput.image);
   }
 
+  void RtxNgxPassthrough::uploadNgxColorTransformConstants(RtxContext* ctx, bool linearize) {
+    NgxPassthroughArgs args = {};
+    args.resolution = vec2(float(m_renderExtent.width), float(m_renderExtent.height));
+    args.outputResolution = linearize
+      ? args.resolution
+      : vec2(float(m_displayExtent.width), float(m_displayExtent.height));
+    args.linearizeInput = linearize ? 1u : 0u;
+    args.outputTransformEnabled = (!linearize && m_outputTransform.enabled) ? 1u : 0u;
+    args.preserveOriginalAlpha = (!linearize && m_preserveOriginalAlpha) ? 1u : 0u;
+    args.outputColorScaleAndGamma = vec4(m_outputTransform.colorScale[0],
+                                         m_outputTransform.colorScale[1],
+                                         m_outputTransform.colorScale[2],
+                                         m_outputTransform.inverseGamma);
+    if (!linearize) {
+      args.outputOverlayColor = vec4(m_outputTransform.overlayColor[0],
+                                     m_outputTransform.overlayColor[1],
+                                     m_outputTransform.overlayColor[2],
+                                     m_outputTransform.overlayColor[3]);
+    }
+    args.jitter = vec2(m_lastJitter[0], m_lastJitter[1]);
+    ctx->updateBuffer(m_constantsBuffer, 0, sizeof(args), &args);
+  }
+
+  void RtxNgxPassthrough::linearizeLateColorInput(RtxContext* ctx, DxvkBarrierSet& barriers) {
+    if (m_colorInput.image == nullptr || m_mergedOutput.image == nullptr || m_constantsBuffer == nullptr)
+      return;
+
+    ScopedGpuProfileZone(ctx, "NGX Passthrough Linearize Late Input");
+
+    uploadNgxColorTransformConstants(ctx, true);
+
+    barriers.accessImage(
+      m_colorInput.image,
+      m_colorInput.view->imageSubresources(),
+      m_colorInput.image->info().layout,
+      m_colorInput.image->info().stages,
+      m_colorInput.image->info().access,
+      m_colorInput.image->info().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT);
+
+    barriers.accessImage(
+      m_mergedOutput.image,
+      m_mergedOutput.view->imageSubresources(),
+      m_mergedOutput.image->info().layout,
+      m_mergedOutput.image->info().stages,
+      m_mergedOutput.image->info().access,
+      m_mergedOutput.image->info().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT);
+
+    barriers.recordCommands(ctx->getCommandList());
+
+    ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+    ctx->bindResourceView(1, m_colorInput.view, nullptr);
+    ctx->bindResourceView(2, m_colorInput.view, nullptr);
+    ctx->bindResourceView(3, m_mergedOutput.view, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NgxPassthroughAlphaMergeShader::getShader());
+
+    const VkExtent3D workgroups = util::computeBlockCount(
+      VkExtent3D { m_renderExtent.width, m_renderExtent.height, 1 }, VkExtent3D { 16, 16, 1 });
+    ctx->dispatch(workgroups.width, workgroups.height, 1);
+
+    barriers.accessImage(
+      m_colorInput.image,
+      m_colorInput.view->imageSubresources(),
+      m_colorInput.image->info().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT,
+      m_colorInput.image->info().layout,
+      m_colorInput.image->info().stages,
+      m_colorInput.image->info().access);
+
+    barriers.accessImage(
+      m_mergedOutput.image,
+      m_mergedOutput.view->imageSubresources(),
+      m_mergedOutput.image->info().layout,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      m_mergedOutput.image->info().layout,
+      m_mergedOutput.image->info().stages,
+      m_mergedOutput.image->info().access);
+
+    barriers.recordCommands(ctx->getCommandList());
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_colorInput.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_mergedOutput.image);
+
+    const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(m_mergedOutput.image->info().format);
+    const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(m_colorInput.image->info().format);
+    VkImageBlit blitInfo = {};
+    blitInfo.srcSubresource = { srcFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.dstSubresource = { dstFormatInfo->aspectMask, 0, 0, 1 };
+    blitInfo.srcOffsets[0] = { 0, 0, 0 };
+    blitInfo.srcOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
+    blitInfo.dstOffsets[0] = { 0, 0, 0 };
+    blitInfo.dstOffsets[1] = { int32_t(m_renderExtent.width), int32_t(m_renderExtent.height), 1 };
+
+    const VkComponentMapping identityMap = {
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+      VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+    ctx->blitImage(m_colorInput.image, identityMap, m_mergedOutput.image, identityMap, blitInfo, VK_FILTER_NEAREST);
+
+    // The merge pass reads these constants after DLSS.
+    uploadNgxColorTransformConstants(ctx, false);
+  }
+
   void RtxNgxPassthrough::snapshotColorInput(RtxContext* ctx,
                                              const Rc<DxvkImage>& colorSourceImage,
                                              const VkOffset2D& colorSourceOffset) {
@@ -1680,12 +1803,24 @@ namespace dxvk {
     // back over the same target, so it cannot be read in place)
     snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
 
+    // The late uber composite is already display-encoded.
+    // That gamma is removed before Super Resolution and applied again on the way out.
+    const bool linearizeLateInput =
+      m_outputTransform.linearizeInput && m_outputTransform.enabled;
+    if (linearizeLateInput) {
+      linearizeLateColorInput(ctx, barriers);
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] Late uber input is linearized before DLSS (inverse gamma ",
+        m_outputTransform.inverseGamma, ") and re-encoded afterwards.")));
+    }
+
     // The HDR flag follows the colour source.
     // Pre-post feeds the game's linear float scene colour, with NGX auto-exposure.
-    // Late injection feeds display-encoded LDR.
-    // Compressing the linear image into the LDR feature leaves disocclusion ghosts.
-    // Pre-post uses the HDR feature.
-    const bool contentHDR = isHDRColorFormat(colorSourceImage->info().format);
+    // A linearized late grade uses the HDR feature with auto-exposure off.
+    // Display-encoded LDR stays on the LDR feature.
+    // Compressing a linear image into the LDR feature leaves disocclusion ghosts.
+    const bool contentHDR = linearizeLateInput || isHDRColorFormat(colorSourceImage->info().format);
+    const bool useAutoExposure = contentHDR && !linearizeLateInput;
 
     // The two injection points alternate freely - whether the pre-post trigger fires depends on
     // the frame's own post chain and on the mid-scene depth clear, both of which follow scene
@@ -1704,6 +1839,7 @@ namespace dxvk {
     const int selectedPresetValue = static_cast<int>(selectedPreset);
     if (feature.initializedRenderPreset != selectedPresetValue ||
         feature.initializedContentHDR != contentHDR ||
+        feature.initializedAutoExposure != useAutoExposure ||
         feature.initializedInput[0] != m_renderExtent.width ||
         feature.initializedInput[1] != m_renderExtent.height ||
         feature.initializedOutput[0] != m_displayExtent.width ||
@@ -1715,6 +1851,7 @@ namespace dxvk {
       feature.needsInitialize = false;
       feature.initializedRenderPreset = selectedPresetValue;
       feature.initializedContentHDR = contentHDR;
+      feature.initializedAutoExposure = useAutoExposure;
       feature.initializedInput[0] = m_renderExtent.width;
       feature.initializedInput[1] = m_renderExtent.height;
       feature.initializedOutput[0] = m_displayExtent.width;
@@ -1732,12 +1869,13 @@ namespace dxvk {
       const NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset =
         DxvkDLSS::presetToHint<NVSDK_NGX_DLSS_Hint_Render_Preset>(selectedPreset);
 
-      // Conventional (non-inverted) depth, NGX-internal auto exposure (Remix's auto exposure
-      // pass never runs in this mode; for LDR content the exposure is ignored anyway).
+      // Conventional depth, not inverted.
+      // Linear HDR uses NGX auto-exposure.
+      // A linearized late grade and display-encoded LDR leave auto-exposure off.
       feature.context->initialize(ctx, inputSize, outputSize,
                                   contentHDR,
                                   /* depthInverted = */ false,
-                                  /* autoExposure = */ true,
+                                  /* autoExposure = */ useAutoExposure,
                                   /* sharpening = */ false,
                                   renderPreset,
                                   perfQuality);
@@ -1749,7 +1887,9 @@ namespace dxvk {
                                " -> ", outputSize[0], "x", outputSize[1],
                                (perfQuality == NVSDK_NGX_PerfQuality_Value_DLAA ? " (DLAA)" : " (Super Resolution)"),
                                ", render preset ", renderPresetToString(renderPreset),
-                               (contentHDR ? ", linear HDR input" : ", LDR input")));
+                               (linearizeLateInput ? ", linearized grade"
+                                                   : contentHDR ? ", linear HDR input"
+                                                                 : ", LDR input")));
     }
 
     if (m_dlssLastContentHDR != int(contentHDR)) {
@@ -1757,10 +1897,20 @@ namespace dxvk {
       m_statContentHdrFlips++;
     }
 
-    // The DLSS indicator reads the exposure texture even with NGX auto exposure enabled, so
-    // make sure it exists (its content is not used otherwise in this mode)
+    // The DLSS indicator reads this texture even when NGX auto-exposure is enabled.
+    // With auto-exposure off, NGX scales the colour by this texture.
+    // The clear holds that texel at 1.
     DxvkAutoExposure& autoExposure = m_device->getCommon()->metaAutoExposure();
     autoExposure.createResources(ctx);
+    if (!useAutoExposure && autoExposure.getExposureTexture().image != nullptr) {
+      VkClearColorValue exposureOne = {};
+      exposureOne.float32[0] = exposureOne.float32[1] = exposureOne.float32[2] = exposureOne.float32[3] = 1.0f;
+      VkImageSubresourceRange exposureRange = {};
+      exposureRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      exposureRange.levelCount = 1;
+      exposureRange.layerCount = 1;
+      ctx->clearColorImage(autoExposure.getExposureTexture().image, exposureOne, exposureRange);
+    }
 
     const Resources::Resource& depthInput = m_depthQueue.get();
     const Resources::Resource& motionVectorInput = m_motionVectorQueue.get();

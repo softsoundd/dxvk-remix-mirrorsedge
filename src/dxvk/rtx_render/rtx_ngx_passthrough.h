@@ -121,6 +121,11 @@ namespace dxvk {
     float overlayColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     float inverseGamma = 1.0f;
     bool enabled = false;
+    // The sampled colour is already display-encoded.
+    // Colour scale and inverse gamma are removed before Super Resolution.
+    // The merge applies them again.
+    // Overlay is not part of this inverse.
+    bool linearizeInput = false;
   };
 
   // Holds the per-frame counters from the D3D9 dynamic-draw capture.
@@ -385,13 +390,14 @@ namespace dxvk {
     static void enforceRaytracingDisabledForPassthrough();
     static void ngxPassthroughModeOnChange(DxvkDevice* device);
 
-    RTX_OPTION_ARGS("rtx", bool, ngxPassthroughMode, false,
+    RTX_OPTION_ARGS("rtx", bool, ngxPassthroughMode, true,
                "Master toggle for the NGX passthrough mode: the game's original rasterized rendering is presented (no path tracing,\n"
                "no scene capture) while the selected upscaler (DLSS, NIS, TAA-U or XeSS), DLSS Frame Generation and Reflex run on top.\n"
                "Screen space motion vectors are synthesized from the game's depth buffer via camera reprojection, and sub-pixel\n"
                "camera jitter is injected through the game's viewport so temporal upscalers can accumulate detail.\n"
-               "Takes precedence over rtx.enableRaytracing (which is forced off while this mode is active). Should be set at launch (game depth\n"
-               "buffers are created with a shader-readable layout only when this mode is active).",
+               "Takes precedence over rtx.enableRaytracing (which is forced off while this mode is active). Enabled by default on this branch.\n"
+               "A depth buffer created while the mode is off is promoted to a shader-readable layout when the mode is turned on.\n"
+               "Multisampled depth still cannot be sampled.",
                args.onChangeCallback = &RtxNgxPassthrough::ngxPassthroughModeOnChange);
     RTX_OPTION("rtx.ngxPassthrough", bool, enableJitter, true,
                "Applies a sub-pixel Halton jitter offset to the game's viewport for all draws targeting the detected scene render\n"
@@ -608,6 +614,11 @@ namespace dxvk {
 
     // Combines m_dlssOutput RGB with m_colorInput alpha into m_mergedOutput
     void dispatchAlphaMerge(RtxContext* ctx, DxvkBarrierSet& barriers);
+    // Undoes the late composite's gamma on m_colorInput before Super Resolution.
+    // The merge pass encodes it again afterwards.
+    void linearizeLateColorInput(RtxContext* ctx, DxvkBarrierSet& barriers);
+    // Replaces the passthrough constant buffer with only the colour-transform fields.
+    void uploadNgxColorTransformConstants(RtxContext* ctx, bool linearize);
     void dispatchSceneColorDebug(RtxContext* ctx, DxvkBarrierSet& barriers);
 
     // One feature per injection point (indexed by HDR content), so switching between them costs
@@ -625,6 +636,9 @@ namespace dxvk {
       // A mismatch rebuilds it.
       // The slot is never evaluated in the other colour space.
       bool initializedContentHDR = false;
+      // Stored in the created feature.
+      // A mismatch rebuilds it.
+      bool initializedAutoExposure = false;
     };
     DlssFeature m_dlssFeatures[2];
     int m_dlssLastContentHDR = -1;

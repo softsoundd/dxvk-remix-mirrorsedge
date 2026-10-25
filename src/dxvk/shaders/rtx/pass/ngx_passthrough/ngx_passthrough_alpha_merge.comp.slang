@@ -56,11 +56,15 @@ void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
 
   float3 color = DlssColor[pixelCoordinate].rgb;
 
-  // Late Super Resolution replaces UE3's FinishRenderViewTarget composite.
-  // That draw's transform is reapplied here.
-  // It is the last step between the post chain and the backbuffer.
-  // Skipping it leaves the frame without the game's gamma.
-  if (cb.outputTransformEnabled != 0) {
+  // Inverse of the encode branch: pow(encoded, 1 / inverseGamma) / colorScale.
+  // Overlay is left in the encoded colour.
+  if (cb.linearizeInput != 0) {
+    const float exponent = max(cb.outputColorScaleAndGamma.a, 1e-4);
+    const float3 scale = max(cb.outputColorScaleAndGamma.rgb, float3(1e-4));
+    color = pow(max(color, float3(0.0)), 1.0 / exponent) / scale;
+  } else if (cb.outputTransformEnabled != 0) {
+    // Reapplies the gamma of the composite Super Resolution replaced.
+    // That draw is the last colour step before the backbuffer.
     color = lerp(color * cb.outputColorScaleAndGamma.rgb,
                  cb.outputOverlayColor.rgb,
                  cb.outputOverlayColor.a);

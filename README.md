@@ -18,7 +18,7 @@ This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised re
 
 **The game's MSAA must be off** because depth cannot be resolved while it is active - plus you want DLSS/DLAA anyway, right? By default NGX mode will attempt to force MSAA off at runtime via `rtx.ngxPassthrough.disableGameMsaa` which makes the D3D9 layer report multisampling as unsupported and create every surface single-sampled. In (rare) cases where that fails, MSAA will need to be disabled manually via the game's settings/configs.
 
-Set `rtx.ngxPassthroughMode` at launch (already configured for Mirror's Edge in this branch) so depth buffers are created shader-readable.
+NGX passthrough mode is enabled by default on this branch, including when no `rtx.conf` is present. Mirror's Edge also sets it in the built-in app config. A depth buffer created while the mode is off is promoted to a shader-readable layout when the mode is turned on. Multisampled depth still requires a restart after MSAA is refused.
 
 How it works:
 
