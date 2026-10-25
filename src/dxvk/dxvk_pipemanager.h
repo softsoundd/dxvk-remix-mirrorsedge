@@ -57,7 +57,6 @@ namespace dxvk {
   class DxvkPipelineManager {
     friend class DxvkComputePipeline;
     friend class DxvkGraphicsPipeline;
-    friend class DxvkRaytracingPipeline;
   public:
     
     DxvkPipelineManager(
@@ -89,18 +88,6 @@ namespace dxvk {
      */
     DxvkGraphicsPipeline* createGraphicsPipeline(
       const DxvkGraphicsPipelineShaders& shaders);
-        
-    /**
-     * \brief Retrieves a raytracing pipeline object
-     * 
-     * If a pipeline for the given shader stage objects
-     * already exists, it will be returned. Otherwise,
-     * a new pipeline will be created.
-     * \param [in] shaders Shaders for the pipeline
-     * \returns Raytracing pipeline object
-     */
-    DxvkRaytracingPipeline* createRaytracingPipeline(
-      const DxvkRaytracingPipelineShaders& shaders);
 
     /*
      * \brief Registers a shader
@@ -115,19 +102,6 @@ namespace dxvk {
 // NV-DXVK start
       bool                          isRemixShader = false);
 // NV-DXVK end
-
-    // NV-DXVK start: compile raytracing shaders on shader compilation threads
-    /**
-     * \brief Registers a set of raytracing shaders
-     * 
-     * Makes the shader available to the pipeline
-     * compiler, and starts compiling all pipelines
-     * for which all shaders become available.
-     * \param [in] shaders The shaders to add
-     */
-    void registerRaytracingShaders(
-      const DxvkRaytracingPipelineShaders& shaders);
-    // NV-DXVK end
 
     /**
      * \brief Retrieves total pipeline count
@@ -170,11 +144,6 @@ namespace dxvk {
       DxvkGraphicsPipelineShaders,
       DxvkGraphicsPipeline,
       DxvkHash, DxvkEq> m_graphicsPipelines;
-
-    std::unordered_map<
-      DxvkRaytracingPipelineShaders,
-      DxvkRaytracingPipeline,
-      DxvkHash, DxvkEq> m_raytracingPipelines;
 
   };
 

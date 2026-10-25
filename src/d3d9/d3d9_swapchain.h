@@ -311,49 +311,4 @@ namespace dxvk {
     // NV-DXVK end
   };
 
-  class D3D9SwapchainExternal final : public D3D9SwapChainEx {
-    Rc<RtxSemaphore> m_frameEndSemaphore;
-    Rc<RtxSemaphore> m_frameResumeSemaphore;
-
-  protected:
-    int NumFrontBuffers() override { return 0; };
-
-  public:
-
-    D3D9SwapchainExternal(
-            D3D9DeviceEx* pDevice,
-            D3DPRESENT_PARAMETERS* pPresentParams,
-      const D3DDISPLAYMODEEX* pFullscreenDisplayMode);
-
-    HRESULT Reset(
-            D3DPRESENT_PARAMETERS* pPresentParams,
-            D3DDISPLAYMODEEX* pFullscreenDisplayMode,
-            bool forceWindowReset = false) override;
-
-    HRESULT STDMETHODCALLTYPE Present(
-      const RECT* pSourceRect,
-      const RECT* pDestRect,
-            HWND     hDestWindowOverride,
-      const RGNDATA* pDirtyRegion,
-            DWORD    dwFlags) override;
-
-// NV-DXVK start: external API
-    VkImage GetVkImage(uint32_t Index) const {
-      D3D9DeviceLock lock = m_parent->LockDevice();
-      if (Index < m_backBuffers.size()) {
-        return m_backBuffers[Index]->GetCommonTexture()->GetImage()->handle();
-      }
-      return VK_NULL_HANDLE;
-    }
-
-    VkSemaphore GetFrameResumeVkSemaphore() const {
-      return m_frameEndSemaphore->handle();
-    }
-
-    VkSemaphore GetFrameCompleteVkSemaphore() const {
-      return m_frameResumeSemaphore->handle();
-    }
-// NV-DXVK end
-  };
-
 }

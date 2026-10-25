@@ -18,14 +18,12 @@ RTX Remix needs to combine settings from many different sources:
 - **Mod developer settings** in configuration files (rtx.conf)
 - **End-user preferences** from the graphics settings menu
 - **Quality presets** like "Ultra" or "Performance"
-- **Remix Logic graphs** that respond to game state (e.g., indoors vs outdoors)
 
 The layer system gives each source its own layer with a defined priority. This provides:
 
 - **Clean separation**: Mod settings stay in `rtx.conf`, user preferences stay in `user.conf`
 - **Easy resets**: Clear a single layer to reset those settings without affecting others
 - **Predictable overrides**: Higher-priority layers always win, so user preferences override mod defaults
-- **Scene-specific tuning**: Dynamic layers can adjust settings for different areas or game states
 
 ### Sparse Layers
 
@@ -45,8 +43,6 @@ Layers are ordered by priority (higher values override lower values). When multi
 ├─────────────────────────────┤
 │  User Settings (user.conf)  │     End-user preferences
 ├─────────────────────────────┤
-│  Dynamic Layers             │     Runtime changes (e.g., indoor areas)
-├─────────────────────────────┤
 │  Remix Config (rtx.conf)    │     Mod developer and game compatibility settings
 ├─────────────────────────────┤
 │  Default Values             │     Built-in fallbacks
@@ -56,7 +52,6 @@ Layers are ordered by priority (higher values override lower values). When multi
 This means:
 - User preferences override mod developer settings
 - When a quality preset is selected (not "Custom"), the settings it applies override user preferences
-- Remix Logic graphs can activate dynamic layers to temporarily merge with or override settings
 
 ### Layer Blending
 
@@ -77,8 +72,6 @@ To understand why an option has a particular value:
 - **Hover over any option** in the Developer Menu to see its tooltip. The tooltip shows the current value from each layer that has an opinion about that option.
 - **Open the Option Layers section** in the Developer Settings tab to see all active layers, their blend strengths, and their contents. You can expand each layer to see what values it contains.
 
-**Note:** If you manually adjust blend strengths in the Option Layers section while Remix Logic graphs are running, the graphs will immediately override your changes. To experiment with blend values, pause graph execution first using the controls at the top of the Option Layers section.
-
 ## The Built-in Layers
 
 RTX Remix includes several built-in layers, each serving a specific purpose:
@@ -88,7 +81,7 @@ RTX Remix includes several built-in layers, each serving a specific purpose:
 | Layer | What It Does |
 |-------|--------------|
 | **User Settings** | Your personal preferences. Saved to `user.conf`. This includes graphics preset choices, direct graphics settings, and other per-user preferences like UI configuration. |
-| **Quality Presets** | Contains settings *derived from* the presets you've selected. For example, selecting "Ultra" graphics sets specific values for path bounces, resolution scale, etc. The User layer stores *which preset* you chose; the Quality layer stores *what values* that preset applies. |
+| **Quality Presets** | Contains settings *derived from* the presets you've selected. For example, selecting "Medium" or "Low" graphics turns on the DLSS Frame Generation lite preset. The User layer stores *which preset* you chose; the Quality layer stores *what values* that preset applies. |
 
 ### For Mod Developers
 
@@ -121,8 +114,6 @@ These keys are dynamic options; see [Dynamic Option Namespaces](#dynamic-option-
 
 On RTX Spark, Auto graphics selection defaults to Medium, and Auto DLSS selection defaults to Performance. Per-GPU graphics and DLSS overrides take precedence over these defaults.
 
-When `rtx.graphicsPreset` is Auto, `rtx.lowMemoryGpu` is enabled when the Vulkan device-local memory heaps total 8 GiB or less and disabled otherwise. This memory default also applies with a per-GPU graphics override.
-
 Selecting a graphics preset other than Auto bypasses automatic graphics selection. To preserve an explicit `rtx.qualityDLSS` value, select the Custom DLSS preset (`rtx.dlssPreset = 2`). The On preset resets the DLSS mode to Auto.
 
 RTX Spark detection requires Vulkan to report an NVIDIA integrated GPU and NVAPI to identify the same adapter by LUID as an integrated Blackwell GPU. Core count does not affect detection. If the required facts are unavailable or do not match, the standard automatic heuristics apply. The log records detection results and query failures, including `RTX Spark detected` on success.
@@ -136,34 +127,6 @@ RTX Spark detection requires Vulkan to report an NVIDIA integrated GPU and NVAPI
 | **Hardcoded EXE Config** | Special overrides compiled into Remix for specific games. |
 | **Environment Variables** | Settings from system environment variables (mainly for testing/automation). |
 | **Derived Settings** | Automatically computed values based on other settings and values that shouldn't be saved. |
-
-### Dynamic Layers
-
-Beyond the built-in layers, mod developers can create **dynamic layers** that are activated by Remix Logic graphs. These are useful for:
-
-- **Location-based settings**: Different lighting for indoors vs outdoors
-- **Game state changes**: Special effects during cutscenes or boss fights
-- **Smooth transitions**: Gradually blending between different visual styles
-
-Dynamic layers are controlled through the Remix Logic system using `RtxOptionLayerAction` components. See [RtxOptionLayerAction documentation](components/RtxOptionLayerAction.md) for details.
-
-#### Creating a Config File for Dynamic Layers
-
-To create a `.conf` file that can be loaded by a dynamic layer:
-
-1. Launch the game.
-2. Open the Developer Menu and make the changes you want for your dynamic layer (e.g., indoor lighting settings). Avoid changing user settings like graphics quality or UI preferences.
-3. To preview what will be exported, expand the **Remix Config** layer in the bottom of the Developer Menu, and expand **View Changes**. Unsaved changes listed there will be saved to your new file.
-4. Find the **Create .conf file for Logic** section.
-5. Enter a filename (e.g., `indoor_lighting.conf`).
-6. Click **Create**. This exports only the unsaved changes from the **Remix Config** layer to your new file.
-7. Move the created file into your mod (e.g., `rtx-remix/mods/YourMod/`). Treat these files as assets: they can be placed in subfolders, and paths to them should be relative to your USD file.
-8. In the Remix Toolkit, configure an `RtxOptionLayerAction` component and set its Config Path to point to your new `.conf` file.
-
-**Notes:**
-- The export captures all changes made to non-user settings since the game launched (or since rtx.conf was last saved).
-- If the file already exists, new changes are merged into it.
-- To reset change tracking, reload or save rtx.conf.
 
 ## Configuration Files
 
@@ -390,8 +353,6 @@ Dynamic layers use priorities in the range 100 to 0xFFFFFFFF - 100.
 
 ## Creating Dynamic Layers
 
-For graph-based control, use the `RtxOptionLayerAction` component.
-
 If adding a new system that controls dynamic layers, use `RtxOptionManager::acquireLayer()` to create or obtain a reference to a layer:
 
 ```cpp
@@ -470,10 +431,6 @@ When resolving values:
 
 5. **Write descriptive documentation**: Description strings appear in auto-generated docs and tooltips.
 
-6. **Prefer dynamic layers for runtime changes**: Use `RtxOptionLayerAction` rather than directly modifying option values from game logic.
-
 ## See Also
 
 - [RtxOptions.md](../RtxOptions.md) - Complete reference of all options
-- [RtxOptionLayerAction](components/RtxOptionLayerAction.md) - Graph component for dynamic layer control
-- [RtxOptionLayerSensor](components/RtxOptionLayerSensor.md) - Graph component for reading layer state

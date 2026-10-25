@@ -30,76 +30,6 @@ namespace dxvk {
     float coeff[4];
   };
 
-  // NV-DXVK start: vertex shader data capture implementation
-  // NOTE: Padding exists to ensure we get vectorized loads for these attributes
-  struct CapturedVertex {
-    Vector3 position;
-    uint32_t pad0;
-    Vector2 texcoord0;
-    uint32_t pad1;
-    uint32_t pad2;
-    Vector3 normal0;
-    uint32_t color0;
-  };
-
-  enum class CapturedVertexMembers {
-    Position = 0,
-    Texcoord0,
-    Normal0,
-    Color0,
-
-    MemberCount
-  };
-
-  // flags for D3D9RtxVertexCaptureData::flags
-  static constexpr uint32_t kVertexCaptureFlag_NormalFromColor0 = 1u;
-  static constexpr uint32_t kVertexCaptureFlag_NormalBoneSkinning = 1u << 1;
-  static constexpr uint32_t kVertexCaptureFlag_NormalInputEncodedUByte4 = 1u << 2;
-  static constexpr uint32_t kVertexCaptureFlag_BlendIndicesInputNormalized = 1u << 3;
-  static constexpr uint32_t kVertexCaptureFlag_BlendWeightsInputUnnormalized = 1u << 4;
-  static constexpr uint32_t kVertexCaptureFlag_PositionFromInput = 1u << 5;
-  // Capture the position the shader itself computed before projection, rather than
-  // inverting its clip-space output. Only valid when the vertex shader's oPos transform
-  // was recognised (see DxsoPreProjectionPositionInfo).
-  static constexpr uint32_t kVertexCaptureFlag_PositionFromPreProjection = 1u << 6;
-
-  struct D3D9RtxVertexCaptureData {
-    Matrix4 normalTransform;
-    Matrix4 customWorldToProjection;
-    Matrix4 invProj;
-    Matrix4 viewToWorld;
-    Matrix4 worldToObject;
-    uint32_t baseVertex = 0;
-    float jitterX;
-    float jitterY;
-    uint32_t flags = 0;
-    uint32_t boneMatricesBaseReg = 0;
-    uint32_t boneCount = 0;
-    uint32_t texcoordOutputRegister = 0xffffffffu;
-    uint32_t texcoordCompU = 0;
-    uint32_t texcoordCompV = 1;
-  };
-
-  enum class D3D9RtxVertexCaptureMembers {
-    NormalTransform = 0,
-    CustomWorldToProjection,
-    InvProj,
-    ViewToWorld,
-    WorldToObject,
-    BaseVertex,
-    JitterX,
-    JitterY,
-    Flags,
-    BoneMatricesBaseReg,
-    BoneCount,
-    TexcoordOutputRegister,
-    TexcoordCompU,
-    TexcoordCompV,
-
-    MemberCount
-  };
-  // NV-DXVK end
-
   struct D3D9RenderStateInfo {
     std::array<float, 3> fogColor = { };
     float fogScale = 0.0f;
@@ -215,11 +145,6 @@ namespace dxvk {
 
   struct D3D9FixedFunctionPS {
     Vector4 textureFactor;
-    // NV-DXVK start: support height map scaling in terrain baking
-    float texturePreOffset;
-    float textureScale;
-    float texturePostOffset;
-    // NV-DXVK end
   };
 
   enum D3D9SharedPSStages {
@@ -228,11 +153,6 @@ namespace dxvk {
     D3D9SharedPSStages_BumpEnvMat1,
     D3D9SharedPSStages_BumpEnvLScale,
     D3D9SharedPSStages_BumpEnvLOffset,
-    // NV-DXVK start: support height map scaling in terrain baking
-    D3D9SharedPSStages_TexturePreOffset,
-    D3D9SharedPSStages_TextureScale,
-    D3D9SharedPSStages_TexturePostOffset,
-    // NV-DXVK end
     D3D9SharedPSStages_Count,
   };
 
@@ -242,12 +162,7 @@ namespace dxvk {
       float BumpEnvMat[2][2];
       float BumpEnvLScale;
       float BumpEnvLOffset;
-    // NV-DXVK start: support height map scaling in terrain baking
-      float texturePreOffset;
-      float textureScale;
-      float texturePostOffset;
-      float padding[3];
-    // NV-DXVK end
+      float Padding[2];
     } Stages[8];
   };
   

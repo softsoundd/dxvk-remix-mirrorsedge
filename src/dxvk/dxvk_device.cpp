@@ -23,9 +23,6 @@
 #include "dxvk_instance.h"
 #include "rtx_render/rtx_context.h"
 #include "dxvk_scoped_annotation.h"
-#include "rtx_render/rtx_ray_reconstruction.h"
-#include "rtx_render/rtx_texture_manager.h"
-#include "rtx_render/rtx_debug_view.h"
 #include "rtx_render/rtx_xess.h"
 
 namespace dxvk {
@@ -259,17 +256,6 @@ namespace dxvk {
 // NV-DXVK end
   }
 
-
-  // NV-DXVK start: implement acceleration structures
-  Rc<DxvkAccelStructure> DxvkDevice::createAccelStructure(
-      const DxvkBufferCreateInfo& createInfo,
-            VkMemoryPropertyFlags memoryType,
-            VkAccelerationStructureTypeKHR accelType,
-      const char* name) {
-    return new DxvkAccelStructure(this, createInfo, m_objects.memoryManager(), memoryType, accelType, name);
-  }
-  // NV-DXVK end
-  
   Rc<DxvkBufferView> DxvkDevice::createBufferView(
     const Rc<DxvkBuffer>&           buffer,
     const DxvkBufferViewCreateInfo& createInfo) {
@@ -523,39 +509,27 @@ namespace dxvk {
     m_sceneManager(device),
     m_rtResources(device),
     m_rtInitializer(device),
-    m_textureManager { std::make_unique<RtxTextureManager>(device) },
     m_imgui(device),
     m_dummyResources(device),
     m_ngxContext(device),
     m_ngxPassthrough(device),
     m_dlfg(device),
     m_dlss(device),
-    m_rayReconstruction(device),
     m_dlssNeuralRendering(device),
     m_nis(device),
     m_taa(device),
     m_xess(device),
     m_gpuCrash(device),
-    m_debug_view(device),
     m_autoExposure(device),
-    m_toneMapping(device),
     m_bloom(device),
-    m_imageUtils(device),
     m_postFx(device),
-    m_srgbDither(device),
-    m_capturer(new GameCapturer(device, m_sceneManager, m_exporter.get())),
     m_lastKnownWindowHandle((HWND) 0) { }
-
-  RtxTextureManager& DxvkObjects::getTextureManager() {
-    return *m_textureManager;
-  }
 
   void DxvkObjects::onDestroy() {
     getRtxInitializer().onDestroy();
 
     getSceneManager().onDestroy();
 
-    m_rayReconstruction.get().onDestroy();
     m_dlssNeuralRendering.get().onDestroy();
     m_dlss.get().onDestroy();
     m_dlfg.get().onDestroy();

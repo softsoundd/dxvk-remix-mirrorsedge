@@ -6,7 +6,7 @@ Technical description of how the Remix runtime is split into binaries, how they 
 
 ### x86 applications
 
-Remix itself is a 64-bit program (which is a requirement for using Vulkan ray-tracing), but many classic games are 32-bit and cannot load 64-bit code. To bridge the gap, these games get a small 32-bit `d3d9.dll` - the Bridge client - that hands the game's graphics calls over to a separate 64-bit program - the Bridge server - which runs Remix. This is why x86 build ships with extra folders and files compared to x64 build.
+Remix itself is a 64-bit program, but many classic games are 32-bit and cannot load 64-bit code. To bridge the gap, these games get a small 32-bit `d3d9.dll` - the Bridge client - that hands the game's graphics calls over to a separate 64-bit program - the Bridge server - which runs Remix. This is why x86 build ships with extra folders and files compared to x64 build.
 
 The x86 Bridge client picks the server folder by the native architecture of the machine: `.trex_arm64` on ARM64, `.trex` otherwise. It launches the Bridge server from that folder, and the server loads `d3d9.dll` Remix implementation from the same folder.
 
@@ -23,18 +23,18 @@ rtx-remix-for-x86-games-*
 │   ├── NvRemixBridge.pdb
 │   ├── d3d9.dll                # x64 runtime implementation
 │   ├── d3d9.pdb
-│   └── runtime dependencies / usd/
+│   └── runtime dependencies
 └── .trex_arm64/
     ├── NvRemixBridge.exe       # ARM64 Bridge server
     ├── NvRemixBridge.pdb
     ├── d3d9.dll                # ARM64 runtime implementation
     ├── d3d9.pdb
-    └── runtime dependencies / usd/
+    └── runtime dependencies
 ```
 
 ### x64 applications
 
-For x64 applications the `d3d9.dll` is a thin proxy. The actual D3D9 and Remix API implementation lives in an architecture-specific DLL next to it. The package file layout is the following:
+For x64 applications the `d3d9.dll` is a thin proxy. The actual D3D9 implementation lives in an architecture-specific DLL next to it. The package file layout is the following:
 
 ```
 rtx-remix-for-x64-games-*
@@ -44,7 +44,7 @@ rtx-remix-for-x64-games-*
 ├── d3d9_x64.pdb
 ├── d3d9_a64ec.dll              # ARM64EC runtime implementation
 ├── d3d9_a64ec.pdb
-└── runtime dependencies / usd/
+└── runtime dependencies
 ```
 
 The shim is always built for x64 and so it can load both x64 and ARM64EC implementations. On Windows-on-Arm (WoA), the shim will first attempt to load the ARM64EC implementation and will fall back to x64 if it does not exist.
@@ -57,7 +57,7 @@ The native ARM64 applications must use a separate native ARM64 Remix build. The 
 rtx-remix-for-ARM64-games-*
 ├── d3d9.dll                    # ARM64 runtime implementation
 ├── d3d9.pdb
-└── runtime dependencies / usd/
+└── runtime dependencies
 ```
 
 ## D3D9 x64 shim technical details
@@ -78,7 +78,7 @@ The implementation DLL is always loaded from the shim's directory, not the proce
 The shim forwards two groups of exports:
 
 - Standard D3D9 exports (`Direct3DCreate9`, `D3DPERF_*`, ...).
-- Remix exports (`remixapi_InitializeLibrary`, `QueryFeatureVersion`, `RtxSentry*`, and other internal entry points).
+- Remix exports (`QueryFeatureVersion`, `RtxSentry*`, and other internal entry points).
 
 Rules for adding an export:
 

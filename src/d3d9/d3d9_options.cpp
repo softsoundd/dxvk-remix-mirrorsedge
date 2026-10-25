@@ -49,9 +49,7 @@ namespace dxvk {
   }
 
 
-// NV-DXVK start: different default values for d3d9 options
-  D3D9Options::D3D9Options(const Rc<DxvkDevice>& device, const Config& config, bool withRemixAPI) {
-// NV-DXVK end
+  D3D9Options::D3D9Options(const Rc<DxvkDevice>& device, const Config& config) {
     const Rc<DxvkAdapter> adapter = device != nullptr ? device->adapter() : nullptr;
 
     // Fetch these as a string representing a hexadecimal number and parse it.
@@ -94,8 +92,8 @@ namespace dxvk {
     this->forceAspectRatio              = config.getOption<std::string> ("d3d9.forceAspectRatio",              "");
     this->allowDoNotWait                = config.getOption<bool>        ("d3d9.allowDoNotWait",                true);
     this->allowDiscard                  = config.getOption<bool>        ("d3d9.allowDiscard",                  true);
-    // NV-DXVK start: different default values for d3d9 options, added env.var for overriding
-    this->enumerateByDisplays           = config.getOption<bool>        ("d3d9.enumerateByDisplays",           withRemixAPI ? false : true, "DXVK_ENUMERATE_D3D9_DEVICES_BY_DISPLAYS");
+    // NV-DXVK start: added env.var for overriding
+    this->enumerateByDisplays           = config.getOption<bool>        ("d3d9.enumerateByDisplays",           true, "DXVK_ENUMERATE_D3D9_DEVICES_BY_DISPLAYS");
     // NV-DXVK end
     this->longMad                       = config.getOption<bool>        ("d3d9.longMad",                       false);
     this->tearFree                      = config.getOption<Tristate>    ("d3d9.tearFree",                      Tristate::Auto);

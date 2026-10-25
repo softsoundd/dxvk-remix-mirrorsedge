@@ -12,13 +12,13 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ## NGX passthrough branch (`mirrors-edge-ngx`)
 
-This branch adds an NGX passthrough mode where Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's Post FX runs on top of it. Like the rest of this fork, NGX passthrough mode may work in other UE3 titles, but support is not guaranteed.
+On this branch the runtime is an NGX passthrough: Mirror's Edge's own rasterised rendering is presented unchanged (no path tracing, no scene capture) while DLSS Super Resolution / DLAA, DLSS Frame Generation, Reflex, and Remix's Post FX run on top of it. Like the rest of this fork, NGX passthrough may work in other UE3 titles, but support is not guaranteed.
 
 ### NGX mode setup
 
 **The game's MSAA must be off** because depth cannot be resolved while it is active - plus you want DLSS/DLAA anyway, right? By default NGX mode will attempt to force MSAA off at runtime via `rtx.ngxPassthrough.disableGameMsaa` which makes the D3D9 layer report multisampling as unsupported and create every surface single-sampled. In (rare) cases where that fails, MSAA will need to be disabled manually via the game's settings/configs.
 
-NGX passthrough mode is enabled by default on this branch, including when no `rtx.conf` is present. Mirror's Edge also sets it in the built-in app config. A depth buffer created while the mode is off is promoted to a shader-readable layout when the mode is turned on. Multisampled depth still requires a restart after MSAA is refused.
+NGX passthrough is always on; there is no path-traced mode to switch to. Multisampled depth still requires a restart after MSAA is refused.
 
 How it works:
 
@@ -90,12 +90,10 @@ Notes and limitations:
         - type `cmd` in the address bar to open a command line window in that folder.
         - copy and paste `powershell -command "& .\build_dxvk_all_ninja.ps1"` into the command line, then press enter
     - Optional flags:
-        - `-SkipApics` — skip downloading game test captures (requires auth token)
         - `-BuildArch <x64|arm64|arm64ec>` — target architecture, default `x64`. `arm64ec` is configured with the Visual Studio backend rather than Ninja, because Meson cannot link arm64ec targets with Ninja, so the `_Comp*_arm64ec` directories hold MSBuild projects instead of Ninja files. The generated **_vs** solution always drives the `_Comp*_x64` directories; build other architectures with `meson compile -C <build directory>`.
     - Examples:
         ```powershell
         .\build_dxvk_all_ninja.ps1
-        .\build_dxvk_all_ninja.ps1 -SkipApics
         .\build_dxvk_all_ninja.ps1 -BuildArch arm64
         ```
     - This will build all 3 configurations of dxvk-remix project inside subdirectories of the build tree:
@@ -136,20 +134,9 @@ To profile:
 3. When ready, hit `Connect` in Tracy to begin profiling.
 4. It's best to collect at least 500 frames worth of data, so you can average out the results.
 
-### Remix API
-
-If there's an intent to use the Remix Renderer in projects with *available* source code, Direct3D 9 API can be utilized, since Remix's `d3d9.dll` implements the Direct3D 9 API.
-Alternatively, Remix API can be used to programmatically pass the game data to the Remix Renderer, with *or* instead of Direct3D API. [Click for more info.](/documentation/RemixSDK.md)
-
 ## Project Documentation
 
-- [Anti-Culling System](/documentation/AntiCullingSystem.md)
 - [Contributing Guide](/CONTRIBUTING.md)
-- [Foliage System](/documentation/FoliageSystem.md)
-- [GPU Print](/documentation/GpuPrint.md)
-- [Opacity Micromap](/documentation/OpacityMicromap.md)
-- [Remix API](/documentation/RemixSDK.md)
 - [Remix Runtime Binaries](/documentation/RemixRuntimeBinaries.md)
 - [Rtx Options](/RtxOptions.md)
-- [Terrain System](/documentation/TerrainSystem.md)
 - [Unit Test](/documentation/UnitTest.md)

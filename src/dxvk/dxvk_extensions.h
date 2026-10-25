@@ -322,12 +322,7 @@ namespace dxvk {
     DxvkExt khrSamplerMirrorClampToEdge       = { VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME,       DxvkExtMode::Optional };
     DxvkExt khrShaderFloatControls            = { VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,              DxvkExtMode::Optional };
     DxvkExt khrSwapchain                      = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,                          DxvkExtMode::Required };
-    DxvkExt khrDeferredHostOperations         = { VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,           DxvkExtMode::Required };
-    DxvkExt khrAccelerationStructure          = { VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,             DxvkExtMode::Required };
-    DxvkExt khrRayQueries                     = { VK_KHR_RAY_QUERY_EXTENSION_NAME,                          DxvkExtMode::Required };
-    DxvkExt khrRayTracingPipeline             = { VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,               DxvkExtMode::Required };
     DxvkExt khrBufferDeviceAddress            = { VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,              DxvkExtMode::Required };
-    DxvkExt khrPipelineLibrary                = { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,                   DxvkExtMode::Optional };
     DxvkExt nvxBinaryImport                   = { VK_NVX_BINARY_IMPORT_EXTENSION_NAME,                      DxvkExtMode::Optional };
     DxvkExt nvxImageViewHandle                = { VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,                  DxvkExtMode::Optional };
     DxvkExt khrPushDescriptor                 = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,                    DxvkExtMode::Optional };
@@ -337,11 +332,8 @@ namespace dxvk {
     DxvkExt nvDeviceDiagnostics               = { VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt nvDeviceDiagnosticCheckpoints     = { VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,       DxvkExtMode::Optional };
     // NV-DXVK end
-    DxvkExt nvRayTracingInvocationReorder     = { VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,      DxvkExtMode::Optional };
 
-    // Opacity micromap
     DxvkExt khrSynchronization2               = { VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,                  DxvkExtMode::Optional };
-    DxvkExt extOpacityMicromap                = { VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME,                   DxvkExtMode::Optional };
 
     // NV-DXVK start: Integrate Reflex
     DxvkExt nvLowLatency                      = { "VK_NV_low_latency",                                      DxvkExtMode::Optional };

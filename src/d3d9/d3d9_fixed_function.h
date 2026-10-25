@@ -154,10 +154,6 @@ namespace dxvk {
         // Affects all stages.
         uint32_t     GlobalSpecularEnable : 1;
         uint32_t     GlobalFlatShade      : 1;
-
-        // NV-DXVK start:
-        uint32_t allowActiveStagesBeyondDisabledStage : 1; // Overrides D3DTOP_DISABLE behavior to allow subsequent stages
-        // NV-DXVK end
       } Contents;
 
       uint32_t Primitive[2];
@@ -254,16 +250,4 @@ namespace dxvk {
 
     return g_ffIsgn;
   }
-
-  uint32_t postprocessTextureReadForTerrainBaking(
-    SpirvModule& spvModule,
-    uint32_t textureValue,
-    uint32_t texcoord,
-    uint32_t texcoordType,
-    std::function<uint32_t()> loadTexturePreOffsetFnc,
-    std::function<uint32_t()> loadTextureScaleFnc,
-    std::function<uint32_t()> loadTexturePostOffsetFnc,
-    std::function<uint32_t()> loadAlbedoOpacityFnc,
-    std::function<void(uint32_t vec4value)> storeVec4ValueToRegisterFnc,
-    std::function<uint32_t()> loadVec4ValueFromRegisterFnc);
 }

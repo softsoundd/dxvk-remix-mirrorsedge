@@ -8,7 +8,6 @@
 #include "dxvk_image.h"
 #include "dxvk_limits.h"
 #include "dxvk_pipelayout.h"
-#include "dxvk_raytracing.h"
 #include "dxvk_sampler.h"
 #include "dxvk_shader.h"
 #include "../util/util_matrix.h"
@@ -51,11 +50,6 @@ namespace dxvk {
     CpDirtyPipelineState,       ///< Compute pipeline needs to be recompiled
     CpDirtyResources,           ///< Compute pipeline resource bindings are out of date
     CpDirtyDescriptorBinding,   ///< Compute descriptor set needs to be rebound
-
-    RpDirtyPipeline,            ///< Raytracing pipeline binding are out of date
-    RpDirtyPipelineState,       ///< Raytracing pipeline needs to be recompiled
-    RpDirtyResources,           ///< Raytracing pipeline resource bindings are out of date
-    RpDirtyDescriptorBinding,   ///< Raytracing descriptor set needs to be rebound
 
     DirtyDrawBuffer,            ///< Indirect argument buffer is dirty
     DirtyPushConstants,         ///< Push constant data has changed
@@ -151,12 +145,6 @@ namespace dxvk {
     DxvkComputePipeline*          pipeline = nullptr;
   };
 
-  struct DxvkRaytracingPipelineState {
-    DxvkRaytracingPipelineShaders shaders;
-    DxvkComputePipelineStateInfo  state;
-    DxvkRaytracingPipeline*       pipeline = nullptr;
-  };
-
   struct DxvkDynamicState {
     DxvkBlendConstants  blendConstants    = { 0.0f, 0.0f, 0.0f, 0.0f };
     DxvkDepthBias       depthBias         = { 0.0f, 0.0f, 0.0f };
@@ -189,6 +177,5 @@ namespace dxvk {
     
     DxvkGraphicsPipelineState gp;
     DxvkComputePipelineState  cp;
-    DxvkRaytracingPipelineState rp;
   };
 }

@@ -182,7 +182,7 @@ namespace dxvk {
 
     // NV-DXVK start: [NGX passthrough] engines build their MSAA option list from this query, so
     // reporting no support here keeps them from ever requesting a multisampled surface
-    if (RtxNgxPassthrough::forceGameMsaaOff() && MultiSampleType != D3DMULTISAMPLE_NONE) {
+    if (RtxNgxPassthrough::disableGameMsaa() && MultiSampleType != D3DMULTISAMPLE_NONE) {
       if (pQualityLevels != nullptr)
         *pQualityLevels = 0;
 

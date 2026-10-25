@@ -31,23 +31,9 @@
 #include "rtx_context.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_options.h"
-#include "rtx_texture_manager.h"
-#include "rtx_ray_reconstruction.h"
 #include "rtx_xess.h"
-#include "rtx_debug_view.h"
 #include "rtx_ngx_passthrough.h"
-
-#include "rtx/pass/sparse_rendering/sparse_rendering.h"
-
-#include "rtx/pass/common_binding_indices.h"
-#include "rtx/pass/raytrace_args.h"
-#include "rtx/pass/volume_args.h"
-#include "rtx/utility/debug_view_indices.h"
-#include "rtx/utility/gpu_printing.h"
 #include "rtx_scene_manager.h"
-
-#include "../d3d9/d3d9_state.h"
-#include "../d3d9/d3d9_spec_constants.h"
 
 #include "../util/log/metrics.h"
 #include "../util/util_defer.h"
@@ -71,9 +57,6 @@ namespace dxvk {
 
   Metrics Metrics::s_instance;
 
-  bool g_allowSrgbConversionForOutput = true;
-  bool g_forceKeepObjectPickingImage = false;
-
   void RtxContext::takeScreenshot(std::string imageName, Rc<DxvkImage> image) {
     // NOTE: Improve this, I'd like all textures from the same frame to have the same time code...  Currently sampling the time on each "dump op" results in different timecodes.
     auto t = std::time(nullptr);
@@ -91,74 +74,8 @@ namespace dxvk {
     exporter.dumpImageToFile(this, path, str::format(imageName, "_", tm.tm_mday, tm.tm_mon, tm.tm_year, "-", tm.tm_hour, tm.tm_min, tm.tm_sec, ".dds"), image);
   }
 
-  void RtxContext::blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter) {
-    const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(dstImage->info().format);
-    const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(srcImage->info().format);
-
-    const VkImageSubresource dstSubresource = { dstFormatInfo->aspectMask, 0, 0 };
-    const VkImageSubresource srcSubresource = { srcFormatInfo->aspectMask, 0, 0 };
-
-    VkExtent3D srcExtent = srcImage->mipLevelExtent(srcSubresource.mipLevel);
-    VkExtent3D dstExtent = dstImage->mipLevelExtent(dstSubresource.mipLevel);
-
-    VkImageSubresourceLayers dstSubresourceLayers = {
-      dstSubresource.aspectMask,
-      dstSubresource.mipLevel,
-      dstSubresource.arrayLayer, 1 };
-
-    VkImageSubresourceLayers srcSubresourceLayers = {
-      srcSubresource.aspectMask,
-      srcSubresource.mipLevel,
-      srcSubresource.arrayLayer, 1 };
-
-    VkImageBlit blitInfo;
-
-    blitInfo.dstSubresource = dstSubresourceLayers;
-    blitInfo.srcSubresource = srcSubresourceLayers;
-
-    blitInfo.dstOffsets[0] = VkOffset3D{ 0,                        0,                       0 };
-    blitInfo.dstOffsets[1] = VkOffset3D{ int32_t(dstExtent.width),  int32_t(dstExtent.height),  1 };
-
-    blitInfo.srcOffsets[0] = VkOffset3D{ 0,                          0,                         0 };
-    blitInfo.srcOffsets[1] = VkOffset3D{ int32_t(srcExtent.width),    int32_t(srcExtent.height),    1 };
-
-    VkComponentMapping swizzle = {
-      VK_COMPONENT_SWIZZLE_IDENTITY,
-      VK_COMPONENT_SWIZZLE_IDENTITY,
-      VK_COMPONENT_SWIZZLE_IDENTITY,
-      VK_COMPONENT_SWIZZLE_IDENTITY,
-    };
-
-    ctx->blitImage(dstImage, swizzle, srcImage, swizzle, blitInfo, filter);
-  }
-
   RtxContext::RtxContext(const Rc<DxvkDevice>& device)
     : DxvkContext(device) {
-    // Note: This may not be the best place to check for these features/properties, they ideally would be specified as
-    // required upfront, but there's no good place to do that for this RTX extension (the D3D9 stuff does it before device
-    // creation), so instead we just check for what is needed.
-    // Note: When adding new extensions update DxvkAdapter::createDevice as it is what brings these features over.
-    m_rayTracingSupported = (m_device->features().core.features.shaderInt16 &&
-                             m_device->features().vulkan11Features.storageBuffer16BitAccess &&
-                             m_device->features().vulkan11Features.uniformAndStorageBuffer16BitAccess &&
-                             m_device->features().vulkan12Features.bufferDeviceAddress &&
-                             m_device->features().vulkan12Features.descriptorIndexing &&
-                             m_device->features().vulkan12Features.runtimeDescriptorArray &&
-                             m_device->features().vulkan12Features.descriptorBindingPartiallyBound &&
-                             m_device->features().vulkan12Features.shaderStorageBufferArrayNonUniformIndexing &&
-                             m_device->features().vulkan12Features.shaderSampledImageArrayNonUniformIndexing &&
-                             m_device->features().vulkan12Features.descriptorBindingVariableDescriptorCount &&
-                             m_device->features().vulkan12Features.shaderInt8 &&
-                             m_device->features().vulkan12Features.shaderFloat16 &&
-                             m_device->features().vulkan12Features.uniformAndStorageBuffer8BitAccess &&
-                             m_device->features().khrAccelerationStructureFeatures.accelerationStructure &&
-                             m_device->features().khrRayQueryFeatures.rayQuery &&
-                             m_device->features().khrDeviceRayTracingPipelineFeatures.rayTracingPipeline &&
-                             m_device->extensions().khrShaderInt8Float16Types &&
-                             m_device->properties().coreSubgroup.subgroupSize >= 1 &&
-                             m_device->properties().coreSubgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT &&
-                             m_device->properties().coreSubgroup.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT);
-
     m_dlssSupported = (m_device->extensions().nvxBinaryImport &&
                        m_device->extensions().nvxImageViewHandle &&
                        m_device->extensions().khrPushDescriptor);
@@ -183,9 +100,6 @@ namespace dxvk {
 
     m_prevRunningTime = std::chrono::steady_clock::now();
 
-    RtxOptions::setIsOpacityMicromapSupported(false);
-    checkShaderExecutionReorderingSupport();
-    checkNeuralRadianceCacheSupport();
     reportCpuSimdSupport();
 
     GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames() * 0.001f);
@@ -233,14 +147,6 @@ namespace dxvk {
       uint32_t displaySize[2] = { upscaleExtent.width, upscaleExtent.height };
       uint32_t renderSize[2];
       dlss.setSetting(displaySize, RtxOptions::qualityDLSS(), renderSize);
-      downscaleExtent.width = renderSize[0];
-      downscaleExtent.height = renderSize[1];
-      downscaleExtent.depth = 1;
-    } else if (shouldUseRayReconstruction()) {
-      DxvkRayReconstruction& rayReconstruction = m_common->metaRayReconstruction();
-      uint32_t displaySize[2] = { upscaleExtent.width, upscaleExtent.height };
-      uint32_t renderSize[2];
-      rayReconstruction.setSettings(displaySize, RtxOptions::qualityDLSS(), renderSize);
       downscaleExtent.width = renderSize[0];
       downscaleExtent.height = renderSize[1];
       downscaleExtent.depth = 1;
@@ -295,36 +201,7 @@ namespace dxvk {
     // 14 of the 16 bits of an integer will be used for these pixel coordinates to pack additional data
     // into the free bits in memory payload structures on the GPU.
     assert((renderSize[0] < (1 << 14)) && (renderSize[1] < (1 << 14)));
-
-    // With reloadTextureWhenResolutionChanged ON, textures will get reloaded when resolution is changed,
-    // which may cause long wait when changing DLSS-RR or other upscalers' settings.
-    // Therefore reloadTextureWhenResolutionChanged is set to OFF by default to improve performance. 
-    if (RtxOptions::reloadTextureWhenResolutionChanged()) {
-      getCommonObjects()->getTextureManager().clear();
-      getCommonObjects()->memoryManager().freeUnusedChunks();
-    }
   }
-
-  bool RtxContext::useRayReconstruction() const {
-    return m_common->metaRayReconstruction().useRayReconstruction();
-  }
-
-  RtxContext::InternalUpscaler RtxContext::getCurrentFrameUpscaler() {
-    if (shouldUseDLSS() && m_common->metaDLSS().isActive()) {
-      return InternalUpscaler::DLSS;
-    } else if (shouldUseRayReconstruction() && m_common->metaRayReconstruction().isActive()) {
-      return InternalUpscaler::DLSS_RR;
-    } else if (shouldUseXeSS() && m_common->metaXeSS().isActive()) {
-      return InternalUpscaler::XeSS;
-    } else if (shouldUseNIS()) {
-      return InternalUpscaler::NIS;
-    } else if (shouldUseTAA()) {
-      return InternalUpscaler::TAAU;
-    } else {
-      return InternalUpscaler::None;
-    }
-  }
-
 
   void RtxContext::onInjectRtxFrameEnd(bool rayTracedThisFrame) {
     getSceneManager().onFrameEnd(this, rayTracedThisFrame);
@@ -369,9 +246,6 @@ namespace dxvk {
     RtxGpuPassTimer::CpuScope injectCpuScope(RtxGpuPassTimer::isEnabled() ? &getCommonObjects()->metaGpuPassTimer() : nullptr,
                                              RtxGpuPassTimer::CpuCounter::CsInjectRtx);
     // NV-DXVK end
-#ifdef REMIX_DEVELOPMENT
-    m_currentPassStage = RtxFramePassStage::FrameBegin;
-#endif
 
     if (RtxOptions::enableBreakIntoDebuggerOnPressingB() && ImGUI::checkHotkeyState({VirtualKey{ 'B' }}, true)) {
       while (!::IsDebuggerPresent()) {
@@ -395,40 +269,14 @@ namespace dxvk {
     common->metaGpuPassTimer().onFrameBegin(this);
     // NV-DXVK end
 
-    const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
 
-    // Whether a ray-traced scene is actually being rendered this frame.
     const bool isCameraValid = getSceneManager().getCamera().isValid(m_device->getCurrentFrameId());
 
-    // Determine and set present throttle delay
-    // Note: This must be done before the early out returns below which is why some logic here is redundant (e.g. checking if ray tracing is supported again)
-    // just to ensure the present throttle delay is always being set properly.
+    // Note: This must be done before the early out return below so the present throttle delay is always set.
+    m_device->setPresentThrottleDelay(RtxOptions::enablePresentThrottle() ? RtxOptions::presentThrottleDelay() : 0);
 
-    const auto requestedPresentThrottleDelay = RtxOptions::enablePresentThrottle() ? RtxOptions::presentThrottleDelay() : 0;
-    std::uint32_t requestedAsyncShaderCompilationDelay = 0U;
-
-    // Note: Only use the async shader compilation throttle delay when rendering which uses Remix shaders would actually take place. As such this delay is not
-    // needed when ray tracing is not supported or enabled, or when there is no valid camera yet (e.g. a 2D main menu) as Remix shaders will not be
-    // used in that case.
-    if (m_rayTracingSupported && isRaytracingEnabled && asyncShaderCompilationActive && isCameraValid) {
-      requestedAsyncShaderCompilationDelay = RtxOptions::Shader::asyncCompilationThrottleMilliseconds();
-    }
-
-    // Note: Determine the throttle delay to use based on the larger of the two requested delay values as the larger should satisfy the requests of both.
-    // A sum is also potentially a valid way of going about this, but a maximum makes more sense in that these delays aren't expected to stack but rather
-    // are just requests for some minimum amount of time to spend waiting per frame.
-    const auto computedPresentThrottleDelay = std::max(requestedPresentThrottleDelay, requestedAsyncShaderCompilationDelay);
-
-    m_device->setPresentThrottleDelay(computedPresentThrottleDelay);
-
-    // Early out if ray tracing is not supported or if Remix has already been injected
-
-    if (!m_rayTracingSupported) {
-      ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Raytracing doesn't appear to be supported on this HW.")));
-      return;
-    }
-
+    // Early out if Remix has already been injected this frame
     if (m_frameLastInjected == m_device->getCurrentFrameId()) {
       return;
     }
@@ -447,24 +295,17 @@ namespace dxvk {
     ShaderManager::getInstance()->update();
 #endif
 
-    common->getTextureManager().processAllHotReloadRequests();
-
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
     Metrics::TestTraceSample testTraceSample;
     testTraceSample.frameId = m_device->getCurrentFrameId();
     testTraceSample.effectiveDeltaMs = GlobalTime::get().deltaTimeMs();
     testTraceSample.realWallDeltaMs = GlobalTime::get().realDeltaTimeMs();
     testTraceSample.gpuIdleTimeMs = gpuIdleTimeMilliseconds;
-    testTraceSample.surfaceCount = 0;
     testTraceSample.shaderCompileInflightCount = getCommonObjects()->pipelineManager().remixShaderCompilationCount();
-    testTraceSample.debugViewMode = 0;
-    testTraceSample.compositeDebugViewMode = 0;
-    testTraceSample.raytracingEnabled = isRaytracingEnabled;
     testTraceSample.cameraValid = isCameraValid;
     testTraceSample.asyncShaderPrewarming = RtxInitializer::asyncShaderPrewarming();
     testTraceSample.asyncCompilationEnabled = RtxOptions::Shader::enableAsyncCompilation();
     testTraceSample.asyncCompilationActive = asyncShaderCompilationActive;
-    testTraceSample.surfaceBufferAvailable = false;
     Metrics::recordTestTrace(testTraceSample);
 
 
@@ -488,10 +329,8 @@ namespace dxvk {
       dispatchNgxPassthrough(targetImage);
 
       m_frameLastInjected = m_device->getCurrentFrameId();
-      m_framesWithoutValidScene = 0;
     } else {
       m_common->metaNgxPassthrough().noteCameraInvalidFrame();
-      m_framesWithoutValidScene++;
     }
 
     onInjectRtxFrameEnd(false);
@@ -500,7 +339,7 @@ namespace dxvk {
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
 
     // Update stats
-    updateMetrics(gpuIdleTimeMilliseconds, isRaytracingEnabled);
+    updateMetrics(gpuIdleTimeMilliseconds);
 
     m_resetHistory = false;
   }
@@ -512,12 +351,6 @@ namespace dxvk {
       // immediately when this frame was already dispatched.
       injectRTX(cachedReflexFrameId, targetImage);
     }
-
-#ifdef REMIX_DEVELOPMENT
-    queryAvailableResourceAliasing();
-    analyzeResourceAliasing();
-    clearResourceAliasingCache();
-#endif
 
     // Update time on the frame end so all other systems can benefit from a global time
     GlobalTime::get().update();
@@ -532,29 +365,21 @@ namespace dxvk {
         sentry::onFirstFrame();
       }
     }
-    // If injectRTX couldn't screenshot a final image or a pre-present screenshot is requested,
-    // take a screenshot of a present image (with UI and others)
+    // Screenshots capture the present image, UI included.
     {
-      const bool isRaytracingEnabled = RtxOptions::enableRaytracing();
-      const bool isCameraValid = getSceneManager().getCameraManager().isCameraValid(CameraType::Main);
-
-      if (!isRaytracingEnabled || !isCameraValid || s_capturePrePresentTestScreenshot) {
-        const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
-        const bool captureDxvkScreenImage = s_triggerScreenshot || captureTestScreenshot;
-        if (captureDxvkScreenImage) {
-          if (targetImage == nullptr) {
-            targetImage = m_state.om.renderTargets.color[0].view->image();
-          }
-          takeScreenshot("rtxImageDxvkView", targetImage);
+      const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
+      if (s_triggerScreenshot || captureTestScreenshot) {
+        if (targetImage == nullptr) {
+          targetImage = m_state.om.renderTargets.color[0].view->image();
         }
+        takeScreenshot("rtxImageDxvkView", targetImage);
       }
     }
     s_triggerScreenshot = false;
 
     // Some time in the future kill process
     if (m_triggerDelayedTerminate &&
-        (m_device->getCurrentFrameId() > m_terminateAppFrameNum) &&
-        m_common->capturer()->isIdle()) {
+        (m_device->getCurrentFrameId() > m_terminateAppFrameNum)) {
       Logger::info(str::format("RTX: Terminating application"));
       Metrics::serialize();
       getCommonObjects()->metaExporter().waitForAllExportsToComplete();
@@ -566,12 +391,9 @@ namespace dxvk {
     GpuMemoryTracker::onFrameEnd();
   }
 
-  void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds, const bool raytracedThisFrame) {
+  void RtxContext::updateMetrics(const float gpuIdleTimeMilliseconds) {
     ScopedCpuProfileZone();
     const uint32_t frameId = m_device->getCurrentFrameId();
-    if (raytracedThisFrame && m_firstRaytracedFrameId == kInvalidFrameIndex) {
-      m_firstRaytracedFrameId = frameId;
-    }
 
     // injectRTX can run twice in a frame, so sample once. GPU idle time from a repeat call carries into the next sample.
     m_metricsGpuIdleTimeMs += gpuIdleTimeMilliseconds;
@@ -586,12 +408,8 @@ namespace dxvk {
     Metrics::logFloat(Metric::dxvk_total_time_ms, timeSinceStartMs);
     Metrics::logFloat(Metric::dxvk_frame_count, static_cast<float>(frameId));
 
-    // Path tracing excludes every frame until the first ray traced one. Passthrough never ray traces,
-    // so its warmup starts at frame 0 instead of waiting forever.
     const uint32_t warmupFrames = RtxOptions::Automation::metricsWarmupFrames();
-    const bool waitingForRaytrace = RtxOptions::enableRaytracing() && m_firstRaytracedFrameId == kInvalidFrameIndex;
-    const uint32_t warmupStart = m_firstRaytracedFrameId == kInvalidFrameIndex ? 0 : m_firstRaytracedFrameId;
-    const bool isWarmup = warmupFrames > 0 && (waitingForRaytrace || frameId <= warmupStart + warmupFrames);
+    const bool isWarmup = warmupFrames > 0 && frameId <= warmupFrames;
     if (isWarmup) {
       Metrics::logFloat(Metric::dxvk_warmup_time_ms, timeSinceStartMs);
       return;
@@ -615,66 +433,6 @@ namespace dxvk {
     Metrics::logAverage(Metric::dxvk_vid_memory_usage_mb, static_cast<float>(vidUsageMib)); // In MB
     Metrics::logAverage(Metric::dxvk_sys_memory_usage_mb, static_cast<float>(sysUsageMib)); // In MB
   }
-
-  void RtxContext::setConstantBuffers(const uint32_t vsFixedFunctionConstants, const uint32_t psSharedStateConstants, Rc<DxvkBuffer> vertexCaptureCB) {
-    m_rtState.vsFixedFunctionCB = m_rc[vsFixedFunctionConstants].bufferSlice.buffer();
-    m_rtState.psSharedStateCB = m_rc[psSharedStateConstants].bufferSlice.buffer();
-    m_rtState.vertexCaptureCB = vertexCaptureCB;
-  }
-
-
-  void RtxContext::commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state) {
-    (void)state;
-  }
-
-
-  void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)
-  {
-    DxvkContext::bindResourceView(slot, imageView, bufferView);
-
-#ifdef REMIX_DEVELOPMENT
-    // Cache resources for aliasing
-    cacheResourceAliasingImageView(imageView);
-#endif
-  }
-
-  bool RtxContext::checkIsShaderExecutionReorderingSupported(DxvkDevice& device) {
-    if (!RtxOptions::isShaderExecutionReorderingSupported()) {
-      return false;
-    }
-
-    // SER Extension support check
-    const bool isSERExtensionSupported = device.extensions().nvRayTracingInvocationReorder;
-    const bool isSERReorderingEnabled =
-      VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV == device.properties().nvRayTracingInvocationReorderProperties.rayTracingInvocationReorderReorderingHint;
-      
-    return isSERExtensionSupported && isSERReorderingEnabled;
-  }
-
-  void RtxContext::checkShaderExecutionReorderingSupport() {
-    const bool isSERSupported = checkIsShaderExecutionReorderingSupported(*m_device);
-    
-    RtxOptions::enableShaderExecutionReordering = isSERSupported;
-
-    const VkPhysicalDeviceProperties& props = m_device->adapter()->deviceProperties();
-    const NV_GPU_ARCHITECTURE_ID archId = RtxOptions::getNvidiaArch();
-
-    Logger::info(str::format("[RTX info] Shader Execution Reordering: ", isSERSupported ? "supported" : "not supported"));
-
-    bool isShaderExecutionReorderingEnabled = RtxOptions::isShaderExecutionReorderingInPathtracerGbufferEnabled() ||
-      RtxOptions::isShaderExecutionReorderingInPathtracerIntegrateIndirectEnabled();
-
-    Logger::info(str::format("[RTX info] Shader Execution Reordering: ", isShaderExecutionReorderingEnabled ? "enabled" : "disabled"));
-  }
-
-  void RtxContext::checkNeuralRadianceCacheSupport() {
-    // Update RtxOption selection if Neural Radiance Cache was selected but it's not supported
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
-      Logger::warn(str::format("[RTX] Neural Radiance Cache is not supported. Switching indirect illumination mode to ReSTIR GI."));
-      RtxOptions::integrateIndirectMode.setImmediately(IntegrateIndirectMode::ReSTIRGI, RtxOptionLayer::getQualityLayer());
-    }
-  }
-
 
   void RtxContext::snapshotNgxPassthroughDepth(const Rc<DxvkImage>& sceneDepthImage) {
     ScopedGpuProfileZone(this, "NGX Passthrough Depth Snapshot");
@@ -797,20 +555,11 @@ namespace dxvk {
     DxvkContext::updateComputeShaderResources();
   }
 
-  void RtxContext::updateRaytracingShaderResources() {
-    ScopedCpuProfileZone();
-    DxvkContext::updateRaytracingShaderResources();
-  }
-
   bool RtxContext::shouldUseDLSS() const {
     // Note: m_dlssSupported only checks for the presence of some basic extensions, the actual DLSS context needs to be queried to see
     // if a given platform supports DLSS (as this will depend on if it was actually initialized successfully or not). Cases where m_dlssSupported
     // is true but supportsDLSS() is not are for example when the DLSS DLL is missing.
     return RtxOptions::isDLSSEnabled() && m_dlssSupported && m_common->metaDLSS().supportsDLSS();
-  }
-
-  bool RtxContext::shouldUseRayReconstruction() const {
-    return useRayReconstruction();
   }
 
   bool RtxContext::shouldUseNIS() const {
@@ -823,56 +572,6 @@ namespace dxvk {
 
   bool RtxContext::shouldUseXeSS() const {
     return RtxOptions::upscalerType() == UpscalerType::XeSS;
-  }
-
-  D3D9RtxVertexCaptureData& RtxContext::allocAndMapVertexCaptureConstantBuffer() {
-    DxvkBufferSliceHandle slice = m_rtState.vertexCaptureCB->allocSlice();
-    invalidateBuffer(m_rtState.vertexCaptureCB, slice);
-
-    return *static_cast<D3D9RtxVertexCaptureData*>(slice.mapPtr);
-  }
-
-  D3D9FixedFunctionVS& RtxContext::allocAndMapFixedFunctionVSConstantBuffer() {
-    DxvkBufferSliceHandle slice = m_rtState.vsFixedFunctionCB->allocSlice();
-    invalidateBuffer(m_rtState.vsFixedFunctionCB, slice);
-
-    return *static_cast<D3D9FixedFunctionVS*>(slice.mapPtr);
-  }
-  D3D9SharedPS& RtxContext::allocAndMapPSSharedStateConstantBuffer() {
-    DxvkBufferSliceHandle slice = m_rtState.psSharedStateCB->allocSlice();
-    invalidateBuffer(m_rtState.psSharedStateCB, slice);
-
-    return *static_cast<D3D9SharedPS*>(slice.mapPtr);
-  }
-
-  void RtxContext::clearRenderTarget(const Rc<DxvkImageView>& imageView,
-                                     VkImageAspectFlags clearAspects, VkClearValue clearValue) {
-    // Capture color for skybox clear
-    if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
-      m_skyClearValue = clearValue;
-
-      // Set dirty flag so that next skyprobe rasterize will clear the views.
-      // We assume that skybox drawcalls will immediately follow the clear. The logic would
-      // need to be revisited if this is not true for some game.
-      m_skyClearDirty = true;
-    }
-
-    DxvkContext::clearRenderTarget(imageView, clearAspects, clearValue);
-  }
-
-  void RtxContext::clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset,
-                                  VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value) {
-    // Capture color for skybox clear
-    if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
-      m_skyClearValue = value;
-
-      // Set dirty flag so that next skyprobe rasterize will clear the views.
-      // We assume that skybox drawcalls will immediately follow the clear. The logic would
-      // need to be revisited if this is not true for some game.
-      m_skyClearDirty = true;
-    }
-
-    DxvkContext::clearImageView(imageView, offset, extent, aspect, value);
   }
 
   void RtxContext::reportCpuSimdSupport() {
@@ -900,211 +599,4 @@ namespace dxvk {
       break;
     }
   }
-
-  const DxvkScInfo& RtxContext::getSpecConstantsInfo(VkPipelineBindPoint pipeline) const {
-    return
-      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
-      ? m_state.gp.state.sc
-      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-      ? m_state.cp.state.sc
-      : m_state.rp.state.sc;
-  }
-
-  void RtxContext::setSpecConstantsInfo(
-    VkPipelineBindPoint pipeline,
-    const DxvkScInfo& newSpecConstantInfo) {
-    DxvkScInfo& specConstantInfo =
-      pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
-      ? m_state.gp.state.sc
-      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-      ? m_state.cp.state.sc
-      : m_state.rp.state.sc;
-
-    if (specConstantInfo != newSpecConstantInfo) {
-      specConstantInfo = newSpecConstantInfo;
-
-      m_flags.set(
-        pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
-        ? DxvkContextFlag::GpDirtyPipelineState
-        : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-          ? DxvkContextFlag::CpDirtyPipelineState
-          : DxvkContextFlag::RpDirtyPipelineState);
-    }
-  }
-
-#ifdef REMIX_DEVELOPMENT
-  void RtxContext::cacheResourceAliasingImageView(const Rc<DxvkImageView>& imageView) {
-    if (imageView.ptr()) {
-      // Determine the format compatibility category for the image view
-      const auto formatCategory = Resources::getFormatCompatibilityCategory(imageView->info().format);
-      const auto categoryIndex = static_cast<uint32_t>(formatCategory);
-      const auto& underlyingImage = imageView->image();
-
-      // Proceed only if the category is valid and the image view is tracked in the resource view map
-      if (formatCategory != RtxTextureFormatCompatibilityCategory::InvalidFormatCompatibilityCategory &&
-          Resources::s_resourcesViewMap.find(imageView.ptr()) != Resources::s_resourcesViewMap.end()) {
-        bool aliasingMatchFound = false;
-        // Search the cache for an existing aliased resource with the same underlying image
-        for (auto& compatibleResource : m_resourceCacheTable[categoryIndex]) {
-          if (compatibleResource.view->image() == underlyingImage) {
-            // Match found: update the begin and end pass stages to expand their range
-            compatibleResource.beginPassStage = std::min(compatibleResource.beginPassStage, m_currentPassStage);
-            compatibleResource.endPassStage = std::max(compatibleResource.endPassStage, m_currentPassStage);
-
-            // Add the current resource name to the set of names for this aliased group
-            compatibleResource.names.insert(Resources::s_resourcesViewMap[imageView.ptr()]);
-            aliasingMatchFound = true;
-            break;
-          }
-        }
-
-        if (!aliasingMatchFound) {
-          // No match found: cache this as a new aliased resource entry
-          m_resourceCacheTable[categoryIndex].push_back({ imageView, m_currentPassStage, m_currentPassStage, { Resources::s_resourcesViewMap[imageView.ptr()] } });
-        }
-      }
-    }
-  }
-
-  void RtxContext::queryAvailableResourceAliasing() {
-    // Check if aliasing query is enabled through user settings
-    if (!Resources::s_queryAliasing) {
-      return;
-    }
-
-    // Set the aliasing resource dimensions based on user options
-    const VkExtent3D extent = { RtxOptions::Aliasing::width(), RtxOptions::Aliasing::height(), RtxOptions::Aliasing::depth() };
-    // Get the start and end frame pass stages from user settings
-    const RtxFramePassStage beginPass = RtxOptions::Aliasing::beginPass();
-    const RtxFramePassStage endPass = RtxOptions::Aliasing::endPass();
-
-    std::string newResourceAliasingQueryResult;
-    // Check if the begin pass is before the end pass
-    if (beginPass > endPass) {
-      // Set an error message if the begin pass is invalid
-      Resources::s_resourceAliasingQueryText = "Begin Pass must be before the End Pass";
-      return;
-    }
-
-    // Lambda function to check if a resource matches the aliasing criteria
-    auto isResourceMatches = [&](const Rc<DxvkImageView>& view) {
-      const auto& imageInfo = view->image()->info();
-      const auto& viewInfo = view->info();
-      uint32_t aliasingWidth = RtxOptions::Aliasing::width();
-      uint32_t aliasingHeight = RtxOptions::Aliasing::height();
-
-      // Adjust dimensions if the aliasing extent type is DownScaledExtent or TargetExtent
-      if (RtxOptions::Aliasing::extentType() == RtxTextureExtentType::DownScaledExtent) {
-        aliasingWidth = getResourceManager().getDownscaleDimensions().width;
-        aliasingHeight = getResourceManager().getDownscaleDimensions().height;
-      } else if (RtxOptions::Aliasing::extentType() == RtxTextureExtentType::TargetExtent) {
-        aliasingWidth = getResourceManager().getTargetDimensions().width;
-        aliasingHeight = getResourceManager().getTargetDimensions().height;
-      }
-
-      // Check if the resource's dimensions and format match the aliasing query settings
-      return imageInfo.extent.width == aliasingWidth &&
-              imageInfo.extent.height == aliasingHeight &&
-              imageInfo.extent.depth == RtxOptions::Aliasing::depth() &&
-              imageInfo.numLayers == RtxOptions::Aliasing::layer() &&
-              imageInfo.type == RtxOptions::Aliasing::imageType() &&
-              viewInfo.type == RtxOptions::Aliasing::imageViewType();
-    };
-
-    std::string manualSolveResources;
-    uint32_t matchedIndex = 0;
-
-    bool aliasingMatchFound = false;
-    const auto category = RtxOptions::Aliasing::formatCategory();
-    if (category == RtxTextureFormatCompatibilityCategory::InvalidFormatCompatibilityCategory) {
-      // If the format category is invalid, no aliasing can be done
-      Resources::s_resourceAliasingQueryText = "Please select aliasing compatible texture format.";
-      return;
-    }
-
-    // Map category to index for cache lookup
-    const uint32_t index = static_cast<uint32_t>(category);
-
-    // Loop through the resource cache table for the corresponding format category
-    for (auto& compatibleResource : m_resourceCacheTable[index]) {
-      // Check if the resource is compatible with the aliasing query (based on pass stages and matching criteria)
-      if ((endPass < compatibleResource.beginPassStage || beginPass > compatibleResource.endPassStage ||
-            (beginPass != endPass && compatibleResource.beginPassStage != compatibleResource.endPassStage &&
-            (endPass == compatibleResource.beginPassStage || beginPass == compatibleResource.endPassStage))) &&
-          (isResourceMatches(compatibleResource.view))) {
-
-        // Loop through names of matching resources and prepare result string
-        for (const auto& name : compatibleResource.names) {
-          if (Resources::s_dynamicAliasingResourcesSet.find(compatibleResource.view.ptr()) == Resources::s_dynamicAliasingResourcesSet.end()) {
-            ++matchedIndex;
-            newResourceAliasingQueryResult += std::to_string(matchedIndex) + ". " + name + "\n";
-            if (matchedIndex > 10) {
-              break; // Limit to 10 results
-            }
-          } else {
-            if (manualSolveResources.empty()) {
-              // Give notification for users who want to do aliasing for dynamic resources
-              manualSolveResources = "[WARNING] Use caution when aliasing dynamic resources. Ensure aliasing is handled every frame in Resources::onFrameBegin.\n";
-            }
-            manualSolveResources += name + "\n";
-          }
-        }
-        aliasingMatchFound = true;
-      }
-    }
-
-    // Set the result of the aliasing query, either showing available resources or a no-match message
-    Resources::s_resourceAliasingQueryText =
-      aliasingMatchFound ? (newResourceAliasingQueryResult + manualSolveResources) : "No available resources that can be aliased, please create a new resource.";
-  }
-
-  void RtxContext::clearResourceAliasingCache() {
-    // Clean up caches
-    for (auto& resourceCaches : m_resourceCacheTable) {
-      resourceCaches.clear();
-    }
-    m_currentPassStage = RtxFramePassStage::FrameEnd;
-  }
-
-  void RtxContext::analyzeResourceAliasing() {
-    // Early exit if the aliasing analyzer option is not enabled
-    if (!Resources::s_startAliasingAnalyzer) {
-      return;
-    }
-
-    // Lambda to check if two image views are compatible for aliasing
-    auto isResourceCompatible = [](const Rc<DxvkImageView>& view, const Rc<DxvkImageView>& matchedView) {
-      const auto& imageInfo = view->image()->info();
-      const auto& matchedImageInfo = matchedView->image()->info();
-      const auto& viewInfo = view->info();
-      return imageInfo.extent == matchedImageInfo.extent &&
-             imageInfo.numLayers == matchedImageInfo.numLayers &&
-             imageInfo.type == matchedImageInfo.type;
-    };
-
-    std::string availableAliasingText;
-
-    // Iterate over all format compatibility categories
-    for (uint32_t index = 0; index < static_cast<uint32_t>(RtxTextureFormatCompatibilityCategory::Count); ++index) {
-      const std::vector<ResourceCache>& cacheList = m_resourceCacheTable[index];
-
-      // Compare each pair of resources within the same format category
-      for (size_t i = 0; i < cacheList.size(); ++i) {
-        for (size_t j = i + 1; j < cacheList.size(); ++j) {
-          // Check for non-overlapping lifetimes (safe for aliasing)
-          if ((cacheList[i].endPassStage < cacheList[j].beginPassStage || cacheList[i].beginPassStage > cacheList[j].endPassStage ||
-               (cacheList[i].beginPassStage != cacheList[i].endPassStage && cacheList[j].beginPassStage != cacheList[j].endPassStage &&
-                (cacheList[i].endPassStage == cacheList[j].beginPassStage || cacheList[i].beginPassStage == cacheList[j].endPassStage))) &&
-              isResourceCompatible(cacheList[i].view, cacheList[j].view)) {
-            // Add the resource names to the output text
-            availableAliasingText += *cacheList[i].names.begin() + " <-> " + *cacheList[j].names.begin() + "\n";
-          }
-        }
-      }
-    }
-
-    // Output the results to the GUI field
-    Resources::s_aliasingAnalyzerResultText = !availableAliasingText.empty() ? availableAliasingText : "Can't find any resources that can be aliased.\n";
-  }
-#endif
 } // namespace dxvk

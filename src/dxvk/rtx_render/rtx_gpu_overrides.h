@@ -37,7 +37,6 @@ namespace dxvk {
   public:
     static constexpr const char* kGraphicsPresetPrefix = "rtx.gpuOverride.graphicsPreset.";
     static constexpr const char* kDlssModePrefix = "rtx.gpuOverride.dlssMode.";
-    static constexpr const char* kRayReconstructionPrefix = "rtx.gpuOverride.rayReconstruction.";
 
     static void registerNamespaces();
 
@@ -61,14 +60,9 @@ namespace dxvk {
     // Each lookup ignores keys without an active value and logs unrecognized values.
     static std::optional<GraphicsPreset> findGraphicsPreset(const std::string& gpuId);
     static std::optional<DLSSProfile> findDlssMode(const std::string& gpuId);
-    static std::optional<bool> findRayReconstruction(const std::string& gpuId);
 
-    // Applies the Ray Reconstruction default and refreshes the cached DLSS mode for the current GPU.
+    // Refreshes the cached DLSS mode for the current GPU.
     static void apply();
-
-    // Writes the current GPU's Ray Reconstruction override to the Derived layer, or withdraws a previous one.
-    // Values set through environment variables take precedence.
-    static void applyRayReconstructionDefault();
 
     // Resolves the current GPU's DLSS mode override; getDlssMode returns the result until the next update.
     static void updateDlssMode();

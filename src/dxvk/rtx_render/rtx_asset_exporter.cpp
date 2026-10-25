@@ -20,7 +20,6 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_asset_exporter.h"
-#include "rtx_types.h"
 #include "rtx_context.h"
 #include "../../util/sync/sync_signal.h"
 #include "../../util/util_threadpool.h"
@@ -104,7 +103,7 @@ namespace dxvk {
     return m_exporterThread;
   }
 
-  void AssetExporter::exportImage(Rc<DxvkContext> ctx, const std::string& filename, Rc<DxvkImage> image, bool thumbnail/* = false*/) {
+  void AssetExporter::exportImage(Rc<DxvkContext> ctx, const std::string& filename, Rc<DxvkImage> image) {
     ScopedCpuProfileZone();
     // NOTE: Should use a mutex here...
     {
@@ -138,23 +137,6 @@ namespace dxvk {
     const gli::format outFormat = (gli::format) dstDesc.format;
     const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(dstDesc.format);
     constexpr VkDeviceSize kReadbackRowAlignment = 4;
-
-    if (thumbnail) {
-      constexpr uint16_t kDefaultExtentSize = 512;
-      uint16_t extentSize = kDefaultExtentSize;
-      // For games with a resolution dimension < 512, we need to make
-      // the thumbnail smaller
-      while ((srcDesc.extent.width < extentSize) ||
-             (srcDesc.extent.height < extentSize)) {
-        extentSize >>= 1;
-      }
-      // Some default parameters for thumbnails
-      dstDesc.extent.width = extentSize;
-      dstDesc.extent.height = extentSize;
-      dstDesc.extent.depth = 1;
-      dstDesc.mipLevels = 1;
-      assert(!gli::is_compressed(outFormat));
-    }
 
     // NOTE: Only non-array textures are fully supported. For array/cube images (e.g. UE3
     // reflection/sky cubemaps captured as a material's primary texture), export layer 0 only -
@@ -190,7 +172,7 @@ namespace dxvk {
       const VkImageSubresourceLayers dstSubresourceLayers = { imageFormatInfo(dstDesc.format)->aspectMask, 0,     0, 1 };
 
       const VkExtent3D srcExtent = srcDesc.extent;
-      const VkExtent3D dstExtent = thumbnail ? dstDesc.extent : image->mipLevelExtent(level);
+      const VkExtent3D dstExtent = image->mipLevelExtent(level);
 
       if (useBlit) {
         DxvkImageCreateInfo desc = dstDesc;
@@ -249,13 +231,7 @@ namespace dxvk {
         pBlitDests[level] = ctx->getDevice()->createImage(desc, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXMaterialTexture, "exportimage blit dest");
       }
 
-      VkOffset3D srcOffset = VkOffset3D { 0,0,0 };
-      if (thumbnail) {
-        // Center the thumbail on the image
-        srcOffset = VkOffset3D { int32_t(srcExtent.width) / 2 - int32_t(dstExtent.width) / 2,
-                                 int32_t(srcExtent.height) / 2 - int32_t(dstExtent.height) / 2,
-                                 0 };
-      }
+      const VkOffset3D srcOffset = VkOffset3D { 0,0,0 };
 
       if (useBlit) {
         VkComponentMapping identityMap = { VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY,VK_COMPONENT_SWIZZLE_IDENTITY };
@@ -371,83 +347,6 @@ namespace dxvk {
     if (!result.valid()) {
       Logger::err(str::format("RTX: Failed to write texture \"", filename, "\".  Coding error, kMaxConcurrentExports, may be too low (currently: ", kMaxConcurrentExports, ")."));
     }
-  }
-
-  void AssetExporter::exportBuffer(Rc<DxvkContext> ctx, const DxvkBufferSlice& buffer, BufferCallback bufferCallback) {
-    ScopedCpuProfileZone();
-    // NOTE: Should use a mutex here...
-    {
-      std::lock_guard lock(m_readbackSignalMutex);
-      if (m_readbackSignal == nullptr) {
-        m_readbackSignal = new sync::Fence(m_signalValue);
-      }
-    }
-
-    m_numExportsInFlight++;
-
-    // We want to retain most of the src image state
-    // NOTE: Some image formats arent well supported by DDS tools, like B8G8R8A8...  So we might want to blit rather than copy for such formats.
-    DxvkBufferCreateInfo desc = buffer.bufferInfo();
-
-    // Modify the state we need for reading on the CPU
-    desc.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    desc.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    desc.access = VK_ACCESS_TRANSFER_WRITE_BIT;
-    desc.size = buffer.length();
-
-    // Make the image where we'll copy the GPU resource to CPU accessible mem
-    Rc<DxvkBuffer> bufferDest = ctx->getDevice()->createBuffer(desc, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, DxvkMemoryStats::Category::RTXBuffer, "Remix Data Export Buffer");
-
-    ctx->copyBuffer(bufferDest, VkDeviceSize { 0 }, buffer.buffer(), buffer.offset(), desc.size);
-
-    ctx->emitMemoryBarrier(0,
-      VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_ACCESS_TRANSFER_WRITE_BIT,
-      VK_PIPELINE_STAGE_HOST_BIT,
-      VK_ACCESS_HOST_READ_BIT);
-
-    // Sync point, before writing to disk, we must wait on GPU
-    const uint64_t syncValue = ++m_signalValue;
-    ctx->signal(m_readbackSignal, syncValue);
-
-    Future<void> result = getExporterThread()->Schedule([this, cDestBuffer = bufferDest, syncValue, bufferCallback] {
-      ScopedCpuProfileZoneN("Export Buffer Finalize");
-      // Stall until the GPU has completed its copy to system memory (GPU->CPU)
-      this->m_readbackSignal->wait(syncValue);
-      bufferCallback(cDestBuffer);
-      m_numExportsInFlight--;
-    });
-
-    if (!result.valid()) {
-      Logger::err(str::format("RTX: Failed to dump buffer.  Coding error, kMaxConcurrentExports, may be too low (currently: ", kMaxConcurrentExports, ")."));
-    }
-  }
-
-  void AssetExporter::generateSceneThumbnail(Rc<DxvkContext> ctx, const std::string& dir, const std::string& filename) {
-    auto& resourceManager = ctx->getCommonObjects()->getResources();
-    auto finalOutput = resourceManager.getRaytracingOutput().m_finalOutput.image(Resources::AccessType::Read);
-
-    env::createDirectory(dir);
-
-    exportImage(ctx, str::format(dir, filename, ".dds"), finalOutput, true);
-  }
-
-  void AssetExporter::bakeSkyProbe(Rc<DxvkContext> ctx, const std::string& dir, const std::string& filename) {
-    auto& resourceManager = ctx->getCommonObjects()->getResources();
-
-    auto skyprobeView = resourceManager.getSkyProbe(ctx);
-
-    const auto skyprobeExt = skyprobeView.image->info().extent;
-    const uint32_t equatorLength = std::min(skyprobeExt.width * 4, 16384u);
-    const VkExtent3D latlongExt { equatorLength, equatorLength / 2, 1 };
-
-    auto latlong = resourceManager.createImageResource(ctx, "sky probe latlong", latlongExt, VK_FORMAT_R16G16B16A16_SFLOAT);
-
-    const auto transform = RtxOptions::zUp() ? RtxImageUtils::LatLongTransform::ZUp2OpenEXR : RtxImageUtils::LatLongTransform::None;
-
-    ctx->getCommonObjects()->metaImageUtils().cubemapToLatLong(ctx, skyprobeView.view, latlong.view, transform);
-
-    dumpImageToFile(ctx, dir, filename, latlong.image);
   }
 
 } // namespace dxvk

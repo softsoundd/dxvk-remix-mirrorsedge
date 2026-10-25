@@ -326,41 +326,6 @@ namespace dxvk::vk {
     VULKAN_FN(vkCmdPipelineBarrier2KHR);
     #endif
 
-    #ifdef VK_EXT_opacity_micromap
-    VULKAN_FN(vkCreateMicromapEXT);
-    VULKAN_FN(vkDestroyMicromapEXT);
-    VULKAN_FN(vkCmdBuildMicromapsEXT);
-    VULKAN_FN(vkGetMicromapBuildSizesEXT);
-    #endif
-
-    #ifdef VK_KHR_acceleration_structure
-    VULKAN_FN(vkCreateAccelerationStructureKHR);
-    VULKAN_FN(vkDestroyAccelerationStructureKHR);
-    VULKAN_FN(vkCmdBuildAccelerationStructuresKHR);
-    VULKAN_FN(vkCmdBuildAccelerationStructuresIndirectKHR);
-    VULKAN_FN(vkBuildAccelerationStructuresKHR);
-    VULKAN_FN(vkCopyAccelerationStructureKHR);
-    VULKAN_FN(vkCopyAccelerationStructureToMemoryKHR);
-    VULKAN_FN(vkCopyMemoryToAccelerationStructureKHR);
-    VULKAN_FN(vkWriteAccelerationStructuresPropertiesKHR);
-    VULKAN_FN(vkCmdCopyAccelerationStructureKHR);
-    VULKAN_FN(vkCmdCopyAccelerationStructureToMemoryKHR);
-    VULKAN_FN(vkCmdCopyMemoryToAccelerationStructureKHR);
-    VULKAN_FN(vkGetAccelerationStructureDeviceAddressKHR);
-    VULKAN_FN(vkCmdWriteAccelerationStructuresPropertiesKHR);
-    VULKAN_FN(vkGetDeviceAccelerationStructureCompatibilityKHR);
-    VULKAN_FN(vkGetAccelerationStructureBuildSizesKHR);
-    #endif
-
-    #ifdef VK_KHR_ray_tracing_pipeline
-    VULKAN_FN(vkCmdTraceRaysKHR);
-    VULKAN_FN(vkCreateRayTracingPipelinesKHR);
-    VULKAN_FN(vkGetRayTracingShaderGroupHandlesKHR);
-    VULKAN_FN(vkGetRayTracingCaptureReplayShaderGroupHandlesKHR);
-    VULKAN_FN(vkCmdTraceRaysIndirectKHR);
-    VULKAN_FN(vkGetRayTracingShaderGroupStackSizeKHR);
-    #endif
-
     #ifdef VK_KHR_create_renderpass2
     VULKAN_FN(vkCreateRenderPass2KHR);
     VULKAN_FN(vkCmdBeginRenderPass2KHR);
@@ -422,14 +387,6 @@ namespace dxvk::vk {
 
     #ifdef VK_EXT_buffer_device_address
     VULKAN_FN(vkGetBufferDeviceAddress);
-    #endif
-
-    #ifdef VK_KHR_deferred_host_operations
-    VULKAN_FN(vkCreateDeferredOperationKHR);
-    VULKAN_FN(vkDeferredOperationJoinKHR);
-    VULKAN_FN(vkDestroyDeferredOperationKHR);
-    VULKAN_FN(vkGetDeferredOperationMaxConcurrencyKHR);
-    VULKAN_FN(vkGetDeferredOperationResultKHR);
     #endif
 
     // NV-DXVK start: Tracy/DLSS-FG Integration

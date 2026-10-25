@@ -26,7 +26,6 @@
 #ifdef NVSDK_NGX_H
 // Now when we have main NGX header we can include the feature headers
 #include <nvsdk_ngx_defs.h>
-#include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 #include <nvsdk_ngx_defs_dlssnr.h>
 #endif
@@ -73,7 +72,6 @@ namespace dxvk {
   class DxvkContext;
 
   class NGXDLSSContext;
-  class NGXRayReconstructionContext;
   class NGXDLFGContext;
   class NGXNeuralRenderingContext;
 
@@ -104,10 +102,6 @@ namespace dxvk {
       return m_dlfgMaxInterpolatedFrames;
     }
 
-    bool supportsRayReconstruction() {
-      return m_supportsRayReconstruction;
-    }
-
     bool supportsDlssNeuralRendering() const {
       return m_supportsDlssNeuralRendering;
     }
@@ -127,7 +121,6 @@ namespace dxvk {
     }
     
     std::unique_ptr<NGXDLSSContext> createDLSSContext();
-    std::unique_ptr<NGXRayReconstructionContext> createRayReconstructionContext();
     std::unique_ptr<NGXDLFGContext> createDLFGContext();
     std::unique_ptr<NGXNeuralRenderingContext> createDlssNeuralRenderingContext();
     
@@ -140,7 +133,6 @@ namespace dxvk {
     bool m_supportsDLSS = false;
     bool m_supportsDLFG = false;
     uint32_t m_dlfgMaxInterpolatedFrames = 0;
-    bool m_supportsRayReconstruction = false;
     bool m_supportsDlssNeuralRendering = false;
     bool m_dlssNeuralRenderingSupportChecked = false;
     bool m_dlssNeuralRenderingDirectLoad = false;
@@ -250,90 +242,6 @@ namespace dxvk {
     Matrix4 m_viewToProjectionMatrix;
   };
 #endif // NVSDK_NGX_DEFS_H
-#ifdef NVSDK_NGX_DEFS_DLSSD_H
-  class NGXRayReconstructionContext final : public NGXFeatureContext {
-  public:
-    struct QuerySettings {
-      uint32_t optimalRenderSize[2];
-      uint32_t minRenderSize[2];
-      uint32_t maxRenderSize[2];
-    };
-
-    struct NGXBuffers {
-      const Resources::Resource* pUnresolvedColor;
-      const Resources::Resource* pResolvedColor;
-      const Resources::Resource* pMotionVectors;
-      const Resources::Resource* pDepth;
-      const Resources::Resource* pDiffuseAlbedo;
-      const Resources::Resource* pSpecularAlbedo;
-      const Resources::Resource* pNormals;
-      const Resources::Resource* pRoughness;
-      const Resources::Resource* pHitDistance;
-      const Resources::Resource* pDisocclusionMask;
-    };
-
-    struct NGXSettings {
-      bool resetAccumulation;
-      float preExposure;
-      float jitterOffset[2];
-      float motionVectorScale[2];
-      float frameTimeMilliseconds;
-    };
-
-    // Query optimal DLSS-RR settings for a given resolution and performance/quality profile.
-    QuerySettings queryOptimalSettings(const uint32_t displaySize[2], NVSDK_NGX_PerfQuality_Value perfQuality) const;
-
-    // initialize DLSS context, throws exception on failure
-    void initialize(
-      Rc<DxvkContext> renderContext,
-      uint32_t maxRenderSize[2],
-      uint32_t displayOutSize[2],
-      bool isContentHDR,
-      bool depthInverted,
-      bool autoExposure,
-      bool sharpening,
-      NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel,
-      NVSDK_NGX_PerfQuality_Value perfQuality = NVSDK_NGX_PerfQuality_Value_MaxPerf);
-
-    /** Release DLSS-RR
-    */
-    void releaseNGXFeature() override;
-
-    /** Checks if DLSS is initialized.
-    */
-    bool isRayReconstructionInitialized() const {
-      return m_initialized && m_featureRayReconstruction != nullptr;
-    }
-
-    /** Evaluate DLSS-RR
-    */
-    bool evaluateRayReconstruction(Rc<DxvkContext> renderContext, const NGXBuffers& buffers, const NGXSettings& settings) const;
-
-    void setWorldToViewMatrix(const Matrix4& worldToView) {
-      m_worldToViewMatrix = worldToView;
-    }
-
-    void setViewToProjectionMatrix(const Matrix4& viewToProjection) {
-      m_viewToProjectionMatrix = viewToProjection;
-    }
-
-  public:
-    // note: ctor is public due to make_unique/unique_ptr, but not intended as public --- use NGXWrapper::createRayReconstructionContext instead
-    explicit NGXRayReconstructionContext(DxvkDevice* device);
-    ~NGXRayReconstructionContext() override;
-
-    NGXRayReconstructionContext(const NGXRayReconstructionContext&)                = delete;
-    NGXRayReconstructionContext(NGXRayReconstructionContext&&) noexcept            = delete;
-    NGXRayReconstructionContext& operator=(const NGXRayReconstructionContext&)     = delete;
-    NGXRayReconstructionContext& operator=(NGXRayReconstructionContext&&) noexcept = delete;
-
-  private:
-    bool m_initialized = false;
-    NVSDK_NGX_Handle* m_featureRayReconstruction = nullptr;
-    Matrix4 m_worldToViewMatrix;
-    Matrix4 m_viewToProjectionMatrix;
-  };
-#endif // NVSDK_NGX_DEFS_DLSSD_H
 #ifdef NVSDK_NGX_DEFS_DLSSG_H
   class NGXDLFGContext final : public NGXFeatureContext {
   public:

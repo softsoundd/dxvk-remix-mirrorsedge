@@ -160,11 +160,8 @@ namespace dxvk {
     case dxvk::DxvkMemoryStats::AppTexture:             return "AppTexture";
     case dxvk::DxvkMemoryStats::RTXReplacementGeometry: return "RTXReplacementGeometry";
     case dxvk::DxvkMemoryStats::RTXBuffer:              return "RTXBuffer";
-    case dxvk::DxvkMemoryStats::RTXAccelerationStructure: return "RTXAccelerationStructure";
-    case dxvk::DxvkMemoryStats::RTXOpacityMicromap:     return "RTXOpacityMicromap";
     case dxvk::DxvkMemoryStats::RTXMaterialTexture:     return "RTXMaterialTexture";
     case dxvk::DxvkMemoryStats::RTXRenderTarget:        return "RTXRenderTarget";
-    case dxvk::DxvkMemoryStats::RTXVertexCapture:       return "RTXVertexCapture";
     default:                                          return "UnknownCategory";
     }
   }

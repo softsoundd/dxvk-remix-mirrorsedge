@@ -4,7 +4,7 @@ This file provides context for AI coding agents working in this repository.
 
 ## Project Overview
 
-dxvk-remix is a fork of DXVK that overhauls the fixed-function D3D9 graphics pipeline for path-traced remastering of classic games.
+dxvk-remix is a fork of DXVK. On this branch (`mirrors-edge-ngx`) the runtime is an NGX passthrough: it presents the game's own rasterised frame and runs DLSS, DLSS Frame Generation, Reflex and Remix post effects on top of it. There is no path tracer.
 
 The top-level runtime is built from the repo root and does **not** support x86 builds. Support for 32-bit games lives in `bridge/`, which contains the 32-bit bridge client plus the 64-bit bridge server/runtime handoff.
 
@@ -124,10 +124,6 @@ Shaders use [Slang](https://github.com/shader-slang/slang) (GLSL-compatible). Al
 | `*.comp.slang` | Compute shaders |
 | `*.vert.slang` | Vertex shaders |
 | `*.frag.slang` | Fragment / pixel shaders |
-| `*.rgen.slang` | Ray generation shaders |
-| `*.rchit.slang` | Ray closest hit shaders |
-| `*.rahit.slang` | Ray any hit shaders |
-| `*.rmiss.slang` | Ray miss shaders |
 
 ### Naming
 
@@ -135,13 +131,12 @@ Files and folders use `lower_snake_case`, named after the primary type or functi
 
 ### Shared C++/Shader Headers
 
-Files in `src/dxvk/shaders/rtx/` with `.h` extension are often shared between C++ and Slang/HLSL via `#ifdef __cplusplus` guards or the `cpu_gpu_compat.h` helpers. Key examples:
-- `rtx/pass/instance_definitions.h` — TLAS instance masks and custom-index encoding
+Files in `src/dxvk/shaders/rtx/` with `.h` extension are often shared between C++ and Slang/HLSL, with `#ifdef __cplusplus` guards where the two need different code. Key examples:
 - `rtx/utility/shader_types.h` — `vec4`, `vec3`, `vec2`, `uint` types compatible in both C++ and Slang
-- `rtx/utility/cpu_gpu_compat.h` — cross-compile compatibility macros and helpers for dual-compile headers
-- `rtx/pass/common_binding_indices.h` — Binding index constants
+- `rtx/pass/ngx_passthrough/ngx_passthrough_args.h` — NGX passthrough constant buffer and push constant structs
+- `rtx/pass/post_fx/post_fx.h` — Post FX constant buffers and binding indices
 
-When modifying shared headers, ensure both C++ and Slang code paths remain consistent. For new dual-compile headers that need shared macros/utilities, include `rtx/utility/cpu_gpu_compat.h` at the top and `rtx/utility/cpu_gpu_compat_undef.h` at the end. GPU struct size/layout constants (e.g. `kSurfaceGPUSize`) must match the actual packed buffer layouts.
+When modifying shared headers, ensure both C++ and Slang code paths remain consistent. GPU struct sizes and layouts must match the actual packed buffer layouts.
 
 ### Slang Conventions
 
@@ -150,7 +145,7 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 - `f16vec3` / `float16_t` for half-precision where appropriate.
 - `BUFFER_ARRAY(bufferName, bufferIndex, elementIndex)` macro for bindless buffer access.
 - `BINDING_INDEX_INVALID` sentinel for missing buffer bindings.
-- Struct properties use getter/setter patterns with bitfield packing (see `surface.h`).
+- Struct properties use getter/setter patterns with bitfield packing (see `geometry_flags.slangh`).
 
 ### C++ GPU Conventions
 
@@ -170,14 +165,11 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 | Path | Description |
 |------|-------------|
 | `src/dxvk/rtx_render/` | Core RTX rendering/runtime code |
-| `src/dxvk/rtx_render/graph/` | Remix graph system and graph components |
 | `src/dxvk/shaders/rtx/` | RTX shader code, shared CPU/GPU headers, and pass entry points |
 | `src/dxvk/imgui/` | ImGui integration and developer UI |
-| `src/usd-plugins/` | USD schema plugins built with the runtime |
 | `src/util/` | Shared utility code |
-| `public/include/` | Public Remix API / SDK headers |
+| `public/include/` | Remix API headers that the bridge compiles against |
 | `bridge/` | 32-bit to 64-bit bridge |
 | `tests/rtx/unit/` | Unit tests |
-| `tests/rtx/apps/` | Small runtime/API test applications |
 | `tests/rtx/dxvk_rt_testing/` | Image/capture regression tests and tooling (private NVIDIA GitLab) |
 | `documentation/` | Project documentation |

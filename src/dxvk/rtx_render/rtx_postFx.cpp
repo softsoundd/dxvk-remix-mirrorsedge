@@ -31,21 +31,18 @@
 #include "rtx/pass/post_fx/post_fx.h"
 
 #include <rtx_shaders/post_fx.h>
-#include <rtx_shaders/post_fx_highlight.h>
 #include <rtx_shaders/post_fx_motion_blur.h>
 #include <rtx_shaders/post_fx_motion_blur_prefilter.h>
 #include <rtx_shaders/post_fx_motion_blur_cine_setup.h>
 #include <rtx_shaders/post_fx_motion_blur_cine_tilemax.h>
 #include <rtx_shaders/post_fx_motion_blur_cine_neighbormax.h>
 #include <rtx_shaders/post_fx_motion_blur_cine_gather.h>
-#include <pxr/base/arch/math.h>
+#include <cmath>
 #include "rtx_imgui.h"
 
 #include "../util/util_global_time.h"
 
 namespace dxvk {
-  std::array<uint8_t, 3> g_customHighlightColor = { 118, 185, 0 };
-
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
     class PostFxShader : public ManagedShader
@@ -159,22 +156,6 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(PostFxMotionBlurCineGatherShader);
-
-    class PostFxHighlightShader : public ManagedShader {
-      SHADER_SOURCE(PostFxHighlightShader, VK_SHADER_STAGE_COMPUTE_BIT, post_fx_highlight)
-
-        PUSH_CONSTANTS(PostFxHighlightingArgs)
-
-        BEGIN_PARAMETER()
-        TEXTURE2D(POST_FX_HIGHLIGHT_INPUT)
-        RW_TEXTURE2D(POST_FX_HIGHLIGHT_OBJECT_PICKING_INPUT)
-        TEXTURE2D(POST_FX_HIGHLIGHT_PRIMARY_LINEAR_VIEW_Z_INPUT)
-        RW_TEXTURE2D(POST_FX_HIGHLIGHT_OUTPUT)
-        STRUCTURED_BUFFER(POST_FX_HIGHLIGHT_VALUES)
-        END_PARAMETER()
-    };
-
-    PREWARM_SHADER_PIPELINE(PostFxHighlightShader);
   }
 
   namespace {
@@ -786,7 +767,6 @@ namespace dxvk {
     }
 
     ScopedGpuProfileZone(ctx, "PostFx Motion Blur");
-    ctx->setFramePassStage(RtxFramePassStage::PostFX);
 
     const Resources::Resource& inOutColorTexture = *inputs.inOutColor;
     const VkExtent3D& inputSize = inOutColorTexture.image->info().extent;
@@ -878,7 +858,6 @@ namespace dxvk {
     }
 
     ScopedGpuProfileZone(ctx, "PostFx Lens Effects");
-    ctx->setFramePassStage(RtxFramePassStage::PostFX);
 
     const Resources::Resource& inOutColorTexture = inOutColor;
     const VkExtent3D& inputSize = inOutColorTexture.image->info().extent;

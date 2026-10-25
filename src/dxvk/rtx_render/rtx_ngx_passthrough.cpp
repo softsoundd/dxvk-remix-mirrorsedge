@@ -58,17 +58,6 @@ namespace ImGui {
 }
 
 namespace dxvk {
-  void RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough() {
-    if (ngxPassthroughMode() && RtxOptions::enableRaytracing()) {
-      RtxOptions::enableRaytracing.setImmediately(false);
-    }
-  }
-
-  void RtxNgxPassthrough::ngxPassthroughModeOnChange(DxvkDevice* device) {
-    (void)device;
-    enforceRaytracingDisabledForPassthrough();
-  }
-
   namespace {
     class NgxPassthroughMvShader : public ManagedShader {
       SHADER_SOURCE(NgxPassthroughMvShader, VK_SHADER_STAGE_COMPUTE_BIT, ngx_passthrough_mv)
@@ -295,27 +284,17 @@ namespace dxvk {
                              ", display ", displayExtent.width, "x", displayExtent.height));
   }
 
-  // Moves a single-sampled depth image into the layout the motion-vector pass samples.
-  // The image includes sampled usage.
-  // A multisampled image is left unchanged.
-
-  static bool promoteNgxDepthLayout(RtxContext* ctx, const Rc<DxvkImage>& sceneDepthImage) {
-    if (sceneDepthImage == nullptr ||
-        sceneDepthImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT ||
-        (sceneDepthImage->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0) {
-      return false;
-    }
-
-    if (sceneDepthImage->info().layout != VK_IMAGE_LAYOUT_GENERAL) {
-      ctx->changeImageLayout(sceneDepthImage, VK_IMAGE_LAYOUT_GENERAL);
-      ONCE(Logger::info("[RTX NGX Passthrough] Promoted the game depth buffer to a shader-readable layout."));
-    }
-
-    return sceneDepthImage->info().layout == VK_IMAGE_LAYOUT_GENERAL;
+  // D3D9CommonTexture creates single-sampled depth surfaces in the GENERAL layout with sampled
+  // usage so the motion-vector pass can read them; multisampled depth cannot be sampled.
+  static bool isNgxDepthSampleable(const Rc<DxvkImage>& sceneDepthImage) {
+    return sceneDepthImage != nullptr &&
+           sceneDepthImage->info().sampleCount == VK_SAMPLE_COUNT_1_BIT &&
+           (sceneDepthImage->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0 &&
+           sceneDepthImage->info().layout == VK_IMAGE_LAYOUT_GENERAL;
   }
 
   void RtxNgxPassthrough::captureDepthSnapshot(RtxContext* ctx, const Rc<DxvkImage>& sceneDepthImage) {
-    if (!promoteNgxDepthLayout(ctx, sceneDepthImage)) {
+    if (!isNgxDepthSampleable(sceneDepthImage)) {
       return;
     }
 
@@ -811,7 +790,6 @@ namespace dxvk {
 
     // Validate that the live buffer can be sampled; the snapshot (always shader-readable)
     // substitutes as the sole source when it cannot.
-    // A single-sampled depth image created before the mode was enabled is promoted here.
     const char* liveFailureReason = nullptr;
 
     if (sceneDepthImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
@@ -819,9 +797,9 @@ namespace dxvk {
       ONCE(Logger::warn("[RTX NGX Passthrough] The game's depth buffer is multisampled, which cannot be "
                         "resolved for the NGX inputs. Leave rtx.ngxPassthrough.disableGameMsaa enabled so "
                         "multisampling is refused at creation, then restart."));
-    } else if (!promoteNgxDepthLayout(ctx, sceneDepthImage)) {
+    } else if (!isNgxDepthSampleable(sceneDepthImage)) {
       liveFailureReason = "depth not shader-readable";
-      ONCE(Logger::warn("[RTX NGX Passthrough] Game depth buffer cannot be sampled. It was created without shader read usage."));
+      ONCE(Logger::warn("[RTX NGX Passthrough] Game depth buffer cannot be sampled. It was not created shader-readable."));
     }
 
     const bool liveValid = liveFailureReason == nullptr;
@@ -1906,19 +1884,9 @@ namespace dxvk {
     }
 
     // The DLSS indicator reads this texture even when NGX auto-exposure is enabled.
-    // With auto-exposure off, NGX scales the colour by this texture.
-    // The clear holds that texel at 1.
+    // With auto-exposure off, NGX scales the colour by this texture, which holds 1.
     DxvkAutoExposure& autoExposure = m_device->getCommon()->metaAutoExposure();
     autoExposure.createResources(ctx);
-    if (!useAutoExposure && autoExposure.getExposureTexture().image != nullptr) {
-      VkClearColorValue exposureOne = {};
-      exposureOne.float32[0] = exposureOne.float32[1] = exposureOne.float32[2] = exposureOne.float32[3] = 1.0f;
-      VkImageSubresourceRange exposureRange = {};
-      exposureRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      exposureRange.levelCount = 1;
-      exposureRange.layerCount = 1;
-      ctx->clearColorImage(autoExposure.getExposureTexture().image, exposureOne, exposureRange);
-    }
 
     const Resources::Resource& depthInput = m_depthQueue.get();
     const Resources::Resource& motionVectorInput = m_motionVectorQueue.get();

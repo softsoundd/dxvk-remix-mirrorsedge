@@ -24,47 +24,19 @@
 #include "../dxvk_buffer.h"
 #include "../dxvk_image.h"
 #include "../dxvk_sampler.h"
-#include "rtx_types.h"
 #include "vulkan/vulkan_core.h"
 #include "rtx_utils.h"
-#include "rtx/pass/raytrace_args.h"
 #include "rtx_common_object.h"
+#include "rtx/utility/shader_types.h"
 
 namespace dxvk 
 {
   class DxvkContext;
   class DxvkDevice;
-  class SceneManager;
-  class RtxTextureManager;
-  struct FrameBeginContext;
 
-  struct EventHandler {
-    friend struct Resources;
-
-    // Event get called when target or downscaled resolution is changed
-    using ResizeEvent = std::function<void(Rc<DxvkContext>& ctx, const VkExtent3D&)>;
-    // Event get called at the beginning of a frame, used for allocate or release resources
-    using FrameBeginEvent = std::function<void(Rc<DxvkContext>& ctx, const FrameBeginContext&)>;
-
-    EventHandler(ResizeEvent&& onTargetResize, ResizeEvent&& onDownscaleResize, FrameBeginEvent&& onFrameBeginEvent) {
-      if (onTargetResize) {
-        onTargetResolutionResize = std::make_shared<ResizeEvent>(onTargetResize);
-      }
-
-      if (onDownscaleResize) {
-        onDownscaledResolutionResize = std::make_shared<ResizeEvent>(onDownscaleResize);
-      }
-
-      if (onFrameBeginEvent) {
-        onFrameBegin = std::make_shared<FrameBeginEvent>(onFrameBeginEvent);
-      }
-    }
-
-  private:
-    std::shared_ptr<ResizeEvent> onTargetResolutionResize = nullptr;
-    std::shared_ptr<ResizeEvent> onDownscaledResolutionResize = nullptr;
-    std::shared_ptr<FrameBeginEvent> onFrameBegin = nullptr;
-  };
+  // DLFG async compute overlap: max of 2 frames in flight
+  // (set to 1 to serialize graphics and async compute queues)
+  constexpr uint32_t kDLFGMaxGPUFramesInFlight = 2;
 
   struct Resources : public CommonDeviceObject {
     class AliasedResource;
@@ -123,16 +95,7 @@ namespace dxvk
                       const VkImageUsageFlags extraUsageFlags = VK_IMAGE_USAGE_STORAGE_BIT,
                       const VkClearColorValue clearValue = { 0.0f, 0.0f, 0.0f, 0.0f },
                       const uint32_t mipLevels = 1);
-      AliasedResource(const AliasedResource& otherAliasedResource,
-                      Rc<DxvkContext>& ctx,
-                      const VkExtent3D& extent,
-                      const VkFormat format,
-                      const char* name,
-                      const uint32_t numLayers = 1,
-                      const VkImageType imageType = VK_IMAGE_TYPE_2D,
-                      const VkImageViewType imageViewType = VK_IMAGE_VIEW_TYPE_2D);
 
-      AliasedResource(const AliasedResource& other, const char* name = nullptr);
       AliasedResource(AliasedResource& other) = delete;   // Prevent shallow copy
       AliasedResource& operator=(AliasedResource&& other);
 
@@ -245,194 +208,9 @@ namespace dxvk
       bool advanced = false;
     };
 
-    struct RaytracingOutput {
-      // Note: resources are called 'shared' if they are written by both Primary and Secondary (PSR) passes
-      Resource m_sharedFlags;
-      Resource m_sharedRadianceRG;
-      Resource m_sharedRadianceB;
-      AliasedResource m_sharedIntegrationSurfacePdf;
-      Resource m_sharedMaterialData0;
-      Resource m_sharedMaterialData1;
-      Resource m_sharedMediumMaterialIndex;
-      AliasedResource m_sharedBiasCurrentColorMask;
-      AliasedResource m_sharedSurfaceIndex;
-      Resource m_sharedSubsurfaceData;
-      Resource m_sharedSubsurfaceDiffusionProfileData;
-      // Terminator offset image is written by Primary and overwritten by a single chosen Secondary pass -- so it's shared,
-      // as a terminator fix not that visible if we have both reflections/refractions, so we can omit it in one of them.
-      Resource m_sharedTerminatorFix[2];
-
-      Resource m_primaryAttenuation;
-      Resource m_primaryWorldShadingNormal;
-      Resource m_primaryPerceptualRoughness;
-      Resource m_primaryLinearViewZ;
-      ResourceQueue m_primaryDepthQueue;
-      Resource m_primaryDepth;  // points at a resource from m_primaryDepthQueue
-      Resource m_primaryAlbedo;
-      AliasedResource m_primaryBaseReflectivity;
-      AliasedResource m_primarySpecularAlbedo;
-      AliasedResource m_primaryVirtualMotionVector;
-      ResourceQueue m_primaryScreenSpaceMotionVectorQueue;
-      Resource m_primaryScreenSpaceMotionVector;
-
-      // Cinematic motion blur intermediates. The two tile textures are sized for the
-      // smallest supported tile so that changing the blur radius never reallocates; larger
-      // tiles simply dispatch into a sub-rect.
-      Resource m_motionBlurCineVelocityDepth;
-      Resource m_motionBlurCineCurvature;
-      Resource m_motionBlurCineTileMaxX;
-      Resource m_motionBlurCineTileMax;
-      Resource m_motionBlurCineNeighborMax;
-      Resource m_primaryVirtualWorldShadingNormalPerceptualRoughness;
-      AliasedResource m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising;
-      Resource m_primaryHitDistance;
-      Resource m_primaryViewDirection;
-      Resource m_primaryConeRadius;
-      AliasedResource m_primaryWorldPositionWorldTriangleNormal[2];
-      Resource m_primaryPositionError;
-      AliasedResource m_primaryRtxdiIlluminance[2];
-      AliasedResource m_primaryRtxdiTemporalPosition;
-      Resource m_primarySurfaceFlags;
-      Resource m_primaryDisocclusionThresholdMix;
-      AliasedResource m_primaryDisocclusionMaskForRR;
-      Resource m_primaryObjectPicking;
-
-      Resource m_secondaryAttenuation;
-      Resource m_secondaryWorldShadingNormal;
-      AliasedResource m_secondaryPerceptualRoughness;
-      Resource m_secondaryLinearViewZ;
-      Resource m_secondaryAlbedo;
-      AliasedResource m_secondaryBaseReflectivity;
-      AliasedResource m_secondarySpecularAlbedo;
-      AliasedResource m_secondaryVirtualMotionVector;
-      Resource m_secondaryVirtualWorldShadingNormalPerceptualRoughness;
-      Resource m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising;
-      Resource m_secondaryHitDistance;
-      // Signed length of the indirect integrator's first bounce; negative means it reached the sky.
-      Resource m_indirectReflectionSegment;
-      AliasedResource m_secondaryViewDirection;
-      AliasedResource m_secondaryConeRadius;
-      AliasedResource m_secondaryWorldPositionWorldTriangleNormal;
-      AliasedResource m_secondaryPositionError;
-      Resource m_alphaBlendGBuffer;
-      AliasedResource m_alphaBlendRadiance;
-
-      // Resource containing 1spp radiance from indirect pass - with each pixel containing {diffuse | specular} for a {primary | secondary} surface
-      AliasedResource m_indirectRadianceHitDistance;
-      AliasedResource m_rayReconstructionHitDistance;
-      Resource m_sparseRenderingActivePixelMask;
-      Resource m_sparseRenderingPixelSamplingRate;
-      Resource m_sparseRenderingActiveLocalPixelCoords;
-
-      AliasedResource m_primaryDirectDiffuseRadiance;
-      AliasedResource m_primaryDirectSpecularRadiance;
-      AliasedResource m_primaryIndirectDiffuseRadiance;
-      AliasedResource m_primaryIndirectSpecularRadiance;
-      AliasedResource m_secondaryCombinedDiffuseRadiance;
-      AliasedResource m_secondaryCombinedSpecularRadiance;
-
-      AliasedResource m_indirectRayOriginDirection;
-      AliasedResource m_indirectThroughputConeRadius;
-      AliasedResource m_indirectFirstSampledLobeData;
-      AliasedResource m_indirectFirstHitPerceptualRoughness;
-
-      AliasedResource m_gbufferPSRData[7];
-
-      // DLSSRR data
-      AliasedResource m_primaryDepthDLSSRR;
-      AliasedResource m_primaryWorldShadingNormalDLSSRR;
-      Resource m_primaryScreenSpaceMotionVectorDLSSRR;
-
-      // DLSSNR Data
-      AliasedResource m_neuralRenderingOutput;
-      Resource m_controlMask;
-      AliasedResource m_neuralRenderingInput;
-
-      Resource m_bsdfFactor;
-
-      VkExtent3D m_compositeOutputExtent;
-      AliasedResource m_compositeOutput;
-
-      VkExtent3D m_finalOutputExtent;
-      AliasedResource m_finalOutput;
-
-      AliasedResource m_postFxIntermediateTexture;
-
-      Resource m_gbufferLast;
-      Resource m_reprojectionConfidence;
-      Resource m_rtxdiGradients;
-      AliasedResource m_rtxdiConfidence[2];
-      AliasedResource m_rtxdiBestLights;
-
-      AliasedResource m_primarySurfaceFlagsIntermediateTexture1;
-      AliasedResource m_primarySurfaceFlagsIntermediateTexture2;
-
-      Rc<DxvkBuffer> m_rtxdiReservoirBuffer;
-
-      Rc<DxvkBuffer> m_neeCache;
-      Rc<DxvkBuffer> m_neeCacheTask;
-      Rc<DxvkBuffer> m_neeCacheSample;
-      Resource m_neeCacheThreadTask;
-
-      Resource m_sharedTextureCoord;
-    
-      Rc<DxvkBuffer> m_gpuPrintBuffer;
-
-      Rc<DxvkBuffer> m_samplerFeedbackDevice;
-      Rc<DxvkBuffer> m_samplerFeedbackReadback[kMaxFramesInFlight];
-
-      RaytraceArgs m_raytraceArgs;
-
-      bool isReady() const { return m_primaryLinearViewZ.image != nullptr; }
-      void onFrameEnd() { m_swapTextures = !m_swapTextures; }
-
-      const AliasedResource& getCurrentRtxdiIlluminance() const { return m_primaryRtxdiIlluminance[m_swapTextures]; }
-      const AliasedResource& getPreviousRtxdiIlluminance() const { return m_primaryRtxdiIlluminance[!m_swapTextures]; }
-      const AliasedResource& getCurrentRtxdiConfidence() const { return m_rtxdiConfidence[m_swapTextures]; }
-      const AliasedResource& getPreviousRtxdiConfidence() const { return m_rtxdiConfidence[!m_swapTextures]; }
-      const AliasedResource& getCurrentPrimaryWorldPositionWorldTriangleNormal() const { return m_primaryWorldPositionWorldTriangleNormal[m_swapTextures]; }
-      const AliasedResource& getPreviousPrimaryWorldPositionWorldTriangleNormal() const { return m_primaryWorldPositionWorldTriangleNormal[!m_swapTextures]; }
-      const Resource& getCurrentSharedTerminatorFix() const { return m_sharedTerminatorFix[m_swapTextures]; }
-      const Resource& getPreviousSharedTerminatorFix() const { return m_sharedTerminatorFix[!m_swapTextures]; }
-
-    private:
-      bool m_swapTextures = false;
-    };
-
     explicit Resources(DxvkDevice* device);
 
-    void addEventHandler(const EventHandler& events) {
-      // NOTE: Implicit conversion to weak ptr
-      if (events.onTargetResolutionResize) {
-        m_onTargetResize.push_back(events.onTargetResolutionResize);
-      }
-
-      if (events.onDownscaledResolutionResize) {
-        m_onDownscaleResize.push_back(events.onDownscaledResolutionResize);
-      }
-
-      if (events.onFrameBegin) {
-        m_onFrameBegin.push_back(events.onFrameBegin);
-      }
-    }
-
-    // Message function called at the beginning of the frame, usually allocate or release resources based on each pass's status
-    void onFrameBegin(Rc<DxvkContext> ctx, RtxTextureManager& textureManager, const SceneManager& sceneManager, const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent, bool resetHistory, bool isCameraCut);
-
-    // Message function called when target or downscaled resolution is changed
-    void onResize(Rc<DxvkContext> ctx, const VkExtent3D& downscaledExtents, const VkExtent3D& upscaledExtents);
-
-    bool validateRaytracingOutput(const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent) const;
-
-    Resources::RaytracingOutput& getRaytracingOutput() { return m_raytracingOutput; }
-
-    Rc<DxvkBuffer> getConstantsBuffer();
     Rc<DxvkImageView> getBlueNoiseTexture(Rc<DxvkContext> ctx);
-    Rc<DxvkImageView> getValueNoiseLut(Rc<DxvkContext> ctx);
-    Rc<DxvkImageView> getWhiteTexture(Rc<DxvkContext> ctx);
-    Resources::Resource getSkyProbe(Rc<DxvkContext> ctx, VkFormat format = VK_FORMAT_UNDEFINED);
-    Resources::Resource getSkyMatte(Rc<DxvkContext> ctx, VkFormat format = VK_FORMAT_UNDEFINED);
-    Rc<DxvkImageView> getCompatibleViewForView(const Rc<DxvkImageView>& view, VkFormat format);
 
     Rc<DxvkSampler> getSampler(const VkFilter filter, const VkSamplerMipmapMode mipFilter,
                                const VkSamplerAddressMode addressModeU,
@@ -443,36 +221,7 @@ namespace dxvk
     Rc<DxvkSampler> getSampler(const VkFilter filter, const VkSamplerMipmapMode mipFilter, 
                                const VkSamplerAddressMode addrMode, 
                                const float mipBias = 0, const bool useAnisotropy = false);
-    
-    // XeSS: Get sampler with automatic XeSS-specific mip bias calculation
-    Rc<DxvkSampler> getSamplerWithXeSSMipBias(const VkFilter filter, const VkSamplerMipmapMode mipFilter,
-                                               const VkSamplerAddressMode addressModeU,
-                                               const VkSamplerAddressMode addressModeV,
-                                               const VkSamplerAddressMode addressModeW,
-                                               const VkClearColorValue borderColor = VkClearColorValue(),
-                                               const float additionalMipBias = 0, const bool useAnisotropy = false);
-    Rc<DxvkSampler> getSamplerWithXeSSMipBias(const VkFilter filter, const VkSamplerMipmapMode mipFilter, 
-                                               const VkSamplerAddressMode addrMode, 
-                                               const float additionalMipBias = 0, const bool useAnisotropy = false);
 
-    Tlas& getTLAS(Tlas::Type type) { return m_tlas[type]; }
-
-    void createConstantsBuffer();
-    void createBlueNoiseTexture(Rc<DxvkContext> ctx);
-    void createValueNoiseLut(Rc<DxvkContext> ctx);
-
-    float getUpscaleRatio() const { return m_raytracingOutput.isReady() ? ((float)m_downscaledExtent.width / m_targetExtent.width) : 1.0f; }
-
-    bool isResourceReady() const { return m_raytracingOutput.isReady(); }
-
-    const VkExtent3D& getTargetDimensions() const { return m_targetExtent; }
-    const VkExtent3D& getDownscaleDimensions() const { return m_downscaledExtent; }
-    bool areNrdDenoisingGuideResourcesAllocated() const { return m_nrdDenoisingGuideResourcesAllocated; }
-    bool needsNrdDenoisingGuideResources() const;
-    void createNrdDenoisingGuideResources(Rc<DxvkContext>& ctx);
-
-    static RtxTextureFormatCompatibilityCategory getFormatCompatibilityCategory(const VkFormat format);
-    static bool areFormatsCompatible(const VkFormat format1, const VkFormat format2);
     static Rc<DxvkImageView> createImageView(Rc<DxvkContext>& ctx, const Rc<DxvkImage>& image, const VkFormat format,
                                              const uint32_t numLayers, const VkImageViewType imageViewType, 
                                              const VkImageUsageFlags extraUsageFlags = VK_IMAGE_USAGE_STORAGE_BIT, const uint32_t mipLevels = 1);
@@ -482,62 +231,19 @@ namespace dxvk
                                         const VkImageCreateFlags imageCreateFlags = 0, const VkImageUsageFlags extraUsageFlags = VK_IMAGE_USAGE_STORAGE_BIT,
                                         const VkClearColorValue clearValue = { 0.0f, 0.0f, 0.0f, 0.0f }, const uint32_t mipLevels = 1);
 
-#ifdef REMIX_DEVELOPMENT
-    static std::unordered_map<const DxvkImageView*, std::string> s_resourcesViewMap;
-    static std::unordered_set<const DxvkImageView*> s_dynamicAliasingResourcesSet;
-    static bool s_queryAliasing;
-    static std::string s_resourceAliasingQueryText;
-    static bool s_startAliasingAnalyzer;
-    static std::string s_aliasingAnalyzerResultText;
-#endif
-
   private:
     Resources(Resources const&) = delete;
     Resources& operator=(Resources const&) = delete;
 
-    RaytracingOutput m_raytracingOutput;
+    void createBlueNoiseTexture(Rc<DxvkContext> ctx);
 
-    Rc<DxvkBuffer> m_constants;
     Rc<DxvkImage> m_blueNoiseTex;
     Rc<DxvkImageView> m_blueNoiseTexView;
-    Rc<DxvkImage> m_valueNoiseLut;
-    Rc<DxvkImageView> m_valueNoiseLutView;
-    Rc<DxvkImage> m_whiteTex;
-    Rc<DxvkImageView> m_whiteTexView;
-
-    Resources::Resource m_skyProbe;
-    Resources::Resource m_skyMatte;
 
     fast_unordered_cache<Rc<DxvkSampler>> m_samplerCache;
-    fast_unordered_cache<std::pair<Rc<DxvkImageView>, uint32_t>> m_viewCache;
-
-    Tlas m_tlas[Tlas::Type::Count];
-
-    VkExtent3D m_downscaledExtent = { 0, 0, 0 };
-    bool m_nrdDenoisingGuideResourcesAllocated = false;
-    bool m_dlssNeuralRenderingResourcesAllocated = false;
-    VkExtent3D m_targetExtent = { 0, 0, 0 };
-
-    using ResizeEventList = std::vector<std::weak_ptr<EventHandler::ResizeEvent>>;
-    using FrameBeginEventList = std::vector<std::weak_ptr<EventHandler::FrameBeginEvent>>;
-    ResizeEventList m_onTargetResize;
-    ResizeEventList m_onDownscaleResize;
-    FrameBeginEventList m_onFrameBegin;
-
-    static void executeResizeEventList(ResizeEventList& eventList, Rc<DxvkContext>& ctx, const VkExtent3D& extent);
-    static void executeFrameBeginEventList(FrameBeginEventList& eventList, Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx);
-
-    void createRaytracingOutput(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent, const VkExtent3D& targetExtent);
-
-    void createTargetResources(Rc<DxvkContext>& ctx);
-
-    void createNeuralRenderingOutput(Rc<DxvkContext>& ctx);
-    void updateDlssNeuralRenderingResources(Rc<DxvkContext>& ctx);
-
-    void createDownscaledResources(Rc<DxvkContext>& ctx);
   };
 
-  // State passed to RtxPass::onFrameBegin() callbacks
+  // State passed to RtxPass::onFrameBegin()
   struct FrameBeginContext {
     VkExtent3D downscaledExtent;
     VkExtent3D targetExtent;
@@ -548,33 +254,20 @@ namespace dxvk
 
   class RtxPass {
   public:
-    // The constructor will register callback functions to Resources class
-    RtxPass(DxvkDevice* device);
-
     virtual ~RtxPass() = default;
 
-    // In order to avoid potential race condition between imgui and injectRTX() running asynchronously, 
-    // m_isActive is updated using derived class's isEnabled(), which generally keys off of an rtx option, in onFrameBegin() at start of the frame.
-    // This way isActive() can be used to consistently check the pass being active or not during the rest of the frame 
-    // Note: a protected isEnabled() method is used to check ImGUI or other enablement state that converts its result to m_isActive in onFrameBegin()
-    // Note2: externall callers and internal checks for pass being active or not should strictly use isActive() to check pass being active or not
-    //        in order to preserve consistent state during frame on render timeline
+    // m_isActive is updated from the derived class's isEnabled() in onFrameBegin(), so isActive() stays
+    // consistent for the rest of the frame even if ImGUI changes the underlying option in between.
+    // External callers and internal checks should use isActive() rather than isEnabled().
     bool isActive() const { return m_isActive; }
 
   protected:
-    // Event callback functions.
-    // Derived class must call this base class implementation first from its override. 
-    // The function adjusts active state of the pass and thus the override must check isActive()
-    // after calling the base class implementation
+    // Derived classes overriding this must call the base implementation first, then check isActive().
     virtual void onFrameBegin(Rc<DxvkContext>& ctx, const FrameBeginContext& frameBeginCtx);
 
   private:
-    // Event callback functions
-    void onTargetResize(Rc<DxvkContext>& ctx, const VkExtent3D& targetExtent);
-    void onDownscaledResize(Rc<DxvkContext>& ctx, const VkExtent3D& downscaledExtent);
-
     bool m_isActive = false;
-    EventHandler m_events;
+
   protected:
     // Interface to determine whether a pass is enabled
     // Note: this state updates m_isActive state at onFrameBegin() time
@@ -584,8 +277,6 @@ namespace dxvk
     // onActivation returns whether it succeeded.
     // When this function should fail, the derived class implementation needs to make any 
     // runtime adjustments to ensure valid runtime state from this point onwards. 
-    // Note: it should not enable any other RtxPasses since it is not guaranteed their onFrameBegin() callback 
-    // would be called within the same frame
     virtual bool onActivation(Rc<DxvkContext>& /* unused */) { return true; }
     virtual void onDeactivation() { }
 
@@ -597,4 +288,3 @@ namespace dxvk
   };
 
 } // namespace dxvk
-

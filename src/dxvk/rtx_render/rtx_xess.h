@@ -57,7 +57,6 @@ namespace dxvk {
       RTX_OPTION("rtx.xess", bool, useRecommendedJitterSequenceLength, true, "Use XeSS 2.1 recommended jitter sequence length calculation based on scaling factor. When disabled, uses the global cameraJitterSequenceLength setting.");
       RTX_OPTION("rtx.xess", float, responsivePixelMaskClampValue, 0.8f, "Maximum value to clamp responsive pixel mask to. XeSS 2.1 default is 0.8 to prevent aliasing artifacts.");
       RTX_OPTION("rtx.xess", float, scalingJitterDamping, 0.6f, "Additional jitter damping factor to reduce swimming artifacts. Lower values = less jitter.");
-      RTX_OPTION("rtx.xess", bool, logJitterSequenceLength, false, "Log the current jitter sequence length being used for XeSS. Useful for debugging swimming artifacts.");
       RTX_OPTION("rtx.xess", uint32_t, minJitterSequenceLength, 8, "Minimum jitter sequence length for XeSS, even at low scaling factors.");
     };
 
@@ -71,12 +70,6 @@ namespace dxvk {
     void initialize(Rc<DxvkContext> renderContext, const VkExtent3D& targetExtent);
 
     VkExtent3D getInputSize(const VkExtent3D& targetExtent) const;
-    
-    void dispatch(
-      Rc<DxvkContext> renderContext,
-      DxvkBarrierSet& barriers,
-      const Resources::RaytracingOutput& rtOutput,
-      bool resetHistory);
 
     void dispatch(
       Rc<DxvkContext> renderContext,
@@ -98,8 +91,7 @@ namespace dxvk {
     // ScreenPercentage mapping for NGX passthrough (hardcoded factors; matches calcUpscaleFactor fallback).
     static float calcScreenPercentageForPreset(XeSSPreset preset);
 
-    // Activates the RtxPass without running the full path-traced Resources::onFrameBegin()
-    // (which assumes raytracing output resources exist and will crash in NGX passthrough).
+    // Updates the RtxPass activation state for the frame; the extents are used if this activates it.
     void beginPassthroughFrame(Rc<DxvkContext>& ctx,
                                const VkExtent3D& renderExtent,
                                const VkExtent3D& displayExtent,
@@ -145,7 +137,7 @@ namespace dxvk {
 #else
 
     // Constructor with device
-    DxvkXeSS(DxvkDevice* device) : RtxPass(device), CommonDeviceObject(device) {
+    DxvkXeSS(DxvkDevice* device) : CommonDeviceObject(device) {
     }
 
     void initialize(Rc<DxvkContext> renderContext, const VkExtent3D& targetExtent) {
@@ -158,7 +150,10 @@ namespace dxvk {
     void dispatch(
       Rc<DxvkContext> renderContext,
       DxvkBarrierSet& barriers,
-      const Resources::RaytracingOutput& rtOutput,
+      const Resources::Resource& colorInput,
+      const Resources::Resource& motionVectors,
+      const Resources::Resource& depth,
+      const Resources::Resource& output,
       bool resetHistory) {
     }
 

@@ -817,28 +817,6 @@ namespace dxvk {
       m_vkd->vkCmdSetViewport(m_execBuffer,
         firstViewport, viewportCount, viewports);
     }
-    
-    void cmdTraceRaysKHR(
-        const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
-        const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
-        const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
-        const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable,
-        uint32_t                               width,
-        uint32_t                               height,
-        uint32_t                               depth) {
-        m_vkd->vkCmdTraceRaysKHR(m_execBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
-    }
-
-    // NV-DXVK start: Indirect ray dispatch support
-    void cmdTraceRaysIndirectKHR(
-        const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
-        const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
-        const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
-        const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable,
-        VkDeviceAddress                        indirectDeviceAddress) {
-        m_vkd->vkCmdTraceRaysIndirectKHR(m_execBuffer, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
-    }
-    // NV-DXVK end
 
     void cmdWriteTimestamp(
             VkPipelineStageFlagBits pipelineStage,
@@ -853,63 +831,11 @@ namespace dxvk {
         m_vkd->vkCmdPipelineBarrier2KHR(m_execBuffer, pDependencyInfo);
     }
 
-    void vkCmdBuildMicromapsEXT(
-        uint32_t                      infoCount,
-        const VkMicromapBuildInfoEXT* pInfos) {
-        m_vkd->vkCmdBuildMicromapsEXT(m_execBuffer, infoCount, pInfos);
-    }
-
-    void vkCmdBuildAccelerationStructuresKHR(
-        uint32_t                                    infoCount,
-        const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-        const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
-    {
-        m_vkd->vkCmdBuildAccelerationStructuresKHR(m_execBuffer, infoCount, pInfos, ppBuildRangeInfos);
-    }
-
-    void vkCmdBuildAccelerationStructuresIndirectKHR(
-        uint32_t                                    infoCount,
-        const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-        const VkDeviceAddress* pIndirectDeviceAddresses,
-        const uint32_t* pIndirectStrides,
-        const uint32_t* const* ppMaxPrimitiveCounts)
-    {
-        m_vkd->vkCmdBuildAccelerationStructuresIndirectKHR(m_execBuffer, infoCount, pInfos, pIndirectDeviceAddresses, pIndirectStrides, ppMaxPrimitiveCounts);
-    }
-
     // NV-DXVK start: Integrate Aftermath
     void vkCmdSetCheckpointNV(const void* pCheckpointMarker) {
       m_vkd->vkCmdSetCheckpointNV(m_execBuffer, pCheckpointMarker);
     }
     // NV-DXVK end
-
-    void vkCmdCopyAccelerationStructureKHR(
-        const VkCopyAccelerationStructureInfoKHR* pInfo)
-    {
-        m_vkd->vkCmdCopyAccelerationStructureKHR(m_execBuffer, pInfo);
-    }
-
-    void vkCmdCopyAccelerationStructureToMemoryKHR(
-        const VkCopyAccelerationStructureToMemoryInfoKHR* pInfo)
-    {
-        m_vkd->vkCmdCopyAccelerationStructureToMemoryKHR(m_execBuffer, pInfo);
-    }
-
-    void vkCmdCopyMemoryToAccelerationStructureKHR(
-        const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo)
-    {
-        m_vkd->vkCmdCopyMemoryToAccelerationStructureKHR(m_execBuffer, pInfo);
-    }
-
-    void vkCmdWriteAccelerationStructuresPropertiesKHR(
-        uint32_t                                    accelerationStructureCount,
-        const VkAccelerationStructureKHR* pAccelerationStructures,
-        VkQueryType                                 queryType,
-        VkQueryPool                                 queryPool,
-        uint32_t                                    firstQuery)
-    {
-        m_vkd->vkCmdWriteAccelerationStructuresPropertiesKHR(m_execBuffer, accelerationStructureCount, pAccelerationStructures, queryType, queryPool, firstQuery);
-    }
     
     void cmdBeginDebugUtilsLabel(VkDebugUtilsLabelEXT *pLabelInfo);
 

@@ -3,9 +3,7 @@
 # that are not managed by the version control system (external/)
 # and third-party submodules (submodules/).
 #
-# NOTE: NVAPI, Reflex, DLSS, DLFG, NRD, NRC and XeSS are configured
-# directly in the root meson.build, as they carry Windows-on-Arm (dxvk_is_woa)
-# specific handling that selects between x64 and arm64 binaries.
+# NOTE: Reflex is configured in the root meson.build and XeSS in src/dxvk/meson.build.
 
 # ============================================================================
 # Sentry Crash Reporting
@@ -89,46 +87,6 @@ remix_sentry_environment = get_option('remix_sentry_environment')
 if remix_sentry_environment != ''
   add_global_arguments('/DREMIX_SENTRY_ENVIRONMENT="' + remix_sentry_environment + '"', language : 'cpp')
 endif
-
-# ============================================================================
-# USD (Universal Scene Description)
-# ============================================================================
-if get_option('buildtype') == 'debug'
-  usd_debug_or_release = 'Debug'
-else
-  usd_debug_or_release = 'Release'
-endif
-
-if dxvk_is_woa
-  usd_debug_release_dir = 'external/usd_stock_arm64/' + usd_debug_or_release + '/'
-else
-  usd_debug_release_dir = 'external/usd_stock_x64/' + usd_debug_or_release + '/'
-endif
-
-usd_lib_path = join_paths(global_src_root_norm, usd_debug_release_dir)
-
-# NOTE newer versions of meson prefer relative paths for include directories.
-# Prefix with ../ since these paths are resolved relative to this subdir.
-nv_usd_include_path = include_directories(join_paths('..', usd_debug_release_dir, 'include'))
-
-usd_include_paths = [nv_usd_include_path]
-
-# ============================================================================
-# RTX IO
-# ============================================================================
-# rtxio_bin_path / rtxio_lib / rtxio_include_path are configured in the root meson.build
-# (they carry Windows-on-Arm specific handling); we only expose the dependency object here.
-if enable_rtxio == true
-  rtxio_dep = declare_dependency(
-    dependencies : [ rtxio_lib ],
-    include_directories : rtxio_include_path
-  )
-endif
-
-# ============================================================================
-# Materials and Shaders
-# ============================================================================
-mdl_include_dir = include_directories('../external/omni_core_materials')
 
 # ============================================================================
 # Aftermath

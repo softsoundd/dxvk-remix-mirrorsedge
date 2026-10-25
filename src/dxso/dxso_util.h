@@ -49,9 +49,6 @@ namespace dxvk {
     VSClipPlanes     = 3,
     VSFixedFunction  = 4,
     VSVertexBlendData = 5,
-    // NV-DXVK start: vertex shader data capture implementation
-    VSVertexCaptureData = 6,
-    // NV-DXVK end
     VSCount,
 
     PSConstantBuffer = 0,
@@ -68,11 +65,6 @@ namespace dxvk {
   // TODO: Intergrate into compute resource slot ID/refactor all of this?
   constexpr uint32_t getSWVPBufferSlot() {
     return baseSlotOffset + DxsoConstantBuffers::VSCount + caps::MaxTexturesVS + DxsoConstantBuffers::PSCount + caps::MaxTexturesPS + 1; // From last pixel shader slot, above.
-  }
-
-  constexpr uint32_t getVertexCaptureBufferSlot() {
-    // Note: One after the SWVP Buffer slot as it currently is the last slot in use in this range (following the general constant buffer/image resources).
-    return getSWVPBufferSlot() + 1;
   }
 
   constexpr uint32_t computeResourceSlotId(

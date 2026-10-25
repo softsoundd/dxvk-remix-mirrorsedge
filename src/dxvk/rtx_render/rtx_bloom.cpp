@@ -77,7 +77,7 @@ namespace dxvk {
     PREWARM_SHADER_PIPELINE(CompositeShader);
   }
   
-  DxvkBloom::DxvkBloom(DxvkDevice* device): RtxPass(device), m_vkd(device->vkd()) {
+  DxvkBloom::DxvkBloom(DxvkDevice* device): m_vkd(device->vkd()) {
   }
   
   DxvkBloom::~DxvkBloom()  {
@@ -98,7 +98,6 @@ namespace dxvk {
                            Rc<DxvkSampler> linearSampler,
                            const Resources::Resource& inOutColorBuffer) {
     ScopedGpuProfileZone(ctx, "Bloom");
-    ctx->setFramePassStage(RtxFramePassStage::Bloom);
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 

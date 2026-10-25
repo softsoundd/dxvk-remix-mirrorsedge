@@ -28,14 +28,8 @@
 #include "dxvk_context.h"
 #include "dxvk_device.h"
 #include "rtx_shader_manager.h"
-#include "rtx_texture_manager.h"
-#include "rtx_io.h"
-#include "dxvk_raytracing.h"
-#include "rtx_debug_view.h"
 #include "rtx_taa.h"
 #include "rtx_nis.h"
-#include "rtx_tone_mapping.h"
-#include "rtx_ray_reconstruction.h"
 #include "rtx_ngx_passthrough.h"
 #include "rtx_postFx.h"
 #include "rtx_gpu_overrides.h"
@@ -53,14 +47,7 @@ namespace dxvk {
   void RtxInitializer::initialize() {
     ShaderManager::getInstance()->setDevice(m_device);
 
-#ifdef WITH_RTXIO
-    if (RtxIo::enabled()) {
-      RtxIo::get().initialize(m_device);
-    }
-    // start async before starting asset loading
     DxvkObjects* pCommon = m_device->getCommon();
-    pCommon->getTextureManager().startAsync();
-#endif
 
     const VkPhysicalDeviceProperties& gpuProperties = m_device->adapter()->devicePropertiesExt().core.properties;
     GpuOverrides::setCurrentGpu(gpuProperties.vendorID, gpuProperties.deviceID);
@@ -79,9 +66,6 @@ namespace dxvk {
     // to be disabled if this is changed).
     if (env::getEnvVar("DXVK_TERMINATE_APP_FRAME") == "" ||
         env::getEnvVar("DXVK_GRAPHICS_PRESET_TYPE") != "0") {
-      if (!RtxNgxPassthrough::ngxPassthroughMode()) {
-        RtxOptions::updateUpscalerFromDlssPreset();
-      }
       RtxOptions::updateGraphicsPresets(m_device);
     } else {
       // Default, init to custom unless otherwise specified
@@ -95,16 +79,9 @@ namespace dxvk {
 
     // Sync upscaler presets from rtx.upscalerType at launch (otherwise preset-dependent
     // options are not applied until the Remix UI first opens).
-    if (RtxNgxPassthrough::ngxPassthroughMode()) {
-      RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough();
-      RtxOptions::dlssPreset.setImmediately(DlssPreset::Custom);
-      RtxOptions::updatePresetFromUpscaler();
-      // Enhancements are path-traced replacements. Loading them in passthrough leaves the
-      // mods stuck in OpeningUSD: the frame-end path that finishes the load does not run,
-      // so the "Loading enhancements" indicator never clears.
-      RtxOptions::enableReplacementAssets.setImmediately(false);
-      RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ false);
-    }
+    RtxOptions::dlssPreset.setImmediately(DlssPreset::Custom);
+    RtxOptions::updatePresetFromUpscaler();
+    RtxOptionManager::applyPendingValues(m_device, /* forceOnChange */ false);
 
     // Kick off shader prewarming
     startPrewarmShaders();
@@ -125,9 +102,6 @@ namespace dxvk {
     }
 
     ShaderManager::destroyInstance();
-#ifdef WITH_RTXIO
-    RtxIo::get().release();
-#endif
   }
 
   void RtxInitializer::startPrewarmShaders() {
@@ -156,8 +130,6 @@ namespace dxvk {
     while (m_device->getCommon()->pipelineManager().isCompilingShaders()) {
       Sleep(1);
     }
-
-    DxvkRaytracingPipeline::releaseFinalizer();
 
     m_warmupComplete = true;
   }

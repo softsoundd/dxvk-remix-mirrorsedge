@@ -36,13 +36,13 @@ cd _CompDebugOptimized_x64; meson compile -v
 
 ### Step 2: Deploy to a Game Target
 
-Deploy built artifacts (d3d9.dll, DLSS, NRD, USD libs, etc.) to a game's `.trex` folder:
+Deploy built artifacts (d3d9.dll, the DLSS/DLFG/DLSS-NR, Reflex and XeSS libraries, etc.) to a game's `.trex` folder:
 
 ```powershell
 meson install -C _CompDebugOptimized_x64 --tags <GameTarget> --only-changed
 ```
 
-The tag is the section name from `gametargets.conf` (e.g. `Portal`, `HalfLife2_RTX`). The `--only-changed` flag skips files that haven't changed.
+The tag is the section name from `gametargets.conf` (e.g. `MirrorsEdge`). The `--only-changed` flag skips files that haven't changed.
 
 ### Step 3: Launch the Game
 

@@ -22,6 +22,7 @@
 #pragma once
 
 #include "../dxvk_include.h"
+#include "../dxvk_image.h"
 
 namespace dxvk {
 
@@ -41,6 +42,8 @@ namespace dxvk {
 
     void dispatch(RtxContext* ctx);
 
+  private:
+    Rc<DxvkImageView> m_target;
   };
 #else
   /** Stub when REMIX_DEVELOPMENT is not defined; only needs to be constructible for Active<>. */

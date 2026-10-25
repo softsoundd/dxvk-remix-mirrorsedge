@@ -11,22 +11,11 @@
 #include <iostream>
 #include <numeric>
 #include <sstream>
-#include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
 
 #include <charconv>
 
 namespace dxvk {
-
-  XXH64_hash_t D3D9_COMMON_TEXTURE_DESC::CalculateResolutionAgnosticHash() const {
-    assert(sizeof(D3D9_COMMON_TEXTURE_DESC) == 44);
-
-    D3D9_COMMON_TEXTURE_DESC normalized = *this;
-    const UINT aspectGcd = std::max(1u, std::gcd(Width, Height));
-    normalized.Width = Width / aspectGcd;
-    normalized.Height = Height / aspectGcd;
-    return XXH3_64bits(&normalized, sizeof(normalized));
-  }
 
   D3D9CommonTexture::D3D9CommonTexture(
           D3D9DeviceEx*             pDevice,
@@ -105,19 +94,6 @@ namespace dxvk {
   D3D9CommonTexture::~D3D9CommonTexture() {
     if (m_size != 0)
       m_device->ChangeReportedMemory(m_size);
-
-    // Release this texture from ImGUI 
-    if (m_image != nullptr) {
-      if (m_image->getHash() != kEmptyHash) {
-        ImGUI::ReleaseTexture(m_image->getHash());
-      }
-      if (m_image->getDescriptorHash() != kEmptyHash) {
-        ImGUI::ReleaseTexture(m_image->getDescriptorHash());
-      }
-      if (m_image->getResolutionAgnosticDescriptorHash() != kEmptyHash) {
-        ImGUI::ReleaseTexture(m_image->getResolutionAgnosticDescriptorHash());
-      }
-    }
   }
 
 
@@ -168,7 +144,7 @@ namespace dxvk {
 
     // NV-DXVK start: [NGX passthrough] downgrade rather than fail, for games that create
     // multisampled surfaces without first querying CheckDeviceMultiSampleType
-    if (RtxNgxPassthrough::forceGameMsaaOff() && pDesc->MultiSample != D3DMULTISAMPLE_NONE) {
+    if (RtxNgxPassthrough::disableGameMsaa() && pDesc->MultiSample != D3DMULTISAMPLE_NONE) {
       pDesc->MultiSample        = D3DMULTISAMPLE_NONE;
       pDesc->MultisampleQuality = 0;
     }
@@ -348,8 +324,7 @@ namespace dxvk {
     // NV-DXVK start: [NGX passthrough] game depth buffers are sampled by the motion vector
     // generation pass, which requires a shader-compatible canonical layout (attachment-only
     // depth-stencil surfaces would otherwise settle on DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-    if (RtxNgxPassthrough::ngxPassthroughMode() &&
-        (m_desc.Usage & D3DUSAGE_DEPTHSTENCIL) &&
+    if ((m_desc.Usage & D3DUSAGE_DEPTHSTENCIL) &&
         imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL) {
       imageInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
       imageInfo.stages |= m_device->GetEnabledShaderStages();
@@ -387,14 +362,6 @@ namespace dxvk {
       newHash = XXH3_64bits_withSeed(&renderTargetHashCounter, sizeof(uint32_t), newHash);
       ++renderTargetHashCounter;
       image->setHash(newHash);
-
-      // Generate descriptor hash from the image properties (not including actual pixel data)
-      XXH64_hash_t descriptorHash = m_desc.CalculateHash();
-      XXH64_hash_t resolutionAgnosticDescriptorHash = m_desc.CalculateResolutionAgnosticHash();
-
-      // save hash to dxvkImage
-      image->setDescriptorHash(descriptorHash);
-      image->setResolutionAgnosticDescriptorHash(resolutionAgnosticDescriptorHash);
     }
     return image;
     // NV-DXVK end
@@ -677,55 +644,15 @@ namespace dxvk {
 
     if (IsSrgbCompatible())
       m_sampleView.Srgb = CreateView(AllLayers, Lod, VK_IMAGE_USAGE_SAMPLED_BIT, true);
-
-    if (IsRenderTarget() && !RtxNgxPassthrough::ngxPassthroughMode()) {
-      // Assumption: All image hashes are created before creating sample view. Put assert here to track hash bugs.
-      assert(m_image->getHash() != kEmptyHash);
-      ImGUI::AddTexture(m_image->getHash(), m_sampleView.Color, ImGUI::kTextureFlagsDefault);
-      RegisterRenderTargetDescriptorHashes(m_sampleView.Color);
-    }
   }
 
-
-  // Both render-target identities are offered to the picker: the aspect-normalized hash tags a
-  // target across resolution changes, while the absolute hash keeps every target individually
-  // selectable.
-  void D3D9CommonTexture::RegisterRenderTargetDescriptorHashes(const Rc<DxvkImageView>& pickerView) {
-    if (m_image == nullptr || pickerView == nullptr) {
-      return;
-    }
-
-    const XXH64_hash_t descriptorHash = m_image->getDescriptorHash();
-    if (descriptorHash != kEmptyHash) {
-      ImGUI::AddTexture(descriptorHash, pickerView, ImGUI::kTextureFlagsRenderTarget);
-    }
-
-    const XXH64_hash_t resolutionAgnosticDescriptorHash = m_image->getResolutionAgnosticDescriptorHash();
-    if (resolutionAgnosticDescriptorHash != kEmptyHash &&
-        resolutionAgnosticDescriptorHash != descriptorHash) {
-      ImGUI::AddTexture(resolutionAgnosticDescriptorHash, pickerView, ImGUI::kTextureFlagsRenderTarget);
-    }
-  }
 
   void D3D9CommonTexture::ClearHash() {
     if (m_image == nullptr) {
       return;
     }
 
-    if (m_image->getHash() != kEmptyHash) {
-      ImGUI::ReleaseTexture(m_image->getHash());
-      m_image->setHash(kEmptyHash);
-    }
-
-    if (m_image->getDescriptorHash() != kEmptyHash) {
-      ImGUI::ReleaseTexture(m_image->getDescriptorHash());
-      m_image->setDescriptorHash(kEmptyHash);
-    }
-
-    if (m_image->getResolutionAgnosticDescriptorHash() != kEmptyHash) {
-      ImGUI::ReleaseTexture(m_image->getResolutionAgnosticDescriptorHash());
-      m_image->setResolutionAgnosticDescriptorHash(kEmptyHash);
-    }
+    m_image->setHash(kEmptyHash);
   }
 
 }

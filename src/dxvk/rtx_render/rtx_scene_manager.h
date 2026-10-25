@@ -21,84 +21,13 @@
 */
 #pragma once
 
-#include <mutex>
-#include <optional>
-#include <vector>
-#include <set>
-#include <unordered_set>
-#include <unordered_map>
-#include <variant>
-
-#include "../dxvk_buffer.h"
-#include "../dxvk_image.h"
-#include "../dxvk_staging.h"
-#include "../dxvk_bind_mask.h"
-#include "../util/util_hashtable.h"
-
-#include "rtx_globals.h"
-#include "rtx_retained_buffer_table.h"
-#include "rtx_types.h"
 #include "rtx_common_object.h"
 #include "rtx_camera_manager.h"
-#include "rtx_sparse_unique_cache.h"
-#include "rtx_mod_manager.h"
-#include <d3d9types.h>
 
 namespace dxvk 
 {
 class DxvkContext;
 class DxvkDevice;
-
-// The resource cache can be *searched* by other users
-class ResourceCache {
-public:
-  bool find(const RtSurfaceMaterial& surf, uint32_t& outIdx) const { return m_surfaceMaterialCache.find(surf, outIdx); }
-  const RtSurfaceMaterial& get(const uint32_t index) const { return m_surfaceMaterialCache.getObjectTable()[index]; }
-
-protected:
-  RetainedBufferTable<RaytraceBuffer> m_bufferCache;
-
-  struct SurfaceMaterialHashFn {
-    size_t operator() (const RtSurfaceMaterial& mat) const {
-      return (size_t)mat.getHash();
-    }
-  };
-  SparseUniqueCache<RtSurfaceMaterial, SurfaceMaterialHashFn> m_surfaceMaterialCache;
-  SparseUniqueCache<RtSurfaceMaterial, SurfaceMaterialHashFn> m_surfaceMaterialExtensionCache;
-  fast_unordered_cache<uint32_t> m_preCreationSurfaceMaterialMap;
-
-  struct VolumeMaterialHashFn {
-    size_t operator() (const RtVolumeMaterial& mat) const {
-      return (size_t)mat.getHash();
-    }
-  };
-  SparseUniqueCache<RtVolumeMaterial, VolumeMaterialHashFn> m_volumeMaterialCache;
-
-  struct SamplerHashFn {
-    size_t operator() (const Rc<DxvkSampler>& sampler) const {
-      return (size_t) sampler->hash();
-    }
-  };
-
-  struct SamplerKeyEqual {
-    bool operator()(const Rc<DxvkSampler>& lhs, const Rc<DxvkSampler>& rhs) const {
-      return lhs->info() == rhs->info();
-    }
-  };
-
-  SparseUniqueCache<Rc<DxvkSampler>, SamplerHashFn, SamplerKeyEqual> m_samplerCache;
-};
-
-struct ExternalDrawState {
-  DrawCallState drawCall {};
-  remixapi_MeshHandle mesh {};
-  CameraType::Enum cameraType {};
-  CategoryFlags categories {};
-  bool doubleSided {};
-  std::optional<RtxParticleSystemDesc> optionalParticleDesc {};
-  std::vector<Matrix4> gpuInstancingTransforms {};
-
-};
 
 class SceneManager : public CommonDeviceObject {
 public:
@@ -112,11 +41,6 @@ public:
 
   void clear(Rc<DxvkContext>, bool) {}
 
-  bool hasAnyMods() const { return false; }
-  std::vector<Mod::State> getReplacementStates() const { return {}; }
-
-  RtxGlobals& getGlobals() { return m_globals; }
-
   const CameraManager& getCameraManager() const { return m_cameraManager; }
   CameraManager& getCameraManager() { return m_cameraManager; }
   const RtCamera& getCamera() const { return m_cameraManager.getMainCamera(); }
@@ -125,7 +49,6 @@ public:
   void onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame);
 
 private:
-  RtxGlobals m_globals;
   CameraManager m_cameraManager;
 };
 

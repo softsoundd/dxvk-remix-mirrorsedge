@@ -87,8 +87,7 @@ namespace dxvk {
 
   // Constructor with device
   DxvkXeSS::DxvkXeSS(DxvkDevice* device) 
-    : RtxPass(device),
-      CommonDeviceObject(device),
+    : CommonDeviceObject(device),
       m_initialized(false),
       m_xessContext(nullptr),
       m_targetExtent{0, 0, 0},
@@ -446,20 +445,6 @@ namespace dxvk {
   void DxvkXeSS::dispatch(
     Rc<DxvkContext> renderContext,
     DxvkBarrierSet& barriers,
-    const Resources::RaytracingOutput& rtOutput,
-    bool resetHistory) {
-    dispatch(renderContext,
-             barriers,
-             rtOutput.m_compositeOutput.resource(Resources::AccessType::Read),
-             rtOutput.m_primaryScreenSpaceMotionVector,
-             rtOutput.m_primaryDepth,
-             rtOutput.m_finalOutput.resource(Resources::AccessType::Write),
-             resetHistory);
-  }
-
-  void DxvkXeSS::dispatch(
-    Rc<DxvkContext> renderContext,
-    DxvkBarrierSet& barriers,
     const Resources::Resource& colorInput,
     const Resources::Resource& motionVectors,
     const Resources::Resource& depth,
@@ -526,7 +511,7 @@ namespace dxvk {
 
     auto& autoExposure = device()->getCommon()->metaAutoExposure();
     Resources::Resource exposureResource = {};
-    if (autoExposure.enabled() && autoExposure.getExposureTexture().image != nullptr) {
+    if (autoExposure.getExposureTexture().image != nullptr) {
       exposureResource = autoExposure.getExposureTexture();
       inputResources[3] = &exposureResource;
     }

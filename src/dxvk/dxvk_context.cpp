@@ -112,9 +112,6 @@ namespace dxvk {
       DxvkContextFlag::CpDirtyPipeline,
       DxvkContextFlag::CpDirtyPipelineState,
       DxvkContextFlag::CpDirtyResources,
-      DxvkContextFlag::RpDirtyPipeline,
-      DxvkContextFlag::RpDirtyPipelineState,
-      DxvkContextFlag::RpDirtyResources,
       DxvkContextFlag::DirtyDrawBuffer);
   }
 
@@ -261,14 +258,12 @@ namespace dxvk {
     if (likely(needsUpdate)) {
       m_flags.set(
         DxvkContextFlag::CpDirtyResources,
-        DxvkContextFlag::GpDirtyResources,
-        DxvkContextFlag::RpDirtyResources);
+        DxvkContextFlag::GpDirtyResources);
     }
     else {
       m_flags.set(
         DxvkContextFlag::CpDirtyDescriptorBinding,
-        DxvkContextFlag::GpDirtyDescriptorBinding,
-        DxvkContextFlag::RpDirtyDescriptorBinding);
+        DxvkContextFlag::GpDirtyDescriptorBinding);
     }
 
     m_rc[slot].bufferSlice = buffer;
@@ -289,14 +284,12 @@ namespace dxvk {
     if (likely(needsUpdate)) {
       m_flags.set(
         DxvkContextFlag::CpDirtyResources,
-        DxvkContextFlag::GpDirtyResources,
-        DxvkContextFlag::RpDirtyResources);
+        DxvkContextFlag::GpDirtyResources);
     }
     else {
       m_flags.set(
         DxvkContextFlag::CpDirtyDescriptorBinding,
-        DxvkContextFlag::GpDirtyDescriptorBinding,
-        DxvkContextFlag::RpDirtyDescriptorBinding);
+        DxvkContextFlag::GpDirtyDescriptorBinding);
     }
 
     m_rc[slot].bufferSlice = std::move(buffer);
@@ -317,8 +310,7 @@ namespace dxvk {
 
     m_flags.set(
       DxvkContextFlag::CpDirtyResources,
-      DxvkContextFlag::GpDirtyResources,
-      DxvkContextFlag::RpDirtyResources);
+      DxvkContextFlag::GpDirtyResources);
   }
 
 
@@ -336,8 +328,7 @@ namespace dxvk {
 
     m_flags.set(
       DxvkContextFlag::CpDirtyResources,
-      DxvkContextFlag::GpDirtyResources,
-      DxvkContextFlag::RpDirtyResources);
+      DxvkContextFlag::GpDirtyResources);
   }
 
 
@@ -350,8 +341,7 @@ namespace dxvk {
 
     m_flags.set(
       DxvkContextFlag::CpDirtyResources,
-      DxvkContextFlag::GpDirtyResources,
-      DxvkContextFlag::RpDirtyResources);
+      DxvkContextFlag::GpDirtyResources);
   }
 
 
@@ -364,44 +354,8 @@ namespace dxvk {
 
     m_flags.set(
       DxvkContextFlag::CpDirtyResources,
-      DxvkContextFlag::GpDirtyResources,
-      DxvkContextFlag::RpDirtyResources);
+      DxvkContextFlag::GpDirtyResources);
   }
-
-
-  // NV-DXVK start: adding support for AS
-  void DxvkContext::bindAccelerationStructure(
-    uint32_t              slot,
-    const Rc<DxvkAccelStructure> accelStructure) {
-    ScopedCpuProfileZone();
-    m_rc[slot].accelStructure = accelStructure;
-    m_rc[slot].tlas = accelStructure != nullptr
-      ? accelStructure->getAccelStructure()
-      : VK_NULL_HANDLE;
-    m_rcTracked.clr(slot);
-
-    if (accelStructure != nullptr)
-      m_cmd->trackResource<DxvkAccess::Read>(accelStructure);
-
-    m_flags.set(
-      DxvkContextFlag::CpDirtyResources,
-      DxvkContextFlag::GpDirtyResources,
-      DxvkContextFlag::RpDirtyResources);
-  }
-
-
-  void DxvkContext::bindRaytracingPipelineShaders(
-    const DxvkRaytracingPipelineShaders& shaders) {
-    ScopedCpuProfileZone();
-
-    m_state.rp.shaders = shaders;
-
-    m_flags.set(
-      DxvkContextFlag::RpDirtyPipeline,
-      DxvkContextFlag::RpDirtyPipelineState,
-      DxvkContextFlag::RpDirtyResources);
-  }
-  // NV-DXVK end
 
 
   void DxvkContext::bindShader(
@@ -2156,12 +2110,10 @@ namespace dxvk {
       m_flags.set(prevSlice.handle == slice.handle
         ? DxvkContextFlags(
             DxvkContextFlag::GpDirtyDescriptorBinding,
-            DxvkContextFlag::CpDirtyDescriptorBinding, 
-            DxvkContextFlag::RpDirtyDescriptorBinding)
+            DxvkContextFlag::CpDirtyDescriptorBinding)
         : DxvkContextFlags(
             DxvkContextFlag::GpDirtyResources,
-            DxvkContextFlag::CpDirtyResources, 
-            DxvkContextFlag::RpDirtyResources));
+            DxvkContextFlag::CpDirtyResources));
     }
 
     // Fast early-out for uniform buffers, very common
@@ -2172,8 +2124,7 @@ namespace dxvk {
       | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT
       | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
       m_flags.set(DxvkContextFlag::GpDirtyResources,
-        DxvkContextFlag::CpDirtyResources,
-        DxvkContextFlag::RpDirtyResources);
+        DxvkContextFlag::CpDirtyResources);
     }
 
     if (usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT)
@@ -3102,9 +3053,7 @@ namespace dxvk {
     auto& specConst =
       pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
       ? m_state.gp.state.sc.specConstants[index]
-      : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-        ? m_state.cp.state.sc.specConstants[index]
-        : m_state.rp.state.sc.specConstants[index];
+      : m_state.cp.state.sc.specConstants[index];
 
     if (specConst != value) {
       specConst = value;
@@ -3112,9 +3061,7 @@ namespace dxvk {
       m_flags.set(
         pipeline == VK_PIPELINE_BIND_POINT_GRAPHICS
         ? DxvkContextFlag::GpDirtyPipelineState
-        : pipeline == VK_PIPELINE_BIND_POINT_COMPUTE
-          ? DxvkContextFlag::CpDirtyPipelineState
-          : DxvkContextFlag::RpDirtyPipelineState);
+        : DxvkContextFlag::CpDirtyPipelineState);
     }
   }
 
@@ -4569,7 +4516,6 @@ namespace dxvk {
       m_gfxBarriers.recordCommands(m_cmd);
 
       this->unbindGraphicsPipeline();
-      this->unbindRaytracingPipeline();
     } else if (!suspend) {
       // We may end a previously suspended render pass
       if (m_flags.test(DxvkContextFlag::GpRenderPassSuspended)) {
@@ -4762,49 +4708,6 @@ namespace dxvk {
       return true;
   }
 
-  void DxvkContext::unbindRaytracingPipeline() {
-      m_flags.set(
-          DxvkContextFlag::RpDirtyPipeline,
-          DxvkContextFlag::RpDirtyPipelineState,
-          DxvkContextFlag::RpDirtyResources);
-
-      m_state.rp.pipeline = nullptr;
-      m_rpActivePipeline = VK_NULL_HANDLE;
-  }
-
-
-  bool DxvkContext::updateRaytracingPipeline() {
-    ScopedCpuProfileZone();
-    m_state.rp.pipeline = lookupRaytracingPipeline(m_state.rp.shaders);
-
-    if (unlikely(m_state.rp.pipeline == nullptr))
-      return false;
-
-    if (m_state.rp.pipeline->layout()->pushConstRange().size)
-      m_flags.set(DxvkContextFlag::DirtyPushConstants);
-
-    m_flags.clr(DxvkContextFlag::RpDirtyPipeline);
-    return true;
-  }
-
-
-  bool DxvkContext::updateRaytracingPipelineState() {
-    ScopedCpuProfileZone();
-
-    m_rpActivePipeline = m_state.rp.pipeline->getPipelineHandle();
-
-    if (unlikely(!m_rpActivePipeline))
-      return false;
-
-    m_cmd->cmdBindPipeline(
-      VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
-      m_rpActivePipeline);
-
-    m_flags.clr(DxvkContextFlag::RpDirtyPipelineState);
-
-    return true;
-  }
-
 
   void DxvkContext::unbindGraphicsPipeline() {
     ScopedCpuProfileZone();
@@ -4915,20 +4818,6 @@ namespace dxvk {
 
     m_flags.clr(DxvkContextFlag::CpDirtyResources,
       DxvkContextFlag::CpDirtyDescriptorBinding);
-  }
-
-
-  void DxvkContext::updateRaytracingShaderResources() {
-    ScopedCpuProfileZone();
-    if ((m_flags.test(DxvkContextFlag::RpDirtyResources))
-      || (m_state.rp.pipeline->layout()->hasStaticBufferBindings()))
-      this->updateShaderResources<VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR>(m_state.rp.pipeline->layout());
-
-    this->updateShaderDescriptorSetBinding<VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR>(
-      m_rpSet, m_state.rp.pipeline->layout());
-
-    m_flags.clr(DxvkContextFlag::RpDirtyResources,
-      DxvkContextFlag::RpDirtyDescriptorBinding);
   }
 
 
@@ -5093,29 +4982,6 @@ namespace dxvk {
             descriptors[i].buffer = m_common->dummyResources().bufferDescriptor();
           } break;
 
-       // NV-DXVK start: adding support for AS
-        case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
-          if (res.accelStructure != nullptr && res.tlas != VK_NULL_HANDLE) {
-            descriptors[i].accelerationStructure = res.tlas;
-
-            if (m_rcTracked.set(binding.slot))
-              // Keep the TLAS alive until this command list retires.
-              // When beginRecording starts a new command list, DXVK marks every descriptor slot "dirty"
-              // but leaves the cached resources (m_rc[...]) untouched. The next call to updateShaderResources
-              // therefore re emits whatever was previously stored in the slot including the old TLAS handle and 
-              // Vulkan requires that handle to remain valid until the new command list finishes execution.
-              // Without tracking the accelStructure here the slot only held a raw VkAccelerationStructureKHR, 
-              // so the resource managers Rc<DxvkAccelStructure> was the last owner.
-              // However, when that resource gets reallocated and overwrote that Rc, the object was destroyed immediately, 
-              // yet the command list still queued descriptor updates pointing at it, triggering the validation error
-              m_cmd->trackResource<DxvkAccess::Read>(res.accelStructure);
-
-          } else {
-            bindMask.clr(i);
-            descriptors[i].accelerationStructure = VK_NULL_HANDLE;
-          } break;
-        // NV-DXVK end
-
         default:
           Logger::err(str::format("DxvkContext: Unhandled descriptor type: ", binding.type));
       }
@@ -5125,9 +4991,7 @@ namespace dxvk {
     auto& set = 
       BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS 
       ? m_gpSet 
-      : BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE
-        ? m_cpSet
-        : m_rpSet;
+      : m_cpSet;
 
     if (layout->bindingCount()) {
       // NV-DXVK start: use EXT_debug_utils
@@ -5160,9 +5024,7 @@ namespace dxvk {
     auto& refMask = 
       BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS
       ? m_state.gp.state.bsBindingMask
-      : BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE
-        ? m_state.cp.state.bsBindingMask
-        : m_state.rp.state.bsBindingMask;
+      : m_state.cp.state.bsBindingMask;
 
     // If some resources are not bound, we may need to
     // update spec constants and rebind the pipeline
@@ -5172,9 +5034,7 @@ namespace dxvk {
       m_flags.set(
         BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS
         ? DxvkContextFlag::GpDirtyPipelineState
-        : BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE
-          ? DxvkContextFlag::CpDirtyPipelineState
-          : DxvkContextFlag::RpDirtyPipelineState);
+        : DxvkContextFlag::CpDirtyPipelineState);
     }
   }
 
@@ -5599,9 +5459,7 @@ namespace dxvk {
     auto layout = 
       BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS
       ? m_state.gp.pipeline->layout()
-      : BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE
-        ? m_state.cp.pipeline->layout()
-        : m_state.rp.pipeline->layout();
+      : m_state.cp.pipeline->layout();
 
     if (!layout)
       return;
@@ -5642,32 +5500,6 @@ namespace dxvk {
 
     if (m_flags.test(DxvkContextFlag::DirtyPushConstants))
       this->updatePushConstants<VK_PIPELINE_BIND_POINT_COMPUTE>();
-
-    return true;
-  }
-
-
-  bool DxvkContext::commitRaytracingState() {
-    ScopedCpuProfileZone();
-    this->spillRenderPass(false);
-
-    if (m_flags.test(DxvkContextFlag::RpDirtyPipeline)) {
-      if (unlikely(!this->updateRaytracingPipeline()))
-        return false;
-    }
-
-    if (m_flags.any(
-      DxvkContextFlag::RpDirtyResources,
-      DxvkContextFlag::RpDirtyDescriptorBinding))
-      this->updateRaytracingShaderResources();
-
-    if (m_flags.test(DxvkContextFlag::RpDirtyPipelineState)) {
-      if (unlikely(!this->updateRaytracingPipelineState()))
-        return false;
-    }
-
-    if (m_flags.test(DxvkContextFlag::DirtyPushConstants))
-      this->updatePushConstants<VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR>();
 
     return true;
   }
@@ -5859,39 +5691,6 @@ namespace dxvk {
       }
     }
   }
-
-
-  // NV-DXVK start: Ray tracing init/post barriers
-  void DxvkContext::commitRaytracingInitBarriers() {
-    ScopedCpuProfileZone();
-    auto layout = m_state.rp.pipeline->layout();
-
-    bool requiresBarrier = false;
-
-    for (uint32_t i = 0; i < layout->bindingCount() && !requiresBarrier; i++) {
-      if (m_state.rp.state.bsBindingMask.test(i)) {
-        const DxvkDescriptorSlot binding = layout->binding(i);
-        requiresBarrier = commitInitBarriers(binding, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-      }
-    }
-
-    if (requiresBarrier)
-      m_execBarriers.recordCommands(m_cmd);
-  }
-
-
-  void DxvkContext::commitRaytracingPostBarriers() {
-    ScopedCpuProfileZone();
-    auto layout = m_state.rp.pipeline->layout();
-
-    for (uint32_t i = 0; i < layout->bindingCount(); i++) {
-      if (m_state.rp.state.bsBindingMask.test(i)) {
-        const DxvkDescriptorSlot binding = layout->binding(i);
-        commitPostBarriers(binding, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR);
-      }
-    }
-  }
-  // NV-DXVK end
 
 
   template<bool Indexed, bool Indirect, bool DoEmit>
@@ -6142,70 +5941,6 @@ namespace dxvk {
   }
   // NV-DXVK end
 
-  void DxvkContext::traceRays(uint32_t width, uint32_t height, uint32_t depth) {
-    ScopedCpuProfileZone();
-    if (this->commitRaytracingState()) {
-      this->commitRaytracingInitBarriers();
-
-      m_queryManager.beginQueries(m_cmd,
-        VK_QUERY_TYPE_PIPELINE_STATISTICS);
-
-      m_cmd->cmdTraceRaysKHR(
-        &m_state.rp.pipeline->m_raygenShaderBindingTable,
-        &m_state.rp.pipeline->m_missShaderBindingTable,
-        &m_state.rp.pipeline->m_hitShaderBindingTable,
-        &m_state.rp.pipeline->m_callableShaderBindingTable,
-        width, height, depth);
-
-      m_queryManager.endQueries(m_cmd,
-        VK_QUERY_TYPE_PIPELINE_STATISTICS);
-
-      this->commitRaytracingPostBarriers();
-    }
-
-    m_cmd->addStatCtr(DxvkStatCounter::CmdTraceRaysCalls, 1);
-  }
-
-  // NV-DXVK start: Indirect ray dispatch support
-  void DxvkContext::traceRaysIndirect(const Rc<DxvkBuffer>& argBuffer, VkDeviceSize argOffset) {
-    ScopedCpuProfileZone();
-    auto argSlice = argBuffer->getSliceHandle(argOffset, sizeof(VkTraceRaysIndirectCommandKHR));
-
-    if (m_execBarriers.isBufferDirty(argSlice, DxvkAccess::Read)) {
-      m_execBarriers.recordCommands(m_cmd);
-    }
-
-    if (this->commitRaytracingState()) {
-      this->commitRaytracingInitBarriers();
-
-      m_cmd->trackResource<DxvkAccess::Read>(argBuffer);
-
-      m_queryManager.beginQueries(m_cmd,
-        VK_QUERY_TYPE_PIPELINE_STATISTICS);
-
-      m_cmd->cmdTraceRaysIndirectKHR(
-        &m_state.rp.pipeline->m_raygenShaderBindingTable,
-        &m_state.rp.pipeline->m_missShaderBindingTable,
-        &m_state.rp.pipeline->m_hitShaderBindingTable,
-        &m_state.rp.pipeline->m_callableShaderBindingTable,
-        argBuffer->getDeviceAddress() + argOffset);
-
-      m_queryManager.endQueries(m_cmd,
-        VK_QUERY_TYPE_PIPELINE_STATISTICS);
-
-      this->commitRaytracingPostBarriers();
-
-      m_execBarriers.accessBuffer(argSlice,
-        VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-        argBuffer->info().stages,
-        argBuffer->info().access);
-    }
-
-    m_cmd->addStatCtr(DxvkStatCounter::CmdTraceRaysCalls, 1);
-  }
-  // NV-DXVK end
-
   void DxvkContext::trackDrawBuffer() {
     ScopedCpuProfileZone();
     if (m_flags.test(DxvkContextFlag::DirtyDrawBuffer)) {
@@ -6232,12 +5967,6 @@ namespace dxvk {
     // Don't discard host-visible buffers since that may interfere with the frontend
     if (buffer->memFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
       return false;
-
-    // NV-DXVK start: Don't swap out the backing resource for buffers being used for acceleration
-    // structure builds
-    if (buffer->info().usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
-      return false;
-    // NV-DXVK end
 
     // Suspend the current render pass if transform feedback is active prior to
     // invalidating the buffer, since otherwise we may invalidate a bound buffer.
@@ -6271,21 +6000,6 @@ namespace dxvk {
       m_cpLookupCache[idx] = m_common->pipelineManager().createComputePipeline(shaders);
 
     return m_cpLookupCache[idx];
-  }
-
-
-  DxvkRaytracingPipeline* DxvkContext::lookupRaytracingPipeline(
-    const DxvkRaytracingPipelineShaders& shaders) {
-    ScopedCpuProfileZone();
-
-    auto foundPipeline = m_rpLookupCache.find(shaders.hash());
-    if (unlikely(foundPipeline == m_rpLookupCache.end() || !shaders.eq(foundPipeline->second->shaders()))) {
-      DxvkRaytracingPipeline* pipeline = m_common->pipelineManager().createRaytracingPipeline(shaders);
-      m_rpLookupCache[pipeline->shaders().hash()] = pipeline;
-      return pipeline;
-    }
-
-    return foundPipeline->second;
   }
 
 

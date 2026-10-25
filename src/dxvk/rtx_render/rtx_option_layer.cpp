@@ -21,7 +21,6 @@
 */
 
 #include "rtx_option.h"
-#include "rtx_mod_manager.h"
 #include "../util/util_env.h"
 #include "../util/log/log.h"
 
@@ -68,11 +67,8 @@ namespace {
     static std::atomic<uint64_t> s_nextGeneration { 1 };
     return s_nextGeneration.fetch_add(1, std::memory_order_relaxed);
   }
-}
 
-namespace dxvk {
-
-  std::string ModManager::getBaseGameModPath(std::string baseGameModRegexStr, std::string baseGameModPathRegexStr) {
+  std::string getBaseGameModPath(const std::string& baseGameModRegexStr, const std::string& baseGameModPathRegexStr) {
     std::string commandLine = GetCommandLineA();
     std::smatch match;
     std::string baseGameModPath;
@@ -86,7 +82,9 @@ namespace dxvk {
     }
     return baseGameModPath;
   }
+}
 
+namespace dxvk {
 
   // ============================================================================
   // RtxOptionLayer implementation
@@ -733,7 +731,7 @@ namespace dxvk {
 
     // 4. baseGameMod rtx.conf layer - only if mod path is detected (overrides rtx.conf)
     // s_mergedConfig now contains dxvk.conf + config.cpp + rtx.conf settings
-    const std::string baseGameModPath = ModManager::getBaseGameModPath(
+    const std::string baseGameModPath = getBaseGameModPath(
       s_mergedConfig.getOption<std::string>("rtx.baseGameModRegex", "", ""),
       s_mergedConfig.getOption<std::string>("rtx.baseGameModPathRegex", "", ""));
     

@@ -112,8 +112,6 @@ function PerformBuild {
 
 		[bool]$ShadersOnly = $false,
 
-		[bool]$SkipApics = $false,
-
 		[bool]$WithShim = $false
 	)
 
@@ -132,9 +130,6 @@ function PerformBuild {
 			"--backend", $Backend, "-Denable_tracy=$EnableTracy", $BuildSubDir)
 		if ( $env:BUILD_SENTRY_ENVIRONMENT ) {
 			$mesonArgs += "-Dremix_sentry_environment=$env:BUILD_SENTRY_ENVIRONMENT"
-		}
-		if ( $ShadersOnly -or $SkipApics ) {
-			$mesonArgs += "-Ddownload_apics=False"
 		}
 		$mesonArgs += "-Dremix_with_shim=$($WithShim.ToString().ToLower())"
 		If ( $BuildArch -eq "arm64ec" ) {

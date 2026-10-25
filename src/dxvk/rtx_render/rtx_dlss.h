@@ -23,13 +23,12 @@
 
 #include "../dxvk_include.h"
 #include "rtx_resources.h"
+#include "rtx_option.h"
 #include "dxvk_image.h"
 
 namespace dxvk {
 
   class NGXDLSSContext;
-  class DxvkCommandList;
-  class DxvkBarrierSet;
   class DxvkContext;
 
   enum class DLSSProfile : uint32_t {
@@ -42,15 +41,8 @@ namespace dxvk {
     Invalid
   };
 
-  const char* dlssProfileToString(DLSSProfile dlssProfile);
-
   class DxvkDLSS : public CommonDeviceObject, public RtxPass {
   public:
-    enum class MotionVectorScale : uint32_t {
-      Absolute,   ///< Motion vectors are provided in absolute screen space length (pixels).
-      Relative,   ///< Motion vectors are provided in relative screen space length (pixels divided by screen width/height).
-    };
-
     // Note: Values must match NVSDK_NGX_DLSS_Hint_Render_Preset in nvsdk_ngx_defs.h.
     // Presets A/B/C/D were removed in the SDK, E/F are deprecated, and G/H/I/N/O are unused,
     // so only the valid presets are exposed here. Default lets DLSS pick the best preset per quality mode.
@@ -86,25 +78,8 @@ namespace dxvk {
     bool supportsDLSS() const;
 
     void setSetting(const uint32_t displaySize[2], const DLSSProfile profile, uint32_t outRenderSize[2]);
-    // Gets the profile DLSS is currently using (the actual profile, not the settings-based one
-    // which may be Auto for example).
-    DLSSProfile getCurrentProfile() const;
-    // Gets the input (the potentially lower resolution) size to be provided to DLSS.
-    void getInputSize(uint32_t& width, uint32_t& height) const;
-    // Gets the output (the potentially upscaled higher resolution) size to be provided to DLSS.
-    void getOutputSize(uint32_t& width, uint32_t& height) const;
-
-    void dispatch(
-      Rc<RtxContext> ctx,
-      DxvkBarrierSet& barriers,
-      const Resources::RaytracingOutput& rtOutput,
-      bool resetHistory = false);
-
-    void showImguiSettings();
 
     void onDestroy();
-
-    void release();
 
     RTX_OPTION_ARGS("rtx.dlss", DLSSPreset, preset, DLSSPreset::Default,
                     "Render preset for DLSS Super Resolution. Default = 0 (DLSS picks the best preset), J = 10, K = 11, L = 12, M = 13.",
@@ -115,25 +90,12 @@ namespace dxvk {
 
     static DLSSProfile getAutoProfile(uint32_t displayWidth, uint32_t displayHeight);
 
-    void initializeDLSS(Rc<DxvkContext> pRenderContext);
-
-    bool useDlssAutoExposure() const;
-
-    // Options
-    DLSSProfile                 mProfile = DLSSProfile::Invalid;
     DLSSProfile                 mActualProfile = DLSSProfile::Invalid;
-    MotionVectorScale           mMotionVectorScale = MotionVectorScale::Absolute;
-    bool                        mIsHDR = true;
-    float                       mPreExposure = 1.f;
-    bool                        mAutoExposure = false;
-    bool                        mInverseDepth = false;
 
     bool                        mRecreate = true;
-    DLSSPreset                  m_prevPreset = DLSSPreset::Default;
     uint32_t                    mInputSize[2] = {};            ///< Input size in pixels.
     uint32_t                    mDLSSOutputSize[2] = {};       ///< DLSS output size in pixels.
 
-    bool                        mBiasCurrentColorEnabled = false;
     std::unique_ptr < NGXDLSSContext > m_dlssContext;
   };
 }  // namespace dxvk

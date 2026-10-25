@@ -64,16 +64,11 @@ namespace dxvk {
       float effectiveDeltaMs = 0.0f;
       float realWallDeltaMs = 0.0f;
       float gpuIdleTimeMs = 0.0f;
-      uint32_t surfaceCount = 0;
       uint32_t shaderCompileInflightCount = 0;
-      uint32_t debugViewMode = 0;
-      uint32_t compositeDebugViewMode = 0;
-      bool raytracingEnabled = false;
       bool cameraValid = false;
       bool asyncShaderPrewarming = false;
       bool asyncCompilationEnabled = false;
       bool asyncCompilationActive = false;
-      bool surfaceBufferAvailable = false;
     };
 
     Metrics();
@@ -97,16 +92,11 @@ namespace dxvk {
       float gpuIdleTimeMs = 0.0f;
       uint32_t screenshotTargetFrame = 0;
       uint32_t terminateTargetFrame = 0;
-      uint32_t surfaceCount = 0;
       uint32_t shaderCompileInflightCount = 0;
-      uint32_t debugViewMode = 0;
-      uint32_t compositeDebugViewMode = 0;
-      bool raytracingEnabled = false;
       bool cameraValid = false;
       bool asyncShaderPrewarming = false;
       bool asyncCompilationEnabled = false;
       bool asyncCompilationActive = false;
-      bool surfaceBufferAvailable = false;
     };
 
     inline static const std::string m_metricNames[] = {

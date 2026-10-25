@@ -21,75 +21,23 @@
 */
 #pragma once
 
-#include "dxvk_format.h"
-#include "dxvk_include.h"
 #include "dxvk_context.h"
 #include "rtx_resources.h"
-
-#include "../spirv/spirv_code_buffer.h"
-#include "../util/util_matrix.h"
-#include "rtx_options.h"
 
 namespace dxvk {
 
   class DxvkDevice;
 
+  // Owns the 1x1 exposure texture passed to DLSS and XeSS. It holds 1.0, so it never scales the input.
   class DxvkAutoExposure: public CommonDeviceObject {
   public:
     explicit DxvkAutoExposure(DxvkDevice* device);
-    ~DxvkAutoExposure();
-
-    void dispatch(
-      Rc<DxvkContext> ctx,
-      Rc<DxvkSampler> linearSampler,
-      const Resources::Resource& colorInput,
-      const VkExtent3D& colorExtent,
-      const float frameTimeMilliseconds,
-      bool resetHistory = false);
-
-    void showImguiSettings();
 
     void createResources(Rc<DxvkContext> ctx);
     const Resources::Resource& getExposureTexture() const { return m_exposure; }
 
   private:
-
-    void dispatchAutoExposure(
-      Rc<DxvkContext> ctx,
-      Rc<DxvkSampler> linearSampler,
-      const Resources::Resource& colorInput,
-      const VkExtent3D& colorExtent,
-      const float frameTimeMilliseconds);
-
-    Rc<vk::DeviceFn> m_vkd;
-
     Resources::Resource m_exposure;
-    Resources::Resource m_exposureHistogram;
-    Resources::Resource m_exposureWeightCurve;
-
-    bool m_resetState = true;
-    bool m_isCurveChanged = true;
-
-    enum ExposureAverageMode : uint32_t {
-      Mean = 0,
-      Median
-    };
-
-    RTX_OPTION("rtx.autoExposure", bool, enabled, true, "Automatically adjusts exposure so that the image won't be too bright or too dark.");
-
-    // Exposure Settings
-    RTX_OPTION("rtx.autoExposure", float, autoExposureSpeed, 5.f, "Average exposure changing speed (in units per second) when the image changes.");
-    RTX_OPTION("rtx.autoExposure", float, evMinValue, -2.0f, "Min/Max values tuned by moving from bright/dark locations in game, and adjusting until they look correct.");
-    RTX_OPTION("rtx.autoExposure", float, evMaxValue, 5.f, "Min/Max values tuned by moving from bright/dark locations in game, and adjusting until they look correct.");
-    RTX_OPTION("rtx.autoExposure", bool,  exposureCenterMeteringEnabled, false, "Gives higher weight to pixels around the screen center.");
-    RTX_OPTION("rtx.autoExposure", float, centerMeteringSize, 0.5f, "The importance of pixels around the screen center.");
-    RTX_OPTION("rtx.autoExposure", ExposureAverageMode, exposureAverageMode, ExposureAverageMode::Median, "Average mode. Valid values: <Mean=0, Median=1>. The mean mode averages exposures across pixels. The median mode is more stable for extreme pixel values.");
-    RTX_OPTION("rtx.autoExposure", bool, useExposureCompensation, false, "Uses a curve to determine the importance of different exposure levels when calculating average exposure.");
-    RTX_OPTION("rtx.autoExposure", float, exposureWeightCurve0, 1.f, "Curve control point 0.");
-    RTX_OPTION("rtx.autoExposure", float, exposureWeightCurve1, 1.f, "Curve control point 1.");
-    RTX_OPTION("rtx.autoExposure", float, exposureWeightCurve2, 1.f, "Curve control point 2.");
-    RTX_OPTION("rtx.autoExposure", float, exposureWeightCurve3, 1.f, "Curve control point 3.");
-    RTX_OPTION("rtx.autoExposure", float, exposureWeightCurve4, 1.f, "Curve control point 4.");
   };
   
 }

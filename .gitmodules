@@ -23,16 +23,6 @@
 [submodule "include/vulkan"]
 	path = include/vulkan
 	url = https://github.com/KhronosGroup/Vulkan-Headers
-[submodule "submodules/rtxdi"]
-	path = submodules/rtxdi
-	url = https://github.com/NVIDIA-RTX/RTXDI.git
-	branch = remix
-[submodule "submodules/rtxcr"]
-	path = submodules/rtxcr
-	url = https://github.com/NVIDIA-RTX/RTXCR-Material-Library.git
-[submodule "submodules/nrc"]
-	path = submodules/nrc
-	url = https://github.com/NVIDIAGameWorks/Neural-Radiance-Cache.git
 [submodule "submodules/nvapi/nvapi"]
 	path = submodules/nvapi
 	url = https://github.com/NVIDIA/nvapi.git

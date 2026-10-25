@@ -841,22 +841,16 @@ namespace dxvk {
 
     DxvkObjects* common = m_device->getCommon();
     if (common != nullptr) {
-      const VkExtent3D& internal = common->getResources().getDownscaleDimensions();
-      const VkExtent3D& target = common->getResources().getTargetDimensions();
-      out << "render=" << internal.width << "x" << internal.height
-          << " output=" << target.width << "x" << target.height;
+      const RtxNgxPassthrough& passthrough = common->metaNgxPassthrough();
+      const VkExtent2D& render = passthrough.getRenderExtent();
+      const VkExtent2D& display = passthrough.getDisplayExtent();
+      out << "render=" << render.width << "x" << render.height
+          << " output=" << display.width << "x" << display.height;
     }
 
     out << " | upscaler=" << static_cast<int>(RtxOptions::upscalerType())
         << " dlssProfile=" << static_cast<int>(RtxOptions::qualityDLSS())
-        << " graphicsPreset=" << static_cast<int>(RtxOptions::graphicsPreset())
-        << " integrateIndirectMode=" << static_cast<int>(RtxOptions::integrateIndirectMode())
-        << " pathMaxBounces=" << static_cast<int>(RtxOptions::pathMaxBounces())
-        << " psrMaxDistanceMeters=" << RtxOptions::psrMaxDistanceMeters()
-        << " displacementMode=" << static_cast<int>(RtxOptions::Displacement::mode())
-        << " tonemappingMode=" << static_cast<int>(RtxOptions::tonemappingMode())
-        << " cullBackfacesInShadowGeometries=" << RtxOptions::cullBackfacesInShadowGeometries().size()
-        << " cullBackfacesInShadowTextures=" << RtxOptions::cullBackfacesInShadowTextures().size();
+        << " graphicsPreset=" << static_cast<int>(RtxOptions::graphicsPreset());
 
     return out.str();
   }
@@ -963,7 +957,7 @@ namespace dxvk {
     ImGui::Separator();
     ImGui::TextUnformatted("Automated A/B sweep");
     RemixGui::InputText("Sweep Steps", &sweepStepsObject());
-    RemixGui::SetTooltipToLastWidgetOnHover("Steps separated by ';', assignments within a step by '&', e.g. rtx.volumetrics.enable=False;rtx.bloom.enable=False. "
+    RemixGui::SetTooltipToLastWidgetOnHover("Steps separated by ';', assignments within a step by '&', e.g. rtx.postfx.enableMotionBlur=False;rtx.bloom.enable=False. "
                                             "Each step is held, logged, then restored. Baseline tables are logged before and after.");
     RemixGui::DragFloat("Hold Seconds Per Step", &sweepHoldSecondsObject(), 1.0f, 1.0f, 600.0f, "%.0f", ImGuiSliderFlags_AlwaysClamp);
 

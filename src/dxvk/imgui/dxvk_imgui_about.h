@@ -23,17 +23,12 @@
 
 #include "../../util/rc/util_rc.h"
 #include "../../util/rc/util_rc_ptr.h"
-#include "../../util/xxHash/xxhash.h"
-#include "rtx_render/rtx_asset_replacer.h"
 
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <chrono>
 
 namespace dxvk {
   class DxvkContext;
-  class SecretMeshes;
 
   class ImGuiAbout : public RcObject {
   public:
@@ -41,7 +36,6 @@ namespace dxvk {
     }
     ImGuiAbout(const ImGuiAbout& other) = delete;
     ImGuiAbout(const ImGuiAbout&& other) = delete;
-    void update(const Rc<DxvkContext>& ctx);
     void show(const Rc<DxvkContext>& ctx);
 
   private:
@@ -60,31 +54,5 @@ namespace dxvk {
       };
       const std::vector<Section> m_sections;
     } m_credits;
-
-    class Secrets {
-    public:
-      Secrets() {
-      }
-      Secrets(const Secrets& other) = delete;
-      Secrets(const Secrets&& other) = delete;
-      void update(const Rc<DxvkContext>& ctx);
-      void show(const Rc<DxvkContext>& ctx);
-    private:
-      void showCodeHashEntry();
-      struct Secret {
-        SecretReplacement replacement;
-        bool bEnabled = false;
-        bool bUnlocked = false;
-      };
-      using HeaderToSecrets =
-        std::unordered_map<std::string, std::vector<Secret>>;
-      using HashToSecretPtrs =
-        std::unordered_map<XXH64_hash_t, std::vector<Secret*>>;
-      HeaderToSecrets m_organizedSecrets;
-      HashToSecretPtrs m_codeHashesToSecretPtrs;
-      HashToSecretPtrs m_assetHashesToSecretPtrs;
-      std::unordered_map<std::string,bool> m_visibleHeaders;
-      std::unordered_set<XXH64_hash_t> m_validCodeHashesEntered;
-    } m_secrets;
   };
 }

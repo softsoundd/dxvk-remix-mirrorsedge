@@ -118,7 +118,6 @@ namespace dxvk {
   DxvkBufferHandle DxvkBuffer::allocBuffer(VkDeviceSize sliceCount, DxvkMemoryStats::Category category) const {
     const auto& vkd = m_device->vkd();
 
-    const bool isAccelerationStructure = m_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
     VkBufferCreateInfo info;
     info.sType                 = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.pNext                 = nullptr;
@@ -137,14 +136,9 @@ namespace dxvk {
     // NV-DXVK end
 
 
-    if (!isAccelerationStructure && m_device->features().vulkan12Features.bufferDeviceAddress)
+    if (m_device->features().vulkan12Features.bufferDeviceAddress)
     {
       info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    }
-
-    if (info.usage & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
-    {
-      info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     }
 
     info.sharingMode           = VK_SHARING_MODE_EXCLUSIVE;
@@ -254,12 +248,6 @@ namespace dxvk {
     if (m_info.usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
       result = std::max(result, devInfo.limits.minStorageBufferOffsetAlignment);
 
-    if (m_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
-      result = std::max(result, (VkDeviceSize)m_device->properties().khrDeviceAccelerationStructureProperties.minAccelerationStructureScratchOffsetAlignment);
-
-    if (m_info.usage & VK_BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT_EXT)
-      result = std::max(result, VkDeviceSize(256u)); // https://vulkan.lunarg.com/doc/view/1.4.304.1/windows/antora/spec/latest/chapters/VK_EXT_opacity_micromap/micromaps.html#VUID-vkCmdBuildMicromapsEXT-pInfos-07515
-    
     if (m_info.usage & (VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT)) {
       result = std::max(result, devInfo.limits.minTexelBufferOffsetAlignment);
       result = std::max(result, VkDeviceSize(16));
@@ -371,50 +359,6 @@ namespace dxvk {
       m_views.insert({ m_bufferSlice, m_bufferView });
     }
   }
-  
-  // NV-DXVK start: implement acceleration structures
-  DxvkAccelStructure::DxvkAccelStructure(
-        DxvkDevice* device,
-  const DxvkBufferCreateInfo& createInfo,
-        DxvkMemoryAllocator& memAlloc,
-        VkMemoryPropertyFlags memFlags,
-        VkAccelerationStructureTypeKHR accelType,
-  const char* name)
-    : DxvkBuffer(device, createInfo, memAlloc, memFlags, DxvkMemoryStats::Category::RTXAccelerationStructure, name) {
-
-    VkAccelerationStructureCreateInfoKHR accelCreateInfo {};
-    accelCreateInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-    accelCreateInfo.pNext = nullptr;
-    accelCreateInfo.createFlags = 0;
-    accelCreateInfo.buffer = DxvkBuffer::getBufferRaw();
-    accelCreateInfo.offset = 0;
-    accelCreateInfo.size = createInfo.size;
-    accelCreateInfo.type = accelType;
-
-    if (m_device->vkd()->vkCreateAccelerationStructureKHR(m_device->handle(), &accelCreateInfo, nullptr, &accelStructureRef) != VK_SUCCESS) {
-      throw DxvkError(str::format(
-        "DxvkAccelStructure: Failed to create acceleration structure:"
-        "\n  size:  ", accelCreateInfo.size,
-        "\n  type: ", accelType));
-    }
-  }
-
-  DxvkAccelStructure::~DxvkAccelStructure() {
-    if (accelStructureRef != VK_NULL_HANDLE) {
-      const auto& vkd = m_device->vkd();
-      vkd->vkDestroyAccelerationStructureKHR(m_device->handle(), accelStructureRef, nullptr);
-    }
-  }
-
-  VkDeviceAddress DxvkAccelStructure::getAccelDeviceAddress() const {
-    VkAccelerationStructureDeviceAddressInfoKHR deviceAddressInfo {};
-    deviceAddressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-    deviceAddressInfo.accelerationStructure = accelStructureRef;
-    VkDeviceAddress deviceAddress = m_device->vkd()->vkGetAccelerationStructureDeviceAddressKHR(m_device->handle(), &deviceAddressInfo);
-    deviceAddress += getDynamicOffset(0);
-    return deviceAddress;
-  }
-  // NV-DXVK end
 
   DxvkBufferTracker:: DxvkBufferTracker() { }
   DxvkBufferTracker::~DxvkBufferTracker() { }

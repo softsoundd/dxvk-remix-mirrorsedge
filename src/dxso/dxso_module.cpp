@@ -14,9 +14,7 @@ namespace dxvk {
   DxsoAnalysisInfo DxsoModule::analyze() {
     DxsoAnalysisInfo info;
 
-    // NV-DXVK start: exact vertex capture - analyzer needs the program type
-    DxsoAnalyzer analyzer(m_header.info(), info);
-    // NV-DXVK end
+    DxsoAnalyzer analyzer(info);
 
     // NV-DXVK start: expose CTAB data
     this->runAnalyzer(analyzer, m_code.iter(), m_ctab);
@@ -37,9 +35,6 @@ namespace dxvk {
 
     this->runCompiler(*compiler, m_code.iter());
     m_isgn = compiler->isgn();
-    // NV-DXVK start: expose shader outputs for vertex capture
-    m_osgn = compiler->osgn();
-    // NV-DXVK end
 
     m_meta            = compiler->meta();
     m_constants       = compiler->constants();

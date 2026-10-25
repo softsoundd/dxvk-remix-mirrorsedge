@@ -355,22 +355,6 @@ namespace dxvk {
     XXH64_hash_t getHash() const {
       return m_hash;
     }
-
-    void setDescriptorHash(XXH64_hash_t hash) {
-      m_descriptorHash = hash;
-    }
-    
-    XXH64_hash_t getDescriptorHash() const {
-      return m_descriptorHash;
-    }
-
-    void setResolutionAgnosticDescriptorHash(XXH64_hash_t hash) {
-      m_resolutionAgnosticDescriptorHash = hash;
-    }
-
-    XXH64_hash_t getResolutionAgnosticDescriptorHash() const {
-      return m_resolutionAgnosticDescriptorHash;
-    }
     // NV-DXVK end
 
     VkDeviceMemory getMemory() const {
@@ -407,8 +391,6 @@ namespace dxvk {
     DxvkPhysicalImage     m_image;
     // NV-DXVK start: Hashes to identify textures.
     XXH64_hash_t          m_hash = 0;
-    XXH64_hash_t          m_descriptorHash = 0;
-    XXH64_hash_t          m_resolutionAgnosticDescriptorHash = 0;
     // NV-DXVK end
     bool m_shared = false;
 

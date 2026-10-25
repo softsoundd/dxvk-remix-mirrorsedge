@@ -74,7 +74,6 @@ dxvk_is_ninja = meson.backend() == 'ninja'
 dxvk_is_woa = target_machine.cpu() == 'armv8'
 dxvk_is_woa_ec = target_machine.cpu() == 'arm64ec'
 dxvk_is_x64 = not dxvk_is_woa and not dxvk_is_woa_ec
-enable_rtxio = get_option('enable_rtxio')
 
 external_dll_paths = []
 
@@ -83,16 +82,9 @@ if dxvk_is_msvc
     # sse2neon requires conformant preproc
     add_global_arguments('/Zc:preprocessor', language : 'cpp')
     add_project_arguments('/DNO_AVX', language : 'cpp')
-
-    # USD 25+ attempts to redefine some POSIX definitions without checking if they are available
-    add_global_arguments('/wd4005', language : 'cpp')
-    # USD 25+ may have inconsistent dll linkage in some function declarations
-    add_global_arguments('/wd4273', language : 'cpp')
   endif
 
   if dxvk_is_woa_ec
-    # Older TBB attempts to redefine some x64 intrinsics which are not available in arm64ec
-    add_global_arguments('/wd4163', language : 'cpp')
     add_project_arguments('/DNO_AVX', language : 'cpp')
   endif
 
@@ -111,11 +103,6 @@ if dxvk_is_msvc and dxvk_is_woa_ec and get_option('buildtype') == 'release'
   dxvk_release_link_args = ['/DEBUG', '/OPT:REF', '/OPT:ICF']
 endif
 
-if enable_rtxio == true
-  add_global_arguments('/DWITH_RTXIO', language : 'cpp')
-  vs_project_defines += 'WITH_RTXIO;'
-endif
-
 if get_option('buildtype') == 'release'
   add_project_arguments('/DNDEBUG', language : 'cpp')
   # note: this define depends on the build type, so it's not included in vs_project_defines
@@ -125,10 +112,6 @@ elif get_option('buildtype') == 'debugoptimized'
 endif
 
 if dxvk_is_ninja
-  # workarounds for our strange symbol name differences when embedding MDL
-  add_global_arguments('/DBUILD_NINJA=1', language : 'cpp')
-  vs_project_defines += 'BUILD_NINJA=1;'
-
   if dxvk_is_woa_ec
     # Meson Ninja backend has no idea of arm64ec
     # https://github.com/mesonbuild/meson/issues/15440
@@ -138,10 +121,6 @@ if dxvk_is_ninja
     # add_global_link_arguments('/machine:arm64ec', language : 'cpp')
     error('Please use the MSVC backend. As of Meson 1.11.0 (4/14/2026) it is not possible to link for arm64ec target with Ninja.')
   endif
-
-else
-  add_global_arguments('/DBUILD_NINJA=0', language : 'cpp')
-  vs_project_defines += 'BUILD_NINJA=0;'
 endif
 
 add_global_arguments('/DBUILD_SOURCE_ROOT="' + global_src_root_norm + '/"', language : 'cpp')
@@ -199,12 +178,6 @@ endif
 
 remix_api_include_path = include_directories('./public/include')
 
-if dxvk_is_woa
-  nrc_include_path = 'external/nrc_arm64/include'
-else
-  nrc_include_path = 'submodules/nrc/include'
-endif
-
 nsight_graphics_capture_supported = (target_machine.cpu_family() == 'x86_64') or dxvk_is_woa_ec
 if nsight_graphics_capture_supported
   add_project_arguments('-DDXVK_ENABLE_NSIGHT_GRAPHICS_CAPTURE=1', language : 'cpp')
@@ -212,8 +185,7 @@ endif
 
 dxvk_include_dirs = [
   './include',
-  './include/vulkan/include',
-  nrc_include_path
+  './include/vulkan/include'
 ]
 
 if nsight_graphics_capture_supported
@@ -299,21 +271,6 @@ if lib_dbghelp.found()
   dxvk_extradep += lib_dbghelp
 endif
 
-if enable_rtxio == true
-  if dxvk_is_woa
-    rtxio_bin_path = join_paths(global_src_root_norm, 'external/rtxio_arm64/bin')
-    rtxio_lib = dxvk_compiler.find_library('rtxio', dirs : join_paths(global_src_root_norm, 'external/rtxio_arm64/lib'))
-    rtxio_include_path = include_directories('external/rtxio_arm64/include')
-  else
-    rtxio_bin_path = join_paths(global_src_root_norm, 'external/rtxio/bin')
-    rtxio_lib = dxvk_compiler.find_library('rtxio', dirs : join_paths(global_src_root_norm, 'external/rtxio/lib'))
-    rtxio_include_path = include_directories('external/rtxio/include')
-  endif
-
-  external_dll_paths += rtxio_bin_path
-  dxvk_extradep += rtxio_lib
-endif
-
 # Shader Compile Tools
 glsl_compiler = find_program('external/glslangvalidator/glslangValidator')
 slang_compiler = find_program('external/slang/slangc')
@@ -352,11 +309,7 @@ rtx_shader_source_directory = join_paths(global_src_root_norm, 'src/dxvk/shaders
 # directory, this is just the best way currently for organizing it into the respective project it is outputting data for.
 rtx_shader_output_directory = join_paths(current_build_dir_norm, 'src/dxvk/rtx_shaders')
 
-rtxcr_include_path = include_directories('submodules/rtxcr/shaders/include')
-rtxcr_include_path_string = join_paths(global_src_root_norm, 'submodules/rtxcr/shaders/include')
-
 submodules_include_path = include_directories('submodules')
-submodules_include_path_string = join_paths(global_src_root_norm, 'submodules')
 
 rtx_shaders_command_arguments = [
   shader_compile_script,
@@ -372,8 +325,6 @@ rtx_shaders_command_arguments = [
   '-spirvval', fs.as_posix(spirv_val.full_path()),
   '-input', rtx_shader_source_directory,
   '-include', shader_directory,
-  '-include', rtxcr_include_path_string,
-  '-include', submodules_include_path_string,
   '-output', rtx_shader_output_directory,
   '-parallel',
 ]
@@ -525,47 +476,9 @@ vk_include_path = include_directories('./include/vulkan/include')
 add_project_arguments('-DVK_ENABLE_BETA_EXTENSIONS', language : 'cpp')
 
 # External dependencies configuration
-# Configures Sentry, USD include/lib paths, MDL includes and the RTX IO dependency.
-# (Reflex, NRD, NRC and XeSS are configured below)
+# Configures Sentry, Aftermath, the DLSS SDKs and NVAPI.
+# (Reflex is configured below)
 subdir('external-build')
-
-# This will be populated by the usd plugin builder
-usd_plugins = []
-usd_plugin_deps = []
-usd_plugin_delay_load_args = []
-
-# Cache lib locations
-external_dll_paths += usd_lib_path
-
-nvusd_deplibs = [
-  'usd_ar',
-  'usd_arch',
-  'usd_js',
-  'usd_gf',
-  'usd_kind',
-  'usd_sdf',
-  'usd_sdr',
-  'usd_pcp',
-  'usd_tf',
-  'usd_trace',
-  'usd_usd',
-  'usd_usdLux',
-  'usd_usdGeom',
-  'usd_usdRender',
-  'usd_usdShade',
-  'usd_usdSkel',
-  'usd_work',
-  'usd_vt',
-  'usd_plug',
-  'usd_ts',
-]
-
-usd_linklibs = []
-foreach ulib : nvusd_deplibs
-  usd_linklibs += dxvk_compiler.find_library(ulib, dirs: join_paths(usd_lib_path, 'lib'))
-endforeach
-
-usd_linklibs += dxvk_compiler.find_library(get_option('buildtype') == 'debug' ? 'tbb12_debug' : 'tbb12', dirs: join_paths(usd_lib_path, 'lib'))
 
 if dxvk_is_woa
   reflex_lib_path = join_paths(global_src_root_norm, 'external/reflex_arm64/lib')
@@ -577,38 +490,14 @@ endif
 external_dll_paths += reflex_lib_path
 reflex_lib = dxvk_compiler.find_library('NvLowLatencyVk', dirs : reflex_lib_path)
 
-nrc_dll_name = 'NRC_Vulkan.dll'
-if dxvk_is_woa
-  nrc_dll_path = join_paths(global_src_root_norm, 'external/nrc_arm64/bin/')
-else
-  nrc_dll_path = join_paths(global_src_root_norm, 'submodules/nrc/bin/')
-endif
-
 xess_dll_path = join_paths(global_src_root_norm, 'submodules/xess/bin/')
 
-nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd/Lib/Release/')
-if get_option('buildtype') == 'debug'
-  nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd/Lib/Debug/')
-endif
-
 # Build meson dependency types
-usd_dep = declare_dependency(
-  dependencies : [ usd_linklibs ],
-  # link_args : ['-L'+usd_lib_path],
-  include_directories : usd_include_paths
-)
-
 reflex_dep = declare_dependency(
   dependencies : [ reflex_lib ],
   include_directories : reflex_include_path
 )
 
-embedded_includes = [ mdl_include_dir ]
-
-embedded_dep = declare_dependency(
-  dependencies : [ ],
-  include_directories : embedded_includes
-)
 subdir('src')
 
 enable_tests = get_option('enable_tests')
@@ -646,29 +535,6 @@ if dxvk_is_ninja or dxvk_is_woa_ec
   fs.read('vsgen/testcase_project.vcxproj.user.template')
   fs.read('vsgen/testcase_project.args.json.template')
   fs.read('vsgen/vsutil.py')
-
-  # meson seems to force / as the path separator in custom_target
-  # ... except in the case where the path separators are inconsistent, in which case it does nothing
-  # force / as the path separator here to make sure it stays consistent
-  if dxvk_is_woa
-    nrc_lib_path = join_paths(global_src_root_norm, 'external/nrc_arm64/Lib/')
-  else
-    nrc_lib_path = join_paths(global_src_root_norm, 'submodules/nrc/Lib/')
-  endif
-
-  if dxvk_is_woa
-    nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd_arm64/Lib/Release/')
-    if get_option('buildtype') == 'debug'
-      nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd_arm64/Lib/Debug/')
-    endif
-  else
-    nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd/Lib/Release/')
-    if get_option('buildtype') == 'debug'
-      nrd_lib_path = join_paths(global_src_root_norm, 'external/nrd/Lib/Debug/')
-    endif
-  endif
-
-  apic_copy_targets = []
 
   vs_gen_cmdline = [ vs_project_defines ]
   # dict of: { <projectname>: { 'output_path': <copy_output_path>, 'target_suffix': <copy_target_suffix>, 'src_exe': <if non-empty, copy exe from this absolute path> } }
@@ -740,39 +606,17 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
     # using tagged install targets to get the files in the right place at install time (each project in VS knows which tag to use)
 
-    install_subdir(join_paths(usd_lib_path, 'lib/usd/'), install_dir : output_path, install_tag: target_suffix)  
-
-
-    foreach ulib : nvusd_deplibs
-      install_data(join_paths(usd_lib_path, 'lib', ulib + '.dll'), install_dir : output_path, install_tag: target_suffix) 
-    endforeach
-
-    install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'), install_dir : output_path, install_tag: target_suffix)
-    install_data(join_paths(usd_lib_path, 'bin', get_option('buildtype') == 'debug' ? 'tbb12_debug.dll' : 'tbb12.dll'), install_dir : output_path, install_tag: target_suffix)
-    # Python DLL not needed for nopy USD build
-    install_data(join_paths(global_src_root_norm, 'src', 'usd-plugins', 'plugInfo.json'), install_dir : join_paths(output_path, 'usd', 'plugins'), install_tag: target_suffix)
-    meson.add_install_script(
-      join_paths(global_src_root_norm, 'scripts-common/install_usd_plugins.bat'),
-      output_path,
-      install_tag: target_suffix 
-    )
-
     if not dxvk_is_woa
       install_data(join_paths(xess_dll_path, 'libxess.dll'), install_dir : output_path, install_tag: target_suffix)
     endif
 
     install_data(join_paths(dlss_bin_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 
-    install_data(join_paths(dlss_bin_path, 'nvngx_dlssd.dll'), install_dir : output_path, install_tag: target_suffix) 
     install_data(join_paths(dlfg_bin_path, 'nvngx_dlssg.dll'), install_dir : output_path, install_tag: target_suffix)
     install_data(join_paths(dlnr_bin_path, 'nvngx_dlssnr.dll'), install_dir : output_path, install_tag: target_suffix)
 
     install_data(join_paths(reflex_lib_path, 'NvLowLatencyVk.dll'), install_dir : output_path, install_tag: target_suffix) 
 
     install_data(aftermath_binary, install_dir : output_path, install_tag: target_suffix)
-
-    if enable_rtxio == true
-      install_data(join_paths(rtxio_bin_path, 'rtxio.dll'), install_dir : output_path, install_tag: target_suffix)
-    endif
 
     # Install Sentry crashpad next to d3d9 when Sentry is enabled (disabled for debug builds)
     if enable_sentry == true

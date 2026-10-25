@@ -40,8 +40,6 @@ namespace dxvk {
 
         void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
-        void dispatch(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput);
-
         void dispatch(Rc<RtxContext> ctx,
                       const Resources::Resource& input,
                       const Resources::Resource& output);

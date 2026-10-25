@@ -31,9 +31,6 @@
 #include "../util/util_sentry.h"
 #include "../util/util_string.h"
 
-// NV-DXVK start: RTXIO
-#include "rtx_render/rtx_io.h"
-// NV-DXVK end:
 // NV-DXVK start: Remix message box utilities
 #include "rtx_render/rtx_env.h"
 // NV-DXVK end:
@@ -345,7 +342,7 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 43> devExtensionList = {{
+    std::array<DxvkExt*, 36> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -372,18 +369,9 @@ namespace dxvk {
       &devExtensions.khrSamplerMirrorClampToEdge,
       &devExtensions.khrShaderFloatControls,
       &devExtensions.khrSwapchain,
-#ifdef _WIN64
-      &devExtensions.khrDeferredHostOperations,
-      &devExtensions.khrAccelerationStructure,
-      &devExtensions.khrRayQueries,
-#endif
-      &devExtensions.khrRayTracingPipeline,
-      &devExtensions.khrPipelineLibrary,
       &devExtensions.khrPushDescriptor,
       &devExtensions.khrShaderInt8Float16Types,
-      &devExtensions.nvRayTracingInvocationReorder,
       &devExtensions.khrSynchronization2,
-      &devExtensions.extOpacityMicromap,
       &devExtensions.nvLowLatency,
       &devExtensions.nvxBinaryImport,
       &devExtensions.nvxImageViewHandle,
@@ -486,12 +474,6 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.shaderInt8 = m_deviceFeatures.vulkan12Features.shaderInt8;
     enabledFeatures.vulkan12Features.shaderFloat16 = m_deviceFeatures.vulkan12Features.shaderFloat16;
     enabledFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess = m_deviceFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess;
-    enabledFeatures.khrAccelerationStructureFeatures.accelerationStructure = m_deviceFeatures.khrAccelerationStructureFeatures.accelerationStructure;
-    enabledFeatures.khrRayQueryFeatures.rayQuery = m_deviceFeatures.khrRayQueryFeatures.rayQuery;
-    enabledFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipeline = m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipeline;
-    // NV-DXVK start: Indirect ray dispatch support
-    enabledFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipelineTraceRaysIndirect = m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.rayTracingPipelineTraceRaysIndirect;
-    // NV-DXVK end
     enabledFeatures.vulkan12Features.scalarBlockLayout = m_deviceFeatures.vulkan12Features.scalarBlockLayout;
     enabledFeatures.vulkan12Features.uniformBufferStandardLayout = m_deviceFeatures.vulkan12Features.uniformBufferStandardLayout;
     
@@ -505,53 +487,15 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.shaderBufferInt64Atomics = m_deviceFeatures.vulkan12Features.shaderBufferInt64Atomics;
     // NV-DXVK end
 
-    // NV-DXVK start: RTXIO
-#ifdef WITH_RTXIO
-    if (RtxIo::enabled()) {
-      // Reset the extension provider to adapter's Vulkan instance first since client app
-      // may have probbed another Vulkan instance in the process and so latched it inside
-      // extension provider singleton.
-      RtxIoExtensionProvider::s_instance.initDeviceExtensions(instance.ptr());
-      if (!RtxIoExtensionProvider::s_instance.getDeviceFeatures(m_handle, enabledFeatures)) {
-        Logger::err("Physical device does not support features required to enable RTX IO.");
-        // NV-DXVK start: Provide error code on exception
-        throw DxvkErrorWithId(REMIXAPI_ERROR_CODE_HRESULT_NO_REQUIRED_GPU_FEATURES, "DxvkAdapter: Failed to create device, device does not support required RTX IO extensions (and RTX IO is enabled).");
-        // NV-DXVK end
-      }
-    }
-#endif
-    // NV-DXVK end:
-
     // Create pNext chain for additional device features
     enabledFeatures.core.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR;
-
-    // NV-DXVK start: RTXIO
-    // Preserve pNext chain from RTXIO
-    std::exchange(enabledFeatures.core.pNext, enabledFeatures.vulkan12Features.pNext);
-    // NV-DXVK end:
+    enabledFeatures.core.pNext = nullptr;
 
     enabledFeatures.vulkan11Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     enabledFeatures.vulkan11Features.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.vulkan11Features);
 
     enabledFeatures.vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     enabledFeatures.vulkan12Features.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.vulkan12Features);
-
-#ifdef _WIN64
-    if (devExtensions.khrAccelerationStructure) {
-      enabledFeatures.khrAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-      enabledFeatures.khrAccelerationStructureFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrAccelerationStructureFeatures);
-    }
-
-    if (devExtensions.khrRayQueries) {
-      enabledFeatures.khrRayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-      enabledFeatures.khrRayQueryFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrRayQueryFeatures);
-    }
-#endif
-
-    if (devExtensions.khrRayTracingPipeline) {
-        enabledFeatures.khrDeviceRayTracingPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-        enabledFeatures.khrDeviceRayTracingPipelineFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrDeviceRayTracingPipelineFeatures);
-    }
 
     if (devExtensions.ext4444Formats) {
       enabledFeatures.ext4444Formats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT;
@@ -616,7 +560,8 @@ namespace dxvk {
     }
     // NV-DXVK end
 
-    // NV-DXVK start: opacity micromap
+    // NV-DXVK start: synchronization2 is unused by the runtime itself, but stays enabled because NGX
+    // feature extension requirements are never queried and DLSS-FG may rely on it.
     if (devExtensions.khrSynchronization2) {
       enabledFeatures.khrSynchronization2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
       enabledFeatures.khrSynchronization2.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrSynchronization2);
@@ -1073,26 +1018,6 @@ namespace dxvk {
       m_deviceInfo.khrShaderFloatControls.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrShaderFloatControls);
     }
 
-    if (m_deviceExtensions.supports(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {
-        m_deviceInfo.khrDeviceRayTracingPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-        m_deviceInfo.khrDeviceRayTracingPipelineProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrDeviceRayTracingPipelineProperties);
-    }
-
-    if (m_deviceExtensions.supports(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
-      m_deviceInfo.khrDeviceAccelerationStructureProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
-      m_deviceInfo.khrDeviceAccelerationStructureProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.khrDeviceAccelerationStructureProperties);
-    }
-
-    if (m_deviceExtensions.supports(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)) {
-      m_deviceInfo.extOpacityMicromapProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
-      m_deviceInfo.extOpacityMicromapProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extOpacityMicromapProperties);
-    }
-
-    if (m_deviceExtensions.supports(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)) {
-      m_deviceInfo.nvRayTracingInvocationReorderProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV;
-      m_deviceInfo.nvRayTracingInvocationReorderProperties.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.nvRayTracingInvocationReorderProperties);
-    }
-
     // Query full device properties for all enabled extensions
     m_vki->vkGetPhysicalDeviceProperties2(m_handle, &m_deviceInfo.core);
     
@@ -1169,21 +1094,6 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME) >= 3) {
       m_deviceFeatures.extVertexAttributeDivisor.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT;
       m_deviceFeatures.extVertexAttributeDivisor.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extVertexAttributeDivisor);
-    }
-
-    if (m_deviceExtensions.supports(VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
-      m_deviceFeatures.khrRayQueryFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
-      m_deviceFeatures.khrRayQueryFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrRayQueryFeatures);
-    }
-
-    if (m_deviceExtensions.supports(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
-      m_deviceFeatures.khrAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
-      m_deviceFeatures.khrAccelerationStructureFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrAccelerationStructureFeatures);
-    }
-
-    if (m_deviceExtensions.supports(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {
-      m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-      m_deviceFeatures.khrDeviceRayTracingPipelineFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrDeviceRayTracingPipelineFeatures);
     }
 
     if (m_deviceExtensions.supports(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {

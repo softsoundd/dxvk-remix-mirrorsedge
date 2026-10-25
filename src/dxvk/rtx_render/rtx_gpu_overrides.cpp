@@ -215,16 +215,7 @@ namespace dxvk {
     return profile;
   }
 
-  std::optional<bool> GpuOverrides::findRayReconstruction(const std::string& gpuId) {
-    const std::optional<std::string> value = findString(kRayReconstructionPrefix, gpuId);
-    if (!value) {
-      return std::nullopt;
-    }
-    return *value == "True";
-  }
-
   void GpuOverrides::apply() {
-    applyRayReconstructionDefault();
     updateDlssMode();
   }
 
@@ -239,10 +230,6 @@ namespace dxvk {
       return std::nullopt;
     }
     return static_cast<DLSSProfile>(profile);
-  }
-
-  void GpuOverrides::applyRayReconstructionDefault() {
-    // This runtime has no rtx.enableRayReconstruction option. The per-GPU key is ignored.
   }
 
   void GpuOverrides::logInvalidEntries() {

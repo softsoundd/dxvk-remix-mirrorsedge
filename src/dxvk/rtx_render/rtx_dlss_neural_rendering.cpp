@@ -87,7 +87,6 @@ namespace dxvk {
       float motionVectorScaleX,
       float motionVectorScaleY) {
     ScopedGpuProfileZone(ctx, "DlssNeuralRendering");
-    ctx->setFramePassStage(RtxFramePassStage::DLSSNR);
 
     if (!isEnabled()) {
       return false;
@@ -141,10 +140,6 @@ namespace dxvk {
           input->imageInfo().layout,
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
           VK_ACCESS_SHADER_READ_BIT);
-
-#ifdef REMIX_DEVELOPMENT
-        ctx->cacheResourceAliasingImageView(input);
-#endif
       }
 
       for (auto output : pOutputs) {
@@ -157,10 +152,6 @@ namespace dxvk {
           output->imageInfo().layout,
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
           VK_ACCESS_SHADER_WRITE_BIT);
-
-#ifdef REMIX_DEVELOPMENT
-        ctx->cacheResourceAliasingImageView(output);
-#endif
       }
 
       barriers.recordCommands(ctx->getCommandList());

@@ -289,7 +289,7 @@ namespace dxvk {
      * \brief Creates a rtx context
      * 
      * Creates a context object that can
-     * be used to record raytracing command buffers.
+     * be used to record Remix command buffers.
      * \returns The context object
      */
     Rc<RtxContext> createRtxContext();
@@ -336,22 +336,6 @@ namespace dxvk {
             // NV-DXVK start: add debug names to VkBuffer objects
             const char* name);
             // NV-DXVK end
-
-     // NV-DXVK start: implement acceleration structures
-    /**
-     * \brief Creates a accel structure object
-     *
-     * \param [in] createInfo Buffer create info
-     * \param [in] memoryType Memory type flags
-     * \param [in] accelType  BLAS/TLAS
-     * \returns The buffer object
-     */
-    Rc<DxvkAccelStructure> createAccelStructure(
-      const DxvkBufferCreateInfo& createInfo,
-            VkMemoryPropertyFlags memoryType,
-            VkAccelerationStructureTypeKHR accelType,
-      const char* name);
-    // NV-DXVK end
 
     /**
      * \brief Creates a buffer view

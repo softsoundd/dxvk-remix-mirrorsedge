@@ -52,7 +52,6 @@ namespace dxvk {
 
   struct AutoPresetDecision {
     GraphicsPreset preset = GraphicsPreset::Low;
-    bool lowMemoryGpu = false;
     bool applyNonNvidiaDefaults = false;
     std::vector<std::string> log;
   };

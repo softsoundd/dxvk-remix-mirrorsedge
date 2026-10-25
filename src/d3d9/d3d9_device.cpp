@@ -75,12 +75,7 @@ namespace dxvk {
           D3DDEVTYPE             DeviceType,
           HWND                   hFocusWindow,
           DWORD                  BehaviorFlags,
-          Rc<DxvkDevice>         dxvkDevice,
-// NV-DXVK start: external API
-          bool                   WithExternalSwapchain,
-          bool                   WithDrawCallConversion,
-          bool                   WithRemixAPI)
-// NV-DXVK end
+          Rc<DxvkDevice>         dxvkDevice)
     : m_parent         ( pParent )
     , m_deviceType     ( DeviceType )
     , m_window         ( hFocusWindow )
@@ -88,9 +83,7 @@ namespace dxvk {
     , m_adapter        ( pAdapter )
     , m_dxvkDevice     ( dxvkDevice )
     , m_shaderModules  ( new D3D9ShaderModuleSet )
-// NV-DXVK start: different default values for d3d9 options
-    , m_d3d9Options    ( dxvkDevice, pParent->GetInstance()->config(), WithRemixAPI )
-// NV-DXVK end
+    , m_d3d9Options    ( dxvkDevice, pParent->GetInstance()->config() )
     , m_multithread    ( BehaviorFlags & D3DCREATE_MULTITHREADED )
     , m_isSWVP         ( (BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) ? true : false )
     , m_csThread       ( dxvkDevice, dxvkDevice->createRtxContext() )
@@ -99,10 +92,7 @@ namespace dxvk {
 // NV-DXVK start: unbound light indices
     , m_state          ( Direct3DState9 { D3D9CapturableState{ static_cast<uint32_t>(std::max(m_d3d9Options.maxEnabledLights, 0)) } } )
 // NV-DXVK end
-    , m_rtx            ( this, WithDrawCallConversion)
-// NV-DXVK start: external API
-    , m_withExternalSwapchain { WithExternalSwapchain } {
-// NV-DXVK end
+    , m_rtx            ( this ) {
     // If we can SWVP, then we use an extended constant set
     // as SWVP has many more slots available than HWVP.
     bool canSWVP = CanSWVP();
@@ -160,10 +150,6 @@ namespace dxvk {
     CreateConstantBuffers();
 
     m_availableMemory = DetermineInitialTextureMemory();
-
-    // NV-DXVK start: Consolidate RTX state
-    m_rtx.Initialize();
-    // NV-DXVK
   }
 
 
@@ -1203,17 +1189,6 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
     }
 
-    // NV-DXVK start: skip scene render target copies while ray tracing (rtx.d3d9.skipRenderTargetCopies)
-    {
-      const bool dstIsBackBuffer = m_implicitSwapchain != nullptr && m_implicitSwapchain->GetBackBuffer(0) == dst;
-      const bool srcIsRenderTarget = (srcTextureInfo->Desc()->Usage & D3DUSAGE_RENDERTARGET) != 0;
-      if (m_rtx.ShouldSkipRenderTargetCopy(srcExtent, srcIsRenderTarget, dstIsBackBuffer)) {
-        m_rtx.NoteRenderTargetCopySkipped();
-        return D3D_OK;
-      }
-    }
-    // NV-DXVK end
-
     auto EmitResolveCS = [&](const Rc<DxvkImage>& resolveDst, bool intermediate) {
       VkImageResolve region;
       region.srcSubresource = blitInfo.srcSubresource;
@@ -1912,10 +1887,6 @@ namespace dxvk {
 
     if (m_state.IsLightEnabled(Index)) {
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
-
-      // NV-DXVK start: implement light support in d3d9 rtx
-      m_rtx.SetDirty(D3D9RtxFlag::DirtyLights);
-      // NV-DXVK end
     }
 
     return D3D_OK;
@@ -1962,10 +1933,6 @@ namespace dxvk {
         idx = setIndex;
         m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
         m_flags.set(D3D9DeviceFlag::DirtyFFVertexShader);
-
-        // NV-DXVK start: implement light support in d3d9 rtx
-        m_rtx.SetDirty(D3D9RtxFlag::DirtyLights);
-        // NV-DXVK end
         break;
       }
     }
@@ -2011,9 +1978,6 @@ namespace dxvk {
     dirty &= enabled;
 
     if (dirty) {
-      // NV-DXVK start: implement clip plane support in d3d9 rtx
-      m_rtx.SetDirty(D3D9RtxFlag::DirtyClipPlanes);
-      // NV-DXVK end
       m_flags.set(D3D9DeviceFlag::DirtyClipPlanes);
     }
 
@@ -2234,10 +2198,6 @@ namespace dxvk {
             m_flags.set(D3D9DeviceFlag::DirtyFFVertexShader);
 
           m_flags.set(D3D9DeviceFlag::DirtyClipPlanes);
-
-          // NV-DXVK start: implement clip plane support in d3d9 rtx
-          m_rtx.SetDirty(D3D9RtxFlag::DirtyClipPlanes);
-          // NV-DXVK end
 
           break;
         }
@@ -4180,10 +4140,6 @@ namespace dxvk {
     if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexBlend);
 
-    // NV-DXVK start: signal that a transform has updated
-    m_rtx.SetTransformDirty(idx);
-    // NV-DXVK end
-
     return D3D_OK;
   }
 
@@ -4728,21 +4684,10 @@ namespace dxvk {
     const bool readOnly = Flags & D3DLOCK_READONLY;
     pResource->SetReadOnlyLocked(Subresource, readOnly);
 
-    // These hashes are configured as stable identities for RTX draw-call setup.
-    // Some games update them after setup, but Remix still needs the original
-    // hash to classify terrain and omit auxiliary textures like lightmaps.
     if (MipLevel == 0 && !readOnly && RtxOptions::recomputeTextureHashOnWrite()) {
       Rc<DxvkImage> image = pResource->GetImage();
-      if (image != nullptr) {
-        const XXH64_hash_t imageHash = image->getHash();
-        const bool keepConfiguredHash =
-          lookupHash(RtxOptions::terrainTextures(), imageHash) ||
-          D3D9Rtx::isLightmapTexture(imageHash) ||
-          lookupHash(RtxOptions::ignoreTextures(), imageHash) ||
-          lookupHash(RtxOptions::ignoreBakedLightingTextures(), imageHash);
-        if (imageHash != kEmptyHash && !keepConfiguredHash) {
-          pResource->ClearHash();
-        }
+      if (image != nullptr && image->getHash() != kEmptyHash) {
+        pResource->ClearHash();
       }
     }
 
@@ -5161,9 +5106,7 @@ namespace dxvk {
     if (desc.Usage & D3DUSAGE_DYNAMIC)
       Flags &= ~D3DLOCK_DONOTWAIT;
 
-    // NV-DXVK start: lock-mode diagnostics (pass timer enabled): first lock of each mode. NOOVERWRITE
-    // is the mode whose safety rests on the game's own GPU sync, which rtx.d3d9.eventQueryCsCompletion
-    // relaxes, so whether a game uses it should be on record.
+    // NV-DXVK start: lock-mode diagnostics (pass timer enabled): first lock of each mode.
     if (RtxGpuPassTimer::isEnabled()) {
       if (Flags & D3DLOCK_NOOVERWRITE) {
         ONCE(Logger::info(str::format("[RTX-LockDiag] First D3DLOCK_NOOVERWRITE buffer lock: size=", desc.Size, " usage=0x", std::hex, desc.Usage, " pool=", uint32_t(desc.Pool), std::dec)));
@@ -6867,11 +6810,6 @@ namespace dxvk {
 
         data->Stages[i].BumpEnvLScale    = bit::cast<float>(m_state.textureStages[i][DXVK_TSS_BUMPENVLSCALE]);
         data->Stages[i].BumpEnvLOffset   = bit::cast<float>(m_state.textureStages[i][DXVK_TSS_BUMPENVLOFFSET]);
-// NV-DXVK start: support height map scaling in terrain baking
-        data->Stages[i].texturePreOffset     = 0.f;
-        data->Stages[i].textureScale     = 1.f;
-        data->Stages[i].texturePostOffset     = 0.f;
-// NV-DXVK end
       }
     }
 
@@ -7058,21 +6996,6 @@ namespace dxvk {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
 
-    // NV-DXVK start: Don't raytrace occlusion queries
-    if (pQuery->GetType() == D3DQUERYTYPE_OCCLUSION) {
-      m_rtx.BeginOcclusionQuery();
-      pQuery->SetRtxOcclusionBracketId(m_rtx.GetCurrentOcclusionBracketId());
-
-      // Conservative occlusion queries synthesise the readback and ignore the bracketed test draws,
-      // so the Vulkan query would measure an empty scope.
-      const bool skipGpuQuery = m_rtx.ConservativeOcclusionQueriesEnabled();
-      pQuery->SetGpuQuerySkipped(skipGpuQuery);
-      if (skipGpuQuery) {
-        return;
-      }
-    }
-    // NV-DXVK end
-
     EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
       cQuery->Begin(ctx);
     });
@@ -7083,19 +7006,9 @@ namespace dxvk {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
 
-    // NV-DXVK start: Don't raytrace occlusion queries
-    if (pQuery->GetType() == D3DQUERYTYPE_OCCLUSION) {
-      m_rtx.EndOcclusionQuery();
-    }
-
-    if (pQuery->IsGpuQuerySkipped()) {
-      pQuery->SkipGpuEnd();
-    } else {
-      EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
-        cQuery->End(ctx);
-      });
-    }
-    // NV-DXVK end
+    EmitCs([cQuery = Com<D3D9Query, false>(pQuery)](DxvkContext* ctx) {
+      cQuery->End(ctx);
+    });
 
     pQuery->NotifyEnd();
     if (unlikely(pQuery->IsEvent())) {
@@ -7477,52 +7390,6 @@ namespace dxvk {
       };
 
       D3D9FFShaderKeyFS key;
-      // NV-DXVK start: skip stages for ignored textures
-      uint32_t lastActiveStageIdx = UINT32_MAX;
-      uint32_t numActiveStages = 0;
-
-      // NOTE: The terrain baker and sky reuse a draw call from rasterization with its
-      // bound textures and other effects like fixed function texture stages.
-      // However, we also would like to skip textures marked as ignored / lightmap for those techniques,
-      // so a corresponding texture stage needs to be skipped in the draw call.
-      // This involves modifying D3D9FFShaderKeyFS, by which DXVK chooses a pixel shader for a draw call.
-      // And because of that draw call re-usage, the checks are done here, and not in d3d9_rtx.
-      auto filterActiveTextureStage = [this, &key, &lastActiveStageIdx, &numActiveStages]
-                                      (uint32_t stageIdx, bool isLastStage) {
-        auto shouldOmitTextureAtStage = [this, &numActiveStages](uint32_t stageIdx, bool isLastStage) {
-          if (const auto tex = GetCommonTexture(m_state.textures[stageIdx])) {
-            XXH64_hash_t texHash = tex->GetImage()->getHash();
-            if (texHash != kEmptyHash) {
-              if (isLastStage && numActiveStages > 1 && RtxOptions::ignoreLastTextureStage()) {
-                return true;
-              }
-              if (lookupHash(RtxOptions::ignoreTextures(), texHash) || D3D9Rtx::isLightmapTexture(texHash)) {
-                return true;
-              }
-            }
-          }
-
-          return false;
-        };
-
-        if (RtxOptions::enableRaytracing()) {
-          if (shouldOmitTextureAtStage(stageIdx, isLastStage)) {
-            D3D9FFShaderStage& stage = key.Stages[stageIdx];
-            // make default
-            memset(&stage, 0, sizeof(D3D9FFShaderStage));
-            stage.Contents.ColorOp = D3DTOP_DISABLE;
-            stage.Contents.AlphaOp = D3DTOP_DISABLE;
-            stage.Contents.allowActiveStagesBeyondDisabledStage = true;
-            return false;
-          }
-        }
-
-        lastActiveStageIdx = stageIdx;
-        numActiveStages++;
-
-        return true;
-      };
-      // NV-DXVK end
 
       uint32_t textureID = 0;
       uint32_t idx;
@@ -7563,17 +7430,7 @@ namespace dxvk {
 
         stage.Projected      = (ttff & D3DTTFF_PROJECTED) ? 1      : 0;
         stage.ProjectedCount = (ttff & D3DTTFF_PROJECTED) ? count  : 0;
-
-        // NV-DXVK start: ignored secondary textures
-        stage.allowActiveStagesBeyondDisabledStage = 0;
-
-        filterActiveTextureStage(idx, false);
       }
-
-      if (idx > 0) {
-        filterActiveTextureStage(idx - 1, true);
-      }
-      // NV-DXVK end
 
       auto& stage0 = key.Stages[0].Contents;
 
@@ -7587,12 +7444,9 @@ namespace dxvk {
       stage0.GlobalSpecularEnable = m_state.renderStates[D3DRS_SPECULARENABLE];
       stage0.GlobalFlatShade      = m_state.renderStates[D3DRS_SHADEMODE] == D3DSHADE_FLAT;
 
-      // NV-DXVK start:
       // The last stage *always* writes to current.
-      if (lastActiveStageIdx != UINT32_MAX) {
-        key.Stages[lastActiveStageIdx].Contents.ResultIsTemp = false;
-      }
-      // NV-DXVK end
+      if (idx >= 1)
+        key.Stages[idx - 1].Contents.ResultIsTemp = false;
 
       EmitCs([
         this,
@@ -7615,9 +7469,6 @@ namespace dxvk {
 
       auto& rs = m_state.renderStates;
       DecodeD3DCOLOR((D3DCOLOR) rs[D3DRS_TEXTUREFACTOR], data->textureFactor.data);
-      data->texturePreOffset = 0.f;
-      data->textureScale = 1.f;
-      data->texturePostOffset = 0.f;
 
       EmitCs([
         cBuffer = m_psFixedFunction,
@@ -8084,11 +7935,6 @@ namespace dxvk {
     UpdateBoolSpecConstantPixel(0u);
     UpdateSamplerDepthModeSpecConstant(0u);
 
-    // NV-DXVK start: Signal that lights and clip planes should be updated
-    m_rtx.SetDirty(D3D9RtxFlag::DirtyLights);
-    m_rtx.SetDirty(D3D9RtxFlag::DirtyClipPlanes);
-    // NV-DXVK end
-
     return D3D_OK;
   }
 
@@ -8124,13 +7970,7 @@ namespace dxvk {
       if (FAILED(m_implicitSwapchain->Reset(pPresentationParameters, pFullscreenDisplayMode)))
         return D3DERR_INVALIDCALL;
     } else {
-// NV-DXVK start: external API
-      if (m_withExternalSwapchain) {
-        m_implicitSwapchain = new D3D9SwapchainExternal(this, pPresentationParameters, pFullscreenDisplayMode);
-      } else {
-// NV-DXVK end
-        m_implicitSwapchain = new D3D9SwapChainEx(this, pPresentationParameters, pFullscreenDisplayMode);
-      }
+      m_implicitSwapchain = new D3D9SwapChainEx(this, pPresentationParameters, pFullscreenDisplayMode);
     }
 
     if (pPresentationParameters->EnableAutoDepthStencil) {
@@ -8181,16 +8021,6 @@ namespace dxvk {
 
     return D3D_OK;
   }
-
-// NV-DXVK start: external API
-  D3D9SwapchainExternal* D3D9DeviceEx::GetExternalPresenter() {
-    ScopedCpuProfileZone();
-    if (m_withExternalSwapchain) {
-      return static_cast<D3D9SwapchainExternal*>(m_implicitSwapchain.ptr());
-    }
-    return nullptr;
-  }
-// NV-DXVK end
 
   void D3D9DeviceEx::TrackBufferMappingBufferSequenceNumber(
         D3D9CommonBuffer* pResource) {

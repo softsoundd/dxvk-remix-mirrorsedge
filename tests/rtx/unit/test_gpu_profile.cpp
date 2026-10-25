@@ -137,7 +137,7 @@ namespace gpu_profile_test {
     info.exactDeviceLocalTypeHeapSize = 49140ull * 1024 * 1024;
     TEST_ASSERT(isRtxSpark(info), "observed Spark");
     const AutoPresetDecision decision = selectAutoPreset(info, std::nullopt, NV_GPU_ARCHITECTURE_GB200);
-    TEST_ASSERT(decision.preset == GraphicsPreset::Medium && !decision.lowMemoryGpu, "observed Spark defaults");
+    TEST_ASSERT(decision.preset == GraphicsPreset::Medium, "observed Spark defaults");
     TEST_ASSERT(!logContains(decision, "Blackwell architecture detected"), "discrete ladder skipped");
   }
 
@@ -155,7 +155,7 @@ namespace gpu_profile_test {
       const AutoPresetDecision decision = selectAutoPreset(discreteNvidia(16 * kGiB), std::nullopt, c.arch);
       TEST_ASSERT(decision.preset == c.preset, "arch 0x" << std::hex << c.arch);
       TEST_ASSERT(logContains(decision, c.log), "log for arch 0x" << std::hex << c.arch);
-      TEST_ASSERT(!decision.lowMemoryGpu && !decision.applyNonNvidiaDefaults, "large discrete GPU flags");
+      TEST_ASSERT(!decision.applyNonNvidiaDefaults, "large discrete GPU flags");
     }
 
     // The architecture query falls back to Turing when NVAPI fails.
@@ -163,10 +163,10 @@ namespace gpu_profile_test {
 
     // 8 GiB threshold is inclusive and demotes by one step, never below Low and never above Medium.
     AutoPresetDecision decision = selectAutoPreset(discreteNvidia(kLowMemoryGpuThreshold), std::nullopt, NV_GPU_ARCHITECTURE_GB200);
-    TEST_ASSERT(decision.preset == GraphicsPreset::Medium && decision.lowMemoryGpu, "Ultra at 8 GiB demotes to Medium");
+    TEST_ASSERT(decision.preset == GraphicsPreset::Medium, "Ultra at 8 GiB demotes to Medium");
     TEST_ASSERT(logContains(decision, "lowering quality setting"), "demotion log");
     decision = selectAutoPreset(discreteNvidia(kLowMemoryGpuThreshold + 1), std::nullopt, NV_GPU_ARCHITECTURE_GB200);
-    TEST_ASSERT(decision.preset == GraphicsPreset::Ultra && !decision.lowMemoryGpu, "one byte over 8 GiB");
+    TEST_ASSERT(decision.preset == GraphicsPreset::Ultra, "one byte over 8 GiB");
     decision = selectAutoPreset(discreteNvidia(8 * kGiB), std::nullopt, NV_GPU_ARCHITECTURE_AD100);
     TEST_ASSERT(decision.preset == GraphicsPreset::Medium, "Ada at 8 GiB demotes to Medium");
     decision = selectAutoPreset(discreteNvidia(8 * kGiB), std::nullopt, NV_GPU_ARCHITECTURE_TU100);
@@ -177,13 +177,12 @@ namespace gpu_profile_test {
     GpuHardwareInfo info = discreteNvidia(0);
     info.deviceLocalHeapTotal = 16 * kGiB;
     decision = selectAutoPreset(info, std::nullopt, NV_GPU_ARCHITECTURE_GB200);
-    TEST_ASSERT(decision.lowMemoryGpu && decision.preset == GraphicsPreset::Medium, "no exact device-local type");
+    TEST_ASSERT(decision.preset == GraphicsPreset::Medium, "no exact device-local type");
   }
 
   void test_overridesAndOtherVendors() {
     AutoPresetDecision decision = selectAutoPreset(discreteNvidia(4 * kGiB), GraphicsPreset::Ultra, 0);
     TEST_ASSERT(decision.preset == GraphicsPreset::Ultra, "override prevents demotion");
-    TEST_ASSERT(decision.lowMemoryGpu, "override keeps memory-based low memory mode");
     TEST_ASSERT(logContains(decision, "keeping the matched graphics preset override"), "override log");
 
     GpuHardwareInfo amd = discreteNvidia(16 * kGiB);
@@ -197,18 +196,14 @@ namespace gpu_profile_test {
 
   void test_sparkPresets() {
     AutoPresetDecision decision = selectAutoPreset(spark(128 * kGiB), std::nullopt, 0);
-    TEST_ASSERT(decision.preset == GraphicsPreset::Medium && !decision.lowMemoryGpu, "Spark default");
+    TEST_ASSERT(decision.preset == GraphicsPreset::Medium, "Spark default");
     TEST_ASSERT(logContains(decision, "RTX Spark detected"), "Spark log");
 
     decision = selectAutoPreset(spark(128 * kGiB), GraphicsPreset::High, 0);
     TEST_ASSERT(decision.preset == GraphicsPreset::High, "per-GPU override wins on Spark");
 
     decision = selectAutoPreset(spark(8 * kGiB), std::nullopt, 0);
-    TEST_ASSERT(decision.preset == GraphicsPreset::Medium && decision.lowMemoryGpu, "8 GiB carve-out enables low memory mode");
-    decision = selectAutoPreset(spark(8 * kGiB - 64 * 1024 * 1024), std::nullopt, 0);
-    TEST_ASSERT(decision.lowMemoryGpu, "slightly under 8 GiB");
-    decision = selectAutoPreset(spark(8 * kGiB + 1), std::nullopt, 0);
-    TEST_ASSERT(!decision.lowMemoryGpu, "one byte over 8 GiB");
+    TEST_ASSERT(decision.preset == GraphicsPreset::Medium, "8 GiB carve-out keeps the Spark default");
   }
 
   void test_dlssMode() {

@@ -175,11 +175,6 @@ namespace dxvk {
         decision.preset = kRtxSparkGraphicsPreset;
         decision.log.push_back("RTX Spark detected, setting default graphics settings to Medium");
       }
-      decision.lowMemoryGpu = info.deviceLocalHeapTotal <= kLowMemoryGpuThreshold;
-      if (decision.lowMemoryGpu) {
-        decision.log.push_back(str::format("RTX Spark with ", toMiB(info.deviceLocalHeapTotal),
-                                           " MiB of device-local memory detected, enabling low memory mode."));
-      }
       return decision;
     }
 
@@ -217,7 +212,6 @@ namespace dxvk {
         decision.log.push_back("8GB GPU detected, lowering quality setting.");
         decision.preset = (GraphicsPreset) std::clamp((int) decision.preset + 1, (int) GraphicsPreset::Medium, (int) GraphicsPreset::Low);
       }
-      decision.lowMemoryGpu = true;
     }
     return decision;
   }

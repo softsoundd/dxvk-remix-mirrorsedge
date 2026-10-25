@@ -25,12 +25,7 @@ namespace dxvk {
 
   HRESULT CreateD3D9(
           bool           Extended,
-          IDirect3D9Ex** ppDirect3D9Ex,
-// NV-DXVK start: external API
-          bool           WithExternalSwapchain = false,
-          bool           WithDrawCallConversion = true,
-          bool           WithRemixAPI = false) {
-// NV-DXVK end
+          IDirect3D9Ex** ppDirect3D9Ex) {
     if (!ppDirect3D9Ex)
       return D3DERR_INVALIDCALL;
       
@@ -54,9 +49,9 @@ namespace dxvk {
     );
 // NV-DXVK end
 
-// NV-DXVK start: external API / provide error code on exception
+// NV-DXVK start: provide error code on exception
     try {
-      *ppDirect3D9Ex = ref(new D3D9InterfaceEx(Extended, WithExternalSwapchain, WithDrawCallConversion, WithRemixAPI));
+      *ppDirect3D9Ex = ref(new D3D9InterfaceEx(Extended));
     }
     catch (const dxvk::DxvkErrorWithId& err) {
       Logger::err(err.message());
@@ -135,7 +130,7 @@ extern "C" {
   }
 }
 
-// NV-DXVK start: functional versioning export + external API
+// NV-DXVK start: functional versioning export
 #include <remix/remix_c.h>
 #include "../util/util_messagechannel.h"
 #include "../util/util_version.h"
@@ -164,8 +159,8 @@ extern "C" {
       }
       case version::RemixApi:
       {
-        static constexpr uint64_t remixApiV = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
-        return remixApiV;
+        // The Remix API is not provided by this runtime.
+        return 0ull;
       }
       case version::FileSys:
       {
@@ -178,9 +173,4 @@ extern "C" {
       }
     }
   }
-}
-
-void dummy() {
-  // need to reference a function so it's exported from d3d9.dll
-  remixapi_InitializeLibrary(nullptr, nullptr);
 }

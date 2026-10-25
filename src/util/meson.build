@@ -59,7 +59,6 @@ util_src = files([
   'util_threadpool.h',
   'util_atomic_queue.h',
 
-  'util_renderprocessor.h',
   
   'util_version.h',
 

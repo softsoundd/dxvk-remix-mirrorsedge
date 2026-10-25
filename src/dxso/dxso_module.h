@@ -52,11 +52,7 @@ namespace dxvk {
       return m_isgn;
     }
 
-    // NV-DXVK start: expose shader outputs for vertex capture
-    const DxsoIsgn& osgn() {
-      return m_osgn;
-    }    
-    
+    // NV-DXVK start: expose CTAB data
     const DxsoCtab& ctab() {
       return m_ctab;
     }
@@ -87,9 +83,6 @@ namespace dxvk {
     DxsoCode        m_code;
 
     DxsoIsgn        m_isgn;
-    // NV-DXVK start: expose shader outputs for vertex capture
-    DxsoIsgn        m_osgn;
-    // NV-DXVK end
     uint32_t        m_usedSamplers;
     uint32_t        m_usedRTs;
 

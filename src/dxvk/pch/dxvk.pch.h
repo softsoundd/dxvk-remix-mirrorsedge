@@ -29,20 +29,9 @@
 #include <cassert>
 #include <limits>
 
-#include "../../lssusd/mdl_helpers.h"
-#include "../../lssusd/particle_system_helpers.h"
-#include "../../lssusd/usd_include_begin.h"
-#include <pxr/base/vt/value.h>
-#include <pxr/usd/usd/tokens.h>
-#include <pxr/usd/usd/prim.h>
-#include "../../lssusd/usd_include_end.h"
-
 #include <nvsdk_ngx.h>
 
 #include "dxvk_device.h"
 #include "dxvk_objects.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_options.h"
-#include "rtx_render/rtx_types.h"
-#include "rtx_render/rtx_materials.h"
-#include "rtx_render/rtx_material_data.h"

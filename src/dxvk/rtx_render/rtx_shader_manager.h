@@ -66,10 +66,6 @@ private: \
 public: \
   static std::vector<dxvk::DxvkResourceSlot> getResourceSlots() { return resourceSlotList; }
 
-// Slang: RaytracingAccelerationStructure
-// GLSL: accelerationStructureEXT 
-#define ACCELERATION_STRUCTURE(binding)     { binding, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR },
-
 // Slang: StructuredBuffer<...>
 // GLSL: readonly buffer {...};
 #define STRUCTURED_BUFFER(binding)          { binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER },

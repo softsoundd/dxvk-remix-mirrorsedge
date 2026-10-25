@@ -85,12 +85,6 @@
 #define POST_FX_INPUT  0
 #define POST_FX_OUTPUT 1
 
-#define POST_FX_HIGHLIGHT_INPUT                       0
-#define POST_FX_HIGHLIGHT_OBJECT_PICKING_INPUT        1
-#define POST_FX_HIGHLIGHT_PRIMARY_LINEAR_VIEW_Z_INPUT 2
-#define POST_FX_HIGHLIGHT_OUTPUT                      3
-#define POST_FX_HIGHLIGHT_VALUES                      4
-
 #define POST_FX_TILE_SIZE 8
 
 struct PostFxArgs {
@@ -197,22 +191,4 @@ struct PostFxMotionBlurCineGatherArgs {
   uint   pad0;
   uint   pad1;
   uint   pad2;
-};
-
-#define POST_FX_HIGHLIGHTING_MAX_VALUES_POW 14
-#define POST_FX_HIGHLIGHTING_MAX_VALUES     (1 << POST_FX_HIGHLIGHTING_MAX_VALUES_POW)
-#define POST_FX_HIGHLIGHTING_INVALID_VALUE  0xFFFFFFFF
-
-struct PostFxHighlightingArgs
-{
-  // Display image information
-  uint2 imageSize;
-  // If need to highlight an object under this pixel
-  int2  pixel;
-  // Highlighting params
-  uint  desaturateNonHighlighted;
-  float timeSinceStartMS;
-  uint  highlightColorPacked;
-  uint  valuesToHighlightCountPow;
-  float missLinearViewZ;
 };

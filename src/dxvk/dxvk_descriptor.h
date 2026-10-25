@@ -41,7 +41,6 @@ namespace dxvk {
     VkDescriptorImageInfo  image;
     VkDescriptorBufferInfo buffer;
     VkBufferView           texelBuffer;
-    VkAccelerationStructureKHR accelerationStructure;
   };
   
   

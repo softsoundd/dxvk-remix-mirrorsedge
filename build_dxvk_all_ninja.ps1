@@ -21,7 +21,6 @@
 #>
 
 param(
-  [switch]$SkipApics,
   # Unrecognized values would otherwise fall through to the arm64 cross toolchain in build_common.ps1.
   [ValidateSet("x64","arm64","arm64ec")]
   [string]$BuildArch = "x64"
@@ -46,6 +45,5 @@ For ($i=0; $i -lt $BuildFlavours.Length; $i++) {
     EnableTracy = 'false'
     BuildArch = ${BuildArch}
   }
-  if ($SkipApics) { $buildArgs['SkipApics'] = $true }
   PerformBuild @buildArgs
 }

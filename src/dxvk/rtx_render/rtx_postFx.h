@@ -24,7 +24,6 @@
 #include "dxvk_format.h"
 #include "dxvk_include.h"
 #include "dxvk_context.h"
-#include "rtx_objectpicking.h"
 #include "rtx_resources.h"
 
 #include "../spirv/spirv_code_buffer.h"
@@ -36,6 +35,7 @@ namespace dxvk {
   class DxvkDevice;
   class DxvkPipelineManager;
   class RtCamera;
+  class RtxContext;
 
   enum class MotionBlurMode : int {
     // The original per-pixel gather. Kept bit-for-bit so it stays available for comparison.
@@ -64,12 +64,10 @@ namespace dxvk {
     DxvkPostFx(DxvkDevice* device);
     ~DxvkPostFx();
 
-    // Registers the frame path's post FX compute shaders for pipeline prewarming. The
-    // highlighting shader is a development picking feature and is left to compile on first use.
+    // Registers the frame path's post FX compute shaders for pipeline prewarming.
     void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
 
-    // Individual motion blur inputs; the path traced pipeline packs these from the
-    // raytracing output bundle, the NGX passthrough mode from its synthesized equivalents.
+    // Individual motion blur inputs, synthesized by the NGX passthrough.
     // All pointers must be valid; color extents may differ from the G-buffer inputs
     // (mainCameraResolution describes the motion vector / flags / view-Z resolution).
     // Screen space positions of a surface point half a frame either side of now, expressed
@@ -151,7 +149,6 @@ namespace dxvk {
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.postfx", bool, enableVignette, true, "Enables vignette post-processing effect.",
                     args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION("rtx.postfx", bool, desaturateOthersOnHighlight, true, "If true, desaturare all objects that are not highlighted.");
     RTX_OPTION_ARGS("rtx.postfx", MotionBlurMode, motionBlurMode, MotionBlurMode::Legacy,
                     "Motion blur algorithm. Legacy is the original per-pixel gather. Cinematic is a tile based "
                     "feature-aware reconstruction filter (Guertin, McGuire & Nowrouzezahrai, HPG 2014) which "
@@ -183,7 +180,6 @@ namespace dxvk {
       const MotionBlurInputs& inputs);
 
     Rc<vk::DeviceFn> m_vkd;
-    Rc<DxvkBuffer> m_highlightingValues;
     // Setup pass arguments live in a uniform buffer: the two curve matrices alone fill the
     // 128 byte push constant budget (MaxPushConstantSize).
     Rc<DxvkBuffer> m_motionBlurCineConstants;

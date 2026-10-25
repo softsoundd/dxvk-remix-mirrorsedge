@@ -77,16 +77,11 @@ namespace dxvk {
     event.gpuIdleTimeMs = sample.gpuIdleTimeMs;
     event.screenshotTargetFrame = s_instance.m_testTraceConfig.screenshotFrameNum;
     event.terminateTargetFrame = s_instance.m_testTraceConfig.terminateAppFrameNum;
-    event.surfaceCount = sample.surfaceCount;
     event.shaderCompileInflightCount = sample.shaderCompileInflightCount;
-    event.debugViewMode = sample.debugViewMode;
-    event.compositeDebugViewMode = sample.compositeDebugViewMode;
-    event.raytracingEnabled = sample.raytracingEnabled;
     event.cameraValid = sample.cameraValid;
     event.asyncShaderPrewarming = sample.asyncShaderPrewarming;
     event.asyncCompilationEnabled = sample.asyncCompilationEnabled;
     event.asyncCompilationActive = sample.asyncCompilationActive;
-    event.surfaceBufferAvailable = sample.surfaceBufferAvailable;
   }
   
   void Metrics::serialize() {
@@ -156,16 +151,11 @@ namespace dxvk {
             << ",\"gpu_idle_time_ms\":" << event.gpuIdleTimeMs
             << ",\"screenshot_target_frame\":" << event.screenshotTargetFrame
             << ",\"terminate_target_frame\":" << event.terminateTargetFrame
-            << ",\"surface_count\":" << event.surfaceCount
             << ",\"shader_compile_inflight_count\":" << event.shaderCompileInflightCount
-            << ",\"debug_view_mode\":" << event.debugViewMode
-            << ",\"composite_debug_view_mode\":" << event.compositeDebugViewMode
-            << ",\"raytracing_enabled\":" << (event.raytracingEnabled ? "true" : "false")
             << ",\"camera_valid\":" << (event.cameraValid ? "true" : "false")
             << ",\"async_shader_prewarming\":" << (event.asyncShaderPrewarming ? "true" : "false")
             << ",\"async_compilation_enabled\":" << (event.asyncCompilationEnabled ? "true" : "false")
             << ",\"async_compilation_active\":" << (event.asyncCompilationActive ? "true" : "false")
-            << ",\"surface_buffer_available\":" << (event.surfaceBufferAvailable ? "true" : "false")
             << "}\n";
         }
         out.close();
@@ -185,16 +175,11 @@ namespace dxvk {
         m_fileStream << "dxvk_trace_effective_delta_ms_at_capture " << captureEvent->effectiveDeltaMs << "\n";
         m_fileStream << "dxvk_trace_real_wall_delta_ms_at_capture " << captureEvent->realWallDeltaMs << "\n";
         m_fileStream << "dxvk_trace_gpu_idle_time_ms_at_capture " << captureEvent->gpuIdleTimeMs << "\n";
-        m_fileStream << "dxvk_trace_surface_count_at_capture " << captureEvent->surfaceCount << "\n";
         m_fileStream << "dxvk_trace_shader_compile_inflight_at_capture " << captureEvent->shaderCompileInflightCount << "\n";
-        m_fileStream << "dxvk_trace_debug_view_mode_at_capture " << captureEvent->debugViewMode << "\n";
-        m_fileStream << "dxvk_trace_composite_debug_view_mode_at_capture " << captureEvent->compositeDebugViewMode << "\n";
-        m_fileStream << "dxvk_trace_raytracing_enabled_at_capture " << (captureEvent->raytracingEnabled ? 1 : 0) << "\n";
         m_fileStream << "dxvk_trace_camera_valid_at_capture " << (captureEvent->cameraValid ? 1 : 0) << "\n";
         m_fileStream << "dxvk_trace_async_shader_prewarming " << (captureEvent->asyncShaderPrewarming ? 1 : 0) << "\n";
         m_fileStream << "dxvk_trace_async_compilation_enabled " << (captureEvent->asyncCompilationEnabled ? 1 : 0) << "\n";
         m_fileStream << "dxvk_trace_async_compilation_active_at_capture " << (captureEvent->asyncCompilationActive ? 1 : 0) << "\n";
-        m_fileStream << "dxvk_trace_surface_buffer_available_at_capture " << (captureEvent->surfaceBufferAvailable ? 1 : 0) << "\n";
         m_fileStream << "dxvk_trace_effective_delta_ms_min " << effectiveDeltaMin << "\n";
         m_fileStream << "dxvk_trace_effective_delta_ms_max " << effectiveDeltaMax << "\n";
         m_fileStream << "dxvk_trace_real_wall_delta_ms_min " << realWallDeltaMin << "\n";

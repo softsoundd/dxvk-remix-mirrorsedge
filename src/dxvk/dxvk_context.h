@@ -31,7 +31,6 @@
 namespace dxvk {
 
   class DxvkObjects;
-  struct TextureRef;
 
   /**
    * \brief DXVk context
@@ -208,25 +207,6 @@ namespace dxvk {
     void bindResourceSampler(
             uint32_t              slot,
             Rc<DxvkSampler>&&     sampler);
-
-    /**
-     * \brief Binds acceleration structure
-     *
-     * Can be used for raytracing
-     * \param [in] slot Resource binding slot
-     * \param [in] accelStructure Acceleration structure
-     */
-    void bindAccelerationStructure(
-      uint32_t              slot,
-      const Rc<DxvkAccelStructure> accelStructure);
-
-    /**
-     * \brief Binds raytracing pipeline shaders 
-     *
-     * \param [in] shaders Raytracing pipeline shaders to bind
-     */
-    void bindRaytracingPipelineShaders(
-      const DxvkRaytracingPipelineShaders& shaders);
 
     /**
      * \brief Binds a shader to a given state
@@ -860,30 +840,6 @@ namespace dxvk {
             VkResolveModeFlagBitsKHR  stencilMode);
 
     /**
-     * \brief Starts raytracing jobs
-     *
-     * \param [in] x Number of rays in width direction
-     * \param [in] y Number of rays in height direction
-     * \param [in] z Number of rays in depth direction
-     */
-    void traceRays(
-            uint32_t                  width,
-            uint32_t                  height,
-            uint32_t                  depth);
-
-    // NV-DXVK start: Indirect ray dispatch support
-    /**
-     * \brief Starts raytracing jobs with the ray counts sourced from a buffer
-     *
-     * \param [in] argBuffer Buffer holding a VkTraceRaysIndirectCommandKHR
-     * \param [in] argOffset Byte offset of the command within the buffer
-     */
-    void traceRaysIndirect(
-      const Rc<DxvkBuffer>&           argBuffer,
-            VkDeviceSize              argOffset);
-    // NV-DXVK end
-
-    /**
      * \brief Transforms image subresource layouts
      * 
      * \param [in] dstImage Image to transform
@@ -1175,52 +1131,6 @@ namespace dxvk {
     void signal(
       const Rc<sync::Signal>&   signal,
             uint64_t            value);
-    
-	void vkCmdBuildAccelerationStructuresKHR(
-		uint32_t                                    infoCount,
-		const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-		const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
-	{
-		m_cmd->vkCmdBuildAccelerationStructuresKHR(infoCount, pInfos, ppBuildRangeInfos);
-	}
-
-	void vkCmdBuildAccelerationStructuresIndirectKHR(
-		uint32_t                                    infoCount,
-		const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-		const VkDeviceAddress* pIndirectDeviceAddresses,
-		const uint32_t* pIndirectStrides,
-		const uint32_t* const* ppMaxPrimitiveCounts)
-	{
-		m_cmd->vkCmdBuildAccelerationStructuresIndirectKHR( infoCount, pInfos, pIndirectDeviceAddresses, pIndirectStrides, ppMaxPrimitiveCounts);
-	}
-
-	void vkCmdCopyAccelerationStructureKHR(
-		const VkCopyAccelerationStructureInfoKHR* pInfo)
-	{
-		m_cmd->vkCmdCopyAccelerationStructureKHR(pInfo);
-	}
-
-	void vkCmdCopyAccelerationStructureToMemoryKHR(
-		const VkCopyAccelerationStructureToMemoryInfoKHR* pInfo)
-	{
-		m_cmd->vkCmdCopyAccelerationStructureToMemoryKHR(pInfo);
-	}
-
-	void vkCmdCopyMemoryToAccelerationStructureKHR(
-		const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo)
-	{
-		m_cmd->vkCmdCopyMemoryToAccelerationStructureKHR(pInfo);
-	}
-
-	void vkCmdWriteAccelerationStructuresPropertiesKHR(
-		uint32_t                                    accelerationStructureCount,
-		const VkAccelerationStructureKHR* pAccelerationStructures,
-		VkQueryType                                 queryType,
-		VkQueryPool                                 queryPool,
-		uint32_t                                    firstQuery)
-	{
-		m_cmd->vkCmdWriteAccelerationStructuresPropertiesKHR(accelerationStructureCount, pAccelerationStructures, queryType, queryPool, firstQuery);
-	}
 
 	void emitMemoryBarrier(
 		VkDependencyFlags         flags,
@@ -1231,8 +1141,6 @@ namespace dxvk {
 
     void commitComputeInitBarriers();
     void commitComputePostBarriers();
-    void commitRaytracingInitBarriers();
-    void commitRaytracingPostBarriers();
    
     /**
      * \brief Begins a debug label region
@@ -1327,11 +1235,9 @@ namespace dxvk {
 
     VkPipeline m_gpActivePipeline = VK_NULL_HANDLE;
     VkPipeline m_cpActivePipeline = VK_NULL_HANDLE;
-    VkPipeline m_rpActivePipeline = VK_NULL_HANDLE;
 
     VkDescriptorSet m_gpSet = VK_NULL_HANDLE;
     VkDescriptorSet m_cpSet = VK_NULL_HANDLE;
-    VkDescriptorSet m_rpSet = VK_NULL_HANDLE;
 
     DxvkBindingSet<MaxNumVertexBindings + 1>  m_vbTracked;
     DxvkBindingSet<MaxNumResourceSlots>       m_rcTracked;
@@ -1341,7 +1247,6 @@ namespace dxvk {
     std::array<DxvkShaderResourceSlot, MaxNumResourceSlots>  m_rc;
     std::array<DxvkGraphicsPipeline*, 4096> m_gpLookupCache = { };
     std::array<DxvkComputePipeline*,   256> m_cpLookupCache = { };
-    std::unordered_map<size_t /*Hash*/, DxvkRaytracingPipeline*> m_rpLookupCache;
 
     // NV-DXVK start: early submit heuristics for memcpy work
 
@@ -1499,16 +1404,11 @@ namespace dxvk {
     bool updateComputePipeline();
     bool updateComputePipelineState();
 
-    void unbindRaytracingPipeline();
-    bool updateRaytracingPipeline();
-    bool updateRaytracingPipelineState();
-
     void unbindGraphicsPipeline();
     bool updateGraphicsPipeline();
     bool updateGraphicsPipelineState();
     
     virtual void updateComputeShaderResources();
-    virtual void updateRaytracingShaderResources();
     void updateGraphicsShaderResources();
 
     template<VkPipelineBindPoint BindPoint>
@@ -1571,7 +1471,6 @@ namespace dxvk {
     void updatePushConstants();
     
     bool commitComputeState();
-    bool commitRaytracingState();
     template<bool Indexed, bool Indirect>
     bool commitGraphicsState();
 
@@ -1611,9 +1510,6 @@ namespace dxvk {
 
     DxvkComputePipeline* lookupComputePipeline(
       const DxvkComputePipelineShaders&   shaders);
-
-    DxvkRaytracingPipeline* lookupRaytracingPipeline(
-      const DxvkRaytracingPipelineShaders& shaders);
     
     Rc<DxvkFramebuffer> lookupFramebuffer(
       const DxvkFramebufferInfo&      framebufferInfo);

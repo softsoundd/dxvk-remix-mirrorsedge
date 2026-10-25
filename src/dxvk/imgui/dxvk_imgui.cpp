@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <nvapi.h>
@@ -49,13 +50,11 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx_render/rtx_camera.h"
 #include "rtx_render/rtx_context.h"
-#include "rtx_render/rtx_hash_collision_detection.h"
 #include "rtx_render/rtx_gpu_overrides.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_xess.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
-#include "rtx_render/rtx_debug_view.h"
 #include "dxvk_image.h"
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
@@ -64,19 +63,12 @@
 #include "dxvk_imgui_about.h"
 #include "dxvk_imgui_first_use_guide.h"
 #include "dxvk_imgui_splash.h"
-#include "dxvk_imgui_capture.h"
 #include "rtx_render/rtx_option_layer_gui.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
 #include "../../d3d9/d3d9_rtx.h"
 #include "dxvk_memory_tracker.h"
 #include "rtx_render/rtx_overlay_window.h"
-
-
-namespace dxvk {
-  extern size_t g_streamedTextures_budgetBytes;
-  extern size_t g_streamedTextures_usedBytes;
-}
 
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -153,118 +145,6 @@ namespace ImGui {
 }
 
 namespace dxvk {
-  struct ImGuiTexture {
-    Rc<DxvkImageView> imageView = VK_NULL_HANDLE;
-    ImTextureID texID = VK_NULL_HANDLE;
-    uint32_t textureFeatureFlags = 0;
-  };
-  std::unordered_map<XXH64_hash_t, ImGuiTexture> g_imguiTextureMap;
-  fast_unordered_cache<FogState> g_imguiFogMap;
-  XXH64_hash_t g_usedFogStateHash;
-  std::mutex g_imguiFogMapMutex; // protects g_imguiFogMap
-
-  struct RtxTextureOption {
-    const char* uniqueId;
-    const char* displayName;
-    RtxOption<fast_unordered_set>* textureSetOption;
-    uint32_t featureFlagMask = ImGUI::kTextureFlagsDefault;
-    bool bufferToggle;
-  };
-
-  std::vector<RtxTextureOption> rtxTextureOptions = {
-    {"uitextures", "UI Texture", &RtxOptions::uiTexturesObject()},
-    {"deferreduitextures", "Deferred UI Texture (overlay)", &RtxOptions::deferredUiTexturesObject()},
-    {"worldspaceuitextures", "World Space UI Texture", &RtxOptions::worldSpaceUiTexturesObject()},
-    {"worldspaceuibackgroundtextures", "World Space UI Background Texture", &RtxOptions::worldSpaceUiBackgroundTexturesObject()},
-    {"skytextures", "Sky Texture", &RtxOptions::skyBoxTexturesObject()},
-    {"ignoretextures", "Ignore Texture (optional)", &RtxOptions::ignoreTexturesObject()},
-    {"hidetextures", "Hide Texture Instance (optional)", &RtxOptions::hideInstanceTexturesObject()},
-    {"lightmaptextures","Lightmap Textures (optional)", &RtxOptions::lightmapTexturesObject()},
-    {"ignorelights", "Ignore Lights (optional)", &RtxOptions::ignoreLightsObject()},
-    {"particletextures", "Particle Texture (optional)", &RtxOptions::particleTexturesObject()},
-    {"haircardtextures", "Hair Cards Texture (optional)", &RtxOptions::hairCardTexturesObject()},
-    {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
-    {"lightconvertertextures", "Add Light to Textures (optional)", &RtxOptions::lightConverterObject()},
-    {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
-    {"terraintextures", "Terrain Texture", &RtxOptions::terrainTexturesObject()},
-    {"watertextures", "Water Texture (optional)", &RtxOptions::animatedWaterTexturesObject()},
-    {"antiCullingTextures", "Anti-Culling Texture (optional)", &RtxOptions::antiCullingTexturesObject()},
-    {"motionBlurMaskOutTextures", "Motion Blur Mask-Out Textures (optional)", &RtxOptions::motionBlurMaskOutTexturesObject()},
-    {"playermodeltextures", "Player Model Texture (optional)", &RtxOptions::playerModelTexturesObject()},
-    {"playermodelbodytextures", "Player Model Body Texture (optional)", &RtxOptions::playerModelBodyTexturesObject()},
-    {"viewmodeltextures", "View Model Texture (optional)", &RtxOptions::viewModelTexturesObject()},
-    {"cullbackfacesinshadowtextures", "Cull Backfaces in Shadows (optional)", &RtxOptions::cullBackfacesInShadowTexturesObject()},
-    {"opacitymicromapignoretextures", "Opacity Micromap Ignore Texture (optional)", &RtxOptions::opacityMicromapIgnoreTexturesObject()},
-    {"ignorebakedlightingtextures","Ignore Baked Lighting Textures (optional)", &RtxOptions::ignoreBakedLightingTexturesObject()},
-    {"ignorealphaontextures","Ignore Alpha Channel of Textures (optional)", &RtxOptions::ignoreAlphaOnTexturesObject()},
-    {"raytracedRenderTargetTextures","Raytraced Render Target Textures (optional)", &RtxOptions::raytracedRenderTargetTexturesObject(), ImGUI::kTextureFlagsRenderTarget},
-    {"particleemittertextures","Particle Emitters (optional)", &RtxOptions::particleEmitterTexturesObject()},
-    {"smoothnormalstextures","Smooth Normals (optional)", &RtxOptions::smoothNormalsTexturesObject()},
-    {"preferredalbedotextures","Prefer As Albedo (optional)", &RtxOptions::preferredAlbedoTexturesObject()},
-    {"neveralbedotextures","Never Albedo (optional)", &RtxOptions::neverAlbedoTexturesObject()}
-  };
-
-  // Geometry-hash categories (no thumbnails) — prefer when Mesh1p/Mesh3p share materials.
-  // Sky stays out: skyBoxGeometries still matches the asset-hash rule, not topology.
-  std::vector<RtxTextureOption> rtxGeometryOptions = {
-    {"viewmodelgeometries", "View Model Geometry (optional)", &RtxOptions::viewModelGeometriesObject()},
-    {"playermodelgeometries", "Player Model Geometry (optional)", &RtxOptions::playerModelGeometriesObject()},
-    {"playermodelbodygeometries", "Player Model Body Geometry (optional)", &RtxOptions::playerModelBodyGeometriesObject()},
-    {"cullbackfacesinshadowgeometries", "Cull Backfaces in Shadows Geometry (optional)", &RtxOptions::cullBackfacesInShadowGeometriesObject()},
-  };
-
-  RemixGui::ComboWithKey<CameraAnimationMode> cameraAnimationModeCombo {
-    "Camera Animation Mode",
-    RemixGui::ComboWithKey<CameraAnimationMode>::ComboEntries { {
-        {CameraAnimationMode::CameraShake_LeftRight, "CameraShake Left-Right"},
-        {CameraAnimationMode::CameraShake_FrontBack, "CameraShake Front-Back"},
-        {CameraAnimationMode::CameraShake_Yaw, "CameraShake Yaw"},
-        {CameraAnimationMode::CameraShake_Pitch, "CameraShake Pitch"},
-        {CameraAnimationMode::YawRotation, "Camera Yaw Rotation"}
-    } }
-  };
-
-  RemixGui::ComboWithKey<int> textureQualityCombo {
-    "Texture Quality",
-    RemixGui::ComboWithKey<int>::ComboEntries { {
-        {0, "High"},
-        {1, "Low"},
-    } }
-  };
-
-  RemixGui::ComboWithKey<ViewDistanceMode> viewDistanceModeCombo {
-    "View Distance Mode",
-    RemixGui::ComboWithKey<ViewDistanceMode>::ComboEntries { {
-        {ViewDistanceMode::None, "None"},
-        {ViewDistanceMode::HardCutoff, "Hard Cutoff"},
-        {ViewDistanceMode::CoherentNoise, "Coherent Noise"},
-    } }
-  };
-
-  RemixGui::ComboWithKey<ViewDistanceFunction> viewDistanceFunctionCombo {
-    "View Distance Function",
-    RemixGui::ComboWithKey<ViewDistanceFunction>::ComboEntries { {
-        {ViewDistanceFunction::Euclidean, "Euclidean"},
-        {ViewDistanceFunction::PlanarEuclidean, "Horizontal"},
-    } }
-  };
-
-  static auto fusedWorldViewModeCombo = RemixGui::ComboWithKey<FusedWorldViewMode>(
-  "Fused World-View Mode",
-  RemixGui::ComboWithKey<FusedWorldViewMode>::ComboEntries { {
-      {FusedWorldViewMode::None, "None"},
-      {FusedWorldViewMode::View, "In View Transform"},
-      {FusedWorldViewMode::World, "In World Transform"},
-  } });
-
-  static auto skyAutoDetectCombo = RemixGui::ComboWithKey<SkyAutoDetectMode>(
-    "Sky Auto-Detect",
-    RemixGui::ComboWithKey<SkyAutoDetectMode>::ComboEntries{ {
-      {SkyAutoDetectMode::None, "Off"},
-      {SkyAutoDetectMode::CameraPosition, "By Camera Position"},
-      {SkyAutoDetectMode::CameraPositionAndDepthFlags, "By Camera Position and Depth Flags"}
-  } });
-
   static auto upscalerNoDLSSCombo = RemixGui::ComboWithKey<UpscalerType>(
     "Upscaler Type",
     { {
@@ -323,30 +203,6 @@ namespace dxvk {
     } }
   };
 
-  RemixGui::ComboWithKey<RussianRouletteMode> secondPlusBounceRussianRouletteModeCombo {
-    "2nd+ Bounce Russian Roulette Mode",
-    RemixGui::ComboWithKey<RussianRouletteMode>::ComboEntries { {
-        {RussianRouletteMode::ThroughputBased, "Throughput Based"},
-        {RussianRouletteMode::SpecularBased, "Specular Based"}
-    } }
-  };
-
-  RemixGui::ComboWithKey<IntegrateIndirectMode> integrateIndirectModeCombo {
-    "Integrate Indirect Illumination Mode",
-    RemixGui::ComboWithKey<IntegrateIndirectMode>::ComboEntries { {
-        {IntegrateIndirectMode::ImportanceSampled, "Importance Sampled",  
-          "Importance Sampled. Importance sampled mode uses typical GI sampling and it is not recommended for general use as it provides the noisiest output.\n"
-          "It serves as a reference integration mode for validation of other indirect integration modes." },
-        {IntegrateIndirectMode::ReSTIRGI, "ReSTIR GI", 
-          "ReSTIR GI provides improved indirect path sampling over \"Importance Sampled\" mode with better indirect diffuse and specular GI quality at increased performance cost."},
-        {IntegrateIndirectMode::NeuralRadianceCache, "RTX Neural Radiance Cache", 
-          "RTX Neural Radiance Cache (NRC). NRC is an AI based world space radiance cache. It is live trained by the path tracer\n"
-          "and allows paths to terminate early by looking up the cached value and saving performance.\n"
-          "NRC supports infinite bounces and often provides results closer to that of reference than ReSTIR GI\n"
-          "while increasing performance in scenarios where ray paths have 2 or more bounces on average."}
-    } }
-  };
-
   RemixGui::ComboWithKey<int> dlfgMfgModeCombo {
     "DLSS Frame Generation Mode",
     RemixGui::ComboWithKey<int>::ComboEntries { {
@@ -374,114 +230,6 @@ namespace dxvk {
         {ReflexMode::LowLatencyBoost, "Enabled + Boost"},
     } }
   };
-
-#ifdef REMIX_DEVELOPMENT
-  RemixGui::ComboWithKey<dxvk::RtxFramePassStage>::ComboEntries aliasingPassComboEntries = { {
-      { RtxFramePassStage::FrameBegin, "FrameBegin" },
-      { RtxFramePassStage::Volumetrics, "Volumetrics" },
-      { RtxFramePassStage::SparseRendering, "SparseRendering" },
-      { RtxFramePassStage::VolumeIntegrateRestirInitial, "VolumeIntegrateRestirInitial" },
-      { RtxFramePassStage::VolumeIntegrateRestirVisible, "VolumeIntegrateRestirVisible" },
-      { RtxFramePassStage::VolumeIntegrateRestirTemporal, "VolumeIntegrateRestirTemporal" },
-      { RtxFramePassStage::VolumeIntegrateRestirSpatialResampling, "VolumeIntegrateRestirSpatialResampling" },
-      { RtxFramePassStage::VolumeIntegrateRaytracing, "VolumeIntegrateRaytracing" },
-      { RtxFramePassStage::GBufferPrimaryRays, "GBufferPrimaryRays" },
-      { RtxFramePassStage::PSR, "PSR" },
-      { RtxFramePassStage::RTXDI_InitialTemporalReuse, "RTXDI_InitialTemporalReuse" },
-      { RtxFramePassStage::RTXDI_SpatialReuse, "RTXDI_SpatialReuse" },
-      { RtxFramePassStage::NEE_Cache, "NEE_Cache" },
-      { RtxFramePassStage::DirectIntegration, "DirectIntegration" },
-      { RtxFramePassStage::RTXDI_ComputeGradients, "RTXDI_ComputeGradients" },
-      { RtxFramePassStage::IndirectIntegration, "IndirectIntegration" },
-      { RtxFramePassStage::NEE_Integration, "NEE_Integration" },
-      { RtxFramePassStage::NRC, "NRC" },
-      { RtxFramePassStage::RTXDI_FilterGradients, "RTXDI_FilterGradients" },
-      { RtxFramePassStage::RTXDI_ComputeConfidence, "RTXDI_ComputeConfidence" },
-      { RtxFramePassStage::ReSTIR_GI_TemporalReuse, "ReSTIR_GI_TemporalReuse" },
-      { RtxFramePassStage::ReSTIR_GI_SpatialReuse, "ReSTIR_GI_SpatialReuse" },
-      { RtxFramePassStage::ReSTIR_GI_FinalShading, "ReSTIR_GI_FinalShading" },
-      { RtxFramePassStage::Demodulate, "Demodulate" },
-      { RtxFramePassStage::NRD, "NRD" },
-      { RtxFramePassStage::CompositionAlphaBlend, "CompositionAlphaBlend" },
-      { RtxFramePassStage::Composition, "Composition" },
-      { RtxFramePassStage::DLSS, "DLSS" },
-      { RtxFramePassStage::DLSSRR, "DLSSRR" },
-      { RtxFramePassStage::DLSSNR, "DLSSNR" },
-      { RtxFramePassStage::NIS, "NIS" },
-      { RtxFramePassStage::XeSS, "XeSS" },
-      { RtxFramePassStage::TAA, "TAA" },
-      { RtxFramePassStage::DustParticles, "DustParticles" },
-      { RtxFramePassStage::Bloom, "Bloom" },
-      { RtxFramePassStage::PostFX, "PostFX" },
-      { RtxFramePassStage::AutoExposure_Histogram, "AutoExposure_Histogram" },
-      { RtxFramePassStage::AutoExposure_Exposure, "AutoExposure_Exposure" },
-      { RtxFramePassStage::ToneMapping, "ToneMapping" },
-      { RtxFramePassStage::FrameEnd, "FrameEnd" },
-  } };
-
-  static auto aliasingBeginPassCombo = RemixGui::ComboWithKey<dxvk::RtxFramePassStage>(
-    "Aliasing Begin Pass", RemixGui::ComboWithKey<dxvk::RtxFramePassStage>::ComboEntries{ aliasingPassComboEntries });
-
-  static auto aliasingEndPassCombo = RemixGui::ComboWithKey<dxvk::RtxFramePassStage>(
-    "Aliasing End Pass", RemixGui::ComboWithKey<dxvk::RtxFramePassStage>::ComboEntries { aliasingPassComboEntries });
-
-  static auto aliasingExtentCombo = RemixGui::ComboWithKey<RtxTextureExtentType>(
-    "Aliasing Extent Type",
-    { {
-      { RtxTextureExtentType::DownScaledExtent, "DownScaledExtent" },
-      { RtxTextureExtentType::TargetExtent, "TargetExtent" },
-      { RtxTextureExtentType::Custom, "Custom" },
-  } } );
-
-  static auto aliasingFormatCombo = RemixGui::ComboWithKey<RtxTextureFormatCompatibilityCategory>(
-     "Aliasing Format",
-     { {
-      { RtxTextureFormatCompatibilityCategory::Color_Format_8_Bits, "8 Bits Color Texture" },
-      { RtxTextureFormatCompatibilityCategory::Color_Format_16_Bits, "16 Bits Color Texture" },
-      { RtxTextureFormatCompatibilityCategory::Color_Format_32_Bits, "32 Bits Color Texture" },
-      { RtxTextureFormatCompatibilityCategory::Color_Format_64_Bits, "64 Bits Color Texture" },
-      { RtxTextureFormatCompatibilityCategory::Color_Format_128_Bits, "128 Bits Color Texture" },
-      { RtxTextureFormatCompatibilityCategory::Color_Format_256_Bits, "256 Bits Color Texture" },
-      // All other formats
-      { RtxTextureFormatCompatibilityCategory::InvalidFormatCompatibilityCategory, "Not Listed Format" },
-     } }
-  );
-
-  static auto aliasingImageTypeCombo = RemixGui::ComboWithKey<VkImageType>(
-     "Aliasing Image Type",
-     { {
-      { VK_IMAGE_TYPE_1D, "VK_IMAGE_TYPE_1D" },
-      { VK_IMAGE_TYPE_2D, "VK_IMAGE_TYPE_2D" },
-      { VK_IMAGE_TYPE_3D, "VK_IMAGE_TYPE_3D" },
-     } }
-  );
-
-  static auto aliasingImageViewTypeCombo = RemixGui::ComboWithKey<VkImageViewType>(
-     "Aliasing Image View Type",
-     { {
-      { VK_IMAGE_VIEW_TYPE_1D, "VK_IMAGE_VIEW_TYPE_1D" },
-      { VK_IMAGE_VIEW_TYPE_1D_ARRAY, "VK_IMAGE_VIEW_TYPE_1D_ARRAY" },
-      { VK_IMAGE_VIEW_TYPE_2D, "VK_IMAGE_VIEW_TYPE_2D" },
-      { VK_IMAGE_VIEW_TYPE_2D_ARRAY, "VK_IMAGE_VIEW_TYPE_2D_ARRAY" },
-      { VK_IMAGE_VIEW_TYPE_3D, "VK_IMAGE_VIEW_TYPE_3D" },
-      { VK_IMAGE_VIEW_TYPE_CUBE, "VK_IMAGE_VIEW_TYPE_CUBE" },
-      { VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, "VK_IMAGE_VIEW_TYPE_CUBE_ARRAY" },
-     } }
-  );
-#endif
-
-  enum class TerrainMode {
-    None,
-    TerrainBaker,
-    AsDecals,
-  };
-  static auto terrainModeCombo = RemixGui::ComboWithKey<TerrainMode>(
-    "Mode##terrain",
-    {
-      {        TerrainMode::None,              "None"},
-      {TerrainMode::TerrainBaker,     "Terrain Baker"},
-      {    TerrainMode::AsDecals, "Terrain-as-Decals"},
-  });
 
   static auto themeCombo = RemixGui::ComboWithKey<ImGUI::Theme>(
     "Mode##theme",
@@ -560,8 +308,6 @@ namespace dxvk {
     pool_info.poolSizeCount = std::size(pool_sizes);
     pool_info.pPoolSizes = pool_sizes;
 
-    integrateIndirectModeCombo.removeComboEntry(IntegrateIndirectMode::NeuralRadianceCache);
-
     m_device->vkd()->vkCreateDescriptorPool(m_device->handle(), &pool_info, nullptr, &m_imguiPool);
 
     // Initialize the core structures of ImGui and ImPlot
@@ -578,8 +324,6 @@ namespace dxvk {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    m_capture = new ImGuiCapture(this);
-
     if (RtxOptions::useNewGuiInputMethod()) {
       m_overlayWin = new GameOverlay("RemixGuiInputSink", this);
     }
@@ -588,8 +332,6 @@ namespace dxvk {
   ImGUI::~ImGUI() {
     // Joins the overlay thread, which feeds input into the ImGui context torn down below.
     m_overlayWin = nullptr;
-
-    g_imguiTextureMap.clear();
 
     ImGui::SetCurrentContext(m_context);
     ImPlot::SetCurrentContext(m_plotContext);
@@ -618,31 +360,6 @@ namespace dxvk {
     ImGui::DestroyContext(m_context);
   }
   
-  void ImGUI::AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags) {
-    if (g_imguiTextureMap.find(hash) == g_imguiTextureMap.end()) {
-      ImGuiTexture texture;
-      texture.imageView = imageView; // Hold a refcount
-      texture.texID = VK_NULL_HANDLE;
-      texture.textureFeatureFlags = textureFeatureFlags;
-      g_imguiTextureMap[hash] = texture;
-    }
-  }
-
-  void ImGUI::ReleaseTexture(const XXH64_hash_t hash) {
-    if (RtxOptions::keepTexturesForTagging()) {
-      return;
-    }
-    
-    // Note: Erase will do nothing if the hash does not exist in the map, and erase it if it is.
-    g_imguiTextureMap.erase(hash);
-  }
-
-  void ImGUI::SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash) {
-    const std::lock_guard<std::mutex> lock(g_imguiFogMapMutex);
-    g_imguiFogMap = fogStates;
-    g_usedFogStateHash = usedFogHash;
-  }
-
   void ImGUI::wndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->gameWndProcHandler(hWnd, msg, wParam, lParam);
@@ -736,106 +453,6 @@ namespace dxvk {
     }
   }
   
-  void ImGUI::showMaterialOptions() {
-    if (RemixGui::CollapsingHeader("Material Options (optional)", collapsingHeaderClosedFlags)) {
-      ImGui::Indent();
-
-      if (RemixGui::CollapsingHeader("Legacy Material Defaults", collapsingHeaderFlags)) {
-        ImGui::Indent();
-
-        RemixGui::Checkbox("Use Albedo/Opacity Texture (if present)", &LegacyMaterialDefaults::useAlbedoTextureIfPresentObject());
-        RemixGui::Checkbox("Ignore Texture Alpha Channel", &LegacyMaterialDefaults::ignoreAlphaChannelObject());
-        RemixGui::ColorEdit3("Albedo", &LegacyMaterialDefaults::albedoConstantObject());
-        RemixGui::DragFloat("Opacity", &LegacyMaterialDefaults::opacityConstantObject(), 0.01f, 0.f, 1.f);
-        RemixGui::ColorEdit3("Emissive Color", &LegacyMaterialDefaults::emissiveColorConstantObject());
-        RemixGui::DragFloat("Emissive Intensity", &LegacyMaterialDefaults::emissiveIntensityObject(), 0.01f, 0.01f, FLT_MAX, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Roughness", &LegacyMaterialDefaults::roughnessConstantObject(), 0.01f, 0.02f, 1.f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Metallic", &LegacyMaterialDefaults::metallicConstantObject(), 0.01f, 0.0f, 1.f, "%.3f", sliderFlags);
-        RemixGui::DragFloat("Anisotropy", &LegacyMaterialDefaults::anisotropyObject(), 0.01f, -1.0f, 1.f, "%.3f", sliderFlags);
-
-        ImGui::Unindent();
-      }
-
-      if (RemixGui::CollapsingHeader("PBR Material Modifiers", collapsingHeaderFlags)) {
-        ImGui::Indent();
-
-        if (RemixGui::CollapsingHeader("Opaque", collapsingHeaderFlags)) {
-          ImGui::Indent();
-
-          RemixGui::SliderFloat("Albedo Scale", &OpaqueMaterialOptions::albedoScaleObject(), 0.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Albedo Bias", &OpaqueMaterialOptions::albedoBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Metallic Scale", &OpaqueMaterialOptions::metallicScaleObject(), 0.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Metallic Bias", &OpaqueMaterialOptions::metallicBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Roughness Scale", &OpaqueMaterialOptions::roughnessScaleObject(), 0.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Roughness Bias", &OpaqueMaterialOptions::roughnessBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::DragFloat("Hair Cards Mip Bias", &RtxOptions::hairCardMipBiasObject(), 0.25f, -32.0f, 16.0f, "%.2f", sliderFlags);
-          RemixGui::DragFloat("Hair Cards Roughness Scale", &RtxOptions::hairCardRoughnessScaleObject(), 0.01f, 0.0f, 4.0f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Normal Strength##1", &OpaqueMaterialOptions::normalIntensityObject(), -10.0f, 10.f, "%.3f", sliderFlags);
-
-          RemixGui::Checkbox("Enable dual-layer animated water normal for Opaque", &OpaqueMaterialOptions::layeredWaterNormalEnableObject());
-
-          if (OpaqueMaterialOptions::layeredWaterNormalEnable()) {
-            ImGui::TextWrapped("Animated water with Opaque material is dependent on the original draw call animating using a texture transform.");
-            RemixGui::SliderFloat2("Layered Motion Direction", &OpaqueMaterialOptions::layeredWaterNormalMotionObject(), -1.0f, 1.0f, "%.3f", sliderFlags);
-            RemixGui::SliderFloat("Layered Motion Scale", &OpaqueMaterialOptions::layeredWaterNormalMotionScaleObject(), -10.0f, 10.0f, "%.3f", sliderFlags);
-            RemixGui::SliderFloat("LOD bias", &OpaqueMaterialOptions::layeredWaterNormalLodBiasObject(), 0.0f, 16.0f, "%.3f", sliderFlags);
-          }
-
-          ImGui::Unindent();
-        }
-
-        if (RemixGui::CollapsingHeader("Translucent", collapsingHeaderFlags)) {
-          ImGui::Indent();
-
-          RemixGui::SliderFloat("Transmit. Color Scale", &TranslucentMaterialOptions::transmittanceColorScaleObject(), 0.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Transmit. Color Bias", &TranslucentMaterialOptions::transmittanceColorBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
-          RemixGui::SliderFloat("Normal Strength##2", &TranslucentMaterialOptions::normalIntensityObject(), -10.0f, 10.f, "%.3f", sliderFlags);
-          RemixGui::DragFloat("IOR Scale", &TranslucentMaterialOptions::refractiveIndexScaleObject(), 0.01f, 0.1f, 3.0f);
-
-          RemixGui::Checkbox("Enable dual-layer animated water normal for Translucent", &TranslucentMaterialOptions::animatedWaterEnableObject());
-          if (TranslucentMaterialOptions::animatedWaterEnable()) {
-            ImGui::TextWrapped("Animated water with Translucent materials will animate using Remix animation time.");
-
-            RemixGui::SliderFloat2("Primary Texcoord Velocity", &TranslucentMaterialOptions::animatedWaterPrimaryNormalMotionObject(), -0.5f, 0.5f, "%.3f", sliderFlags);
-            RemixGui::SliderFloat2("Secondary Normal Texcoord Velocity", &TranslucentMaterialOptions::animatedWaterSecondaryNormalMotionObject(), -0.5f, 0.5f, "%.3f", sliderFlags);
-            RemixGui::SliderFloat("Secondary Normal LOD bias", &TranslucentMaterialOptions::animatedWaterSecondaryNormalLodBiasObject(), 0.0f, 16.0f, "%.3f", sliderFlags);
-          }
-          ImGui::Unindent();
-        }
-
-        ImGui::Unindent();
-      }
-
-      if (RemixGui::CollapsingHeader("PBR Material Overrides", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-
-        if (RemixGui::CollapsingHeader("Opaque", collapsingHeaderFlags)) {
-          ImGui::Indent();
-
-          RemixGui::Checkbox("Enable Thin-Film Layer", &OpaqueMaterialOptions::enableThinFilmOverrideObject());
-
-          if (OpaqueMaterialOptions::enableThinFilmOverride()) {
-            RemixGui::SliderFloat("Thin Film Thickness", &OpaqueMaterialOptions::thinFilmThicknessOverrideObject(), 0.0f, OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS, "%.1f nm", sliderFlags);
-          }
-
-          ImGui::Unindent();
-        }
-
-        if (RemixGui::CollapsingHeader("Translucent", collapsingHeaderFlags)) {
-          ImGui::Indent();
-
-          RemixGui::Checkbox("Enable Diffuse Layer", &TranslucentMaterialOptions::enableDiffuseLayerOverrideObject());
-
-          ImGui::Unindent();
-        }
-
-        ImGui::Unindent();
-      }
-
-      ImGui::Unindent();
-    }
-  }
-
   void ImGUI::processHotkeys() {
     auto& io = ImGui::GetIO();
 
@@ -861,15 +478,8 @@ namespace dxvk {
 
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
     processHotkeys();
-    updateQuickActions(ctx);
 
     m_splash->update(m_largeFont);
-
-    m_about->update(ctx);
-    
-    m_capture->update(ctx);
-
-    showDebugVisualizations(ctx);
 
     // On first frame, check if the first-use guide should be shown (overrides loaded showUI).
     {
@@ -937,55 +547,6 @@ namespace dxvk {
     ImGui::Render();
   }
 
-  void ImGUI::updateQuickActions(const Rc<DxvkContext>& ctx) {
-#ifdef REMIX_DEVELOPMENT
-    enum RtxQuickAction : uint32_t {
-      kOriginal = 0,
-      kRtxOnEnhanced,
-      kRtxOn,
-      kCount
-    };
-
-    auto common = ctx->getCommonObjects();
-    static RtxQuickAction sQuickAction = common->getSceneManager().hasAnyMods() ? RtxQuickAction::kRtxOnEnhanced : RtxQuickAction::kRtxOn;
-
-    if (ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_KeypadAdd))) {
-      sQuickAction = (RtxQuickAction) ((sQuickAction + 1) % RtxQuickAction::kCount);
-
-      // Skip "RTX On Enhanced" if no mods are present — the mode would be identical to plain RTX On
-      if(!common->getSceneManager().hasAnyMods() && sQuickAction == RtxQuickAction::kRtxOnEnhanced)
-        sQuickAction = (RtxQuickAction) ((sQuickAction + 1) % RtxQuickAction::kCount);
-
-      switch (sQuickAction) {
-      case RtxQuickAction::kOriginal:
-        RtxOptions::enableRaytracing.setDeferred(false);
-        RtxOptions::enableReplacementLights.setDeferred(false);
-        RtxOptions::enableReplacementMaterials.setDeferred(false);
-        RtxOptions::enableReplacementMeshes.setDeferred(false);
-        break;
-      case RtxQuickAction::kRtxOnEnhanced:
-        RtxOptions::enableReplacementLights.setDeferred(true);
-        RtxOptions::enableReplacementMaterials.setDeferred(true);
-        RtxOptions::enableReplacementMeshes.setDeferred(true);
-        break;
-      case RtxQuickAction::kRtxOn:
-        RtxOptions::enableReplacementLights.setDeferred(false);
-        RtxOptions::enableReplacementMaterials.setDeferred(false);
-        RtxOptions::enableReplacementMeshes.setDeferred(false);
-        break;
-      case RtxQuickAction::kCount:
-        assert(false && "invalid RtxQuickAction::kCount in ImGUI::updateQuickActions");
-        break;
-      }
-    }
-#endif
-  }
-
-
-  void ImGUI::showDebugVisualizations(const Rc<DxvkContext>& ctx) {
-    (void)ctx;
-  }
-
   void ImGUI::showMainMenu(const Rc<DxvkContext>& ctx) {
     // Target rtx.conf layer for developer menu changes
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::User);
@@ -1017,13 +578,6 @@ namespace dxvk {
       // Tab Bar
       if (ImGui::BeginTabBar("Developer Tabs", tab_bar_flags)) {
         for (int n = 0; n < kTab_Count; n++) {
-          // Game Setup and Enhancements author a ray-traced scene this branch does not build.
-          if (n == kTab_Setup || n == kTab_Enhancements) {
-            if (n == m_triggerTab) {
-              m_triggerTab = kTab_Count;
-            }
-            continue;
-          }
           auto tabItemFlags = tab_item_flags;
           if(n == m_triggerTab) {
             tabItemFlags |= ImGuiTabItemFlags_SetSelected;
@@ -1034,9 +588,6 @@ namespace dxvk {
             switch (tab) {
             case kTab_Rendering:
               showRenderingSettings(ctx);
-              break;
-            case kTab_Setup:
-            case kTab_Enhancements:
               break;
             case kTab_About:
               m_about->show(ctx);
@@ -1189,34 +740,6 @@ namespace dxvk {
                             "It does not save the changes.");
         }
       }
-
-      ImGui::Spacing();
-      ImGui::Separator();
-      ImGui::Spacing();
-
-      // --- Create .conf file for Logic ---
-      ImGui::Text("Create .conf file for Logic:");
-      ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(Only unsaved Remix Config changes will be exported)");
-      static char exportFileName[512] = "exported_rtx.conf";
-      ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 100);
-      ImGui::InputText("##ExportFileName", exportFileName, IM_ARRAYSIZE(exportFileName));
-      ImGui::SameLine();
-      ImGui::BeginDisabled(!rtxHasUnsaved);
-      if (ImGui::Button("Create", ImVec2(-1, 0))) {
-        if (rtxConfLayer) {
-          std::string exportPath(exportFileName);
-          rtxConfLayer->exportUnsavedChanges(exportPath);
-        }
-      }
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-        if (rtxHasUnsaved) {
-          ImGui::SetTooltip("Create a .conf file containing only the unsaved changes from rtx.conf.\nIf the file already exists, changes will be merged into it.");
-        } else {
-          ImGui::SetTooltip("No unsaved changes in rtx.conf to export.");
-        }
-      }
-      ImGui::EndDisabled();
-
     }
 
     ImGui::Spacing();
@@ -1286,58 +809,6 @@ namespace dxvk {
       const auto compilationText = str::format("Compiling shaders (", asyncShaderCompilationCount, " remaining)");
 
       hudMessages.emplace_back(std::move(compilationText), "This may take some time if shaders are not cached yet.\nRemix will not render properly until compilation is finished.");
-    }
-
-    // Add Enhancement Loading HUD messages
-
-    const auto replacementStates = common->getSceneManager().getReplacementStates();
-    std::string replacementLoadingSubtext;
-    std::uint32_t loadingReplacementStateCount{ 0U };
-
-    for (std::size_t i{ 0U }; i < replacementStates.size(); ++i) {
-      auto&& replacementState = replacementStates[i];
-
-      // Add a newline when reporting on more than one mod in a loading state
-
-      if (loadingReplacementStateCount != 0) {
-        replacementLoadingSubtext += '\n';
-      }
-
-      // Hide individual mod progress messages beyond a requested amount
-      // Note: This ensures if for some reason there are a significant amount of mods in place that the screen will not be filled with progress hud messages.
-
-      constexpr std::size_t maxModProgressCount{ 4 };
-
-      if (loadingReplacementStateCount >= maxModProgressCount) {
-        replacementLoadingSubtext += str::format(replacementStates.size() - maxModProgressCount, " more hidden...");
-
-        break;
-      }
-
-      // Set the progress message if the mod is in a loading state and increment the number of currently loading mods
-
-      switch (replacementState.progressState) {
-      case Mod::ProgressState::OpeningUSD: replacementLoadingSubtext += str::format("Opening USD"); break;
-      case Mod::ProgressState::ProcessingMaterials: replacementLoadingSubtext += str::format("Processing Materials (", replacementState.progressCount, " processed)"); break;
-      case Mod::ProgressState::ProcessingMeshes: replacementLoadingSubtext += str::format("Processing Meshes (", replacementState.progressCount, " processed)"); break;
-      case Mod::ProgressState::ProcessingLights: replacementLoadingSubtext += str::format("Processing Lights (", replacementState.progressCount, " processed)"); break;
-      default: break;
-      }
-
-      if (
-        replacementState.progressState == Mod::ProgressState::OpeningUSD ||
-        replacementState.progressState == Mod::ProgressState::ProcessingMaterials ||
-        replacementState.progressState == Mod::ProgressState::ProcessingMeshes ||
-        replacementState.progressState == Mod::ProgressState::ProcessingLights
-      ) {
-        ++loadingReplacementStateCount;
-      }
-    }
-
-    assert((loadingReplacementStateCount == 0U) == replacementLoadingSubtext.empty());
-
-    if (loadingReplacementStateCount != 0U) {
-      hudMessages.emplace_back("Loading enhancements", replacementLoadingSubtext);
     }
 
     // Draw Hud Messages
@@ -1590,57 +1061,6 @@ namespace dxvk {
         RemixGui::SliderInt("Present delay", &RtxOptions::presentThrottleDelayObject(), 1, 1000, "%d ms", sliderFlags);
         ImGui::Unindent();
       }
-      RemixGui::Checkbox("Hash Collision Detection", &HashCollisionDetectionOptions::enableObject());
-      RemixGui::Checkbox("Validate CPU index data", &RtxOptions::validateCPUIndexDataObject());
-
-#ifdef REMIX_DEVELOPMENT
-      if (RemixGui::CollapsingHeader("Resource Aliasing Query", collapsingHeaderClosedFlags)) {
-        ImGui::Indent();
-        aliasingBeginPassCombo.getKey(&RtxOptions::Aliasing::beginPassObject());
-        aliasingEndPassCombo.getKey(&RtxOptions::Aliasing::endPassObject());
-        aliasingFormatCombo.getKey(&RtxOptions::Aliasing::formatCategoryObject());
-        aliasingExtentCombo.getKey(&RtxOptions::Aliasing::extentTypeObject());
-        const auto aliasingExtentType = RtxOptions::Aliasing::extentType();
-        if (aliasingExtentType == RtxTextureExtentType::Custom) {
-          RemixGui::DragInt("Aliasing Width", &RtxOptions::Aliasing::widthObject());
-          RemixGui::DragInt("Aliasing Height", &RtxOptions::Aliasing::heightObject());
-        }
-        if (RtxOptions::Aliasing::imageType() == VkImageType::VK_IMAGE_TYPE_3D)
-        {
-          RemixGui::DragInt("Aliasing Depth", &RtxOptions::Aliasing::depthObject());
-        }
-        RemixGui::DragInt("Aliasing Layer", &RtxOptions::Aliasing::layerObject());
-        aliasingImageTypeCombo.getKey(&RtxOptions::Aliasing::imageTypeObject());
-        aliasingImageViewTypeCombo.getKey(&RtxOptions::Aliasing::imageViewTypeObject());
-
-        if (IMGUI_ADD_TOOLTIP(ImGui::Button("Check aliasing for a new resource"),
-          "Make sure to check the resources can be aliased under all major settings. For example, DLSS-RR or NRD, NRC or ReSTIR-GI.")) {
-          Resources::s_queryAliasing = true;
-        } else {
-          Resources::s_queryAliasing = false;
-        }
-        std::string resourceAliasingQueryText = "Resource Aliasing Query Result: (NRD, ";
-        if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache) {
-          resourceAliasingQueryText += "NRC)";
-        } else if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::ReSTIRGI) {
-          resourceAliasingQueryText += "ReSTIR-GI)";
-        } else {
-          resourceAliasingQueryText += "ImportanceSampled)";
-        }
-
-        ImGui::Text(resourceAliasingQueryText.c_str());
-        ImGui::Text("%s", Resources::s_resourceAliasingQueryText.c_str());
-
-        if (IMGUI_ADD_TOOLTIP(ImGui::Button("Check aliasing for current resources"), "Make sure the resources are being active when checking for aliasing.")) {
-          Resources::s_startAliasingAnalyzer = true;
-        } else {
-          Resources::s_startAliasingAnalyzer = false;
-        }
-        auto& str = Resources::s_aliasingAnalyzerResultText;
-        ImGui::Text("Available Aliasing:\n%s", Resources::s_aliasingAnalyzerResultText.c_str());
-        ImGui::Unindent();
-      }
-#endif
     }
 
     if (IMGUI_ADD_TOOLTIP(RemixGui::CollapsingHeader("Option Layers"), "View what options are present in each layer, and alter the blend strength and threshold for them.")) {
@@ -1861,672 +1281,6 @@ namespace dxvk {
     }
 
     ImGui::PopItemWidth();
-  }
-
-  namespace {
-    Vector2i tovec2i(const ImVec2& v) {
-      return Vector2i { static_cast<int>(v.x), static_cast<int>(v.y) };
-    };
-
-    bool isWorldTextureSelectionAllowed() {
-      // mouse cursor is not obstructed by any imgui window
-      return !ImGui::GetIO().WantCaptureMouse;
-    }
-
-    bool isMaterialReplacement(SceneManager&, XXH64_hash_t) {
-      return false;
-    }
-
-    std::string makeTextureInfo(XXH64_hash_t texHash, bool isMaterialReplacement, bool includeLayerInfo = true) {
-      auto iter = g_imguiTextureMap.find(texHash);
-      if (iter == g_imguiTextureMap.end()) {
-        return {};
-      }
-      const auto& imageInfo = iter->second.imageView->imageInfo();
-
-      const auto isRT = (imageInfo.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-
-      const auto vkFormatName = (std::stringstream{} << imageInfo.format).str();
-      const auto formatName = std::string_view { vkFormatName }.substr(std::string_view{"VK_FORMAT_"}.length());
-
-      auto str = std::ostringstream {};
-      str << (isMaterialReplacement ? "Replaced material" : "Legacy material") << '\n';
-      str << (isRT ? "Render Target " : "Texture ") << imageInfo.extent.width << 'x' << imageInfo.extent.height << '\n';
-      str << formatName << '\n';
-      str << "Hash: " << hashToString(texHash) << '\n';
-      
-      if (!includeLayerInfo) {
-        return str.str();
-      }
-      
-      // For each category, show which layers add/remove this hash
-      for (const auto& category : rtxTextureOptions) {
-        if (!category.textureSetOption) {
-          continue;
-        }
-        
-        std::string layerValues = RemixGui::FormatOptionLayerValues(category.textureSetOption, texHash, true);
-        if (!layerValues.empty()) {
-          str << '\n' << category.displayName << ":\n" << layerValues;
-        }
-      }
-      
-      return str.str();
-    }
-
-    std::string buildTextureCategoryTooltip(const RtxTextureOption& category,
-                                            std::optional<XXH64_hash_t> texHash = std::nullopt) {
-      if (!category.textureSetOption) {
-        assert(false && "Texture category is missing an RTX option.");
-        return category.displayName;
-      }
-
-      std::string tooltipText;
-      const char* description = category.textureSetOption->getDescription();
-      if (description && description[0] != '\0') {
-        tooltipText = description;
-        tooltipText += "\n\n";
-      }
-
-      tooltipText += category.textureSetOption->getFullName();
-
-      if (texHash.has_value()) {
-        std::string layerValues = RemixGui::FormatOptionLayerValues(category.textureSetOption, texHash, false);
-        if (!layerValues.empty()) {
-          tooltipText += "\n\nPer-layer status for this hash:\n";
-          tooltipText += layerValues;
-        }
-      }
-
-      return tooltipText;
-    }
-
-    float computeTexturePopupLabelColumnWidth(uint32_t textureFeatureFlags) {
-      float maxWidth = 0.0f;
-      for (const auto& rtxOption : rtxTextureOptions) {
-        if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
-          continue;
-        }
-        const std::string labelForWidth = std::string(rtxOption.displayName) + " [!]";
-        maxWidth = ImMax(maxWidth, ImGui::CalcTextSize(labelForWidth.c_str()).x);
-      }
-      return maxWidth + ImGui::GetStyle().FramePadding.x * 2.0f;
-    }
-
-    void toggleTextureSelection(XXH64_hash_t textureHash, const char* uniqueId, RtxOption<fast_unordered_set>* textureSet) {
-      if (textureHash == kEmptyHash) {
-        return;
-      }
-      
-      // Determine if user wants to add (currently unchecked) or remove (currently checked)
-      const bool userWantsRemove = textureSet->containsHash(textureHash);
-
-      // Analyze the layer state in a single pass
-      const RtxOptionLayer* targetLayer = textureSet->getTargetLayer();
-      const auto& targetKey = targetLayer->getLayerKey();
-      
-      // Track target layer's opinion and strongest weaker layer's opinion
-      bool targetHasPositive = false;
-      bool targetHasNegative = false;
-      bool weakerLayerAddsHash = false;  // True if strongest weaker layer adds this hash
-      
-      textureSet->forEachLayerValue([&](const RtxOptionLayer* layer, const GenericValue& value) {
-        const HashSetLayer* hashSet = value.hashSet;
-        const auto& layerKey = layer->getLayerKey();
-        
-        if (layerKey == targetKey) {
-          targetHasPositive = hashSet->hasPositive(textureHash);
-          targetHasNegative = hashSet->hasNegative(textureHash);
-        } else if (targetKey < layerKey) {
-          // First weaker layer with an opinion - determines what happens without target layer
-          weakerLayerAddsHash = hashSet->hasPositive(textureHash);
-          return false; // Stop iteration
-        }
-        return true; // Continue
-      }, textureHash);
-
-      // Lambda to apply the user's intended action to the target layer
-      auto applyAction = [textureSet, textureHash, targetLayer, userWantsRemove, weakerLayerAddsHash, uniqueId,
-                          targetHasPositive, targetHasNegative]() {
-        const char* action;
-        if (userWantsRemove) {
-          // User wants to remove this hash from the resolved set
-          if (!targetHasNegative) {
-            // Either the target has a positive opinion, or no opinion at all
-            // In both cases, create a negative opinion to express "I don't want this"
-            textureSet->removeHash(textureHash, targetLayer);
-            action = "removed (negative opinion)";
-          } else {
-            // Already has a negative opinion - nothing to do
-            action = "already removed";
-          }
-        } else {
-          // User wants to add this hash to the resolved set
-          if (!targetHasPositive) {
-            // Either the target has a negative opinion, or no opinion at all
-            // In both cases, create a positive opinion to express "I want this"
-            textureSet->addHash(textureHash, targetLayer);
-            action = "added (positive opinion)";
-          } else {
-            // Already has a positive opinion - nothing to do
-            action = "already added";
-          }
-        }
-
-        char buffer[256];
-        sprintf_s(buffer, "%s - %s %016llX\n", uniqueId, action, textureHash);
-        Logger::info(buffer);
-      };
-
-      // Check for blocking layers using the standardized popup system.
-      // If blocked, popup is shown and applyAction will be called after user clears blockers.
-      // If not blocked, apply directly.
-      if (!RemixGui::CheckRtxOptionPopups(textureSet, textureHash, applyAction)) {
-        applyAction();
-      }
-    }
-
-    RtxOption<fast_unordered_set>* findTextureSetByUniqueId(const char* uniqueId) {
-      if (uniqueId) {
-        for (RtxTextureOption& category : rtxTextureOptions) {
-          if (strcmp(category.uniqueId, uniqueId) == 0) {
-            return category.textureSetOption;
-          }
-        }
-        for (RtxTextureOption& category : rtxGeometryOptions) {
-          if (strcmp(category.uniqueId, uniqueId) == 0) {
-            return category.textureSetOption;
-          }
-        }
-      }
-      return nullptr;
-    }
-
-    bool isGeometryCategoryId(const char* uniqueId) {
-      if (!uniqueId) {
-        return false;
-      }
-      for (const RtxTextureOption& category : rtxGeometryOptions) {
-        if (strcmp(category.uniqueId, uniqueId) == 0) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    namespace texture_popup {
-      constexpr char POPUP_NAME[] = "rtx_texture_selection_popup";
-
-      bool lastOpenCategoryActive { false };
-      std::string lastOpenCategoryId {};
-
-      bool g_wasLeftClick { false };
-
-      // need to keep a reference to a texture that was passed to 'open()',
-      // as 'open()' is called only once, but popup needs to reference that texture throughout open-close
-      std::atomic<XXH64_hash_t> g_holdingTexture {};
-      std::atomic<XXH64_hash_t> g_holdingGeometry {};
-      bool g_openWhenAvailable {};
-
-      void openImguiPopupOrToggle() {
-        // don't show popup window and toggle the list directly,
-        // if was a left mouse click in the splitted lists
-        bool toggleWithoutPopup = ImGUI::showLegacyTextureGui() &&
-                                  g_wasLeftClick &&
-                                  !lastOpenCategoryId.empty();
-        g_wasLeftClick = false;
-
-        if (toggleWithoutPopup) {
-          const bool geometryCategory = isGeometryCategoryId(lastOpenCategoryId.c_str());
-          const XXH64_hash_t hashToToggle = geometryCategory
-            ? g_holdingGeometry.load()
-            : g_holdingTexture.load();
-          // Geometry categories only toggle from world picks (holding a geometry hash).
-          // Texture-thumbnail clicks leave geometry empty — fall through to the popup.
-          if (!geometryCategory || hashToToggle != kEmptyHash) {
-            if (auto textureSet = findTextureSetByUniqueId(lastOpenCategoryId.c_str())) {
-              toggleTextureSelection(hashToToggle,
-                                     lastOpenCategoryId.c_str(),
-                                     textureSet);
-              return;
-            }
-          }
-        }
-        ImGui::OpenPopup(POPUP_NAME);
-      }
-
-      void open(std::optional<XXH64_hash_t> texHash, std::optional<XXH64_hash_t> geoHash = std::nullopt) {
-        g_holdingTexture.exchange(texHash.value_or(kEmptyHash));
-        g_holdingGeometry.exchange(geoHash.value_or(kEmptyHash));
-        g_openWhenAvailable = false;
-        // no need to wait, open immediately
-        openImguiPopupOrToggle();
-      }
-
-      void openAsync() {
-        g_holdingTexture.exchange(kEmptyHash);
-        g_holdingGeometry.exchange(kEmptyHash);
-        g_openWhenAvailable = true;
-      }
-
-      bool isOpened() {
-        return ImGui::IsPopupOpen(POPUP_NAME);
-      }
-
-      // Returns a texture hash that it holds, if the popup is opened.
-      // Must be called every frame.
-      std::optional<XXH64_hash_t> produce(SceneManager& sceneMgr) {
-        // delayed open, if waiting async to set g_holdingTexture / g_holdingGeometry
-        if (g_openWhenAvailable) {
-          if (g_holdingTexture.load() != kEmptyHash || g_holdingGeometry.load() != kEmptyHash) {
-            openImguiPopupOrToggle();
-            g_openWhenAvailable = false;
-          }
-        }
-
-        const XXH64_hash_t texHashForSizing = g_holdingTexture.load();
-        float texturePopupLabelColumnW = 0.0f;
-        {
-          uint32_t textureFeatureFlagsForSizing = 0;
-          if (texHashForSizing != kEmptyHash) {
-            const auto pairForSizing = g_imguiTextureMap.find(texHashForSizing);
-            if (pairForSizing != g_imguiTextureMap.end()) {
-              textureFeatureFlagsForSizing = pairForSizing->second.textureFeatureFlags;
-            }
-          }
-          texturePopupLabelColumnW = computeTexturePopupLabelColumnWidth(textureFeatureFlagsForSizing);
-          for (const auto& geoOption : rtxGeometryOptions) {
-            const std::string labelForWidth = std::string(geoOption.displayName) + " [!]";
-            texturePopupLabelColumnW = ImMax(texturePopupLabelColumnW,
-                                             ImGui::CalcTextSize(labelForWidth.c_str()).x + ImGui::GetStyle().FramePadding.x * 2.0f);
-          }
-          if (ImGui::IsPopupOpen(POPUP_NAME, ImGuiPopupFlags_None)) {
-            const ImGuiStyle& sizingStyle = ImGui::GetStyle();
-            const float minPopupW =
-              texturePopupLabelColumnW + sizingStyle.ItemInnerSpacing.x + ImGui::GetFrameHeight() + sizingStyle.WindowPadding.x * 2.0f;
-            ImGui::SetNextWindowSizeConstraints(ImVec2(minPopupW, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
-          }
-        }
-
-        if (ImGui::BeginPopup(POPUP_NAME)) {
-          const XXH64_hash_t texHash = g_holdingTexture.load();
-          const XXH64_hash_t geoHash = g_holdingGeometry.load();
-          if (texHash != kEmptyHash || geoHash != kEmptyHash) {
-            if (texHash != kEmptyHash) {
-              ImGui::Text("Texture Info:\n%s", makeTextureInfo(texHash, isMaterialReplacement(sceneMgr, texHash), false).c_str());
-              if (ImGui::Button("Copy Texture hash##texture_popup")) {
-                ImGui::SetClipboardText(hashToString(texHash).c_str());
-              }
-            }
-            if (geoHash != kEmptyHash) {
-              if (texHash != kEmptyHash) {
-                ImGui::Separator();
-              }
-              ImGui::Text("Geometry Hash:\n%s", hashToString(geoHash).c_str());
-              if (ImGui::Button("Copy Geometry hash##texture_popup")) {
-                ImGui::SetClipboardText(hashToString(geoHash).c_str());
-              }
-            }
-
-            uint32_t textureFeatureFlags = 0;
-            if (texHash != kEmptyHash) {
-              const auto& pair = g_imguiTextureMap.find(texHash);
-              if (pair != g_imguiTextureMap.end()) {
-                textureFeatureFlags = pair->second.textureFeatureFlags;
-              }
-            }
-            RemixGui::PushLabelColumnFixedWidth(texturePopupLabelColumnW);
-
-            if (texHash != kEmptyHash) {
-              ImGui::Separator();
-              ImGui::TextUnformatted("Texture Categories");
-              for (auto& rtxOption : rtxTextureOptions) {
-                rtxOption.bufferToggle = rtxOption.textureSetOption->containsHash(texHash);
-                if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
-                  continue;
-                }
-
-                bool hasBlockingLayer = false;
-                const RtxOptionLayer* targetLayer = rtxOption.textureSetOption->getTargetLayer();
-                if (targetLayer) {
-                  hasBlockingLayer = rtxOption.textureSetOption->getBlockingLayer(targetLayer, texHash) != nullptr;
-                }
-
-                std::string displayName = rtxOption.displayName;
-                if (hasBlockingLayer) {
-                  displayName = std::string(rtxOption.displayName) + " [!]";
-                }
-
-                const bool toggleChanged = RemixGui::Checkbox(displayName.c_str(), &rtxOption.bufferToggle);
-                const bool showTooltip = ImGui::IsItemHovered();
-
-                if (toggleChanged) {
-                  toggleTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption);
-                }
-
-                if (showTooltip) {
-                  std::string tooltipText = buildTextureCategoryTooltip(rtxOption, texHash);
-                  RemixGui::SetTooltipUnformatted(tooltipText.c_str());
-                }
-              }
-            }
-
-            if (geoHash != kEmptyHash) {
-              ImGui::Separator();
-              ImGui::TextUnformatted("Geometry Categories");
-              for (auto& geoOption : rtxGeometryOptions) {
-                geoOption.bufferToggle = geoOption.textureSetOption->containsHash(geoHash);
-
-                bool hasBlockingLayer = false;
-                const RtxOptionLayer* targetLayer = geoOption.textureSetOption->getTargetLayer();
-                if (targetLayer) {
-                  hasBlockingLayer = geoOption.textureSetOption->getBlockingLayer(targetLayer, geoHash) != nullptr;
-                }
-
-                std::string displayName = geoOption.displayName;
-                if (hasBlockingLayer) {
-                  displayName = std::string(geoOption.displayName) + " [!]";
-                }
-
-                const bool toggleChanged = RemixGui::Checkbox(displayName.c_str(), &geoOption.bufferToggle);
-                const bool showTooltip = ImGui::IsItemHovered();
-
-                if (toggleChanged) {
-                  toggleTextureSelection(geoHash, geoOption.uniqueId, geoOption.textureSetOption);
-                }
-
-                if (showTooltip) {
-                  std::string tooltipText = buildTextureCategoryTooltip(geoOption, geoHash);
-                  RemixGui::SetTooltipUnformatted(tooltipText.c_str());
-                }
-              }
-            }
-
-            RemixGui::PopLabelColumnFixedWidth();
-
-            ImGui::EndPopup();
-            return texHash != kEmptyHash ? std::optional<XXH64_hash_t>{ texHash } : std::nullopt;
-          }
-          ImGui::EndPopup();
-          return {};
-        } else {
-          // popup is closed, forget hashes
-          g_holdingTexture.exchange(kEmptyHash);
-          g_holdingGeometry.exchange(kEmptyHash);
-          return {};
-        }
-      }
-    }
-
-    // NOTE: this is temporary, might need to show a full replacement material info
-    namespace replacement_popup {
-      double g_startTime { 0 };
-
-      void open(uint32_t surfMaterialIndex) {
-        g_startTime = ImGui::GetTime();
-      }
-
-      // Must be called every frame.
-      std::optional< uint32_t > produce(SceneManager& sceneMgr) {
-        // if mouse is now over imgui windows or there was a click, close this tooltip
-        if (ImGui::GetIO().WantCaptureMouse ||
-            ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-            ImGui::IsMouseClicked(ImGuiMouseButton_Middle) ||
-            ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-          g_startTime = 0;
-        }
-        if (ImGui::GetTime() - g_startTime < 1.5f) {
-          ImGui::SetTooltip("Replacement material");
-        }
-        return {};
-      }
-    }
-
-    float fract(float v) {
-      return v - std::floor(v);
-    }
-
-    // should be in sync with post_fx_highlight.comp.slang::highlightIntensity(),
-    // so animation of post-effect highlight and UI are same
-    float animatedHighlightIntensity(uint64_t timeSinceStartMS) {
-      constexpr float ymax = 0.65f;
-      float t10 = 1.0f - fract(static_cast<float>(timeSinceStartMS) / 1000.0f);
-      return clamp(t10 > ymax ? t10 - (1.0f - ymax) : t10, 0.0f, 1.0f) / ymax;
-    }
-
-    constexpr const char* Uncategorized = "_nocategory";
-  } // anonymous namespace
-
-  void ImGUI::showTextureSelectionGrid(const Rc<DxvkContext>& ctx, const char* uniqueId, const uint32_t texturesPerRow, const float thumbnailSize, const float minChildHeight) {
-    ImGui::PushID(uniqueId);
-    auto common = ctx->getCommonObjects();
-    uint32_t cnt = 0;
-    float x = 0;
-    const float startX = ImGui::GetCursorPosX();
-    const float thumbnailSpacing = ImGui::GetStyle().ItemSpacing.x;
-    const float thumbnailPadding = ImGui::GetStyle().CellPadding.x;
-
-    bool isListFiltered = false;
-    RtxTextureOption listRtxOption{};
-
-    for (auto rtxOption : rtxTextureOptions) {
-      if (strcmp(rtxOption.uniqueId, uniqueId) == 0) {
-        listRtxOption = rtxOption;
-        isListFiltered = true;
-        break;
-      }
-    }
-
-    const ImVec2 availableSize = ImGui::GetContentRegionAvail();
-    const float childWindowHeight = minChildHeight <= 600.0f ? minChildHeight
-                                                             : availableSize.y < 600 ? 600.0f : availableSize.y;
-    ImGuiWindowFlags window_flags = ImGuiWindowFlags_None;
-    ImGui::BeginChild(str::format("Child", uniqueId).c_str(), ImVec2(availableSize.x, childWindowHeight), false, window_flags);
-
-    bool clickedOnTextureButton = false;
-    static std::atomic<XXH64_hash_t> g_jumpto {};
-
-    const XXH64_hash_t textureInPopup = texture_popup::g_holdingTexture.load();
-
-    auto foundTextureHash = std::optional<XXH64_hash_t> {};
-    auto highlightColor = HighlightColor::World;
-
-    for (auto& [texHash, texImgui] : g_imguiTextureMap) {
-      bool textureHasSelection = false;
-
-      if (isListFiltered) {
-        textureHasSelection = listRtxOption.textureSetOption->containsHash(texHash);
-
-        if ((listRtxOption.featureFlagMask & texImgui.textureFeatureFlags) != listRtxOption.featureFlagMask) {
-          // If the list needs to be filtered by texture feature, skip it for this category.
-          continue;
-        }
-      } else {
-        for (const auto rtxOption : rtxTextureOptions) {
-          if (textureHasSelection) {
-            break;
-          }
-          textureHasSelection = rtxOption.textureSetOption->containsHash(texHash);
-        }
-      }
-
-      // Only apply "show assigned only" filtering when using the legacy split texture GUI
-      // When showLegacyTextureGui() is false, we want to show ALL textures in the single grid
-      if (showLegacyTextureGui() && legacyTextureGuiShowAssignedOnly()) {
-        if (std::string_view { uniqueId } == Uncategorized) {
-          if (textureHasSelection) {
-            continue; // Currently handling the uncategorized texture tab and current texture is assigned to a category -> skip
-          }
-        } else {
-          if (!textureHasSelection) {
-            continue; // Texture is not assigned to this category -> skip
-          }
-        }
-      }
-
-      if (texHash == textureInPopup || texHash == g_jumpto.load()) {
-        const auto blueColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
-        const auto nvidiaColor = ImVec4(0.462745f, 0.725490f, 0.f, 1.f);
-
-        const auto color = (texHash == textureInPopup ? blueColor : nvidiaColor);
-        const float anim = animatedHighlightIntensity(GlobalTime::get().absoluteTimeMs());
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(anim * color.x, anim * color.y, anim * color.z, 1.f));
-      } else if (textureHasSelection) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.996078f, 0.329412f, 0.f, 1.f));
-      } else {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, 1.00f));
-      }
-
-      // Lazily create the tex ID ImGUI wants
-      if (texImgui.texID == VK_NULL_HANDLE) {
-        texImgui.texID = ImGui_ImplDxvk::AddTexture(nullptr, texImgui.imageView);
-
-        if (texImgui.texID == VK_NULL_HANDLE) {
-          ONCE(Logger::err("Failed to allocate ImGUI handle for texture, likely because we're trying to render more textures than VkDescriptorPoolCreateInfo::maxSets.  As such, we will truncate the texture list to show only what we can."));
-          return;
-        }
-      }
-
-      const auto& imageInfo = texImgui.imageView->imageInfo();
-
-      // Calculate thumbnail extent with respect to image aspect
-      const float aspect = static_cast<float>(imageInfo.extent.width) / imageInfo.extent.height;
-      const ImVec2 extent {
-        aspect >= 1.f ? thumbnailSize : thumbnailSize * aspect,
-        aspect <= 1.f ? thumbnailSize : thumbnailSize / aspect
-      };
-
-      // Align thumbnail image button
-      const float y = ImGui::GetCursorPosY();
-      ImGui::SetCursorPosX(x + startX + (thumbnailSize - extent.x) / 2.f);
-      ImGui::SetCursorPosY(y + (thumbnailSize - extent.y) / 2.f);
-
-      if (ImGui::ImageButton(texImgui.texID, extent)) {
-        clickedOnTextureButton = true;
-        texture_popup::g_wasLeftClick = true;
-      }
-
-      if (!showLegacyTextureGui() || uniqueId == texture_popup::lastOpenCategoryId) {
-        if (g_jumpto.load() == texHash) {
-          ImGui::SetScrollHereY(0);
-          g_jumpto.exchange(kEmptyHash);
-        }
-      }
-
-      if (!texture_popup::isOpened()) {
-        // if ImageButton is hovered
-        if (ImGui::IsItemHovered()) {
-          // imgui doesn't have right-click on a button, emulate it
-          if (showLegacyTextureGui()) {
-            if (ImGui::IsMouseReleased(ImGuiMouseButton_Right)) {
-              clickedOnTextureButton = true;
-              texture_popup::g_wasLeftClick = false;
-            }
-          }
-
-          foundTextureHash = texHash;
-          highlightColor = HighlightColor::UI;
-
-          // show additional info
-          std::string rtxTextureSelection;
-          for (auto& rtxOption : rtxTextureOptions) {
-            if (rtxOption.textureSetOption->containsHash(texHash)) {
-              if (rtxTextureSelection.empty()) {
-                rtxTextureSelection = "\n";
-              }
-              rtxTextureSelection = str::format(rtxTextureSelection, " - ", rtxOption.displayName, "\n");
-            }
-          }
-          ImGui::SetTooltip("%s\n(Left click to assign categories. Middle click to copy a texture hash.)\n\nCurrent categories:%s",
-                            makeTextureInfo(texHash, isMaterialReplacement(common->getSceneManager(), texHash)).c_str(),
-                            rtxTextureSelection.empty() ? "\n - None\n" : rtxTextureSelection.c_str());
-          if (ImGui::IsMouseReleased(ImGuiMouseButton_Middle)) {
-            ImGui::SetClipboardText(hashToString(texHash).c_str());
-          }
-          texture_popup::lastOpenCategoryId = uniqueId;
-        }
-      }
-
-      ImGui::PopStyleColor(1);
-
-      if (++cnt % texturesPerRow != 0) {
-        x += thumbnailSize + thumbnailSpacing + thumbnailPadding;
-        ImGui::SetCursorPosY(y);
-      } else {
-        x = 0;
-        ImGui::SetCursorPosY(y + thumbnailSize + thumbnailSpacing + thumbnailPadding);
-      }
-    }
-
-    // popup for texture selection from world / ui
-    // Only the "active" category is allowed to control the texture popup and highlighting logic
-    if (!showLegacyTextureGui() || uniqueId == texture_popup::lastOpenCategoryId) {
-      const bool wasUIClick = 
-        !texture_popup::isOpened() && 
-        clickedOnTextureButton;
-
-      const bool wasWorldClick =
-        isWorldTextureSelectionAllowed() &&
-        !texture_popup::isOpened() &&
-        !clickedOnTextureButton && 
-        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right));
-
-      if (wasUIClick) {
-        texture_popup::open(foundTextureHash);
-      } else if (wasWorldClick) {
-        texture_popup::g_wasLeftClick = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-        // open as empty
-        texture_popup::openAsync();
-        // and make a request on a mouse click
-        common->metaDebugView().ObjectPicking.request(
-          tovec2i(ImGui::GetMousePos()),
-          tovec2i(ImGui::GetMousePos()) + Vector2i { 1, 1 },
-
-          // and callback on result:
-          [](std::vector<ObjectPickingValue>&& objectPickingValues, std::optional<XXH64_hash_t> legacyTextureHash,
-             std::optional<XXH64_hash_t> geometryHash) {
-            texture_popup::g_holdingTexture.exchange(legacyTextureHash.value_or(kEmptyHash));
-            texture_popup::g_holdingGeometry.exchange(geometryHash.value_or(kEmptyHash));
-            // move UI menu focus
-            g_jumpto.exchange(legacyTextureHash.value_or(kEmptyHash));
-          });
-      }
-
-      if (wasUIClick) {
-        texture_popup::lastOpenCategoryId = uniqueId;
-      }
-
-      auto texHashToHighlight = std::optional<XXH64_hash_t>{};
-
-      // top priority for what's inside a currently open texture popup
-      if (auto texInPopup = texture_popup::produce(common->getSceneManager())) {
-        texHashToHighlight = *texInPopup;
-        highlightColor = HighlightColor::UI;
-      } else {
-        if (foundTextureHash) {
-          texHashToHighlight = *foundTextureHash;
-        }
-      }
-
-      if (texHashToHighlight) {
-        common->metaDebugView().Highlighting.requestHighlighting(*texHashToHighlight, highlightColor, ctx->getDevice()->getCurrentFrameId());
-      } else {
-        // if no hash to highlight: world -- highlight under a mouse cursor, ui - just desaturate
-        if (isWorldTextureSelectionAllowed()) {
-          common->metaDebugView().Highlighting.requestHighlighting(tovec2i(ImGui::GetMousePos()), highlightColor, ctx->getDevice()->getCurrentFrameId());
-        } else {
-          common->metaDebugView().Highlighting.requestHighlighting(XXH64_hash_t { kEmptyHash }, HighlightColor::UI, ctx->getDevice()->getCurrentFrameId());
-        }
-      }
-
-      // checked after the last 'showTextureSelectionGrid' call to see if saved category is still active
-      texture_popup::lastOpenCategoryActive = true;
-    }
-
-    ImGui::EndChild();
-
-    ImGui::NewLine();
-    ImGui::PopID();
   }
 
   void ImGUI::adjustStyleBackgroundAlpha(const float& alpha, ImGuiStyle* dst) {
@@ -3263,78 +2017,61 @@ namespace dxvk {
       auto& dlss = common->metaDLSS();
       ImGui::Indent();
 
-      {
-        IMGUI_ADD_TOOLTIP(
-          RemixGui::Checkbox("NGX Passthrough Mode", &RtxNgxPassthrough::ngxPassthroughModeObject()),
-          "Presents the game's own rasterized rendering (no path tracing) with the selected upscaler, Frame Generation and Reflex on top.\nA depth buffer created while the mode was off is promoted to a shader-readable layout. Multisampled depth still requires a restart after MSAA is refused.");
+      common->metaNgxPassthrough().showImguiSettings();
 
-        if (RtxNgxPassthrough::ngxPassthroughMode()) {
-          ImGui::Indent();
-          common->metaNgxPassthrough().showImguiSettings();
-          ImGui::Unindent();
-        }
+      RemixGui::Separator();
 
-        RemixGui::Separator();
+      showDLFGOptions(ctx);
+
+      RemixGui::Separator();
+
+      showReflexOptions(ctx, true);
+
+      RemixGui::Separator();
+
+      getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
+
+      RtxOptions::updatePresetFromUpscaler();
+
+      if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+        RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
       }
 
-      if (RtxNgxPassthrough::ngxPassthroughMode()) {
-        showDLFGOptions(ctx);
+      if (RtxOptions::upscalerType() == UpscalerType::DLSS) {
+        dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
+        dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
+      } else if (RtxOptions::upscalerType() == UpscalerType::NIS) {
+        RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+        RemixGui::SliderFloat("Sharpness", &ctx->getCommonObjects()->metaNIS().m_sharpness, 0.1f, 1.0f);
+        RemixGui::Checkbox("Use FP16", &ctx->getCommonObjects()->metaNIS().m_useFp16);
+      } else if (RtxOptions::upscalerType() == UpscalerType::XeSS) {
+        xessPresetCombo.getKey(&DxvkXeSS::XessOptions::presetObject());
 
+        if (DxvkXeSS::XessOptions::preset() == XeSSPreset::Custom) {
+          RemixGui::SliderFloat("Resolution Scale", &RtxOptions::resolutionScaleObject(), 0.1f, 1.0f, "%.2f");
+        }
+
+        uint32_t inputWidth;
+        uint32_t inputHeight;
+        ctx->getCommonObjects()->metaNgxPassthrough().getXeSSInputResolution(
+          uint32_t(ImGui::GetIO().DisplaySize.x),
+          uint32_t(ImGui::GetIO().DisplaySize.y),
+          inputWidth, inputHeight);
+        ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
+      } else if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
+        RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+      }
+
+      auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
+      if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
         RemixGui::Separator();
 
-        showReflexOptions(ctx, true);
-
-        RemixGui::Separator();
-
-        if (ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
-          getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
-        } else {
-          getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
-        }
-
-        RtxOptions::updatePresetFromUpscaler();
-
-        if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
-          RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
-        }
-
-        if (RtxOptions::upscalerType() == UpscalerType::DLSS) {
-          dlssRenderPresetCombo.getKey(&DxvkDLSS::presetObject());
-          dlssProfileCombo.getKey(&RtxOptions::qualityDLSSObject());
-          dlss.showImguiSettings();
-        } else if (RtxOptions::upscalerType() == UpscalerType::NIS) {
-          RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
-          RemixGui::SliderFloat("Sharpness", &ctx->getCommonObjects()->metaNIS().m_sharpness, 0.1f, 1.0f);
-          RemixGui::Checkbox("Use FP16", &ctx->getCommonObjects()->metaNIS().m_useFp16);
-        } else if (RtxOptions::upscalerType() == UpscalerType::XeSS) {
-          xessPresetCombo.getKey(&DxvkXeSS::XessOptions::presetObject());
-
-          if (DxvkXeSS::XessOptions::preset() == XeSSPreset::Custom) {
-            RemixGui::SliderFloat("Resolution Scale", &RtxOptions::resolutionScaleObject(), 0.1f, 1.0f, "%.2f");
-          }
-
-          uint32_t inputWidth;
-          uint32_t inputHeight;
-          ctx->getCommonObjects()->metaNgxPassthrough().getXeSSInputResolution(
-            uint32_t(ImGui::GetIO().DisplaySize.x),
-            uint32_t(ImGui::GetIO().DisplaySize.y),
-            inputWidth, inputHeight);
-          ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
-        } else if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
-          RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
-        }
-
-        auto& dlssNeuralRendering = common->metaDlssNeuralRendering();
-        if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
-          RemixGui::Separator();
-
-          if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Rendering", collapsingHeaderClosedFlags)) {
-            ImGui::Indent();
-            ImGui::PushID("DLSS 3D-Guided Neural Rendering");
-            dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
-            ImGui::PopID();
-            ImGui::Unindent();
-          }
+        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Rendering", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          ImGui::PushID("DLSS 3D-Guided Neural Rendering");
+          dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
+          ImGui::PopID();
+          ImGui::Unindent();
         }
       }
 
@@ -3348,7 +2085,7 @@ namespace dxvk {
     }
 
 
-    if (RtxNgxPassthrough::ngxPassthroughMode() && RemixGui::CollapsingHeader("Post-Processing", collapsingHeaderClosedFlags)) {
+    if (RemixGui::CollapsingHeader("Post-Processing", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
 
 
@@ -3362,9 +2099,6 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Post FX", collapsingHeaderClosedFlags))
         common->metaPostFx().showImguiSettings();
-
-      if (RemixGui::CollapsingHeader("sRGB + Dither", collapsingHeaderClosedFlags))
-        common->metaSRGBDither().showImguiSettings();
 
       ImGui::Unindent();
     }

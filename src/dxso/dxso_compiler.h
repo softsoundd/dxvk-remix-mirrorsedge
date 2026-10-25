@@ -161,13 +161,6 @@ namespace dxvk {
    */
   struct DxsoCompilerVsPart {
     uint32_t functionId       = 0;
-    
-    // NV-DXVK start: vertex shader data capture implementation
-    // Special buffer for vertex streamout
-    uint32_t vertexCaptureConstants;
-    uint32_t capturedVertexStructType;
-    DxsoUav vertexOutBuf;
-    // NV-DXVK end
 
     ////////////////////
     // Address register
@@ -177,21 +170,6 @@ namespace dxvk {
     // Rasterizer output registers
     DxsoRegisterPointer oPos;
     DxsoRegisterPointer oPSize;
-
-    // NV-DXVK start: vertex shader data capture implementation
-    DxsoRegisterPointer iPosition0;
-    DxsoRegisterPointer oTex0;
-    DxsoRegisterPointer oNormal0;
-    DxsoRegisterPointer oColor0;
-    DxsoRegisterPointer oBlendWeight0;
-    DxsoRegisterPointer oBlendIndices0;
-    // NV-DXVK end
-
-    // NV-DXVK start: exact vertex capture
-    // vec4 snapshot of the register the shader transforms into oPos, taken at the
-    // instruction the analyzer identified. Zero when the analyzer found no transform.
-    uint32_t preProjPosition = 0;
-    // NV-DXVK end
   };
 
   /**
@@ -292,7 +270,6 @@ namespace dxvk {
     DxsoPermutations compile();
 
     const DxsoIsgn& isgn() { return m_isgn; }
-    const DxsoIsgn& osgn() { return m_osgn; }
 
     const DxsoShaderMetaInfo& meta() { return m_meta; }
     const DxsoDefinedConstants& constants() { return m_constants; }
@@ -432,10 +409,6 @@ namespace dxvk {
     /////////////////////////////////
     // Shader initialization methods
     void emitVsInit();
-
-    // NV-DXVK start: vertex shader data capture implementation
-    void emitVertexCaptureInit();    
-    // NV-DXVK end
 
     void emitPsSharedConstants();
     void emitPsInit();
@@ -730,17 +703,6 @@ namespace dxvk {
     void emitFog();
     void emitPsProcessing();
     void emitOutputDepthClamp();
-
-    // NV-DXVK start: vertex shader data capture implementation
-    void emitVertexCaptureOp();
-
-    void emitVertexCaptureWrite(uint32_t vertexIndex, CapturedVertexMembers memberIdx, uint32_t valueId, uint32_t valueType);
-
-    // NV-DXVK end
-
-    // NV-DXVK start: exact vertex capture
-    void emitPreProjectionPositionSnapshot(const DxsoInstructionContext& ctx);
-    // NV-DXVK end
 
     void emitLinkerOutputSetup();
 

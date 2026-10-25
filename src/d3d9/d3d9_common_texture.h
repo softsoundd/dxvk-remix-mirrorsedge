@@ -44,23 +44,6 @@ namespace dxvk {
     bool                Discard;
     bool                IsBackBuffer;
     bool                IsAttachmentOnly;
-    // NV-DXVK start: stable descriptor hashing for identifying render targets.
-    // Forcing the extra padding byte at the end of the struct to be 0 initialized.  This is required for a stable hash.
-    unsigned char padding = 0;
-    
-    XXH64_hash_t CalculateHash() const {
-      // Warning: if this assert triggers, then hashes of this struct have been invalidated.  To maintain stable hashes, we should transition
-      // to copying the data into a local struct that mimics the old struct fields and hashing that.
-      assert(sizeof(D3D9_COMMON_TEXTURE_DESC) == 44);
-
-      return XXH3_64bits(this, sizeof(D3D9_COMMON_TEXTURE_DESC));
-    }
-
-    // Like CalculateHash, but Width/Height are replaced with the reduced aspect ratio
-    // (W/gcd, H/gcd) so RT identity survives resolution changes while still distinguishing
-    // format, usage, MSAA, and aspect.
-    XXH64_hash_t CalculateResolutionAgnosticHash() const;
-    // NV-DXVK end
   };
 
   struct D3D9ColorView {
@@ -481,10 +464,6 @@ namespace dxvk {
     }
 
   private:
-
-    // NV-DXVK start: resolution-agnostic render target tagging
-    void RegisterRenderTargetDescriptorHashes(const Rc<DxvkImageView>& pickerView);
-    // NV-DXVK end
 
     D3D9DeviceEx*                 m_device;
     D3D9_COMMON_TEXTURE_DESC      m_desc;

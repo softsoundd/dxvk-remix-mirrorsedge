@@ -43,15 +43,12 @@ namespace dxvk {
 
       RTXReplacementGeometry,
       RTXBuffer,
-      RTXAccelerationStructure,
-      RTXOpacityMicromap,
       RTXMaterialTexture,
       RTXRenderTarget,
-      RTXVertexCapture,
 
       Count,
       First = AppBuffer,
-      Last = RTXVertexCapture,
+      Last = RTXRenderTarget,
     };
 
     DxvkMemoryStats() = default;
@@ -84,12 +81,9 @@ namespace dxvk {
     std::atomic<VkDeviceSize> applicationBuffers = 0;
     std::atomic<VkDeviceSize> applicationTextures = 0;
     std::atomic<VkDeviceSize> rtxBuffers = 0;
-    std::atomic<VkDeviceSize> rtxAccelerationStructures = 0;
-    std::atomic<VkDeviceSize> rtxOpacityMicromaps = 0;
     std::atomic<VkDeviceSize> rtxMaterialTextures = 0;
     std::atomic<VkDeviceSize> rtxRenderTargets = 0;
     std::atomic<VkDeviceSize> rtxReplacementGeometry = 0;
-    std::atomic<VkDeviceSize> rtxVertexCapture = 0;
   };
 
 

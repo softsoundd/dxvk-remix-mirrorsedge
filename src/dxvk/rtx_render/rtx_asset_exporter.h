@@ -28,6 +28,7 @@
 #include <mutex>
 #include "../util/util_env.h"
 #include "../util/util_string.h"
+#include "../util/util_threadpool.h"
 #include "rtx_constants.h"
 
 
@@ -36,14 +37,9 @@ namespace dxvk {
   class DxvkContext;
   class DxvkDevice;
   class DxvkImage;
-  class DxvkBuffer;
-  class DxvkBufferSlice;
-  template<size_t NumTasksPerThread, bool WorkStealing, bool LowLatency> class WorkerThreadPool;
 
   class AssetExporter {
   public:
-    using BufferCallback = std::function<void(Rc<DxvkBuffer>)>;
-
     void waitForAllExportsToComplete(const float numSecsToWait = 10);
 
     void dumpImageToFile(Rc<DxvkContext> ctx, const std::string& dir, const std::string& filename, Rc<DxvkImage> image) {
@@ -51,31 +47,16 @@ namespace dxvk {
       exportImage(ctx, str::format(dir, filename), image);
     }
 
-    void copyBufferFromGPU(Rc<DxvkContext> ctx, const DxvkBufferSlice& buffer, BufferCallback bufferCallback) {
-      exportBuffer(ctx, buffer, bufferCallback);
-    }
-
-    void generateSceneThumbnail(Rc<DxvkContext> ctx, const std::string& dir, const std::string& filename);
-
-    void bakeSkyProbe(Rc<DxvkContext> ctx, const std::string& dir, const std::string& filename);
-
-    size_t getNumExportsInFlights() const {
-      return m_numExportsInFlight.load();
-    }
-
   private:
     Rc<sync::Fence> m_readbackSignal;
     std::atomic<uint64_t> m_signalValue = 1;
     dxvk::mutex m_readbackSignalMutex;
     std::atomic<uint64_t> m_numExportsInFlight = 0;
-    inline static const size_t kMaxConcurrentExports = 64*1024 - 11; // Sized to match the buffer cache size in scene manager
-    static_assert(kMaxConcurrentExports == kBufferCacheLimit, "When changing the maximum number of unique buffers, we also must consider that this limit may need changing also, since the number of buffers is proportional to the number of concurrent exports.");
+    inline static const size_t kMaxConcurrentExports = 64*1024 - 11;
     using ThreadPool = WorkerThreadPool<kMaxConcurrentExports, false, false>;
     std::unique_ptr<ThreadPool> m_exporterThread;
 
-    void exportImage(Rc<DxvkContext> ctx, const std::string& filename, Rc<DxvkImage> image, bool thumbnail = false);
-
-    void exportBuffer(Rc<DxvkContext> ctx, const DxvkBufferSlice& buffer, BufferCallback bufferCallback);
+    void exportImage(Rc<DxvkContext> ctx, const std::string& filename, Rc<DxvkImage> image);
 
     std::unique_ptr<ThreadPool>& getExporterThread();
   };

@@ -312,13 +312,6 @@ namespace dxvk {
                                                  uint32_t renderHeight = 0,
                                                  uint32_t displayHeight = 0);
 
-    // Multisampled depth cannot be resolved for the NGX inputs, so the D3D9 layer refuses MSAA
-    // outright (capability queries and resource creation) rather than negotiating it with the
-    // game's own settings.
-    static bool forceGameMsaaOff() {
-      return ngxPassthroughMode() && disableGameMsaa();
-    }
-
     /**
       * \brief: Draws the frame's held-back debug view over the presented image.
       *
@@ -368,6 +361,15 @@ namespace dxvk {
     // Shows the upscaler state and resolution in the user menu.
     void showImguiStatusLine();
 
+    // Extents of the last dispatched frame; zero before the first dispatch.
+    const VkExtent2D& getRenderExtent() const {
+      return m_renderExtent;
+    }
+
+    const VkExtent2D& getDisplayExtent() const {
+      return m_displayExtent;
+    }
+
     // Copies the game's depth buffer into a runtime-owned snapshot. Called (via RtxContext)
     // right before the game's first mid-scene depth clear: UE3 clears the depth buffer
     // ahead of its foreground DPG (with occlusion culling enabled, an extra clear precedes
@@ -405,19 +407,6 @@ namespace dxvk {
       SceneColor = 4,
     };
 
-    // Path tracing is incompatible with NGX passthrough; keep rtx.enableRaytracing off.
-    static void enforceRaytracingDisabledForPassthrough();
-    static void ngxPassthroughModeOnChange(DxvkDevice* device);
-
-    RTX_OPTION_ARGS("rtx", bool, ngxPassthroughMode, true,
-               "Master toggle for the NGX passthrough mode: the game's original rasterized rendering is presented (no path tracing,\n"
-               "no scene capture) while the selected upscaler (DLSS, NIS, TAA-U or XeSS), DLSS Frame Generation and Reflex run on top.\n"
-               "Screen space motion vectors are synthesized from the game's depth buffer via camera reprojection, and sub-pixel\n"
-               "camera jitter is injected through the game's viewport so temporal upscalers can accumulate detail.\n"
-               "Takes precedence over rtx.enableRaytracing (which is forced off while this mode is active). Enabled by default on this branch.\n"
-               "A depth buffer created while the mode is off is promoted to a shader-readable layout when the mode is turned on.\n"
-               "Multisampled depth still cannot be sampled.",
-               args.onChangeCallback = &RtxNgxPassthrough::ngxPassthroughModeOnChange);
     RTX_OPTION("rtx.ngxPassthrough", bool, enableJitter, true,
                "Applies a sub-pixel Halton jitter offset to the game's viewport for all draws targeting the detected scene render\n"
                "target. Required for temporal upscalers (DLSS, TAA-U, XeSS) to anti-alias; only disable for debugging.");
@@ -441,8 +430,7 @@ namespace dxvk {
     RTX_OPTION("rtx.ngxPassthrough", bool, motionBlurFirstPerson, true,
                "Applies Remix motion blur (rtx.postfx) to the camera-locked first person meshes like the rest of the scene:\n"
                "during sprints and camera motion the hands smear with their true motion, matching the vanilla game's camera\n"
-               "motion blur. Disable to exclude them from blur like the path traced pipeline's view model exclusion\n"
-               "(crisp hands).");
+               "motion blur. Disable to exclude them from blur (crisp hands).");
     RTX_OPTION("rtx.ngxPassthrough", bool, dlfgHudlessInput, true,
                "Provides DLSS Frame Generation with a HUD-less copy of the frame (captured between the end of the game's\n"
                "rendering and the first UI draw) in addition to the presented backbuffer. The interpolator then knows exactly\n"
@@ -455,12 +443,11 @@ namespace dxvk {
                "Lets the Remix upscaler quality preset choose the game's effective render resolution.\n"
                "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); other tiers use the upscaler's\n"
                "standard scaling factors. In-memory only (saved game settings unchanged); when disabled, follows live\n"
-               "game values. Requires rtx.ngxPassthroughMode and locatable game readers.");
+               "game values. Requires locatable game readers.");
     RTX_OPTION("rtx.ngxPassthrough", bool, disableGameMsaa, true,
                "Reports multisampling as unsupported to the game and creates every surface single-sampled, so no\n"
                "multisampled resource can exist. Required because multisampled depth cannot be resolved for NGX inputs.\n"
-               "The game's saved MSAA setting is not modified; it simply has nothing to select. Requires\n"
-               "rtx.ngxPassthroughMode.");
+               "The game's saved MSAA setting is not modified; it simply has nothing to select.");
     RTX_OPTION("rtx.ngxPassthrough", int, jitterSequenceLength, 0,
                "Number of frames in the sub-pixel jitter loop. 0 derives it from the upscale ratio as\n"
                "8 * (display/render)^2, the value DLSS documents, and uses it unchanged up to a 2.5x ratio -\n"

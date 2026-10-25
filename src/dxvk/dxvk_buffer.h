@@ -744,30 +744,6 @@ namespace dxvk {
       const DxvkBufferSliceHandle& slice);
     
   };
-  
-
-  // NV-DXVK start: implement acceleration structures
-  class DxvkAccelStructure : public DxvkBuffer {
-    VkAccelerationStructureKHR accelStructureRef = VK_NULL_HANDLE;
-
-  public:
-    DxvkAccelStructure(
-            DxvkDevice* device,
-      const DxvkBufferCreateInfo& createInfo,
-            DxvkMemoryAllocator& memAlloc,
-            VkMemoryPropertyFlags memFlags,
-            VkAccelerationStructureTypeKHR accelType,
-      const char* name);
-
-    ~DxvkAccelStructure();
-
-    const VkAccelerationStructureKHR& getAccelStructure() const {
-      return accelStructureRef;
-    }
-
-    VkDeviceAddress getAccelDeviceAddress() const;
-  };
-  // NV-DXVK end
 
 
   /**

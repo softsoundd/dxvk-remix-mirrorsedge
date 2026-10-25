@@ -62,12 +62,8 @@ namespace {
   using PFN_QueryFeatureVersion                      = uint64_t(REMIXAPI_CALL*)(version::Feature);
   using PFN_RtxSentryRunUploadHelper                 = void(REMIXAPI_CALL*)(const char*, const char*);
   using PFN_RtxSentryShutdown                        = void(REMIXAPI_CALL*)();
-  using PFN_remixinternal_GetNrcStatus               = int(*)(uint32_t*);
   using PFN_remixinternal_GetShaderCompilationCount  = uint32_t(*)();
-  using PFN_writeAllMarkdownDocs                     = bool(*)(const char*);
-  using PFN_writeAllOGNSchemas                       = bool(*)(const char*);
   using PFN_writeMarkdownDocumentation               = bool(*)(const char*);
-  using PFN_writeRemixCategoriesSchemaUsda           = bool(*)(const char*);
   using PFN_remixinternal_GetDlssNeuralRenderingStatus = int(*)();
 
   struct ShimExports {
@@ -90,13 +86,8 @@ namespace {
     PFN_QueryFeatureVersion                      QueryFeatureVersion = nullptr;
     PFN_RtxSentryRunUploadHelper                 RtxSentryRunUploadHelper = nullptr;
     PFN_RtxSentryShutdown                        RtxSentryShutdown = nullptr;
-    PFN_remixapi_InitializeLibrary               remixapi_InitializeLibrary = nullptr;
-    PFN_remixinternal_GetNrcStatus               remixinternal_GetNrcStatus = nullptr;
     PFN_remixinternal_GetShaderCompilationCount  remixinternal_GetShaderCompilationCount = nullptr;
-    PFN_writeAllMarkdownDocs                     writeAllMarkdownDocs = nullptr;
-    PFN_writeAllOGNSchemas                       writeAllOGNSchemas = nullptr;
     PFN_writeMarkdownDocumentation               writeMarkdownDocumentation = nullptr;
-    PFN_writeRemixCategoriesSchemaUsda           writeRemixCategoriesSchemaUsda = nullptr;
     PFN_remixinternal_GetDlssNeuralRenderingStatus remixinternal_GetDlssNeuralRenderingStatus = nullptr;
   };
 
@@ -172,13 +163,8 @@ namespace {
     LOAD_SHIM_EXPORT(QueryFeatureVersion);
     LOAD_SHIM_EXPORT(RtxSentryRunUploadHelper);
     LOAD_SHIM_EXPORT(RtxSentryShutdown);
-    LOAD_SHIM_EXPORT(remixapi_InitializeLibrary);
-    LOAD_SHIM_EXPORT(remixinternal_GetNrcStatus);
     LOAD_SHIM_EXPORT(remixinternal_GetShaderCompilationCount);
-    LOAD_SHIM_EXPORT(writeAllMarkdownDocs);
-    LOAD_SHIM_EXPORT(writeAllOGNSchemas);
     LOAD_SHIM_EXPORT(writeMarkdownDocumentation);
-    LOAD_SHIM_EXPORT(writeRemixCategoriesSchemaUsda);
     LOAD_SHIM_EXPORT(remixinternal_GetDlssNeuralRenderingStatus);
 #undef LOAD_SHIM_EXPORT
   }
@@ -288,36 +274,12 @@ extern "C" {
     }
   }
 
-  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
-      const remixapi_InitializeLibraryInfo* info,
-      remixapi_Interface*                   out_result) {
-    return shim().remixapi_InitializeLibrary
-      ? shim().remixapi_InitializeLibrary(info, out_result)
-      : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-  }
-
-  REMIXAPI int remixinternal_GetNrcStatus(uint32_t* outTrainingRecords) {
-    return shim().remixinternal_GetNrcStatus ? shim().remixinternal_GetNrcStatus(outTrainingRecords) : -1;
-  }
-
   REMIXAPI uint32_t remixinternal_GetShaderCompilationCount() {
     return shim().remixinternal_GetShaderCompilationCount ? shim().remixinternal_GetShaderCompilationCount() : UINT32_MAX;
   }
 
-  REMIXAPI bool writeAllMarkdownDocs(const char* outputFolderPath) {
-    return shim().writeAllMarkdownDocs ? shim().writeAllMarkdownDocs(outputFolderPath) : false;
-  }
-
-  REMIXAPI bool writeAllOGNSchemas(const char* outputFolderPath) {
-    return shim().writeAllOGNSchemas ? shim().writeAllOGNSchemas(outputFolderPath) : false;
-  }
-
   REMIXAPI bool writeMarkdownDocumentation(const char* outputMarkdownFilePath) {
     return shim().writeMarkdownDocumentation ? shim().writeMarkdownDocumentation(outputMarkdownFilePath) : false;
-  }
-
-  REMIXAPI bool writeRemixCategoriesSchemaUsda(const char* outputFilePath) {
-    return shim().writeRemixCategoriesSchemaUsda ? shim().writeRemixCategoriesSchemaUsda(outputFilePath) : false;
   }
 
   REMIXAPI int remixinternal_GetDlssNeuralRenderingStatus() {

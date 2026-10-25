@@ -44,10 +44,6 @@
 #include <nvsdk_ngx_helpers.h>
 #include <nvsdk_ngx_helpers_vk.h>
 
-#include <nvsdk_ngx_params_dlssd.h>
-#include <nvsdk_ngx_helpers_dlssd.h>
-#include <nvsdk_ngx_helpers_dlssd_vk.h>
-
 #include <vulkan/vulkan.h>
 #include <nvsdk_ngx_helpers_dlssg.h>
 #include <nvsdk_ngx_helpers_dlssg_vk.h>
@@ -204,7 +200,6 @@ namespace dxvk
     // Note: This is done here so that if initialization fails before feature checking the support will be false as expected.
 
     m_supportsDLSS = false;
-    m_supportsRayReconstruction = false;
     m_supportsDlssNeuralRendering = false;
     m_dlssNeuralRenderingSupportChecked = false;
     m_dlssNeuralRenderingDirectLoad = false;
@@ -330,37 +325,6 @@ namespace dxvk
     m_supportsDLSS = checkDLSSSupport(tempParams);
     checkDLFGSupport(tempParams);
 
-    // Check DLSS-RR Support
-    NVSDK_NGX_FeatureCommonInfo ci = {};
-    memset(&ci, 0, sizeof(ci));
-    const wchar_t* paths[] = { featureDirectoryWide.c_str(), logFolder.c_str(), L"." };
-    ci.PathListInfo.Path = paths + (featureDirectoryWide.empty() ? 1 : 0);
-    ci.PathListInfo.Length = featureDirectoryWide.empty() ? 2 : 3;
-    ci.InternalData = nullptr;
-    ci.LoggingInfo.LoggingCallback = nullptr;
-    ci.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
-    ci.LoggingInfo.DisableOtherLoggingSinks = false;
-    NVSDK_NGX_FeatureDiscoveryInfo di;
-    memset(&di, 0, sizeof(di));
-    di.SDKVersion = NVSDK_NGX_Version_API;
-    di.FeatureID = NVSDK_NGX_Feature_RayReconstruction;
-    di.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Application_Id;
-    di.Identifier.v.ApplicationId = (unsigned long long)RtxOptions::applicationId();
-    di.ApplicationDataPath = L".";
-    di.FeatureInfo = &ci;
-    NVSDK_NGX_FeatureRequirement fr = {};
-
-    result = NGX_CALL(NVSDK_NGX_VULKAN_GetFeatureRequirements(vkInstance, vkPhysicalDevice, &di, &fr));
-    if (NVSDK_NGX_FAILED(result) || fr.FeatureSupported != NVSDK_NGX_FeatureSupportResult_Supported) {
-      if (result == NVSDK_NGX_Result_FAIL_OutOfDate || fr.FeatureSupported == NVSDK_NGX_FeatureSupportResult_DriverVersionUnsupported) {
-        Logger::warn(str::format("NVIDIA DLSS-RR cannot be loaded due to outdated driver: ", resultToString(result)));
-      } else {
-        Logger::warn(str::format("NVIDIA DLSS-RR not available on this hardware/platform: ", resultToString(result)));
-      }
-    } else {
-      m_supportsRayReconstruction = true;
-    }
-
     NGX_CALL(NVSDK_NGX_VULKAN_DestroyParameters(tempParams));
     m_initialized = true;
     return true;
@@ -391,21 +355,6 @@ namespace dxvk
     }
 
     return std::make_unique<NGXDLSSContext>(m_device);
-  }
-
-  std::unique_ptr<NGXRayReconstructionContext> NGXContext::createRayReconstructionContext() {
-    if (!m_initialized) {
-      if (!initialize()) {
-        return nullptr;
-      }
-    }
-
-    if (!supportsRayReconstruction()) {
-      Logger::err("NVIDIA DLSS-RR not supported");
-      return nullptr;
-    }
-
-    return std::make_unique<NGXRayReconstructionContext>(m_device);
   }
 
   std::unique_ptr<NGXDLFGContext> NGXContext::createDLFGContext() {
@@ -801,175 +750,6 @@ namespace dxvk
 
     NVSDK_NGX_Result result;
     result = NGX_CALL(NGX_VULKAN_EVALUATE_DLSS_EXT(vkCommandbuffer, m_featureDLSS, m_parameters, &evalParams));
-
-    if (NVSDK_NGX_FAILED(result)) {
-      success = false;
-    }
-
-    return success;
-  }
-
-  NGXRayReconstructionContext::NGXRayReconstructionContext(DxvkDevice* device)
-    : NGXFeatureContext(device) { }
-
-  NGXRayReconstructionContext::~NGXRayReconstructionContext() {
-    releaseNGXFeature();
-  }
-
-  void NGXRayReconstructionContext::initialize(Rc<DxvkContext> renderContext,
-                                  uint32_t maxRenderSize[2],
-                                  uint32_t displayOutSize[2],
-                                  bool isContentHDR,
-                                  bool depthInverted,
-                                  bool autoExposure,
-                                  bool sharpening,
-                                  NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel,
-                                  NVSDK_NGX_PerfQuality_Value perfQuality) {
-    ScopedCpuProfileZone();
-
-    if (m_featureRayReconstruction) {
-      renderContext->getDevice()->waitForIdle();
-      releaseNGXFeature();
-    }
-
-    const unsigned int CreationNodeMask = 1;
-    const unsigned int VisibilityNodeMask = 1;
-
-    const bool lowResolutionMotionVectors = true; // we let the Snippet do the upsampling of the motion vector
-    const bool jitteredMV = false; // We don't use the jittered camera matrix to calculate motion vector
-    // Next create features
-    int createFlags = NVSDK_NGX_DLSS_Feature_Flags_None;
-    createFlags |= lowResolutionMotionVectors ? NVSDK_NGX_DLSS_Feature_Flags_MVLowRes : 0;
-    createFlags |= isContentHDR ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
-    createFlags |= depthInverted ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0;
-    createFlags |= jitteredMV ? NVSDK_NGX_DLSS_Feature_Flags_MVJittered : 0;
-    createFlags |= autoExposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0;
-    createFlags |= sharpening ? NVSDK_NGX_DLSS_Feature_Flags_DoSharpening : 0;
-
-    VkCommandBuffer vkCommandBuffer = renderContext->getCommandList()->getCmdBuffer(dxvk::DxvkCmdBuffer::ExecBuffer);
-
-    NVSDK_NGX_DLSSD_Create_Params dlssdCreateParams = {};
-    dlssdCreateParams.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
-    dlssdCreateParams.InWidth = maxRenderSize[0];
-    dlssdCreateParams.InHeight = maxRenderSize[1];
-    dlssdCreateParams.InTargetWidth = displayOutSize[0];
-    dlssdCreateParams.InTargetHeight = displayOutSize[1];
-    dlssdCreateParams.InPerfQualityValue = perfQuality;
-    dlssdCreateParams.InFeatureCreateFlags = createFlags;
-    dlssdCreateParams.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;
-
-    m_parameters->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, dlssdModel);
-    m_parameters->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, dlssdModel);
-    m_parameters->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, dlssdModel);
-    m_parameters->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, dlssdModel);
-    m_parameters->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, dlssdModel);
-
-    // Release video memory when DLSS-RR is disabled.
-    m_parameters->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
-
-    NVSDK_NGX_Result result = NGX_CALL(NGX_VULKAN_CREATE_DLSSD_EXT1(m_device->handle(),
-      vkCommandBuffer,
-      CreationNodeMask,
-      VisibilityNodeMask,
-      &m_featureRayReconstruction,
-      m_parameters,
-      &dlssdCreateParams));
-
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::err(str::format("Failed to create DLSS-RR feature: ", resultToString(result)));
-      return;
-    }
-  }
-
-  void NGXRayReconstructionContext::releaseNGXFeature() {
-    if (m_featureRayReconstruction) {
-      NGX_CALL(NVSDK_NGX_VULKAN_ReleaseFeature(m_featureRayReconstruction));
-      m_featureRayReconstruction = nullptr;
-    }
-  }
-
-
-  NGXRayReconstructionContext::QuerySettings NGXRayReconstructionContext::queryOptimalSettings(const uint32_t displaySize[2], NVSDK_NGX_PerfQuality_Value perfQuality) const {
-    ScopedCpuProfileZone();
-    QuerySettings settings;
-    // Note: Deprecated, should not be used but still must be passed into the query function.
-    float dummySharpness;
-
-    NVSDK_NGX_Result result = NGX_CALL(NGX_DLSSD_GET_OPTIMAL_SETTINGS(m_parameters,
-      displaySize[0], displaySize[1], perfQuality,
-      &settings.optimalRenderSize[0], &settings.optimalRenderSize[1],
-      &settings.maxRenderSize[0], &settings.maxRenderSize[1],
-      &settings.minRenderSize[0], &settings.minRenderSize[1],
-      &dummySharpness));
-
-    if (NVSDK_NGX_FAILED(result)) {
-      Logger::err(str::format("Querying optimal settings failed: ", resultToString(result)));
-      return settings;
-    }
-
-    return settings;
-  }
-
-  bool NGXRayReconstructionContext::evaluateRayReconstruction(
-    Rc<DxvkContext> renderContext,
-    const NGXBuffers& buffers,
-    const NGXSettings& settings) const {
-    if (!m_featureRayReconstruction) {
-      return false;
-    }
-    
-    ScopedCpuProfileZone();
-
-    // In DLSS v2, the target is already upsampled (while in v1, the upsampling is handled in a later pass)
-    uint32_t inWidth = buffers.pUnresolvedColor->image->info().extent.width;
-    uint32_t inHeight = buffers.pUnresolvedColor->image->info().extent.height;
-    uint32_t outWidth = buffers.pResolvedColor->image->info().extent.width;
-    uint32_t outHeight = buffers.pResolvedColor->image->info().extent.height;
-    assert(outWidth >= inWidth && outHeight >= inHeight);
-
-    bool success = true;
-
-    VkCommandBuffer vkCommandbuffer = renderContext->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
-
-    NVSDK_NGX_Resource_VK unresolvedColorResource = TextureToResourceVK(buffers.pUnresolvedColor, false);
-    NVSDK_NGX_Resource_VK resolvedColorResource = TextureToResourceVK(buffers.pResolvedColor, true);
-    NVSDK_NGX_Resource_VK motionVectorsResource = TextureToResourceVK(buffers.pMotionVectors, false);
-    NVSDK_NGX_Resource_VK depthResource = TextureToResourceVK(buffers.pDepth, false);
-    NVSDK_NGX_Resource_VK hitDistanceResource = TextureToResourceVK(buffers.pHitDistance, false);
-
-    NVSDK_NGX_Resource_VK diffuseAlbedoResource = TextureToResourceVK(buffers.pDiffuseAlbedo, false);
-    NVSDK_NGX_Resource_VK specularAlbedoResource = TextureToResourceVK(buffers.pSpecularAlbedo, false);
-    NVSDK_NGX_Resource_VK normalsResource = TextureToResourceVK(buffers.pNormals, false);
-    NVSDK_NGX_Resource_VK roughnessResource = TextureToResourceVK(buffers.pRoughness, false);
-    NVSDK_NGX_Resource_VK disocclusionMask = TextureToResourceVK(buffers.pDisocclusionMask, false);
-
-    NVSDK_NGX_VK_DLSSD_Eval_Params evalParams_DLDN = {};
-    evalParams_DLDN.pInDiffuseAlbedo = &diffuseAlbedoResource;
-    evalParams_DLDN.pInSpecularAlbedo = &specularAlbedoResource;
-    evalParams_DLDN.pInNormals = &normalsResource;
-    evalParams_DLDN.pInRoughness = &roughnessResource;
-
-    evalParams_DLDN.pInColor = &unresolvedColorResource;
-    evalParams_DLDN.pInOutput = &resolvedColorResource;
-    evalParams_DLDN.pInDepth = &depthResource;
-    evalParams_DLDN.pInExposureTexture = nullptr;
-    evalParams_DLDN.pInMotionVectors = &motionVectorsResource;
-    evalParams_DLDN.pInBiasCurrentColorMask = nullptr;
-    evalParams_DLDN.InJitterOffsetX = settings.jitterOffset[0];
-    evalParams_DLDN.InJitterOffsetY = settings.jitterOffset[1];
-    evalParams_DLDN.InPreExposure = settings.preExposure;
-    evalParams_DLDN.InReset = settings.resetAccumulation ? 1 : 0;
-    evalParams_DLDN.InMVScaleX = settings.motionVectorScale[0];
-    evalParams_DLDN.InMVScaleY = settings.motionVectorScale[1];
-    evalParams_DLDN.InRenderSubrectDimensions = { inWidth, inHeight };
-    evalParams_DLDN.InFrameTimeDeltaInMsec = settings.frameTimeMilliseconds;
-    evalParams_DLDN.pInWorldToViewMatrix = (float*) m_worldToViewMatrix.data;
-    evalParams_DLDN.pInViewToClipMatrix = (float*) m_viewToProjectionMatrix.data;
-    evalParams_DLDN.pInSpecularHitDistance = buffers.pHitDistance ? &hitDistanceResource : nullptr;
-    evalParams_DLDN.pInDisocclusionMask = &disocclusionMask;
-
-    NVSDK_NGX_Result result = NGX_CALL(
-      NGX_VULKAN_EVALUATE_DLSSD_EXT(vkCommandbuffer, m_featureRayReconstruction, m_parameters, &evalParams_DLDN));
 
     if (NVSDK_NGX_FAILED(result)) {
       success = false;

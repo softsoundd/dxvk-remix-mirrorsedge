@@ -26,19 +26,11 @@
 #include "imgui.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
-#include "dxvk_objects.h"
-#include "rtx_render/rtx_scene_manager.h"
 #include "rtx_render/rtx_imgui.h"
 
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace dxvk {
-  void ImGuiAbout::update(const Rc<DxvkContext>& ctx) {
-    m_secrets.update(ctx);
-  }
-
   void ImGuiAbout::show(const Rc<DxvkContext>& ctx) {
     ImGui::PushItemWidth(250);
 
@@ -75,12 +67,6 @@ namespace dxvk {
       RemixGui::Separator();
 
       m_credits.show();
-    }
-
-    // Secret Code Section
-
-    if (RemixGui::CollapsingHeader("Secrets")) {
-      m_secrets.show(ctx);
     }
 
     ImGui::PopItemWidth();
@@ -209,39 +195,6 @@ namespace dxvk {
         ImGui::TextUnformatted(name);
       }
       ImGui::Unindent();
-    }
-  }
-
-  void ImGuiAbout::Secrets::update(const Rc<DxvkContext>& ctx) {
-    (void)ctx;
-  }
-
-  void ImGuiAbout::Secrets::show(const Rc<DxvkContext>& ctx) {
-    (void)ctx;
-    showCodeHashEntry();
-  }
-
-  void ImGuiAbout::Secrets::showCodeHashEntry() {
-    ImGui::TextUnformatted("Codeword:");
-    ImGui::SameLine();
-    static char codewordBuf[32] = "";
-    static auto sameLineAndButton = [&]() {
-      ImGui::SameLine();
-      return ImGui::Button("Enter");
-    };
-    if (ImGui::InputText(" " /*Cannot be empty string or else weird ImGUI assert*/,
-                          codewordBuf,
-                          IM_ARRAYSIZE(codewordBuf),
-                          ImGuiInputTextFlags_EnterReturnsTrue)
-        || sameLineAndButton()) {
-      const XXH64_hash_t hashedCodeword = XXH3_64bits(&codewordBuf[0], strnlen(codewordBuf,IM_ARRAYSIZE(codewordBuf)));
-      if((m_validCodeHashesEntered.count(hashedCodeword) == 0) &&
-          (m_codeHashesToSecretPtrs.count(hashedCodeword) > 0)) {
-        m_validCodeHashesEntered.insert(hashedCodeword);
-        for(auto& pSecret : m_codeHashesToSecretPtrs.at(hashedCodeword)) {
-          pSecret->bUnlocked = true;
-        }
-      }
     }
   }
 }

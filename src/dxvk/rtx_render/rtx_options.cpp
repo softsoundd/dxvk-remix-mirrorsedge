@@ -21,27 +21,18 @@
 */
 #include "rtx_options.h"
 
-#include <filesystem>
 #include <mutex>
 #include <nvapi.h>
 #include "../imgui/imgui.h"
 #include "rtx_bridge_message_channel.h"
-#include "rtx_ngx_passthrough.h"
 #include "rtx_gpu_overrides.h"
 #include "rtx_dlfg.h"
 #include "../util/util_global_time.h"
 
 #include "dxvk_device.h"
-#include "rtx_scene_manager.h"
 
 namespace dxvk {
   RtxOptions* RtxOptions::s_instance = nullptr;
-  HashRule RtxOptions::s_geometryHashGenerationRule = 0;
-  HashRule RtxOptions::s_geometryAssetHashRule = 0;
-
-  void RtxOptions::enableRaytracingOnChange(DxvkDevice* device) {
-    RtxNgxPassthrough::enforceRaytracingDisabledForPassthrough();
-  }
 
   void RtxOptions::graphicsPresetOnChange(DxvkDevice* device) {
     // device will be nullptr during initial config loading.
@@ -98,58 +89,6 @@ namespace dxvk {
     BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG", doBlock ? 1 : 0, 0);
   }
 
-  void RtxOptions::ViewModel::enableOnChange(DxvkDevice* device) {
-    if (device) {
-      // applyPendingValues (which invokes this callback) runs after onFrameEnd,
-      // so no rendering is in flight and we can clear the scene immediately
-      // without a WFI or deferred clear.  Using a delayed clear here would cause
-      // a frame to render with the old scene but the new view model setting.
-      device->getCommon()->getSceneManager().clear(nullptr, false);
-    }
-  }
-
-  namespace {
-    bool migrateHashSet(const GenericValue& src, GenericValue& dst, bool destHasExistingValue) {
-      HashSetLayer* sourceHashSet = src.hashSet;
-      HashSetLayer* destHashSet = dst.hashSet;
-      if (!sourceHashSet || sourceHashSet->empty() || !destHashSet) {
-        return false;
-      }
-      // Union merge for hash sets
-      destHashSet->mergeFrom(*sourceHashSet);
-      return true;
-    }
-  }
-  void RtxOptions::dynamicDecalTexturesOnChange(DxvkDevice* device) {
-    if (dynamicDecalTextures.migrateValuesTo(&decalTextures, migrateHashSet)) {
-      dynamicDecalTextures.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
-      Logger::info("[Deprecated Config] rtx.dynamicDecalTextures has been deprecated, "
-                   "we have moved all your textures from this list to rtx.decalTextures, "
-                   "no further action is required from you. "
-                   "Please re-save your rtx config to get rid of this message.");
-    }
-  }
-
-  void RtxOptions::singleOffsetDecalTexturesOnChange(DxvkDevice* device) {
-    if (singleOffsetDecalTextures.migrateValuesTo(&decalTextures, migrateHashSet)) {
-      singleOffsetDecalTextures.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
-      Logger::info("[Deprecated Config] rtx.singleOffsetDecalTextures has been deprecated, "
-                   "we have moved all your textures from this list to rtx.decalTextures, "
-                   "no further action is required from you. "
-                   "Please re-save your rtx config to get rid of this message.");
-    }
-  }
-
-  void RtxOptions::nonOffsetDecalTexturesOnChange(DxvkDevice* device) {
-    if (nonOffsetDecalTextures.migrateValuesTo(&decalTextures, migrateHashSet)) {
-      nonOffsetDecalTextures.clearFromStrongerLayers(RtxOptionLayer::getDefaultLayer());
-      Logger::info("[Deprecated Config] rtx.nonOffsetDecalTextures has been deprecated, "
-                   "we have moved all your textures from this list to rtx.decalTextures, "
-                   "no further action is required from you. "
-                   "Please re-save your rtx config to get rid of this message.");
-    }
-  }
-
   void RtxOptions::updateUpscalerFromDlssPreset() {
     // Code-driven changes for DLSS preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
@@ -168,7 +107,7 @@ namespace dxvk {
       case DlssPreset::On:
         // NGX passthrough selects the upscaler via rtx.upscalerType (NIS/TAA-U/XeSS/DLSS).
         // The bundled DLSS preset must not stomp a user-configured non-DLSS upscaler at launch.
-        if (RtxNgxPassthrough::ngxPassthroughMode() && RtxOptions::upscalerType() != UpscalerType::DLSS) {
+        if (RtxOptions::upscalerType() != UpscalerType::DLSS) {
           dlssPreset.setImmediately(DlssPreset::Custom);
           break;
         }
@@ -309,20 +248,11 @@ namespace dxvk {
     return archInfo.architecture_id;
   }
 
-  NV_GPU_ARCH_IMPLEMENTATION_ID RtxOptions::getNvidiaChipId() {
-    NV_GPU_ARCH_INFO archInfo;
-    if (queryNvidiaArchInfo(archInfo) == false) {
-      return NV_GPU_ARCH_IMPLEMENTATION_TU100;
-    }
-    
-    return archInfo.implementation_id;
-  }
-
   void RtxOptions::updateGraphicsPresets(DxvkDevice* device) {
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
 
-    // Per-GPU overrides are applied first so the preset and lighting settings below see the effective Ray Reconstruction state.
+    // Refresh the per-GPU DLSS mode override along with the preset.
     GpuOverrides::apply();
 
     // Handle Automatic Graphics Preset (From configuration/default)
@@ -369,25 +299,12 @@ namespace dxvk {
         RtxOptions::nisPreset.setDeferred(NisPreset::Performance);
         RtxOptions::taauPreset.setDeferred(TaauPreset::Performance);
       }
-      RtxOptions::lowMemoryGpu.setDeferred(decision.lowMemoryGpu);
 
       // graphicsPreset itself should go to User layer, not Quality layer
       // (graphicsPreset controls what goes into Quality, it's not controlled BY Quality)
       {
         RtxOptionLayerTarget userTarget(RtxOptionEditTarget::User);
         RtxOptions::graphicsPreset.setImmediately(preferredDefault);
-      }
-    }
-
-    DxvkPostFx& postFx = device->getCommon()->metaPostFx();
-
-    // NGX passthrough keeps its own DLSS, frame generation, and post effect defaults.
-    // Graphics presets only retune those for the path-traced pipeline.
-    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
-      if (graphicsPreset() == GraphicsPreset::Ultra || graphicsPreset() == GraphicsPreset::High) {
-        postFx.enable.setDeferred(true);
-      } else if (graphicsPreset() == GraphicsPreset::Medium || graphicsPreset() == GraphicsPreset::Low) {
-        postFx.enable.setDeferred(false);
       }
     }
 
@@ -398,12 +315,6 @@ namespace dxvk {
     if (graphicsPreset() == GraphicsPreset::Medium || graphicsPreset() == GraphicsPreset::Low) {
       DxvkDLFG::litePreset.setDeferred(true);
     }
-
-    // Respect a user DLSS override. Otherwise stay on the auto profile.
-    // NGX passthrough defaults to Full Resolution and must not be reset to Auto here.
-    if (!RtxNgxPassthrough::ngxPassthroughMode() && dlssPreset() != DlssPreset::Custom) {
-      qualityDLSS.setDeferred(DLSSProfile::Auto);
-    }
   }
 
   void RtxOptions::resetUpscaler() {
@@ -412,78 +323,5 @@ namespace dxvk {
     
     RtxOptions::upscalerType.setDeferred(UpscalerType::DLSS);
     reflexMode.setDeferred(ReflexMode::LowLatency);
-  }
-
-  std::string RtxOptions::getCurrentDirectory() {
-    return std::filesystem::current_path().string();
-  }
-
-  bool RtxOptions::needsMeshBoundingBox() {
-    return AntiCulling::isObjectAntiCullingEnabled() ||
-           AntiCulling::isLightAntiCullingEnabled() ||
-           enableAlwaysCalculateAABB();
-  }
-
-  void RtxOptions::resolveTransparencyThresholdOnChange(DxvkDevice* device) {
-    // Adjust valid range on resolveOpaquenessThreshold to prevent value below resolveTransparencyThreshold
-    resolveOpaquenessThresholdObject().setMinValue(resolveTransparencyThreshold());
-  }
-
-  void RtxOptions::pathMinBouncesOnChange(DxvkDevice* device) {
-    // Adjust valid range on pathMaxBounces to prevent value below pathMinBounces
-    pathMaxBouncesObject().setMinValue(pathMinBounces());
-  }
-
-  void RtxOptions::pathMaxBouncesOnChange(DxvkDevice* device) {
-    // Adjust valid range on pathMinBounces to prevent value above pathMaxBounces
-    pathMinBouncesObject().setMaxValue(pathMaxBounces());
-  }
-
-  void RtxOptions::rayPortalModelTextureHashesOnChange(DxvkDevice* device) {
-    // Ensure the Ray Portal texture hashes are always in pairs of 2 and don't exceed maxRayPortalCount
-    std::vector<XXH64_hash_t> trimmedHashes = rayPortalModelTextureHashes();
-    
-    // Must be a multiple of 2
-    if (trimmedHashes.size() % 2 == 1) {
-      trimmedHashes.pop_back();
-    }
-    
-    // Must not exceed maxRayPortalCount
-    if (trimmedHashes.size() > maxRayPortalCount) {
-      trimmedHashes.erase(trimmedHashes.begin() + maxRayPortalCount, trimmedHashes.end());
-    }
-    
-    // Only update if the value changed
-    if (trimmedHashes != rayPortalModelTextureHashes()) {
-      rayPortalModelTextureHashesObject().setDeferred(trimmedHashes);
-    }
-  }
-
-  void RtxOptions::geometryGenerationHashRuleStringOnChange(DxvkDevice* device) {
-    s_geometryHashGenerationRule = createRule("Geometry generation", geometryGenerationHashRuleString());
-  }
-
-  void RtxOptions::geometryAssetHashRuleStringOnChange(DxvkDevice* device) {
-    s_geometryAssetHashRule = createRule("Geometry asset", geometryAssetHashRuleString());
-  }
-
-  void RtxOptions::rayPortalSamplingWeightMinDistanceOnChange(DxvkDevice* device) {
-    // Adjust valid range on rayPortalSamplingWeightMaxDistance to prevent value below min distance
-    rayPortalSamplingWeightMaxDistanceObject().setMinValue(rayPortalSamplingWeightMinDistance());
-  }
-
-  void RtxOptions::rayPortalSamplingWeightMaxDistanceOnChange(DxvkDevice* device) {
-    // Adjust valid range on rayPortalSamplingWeightMinDistance to prevent value above max distance
-    rayPortalSamplingWeightMinDistanceObject().setMaxValue(rayPortalSamplingWeightMaxDistance());
-  }
-
-  void ViewDistanceOptions::distanceFadeMinOnChange(DxvkDevice* device) {
-    // Adjust valid range on distanceFadeMax to prevent value below distanceFadeMin
-    distanceFadeMaxObject().setMinValue(distanceFadeMin());
-  }
-
-  void ViewDistanceOptions::distanceFadeMaxOnChange(DxvkDevice* device) {
-    // Adjust valid range on distanceFadeMin to prevent value above distanceFadeMax
-    distanceFadeMinObject().setMaxValue(distanceFadeMax());
   }
 }

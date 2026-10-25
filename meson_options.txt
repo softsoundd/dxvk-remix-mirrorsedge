@@ -49,11 +49,7 @@ option('tracy_manual_lifetime', type : 'boolean', value : false, description : '
 option('tracy_fibers', type : 'boolean', value : false, description : 'Enable fibers support')
 option('tracy_shared_libs', type : 'boolean', value : false, description : 'Builds Tracy as a shared object')
 
-option('enable_rtxio', type : 'boolean', value : true)
-
 option('remixsdk_local', type: 'string', value: '', description: 'Path to the local, prebuilt Remix SDK. Must contain the include and bin directories.')
-
-option('download_apics', type : 'boolean', value : true, description : 'Download APICs for testing')
 
 option('remix_sentry_environment', type : 'string', value : '', description : 'Sentry environment tag baked in at compile time (e.g. github-production, gitlab-production). When empty or not set, the C++ code uses "development". CI should pass -Dremix_sentry_environment=$env:BUILD_SENTRY_ENVIRONMENT.')
 

@@ -23,11 +23,7 @@ namespace dxvk {
     VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT       extVertexAttributeDivisor;
     VkPhysicalDeviceDepthStencilResolvePropertiesKHR          khrDepthStencilResolve;
     VkPhysicalDeviceDriverPropertiesKHR                       khrDeviceDriverProperties;
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR           khrDeviceRayTracingPipelineProperties;
-    VkPhysicalDeviceAccelerationStructurePropertiesKHR        khrDeviceAccelerationStructureProperties;
     VkPhysicalDeviceFloatControlsPropertiesKHR                khrShaderFloatControls;
-    VkPhysicalDeviceOpacityMicromapPropertiesEXT              extOpacityMicromapProperties;
-    VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV   nvRayTracingInvocationReorderProperties;
   };
 
 
@@ -51,16 +47,10 @@ namespace dxvk {
     VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT extShaderDemoteToHelperInvocation;
     VkPhysicalDeviceTransformFeedbackFeaturesEXT              extTransformFeedback;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT         extVertexAttributeDivisor;
-  	VkPhysicalDeviceRayQueryFeaturesKHR	                      khrRayQueryFeatures;
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR	            khrDeviceRayTracingPipelineFeatures;
-  	VkPhysicalDeviceAccelerationStructureFeaturesKHR          khrAccelerationStructureFeatures;
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT              extShaderAtomicFloat;
     VkPhysicalDeviceDiagnosticsConfigFeaturesNV               nvDeviceDiagnosticsConfig;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR            khrBufferDeviceAddress;
-
-    // NV-DXVK start: opacity micromap
     VkPhysicalDeviceSynchronization2FeaturesKHR               khrSynchronization2;
-    // NV-DXVK end
   };
 
 }

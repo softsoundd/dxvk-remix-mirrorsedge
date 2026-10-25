@@ -29,15 +29,10 @@
 
 namespace dxvk {
 
-// NV-DXVK start: external API
-  D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended, bool WithExternalSwapchain, bool WithDrawCallConversion, bool WithRemixAPI)
+  D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended)
     : m_instance    ( new DxvkInstance() )
     , m_extended    ( bExtended ) 
-    , m_d3d9Options ( nullptr, m_instance->config(), WithRemixAPI)
-    , m_withExternalSwapchain { WithExternalSwapchain }
-    , m_withDrawCallConversion { WithDrawCallConversion }
-    , m_withRemixAPI { WithRemixAPI } {
-// NV-DXVK end
+    , m_d3d9Options ( nullptr, m_instance->config() ) {
     // D3D9 doesn't enumerate adapters like physical adapters...
     // only as connected displays.
 
@@ -384,12 +379,7 @@ namespace dxvk {
         DeviceType,
         hFocusWindow,
         BehaviorFlags,
-        dxvkDevice,
-// NV-DXVK start: external API
-        m_withExternalSwapchain,
-        m_withDrawCallConversion,
-        m_withRemixAPI);
-// NV-DXVK end
+        dxvkDevice);
 
       HRESULT hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
 

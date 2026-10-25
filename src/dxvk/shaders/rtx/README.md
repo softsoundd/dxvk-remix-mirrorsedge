@@ -19,21 +19,18 @@ The following extensions are used in most of the project for general purpose fil
 
 The remainder of the extensions used on the other hand are used only for "pass" implementations, other functionality should be split into `.slangh` files. Additionally, note that the extensions in these cases are important for how the shader is compiled as otherwise indicating which shader stage to compile for would have to be done in another way.
 
-- `*.slang` - Generic shader files, typically used when multiple types of shader stages will be generated via permutations (e.g. compute for ray query implementations and ray generation for trace ray implementations in the same file).
+- `*.slang` - Generic shader files, typically used when multiple shader variants will be generated via permutations.
 - `*.comp.slang` - Compute shader files.
-- `*.rgen.slang` - Ray generation shader files.
-- `*.rchit.slang` - Ray closest hit shader files.
-- `*.rahit.slang` - Ray any hit shader files.
-- `*.rmiss.slang` - Ray miss shader files.
+- `*.vert.slang` - Vertex shader files.
+- `*.frag.slang` - Fragment shader files.
 
 ### Organization
 
 All RTX Remix shaders are to be put in the `rtx` shader folder, with the following subfolders utilized as applicable based on the Architecture section below:
 
 - `external` - External pre-existing frameworks or helper files, typically with a differing license from the rest of RTX Remix.
-- `utility` - General helper functionality for common operations. Examples include packing, texture sampling, random number generation and math.
-- `concept` - Concept files for major organizational units in the codebase. Examples include surfaces, materials, lights and rays.
-- `algorithm` - Algorithm files for major rendering logic.
+- `utility` - General helper functionality for common operations. Examples include packing, color conversion, noise and math.
+- `concept` - Concept files for shared types. Currently only the ray portal space encoded in the geometry flags.
 - `pass` - Shader files for entry points into various rendering passes.
 
 ### Structure
@@ -276,50 +273,12 @@ Functions take two forms generally, "member" functions (conceptually part of a s
 
 ## Architecture
 
-### Concepts
+The shaders only post-process the game's own rasterised frame for the NGX passthrough. The passes are as follows:
 
-Concepts are core types which represent general ideas for the renderer. They typically contain most of the actual information about what should be rendered as well as the functionality to implement rendering algorithms easily. They may additionally be polymorphic or specific to a polymorphic type. A list of the current concepts is as follows:
-
-- Camera - Camera-related functionality such as its position and orientation for current and previous frames.
-- Ray/Ray Interaction - Ray-related functionality for both spawning and manipulating as well as their raw interactions from ray queries.
-- Ray Portal - Transformations and other information for handling ray portal teleportation.
-- Surface/Surface Interaction - Information about scene geometry beyond just that which the hardware stores, as well calculated interaction information at a given hit point such as normals, texture coordinates and gradients, and motion vectors.
-- Surface Material/Surface Material Interaction - Information about materials applied to scene surfaces, as well as calculated interaction information at a given hit point and functions to sample or evaluate the BSDF representing the material. Typically polymorphic.
-- Volume/Volume Interaction - Unused currently.
-- Volume Material/Volume Material Interaction - Unused currently.
-- Light - Information about lights in the scene containing functions to sample or evaluate the light. Typically polymorphic.
-
-### Algorithm
-
-Algorithms are generally functions which implement commonly used algorithms for rendering, such as various integrators for computing radiance in the scene. A list of some of the current algorithms is as follows:
-
-- Resolver - Handles logic which occurs on the majority of typical ray casts such as particles (separate unordered approximations), ray portals, decals, and creation of various hit structures.
-- Geometry Resolver - Handles various "primary ray" logic to resolve the G-Buffer(s). Includes viewmodel code, [PSR](https://developer.nvidia.com/blog/rendering-perfect-reflections-and-refractions-in-path-traced-games/) and primary/secondary G-Buffer creation.
-- Integrator - Direct/Indirect integration path tracing logic, handles the evaluation of direct lighting (initial hit next event estimation), as well as indirect lighting (material sampling, path continuation, further next event estimation).
-- Volume Integrator - Froxel radiance cache integration logic, handles next event estimation on froxel grid cells.
-
-### Pass
-
-Passes are actual ray tracing or compute passes which invoke algorithms or perform other functions and make up the rendering pipeline. Typically they also are responsible for the various inputs and outputs a compute shader may be responsible to read or write data to. A list of the current passes in general order of execution is as follows:
-
-- Froxel Radiance Cache (Volumetrics) - Handles lighting and filtering of the froxel radiance cache for usage in various volume-based lighting techniques. Invokes the volume integrator.
-- G-Buffer - Primarily invokes the geometry resolver, see the Algorithm second for more details.
-- RTXDI - Handles direct lighting ReSTIR preparation via the RTXDI SDK.
-- Integration - Primarily invokes the integrator, see the Algorithm section for more details.
-- RTXDI Confidence - Computes RTXDI confidence and temporal gradients for usage in denoising.
-- ReSTIR GI - Handles ReSTIR GI evaluation and final shading.
-- Demodulate - Demodulates the rendered signals when denoising is enabled to preserve various noise-free aspects of detail across the denoising process.
-- (Denoise) - Denoising if enabled will implicitly be inserted at this stage (not an actual shader pass on Remix's side).
-- Composite - Handles remodulation of denoised signals and compositing together into a single image.
-- (Upscaling) - Upscaling if enabled will implicitly be inserted at this stage (not an actual shader pass on Remix's side except in the case of TAA).
-- Bloom - Applies a post processing bloom effect.
-- Post FX - Applies various additional post processing such as motion blur, vignetting and chromatic aberration.
-- Tonemapping - Preforms tonemapping of the fully rendered image to convert from the linear HDR space all rendering is done in to the desired output space.
-
-Other passes which execute outside the main rendering pipeline are as follows:
-
-- Opacity Micromap Generation - Handles dynamic generation of opacity micromap information for use in rendering.
-- View Model Correction - Applies a correction transformation to view model vertices, specifically meant to assist in how viewmodels are rendered in Remix.
-- Triangle List Generation - Handles generation of triangle lists from topologies such as triangle strips for usage in ray tracing (as BLAS generation only supports triangle lists currently).
-- GPU Skinning - Applies bone-based skinning to vertices for handling specific types of animated objects.
-- Geometry Interleaving - Handles interleaving of separate buffers (for instance separate vertex and normal buffers) into a singular buffer to match Remix's expectations.
+- NGX Passthrough - Synthesises motion vectors from depth and the current and previous cameras (`ngx_passthrough_mv`), rasterises per-object velocity for rigid, GPU-skinned and CPU-skinned meshes (`ngx_passthrough_velocity_*`), merges the game's scene colour alpha (which holds depth in UE3) back into the upscaled colour (`ngx_passthrough_alpha_merge`), and displays the upscaler input as a debug view (`ngx_passthrough_scene_color_debug`).
+- TAA-U - Temporal anti-aliasing and upscaling when TAA-U is the selected upscaler.
+- NIS - NVIDIA Image Scaling, from the external NIS SDK.
+- Bloom - Optional Remix bloom, which runs only on linear HDR colour.
+- Post FX - Motion blur (the per-pixel gather and the tile-based cinematic filter), chromatic aberration and vignette.
+- GPU Crash Trigger - Development only. Hangs the GPU when the GPU crash hotkey is pressed so that Aftermath can capture a crash dump.
+- ImGui - Renders the Remix user interface.

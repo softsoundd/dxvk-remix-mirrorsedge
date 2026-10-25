@@ -65,7 +65,6 @@ def generate_dxvk_project(output_root_path, dxvk_cpp_defines):
             "../include/vulkan/include": 1,
             "../public/include": 1,
             "../submodules/Detours/src": 1,
-            "../submodules/nrc/Include": 1,
     }
 
     def add_file(dirpath, filename):

@@ -41,34 +41,27 @@
 #include "rtx_render/rtx_nis.h"
 #include "rtx_render/rtx_taa.h"
 #include "rtx_render/rtx_auto_exposure.h"
-#include "rtx_render/rtx_tone_mapping.h"
 #include "rtx_render/rtx_bloom.h"
-#include "rtx_render/rtx_image_utils.h"
 #include "rtx_render/rtx_postFx.h"
-#include "rtx_render/rtx_srgb_dither.h"
 #include "rtx_render/rtx_initializer.h"
 #include "rtx_render/rtx_scene_manager.h"
 #include "rtx_render/rtx_reflex.h"
-#include "rtx_render/rtx_game_capturer.h"
+#include "rtx_render/rtx_asset_exporter.h"
 #include "rtx_render/rtx_gpu_crash.h"
 #include "rtx_render/rtx_dlss_neural_rendering.h"
 #include "rtx_render/rtx_gpu_pass_timer.h"
 
 #include "rtx_render/rtx_denoise_type.h"
+#include "imgui/dxvk_imgui.h"
 #include "../util/util_lazy.h"
 #include "../util/util_active.h"
 
 namespace dxvk {
 
   class DxvkDevice;
-  class DxvkRayReconstruction;
-  class DxvkToneMapping;
   class DxvkBloom;
-  class DebugView;
   class DxvkPostFx;
-  class DxvkSRGBDither;
   class ImGUI;
-  class RtxTextureManager;
   class DxvkXeSS;
 
   class NGXContext;
@@ -135,10 +128,6 @@ namespace dxvk {
       return m_dlss.get();
     }
 
-    DxvkRayReconstruction& metaRayReconstruction() {
-      return m_rayReconstruction.get();
-    }
-
     DxvkDLFG& metaDLFG() {
       return m_dlfg.get();
     }
@@ -163,32 +152,16 @@ namespace dxvk {
       return m_gpuCrash.get();
     }
 
-    DebugView& metaDebugView() {
-      return m_debug_view.get();
-    }
-
     DxvkAutoExposure& metaAutoExposure() {
       return m_autoExposure.get();
-    }
-
-    DxvkToneMapping& metaToneMapping() {
-      return m_toneMapping.get();
     }
 
     DxvkBloom& metaBloom() {
       return m_bloom.get();
     }
 
-    RtxImageUtils& metaImageUtils() {
-      return m_imageUtils.get();
-    }
-
     DxvkPostFx& metaPostFx() {
       return m_postFx.get();
-    }
-
-    DxvkSRGBDither& metaSRGBDither() {
-      return m_srgbDither.get();
     }
 
     RtxReflex& metaReflex() {
@@ -207,18 +180,12 @@ namespace dxvk {
       return m_rtInitializer;
     }
 
-    RtxTextureManager& getTextureManager();
-    
     ImGUI& getImgui() {
       return m_imgui;
     }
 
     AssetExporter& metaExporter() {
       return m_exporter.get();
-    }
-
-    Rc<GameCapturer> capturer() {
-      return m_capturer;
     }
 
     RtxGpuPassTimer& metaGpuPassTimer() {
@@ -253,36 +220,27 @@ namespace dxvk {
     Lazy<DxvkMetaResolveObjects>      m_metaResolve;
     Lazy<DxvkMetaPackObjects>         m_metaPack;
 
-
-    // Note: SceneManager(...) retrieves m_exporter from DxvkObjects(), so m_exporter has to be initialized prior to m_sceneManager
     Lazy<AssetExporter>               m_exporter;
 
     // RTX Management
     SceneManager       m_sceneManager;
     Resources          m_rtResources;
     RtxInitializer     m_rtInitializer;
-    std::unique_ptr<RtxTextureManager> m_textureManager;
     ImGUI              m_imgui;
-    Rc<GameCapturer>   m_capturer;
 
     // RTX Shaders
     Active<NGXContext>                      m_ngxContext;
     Active<RtxNgxPassthrough>               m_ngxPassthrough;
     Active<DxvkDLFG>                        m_dlfg;
     Active<DxvkDLSS>                        m_dlss;
-    Active<DxvkRayReconstruction>           m_rayReconstruction;
     Active<DlssNeuralRendering>             m_dlssNeuralRendering;
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
     Active<GpuCrashPass>                    m_gpuCrash;
-    Active<DebugView>                       m_debug_view;
     Active<DxvkAutoExposure>                m_autoExposure;
-    Active<DxvkToneMapping>                 m_toneMapping;
     Active<DxvkBloom>                       m_bloom;
-    Active<RtxImageUtils>                   m_imageUtils;
     Active<DxvkPostFx>                      m_postFx;
-    Active<DxvkSRGBDither>                  m_srgbDither;
     Lazy<RtxReflex>                         m_reflex;
     Lazy<RtxGpuPassTimer>                   m_gpuPassTimer;
 

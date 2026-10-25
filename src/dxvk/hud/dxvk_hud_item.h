@@ -187,21 +187,6 @@ namespace dxvk::hud {
 
   };
 
-  /**
-   * \brief HUD item to display the raytracing mode
-   */
-  class HudRaytracingModeItem : public HudItem {
-
-  public:
-
-    HudRaytracingModeItem() = default;
-    ~HudRaytracingModeItem() = default;
-
-    HudPos render(
-      HudRenderer&      renderer,
-      HudPos            position);
-  };
-
 
   /**
    * \brief HUD item to display the frame rate
@@ -323,7 +308,6 @@ namespace dxvk::hud {
 
     uint64_t          m_gpCount = 0;
     uint64_t          m_cpCount = 0;
-    uint64_t          m_rtpCount = 0;
     uint64_t          m_rpCount = 0;
     uint64_t          m_pbCount = 0;
 

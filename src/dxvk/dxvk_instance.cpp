@@ -27,7 +27,6 @@
 #include "dxvk_platform_exts.h"
 #include "rtx_render/rtx_system_info.h"
 #include "rtx_render/rtx_options.h"
-#include "rtx_render/rtx_mod_manager.h"
 #include "rtx_render/rtx_nsight_capture.h"
 
 // NV-DXVK start: Integrate Aftermath
@@ -58,9 +57,6 @@
 #include "../util/util_string.h"
 // NV-DXVK end
 
-// NV-DXVK start: RTXIO
-#include "rtx_render/rtx_io.h"
-// NV-DXVK end
 #include "rtx_render/rtx_env.h"
 
 // NV-DXVK start: Provide error code on exception
@@ -490,14 +486,6 @@ namespace dxvk {
     m_extProviders.push_back(&DxvkPlatformExts::s_instance);
     m_extProviders.push_back(&VrInstance::s_instance);
     m_extProviders.push_back(&DxvkXrProvider::s_instance);
-
-    // NV-DXVK start: RTXIO
-#ifdef WITH_RTXIO
-    if (RtxIo::enabled()) {
-      m_extProviders.push_back(&RtxIoExtensionProvider::s_instance);
-    }
-#endif
-    // NV-DXVK end
 
     Logger::info("Built-in extension providers:");
     for (const auto& provider : m_extProviders)
@@ -943,20 +931,7 @@ namespace dxvk {
           if (b->deviceProperties().deviceType == deviceTypes[i]) bRank = i;
         }
 
-        if (aRank != bRank)
-          return aRank < bRank;
-
-        // Among adapters of the same device type, prefer ones that support
-        // ray tracing extensions required by RTX Remix.
-        const bool aSupportsRT = a->supportsExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
-                               && a->supportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-        const bool bSupportsRT = b->supportsExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
-                               && b->supportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-
-        if (aSupportsRT != bSupportsRT)
-          return aSupportsRT;
-
-        return false;
+        return aRank < bRank;
       });
     
     if (result.size() == 0) {

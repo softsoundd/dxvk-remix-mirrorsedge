@@ -869,26 +869,6 @@ namespace dxvk {
     return D3D_OK;
   }
 
-  HRESULT D3D9SwapchainExternal::Reset(D3DPRESENT_PARAMETERS* pPresentParams, D3DDISPLAYMODEEX* pFullscreenDisplayMode, bool forceWindowReset) {
-    D3D9DeviceLock lock = m_parent->LockDevice();
-
-    this->SynchronizePresent();
-    this->NormalizePresentParameters(pPresentParams);
-
-    if (pPresentParams->hDeviceWindow != nullptr && m_window != pPresentParams->hDeviceWindow) {
-      ResetWindowProc(m_window);
-      m_window = m_parent->m_window = pPresentParams->hDeviceWindow;
-      HookWindowProc(m_window);
-    }
-
-    m_presentParams = *pPresentParams;
-    sentry::setTag("windowed", m_presentParams.Windowed ? "true" : "false");
-
-    CreateBackBuffers(m_presentParams.BackBufferCount);
-
-    return S_OK;
-  }
-
   HRESULT D3D9SwapChainEx::Reset(
           D3DPRESENT_PARAMETERS* pPresentParams,
           D3DDISPLAYMODEEX*      pFullscreenDisplayMode,
@@ -1118,7 +1098,7 @@ namespace dxvk {
     }
 
     // NV-DXVK start: [NGX passthrough] no multisampled surface may exist, including the swapchain
-    if (RtxNgxPassthrough::forceGameMsaaOff()) {
+    if (RtxNgxPassthrough::disableGameMsaa()) {
       pPresentParams->MultiSampleType    = D3DMULTISAMPLE_NONE;
       pPresentParams->MultiSampleQuality = 0;
     }

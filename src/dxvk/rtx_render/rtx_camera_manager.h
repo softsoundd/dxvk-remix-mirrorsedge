@@ -22,15 +22,12 @@
 #pragma once
 
 #include "rtx_camera.h"
-#include "rtx_option.h"
-#include "rtx_types.h"
 #include "rtx_common_object.h"
 #include "rtx_matrix_helpers.h"
+#include "../../util/util_fast_cache.h"
 
 namespace dxvk {
   class DxvkDevice;
-  class RayPortalManager;
-  class Config;
 
   class CameraManager : public CommonDeviceObject {
   public:
@@ -48,18 +45,11 @@ namespace dxvk {
     const RtCamera& getMainCamera() const { return getCamera(CameraType::Main); }
     RtCamera& getMainCamera() { return getCamera(CameraType::Main); }
 
-    CameraType::Enum getLastSetCameraType() const { return m_lastSetCameraType; }
-    
     bool isCameraValid(CameraType::Enum cameraType) const;
 
     void onFrameEnd();
 
-    // Calculates a camera type for the specified draw call.
-    CameraType::Enum processCameraData(const DrawCallState& input);
     void processExternalCamera(CameraType::Enum type, const Matrix4& worldToView, const Matrix4& viewToProjection);
-
-    uint32_t getLastCameraCutFrameId() const { return m_lastCameraCutFrameId; }
-    bool isCameraCutThisFrame() const;
 
   private:
     template<
@@ -67,11 +57,7 @@ namespace dxvk {
       std::enable_if_t<std::is_same_v<T, CameraManager> || std::is_same_v<T, const CameraManager>, bool> = true>
     static auto& accessCamera(T& cameraManager, CameraType::Enum cameraType) {
       assert(cameraType < CameraType::Count);
-      // Default Unknown to Main camera object
-      // since cameras can get rejected but rtx pipeline can
-      // still try to retrieve a camera corresponding to a DrawCall object.
-      // In that case it will read from the Main camera.
-      // This is OK as we never update Unknown camera directly.
+      // Unknown aliases the Main camera object; it is never updated directly.
       if (cameraType == CameraType::Unknown) {
         return cameraManager.m_cameras[CameraType::Main];
       }
@@ -80,18 +66,8 @@ namespace dxvk {
 
   private:
     std::array<RtCamera, CameraType::Count> m_cameras;
-    CameraType::Enum m_lastSetCameraType = CameraType::Unknown;
-    uint32_t m_lastCameraCutFrameId = -1;
-    uint32_t m_lastCameraViewHistoryInvalidationFrameId = -1;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);
-
-  public:
-    RTX_OPTION("rtx.cameraManager", bool, logMainCameraUpdates, false,
-               "Logs main camera acceptance, skipped-update, camera-cut, and history-invalidation decisions.");
-
-  private:
-    RTX_OPTION("rtx", bool, rayPortalEnabled, false, "Enables ray portal support. Note this requires portal texture hashes to be set for the ray portal geometries in rtx.rayPortalModelTextureHashes.");
   };
 }  // namespace dxvk

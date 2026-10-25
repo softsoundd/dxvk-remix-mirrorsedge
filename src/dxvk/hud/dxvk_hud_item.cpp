@@ -4,7 +4,6 @@
 #include <version.h>
 
 #include "rtx_render/rtx_options.h"
-#include "rtx_render/rtx_texture_manager.h"
 
 namespace dxvk::hud {
 
@@ -52,7 +51,6 @@ namespace dxvk::hud {
     if (m_enabled.find("1") != m_enabled.end()) {
       m_enabled.insert("version");
       m_enabled.insert("devinfo");
-      m_enabled.insert("raytracingMode");
       m_enabled.insert("fps");
       m_enabled.insert("memory");
       m_enabled.insert("gpuload");
@@ -177,28 +175,6 @@ namespace dxvk::hud {
       m_vulkanVer);
 
     position.y += 8.0f;
-    return position;
-  }
-
-
-  HudPos HudRaytracingModeItem::render(
-    HudRenderer&      renderer,
-    HudPos            position) {
-    position.y += 16.0f;
-
-    renderer.drawText(16.0f,
-      { position.x, position.y },
-      { 0.25f, 0.5f, 0.25f, 1.0f },
-      "Raytracing Mode: ");
-
-    position.y += 16.0f;
-    renderer.drawText(14.0f,
-      { position.x, position.y },
-      { 1.0f, 1.0f, 1.0f, 1.0f },
-      "RTX-Off (Raster)");
-
-    position.y += 16.0f;
-
     return position;
   }
 
@@ -416,7 +392,6 @@ namespace dxvk::hud {
     if (elapsed.count() >= UpdateInterval) {
       m_gpCount = diffCounters.getCtr(DxvkStatCounter::CmdDrawCalls);
       m_cpCount = diffCounters.getCtr(DxvkStatCounter::CmdDispatchCalls);
-      m_rtpCount = diffCounters.getCtr(DxvkStatCounter::CmdTraceRaysCalls);
       m_rpCount = diffCounters.getCtr(DxvkStatCounter::CmdRenderPassCount);
       m_pbCount = diffCounters.getCtr(DxvkStatCounter::CmdBarrierCount);
 
@@ -451,17 +426,6 @@ namespace dxvk::hud {
       { position.x + 192.0f, position.y },
       { 1.0f, 1.0f, 1.0f, 1.0f },
       str::format(m_cpCount));
-
-    position.y += 20.0f;
-    renderer.drawText(16.0f,
-      { position.x, position.y },
-      { 0.25f, 0.5f, 1.0f, 1.0f },
-      "TraceRays calls:");
-
-    renderer.drawText(16.0f,
-      { position.x + 192.0f, position.y },
-      { 1.0f, 1.0f, 1.0f, 1.0f },
-      str::format(m_rtpCount));
     
     position.y += 20.0f;
     renderer.drawText(16.0f,
@@ -821,32 +785,8 @@ namespace dxvk::hud {
     HudPos       position) {
     const DxvkStatCounters counters = m_device->getStatCounters();
 
-    const std::string labels[] = { "# Presents:" ,
-                                   "# BLAS:" ,
-                                   "# Buffers:" ,
-                                   "# Textures:" ,
-                                   "# Active Replacement Textures:",
-                                   "# Instances/Surfaces:" ,
-                                   "# Surface Materials:" ,
-                                   "# Surface Material Extensions:" ,
-                                   "# Volume Materials:" ,
-                                   "# Lights:",
-                                   "# Samplers:",
-                                   "# Textures in-flight:",
-                                   "# Last tex. batch (ms):"};
-    const uint64_t values[] = { counters.getCtr(DxvkStatCounter::QueuePresentCount),
-                                counters.getCtr(DxvkStatCounter::RtxBlasCount),
-                                counters.getCtr(DxvkStatCounter::RtxBufferCount),
-                                counters.getCtr(DxvkStatCounter::RtxTextureCount),
-                                counters.getCtr(DxvkStatCounter::RtxReplacementTextureCount),
-                                counters.getCtr(DxvkStatCounter::RtxInstanceCount),
-                                counters.getCtr(DxvkStatCounter::RtxSurfaceMaterialCount),
-                                counters.getCtr(DxvkStatCounter::RtxSurfaceMaterialExtensionCount),
-                                counters.getCtr(DxvkStatCounter::RtxVolumeMaterialCount),
-                                counters.getCtr(DxvkStatCounter::RtxLightCount),
-                                counters.getCtr(DxvkStatCounter::RtxSamplers),
-                                counters.getCtr(DxvkStatCounter::RtxTexturesInFlight),
-                                counters.getCtr(DxvkStatCounter::RtxLastTextureBatchDuration)};
+    const std::string labels[] = { "# Presents:" };
+    const uint64_t values[] = { counters.getCtr(DxvkStatCounter::QueuePresentCount) };
 
     const uint32_t kNumLabels = sizeof(labels) / sizeof(labels[0]);
     static_assert(kNumLabels == sizeof(values) / sizeof(values[0]));
@@ -887,28 +827,6 @@ namespace dxvk::hud {
                         { 1.0f, 0.2f, 0.2f, 1.0f },
                         str::format("Present Throttling enabled! (Delay: ", presentThrottleDelay, " ms)"));
       position.y += 16.0f;
-    }
-
-    if (RtxTextureManager::getShowProgress()) {
-      constexpr size_t kNumTexPerLine = 64;
-      int64_t numTexInFlight = counters.getCtr(DxvkStatCounter::RtxTexturesInFlight);
-
-      std::string progress(std::min<size_t>(kNumTexPerLine, numTexInFlight), '*');
-
-      while (numTexInFlight > 0) {
-        if (progress.length() > numTexInFlight) {
-          progress.resize(numTexInFlight);
-        }
-
-        position.y += 8.0f;
-        renderer.drawText(16.0f,
-                          { position.x, position.y },
-                          { 0.0f, 1.0f, 0.0f, 1.0f },
-                          progress);
-        position.y += 16.0f;
-
-        numTexInFlight -= kNumTexPerLine;
-      }
     }
 
     return position;

@@ -35,9 +35,7 @@ namespace dxvk {
 
   struct D3D9Options {
 
-// NV-DXVK start: different default values for d3d9 options
-    D3D9Options(const Rc<DxvkDevice>& device, const Config& config, bool withRemixAPI);
-// NV-DXVK end
+    D3D9Options(const Rc<DxvkDevice>& device, const Config& config);
 
     /// Override PCI vendor and device IDs reported to the
     /// application. This may make apps think they are running

@@ -99,9 +99,9 @@ namespace dxvk {
      * the derived class with an opportunity to clean up
      * internal circular references to dxvk objects so that
      * the parent DxvkDevice can be destroyed. The common
-     * offenders that hold a reference to DxvkDevice are:
-     * DxvkContex, RtxStagingDataAlloc.
-     * If derived class has members of one of those classes,
+     * offender that holds a reference to DxvkDevice is
+     * DxvkContext.
+     * If derived class has members of that class,
      * these members MUST be cleaned up using the
      * onDestroy() method. The DxvkDevice object can NOT be
      * destroyed otherwise and will leak the entire set

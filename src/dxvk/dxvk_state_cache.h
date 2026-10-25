@@ -30,9 +30,6 @@
 #include <vector>
 
 #include "dxvk_state_cache_types.h"
-// NV-DXVK start: compile rt shaders on shader compilation threads
-#include "dxvk_raytracing.h"
-// NV-DXVK end
 
 namespace dxvk {
 
@@ -97,19 +94,6 @@ namespace dxvk {
 // NV-DXVK start
       bool                                  isRemixShader = false);
 // NV-DXVK end
-
-    // NV-DXVK start: compile raytracing shaders on shader compilation threads
-    /**
-     * \brief Registers a set of raytracing shaders
-     * 
-     * Makes the shader available to the pipeline
-     * compiler, and starts compiling all pipelines
-     * for which all shaders become available.
-     * \param [in] shaders The shaders to add
-     */
-    void registerRaytracingShaders(
-      const DxvkRaytracingPipelineShaders& shaders);
-    // NV-DXVK end
     
     /**
      * \brief Explicitly stops worker threads
@@ -138,19 +122,12 @@ namespace dxvk {
       DxvkGraphicsPipelineShaders gp;
       DxvkComputePipelineShaders  cp;
 
-      // NV-DXVK start: compile rt shaders on shader compilation threads
-      DxvkRaytracingPipelineShaders rt;
-      // NV-DXVK end
       // NV-DXVK start
       bool isRemixShader = false;
       // NV-DXVK end
 
       // NV-DXVK start: do not compile same shader multiple times
       size_t hash() const {
-        // raytracing shader group hash is NOT guaranteed to be zero
-        if (!rt.groups.empty()) {
-          return rt.hash();
-        }
         // note that one of these is guaranteed to be zero
         return cp.hash() ^ gp.hash();
       }

@@ -144,7 +144,7 @@ namespace dxvk {
 
 
       if (ImGui::BeginTabBar("Settings Tabs", tab_bar_flags)) {
-        if (RtxNgxPassthrough::ngxPassthroughMode() && ImGui::BeginTabItem("General", nullptr, tab_item_flags)) {
+        if (ImGui::BeginTabItem("General", nullptr, tab_item_flags)) {
           beginTabChild("##tab_child_general");
           showUserGeneralSettings(ctx, subItemWidth, subItemIndent);
           endTabChild();
@@ -245,10 +245,6 @@ namespace dxvk {
     const Rc<DxvkContext>& ctx,
     const int subItemWidth,
     const int subItemIndent) {
-    if (!RtxNgxPassthrough::ngxPassthroughMode()) {
-      return;
-    }
-
     auto common = ctx->getCommonObjects();
     DxvkDLSS& dlss = common->metaDLSS();
     DxvkDLFG& dlfg = common->metaDLFG();
@@ -415,41 +411,38 @@ namespace dxvk {
     const int subItemWidth,
     const int subItemIndent) {
     auto common = ctx->getCommonObjects();
+    DxvkPostFx& postFx = common->metaPostFx();
 
-    if (RtxNgxPassthrough::ngxPassthroughMode()) {
-      DxvkPostFx& postFx = common->metaPostFx();
+    ImGui::TextWrapped("Post-processing and display settings for the NGX passthrough pipeline.");
 
-      ImGui::TextWrapped("Post-processing and display settings for the NGX passthrough pipeline.");
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
 
-      ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    ImGui::TextSeparator("Post Effect Settings");
 
-      ImGui::TextSeparator("Post Effect Settings");
+    {
+      RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
 
-      {
-        RemixGui::Checkbox("Enable Post Effects", &postFx.enableObject());
+      ImGui::PushItemWidth(static_cast<float>(subItemWidth));
+      ImGui::Indent(static_cast<float>(subItemIndent));
 
-        ImGui::PushItemWidth(static_cast<float>(subItemWidth));
+      ImGui::BeginDisabled(!postFx.enable());
+
+      RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
+      if (postFx.enableMotionBlur()) {
         ImGui::Indent(static_cast<float>(subItemIndent));
-
-        ImGui::BeginDisabled(!postFx.enable());
-
-        RemixGui::Checkbox("Enable Motion Blur", &postFx.enableMotionBlurObject());
-        if (postFx.enableMotionBlur()) {
-          ImGui::Indent(static_cast<float>(subItemIndent));
-          RemixGui::Combo("Motion Blur Quality", &postFx.motionBlurModeObject(), "Legacy\0Cinematic\0");
-          if (postFx.motionBlurMode() == MotionBlurMode::Cinematic) {
-            RemixGui::DragFloat("Shutter Angle", &postFx.motionBlurShutterAngleObject(), 1.0f, 0.0f, 360.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
-          }
-          ImGui::Unindent(static_cast<float>(subItemIndent));
+        RemixGui::Combo("Motion Blur Quality", &postFx.motionBlurModeObject(), "Legacy\0Cinematic\0");
+        if (postFx.motionBlurMode() == MotionBlurMode::Cinematic) {
+          RemixGui::DragFloat("Shutter Angle", &postFx.motionBlurShutterAngleObject(), 1.0f, 0.0f, 360.0f, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
         }
-        RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
-        RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
-
-        ImGui::EndDisabled();
-
         ImGui::Unindent(static_cast<float>(subItemIndent));
-        ImGui::PopItemWidth();
       }
+      RemixGui::Checkbox("Enable Chromatic Aberration", &postFx.enableChromaticAberrationObject());
+      RemixGui::Checkbox("Enable Vignette", &postFx.enableVignetteObject());
+
+      ImGui::EndDisabled();
+
+      ImGui::Unindent(static_cast<float>(subItemIndent));
+      ImGui::PopItemWidth();
     }
 
     ImGui::Dummy(ImVec2(0.0f, 3.0f));

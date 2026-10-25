@@ -27,7 +27,7 @@
 #include "rtx/pass/temporal_aa/temporal_aa.h"
 
 #include <rtx_shaders/temporal_aa.h>
-#include <pxr/base/arch/math.h>
+#include <cmath>
 #include "rtx_imgui.h"
 
 namespace dxvk {
@@ -53,7 +53,7 @@ namespace dxvk {
 
 
   DxvkTemporalAA::DxvkTemporalAA(DxvkDevice* device)
-  : RtxPass(device), m_vkd(device->vkd()) {
+  : m_vkd(device->vkd()) {
   }
 
   DxvkTemporalAA::~DxvkTemporalAA() {

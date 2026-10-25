@@ -46,7 +46,6 @@ namespace dxvk {
   class ImGuiAbout;
   class ImGuiFirstUseGuide;
   class ImGuiSplash;
-  class ImGuiCapture;
   class DxvkDevice;
   class DxvkContext;
 
@@ -58,13 +57,6 @@ namespace dxvk {
   class ImGUI {
     
   public:
-    // if set for a texture category, only textures with that flag can be set to that category.
-    static const uint32_t kTextureFlagsNone = 0; 
-    // Use this for regular textures
-    static const uint32_t kTextureFlagsDefault = 1 << 0; 
-    // Use this for render target textures
-    static const uint32_t kTextureFlagsRenderTarget = 1 << 1; 
-    
     enum class Theme {
       Toolkit,
       Legacy,
@@ -110,17 +102,12 @@ namespace dxvk {
      */
     void render(const Rc<DxvkContext>&  ctx,  VkExtent2D surfaceSize);
     
-    static void AddTexture(const XXH64_hash_t hash, const Rc<DxvkImageView>& imageView, uint32_t textureFeatureFlags);
-    static void ReleaseTexture(const XXH64_hash_t hash);
     static bool checkHotkeyState(const VirtualKeys& virtKeys, const bool allowContinuousPress = false);
-    static void SetFogStates(const fast_unordered_cache<FogState>& fogStates, XXH64_hash_t usedFogHash);
 
     void switchMenu(UIType type, bool force = false);
     
     enum Tabs {
       kTab_Rendering = 0,
-      kTab_Setup,
-      kTab_Enhancements,
       kTab_About,
       kTab_Development,
       kTab_Count
@@ -156,7 +143,6 @@ namespace dxvk {
     Rc<ImGuiAbout>        m_about;
     Rc<ImGuiFirstUseGuide> m_firstUseGuide;
     Rc<ImGuiSplash>       m_splash;
-    Rc<ImGuiCapture>      m_capture;
     Rc<class GameOverlay>  m_overlayWin;
 
     // Note: May be NULL until the font loads, needs to be checked before use.
@@ -219,7 +205,7 @@ namespace dxvk {
     bool m_reflexLatencyStatsOpen = false;
     bool m_lastRenderVsyncStatus = false;
 
-    static constexpr const char* tabNames[] = { "Rendering", "Game Setup", "Enhancements", "About" , "Dev Settings"};
+    static constexpr const char* tabNames[] = { "Rendering", "About" , "Dev Settings"};
     Tabs m_curTab = kTab_Count;
     Tabs m_triggerTab = kTab_Count;
     void triggerTab(const Tabs tab) {
@@ -227,10 +213,6 @@ namespace dxvk {
     }
 
     void update(const Rc<DxvkContext>& ctx);
-
-    void updateQuickActions(const Rc<DxvkContext>& ctx);
-
-    void showDebugVisualizations(const Rc<DxvkContext>& ctx);
 
     void showMainMenu(const Rc<DxvkContext>& ctx);
 
@@ -253,12 +235,7 @@ namespace dxvk {
     void showReflexOptions(const Rc<DxvkContext>& ctx, bool displayStatsWindowToggle);
     void showReflexLatencyStats();
 
-    void showMaterialOptions();
-
     void showDevelopmentSettings(const Rc<DxvkContext>& ctx);
-
-    // helper to display a configurable grid of all textures currently hooked to ImGUI
-    void showTextureSelectionGrid(const Rc<DxvkContext>& ctx, const char* uniqueId, const uint32_t texturesPerRow, const float thumbnailSize, const float minChildHeight = 600.0f);
 
     void createFontsTexture(const Rc<DxvkContext>& ctx);
 
@@ -280,14 +257,11 @@ namespace dxvk {
 
     void showMemoryStats() const;
 
-    RTX_OPTION_ARGS("rtx.gui", bool, showLegacyTextureGui, false, "A setting to toggle the old texture selection GUI, where each texture category is represented as its own list.", args.flags = RtxOptionFlags::UserSetting);
-    RTX_OPTION_ARGS("rtx.gui", bool, legacyTextureGuiShowAssignedOnly, false, "A setting to show only the textures in a category that are assigned to it (Unassigned textures are found in the new \"Uncategorized\" list at the top).\nRequires: \'Split Texture Category List\' option to be enabled.", args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.gui", std::uint32_t, hudMessageAnimatedDotDurationMilliseconds, 1000, "A duration in milliseconds between each dot in the animated dot sequence for HUD messages. Must be greater than 0.\nThese dots help indicate progress is happening to the user with a bit of animation which can be configured to animate at whatever speed is desired.");
     RTX_OPTION_ARGS("rtx.gui", float, reflexStatRangeInterpolationRate, 0.05f, "A value controlling the interpolation rate applied to the Reflex stat graph ranges for smoother visualization.",
                     args.minValue = 0.0f, args.maxValue = 1.0f);
     RTX_OPTION_ARGS("rtx.gui", float, reflexStatRangePaddingRatio, 0.05f, "A value specifying the amount of padding applied to the Reflex stat graph ranges as a ratio to the calculated range.",
                     args.minValue = 0.0f);
-    RTX_OPTION("rtx.gui", bool, enableExternalPresenter, false, "Enables GUI rendering for external presenters.");
     RTX_OPTION("rtx.gui", Vector4, subRect, Vector4(0.f, 0.f, 0.f, 0.f), "Used for toolkit.");
     
     public: static void onThemeChange(DxvkDevice* device);

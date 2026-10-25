@@ -26,7 +26,6 @@
 #include "rtx_gpu_crash.h"
 #include "dxvk_device.h"
 #include "rtx_context.h"
-#include "rtx_debug_view.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/gpu_crash_trigger/gpu_crash_trigger.h"
 
@@ -47,8 +46,11 @@ namespace dxvk {
   } // namespace
 
   void GpuCrashPass::dispatch(RtxContext* ctx) {
-    DebugView& debugView = ctx->getCommonObjects()->metaDebugView();
-    ctx->bindResourceView(GPU_CRASH_TRIGGER_OUTPUT, debugView.getDebugOutput(), nullptr);
+    if (m_target == nullptr) {
+      Rc<DxvkContext> dxvkCtx = ctx;
+      m_target = Resources::createImageResource(dxvkCtx, "GPU crash trigger target", { 1, 1, 1 }, VK_FORMAT_R16G16B16A16_SFLOAT).view;
+    }
+    ctx->bindResourceView(GPU_CRASH_TRIGGER_OUTPUT, m_target, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, GpuCrashShader::getShader());
     const GpuCrashTriggerArgs crashArgs = { 1 };
     ctx->pushConstants(0, sizeof(crashArgs), &crashArgs);

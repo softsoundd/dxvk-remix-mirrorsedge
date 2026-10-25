@@ -293,25 +293,7 @@ namespace dxvk {
     if (key.eq(g_nullShaderKey))
       return;
 
-    const auto shaderStage = shader->stage();
-    const auto isRayTracingShader = shaderStage > VK_SHADER_STAGE_COMPUTE_BIT;
-    const auto isComputeShader = shaderStage == VK_SHADER_STAGE_COMPUTE_BIT;
-
-    // NV-DXVK start: compile raytracing shaders on shader compilation threads
-    if (isRayTracingShader) {
-      // Note: Ensure the shader was actually a ray tracing shader type, as the current check
-      // for if something is a ray tracing shader or not is fairly basic and could have false positives.
-      assert(
-        shaderStage == VK_SHADER_STAGE_RAYGEN_BIT_KHR ||
-        shaderStage == VK_SHADER_STAGE_ANY_HIT_BIT_KHR ||
-        shaderStage == VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR ||
-        shaderStage == VK_SHADER_STAGE_MISS_BIT_KHR ||
-        shaderStage == VK_SHADER_STAGE_INTERSECTION_BIT_KHR
-      );
-
-      return;
-    }
-    // NV-DXVK end
+    const auto isComputeShader = shader->stage() == VK_SHADER_STAGE_COMPUTE_BIT;
 
     // Add the shader so we can look it up by its key
     std::unique_lock<dxvk::mutex> entryLock(m_entryLock);
@@ -371,31 +353,6 @@ namespace dxvk {
     if (workerLock)
       m_workerCond.notify_all();
   }
-
-  // NV-DXVK start: compile raytracing shaders on shader compilation threads
-  void DxvkStateCache::registerRaytracingShaders(
-    const DxvkRaytracingPipelineShaders& shaders) {
-    if (shaders.groups.empty())
-      return;
-
-    WorkerItem item;
-    item.rt = shaders;
-    item.isRemixShader = true;
-
-    std::unique_lock<dxvk::mutex> workerLock(m_workerLock);
-
-    // Do not compile same shader multiple times
-    if (m_workerItemsInFlight.count(item.hash()) == 0) {
-      assert(item.isRemixShader);
-      ++m_workerCompilingRemixShaders;
-
-      m_workerQueue.push(item);
-      m_workerItemsInFlight.insert(item.hash());
-
-      m_workerCond.notify_all();
-    }
-  }
-  // NV-DXVK end
 
   void DxvkStateCache::stopWorkerThreads() {
     { std::lock_guard<dxvk::mutex> workerLock(m_workerLock);
@@ -459,12 +416,7 @@ namespace dxvk {
     key.fs  = getShaderKey(item.gp.fs);
     key.cs  = getShaderKey(item.cp.cs);
 
-    if (!item.rt.groups.empty()) {
-      // Compile Ray Tracing Pipelines
-
-      auto pipeline = m_pipeManager->createRaytracingPipeline(item.rt);
-      pipeline->compilePipeline();
-    } else if (item.cp.cs == nullptr) {
+    if (item.cp.cs == nullptr) {
       // Compile Graphics Pipelines
 
       auto pipeline = m_pipeManager->createGraphicsPipeline(item.gp);

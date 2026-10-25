@@ -138,8 +138,6 @@ dxvk_src = files([
   'dxvk_platform_exts.h',
   'dxvk_queue.cpp',
   'dxvk_queue.h',
-  'dxvk_raytracing.cpp',
-  'dxvk_raytracing.h',
   'dxvk_recycler.h',
   'dxvk_renderpass.cpp',
   'dxvk_renderpass.h',
@@ -175,15 +173,8 @@ dxvk_src = files([
   'dxvk_memory_tracker.h',
 
   'rtx_render/rtx.h',
-  'rtx_render/rtx_accumulation.cpp',
-  'rtx_render/rtx_accumulation.h',
-  'rtx_render/rtx_asset_data.h',
-  'rtx_render/rtx_asset_data_manager.cpp',
-  'rtx_render/rtx_asset_data_manager.h',
   'rtx_render/rtx_asset_exporter.cpp',
   'rtx_render/rtx_asset_exporter.h',
-  'rtx_render/rtx_asset_package.h',
-  'rtx_render/rtx_asset_replacer.h',
   'rtx_render/rtx_auto_exposure.cpp',
   'rtx_render/rtx_auto_exposure.h',
   'rtx_render/rtx_bloom.cpp',
@@ -197,8 +188,6 @@ dxvk_src = files([
   'rtx_render/rtx_context.h',
   'rtx_render/rtx_gpu_crash.cpp',
   'rtx_render/rtx_gpu_crash.h',
-  'rtx_render/rtx_debug_view.cpp',
-  'rtx_render/rtx_debug_view.h',
   'rtx_render/rtx_denoise_type.h',
   'rtx_render/rtx_dlfg.cpp',
   'rtx_render/rtx_dlfg.h',
@@ -208,15 +197,6 @@ dxvk_src = files([
   'rtx_render/rtx_dlss_neural_rendering.h',
   'rtx_render/rtx_env.cpp',
   'rtx_render/rtx_env.h',
-  'rtx_render/rtx_file_watch.cpp',
-  'rtx_render/rtx_file_watch.h',
-  'rtx_render/rtx_game_capturer.cpp',
-  'rtx_render/rtx_game_capturer.h',
-  'rtx_render/rtx_game_capturer_utils.h',
-  'rtx_render/rtx_geometry_utils.h',
-  'rtx_render/rtx_terrain_baker.h',
-  'rtx_render/rtx_gpu_crash_recorder.cpp',
-  'rtx_render/rtx_gpu_crash_recorder.h',
   'rtx_render/rtx_gpu_overrides.cpp',
   'rtx_render/rtx_gpu_overrides.h',
   'rtx_render/rtx_gpu_pass_timer.cpp',
@@ -224,31 +204,11 @@ dxvk_src = files([
   'rtx_render/rtx_gpu_profile.cpp',
   'rtx_render/rtx_gpu_profile.h',
   'rtx_render/rtx_graphics_preset.h',
-  'rtx_render/rtx_hashing.cpp',
-  'rtx_render/rtx_hashing.h',
-  'rtx_render/rtx_hash_collision_detection.cpp',
-  'rtx_render/rtx_hash_collision_detection.h',
-  'rtx_render/rtx_image_utils.cpp',
-  'rtx_render/rtx_image_utils.h',
   'rtx_render/rtx_imgui.cpp',
   'rtx_render/rtx_imgui.h',
   'rtx_render/rtx_initializer.cpp',
   'rtx_render/rtx_initializer.h',
-  'rtx_render/rtx_instance_manager.h',
-  'rtx_render/rtx_intersection_test.h',
-  'rtx_render/rtx_intersection_test_helpers.h',
-  'rtx_render/rtx_io.cpp',
-  'rtx_render/rtx_io.h',
-  'rtx_render/rtx_light_manager.h',
-  'rtx_render/rtx_lights.h',
-  'rtx_render/rtx_lights_data.h',
-  'rtx_render/rtx_materials.cpp',
-  'rtx_render/rtx_materials.h',
-  'rtx_render/rtx_material_data.h',
   'rtx_render/rtx_matrix_helpers.h',
-  'rtx_render/rtx_mipmap.cpp',
-  'rtx_render/rtx_mipmap.h',
-  'rtx_render/rtx_mod_manager.h',
   'rtx_render/rtx_ngx_passthrough.cpp',
   'rtx_render/rtx_ngx_passthrough.h',
   'rtx_render/rtx_ngx_wrapper.cpp',
@@ -257,8 +217,6 @@ dxvk_src = files([
   'rtx_render/rtx_nis.h',
   'rtx_render/rtx_nsight_capture.cpp',
   'rtx_render/rtx_nsight_capture.h',
-  'rtx_render/rtx_objectpicking.h',
-  'rtx_render/rtx_objectpicking.cpp',
   'rtx_render/rtx_option.cpp',
   'rtx_render/rtx_option.h',
   'rtx_render/rtx_option_constants.h',
@@ -274,14 +232,8 @@ dxvk_src = files([
   'rtx_render/rtx_options.h',
   'rtx_render/rtx_postFx.cpp',
   'rtx_render/rtx_postFx.h',
-  'rtx_render/rtx_preserved_object_picking.h',
-  'rtx_render/rtx_srgb_dither.cpp',
-  'rtx_render/rtx_srgb_dither.h',
-  'rtx_render/rtx_ray_reconstruction.cpp',
-  'rtx_render/rtx_ray_reconstruction.h',
   'rtx_render/rtx_reflex.cpp',
   'rtx_render/rtx_reflex.h',
-  'rtx_render/rtx_remix_api.cpp',
   'rtx_render/rtx_resources.cpp',
   'rtx_render/rtx_resources.h',
   'rtx_render/rtx_scene_manager.cpp',
@@ -290,19 +242,8 @@ dxvk_src = files([
   'rtx_render/rtx_semaphore.h',
   'rtx_render/rtx_shader_manager.cpp',
   'rtx_render/rtx_shader_manager.h',
-  'rtx_render/rtx_sparse_unique_cache.h',
-  'rtx_render/rtx_staging.h',
-  'rtx_render/rtx_staging.cpp',
   'rtx_render/rtx_taa.cpp',
   'rtx_render/rtx_taa.h',
-  'rtx_render/rtx_texture.cpp',
-  'rtx_render/rtx_texture.h',
-  'rtx_render/rtx_texture_manager.cpp',
-  'rtx_render/rtx_texture_manager.h',
-  'rtx_render/rtx_tone_mapping.cpp',
-  'rtx_render/rtx_tone_mapping.h',
-  'rtx_render/rtx_types.cpp',
-  'rtx_render/rtx_types.h',
   'rtx_render/rtx_utils.h',
   'rtx_render/rtx_xess.cpp',
   'rtx_render/rtx_xess.h',
@@ -310,7 +251,6 @@ dxvk_src = files([
   'rtx_render/rtx_system_info.cpp',
   'rtx_render/rtx_system_info.h',
 
-  'rtx_render/graph/rtx_graph_types.h',
 
   'rtx_render/rtx_overlay_window.cpp',
   'rtx_render/rtx_overlay_window.h',
@@ -337,8 +277,6 @@ dxvk_src = files([
   'imgui/dxvk_imgui.h',
   'imgui/dxvk_imgui_about.cpp',
   'imgui/dxvk_imgui_about.h',
-  'imgui/dxvk_imgui_capture.cpp',
-  'imgui/dxvk_imgui_capture.h',
   'imgui/dxvk_imgui_first_use_guide.cpp',
   'imgui/dxvk_imgui_first_use_guide.h',
   'imgui/dxvk_imgui_splash.cpp',
@@ -347,7 +285,6 @@ dxvk_src = files([
   'imgui/imconfig.h',
   'imgui/imgui.cpp',
   'imgui/imgui.h',
-  'imgui/imgui_demo.cpp',
   'imgui/imgui_draw.cpp',
   'imgui/imgui_impl_dxvk.hpp',
   'imgui/imgui_impl_win32.cpp',
@@ -361,27 +298,11 @@ dxvk_src = files([
   'imgui/imstb_truetype.h',
   'imgui/implot.cpp',
   'imgui/implot.h',
-  'imgui/implot_demo.cpp',
   'imgui/implot_internal.h',
   'imgui/implot_items.cpp',
 ])
 
 thread_dep = dependency('threads')
-
-nrd_include_dir = include_directories(join_paths('../../', 'external/nrd/Include'))
-nrd_dep = declare_dependency(
-  include_directories : nrd_include_dir
-)
-
-if dxvk_is_woa
-  nrc_dll_path = join_paths(meson.global_source_root(), 'external/nrc_arm64/bin/')
-  nrc_lib_path = join_paths(meson.global_source_root(), 'external/nrc_arm64/lib/')
-  nrc_include_path = include_directories(join_paths('../../', 'external/nrc_arm64/include'))
-else
-  nrc_dll_path = join_paths(meson.global_source_root(), 'submodules/nrc/bin/')
-  nrc_lib_path = join_paths(meson.global_source_root(), 'submodules/nrc/lib/')
-  nrc_include_path = include_directories(join_paths('../../', 'submodules/nrc/include'))
-endif
 
 # XeSS dependency
 if not dxvk_is_woa
@@ -393,12 +314,6 @@ if not dxvk_is_woa
     include_directories : xess_include_dir
   )
 endif
-
-nrc_lib = dxvk_compiler.find_library('NRC_Vulkan', dirs : nrc_lib_path, required : true)
-
-nrc_dep = declare_dependency(
-  dependencies : [ nrc_lib ]
-)
 
 submodules_dep = declare_dependency(
   include_directories : include_directories('../../submodules')
@@ -420,14 +335,10 @@ dxvk_embedded_data_files = files([
 
 dxvk_generated_embedded_files = embedding_compiler.process(dxvk_embedded_data_files)
 
-dxvk_deps = [ thread_dep, vkcommon_dep, dxvk_extradep, usd_dep, lssUsd_dep, dlss_dep, submodules_dep, tracy_dep, tracy_dep_dynamic, aftermath_dep, nvapi_dep, reflex_dep, usd_plugin_deps ]
+dxvk_deps = [ thread_dep, vkcommon_dep, dxvk_extradep, dlss_dep, submodules_dep, tracy_dep, tracy_dep_dynamic, aftermath_dep, nvapi_dep, reflex_dep ]
 
 if not dxvk_is_woa
   dxvk_deps += xess_dep
-endif
-
-if enable_rtxio
-  dxvk_deps += rtxio_dep
 endif
 
 if not dxvk_is_msvc
@@ -441,9 +352,9 @@ delayimp_dep = declare_dependency(
 dxvk_deps += delayimp_dep
 
 dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shaders, rtx_shaders, dxvk_generated_embedded_files],
-  link_with           : [ util_lib, spirv_lib, usd_plugins ], 
+  link_with           : [ util_lib, spirv_lib ], 
   dependencies        : [ dxvk_deps ],
-  include_directories : [ dxvk_include_path, dxvk_shader_include_path, remix_api_include_path, rtxcr_include_path, submodules_include_path ],
+  include_directories : [ dxvk_include_path, dxvk_shader_include_path, remix_api_include_path, submodules_include_path ],
   override_options    : ['cpp_std='+dxvk_cpp_std],
   # Force switch statements over enums to either cover all cases or have a default case.
   cpp_args            : dxvk_is_msvc ? ['/we4062', '/DREMIX_LIBRARY_EXPORTS=1'] : ['-Wswitch'],

@@ -7,9 +7,6 @@
 #include "../dxvk/dxvk_hash.h"
 #include "../dxvk/dxvk_spec_const.h"
 
-#include "../dxvk/rtx_render/rtx_replacement_material_texture_type.h"
-#include "../dxvk/rtx_render/rtx_terrain_baker.h"
-
 #include "../spirv/spirv_module.h"
 
 #include <cfloat>
@@ -388,12 +385,6 @@ namespace dxvk {
 
       float_t,
       float_t,
-
-// NV-DXVK start: support height map scaling in terrain baking
-      float_t,
-      float_t,
-      float_t,
-// NV-DXVK end
     };
 
     std::array<decltype(stageMembers), caps::TextureStageCount> members;
@@ -423,19 +414,8 @@ namespace dxvk {
       spvModule.memberDecorateOffset(structType, stage * D3D9SharedPSStages_Count + D3D9SharedPSStages_BumpEnvLOffset, offset);
       offset += sizeof(float);
 
-// NV-DXVK start: support height map scaling in terrain baking
-      spvModule.memberDecorateOffset(structType, stage * D3D9SharedPSStages_Count + D3D9SharedPSStages_TexturePreOffset, offset);
-      offset += sizeof(float);
-
-      spvModule.memberDecorateOffset(structType, stage * D3D9SharedPSStages_Count + D3D9SharedPSStages_TextureScale, offset);
-      offset += sizeof(float);
-
-      spvModule.memberDecorateOffset(structType, stage * D3D9SharedPSStages_Count + D3D9SharedPSStages_TexturePostOffset, offset);
-      offset += sizeof(float);
-
-      // Padding
-      offset += 3 * sizeof(float);
-// NV-DXVK end
+      // Padding...
+      offset += sizeof(float) * 2;
     }
 
     uint32_t sharedState = spvModule.newVar(
@@ -548,9 +528,6 @@ namespace dxvk {
 
   enum D3D9FFPSMembers {
     TextureFactor = 0,
-    TexturePreOffset = 1,
-    TextureScale = 2,
-    TexturePostOffset = 3,
 
     MemberCount
   };
@@ -561,9 +538,6 @@ namespace dxvk {
 
     struct {
       uint32_t textureFactor;
-      uint32_t texturePreOffset;
-      uint32_t textureScale;
-      uint32_t texturePostOffset;
     } constants;
 
     struct {
@@ -635,10 +609,6 @@ namespace dxvk {
 
     bool isVS() { return m_programType == DxsoProgramType::VertexShader; }
     bool isPS() { return !isVS(); }
-
-// NV-DXVK start
-    uint32_t postprocessVertexColorForTerrainBaking(uint32_t vertexColor);
-// NV-DXVK end
 
     std::string           m_filename;
 
@@ -1609,277 +1579,6 @@ namespace dxvk {
     m_vs.out.FOG      = declareIO(false, DxsoSemantic{ DxsoUsage::Fog,   0 });
   }
 
-// NV-DXVK start: Replacement material texture support
-  // Performs octahedral decoding on the input vec2 vector
-  // Returns a vec3 direction
-  // Converts an unsigned octahedral encoding (2 channels of [0, 1] to a normalized hemispherical vector (positive z)
-  uint32_t unsignedOctahedralToHemisphereDirection(SpirvModule& spvModule, uint32_t octahedralDirectionVec2) {
-    uint32_t floatType = spvModule.defFloatType(32);
-    uint32_t vec2Type = spvModule.defVectorType(floatType, 2);
-    uint32_t vec3Type = spvModule.defVectorType(floatType, 3);
-    const std::array<uint32_t, 2> indices = { 0, 1 };
-
-    // vec2 p = octahedralDirectionVec4.xy * 2.f - 1.f;
-    uint32_t p = spvModule.opVectorTimesScalar(vec2Type, octahedralDirectionVec2, spvModule.constf32(2.f));  // p = octahedralDirectionVec2 * 2.f
-    p = spvModule.opFSub(vec2Type, p, spvModule.constvec2f32(1.f, 1.f));                        // p = p - 1.f
-
-    // vec2 t = vec2(p.x + p.y, p.x - p.y) * 0.5f;
-    uint32_t p_x = spvModule.opCompositeExtract(floatType, p, 1, &indices[0]);                 // p_x = p.x
-    uint32_t p_y = spvModule.opCompositeExtract(floatType, p, 1, &indices[1]);                 // p_y = p.y
-    std::array<uint32_t, 3> t;
-    t[0] = spvModule.opFAdd(floatType, p_x, p_y);                                              // t[0] = p_x + p_y
-    t[1] = spvModule.opFSub(floatType, p_x, p_y);                                              // t[1] = p_x - p_y
-    t[0] = spvModule.opFMul(floatType, t[0], spvModule.constf32(0.5f));                        // t[0] = t[0] * 0.5f
-    t[1] = spvModule.opFMul(floatType, t[1], spvModule.constf32(0.5f));                        // t[1] = t[1] * 0.5f
-
-    // vec3 v = vec3(t.x, t.y, 1.0f - abs(t.x) - abs(t.y));
-    uint32_t abs_t_x = spvModule.opFAbs(floatType, t[0]);                                      // abs_t_x = abs(t[0])
-    uint32_t abs_t_y = spvModule.opFAbs(floatType, t[1]);                                      // abs_t_y = abs(t[1])
-    t[2] = spvModule.opFNegate(floatType, abs_t_x);                                            // t[2] = - abs_t_x
-    t[2] = spvModule.opFSub(floatType, t[2], abs_t_y);                                         // t[2] = t[2] - abs_t_y
-    t[2] = spvModule.opFAdd(floatType, t[2], spvModule.constf32(1.f));                         // t[2] = t[2] + 1.f
-    uint32_t v = spvModule.opCompositeConstruct(vec3Type, t.size(), t.data());                 // v = vec3(t[0], t[1], t[2])
-
-    // return normalize(v)
-    return spvModule.opNormalize(vec3Type, v);                                                     
-  };
-
-  // Returns a decoded (if it is encoded) a replacement texture value
-  uint32_t conditionallyDecodeReplacementTextureValue(
-    SpirvModule& spvModule, 
-    uint32_t rawTextureValue, 
-    uint32_t textureCategory,
-    std::function<void(uint32_t vec4value)> storeVec4ValueToRegisterFnc,
-    std::function<uint32_t()> loadVec4ValueFromRegisterFnc, 
-    bool isTextureValueInRegisterStorage = false) {
-    // Types
-    uint32_t boolType = spvModule.defBoolType();
-    uint32_t floatType = spvModule.defFloatType(32);
-    uint32_t vec2Type = spvModule.defVectorType(floatType, 2);
-    uint32_t vec4Type = spvModule.defVectorType(floatType, 4);
-
-    // Branch labels
-    uint32_t decodeOctahedralBeginLabel = spvModule.allocateId();
-    uint32_t decodeOctahedralEndLabel = spvModule.allocateId();
-
-    // Store the value as it will be reloaded after the if branch
-    if (!isTextureValueInRegisterStorage) {
-      storeVec4ValueToRegisterFnc(rawTextureValue);
-    }
-
-    // if (replacement_texture_category == ReplacementMaterialTextureCategory::SecondaryOctahedralEncoded) { ... }
-    uint32_t isOctahedralEncoded = spvModule.opIEqual(boolType, textureCategory, spvModule.constu32(ReplacementMaterialTextureCategory::SecondaryOctahedralEncoded));
-    spvModule.opSelectionMerge(decodeOctahedralEndLabel, spv::SelectionControlMaskNone);
-    spvModule.opBranchConditional(isOctahedralEncoded, decodeOctahedralBeginLabel, decodeOctahedralEndLabel);
-    {
-      // Octahedral decode the texture
-      spvModule.opLabel(decodeOctahedralBeginLabel);
-
-      const std::array<uint32_t, 3> indices = { 0, 1, 2 };
-
-      uint32_t octahedralDirection = spvModule.opVectorShuffle(vec2Type, rawTextureValue, rawTextureValue, 2, indices.data()); // octahedralDirection = texture.xy
-      uint32_t direction = unsignedOctahedralToHemisphereDirection(spvModule, octahedralDirection);
-
-      // texture = vec4(direction, 0.f);
-      std::array<uint32_t, 4> texture_components;
-      texture_components[0] = spvModule.opCompositeExtract(floatType, direction, 1, &indices[0]);
-      texture_components[1] = spvModule.opCompositeExtract(floatType, direction, 1, &indices[1]);
-      texture_components[2] = spvModule.opCompositeExtract(floatType, direction, 1, &indices[2]);
-      texture_components[3] = spvModule.constf32(0.f);
-      uint32_t decodedTextureValue = spvModule.opCompositeConstruct(vec4Type, texture_components.size(), texture_components.data());
-
-      // The new texture value needs to be stored before branching out, and reloaded after
-      storeVec4ValueToRegisterFnc(decodedTextureValue);
-
-      spvModule.opBranch(decodeOctahedralEndLabel);
-      spvModule.opLabel(decodeOctahedralEndLabel);
-    } // ~Octahedral decode the input texture
-
-    // Re-load the value
-    return loadVec4ValueFromRegisterFnc();
-  }
-
-  // Postprocess the texture load for terrain baking if this is a terrain baking call, it's a noop otherwise
-  uint32_t postprocessTextureReadForTerrainBaking(
-    SpirvModule& spvModule,
-    uint32_t textureValue, 
-    uint32_t texcoord,
-    uint32_t texcoordType,
-    std::function<uint32_t()> loadTexturePreOffsetFnc,
-    std::function<uint32_t()> loadTextureScaleFnc,
-    std::function<uint32_t()> loadTexturePostOffsetFnc,
-    std::function<uint32_t()> loadAlbedoOpacityFnc,
-    std::function<void(uint32_t vec4value)> storeVec4ValueToRegisterFnc,
-    std::function<uint32_t()> loadVec4ValueFromRegisterFnc) {
-
-    // Types
-    uint32_t boolType = spvModule.defBoolType();
-    uint32_t floatType = spvModule.defFloatType(32);
-    uint32_t uint32Type = spvModule.defIntType(32, 0);
-    uint32_t vec4Type = spvModule.defVectorType(floatType, 4);
-    uint32_t vec2Type = spvModule.defVectorType(floatType, 2);
-
-    // Initialize spec constant for texture category
-    uint32_t textureCategory = spvModule.specConst32(uint32Type, 0);
-    spvModule.setDebugName(textureCategory, "replacement_texture_category");
-    spvModule.decorateSpecId(textureCategory, getSpecId(D3D9SpecConstantId::ReplacementTextureCategory));
-
-    // Allocate branch labels
-    uint32_t addOpacityBeginLabel = spvModule.allocateId();
-    uint32_t addOpacityEndLabel = spvModule.allocateId();
-
-    storeVec4ValueToRegisterFnc(textureValue);
-
-    // if (replacement_texture_category != ReplacementMaterialTextureCategory::AlbedoOpacity) { ... }
-    uint32_t isNotAlbedoOpacity = spvModule.opINotEqual(boolType, textureCategory, spvModule.constu32(ReplacementMaterialTextureCategory::AlbedoOpacity));
-    spvModule.opSelectionMerge(addOpacityEndLabel, spv::SelectionControlMaskNone);
-    spvModule.opBranchConditional(isNotAlbedoOpacity, addOpacityBeginLabel, addOpacityEndLabel);
-    {
-      // Decode the input texture value and add opacity
-      spvModule.opLabel(addOpacityBeginLabel);
-
-      // Decode the read replacement texture value since it may be encoded depending on the texture category type
-      // Note: passing true as the value has already been stored to register storage before the if check above
-      textureValue = conditionallyDecodeReplacementTextureValue(spvModule, textureValue, textureCategory, storeVec4ValueToRegisterFnc, loadVec4ValueFromRegisterFnc, true);
-
-      // Scale the texture value if it uses a different constant multiplier than the baked output
-      {
-        // Branch labels
-        uint32_t scaleBeginLabel = spvModule.allocateId();
-        uint32_t scaleEndLabel = spvModule.allocateId();
-
-        storeVec4ValueToRegisterFnc(textureValue);
-
-        // if (replacement_texture_category == ReplacementMaterialTextureCategory::SecondaryScaled) { ... }
-        uint32_t isScaled = spvModule.opIEqual(boolType, textureCategory, spvModule.constu32(ReplacementMaterialTextureCategory::SecondaryScaled));
-        spvModule.opSelectionMerge(scaleEndLabel, spv::SelectionControlMaskNone);
-        spvModule.opBranchConditional(isScaled, scaleBeginLabel, scaleEndLabel);
-        {
-          // Scale the input texture
-          spvModule.opLabel(scaleBeginLabel);
-
-          // Account for the difference in UV density between the input terrain material and the baked terrain.
-          // This part is just doing the "divide by input uv density".  The baked UV density is pre multiplied into the textureScale.
-          // We want the max length for the uv delta in either X or Y.
-          // Get the square of both deltas: lenSquare(x) = dot(x, x)
-          uint32_t uvDeltaX = spvModule.opDpdx(texcoordType, texcoord); // uv delta for 1 pixel horizontally
-          uint32_t uvDeltaXSqr = spvModule.opDot(floatType, uvDeltaX, uvDeltaX);
-          uint32_t uvDeltaY = spvModule.opDpdy(texcoordType, texcoord);
-          uint32_t uvDeltaYSqr = spvModule.opDot(floatType, uvDeltaY, uvDeltaY);
-          // Find the larger square, then take the square root of it.
-          uint32_t maxDelta = spvModule.opFMax(floatType, uvDeltaXSqr, uvDeltaYSqr);
-                   maxDelta = spvModule.opSqrt(floatType, maxDelta); 
-
-          // Divide textureScale by the max input uv delta.
-          uint32_t textureScale = spvModule.opFDiv(floatType, loadTextureScaleFnc(), maxDelta);
-          
-          // The height values need to scale relative to a neutral value (which is different in the input image and the output map).
-          // First, subtract the neutral value from the pixel color:
-          uint32_t texturePreOffset4 = spvModule.opVectorTimesScalar(vec4Type, spvModule.constvec4f32(1.0f, 1.0f, 1.0f, 1.0f), loadTexturePreOffsetFnc());
-          textureValue = spvModule.opFAdd(vec4Type, texturePreOffset4, textureValue);
-
-          // Second, apply all of the scale operations:
-          textureValue = spvModule.opVectorTimesScalar(vec4Type, textureValue, textureScale);
-
-          // Third, add the output neutral value:
-          uint32_t texturePostOffset4 = spvModule.opVectorTimesScalar(vec4Type, spvModule.constvec4f32(1.0f, 1.0f, 1.0f, 1.0f), loadTexturePostOffsetFnc());
-          textureValue = spvModule.opFAdd(vec4Type, texturePostOffset4, textureValue);
-
-          // The new texture value needs to be stored before branching out, and reloaded after
-          storeVec4ValueToRegisterFnc(textureValue);
-
-          spvModule.opBranch(scaleEndLabel);
-          spvModule.opLabel(scaleEndLabel);
-
-        }// ~Scale the input texture
-
-        // reload the scaled value
-        textureValue = loadVec4ValueFromRegisterFnc();
-      }
-
-      // Add opacity to the secondary replacement texture
-      {
-        uint32_t albedoOpacityTexture = loadAlbedoOpacityFnc();
-
-        // texture.a = albedoOpacity.a
-        uint32_t alphaChannelIndex = 3;
-        uint32_t alphaValue = spvModule.opCompositeExtract(floatType, albedoOpacityTexture, 1, &alphaChannelIndex);
-        textureValue = spvModule.opCompositeInsert(vec4Type, alphaValue, textureValue, 1, &alphaChannelIndex);
-      }
-
-      // The new texture value needs to be stored before branching out, and reloaded after
-      storeVec4ValueToRegisterFnc(textureValue);
-
-      // ~Decode the input texture and add opacity
-      spvModule.opBranch(addOpacityEndLabel);
-      spvModule.opLabel(addOpacityEndLabel);
-    }
-
-    return loadVec4ValueFromRegisterFnc();
-  }
-
-  // Ignore vertex color (but keep vertex opacity) for non-color replacement textures.
-  // Vertex opacity is kept because it indicates how strongly the current draw call should effect the end result.
-  uint32_t D3D9FFShaderCompiler::postprocessVertexColorForTerrainBaking(uint32_t vertexColor) {
-
-    // Avoid injecting shader code if the support is disabled at launch
-    if (!TerrainBaker::Material::replacementSupportInPS_fixedFunction()) {
-      return vertexColor;
-    }
-
-    // Initialize spec constant for texture category
-    uint32_t textureCategory = m_module.specConst32(m_uint32Type, 0);
-    m_module.setDebugName(textureCategory, "replacement_texture_category");
-    m_module.decorateSpecId(textureCategory, getSpecId(D3D9SpecConstantId::ReplacementTextureCategory));
-    
-    // Allocate branch labels
-    uint32_t removeVertexColorBeginLabel = m_module.allocateId();
-    uint32_t removeVertexColorEndLabel = m_module.allocateId();
-    
-    // Functions to store/load a color value
-    uint32_t registerStoragePtr = m_module.defPointerType(m_vec4Type, spv::StorageClassPrivate);
-    uint32_t registerStorage = m_module.newVar(registerStoragePtr, spv::StorageClassPrivate);
-
-    auto storeVec4ValueToRegisterFnc = [&](uint32_t vec4value) {
-      m_module.opStore(registerStorage, vec4value);
-    };
-
-    auto loadVec4ValueFromRegisterFnc = [&]() -> uint32_t {
-      return m_module.opLoad(m_vec4Type, registerStorage);
-    };
-
-    storeVec4ValueToRegisterFnc(vertexColor);
-
-    // if (replacement_texture_category != ReplacementMaterialTextureCategory::AlbedoOpacity) { ... }
-    uint32_t isNotAlbedoOpacity = m_module.opINotEqual(m_boolType, textureCategory, m_module.constu32(ReplacementMaterialTextureCategory::AlbedoOpacity));
-    m_module.opSelectionMerge(removeVertexColorEndLabel, spv::SelectionControlMaskNone);
-    m_module.opBranchConditional(isNotAlbedoOpacity, removeVertexColorBeginLabel, removeVertexColorEndLabel);
-    {
-      // Remove the color component of the vertex color
-      m_module.opLabel(removeVertexColorBeginLabel);
-
-      // extract the original alpha
-      uint32_t alphaChannelIndex = 3;
-      uint32_t alphaValue = m_module.opCompositeExtract(m_floatType, vertexColor, 1, &alphaChannelIndex);
-
-      // Start from opaque white
-      vertexColor = m_module.constvec4f32(1.0f, 1.0f, 1.0f, 1.0f);
-
-      // Combine the constant color with the original alpha.
-      vertexColor = m_module.opCompositeInsert(m_vec4Type, alphaValue, vertexColor, 1, &alphaChannelIndex);
-
-      // The new value needs to be stored before branching out, and reloaded after
-      storeVec4ValueToRegisterFnc(vertexColor);
-
-      // ~Remove the color component of the vertex color
-      m_module.opBranch(removeVertexColorEndLabel);
-      m_module.opLabel(removeVertexColorEndLabel);
-    }
-    return loadVec4ValueFromRegisterFnc();
-  }
-  
-// NV-DXVK end
-
   void D3D9FFShaderCompiler::compilePS() {
     setupPS();
 
@@ -1892,10 +1591,6 @@ namespace dxvk {
     uint32_t temp  = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
     
     uint32_t texture = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 1.0f);
-
-// NV-DXVK start: Replacement material texture support
-    current = postprocessVertexColorForTerrainBaking(current);
-// NV-DXVK end
 
     for (uint32_t i = 0; i < caps::TextureStageCount; i++) {
       const auto& stage = m_fsKey.Stages[i].Contents;
@@ -1979,66 +1674,6 @@ namespace dxvk {
             texture = m_module.opImageSampleProjImplicitLod(m_vec4Type, imageVarId, texcoord, imageOperands);
           else
             texture = m_module.opImageSampleImplicitLod(m_vec4Type, imageVarId, texcoord, imageOperands);
-
-// NV-DXVK start: Replacement material texture support for Terrain Baking
-          auto postprocessColorOutputTextureRead = [&](uint32_t textureValue) -> uint32_t {
-
-            // Avoid injecting shader code if the support is disabled at launch
-            if (!TerrainBaker::Material::replacementSupportInPS_fixedFunction()) {
-              return textureValue;
-            }
-
-            // Types
-            uint32_t floatType = m_module.defFloatType(32);
-            uint32_t vec4Type = m_module.defVectorType(floatType, 4);
-
-            // Function to load albedo opacity from a texture
-            auto loadAlbedoOpacityFnc = [&]() -> uint32_t {
-              uint32_t albedoOpacityImageVarId = m_module.opLoad(m_ps.samplers[kTerrainBakerSecondaryTextureStage].typeId, m_ps.samplers[kTerrainBakerSecondaryTextureStage].varId);
-              if (shouldProject) {
-                return m_module.opImageSampleProjImplicitLod(m_vec4Type, albedoOpacityImageVarId, texcoord, imageOperands);
-              } else {
-                return m_module.opImageSampleImplicitLod(m_vec4Type, albedoOpacityImageVarId, texcoord, imageOperands);
-              }
-            };
-
-            // Functions to store/load a color value
-
-            uint32_t registerStoragePtr = m_module.defPointerType(m_vec4Type, spv::StorageClassPrivate);
-            uint32_t registerStorage = m_module.newVar(registerStoragePtr, spv::StorageClassPrivate);
-
-            auto storeVec4ValueToRegisterFnc = [&](uint32_t vec4value) {
-              m_module.opStore(registerStorage, vec4value);
-            };
-
-            auto loadVec4ValueFromRegisterFnc = [&]() -> uint32_t {
-              return m_module.opLoad(vec4Type, registerStorage);
-            };
-            auto loadTexturePreOffsetFnc = [&]() -> uint32_t {
-              uint32_t texturePreOffsetOffset = m_module.constu32(D3D9SharedPSStages_Count * kTerrainBakerSecondaryTextureStage + D3D9SharedPSStages_TexturePreOffset);
-              uint32_t texturePreOffsetPtr = m_module.opAccessChain(m_module.defPointerType(m_floatType, spv::StorageClassUniform),
-                m_ps.sharedState, 1, &texturePreOffsetOffset);
-              return m_module.opLoad(m_floatType, texturePreOffsetPtr);
-            };
-            auto loadTextureScaleFnc = [&]() -> uint32_t {
-              uint32_t textureScaleOffset = m_module.constu32(D3D9SharedPSStages_Count * kTerrainBakerSecondaryTextureStage + D3D9SharedPSStages_TextureScale);
-              uint32_t textureScalePtr = m_module.opAccessChain(m_module.defPointerType(m_floatType, spv::StorageClassUniform),
-                m_ps.sharedState, 1, &textureScaleOffset);
-              return m_module.opLoad(m_floatType, textureScalePtr);
-            };
-            auto loadTexturePostOffsetFnc = [&]() -> uint32_t {
-              uint32_t texturePostOffsetOffset = m_module.constu32(D3D9SharedPSStages_Count * kTerrainBakerSecondaryTextureStage + D3D9SharedPSStages_TexturePostOffset);
-              uint32_t texturePostOffsetPtr = m_module.opAccessChain(m_module.defPointerType(m_floatType, spv::StorageClassUniform),
-                m_ps.sharedState, 1, &texturePostOffsetOffset);
-              return m_module.opLoad(m_floatType, texturePostOffsetPtr);
-            };
-            
-
-            return postprocessTextureReadForTerrainBaking(m_module, textureValue, texcoord, texcoord_t, loadTexturePreOffsetFnc, loadTextureScaleFnc, loadTexturePostOffsetFnc, loadAlbedoOpacityFnc, storeVec4ValueToRegisterFnc, loadVec4ValueFromRegisterFnc);
-          };
-
-          texture = postprocessColorOutputTextureRead(texture);
-// NV-DXVK end
 
           if (i != 0 && m_fsKey.Stages[i - 1].Contents.ColorOp == D3DTOP_BUMPENVMAPLUMINANCE) {
             uint32_t index = m_module.constu32(D3D9SharedPSStages_Count * (i - 1) + D3D9SharedPSStages_BumpEnvLScale);
@@ -2295,14 +1930,8 @@ namespace dxvk {
 
       D3DTEXTUREOP colorOp = (D3DTEXTUREOP)stage.ColorOp;
 
-      if (colorOp == D3DTOP_DISABLE) {
-        if (stage.allowActiveStagesBeyondDisabledStage) {
-          continue;
-        } else {
-          // Cancel subsequent stages on D3DTOP_DISABLE op by default
-          break;
-        }
-      }
+      if (colorOp == D3DTOP_DISABLE)
+        break;
 
       std::array<uint32_t, TextureArgCount> colorArgs = {
           stage.ColorArg0,
@@ -2409,9 +2038,6 @@ namespace dxvk {
     // Constant Buffer for PS.
     std::array<uint32_t, uint32_t(D3D9FFPSMembers::MemberCount)> members = {
       m_vec4Type, // TextureFactor
-      m_floatType, // TexturePreOffset
-      m_floatType, // TextureScale
-      m_floatType // TexturePostOffset
     };
 
     const uint32_t structType =
@@ -2422,21 +2048,9 @@ namespace dxvk {
 
     m_module.memberDecorateOffset(structType, D3D9FFPSMembers::TextureFactor, offset);
     offset += sizeof(Vector4);
-    
-    m_module.memberDecorateOffset(structType, D3D9FFPSMembers::TexturePreOffset, offset);
-    offset += sizeof(float);
-    
-    m_module.memberDecorateOffset(structType, D3D9FFPSMembers::TextureScale, offset);
-    offset += sizeof(float);
-    
-    m_module.memberDecorateOffset(structType, D3D9FFPSMembers::TexturePostOffset, offset);
-    offset += sizeof(float);
 
     m_module.setDebugName(structType, "D3D9FixedFunctionPS");
     m_module.setDebugMemberName  (structType, D3D9FFPSMembers::TextureFactor, "TextureFactor");
-    m_module.setDebugMemberName  (structType, D3D9FFPSMembers::TexturePreOffset, "TexturePreOffset");
-    m_module.setDebugMemberName  (structType, D3D9FFPSMembers::TextureScale, "TextureScale");
-    m_module.setDebugMemberName  (structType, D3D9FFPSMembers::TexturePostOffset, "TexturePostOffset");
 
     m_ps.constantBuffer = m_module.newVar(
       m_module.defPointerType(structType, spv::StorageClassUniform),
@@ -2468,9 +2082,6 @@ namespace dxvk {
     };
 
     m_ps.constants.textureFactor = LoadConstant(m_vec4Type, uint32_t(D3D9FFPSMembers::TextureFactor));
-    m_ps.constants.texturePreOffset = LoadConstant(m_floatType, uint32_t(D3D9FFPSMembers::TexturePreOffset));
-    m_ps.constants.textureScale = LoadConstant(m_floatType, uint32_t(D3D9FFPSMembers::TextureScale));
-    m_ps.constants.texturePostOffset = LoadConstant(m_floatType, uint32_t(D3D9FFPSMembers::TexturePostOffset));
 
     // Samplers
     for (uint32_t i = 0; i < caps::TextureStageCount; i++) {

@@ -79,25 +79,6 @@ namespace dxvk {
       std::tuple(this, shaders));
     return &iter.first->second;
   }
-
-
-  DxvkRaytracingPipeline* DxvkPipelineManager::createRaytracingPipeline(
-    const DxvkRaytracingPipelineShaders& shaders) {
-    if (shaders.groups.empty())
-      return nullptr;
-
-    std::lock_guard<dxvk::mutex> lock(m_mutex);
-
-    auto pair = m_raytracingPipelines.find(shaders);
-    if (pair != m_raytracingPipelines.end())
-      return &pair->second;
-
-    auto iter = m_raytracingPipelines.emplace(
-      std::piecewise_construct,
-      std::tuple(shaders),
-      std::tuple(this, shaders));
-    return &iter.first->second;
-  }
   
 
   void DxvkPipelineManager::registerShader(
@@ -110,25 +91,6 @@ namespace dxvk {
       m_stateCache->registerShader(shader, isRemixShader);
 // NV-DXVK end
   }
-
-  // NV-DXVK start: compile raytracing shaders on shader compilation threads
-  namespace WAR4000939 {
-    extern bool shouldApply(const Rc<DxvkDevice>& device);
-  }
-  void DxvkPipelineManager::registerRaytracingShaders(
-    const DxvkRaytracingPipelineShaders& shaders) {
-    if (m_stateCache != nullptr)
-      m_stateCache->registerRaytracingShaders(shaders);
-    else {
-      // WAR: when pipelines are not compiled on the compilation threadpool
-      // we need to frontload the OMM pipeline compiles in-place due to driver bug.
-      if (WAR4000939::shouldApply(m_device) &&
-          0 != (shaders.pipelineFlags & VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT)) {
-        createRaytracingPipeline(shaders)->compilePipeline();
-      }
-    }
-  }
-  // NV-DXVK end
 
   DxvkPipelineCount DxvkPipelineManager::getPipelineCount() const {
     DxvkPipelineCount result;

@@ -100,10 +100,6 @@ namespace dxvk {
     NISShader_256_half_32::getShader();
   }
 
-  static const Resources::Resource& getInput(const dxvk::Rc<DxvkContext>& ctx, const Resources::RaytracingOutput& rtOutput) {
-    return rtOutput.m_compositeOutput.resource(Resources::AccessType::Read);
-  };
-
   void DxvkNIS::createTexture(DxvkNIS::Texture& texture, const dxvk::Rc<DxvkContext>& ctx, const VkFormat format, void* data) {
     DxvkImageCreateInfo desc;
     desc.type = VK_IMAGE_TYPE_2D;
@@ -240,12 +236,6 @@ namespace dxvk {
         }
       }
     }
-  }
-
-  void DxvkNIS::dispatch(Rc<RtxContext> ctx, const Resources::RaytracingOutput& rtOutput) {
-    dispatch(ctx,
-             getInput(ctx, rtOutput),
-             rtOutput.m_finalOutput.resource(Resources::AccessType::Write));
   }
 
   void DxvkNIS::dispatch(Rc<RtxContext> ctx,

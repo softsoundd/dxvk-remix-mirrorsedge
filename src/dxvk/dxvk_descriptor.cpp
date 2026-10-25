@@ -90,7 +90,7 @@ namespace dxvk {
 // NV-DXVK end
     const uint32_t maxSets = 8192;
 
-    std::array<VkDescriptorPoolSize, 10> pools = { {
+    std::array<VkDescriptorPoolSize, 9> pools = { {
       { VK_DESCRIPTOR_TYPE_SAMPLER,                     maxSets * 2  },
       { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,               maxSets * 2  },
       { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,               maxSets / 64 },
@@ -99,8 +99,7 @@ namespace dxvk {
       { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,        maxSets * 1  },
       { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,        maxSets / 64 },
       { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,      maxSets * 1  },
-      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,      maxSets },
-      { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,  10 } } };
+      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,      maxSets } } };
 
     VkDescriptorPoolCreateInfo info;
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
