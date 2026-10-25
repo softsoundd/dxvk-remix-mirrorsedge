@@ -1281,11 +1281,18 @@ namespace dxvk {
 
     // Scene-camera viewport gate. 0 means unknown.
     float m_ngxGameScreenPercentage = 0.0f;
-    // True after this frame records the ScreenPercentage view.
-    // A later full-surface draw is not that view.
-    // Rebinding scene colour leaves the viewport at the whole target.
-    // The picture stays in the recorded rect.
+
+    // True after this frame records a viewport that matches the driven ScreenPercentage.
+    // A full-surface replay on that scene-colour image matches primitive count and vertex shader.
+    // The replay leaves the recorded rect in place.
+    // Any other full-surface view replaces the rect.
     bool m_ngxReducedSceneViewportThisFrame = false;
+    struct NgxReducedSceneDraw {
+      uint32_t primitiveCount = 0;
+      XXH64_hash_t vertexShaderHash = 0;
+    };
+    std::vector<NgxReducedSceneDraw> m_ngxReducedSceneDraws;
+
     bool m_ngxPassthroughBootstrapped = false;
 
     // Latest UE3 camera matrices accepted this frame; replayed into the CS camera at injection
@@ -1427,7 +1434,9 @@ namespace dxvk {
     // color/depth target identification (for viewport jitter and DLSS inputs) and the thin
     // RTX injection trigger at scene end.
     PrepareDrawFlags prepareDrawForNgxPassthrough(const DrawContext& drawContext);
-    void tryNgxPassthroughCameraCapture();
+    void tryNgxPassthroughCameraCapture(uint32_t primitiveCount);
+    void rememberNgxReducedSceneDraw(uint32_t primitiveCount, XXH64_hash_t vertexShaderHash);
+    bool ngxFullSurfaceDrawReplaysReducedScene(uint32_t primitiveCount, XXH64_hash_t vertexShaderHash) const;
     void emitNgxPassthroughFrameData();
 
     void applyNgxPassthroughScreenPercentage();
@@ -1445,6 +1454,8 @@ namespace dxvk {
     // engage from the first draw of a frame; dropped when unseen for a while.
     Rc<DxvkImage> m_ngxSceneColorImage;
     Rc<DxvkImage> m_ngxSceneDepthImage;
+    // Holds the screen-percentage distortion offsets while they are scaled onto the full target.
+    Rc<DxvkImage> m_ngxDistortionFieldCopy;
     uint32_t m_ngxSceneTargetsLastSeenFrame = 0;
 
     // Per-frame sub-pixel jitter (pixels), decided on the app thread at the first draw of the
@@ -1567,6 +1578,23 @@ namespace dxvk {
     bool ngxBoundPixelIsDofGather();
     bool ngxBoundPixelIsDofBlend();
     bool ngxDrawIsDofBloomGather();
+    bool ngxDepthTestDisabled() const;
+    // The apply reads the offset field and scene colour through one coordinate.
+    bool ngxBoundPixelIsDistortionApply();
+    // True for haze, depth of field, bloom, tonemap, and gamma.
+    // Fog and other scene-colour quads come earlier.
+    // Upscaling on those quads leaves the distortion stencil in the screen-percentage rect.
+    bool ngxBoundPixelIsUpscaleBoundary();
+    Rc<DxvkImage> ngxBoundDistortionAccumulationImage() const;
+    // Scales the screen-percentage offset field onto the full accumulation target.
+    // The apply then reads that field on the same coordinates as the upscaled scene.
+    bool stretchNgxDistortionField();
+    // True when one more scene-colour read would pass the ordinal gate.
+    bool ngxSceneColorReadIsAimed() const;
+    // True when this gather is the aimed scene-colour read.
+    // The scene viewport must be a reduced subrect of scene colour.
+    // No earlier post quad has qualified this frame.
+    bool ngxGatherIsReducedSubrectAimedRead();
     void refreshNgxUe3VertexFactory();
     void armNgxFullBufferScreenPositionScaleBias();
     void noteNgxPostUpscaleViewport();
