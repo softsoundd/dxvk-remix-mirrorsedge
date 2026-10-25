@@ -36,14 +36,9 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
     RTX_OPTION("rtx", bool, preTransformedVerticesIsUI, false, "When enabled, draw calls using pre-transformed (screen-space) vertices will be considered as UI. This is typical for D3D8/D3D9 games that render UI with RHW vertices.");
     RTX_OPTION("rtx.d3d9", bool, ue3EngineMode, false,
-               "Master toggle for Unreal Engine 3 D3D9 compatibility.");
-    RTX_OPTION("rtx.d3d9", bool, ue3SkipSceneCapturePasses, false,
-               "UE3 multi-pass compat: classify UE3 SceneCapture rendering (SceneCapture2D/Reflect/Portal actors: security "
-               "monitors, mirrors, scripted window reflections) as capture passes, so a probe's camera never replaces the "
-               "Main camera and its world draws are not treated as the main scene. A world draw is a capture pass when its "
-               "viewport is strictly smaller than half the backbuffer in both dimensions, or when a sub-full viewport's "
-               "aspect does not match the backbuffer (exact-half splitscreen viewports are never matched). "
-               "Implicitly enabled by rtx.d3d9.ue3EngineMode.");
+               "Classifies draws by their UE3 vertex factory and shader parameters. NGX passthrough uses this to recognise "
+               "UI composites and blended post-process passes when choosing its injection points. Without it, those choices "
+               "rely on draw shape and rtx.uiTextures. The Mirror's Edge profile turns it on.");
     RTX_OPTION_ARGS("rtx.d3d9", bool, sequenceTrackedLockWaits, true,
                     "When a Lock has to wait for a resource, drain the command stream thread only up to the last command "
                     "that touched it (tracked per buffer and texture subresource) instead of everything queued, which "
@@ -1068,7 +1063,6 @@ namespace dxvk {
       bool orthographicIsUI = false;
       bool preTransformedVerticesIsUI = false;
       bool ue3EngineMode = false;
-      bool ue3SkipSceneCapturePasses = false;
       bool sequenceTrackedLockWaits = true;
       bool ngxPassthroughJitter = false;
       bool ngxPrePostProcess = false;

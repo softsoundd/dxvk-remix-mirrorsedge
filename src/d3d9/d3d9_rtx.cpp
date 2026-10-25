@@ -846,11 +846,8 @@ namespace dxvk {
     if (psInfo.hasUiSampler || psInfo.hasUiCompositeConstants)
       return Ue3PassType::UiComposite;
 
-    // UE3 SceneCapture probes re-render the world before the main view; viewport size/aspect
-    // (and later mirrored/undecomposable camera checks) keep them from stealing Main.
-    if ((m_frameOptions.ue3SkipSceneCapturePasses || m_frameOptions.ue3EngineMode) &&
-        isWorldGeometry &&
-        m_activePresentParams.has_value()) {
+    // UE3 SceneCapture probes re-render the world into a smaller or differently shaped viewport.
+    if (isWorldGeometry && m_activePresentParams.has_value()) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
       const uint32_t bbW = m_activePresentParams->BackBufferWidth;
       const uint32_t bbH = m_activePresentParams->BackBufferHeight;
@@ -981,7 +978,6 @@ namespace dxvk {
     o.orthographicIsUI = orthographicIsUIObject().get();
     o.preTransformedVerticesIsUI = preTransformedVerticesIsUIObject().get();
     o.ue3EngineMode = ue3EngineModeObject().get();
-    o.ue3SkipSceneCapturePasses = ue3SkipSceneCapturePassesObject().get();
     o.sequenceTrackedLockWaits = sequenceTrackedLockWaitsObject().get();
     o.ngxPassthroughJitter = RtxNgxPassthrough::enableJitter();
     o.ngxPrePostProcess = RtxNgxPassthrough::prePostProcess();
@@ -7277,19 +7273,8 @@ namespace dxvk {
     }
 
     // UE3 vertex factory classification (cached by vertex declaration) feeds classifyUe3Pass
-    m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
+    refreshNgxUe3VertexFactory();
     m_currentUe3PassType = Ue3PassType::Unknown;
-    if (m_frameOptions.ue3EngineMode && d3d9State().vertexDecl != nullptr) {
-      const auto& elements = d3d9State().vertexDecl->GetElements();
-      XXH64_hash_t declKey = XXH3_64bits(elements.data(), elements.size() * sizeof(D3DVERTEXELEMENT9));
-      auto it = m_ue3VertexFactoryCache.find(declKey);
-      if (it != m_ue3VertexFactoryCache.end()) {
-        m_currentUe3VertexFactory = it->second;
-      } else {
-        m_currentUe3VertexFactory = classifyUe3VertexFactory(elements);
-        m_ue3VertexFactoryCache.emplace(declKey, m_currentUe3VertexFactory);
-      }
-    }
 
     // Camera extraction from UE3 reserved shader constants (CTAB-verified draws only)
     if (m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
