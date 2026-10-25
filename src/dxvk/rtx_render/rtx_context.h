@@ -115,6 +115,9 @@ namespace dxvk {
     // Copies the pre-UI backbuffer into the HUD-less slot. Emitted by the D3D9 layer.
     void captureNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage);
 
+    // Runs DLSS-NR on the pre-UI backbuffer of a pre-post frame. Emitted by the D3D9 layer.
+    void applyNgxPassthroughNeuralRendering(const Rc<DxvkImage>& backbufferImage);
+
     // Copies that slot onto the backbuffer for the developer preview.
     void previewNgxPassthroughHudless(const Rc<DxvkImage>& backbufferImage);
 

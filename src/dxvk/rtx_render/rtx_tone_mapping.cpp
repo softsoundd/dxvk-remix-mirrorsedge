@@ -20,7 +20,6 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_tone_mapping.h"
-#include "rtx_dlss_neural_rendering.h"
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -32,8 +31,6 @@
 #include <rtx_shaders/tonemapping_histogram.h>
 #include <rtx_shaders/tonemapping_tone_curve.h>
 #include <rtx_shaders/tonemapping_apply_tonemapping.h>
-#include <rtx_shaders/tonemapping_fast_tonemapping.h>
-#include <rtx_shaders/tonemapping_inverse_tonemapping.h>
 #include "rtx_imgui.h"
 #include "rtx/utility/debug_view_indices.h"
 
@@ -81,30 +78,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    class FastTonemappingShader : public ManagedShader {
-      SHADER_SOURCE(FastTonemappingShader, VK_SHADER_STAGE_COMPUTE_BIT, tonemapping_fast_tonemapping)
-
-      PUSH_CONSTANTS(FastToneMappingArgs)
-
-      BEGIN_PARAMETER()
-        TEXTURE2D(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT)
-        RW_TEXTURE1D_READONLY(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT)
-        RW_TEXTURE2D(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)
-      END_PARAMETER()
-    };
-
-    class InverseTonemappingShader : public ManagedShader {
-      SHADER_SOURCE(InverseTonemappingShader, VK_SHADER_STAGE_COMPUTE_BIT, tonemapping_inverse_tonemapping)
-
-      PUSH_CONSTANTS(FastToneMappingArgs)
-
-      BEGIN_PARAMETER()
-        TEXTURE2D(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT)
-        RW_TEXTURE1D_READONLY(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT)
-        RW_TEXTURE2D(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)
-      END_PARAMETER()
-    };
-
   }
 
   DxvkToneMapping::DxvkToneMapping(DxvkDevice* device)
@@ -114,12 +87,6 @@ namespace dxvk {
   DxvkToneMapping::~DxvkToneMapping()  {  }
 
   void DxvkToneMapping::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
-    const auto& dlssNeuralRendering = m_device->getCommon()->metaDlssNeuralRendering();
-    if (DlssNeuralRendering::enable() && dlssNeuralRendering.supportsDlssNeuralRendering()) {
-      FastTonemappingShader::getShader();
-      InverseTonemappingShader::getShader();
-    }
-
     if (RtxOptions::tonemappingMode() != TonemappingMode::Global) {
       return;
     }
@@ -309,59 +276,6 @@ namespace dxvk {
     ctx->bindResourceSampler(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT, linearSampler);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT, colorBuffer.view, nullptr);
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, ApplyTonemappingShader::getShader());
-    ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-  }
-
-
-  void DxvkToneMapping::dispatchFastToneMapping(
-    Rc<RtxContext> ctx,
-    Rc<DxvkImageView> exposureView,
-    const Resources::Resource& hdrColor,
-    const Resources::Resource& ldrOutput,
-    bool autoExposureEnabled) {
-
-    ScopedGpuProfileZone(ctx, "Fast Tone Mapping");
-
-    FastToneMappingArgs pushArgs = {};
-    pushArgs.enableAutoExposure = autoExposureEnabled;
-    pushArgs.exposureFactor = exp2f(exposureBias() + RtxOptions::calcUserEVBias());
-
-    const VkExtent3D workgroups = util::computeBlockCount(hdrColor.view->imageInfo().extent, VkExtent3D { 16 , 16, 1 });
-
-    ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT, hdrColor.view, nullptr);
-    ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT, exposureView, nullptr);
-    ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT, ldrOutput.view, nullptr);
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, FastTonemappingShader::getShader());
-    ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
-    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
-  }
-
-
-  void DxvkToneMapping::dispatchInverseToneMapping(
-    Rc<RtxContext> ctx,
-    Rc<DxvkImageView> exposureView,
-    const Resources::Resource& ldrColor,
-    const Resources::Resource& hdrOutput,
-    bool autoExposureEnabled) {
-
-    ScopedGpuProfileZone(ctx, "Inverse Tone Mapping");
-
-    FastToneMappingArgs pushArgs = {};
-    pushArgs.enableAutoExposure = autoExposureEnabled;
-    pushArgs.exposureFactor = exp2f(exposureBias() + RtxOptions::calcUserEVBias());
-    pushArgs.enableHighlightRecovery = DlssNeuralRendering::enableHighlightRecovery() ? 1u : 0u;
-    {
-      const Vector4& t = DlssNeuralRendering::highlightRecoveryThresholds();
-      pushArgs.highlightRecoveryThresholds = vec4(t.x, t.y, t.z, t.w);
-    }
-
-    const VkExtent3D workgroups = util::computeBlockCount(ldrColor.view->imageInfo().extent, VkExtent3D { 16 , 16, 1 });
-
-    ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT, ldrColor.view, nullptr);
-    ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT, exposureView, nullptr);
-    ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT, hdrOutput.view, nullptr);
-    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, InverseTonemappingShader::getShader());
     ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
   }

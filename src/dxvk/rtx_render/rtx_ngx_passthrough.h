@@ -381,6 +381,13 @@ namespace dxvk {
     // Frame end calls it when that draw never comes.
     void captureHudless(RtxContext* ctx, const Rc<DxvkImage>& backbufferImage);
 
+    // Runs DLSS-NR on the pre-UI backbuffer.
+    // DLSS-NR takes display-referred colour, which exists only after the game's own tonemap.
+    // Late injection calls this from dispatch.
+    // Pre-post injection calls it on the first draw after the scene blit.
+    // Frame end calls it when that draw never comes.
+    void applyNeuralRendering(RtxContext* ctx, DxvkBarrierSet& barriers, const Rc<DxvkImage>& backbufferImage);
+
     // Copies the HUD-less slot onto the backbuffer for the developer preview.
     void previewHudless(RtxContext* ctx, const Rc<DxvkImage>& backbufferImage);
 
@@ -603,7 +610,8 @@ namespace dxvk {
                             const VkOffset2D& colorSourceOffset);
 
     void scaleResourceToDisplay(RtxContext* ctx, const Resources::Resource& source, Resources::Resource& destination);
-    void applyNeuralRenderingAndBloom(RtxContext* ctx, DxvkBarrierSet& barriers, bool resetHistory);
+    // Remix bloom expects linear HDR colour, so display-encoded late input is left alone.
+    void applyBloom(RtxContext* ctx);
 
     bool applyPostFxAndWriteback(RtxContext* ctx,
                                  DxvkBarrierSet& barriers,
@@ -700,15 +708,20 @@ namespace dxvk {
 
     Resources::Resource m_colorInput;                 // copy of the game color target fed to DLSS
     Resources::Resource m_dlssOutput;                 // DLSS output, blitted back onto the game target
-    // Display-sized scratch for DLSS neural generation. Depth and motion vectors are
-    // scaled up from the render-sized queues before the call.
+    // DLSS-NR reads and writes these display-sized images.
+    // Depth and motion vectors are scaled up from the render-sized queues before each call.
     Resources::Resource m_nrInput;
     Resources::Resource m_nrOutput;
     Resources::Resource m_nrDepth;
     Resources::Resource m_nrMotionVectors;
     Resources::Resource m_nrControlMask;
     VkExtent2D m_nrConfiguredExtent = { 0, 0 };
+    uint32_t m_nrAppliedFrameId = UINT32_MAX;
+
     bool m_depthMvInputsValid = false;
+    bool m_colorSourceLinearHdr = false;
+    // Pre-post DLSS-NR runs after dispatch returns, so it reads this frame's reset from here.
+    bool m_lastResetHistory = false;
     Resources::Resource m_mergedOutput;               // DLSS RGB + the game's original alpha (pre-post
                                                       // injection: UE3 D3D9 stores scene depth in alpha)
     Resources::Resource m_debugPresentImage;          // debug view held back for the present-time overlay

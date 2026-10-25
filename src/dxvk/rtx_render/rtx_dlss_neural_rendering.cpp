@@ -248,15 +248,6 @@ namespace dxvk {
     ImGui::BeginDisabled(!autoMaskEnabled);
     RemixGui::DragFloat("Character Intensity", &DlssNeuralRendering::skinStructureStrengthObject(), 0.01f, 0.0f, 1.0f, "%.3f", flags);
     ImGui::EndDisabled();
-
-    ImGui::Separator();
-    if (RemixGui::CollapsingHeader("Advanced Settings")) {
-      ImGui::Indent();
-      RemixGui::Checkbox("Highlight Recovery", &DlssNeuralRendering::enableHighlightRecoveryObject());
-      // Thresholds: (exposed HDR max-channel min/max, LDR max-channel min/max)
-      RemixGui::DragFloat4("Highlight Recovery Thresholds", &DlssNeuralRendering::highlightRecoveryThresholdsObject(), 0.01f, 0.0f, 32.0f, "%.3f", flags);
-      ImGui::Unindent();
-    }
   }
 
   void DlssNeuralRendering::setDlssNeuralRenderingSettings(const uint32_t displaySize[2]) {

@@ -1622,6 +1622,8 @@ namespace dxvk {
 
     // True after this frame's HUD-less copy has been recorded.
     bool m_ngxHudlessCapturedThisFrame = false;
+    // True after this frame's pre-post DLSS-NR has been recorded.
+    bool m_ngxNeuralRenderingAppliedThisFrame = false;
     // True after the scene blit has targeted the backbuffer.
     // A copy before that blit reads the previous frame.
     bool m_ngxHudlessSceneCompositeSeen = false;
@@ -1630,7 +1632,9 @@ namespace dxvk {
     NgxHudlessCaptureSite m_ngxHudlessLoggedSite = NgxHudlessCaptureSite::AfterSceneComposite;
     uint32_t m_ngxHudlessLastLogFrame = 0;
 
-    void maybeCaptureNgxHudless(const DrawContext& drawContext);
+    // Acts on the first backbuffer draw after the scene blit, while the backbuffer holds the finished pre-UI image.
+    // It records a pre-post frame's DLSS-NR, then the HUD-less copy.
+    void maybeFinishNgxScene(const DrawContext& drawContext);
     bool ngxDrawIsBackbufferSceneComposite(const DrawContext& drawContext) const;
     // True for a backbuffer draw after this frame's scene composite that is not itself composite-shaped.
     // Nothing from there on needs retargeting.
@@ -1746,6 +1750,7 @@ namespace dxvk {
       bool ngxPrePostProcess = false;
       bool ngxDlfgHudless = false;
       bool ngxDlfgHudlessPreview = false;
+      bool ngxNeuralRendering = false;
       bool ngxObjectVelocities = false;
       int ngxDebugVisualization = 0;
 

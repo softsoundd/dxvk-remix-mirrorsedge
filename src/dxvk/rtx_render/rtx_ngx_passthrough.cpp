@@ -39,8 +39,6 @@
 #include "rtx_auto_exposure.h"
 #include "rtx_bloom.h"
 #include "rtx_dlss_neural_rendering.h"
-#include "rtx_tone_mapping.h"
-#include "../util/util_global_time.h"
 #include "rtx_imgui.h"
 #include "rtx_initializer.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -1269,15 +1267,15 @@ namespace dxvk {
       }
     }
 
-    // Blit an image 1:1 into a rect of another image (used for the DLSS output and debug
-    // visualization write-back, which target a subrect of the game's scene color at the
-    // pre-post-process injection point)
-    // A source rect at the origin into an arbitrary destination rect. Equal extents with a
-    // nearest filter deliver a result unaltered; differing extents stretch.
+    // Blits a source rect at the origin into a rect of the target.
+    // Equal extents with a nearest filter copy the source unaltered.
+    // Differing extents stretch it.
+    // A swizzled source alpha needs a sampled source and a colour-attachment target.
     void blitImageRect(DxvkContext* ctx,
                        const Rc<DxvkImage>& sourceImage, const VkExtent2D& sourceExtent,
                        const Rc<DxvkImage>& targetImage, const VkOffset2D& targetOffset,
-                       const VkExtent2D& targetExtent, VkFilter filter) {
+                       const VkExtent2D& targetExtent, VkFilter filter,
+                       VkComponentSwizzle sourceAlpha = VK_COMPONENT_SWIZZLE_IDENTITY) {
       const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(sourceImage->info().format);
       const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(targetImage->info().format);
 
@@ -1294,8 +1292,12 @@ namespace dxvk {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
       };
+      const VkComponentMapping sourceMap = {
+        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY, sourceAlpha,
+      };
 
-      ctx->blitImage(targetImage, identityMap, sourceImage, identityMap, blitInfo, filter);
+      ctx->blitImage(targetImage, identityMap, sourceImage, sourceMap, blitInfo, filter);
     }
 
     void blitToTargetRect(DxvkContext* ctx,
@@ -1643,69 +1645,89 @@ namespace dxvk {
     ctx->blitImage(destination.image, identityMap, source.image, identityMap, blitInfo, VK_FILTER_NEAREST);
   }
 
-  void RtxNgxPassthrough::applyNeuralRenderingAndBloom(RtxContext* ctx, DxvkBarrierSet& barriers, bool resetHistory) {
-    if (m_dlssOutput.image == nullptr) {
+  void RtxNgxPassthrough::applyNeuralRendering(RtxContext* ctx, DxvkBarrierSet& barriers,
+                                               const Rc<DxvkImage>& backbufferImage) {
+    DlssNeuralRendering& neuralRendering = m_device->getCommon()->metaDlssNeuralRendering();
+    if (!DlssNeuralRendering::enable() || !neuralRendering.supportsDlssNeuralRendering() ||
+        backbufferImage == nullptr || backbufferImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT ||
+        debugVisualization() != int(DebugVisualization::Off)) {
+      return;
+    }
+
+    // The depth and motion vectors come from this frame's dispatch.
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if (m_nrAppliedFrameId == frameId || m_lastDispatchFrameId != frameId || !m_depthMvInputsValid ||
+        m_depthQueue.get().image == nullptr || m_motionVectorQueue.get().image == nullptr) {
+      return;
+    }
+
+    const VkExtent3D& backbufferExtent = backbufferImage->info().extent;
+    if (backbufferExtent.width != m_displayExtent.width || backbufferExtent.height != m_displayExtent.height) {
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] DLSS-NR is skipped. The backbuffer is ", backbufferExtent.width, "x", backbufferExtent.height,
+        ", but the depth and motion vectors cover ", m_displayExtent.width, "x", m_displayExtent.height, ".")));
+      return;
+    }
+
+    ScopedGpuProfileZone(ctx, "NGX Passthrough DLSS-NR");
+    m_nrAppliedFrameId = frameId;
+
+    Rc<DxvkContext> dxvkCtx = ctx;
+    const VkExtent3D displayExtent = { m_displayExtent.width, m_displayExtent.height, 1 };
+    const bool extentChanged = m_nrInput.image == nullptr ||
+      m_nrInput.image->info().extent.width != displayExtent.width ||
+      m_nrInput.image->info().extent.height != displayExtent.height;
+    if (extentChanged) {
+      m_nrInput = Resources::createImageResource(
+        dxvkCtx, "NGX passthrough NR input", displayExtent, VK_FORMAT_R16G16B16A16_SFLOAT,
+        1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      m_nrOutput = Resources::createImageResource(dxvkCtx, "NGX passthrough NR output", displayExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_nrDepth = Resources::createImageResource(dxvkCtx, "NGX passthrough NR depth", displayExtent, VK_FORMAT_R32_SFLOAT);
+      m_nrMotionVectors = Resources::createImageResource(dxvkCtx, "NGX passthrough NR motion vectors", displayExtent, VK_FORMAT_R16G16_SFLOAT);
+      // A white mask applies the full effect everywhere, since there are no material IDs.
+      // The auto mask is combined with it by taking the minimum.
+      const VkClearColorValue fullMask = { 1.f, 1.f, 1.f, 1.f };
+      m_nrControlMask = Resources::createImageResource(
+        dxvkCtx, "NGX passthrough NR control mask", displayExtent, VK_FORMAT_R8G8B8A8_UNORM,
+        1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_STORAGE_BIT, fullMask);
+    }
+
+    if (m_nrConfiguredExtent.width != displayExtent.width || m_nrConfiguredExtent.height != displayExtent.height) {
+      uint32_t displaySize[2] = { displayExtent.width, displayExtent.height };
+      neuralRendering.setDlssNeuralRenderingSettings(displaySize);
+      m_nrConfiguredExtent = { displayExtent.width, displayExtent.height };
+    }
+
+    // The backbuffer alpha holds whatever the game last wrote, so DLSS-NR reads opaque alpha instead.
+    const VkComponentSwizzle inputAlpha = (backbufferImage->info().usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0
+      ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY;
+    blitImageRect(ctx, backbufferImage, m_displayExtent, m_nrInput.image, VkOffset2D { 0, 0 }, m_displayExtent,
+                  VK_FILTER_NEAREST, inputAlpha);
+    scaleResourceToDisplay(ctx, m_depthQueue.get(), m_nrDepth);
+    scaleResourceToDisplay(ctx, m_motionVectorQueue.get(), m_nrMotionVectors);
+
+    const float motionScaleX = m_renderExtent.width > 0
+      ? float(m_displayExtent.width) / float(m_renderExtent.width) : 1.0f;
+    const float motionScaleY = m_renderExtent.height > 0
+      ? float(m_displayExtent.height) / float(m_renderExtent.height) : 1.0f;
+    if (neuralRendering.dispatch(ctx, barriers, m_nrInput, m_nrOutput, m_nrMotionVectors, m_nrDepth, m_nrControlMask,
+                                 m_lastResetHistory, motionScaleX, motionScaleY)) {
+      blitToTargetRect(ctx, m_nrOutput.image, m_displayExtent, backbufferImage, VkOffset2D { 0, 0 });
+      ONCE(Logger::info("[RTX NGX Passthrough] DLSS-NR runs on the finished pre-UI image."));
+    }
+  }
+
+  void RtxNgxPassthrough::applyBloom(RtxContext* ctx) {
+    DxvkBloom& bloom = m_device->getCommon()->metaBloom();
+    if (!bloom.enabled() || !m_colorSourceLinearHdr || m_dlssOutput.image == nullptr) {
       return;
     }
 
     Rc<DxvkContext> dxvkCtx = ctx;
-    const VkExtent3D displayExtent = { m_displayExtent.width, m_displayExtent.height, 1 };
-
-    DlssNeuralRendering& neuralRendering = m_device->getCommon()->metaDlssNeuralRendering();
-    if (m_depthMvInputsValid &&
-        neuralRendering.supportsDlssNeuralRendering() &&
-        DlssNeuralRendering::enable() &&
-        m_depthQueue.get().image != nullptr &&
-        m_motionVectorQueue.get().image != nullptr) {
-      const bool extentChanged = m_nrInput.image == nullptr ||
-        m_nrInput.image->info().extent.width != displayExtent.width ||
-        m_nrInput.image->info().extent.height != displayExtent.height;
-      if (extentChanged) {
-        m_nrInput = Resources::createImageResource(dxvkCtx, "NGX passthrough NR input", displayExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
-        m_nrOutput = Resources::createImageResource(dxvkCtx, "NGX passthrough NR output", displayExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
-        m_nrDepth = Resources::createImageResource(dxvkCtx, "NGX passthrough NR depth", displayExtent, VK_FORMAT_R32_SFLOAT);
-        m_nrMotionVectors = Resources::createImageResource(dxvkCtx, "NGX passthrough NR motion vectors", displayExtent, VK_FORMAT_R16G16_SFLOAT);
-        // White: no material IDs, so the effect covers the frame. Auto mask replaces this.
-        const VkClearColorValue fullMask = { 1.f, 1.f, 1.f, 1.f };
-        m_nrControlMask = Resources::createImageResource(
-          dxvkCtx, "NGX passthrough NR control mask", displayExtent, VK_FORMAT_R8G8B8A8_UNORM,
-          1, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_STORAGE_BIT, fullMask);
-      }
-
-      if (m_nrConfiguredExtent.width != displayExtent.width || m_nrConfiguredExtent.height != displayExtent.height) {
-        uint32_t displaySize[2] = { displayExtent.width, displayExtent.height };
-        neuralRendering.setDlssNeuralRenderingSettings(displaySize);
-        m_nrConfiguredExtent = { displayExtent.width, displayExtent.height };
-      }
-
-      scaleResourceToDisplay(ctx, m_depthQueue.get(), m_nrDepth);
-      scaleResourceToDisplay(ctx, m_motionVectorQueue.get(), m_nrMotionVectors);
-
-      Rc<DxvkSampler> linearSampler =
-        ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
-      DxvkAutoExposure& autoExposure = m_device->getCommon()->metaAutoExposure();
-      autoExposure.dispatch(dxvkCtx, linearSampler, m_dlssOutput, displayExtent, GlobalTime::get().deltaTimeMs(), resetHistory);
-
-      DxvkToneMapping& toneMapper = m_device->getCommon()->metaToneMapping();
-      toneMapper.dispatchFastToneMapping(ctx, autoExposure.getExposureTexture().view, m_dlssOutput, m_nrInput, autoExposure.enabled());
-
-      const float motionScaleX = m_renderExtent.width > 0
-        ? float(m_displayExtent.width) / float(m_renderExtent.width) : 1.0f;
-      const float motionScaleY = m_renderExtent.height > 0
-        ? float(m_displayExtent.height) / float(m_renderExtent.height) : 1.0f;
-      if (neuralRendering.dispatch(ctx, barriers, m_nrInput, m_nrOutput, m_nrMotionVectors, m_nrDepth, m_nrControlMask,
-                                   resetHistory, motionScaleX, motionScaleY)) {
-        toneMapper.dispatchInverseToneMapping(ctx, autoExposure.getExposureTexture().view, m_nrOutput, m_dlssOutput, autoExposure.enabled());
-      }
-    }
-
-    DxvkBloom& bloom = m_device->getCommon()->metaBloom();
-    if (bloom.enabled()) {
-      bloom.ensureResources(dxvkCtx, displayExtent);
-      Rc<DxvkSampler> linearSampler =
-        ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
-      bloom.dispatch(ctx, linearSampler, m_dlssOutput);
-    }
+    bloom.ensureResources(dxvkCtx, VkExtent3D { m_displayExtent.width, m_displayExtent.height, 1 });
+    Rc<DxvkSampler> linearSampler =
+      ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    bloom.dispatch(ctx, linearSampler, m_dlssOutput);
   }
 
   bool RtxNgxPassthrough::applyPostFxAndWriteback(RtxContext* ctx,
@@ -1714,7 +1736,7 @@ namespace dxvk {
                                                   const VkOffset2D& targetOffset,
                                                   bool preserveTargetAlpha,
                                                   bool resetHistory) {
-    applyNeuralRenderingAndBloom(ctx, barriers, resetHistory);
+    applyBloom(ctx);
     {
       DxvkPostFx& postFx = m_device->getCommon()->metaPostFx();
 
@@ -2143,6 +2165,16 @@ namespace dxvk {
     m_lastDispatchPrePost = prePostProcess;
     m_postFxActive = false;
 
+    // The DLSS-NR scratch holds several display-sized images, so it is released while DLSS-NR is off.
+    if (!DlssNeuralRendering::enable() && m_nrInput.image != nullptr) {
+      m_nrInput.reset();
+      m_nrOutput.reset();
+      m_nrDepth.reset();
+      m_nrMotionVectors.reset();
+      m_nrControlMask.reset();
+      m_nrConfiguredExtent = { 0, 0 };
+    }
+
     const bool dlfgSupported = m_device->getCommon()->metaNGXContext().supportsDLFG();
 
     // Advance the DLFG input queues once per frame so the present thread can still read the
@@ -2172,6 +2204,7 @@ namespace dxvk {
     const VkExtent2D renderExtent = superResolution ? sourceSubrect.extent : displayExtent;
     const VkOffset2D subrectOffset = (superResolution || prePostInRect) ? sourceSubrect.offset : VkOffset2D { 0, 0 };
     const Rc<DxvkImage>& colorSourceImage = lateSuperResolution ? upscaleSourceImage : targetImage;
+    m_colorSourceLinearHdr = isHdrColorFormat(colorSourceImage->info().format);
 
     // Depth reads at subrectOffset.
     // On the late path the colour can sit at a different offset in its own image.
@@ -2206,6 +2239,7 @@ namespace dxvk {
     // the two. Only the crossing resets, so the movie still accumulates across its own frames.
     resetHistory |= m_sceneCameraFresh != m_previousSceneCameraFresh;
     m_previousSceneCameraFresh = m_sceneCameraFresh;
+    m_lastResetHistory = resetHistory;
 
     const bool haveDepthMvInputs = generateMotionVectorsAndDepth(ctx, dxvkCtxState, barriers, sceneDepthImage, subrectOffset, camera,
                                                                  objectVelocities() ? velocityDraws : std::vector<NgxVelocityDraw>(),
@@ -2416,6 +2450,12 @@ namespace dxvk {
       };
 
       ctx->blitImage(targetImage, identityMap, colorSourceImage, identityMap, blitInfo, VK_FILTER_LINEAR);
+    }
+
+    // The late target is the finished pre-UI backbuffer.
+    // The HUD-less copy below then includes DLSS-NR.
+    if (!prePostProcess) {
+      applyNeuralRendering(ctx, barriers, targetImage);
     }
 
     // Frame generation: hand this frame's camera + depth/motion vectors to the DLFG

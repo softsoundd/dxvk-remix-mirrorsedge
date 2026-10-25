@@ -82,13 +82,6 @@ namespace dxvk {
                     "Controls DLSS 3D-Guided Neural Rendering adjustments to characters when Auto Mask is enabled. Lower values preserve the original structure; higher values apply stronger structural adjustments.",
                     args.minValue = 0.0f, args.maxValue = 1.0f);
 
-    // Highlight recovery substitutes original pre-NR HDR for pixels that were very bright
-    // and would land in the active tone mapper's shoulder.
-    //   .x/.y = exposed HDR max-channel preserve range (default 1.0..8.0)
-    //   .z/.w = exposed LDR max-channel shoulder range (default 0.75..0.99)
-    RTX_OPTION("rtx.dlssNeuralRendering", bool,    enableHighlightRecovery, true, "Recover highlights compressed by DLSS 3D-Guided Neural Rendering's LDR-domain processing.");
-    RTX_OPTION("rtx.dlssNeuralRendering", Vector4, highlightRecoveryThresholds, Vector4(1.0f, 8.0f, 0.75f, 0.99f), "Smoothstep edges for highlight recovery: (exposed HDR max-channel min, exposed HDR max-channel max, LDR max-channel min, LDR max-channel max).");
-
     RTX_OPTION("rtx.dlssNeuralRendering", bool, showVramUsage, false,
                "Shows SDK VRAM allocation in the DLSS 3D-Guided Neural Rendering settings. Queries aggregate SDK allocation at feature creation; excludes Remix textures. Enable before activating the feature.");
 

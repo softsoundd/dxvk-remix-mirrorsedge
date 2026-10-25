@@ -82,7 +82,8 @@ namespace dxvk {
     // Each image is 1/2 resolution of the previous.
     Resources::Resource m_bloomBuffer[MaxBloomSteps] = {};
 
-    RTX_OPTION_ENV("rtx.bloom", bool, enable, true, "RTX_BLOOM_ENABLE", "Enable bloom - glowing halos around intense, bright areas.");
+    // Defaults off, since UE3 titles bloom in their own post chain.
+    RTX_OPTION_ENV("rtx.bloom", bool, enable, false, "RTX_BLOOM_ENABLE", "Enable bloom - glowing halos around intense, bright areas.");
     RTX_OPTION("rtx.bloom", float, burnIntensity, 1.0f, "Amount of bloom to add to the final image.");
     RTX_OPTION("rtx.bloom", float, luminanceThreshold, 0.25f,
                "Adjust the bloom threshold to suppress blooming of the dim areas. "

@@ -17,6 +17,7 @@
 #include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_dlfg.h"
+#include "../dxvk/rtx_render/rtx_dlss_neural_rendering.h"
 #include "../dxvk/rtx_render/rtx_camera.h"
 // NV-DXVK start: draw disposition statistics
 #include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
@@ -4589,6 +4590,8 @@ namespace dxvk {
     o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && DxvkDLFG::enable() &&
                        m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
     o.ngxDlfgHudlessPreview = RtxNgxPassthrough::dlfgHudlessPreview();
+    o.ngxNeuralRendering = DlssNeuralRendering::enable() &&
+                           m_parent->GetDXVKDevice()->getCommon()->metaDlssNeuralRendering().supportsDlssNeuralRendering();
     o.ngxObjectVelocities = RtxNgxPassthrough::objectVelocities();
     o.ngxDebugVisualization = RtxNgxPassthrough::debugVisualization();
 
@@ -9891,7 +9894,10 @@ namespace dxvk {
 
     const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
     const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
-    const D3DVIEWPORT9& vp = d3d9State().viewport;
+
+    // After an in-place upscale, a composite at the scene or centred view rect rasterizes over the whole backbuffer.
+    D3DVIEWPORT9 vp = d3d9State().viewport;
+    GetNgxPassthroughExpandedViewport(&vp);
     if (backBufferWidth == 0 || backBufferHeight == 0 ||
         vp.Width + 1 < backBufferWidth || vp.Height + 1 < backBufferHeight) {
       return false;
@@ -9957,10 +9963,13 @@ namespace dxvk {
       "[RTX NGX Passthrough] HUD-less capture before draw ", m_drawCallID, ", ", where, "."));
   }
 
-  // Copies the backbuffer on the first draw after the scene blit.
-  void D3D9Rtx::maybeCaptureNgxHudless(const DrawContext& drawContext) {
-    if (m_ngxHudlessCapturedThisFrame || !m_frameOptions.ngxDlfgHudless ||
-        m_ngxFrameBackbufferImage == nullptr) {
+  // Records DLSS-NR and the HUD-less copy on the first draw after the scene blit.
+  void D3D9Rtx::maybeFinishNgxScene(const DrawContext& drawContext) {
+    // Late injection runs DLSS-NR and takes the HUD-less copy in its own dispatch.
+    const bool needsNeuralRendering =
+      m_frameOptions.ngxNeuralRendering && !m_ngxNeuralRenderingAppliedThisFrame && m_ngxColorTargetImage != nullptr;
+    const bool needsHudless = m_frameOptions.ngxDlfgHudless && !m_ngxHudlessCapturedThisFrame;
+    if ((!needsNeuralRendering && !needsHudless) || m_ngxFrameBackbufferImage == nullptr) {
       return;
     }
 
@@ -9983,12 +9992,21 @@ namespace dxvk {
       return;
     }
 
-    m_ngxHudlessCapturedThisFrame = true;
-    noteNgxHudlessCapture(NgxHudlessCaptureSite::AfterSceneComposite);
+    if (needsNeuralRendering) {
+      m_ngxNeuralRenderingAppliedThisFrame = true;
+      m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->applyNgxPassthroughNeuralRendering(cBackbuffer);
+      });
+    }
 
-    m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
-    });
+    if (needsHudless) {
+      m_ngxHudlessCapturedThisFrame = true;
+      noteNgxHudlessCapture(NgxHudlessCaptureSite::AfterSceneComposite);
+
+      m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->captureNgxPassthroughHudless(cBackbuffer);
+      });
+    }
   }
 
   // Positions the next frame's injection from the shape this one turned out to have, and logs that
@@ -10718,7 +10736,7 @@ namespace dxvk {
     }
 
     // Records the scene blit on every backbuffer draw, including the injection trigger.
-    // maybeCapture does not run until the following draw.
+    // maybeFinishNgxScene does not run until the following draw.
     if (!m_ngxHudlessSceneCompositeSeen &&
         m_ngxFrameBackbufferImage != nullptr &&
         d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
@@ -10761,7 +10779,7 @@ namespace dxvk {
       checkNgxPostInjectionDraw(drawContext);
       noteNgxPostUpscaleViewport();
       countNgxPostInjectionSceneColorConsumer(drawContext);
-      maybeCaptureNgxHudless(drawContext);
+      maybeFinishNgxScene(drawContext);
       return PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
@@ -11542,6 +11560,22 @@ namespace dxvk {
       emitNgxPassthroughFrameData();
     }
 
+    // A pre-post frame that draws nothing after its scene blit finishes the scene here.
+    // Without an identified scene blit, the backbuffer may already hold the UI, so DLSS-NR stays off.
+    if (m_frameOptions.ngxPassthroughMode && m_rtxInjectTriggered && callInjectRtx &&
+        m_frameOptions.ngxNeuralRendering && !m_ngxNeuralRenderingAppliedThisFrame &&
+        m_ngxColorTargetImage != nullptr && m_ngxFrameBackbufferImage != nullptr) {
+      if (m_ngxHudlessSceneCompositeSeen) {
+        m_ngxNeuralRenderingAppliedThisFrame = true;
+        m_parent->EmitCs([cBackbuffer = m_ngxFrameBackbufferImage](DxvkContext* ctx) {
+          static_cast<RtxContext*>(ctx)->applyNgxPassthroughNeuralRendering(cBackbuffer);
+        });
+      } else {
+        ONCE(Logger::info("[RTX NGX Passthrough] DLSS-NR is skipped on a pre-post frame whose scene blit was not identified. "
+                          "The backbuffer may already hold the UI."));
+      }
+    }
+
     // The presenter already holds this frame's slot.
     // Leaving the slot unfilled repeats the previous frame.
     if (m_frameOptions.ngxPassthroughMode && m_rtxInjectTriggered && callInjectRtx &&
@@ -11621,6 +11655,7 @@ namespace dxvk {
     updateNgxPrePostInjectionAim();
 
     m_ngxHudlessCapturedThisFrame = false;
+    m_ngxNeuralRenderingAppliedThisFrame = false;
     m_ngxHudlessSceneCompositeSeen = false;
 
     // Object velocity per-frame state: rotate the accepted camera, drop uncaptured

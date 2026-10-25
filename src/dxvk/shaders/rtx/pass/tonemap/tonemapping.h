@@ -118,18 +118,5 @@ struct ToneMappingApplyToneMappingArgs {
   uint useLegacyACES;
 };
 
-struct FastToneMappingArgs {
-  uint enableAutoExposure;
-  float exposureFactor;
-  uint enableHighlightRecovery;
-  uint pad0;
-
-  // Highlight recovery (inverse tonemap): substitute the original HDR back in for pixels that were
-  // very bright in HDR and land in the active curve's shoulder. Thresholds are smoothstep edges:
-  //   .x/.y = exposed HDR max-channel preserve range
-  //   .z/.w = exposed LDR max-channel shoulder range
-  vec4 highlightRecoveryThresholds;
-};
-
 
 #endif  // TONEMAPPING_H
