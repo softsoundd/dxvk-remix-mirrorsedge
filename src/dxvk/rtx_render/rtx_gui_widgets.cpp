@@ -744,7 +744,7 @@ namespace RemixGui {
         PushID(i);
         const bool itemSelected = (i == *currentItem);
         const char* itemText;
-        const char* itemTooltip;
+        const char* itemTooltip = nullptr;
         if (!itemsGetter(data, i, &itemText, &itemTooltip)) {
           itemText = "*Unknown item*";
         }
@@ -775,24 +775,18 @@ namespace RemixGui {
 
 
   bool Combo(const char* label, int* currentItem, const char* const items[], int itemsCount, int heightInItems) {
-    return withLabeledRow(label, [&]() {
-      SetNextItemWidth(GetRowFieldWidth());
-      return Combo("##v", currentItem, Items_ArrayGetter, (void*) items, itemsCount, heightInItems);
-    });
+    return Combo(label, currentItem, Items_ArrayGetter, (void*) items, itemsCount, heightInItems);
   }
 
   // Combo box helper allowing to pass all items in a single string literal holding multiple zero-terminated items "item1\0item2\0"
   bool Combo(const char* label, int* currentItem, const char* itemsSeparatedByZeros, int heightInItems) {
-    return withLabeledRow(label, [&]() {
-      SetNextItemWidth(GetRowFieldWidth());
-      int itemsCount = 0;
-      const char* p = itemsSeparatedByZeros;
-      while (*p) {
-        p += strlen(p) + 1;
-        itemsCount++;
-      }
-      return Combo("##v", currentItem, Items_SingleStringGetter, (void*) itemsSeparatedByZeros, itemsCount, heightInItems);
-    });
+    int itemsCount = 0;
+    const char* p = itemsSeparatedByZeros;
+    while (*p) {
+      p += strlen(p) + 1;
+      itemsCount++;
+    }
+    return Combo(label, currentItem, Items_SingleStringGetter, (void*) itemsSeparatedByZeros, itemsCount, heightInItems);
   }
 
   void Separator() {

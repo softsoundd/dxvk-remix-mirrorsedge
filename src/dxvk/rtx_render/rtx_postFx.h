@@ -150,17 +150,12 @@ namespace dxvk {
     RTX_OPTION_ARGS("rtx.postfx", bool, enableVignette, true, "Enables vignette post-processing effect.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.postfx", MotionBlurMode, motionBlurMode, MotionBlurMode::Legacy,
-                    "Motion blur algorithm. Legacy is the original per-pixel gather. Cinematic is a tile based "
-                    "feature-aware reconstruction filter (Guertin, McGuire & Nowrouzezahrai, HPG 2014) which "
-                    "dilates velocity across tiles so moving objects smear onto stationary background, samples "
-                    "two directions to resolve overlapping motion, and can follow curved sample paths.",
+                    "Motion blur algorithm. Legacy (0) is the original per-pixel blur. Cinematic (1) is a higher quality "
+                    "filter that smears moving objects over the background and follows curved motion.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.postfx", float, motionBlurShutterAngle, 180.0f,
-                    "Cinematic motion blur: shutter angle in degrees, following the film convention where 180 "
-                    "means the shutter is open for half of each frame. Because motion vectors already describe "
-                    "one frame of displacement, the blur length tracks the current frame rate: the same real "
-                    "motion blurs half as far at twice the frame rate, which is the motion actually lost between "
-                    "those two frames. Replaces exposureFraction, which only applies to Legacy mode.",
+                    "Cinematic motion blur length as a film shutter angle: 180 blurs across half of each frame's motion, "
+                    "360 across all of it. Blur shortens as the frame rate rises, like a real camera.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.postfx", float, motionBlurShutterReferenceFps, 0.0f,
                "Cinematic motion blur: when above zero, scale the shutter as though the frame rate were this "

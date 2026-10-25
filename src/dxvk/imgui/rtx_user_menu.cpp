@@ -28,6 +28,7 @@
 #include "rtx_render/rtx_context.h"
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_dlss.h"
+#include "rtx_render/rtx_dlss_neural_rendering.h"
 #include "rtx_render/rtx_dlfg.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_reflex.h"
@@ -248,10 +249,12 @@ namespace dxvk {
     auto common = ctx->getCommonObjects();
     DxvkDLSS& dlss = common->metaDLSS();
     DxvkDLFG& dlfg = common->metaDLFG();
+    DlssNeuralRendering& dlssNeuralRendering = common->metaDlssNeuralRendering();
     const RtxReflex& reflex = m_device->getCommon()->metaReflex();
 
     const bool dlssSupported = dlss.supportsDLSS();
     const bool dlfgSupported = dlfg.supportsDLFG();
+    const bool dlssNeuralRenderingSupported = dlssNeuralRendering.supportsDlssNeuralRendering();
     const bool reflexInitialized = reflex.reflexInitialized();
 
     // Describe the tab
@@ -379,6 +382,25 @@ namespace dxvk {
       ImGui::PopItemWidth();
 
       ImGui::EndDisabled();
+    }
+
+    // Neural Rendering Settings
+
+    if (dlssNeuralRenderingSupported) {
+      ImGui::Dummy(ImVec2(0.0f, 3.0f));
+      ImGui::TextSeparator("Neural Rendering Settings");
+
+      RemixGui::Checkbox("Enable DLSS Neural Rendering", &DlssNeuralRendering::enableObject());
+
+      if (DlssNeuralRendering::enable()) {
+        ImGui::PushItemWidth(static_cast<float>(subItemWidth));
+        ImGui::Indent(static_cast<float>(subItemIndent));
+
+        dlssNeuralRendering.showDlssNeuralRenderingImguiTuning();
+
+        ImGui::Unindent(static_cast<float>(subItemIndent));
+        ImGui::PopItemWidth();
+      }
     }
 
     // Latency Reduction Settings

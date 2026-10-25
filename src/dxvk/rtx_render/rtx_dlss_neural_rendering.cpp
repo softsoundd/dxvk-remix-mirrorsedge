@@ -207,14 +207,6 @@ namespace dxvk {
   }
 
   void DlssNeuralRendering::showDlssNeuralRenderingImguiSettings() {
-    static auto modelCombo = RemixGui::ComboWithKey<Model>(
-      "Model",
-      { {
-        { Model::Model0, "Model A" },
-        { Model::Model1, "Model B" },
-        { Model::Model2, "Model C" },
-      } });
-
     if (DlssNeuralRendering::showVramUsage()) {
       if (m_dlssNeuralRenderingContext && m_dlssNeuralRenderingContext->hasVramAllocation()) {
         constexpr double kBytesPerMiB = 1024.0 * 1024.0;
@@ -229,6 +221,17 @@ namespace dxvk {
     }
 
     RemixGui::Checkbox("DLSS 3D-Guided Neural Rendering", &DlssNeuralRendering::enableObject());
+    showDlssNeuralRenderingImguiTuning();
+  }
+
+  void DlssNeuralRendering::showDlssNeuralRenderingImguiTuning() {
+    static auto modelCombo = RemixGui::ComboWithKey<Model>(
+      "Model",
+      { {
+        { Model::Model0, "Model A" },
+        { Model::Model1, "Model B" },
+        { Model::Model2, "Model C" },
+      } });
 
     constexpr ImGuiSliderFlags flags = ImGuiSliderFlags_AlwaysClamp;
     modelCombo.getKey(&DlssNeuralRendering::modelObject());

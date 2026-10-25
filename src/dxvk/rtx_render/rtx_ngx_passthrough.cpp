@@ -2558,7 +2558,7 @@ namespace dxvk {
       statRow("New registrations", str::format(stats.newRegistrations),
               "No partner for the sighting, so that draw produced no velocity. A spike during motion means pairing is failing.");
       statRow("New registrations, skinned", str::format(stats.newRegistrationsSkinned),
-              "Instanced static geometry can raise the total without a skinned miss. A skinned miss is a character or attachment losing a frame of velocity.");
+              "Each one is a character or attachment losing a frame of velocity.");
       statRow("Miss, no last frame", str::format(stats.missNoLastFrameSighting),
               "That placement was not seen on the previous frame.");
       statRow("Miss, beyond translation", str::format(stats.missBeyondTranslation),
@@ -2568,7 +2568,7 @@ namespace dxvk {
       statRow("Claimed without velocity", str::format(stats.claimedWithoutVelocity),
               "Paired, but the emission gate rejected the motion.");
       statRow("Paired beyond bounds", str::format(stats.pairedBeyondBounds),
-              "Held for another confirming frame. A steady nonzero count while something moves means a real mover is waiting. A spike while turning the camera is a swap being refused.");
+              "Held for a confirming frame. A steady count means a real mover is waiting; a spike while turning is a refused swap.");
       statRow("Skipped, no camera", str::format(stats.skippedNoCamera));
       statRow("Skipped, budget", str::format(stats.skippedBudget),
               "The per-frame capture budget was exhausted.");
@@ -2577,13 +2577,13 @@ namespace dxvk {
       statRow("Skipped, instance cap", str::format(stats.skippedInstanceCap),
               "Every instance slot for that asset was already in use. A mover in that set gets no velocity.");
       statRow("Skipped, dynamic buffer", str::format(stats.skippedDynamicBuffer),
-              "The buffer did not match the CPU-modified mesh shape. Ring-pool geometry lands here, and a mesh whose motion is in its vertices gets no velocity.");
+              "The buffer did not match the CPU-modified mesh shape, so a mesh whose motion is in its vertices gets no velocity.");
       statRow("Skipped, bone palette", str::format(stats.skippedBonePalette),
               "The bone palette does not fit the capture cap, so every mesh on that rig gets no velocity.");
       statRow("Frame camera", stats.frameCameraValid ? "Valid" : "Missing",
               "Missing during a fullscreen movie or loading screen, where the last camera matrices are kept.");
       statRow("Depth clears", str::format(stats.depthClears),
-              "Must be nonzero while first-person meshes render in SDPG_Foreground. Otherwise those draws are tagged as world-phase. Occlusion culling disabled leaves one clear. Occlusion culling enabled leaves two.");
+              "Must be nonzero while first-person meshes render, or they are treated as world geometry. Expect one with occlusion culling off, two with it on.");
       statRow("Camera transpose flips", str::format(stats.cameraTransposeFlips),
               "Must stay at zero. A flip means consecutive frames were read with different matrix conventions.");
       ImGui::EndTable();
@@ -2594,8 +2594,8 @@ namespace dxvk {
 
   void RtxNgxPassthrough::showImguiSettings() {
     RemixGui::Checkbox("Sub-Pixel Camera Jitter", &enableJitterObject());
-    RemixGui::Checkbox("Pre-Post-Process Injection (DLSS before the game's post chain)", &prePostProcessObject());
-    RemixGui::Checkbox("Bypass Upscaler (keep the reduced render, plain stretch)", &bypassUpscalerObject());
+    RemixGui::Checkbox("Pre-Post-Process Injection", &prePostProcessObject());
+    RemixGui::Checkbox("Bypass Upscaler", &bypassUpscalerObject());
 
     if (RemixGui::CollapsingHeader("Diagnostics", ImGuiTreeNodeFlags_CollapsingHeader)) {
       showImguiDiagnostics();
@@ -2603,10 +2603,9 @@ namespace dxvk {
 
     // rtx.ngxPassthrough.motionBlurFirstPerson and rtx.ngxPassthrough.objectVelocities
     // stay config-only: both default on and only serve as kill-switches
-    RemixGui::Checkbox("Object Velocity Debug Freeze (zero motion)", &objectVelocityDebugFreezeObject());
+    RemixGui::Checkbox("Object Velocity Debug Freeze", &objectVelocityDebugFreezeObject());
     RemixGui::Checkbox("Frame Gen HUD-less UI Input", &dlfgHudlessInputObject());
-    IMGUI_ADD_TOOLTIP(RemixGui::Checkbox("Preview HUD-less Frame", &dlfgHudlessPreviewObject()),
-      "Presents the HUD-less copy in place of the finished frame. UI drawn after the capture is absent. Frame generation must be enabled.");
+    RemixGui::Checkbox("Preview HUD-less Frame", &dlfgHudlessPreviewObject());
 
     int debugVisualizationValue = debugVisualization();
     if (ImGui::Combo("Debug Visualization", &debugVisualizationValue,

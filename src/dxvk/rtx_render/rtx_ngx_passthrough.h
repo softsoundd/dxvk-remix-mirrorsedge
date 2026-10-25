@@ -408,17 +408,11 @@ namespace dxvk {
     };
 
     RTX_OPTION("rtx.ngxPassthrough", bool, enableJitter, true,
-               "Applies a sub-pixel Halton jitter offset to the game's viewport for all draws targeting the detected scene render\n"
-               "target. Required for temporal upscalers (DLSS, TAA-U, XeSS) to anti-alias; only disable for debugging.");
+               "Offsets the game's viewport by a sub-pixel amount each frame. Temporal upscalers (DLSS, TAA-U, XeSS) need this "
+               "to anti-alias; disable only for debugging.");
     RTX_OPTION("rtx.ngxPassthrough", bool, prePostProcess, true,
-               "Runs the upscaler on the game's linear scene color before the game's post-process chain instead of on the final\n"
-               "post-processed output, matching a native engine integration: bloom, tonemapping and color grading then operate\n"
-               "on the anti-aliased, unjittered image rather than baking into the upscaler input (post effects sampling a jittered\n"
-               "scene wobble sub-pixel per frame, which temporal upscalers otherwise have to soften out). Floating-point scene\n"
-               "colour is passed to DLSS as linear HDR with NGX auto-exposure. At a lower preset the same point upscales that\n"
-               "HDR subrect onto the full scene-colour target.\n"
-               "The injection triggers on the first post-process pass sampling the identified scene color; frames where that never\n"
-               "happens (e.g. the game's post chain is disabled) fall back to the late injection point automatically.");
+               "Runs the upscaler on the game's scene colour before its post-processing, so bloom, tonemapping and depth of field "
+               "see the anti-aliased image. Frames without a recognised post-process pass are upscaled after post-processing instead.");
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocities, true,
                "Rasterizes true motion vectors for dynamic objects into the synthesized motion vector inputs, replacing the\n"
                "static-world camera reprojection where they land. Covers rigid movers (doors, elevators - draws whose transform\n"
@@ -432,13 +426,10 @@ namespace dxvk {
                "during sprints and camera motion the hands smear with their true motion, matching the vanilla game's camera\n"
                "motion blur. Disable to exclude them from blur (crisp hands).");
     RTX_OPTION("rtx.ngxPassthrough", bool, dlfgHudlessInput, true,
-               "Provides DLSS Frame Generation with a HUD-less copy of the frame (captured between the end of the game's\n"
-               "rendering and the first UI draw) in addition to the presented backbuffer. The interpolator then knows exactly\n"
-               "which pixels are UI instead of detecting them heuristically, which strongly reduces UI warping over busy\n"
-               "moving backgrounds.");
+               "Gives Frame Generation a copy of each frame without the UI, which reduces UI warping over moving backgrounds.");
     RTX_OPTION("rtx.ngxPassthrough", bool, dlfgHudlessPreview, false,
-               "Presents the HUD-less copy in place of the finished frame.\n"
-               "UI drawn after the capture is absent. Requires frame generation and rtx.ngxPassthrough.dlfgHudlessInput.");
+               "Diagnostic: shows the UI-free copy that Frame Generation receives instead of the finished frame. "
+               "Requires Frame Generation and rtx.ngxPassthrough.dlfgHudlessInput.");
     RTX_OPTION("rtx.ngxPassthrough", bool, driveGameScreenPercentage, true,
                "Lets the Remix upscaler quality preset choose the game's effective render resolution.\n"
                "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); other tiers use the upscaler's\n"
@@ -468,17 +459,11 @@ namespace dxvk {
                "FSystemSettings::ScreenPercentage within the game's main module. 0 leaves discovery\n"
                "automatic. The value is still proven by the behavioural probe before it is used.");
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocityDebugFreeze, false,
-               "Diagnostic for the object velocity pass: composes every captured draw's previous-frame side from the\n"
-               "current frame's transforms and bone palettes (forcing the rasterized velocity to zero) and disables the\n"
-               "depth test (exposing the raw rasterized footprint). Coverage in the motion vector debug view then shows\n"
-               "exactly where the replayed geometry lands with current-frame data alone: neutral coverage hugging the\n"
-               "object silhouettes means the replay (transforms, skinning) is correct; any artifact seen without the\n"
-               "freeze then comes from the depth-based visibility or the previous-frame history pairing.");
+               "Diagnostic: replays captured objects with zero motion and no depth test. Coverage that hugs each silhouette "
+               "in the debug views means their transforms and skinning are correct.");
     RTX_OPTION("rtx.ngxPassthrough", bool, bypassUpscaler, false,
-               "Diagnostic: keeps driving the game's render resolution from the selected upscaler's preset but does not\n"
-               "run the upscaler, bringing the reduced render up to display resolution with a plain filtered stretch\n"
-               "instead - the same reduced input, with and without the reconstruction. Setting rtx.upscalerType to None\n"
-               "instead returns the game to rendering at full resolution.")
+               "Diagnostic: keeps the preset's reduced render resolution but replaces the upscaler with a plain filtered "
+               "stretch, to compare the same input with and without reconstruction.")
     RTX_OPTION("rtx.ngxPassthrough", float, objectVelocityDepthTolerance, 1.0f,
                "Diagnostic multiplier on the object velocity raster's depth match, which is 0.1% of view distance at\n"
                "1.0. An object that is captured and rasterized in the right place but never appears in the Object\n"
