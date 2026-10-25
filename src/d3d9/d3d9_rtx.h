@@ -561,7 +561,11 @@ namespace dxvk {
     // The DOF gather keeps its filter-buffer quad and reads the full upscaled scene.
     // The separable blur stays on the downsampled region.
     // A blend quad on the scene rect grows to the bound target, and its filter UVs stay put.
+    // A composite at the centred view rect on the backbuffer grows to the whole backbuffer.
     void RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride);
+    // True when the bound declaration starts with a float4 position followed by a float2 UV.
+    // UE3's FFilterVertex and its FBatchedElements resolve vertex both match.
+    bool ngxBoundDeclIsFilterVertex() const;
 
     // Called at the end of the draw that deferred injection.
     // A queued draw is followed by DLSS on the image it wrote.
@@ -814,9 +818,15 @@ namespace dxvk {
       bool hasDofPackedParameters = false;
       bool hasDofMinMaxBlurClamp = false;
       bool hasFilterSampleWeights = false;
+      // Only the DOF/bloom gather declares BloomScale.
+      bool hasBloomScale = false;
+      // The sampler register of the motion-blur velocity buffer.
+      // It stays 0xFF when the shader has none.
+      uint8_t velocitySamplerIndex = 0xFF;
 
       bool looksLikeDofAndBloomPostProcess() const {
         return hasBlurredImageSampler ||
+               hasBloomScale ||
                (hasDofPackedParameters && hasDofMinMaxBlurClamp) ||
                (hasFilterTextureSampler && hasFilterSampleWeights);
       }
@@ -1133,10 +1143,22 @@ namespace dxvk {
     struct NgxSpsbCtabReg {
       bool present = false;
       uint32_t reg = 0;
+      // UE3's motion blur keeps its taps inside the view rect with RenderTargetClampParameter.
+      bool clampPresent = false;
+      uint32_t clampReg = 0;
     };
+    // Returns a key for the registers a patch occupies, so a change between shaders forces a fresh upload.
+    // Returns -1 when the shader has nothing to patch.
+    static int32_t ngxPatchRegisterKey(const NgxSpsbCtabReg& patch, bool replaceFull);
     fast_unordered_cache<NgxSpsbCtabReg> m_ngxSpsbCtabCache;
     NgxSpsbCtabReg scanNgxSpsbCtabReg(const std::vector<uint8_t>& bytecode) const;
     NgxSpsbCtabReg lookupNgxSpsbCtabReg(const D3D9CommonShader* shader);
+
+    // Returns the scale-bias UE3 would upload for a view covering the whole scene-colour buffer.
+    // The layout is (scale U, scale V, offset V, offset U),
+    // as in ScreenPositionScaleBias and SceneCoordinateScaleBias.
+    // The offsets include UE3's D3D9 half-pixel centre.
+    Vector4 ngxFullBufferScaleBias() const;
 
     // Per-draw ScreenPositionScaleBias patch, decided in prepareDrawForNgxPassthrough
     // and consumed when the device uploads constants.
@@ -1166,6 +1188,52 @@ namespace dxvk {
     bool m_ngxDeferPrePostInjection = false;
     Rc<DxvkImage> m_ngxDeferredPrePostTarget;
     D3DPRIMITIVETYPE m_ngxDeferredPrimitiveType = D3DPT_TRIANGLELIST;
+
+    // Where this frame's injection was taken.
+    enum class NgxInjectionSite : uint8_t {
+      None,
+      Haze,
+      Gather,
+      AimedRead,
+      FinalComposite,
+      Stretch,
+      Late,
+    };
+    NgxInjectionSite m_ngxFrameInjectionSite = NgxInjectionSite::None;
+    // True once this frame's pre-post injection upscaled the scene subrect in place.
+    bool m_ngxFrameUpscaledInPlace = false;
+
+    // Scene geometry drawn after an offscreen injection means the injection landed inside the scene.
+    // Consecutive frames like that suspend the haze, gather and aimed-read points.
+    bool m_ngxSceneDrawAfterInjection = false;
+    uint32_t m_ngxSceneAfterInjectionStrikes = 0;
+    uint32_t m_ngxEarlyInjectionSuspensions = 0;
+    uint32_t m_ngxEarlyInjectionSuspendedUntil = 0;
+    bool ngxEarlyInjectionSuspended() const;
+
+    // Set when a post pass stays on the reduced view rect after an in-place upscale.
+    // Consecutive frames like that suspend sub-full pre-post until ScreenPercentage or the scene extent changes.
+    bool m_ngxReducedRectDrawThisFrame = false;
+    uint32_t m_ngxReducedRectStrikes = 0;
+    bool m_ngxSubrectPrePostSuspended = false;
+    float m_ngxSuspendedScreenPercentage = 0.0f;
+    VkExtent3D m_ngxSuspendedSceneExtent = { 0, 0, 0 };
+
+    // A profile is logged once it holds for two frames, so frames that alternate do not flood the log.
+    std::string m_ngxPendingProfile;
+    std::string m_ngxLoggedProfile;
+    uint32_t m_ngxPendingProfileFrames = 0;
+    uint32_t m_ngxProfileLogsRemaining = 100;
+    void logNgxUe3Profile();
+
+    // These hold the first draw that tripped each fallback this frame, which its warning quotes.
+    std::string m_ngxSceneDrawEvidence;
+    std::string m_ngxReducedRectEvidence;
+
+    std::string describeNgxDraw(const DrawContext& drawContext) const;
+    void checkNgxPostInjectionDraw(const DrawContext& drawContext);
+    void noteNgxReducedRectDraw(const char* reason);
+    void updateNgxInjectionFallbacks();
 
     // Constant uploads only happen when the game dirties them; when the bound shader's
     // patch register differs from what the last upload patched (shader switch without a
@@ -1454,8 +1522,8 @@ namespace dxvk {
     // engage from the first draw of a frame; dropped when unseen for a while.
     Rc<DxvkImage> m_ngxSceneColorImage;
     Rc<DxvkImage> m_ngxSceneDepthImage;
-    // Holds the screen-percentage distortion offsets while they are scaled onto the full target.
-    Rc<DxvkImage> m_ngxDistortionFieldCopy;
+    // Holds a buffer's screen-percentage subrect while it is scaled onto the whole image.
+    Rc<DxvkImage> m_ngxSubrectStretchCopy;
     uint32_t m_ngxSceneTargetsLastSeenFrame = 0;
 
     // Per-frame sub-pixel jitter (pixels), decided on the app thread at the first draw of the
@@ -1467,18 +1535,17 @@ namespace dxvk {
     // Qualifying mid-scene depth clears seen this frame (first = foreground DPG boundary,
     // second = occlusion query pass wiping the foreground depth)
     uint32_t m_ngxDepthClearsThisFrame = 0;
-    // Depth-writing draws since the latest counted clear.
-    uint32_t m_ngxDepthWritesAfterLastClear = 0;
-    // A compiled shader has haze constants.
-    // Distortion injection stays off.
-    bool m_ngxHazeShaderSeen = false;
-    // A compiled shader is the uber post blend.
-    // The bloom gather is the pre-post point from the next frame.
-    bool m_ngxUberPostShaderSeen = false;
     // The late upscale runs after the uber pass is queued, before the HUD.
     bool m_ngxDeferLateSubrectUpscale = false;
-    // The gather that engaged injection remaps its scene-colour UVs onto the full image.
-    bool m_ngxRetargetSceneColorUvs = false;
+
+    // A title that clears depth mid-scene draws its foreground after that clear.
+    // The frame of the latest such clear tells whether the title still clears there.
+    bool m_ngxMidSceneClearSeen = false;
+    uint32_t m_ngxLastMidSceneClearFrame = 0;
+    // True once this frame is past its foreground depth clear.
+    // True as well when the title has not cleared depth mid-scene recently.
+    bool ngxPastForegroundClear() const;
+
     XXH64_hash_t m_ngxLastCameraConstantsHash = 0;
 
     // The swapchain backbuffer image for this frame (backbuffers rotate every present).
@@ -1511,10 +1578,20 @@ namespace dxvk {
     NgxOutputTransform m_ngxOutputTransform;
     void captureNgxOutputTransform();
 
-    // Set when the engine's upscaling draw turned out to also be its post-process composite, so
-    // neither replacing it (the grade is lost) nor leaving it (it upscales itself, bilinearly)
-    // is correct. Such a title only supports full resolution DLAA.
-    bool m_ngxEngineCompositeUnsafe = false;
+    // The uber pass encodes its output with GammaColorScaleAndInverse.
+    // These track that output and plain copies of it, so a late upscale that reads one is linearized first.
+    std::array<Rc<DxvkImage>, 4> m_ngxUberEncodedImages;
+    uint32_t m_ngxUberEncodedImageCount = 0;
+    Vector4 m_ngxUberGammaColorScaleAndInverse = Vector4(1.0f, 1.0f, 1.0f, 1.0f);
+    bool ngxImageIsUberEncoded(const DxvkImage* image) const;
+    void rememberNgxUberEncodedImage(const Rc<DxvkImage>& image);
+    void noteNgxUberEncode(const DrawContext& drawContext);
+    // Reads GammaColorScaleAndInverse from the bound pixel shader.
+    // requireBlurredImage limits it to the uber blend, since a tonemap-only pass has no BlurredImage.
+    bool readNgxBoundUberGamma(Vector4& gammaColorScaleAndInverse, bool requireBlurredImage);
+    // Returns the transform that linearizes an image the uber pass encoded and encodes it again after DLSS.
+    // Returns a disabled transform when the values do not describe a real encode.
+    static NgxOutputTransform ngxLinearizingTransform(const Vector4& gammaColorScaleAndInverse);
 
     // Pre-post-process injection: when the scene end trigger was the first post-process pass
     // sampling the scene color, DLSS reads and writes the image that pass consumes - the
@@ -1525,10 +1602,16 @@ namespace dxvk {
     Rc<DxvkImage> m_ngxColorTargetImage;
     Rc<DxvkImage> m_ngxColorMirrorImage;
 
-    // Same-size StretchRect destinations copied from the scene color surface this frame
-    // (UE3 D3D9 scene color resolves); sampled by the post chain in place of the surface
-    std::array<Rc<DxvkImage>, 4> m_ngxSceneColorResolves;
+    // These are this frame's same-size copies of the scene colour surface.
+    // The post chain samples them in place of the surface.
+    // Mirror's Edge copies with StretchRect.
+    // Stock UE3 D3D9 copies with an opaque two-triangle draw.
+    std::array<Rc<DxvkImage>, 8> m_ngxSceneColorResolves;
     uint32_t m_ngxSceneColorResolveCount = 0;
+    bool m_ngxResolvesFromStretchRect = false;
+    bool m_ngxResolvesFromDraws = false;
+    void rememberNgxSceneColorResolve(const Rc<DxvkImage>& image);
+    void learnNgxDrawResolve(const DrawContext& drawContext);
 
     // Where this frame's HUD-less copy was taken.
     enum class NgxHudlessCaptureSite {
@@ -1549,6 +1632,9 @@ namespace dxvk {
 
     void maybeCaptureNgxHudless(const DrawContext& drawContext);
     bool ngxDrawIsBackbufferSceneComposite(const DrawContext& drawContext) const;
+    // True for a backbuffer draw after this frame's scene composite that is not itself composite-shaped.
+    // Nothing from there on needs retargeting.
+    bool ngxDrawFollowsSceneComposite(const DrawContext& drawContext) const;
     void noteNgxHudlessCapture(NgxHudlessCaptureSite site);
 
     // Diagnostic dump of the post-chain flow (draws sampling render targets, StretchRect
@@ -1564,6 +1650,9 @@ namespace dxvk {
 
     void dumpNgxPostChainDraw(const DrawContext& drawContext);
     const char* classifyNgxImageForDump(const DxvkImage* image) const;
+    // Names the pass the bound pixel shader belongs to for the dump.
+    // The names are haze, gather, blur, uber, DOF blend, tonemap, gamma, motion blur, resolve and other.
+    const char* classifyNgxPassForDump(uint32_t rtSamplerMask, const DxvkImage* renderTargetImage);
     void reportNgxPrePostMiss();
 
     bool ngxPrePostInjectionAllowed() const;
@@ -1571,38 +1660,43 @@ namespace dxvk {
     void recordNgxPrePostSceneColorRead();
     void engageNgxPrePostInjection(const Rc<DxvkImage>& matchedTarget);
     Rc<DxvkImage> findNgxPrePostSceneColorFromSamplers(bool applyOrdinalGate, bool recordRead);
+    // Returns the image the bound pixel shader reads as scene colour.
+    // A known scene-colour image wins.
+    // Otherwise returns the largest sampled render target that covers the scene viewport, float formats first.
+    // Returns null when nothing qualifies.
+    Rc<DxvkImage> findNgxSceneColorSource() const;
     static bool ngxSceneViewportIsSubrect(const D3DVIEWPORT9& sceneViewport,
                                           uint32_t backBufferWidth, uint32_t backBufferHeight);
     // True when the viewport is the rect produced by the driven ScreenPercentage.
     bool ngxViewportMatchesDrivenScreenPercentage(const D3DVIEWPORT9& viewport) const;
     static bool ngxShaderIsFinishRenderViewTargetGamma(const Ue3ShaderFeatureInfo& psInfo);
     static bool ngxShaderIsFinalBackbufferComposite(const Ue3ShaderFeatureInfo& psInfo);
+    // True when the shader declares any name of a scene, post-process or UI pass.
+    // A plain copy declares none.
+    static bool ngxShaderHasPostProcessNames(const Ue3ShaderFeatureInfo& psInfo);
     bool ngxDrawIsUi(const DrawContext& drawContext);
     bool ngxOffscreenPrePostShape(const DrawContext& drawContext);
     // True for UE3's filter color target.
-    // Its size is the scene buffer divided by four, plus a two-pixel border.
+    // Its size is the scene buffer divided by FilterDownsampleFactor (2, 4 or 8), plus a two-pixel border.
     bool ngxImageIsDofFilterBuffer(const DxvkImage* image) const;
     bool ngxBoundImageIsDofFilterBuffer() const;
-    bool ngxDrawSamplesSceneColor() const;
     bool tryGetBoundPixelFeatures(Ue3ShaderFeatureInfo& info);
-    // Requires DepthOfFieldCommon and a scene-color sample.
-    // Blur weights and BlurredImage belong to the other two passes.
+    // True for the DOF/bloom gather.
+    // It samples scene colour and declares BloomScale or the DepthOfFieldCommon parameters.
+    // Blur weights, BlurredImage and the uber grade belong to the passes after it.
     bool ngxBoundPixelIsDofGather();
     bool ngxBoundPixelIsDofBlend();
-    bool ngxDrawIsDofBloomGather();
     bool ngxDepthTestDisabled() const;
-    // The apply reads the offset field and scene colour through one coordinate.
-    bool ngxBoundPixelIsDistortionApply();
-    // True after the foreground depth clear, once that depth has been written.
-    bool ngxDistortionApplyFollowsScene() const;
     // True for haze, depth of field, bloom, tonemap, and gamma.
     // Fog and other scene-colour quads come earlier.
     // Upscaling on those quads leaves the distortion stencil in the screen-percentage rect.
     bool ngxBoundPixelIsUpscaleBoundary();
-    Rc<DxvkImage> ngxBoundDistortionAccumulationImage() const;
-    // Scales the screen-percentage offset field onto the full accumulation target.
-    // The apply then reads that field on the same coordinates as the upscaled scene.
-    bool stretchNgxDistortionField();
+    // Scales the screen-percentage subrect of a screen-space buffer onto the whole image.
+    // Passes after an in-place upscale then read it on the same coordinates as the upscaled scene.
+    bool stretchNgxSubrectToFull(const Rc<DxvkImage>& image);
+    // Scales the velocity buffer the bound motion-blur shader samples, once per frame.
+    void stretchNgxVelocityBuffer();
+    bool m_ngxVelocityStretchedThisFrame = false;
     void refreshNgxUe3VertexFactory();
     void armNgxFullBufferScreenPositionScaleBias();
     void noteNgxPostUpscaleViewport();

@@ -1269,20 +1269,6 @@ namespace dxvk {
       }
     }
 
-    // At the pre-post-process injection point the color source is the game's scene color,
-    // which is a linear (pre-tonemap) target; a floating point format means HDR content
-    // for the DLSS feature. The late injection point sees display-encoded UNORM output.
-    bool isHDRColorFormat(VkFormat format) {
-      switch (format) {
-      case VK_FORMAT_R16G16B16A16_SFLOAT:
-      case VK_FORMAT_R32G32B32A32_SFLOAT:
-      case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-        return true;
-      default:
-        return false;
-      }
-    }
-
     // Blit an image 1:1 into a rect of another image (used for the DLSS output and debug
     // visualization write-back, which target a subrect of the game's scene color at the
     // pre-post-process injection point)
@@ -1816,10 +1802,10 @@ namespace dxvk {
 
     // The HDR flag follows the colour source.
     // Pre-post feeds the game's linear float scene colour, with NGX auto-exposure.
+    // The late point sees display-encoded UNORM output, which stays on the LDR feature.
     // A linearized late grade uses the HDR feature with auto-exposure off.
-    // Display-encoded LDR stays on the LDR feature.
     // Compressing a linear image into the LDR feature leaves disocclusion ghosts.
-    const bool contentHDR = linearizeLateInput || isHDRColorFormat(colorSourceImage->info().format);
+    const bool contentHDR = linearizeLateInput || isHdrColorFormat(colorSourceImage->info().format);
     const bool useAutoExposure = contentHDR && !linearizeLateInput;
 
     // The two injection points alternate freely - whether the pre-post trigger fires depends on

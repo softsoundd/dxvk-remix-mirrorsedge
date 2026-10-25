@@ -246,6 +246,18 @@ namespace dxvk {
              uint64_t(height) * 100 <= uint64_t(targetHeight) * kSubrectPercentOfTarget;
     }
 
+    // True for the float formats UE3 renders linear scene colour into.
+    static bool isHdrColorFormat(VkFormat format) {
+      switch (format) {
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+      case VK_FORMAT_R32G32B32A32_SFLOAT:
+      case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        return true;
+      default:
+        return false;
+      }
+    }
+
     // Runs the passthrough pipeline at the injection point. targetImage is the game's color
     // target DLSS reads from and writes back to, sceneDepthImage the depth-stencil image
     // identified by the D3D9 layer as holding the scene depth this frame (may be null, in

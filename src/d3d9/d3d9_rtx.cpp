@@ -4139,12 +4139,8 @@ namespace dxvk {
       return empty;
 
     auto it = m_ue3ShaderFeatureCache.find(shaderHash);
-    if (it != m_ue3ShaderFeatureCache.end()) {
-      m_ngxHazeShaderSeen = m_ngxHazeShaderSeen || it->second.hasHazeConstants;
-      m_ngxUberPostShaderSeen = m_ngxUberPostShaderSeen ||
-        (it->second.hasToneMapConstants && it->second.hasBlurredImageSampler);
+    if (it != m_ue3ShaderFeatureCache.end())
       return it->second;
-    }
 
     Ue3ShaderFeatureInfo info;
     info.initialized = true;
@@ -4152,7 +4148,6 @@ namespace dxvk {
     try {
       if (bytecode.size() < sizeof(uint32_t) || (bytecode.size() % sizeof(uint32_t)) != 0) {
         m_ue3ShaderFeatureCache.emplace(shaderHash, info);
-        m_ngxHazeShaderSeen = m_ngxHazeShaderSeen || info.hasHazeConstants;
         return info;
       }
 
@@ -4167,7 +4162,6 @@ namespace dxvk {
       const DxsoCtab& ctab = decoder.getCtabInfo();
       if (ctab.m_size == 0 || ctab.m_constantData.empty()) {
         m_ue3ShaderFeatureCache.emplace(shaderHash, info);
-        m_ngxHazeShaderSeen = m_ngxHazeShaderSeen || info.hasHazeConstants;
         return info;
       }
 
@@ -4196,8 +4190,11 @@ namespace dxvk {
           info.hasShadowSampler |= containsToken(lowerName, "shadowdepth") ||
                                    containsToken(lowerName, "shadowtexture") ||
                                    containsToken(lowerName, "shadowvariance");
-          info.hasVelocitySampler |= containsToken(lowerName, "velocitybuffer") ||
-                                     containsToken(lowerName, "velocitytexture");
+          const bool velocitySampler = containsToken(lowerName, "velocitybuffer") ||
+                                       containsToken(lowerName, "velocitytexture");
+          info.hasVelocitySampler |= velocitySampler;
+          if (velocitySampler && registerIndex < 0xFF)
+            info.velocitySamplerIndex = uint8_t(registerIndex);
           info.hasBlurredImageSampler |= containsToken(lowerName, "blurredimage");
           info.hasFilterTextureSampler |= containsToken(lowerName, "filtertexture");
           info.hasExposureOrToneSampler |= containsToken(lowerName, "exposure") ||
@@ -4265,6 +4262,7 @@ namespace dxvk {
         info.hasDofPackedParameters |= containsToken(lowerName, "packedparameters");
         info.hasDofMinMaxBlurClamp |= containsToken(lowerName, "minmaxblurclamp");
         info.hasFilterSampleWeights |= containsToken(lowerName, "sampleweights");
+        info.hasBloomScale |= containsToken(lowerName, "bloomscale");
 
         // TdToneMapping capture: record the exact float register indices of
         // the grade constants so the (skipped) tonemap pass's pixel shader
@@ -4307,9 +4305,6 @@ namespace dxvk {
     } catch (...) {
     }
 
-    m_ngxHazeShaderSeen = m_ngxHazeShaderSeen || info.hasHazeConstants;
-    m_ngxUberPostShaderSeen = m_ngxUberPostShaderSeen ||
-      (info.hasToneMapConstants && info.hasBlurredImageSampler);
     m_ue3ShaderFeatureCache.emplace(shaderHash, info);
     return info;
   }
@@ -8027,14 +8022,6 @@ namespace dxvk {
     float screenPercentage = m_parent->GetDXVKDevice()->getCommon()->metaNgxPassthrough()
       .screenPercentageForDisplay(displayWidth, displayHeight);
 
-    // A title whose composite cannot be separated from its upscale is served by the runtime-owned
-    // path, where the engine's pass runs untouched into the reduced rect. Without that path a
-    // reduced resolution either loses the game's grade or leaves a bordered image, so the only
-    // correct answer left is full resolution.
-    if (m_ngxEngineCompositeUnsafe && !ngxRuntimeOwnsUpscale()) {
-      screenPercentage = 100.0f;
-    }
-
     if (!std::isfinite(screenPercentage) || screenPercentage <= 0.0f) {
       ONCE(Logger::warn("[RTX NGX Passthrough] Upscaler returned an invalid "
                         "ScreenPercentage; retaining the previous effective value."));
@@ -8774,6 +8761,40 @@ namespace dxvk {
                              "costs the moving content its accumulation."));
   }
 
+  const char* D3D9Rtx::classifyNgxPassForDump(uint32_t rtSamplerMask, const DxvkImage* renderTargetImage) {
+    Ue3ShaderFeatureInfo info;
+    if (!tryGetBoundPixelFeatures(info))
+      return "other";
+
+    if (info.hasHazeConstants)
+      return "haze";
+    if (ngxBoundPixelIsDofGather())
+      return "gather";
+    if (info.hasFilterTextureSampler && info.hasFilterSampleWeights)
+      return "blur";
+    if (info.hasBlurredImageSampler)
+      return info.hasToneMapConstants ? "uber" : "DOF blend";
+    if (info.hasToneMapConstants || info.hasExposureOrToneSampler)
+      return "tonemap";
+    if (info.gammaInverseReg != Ue3ShaderFeatureInfo::kNgxNoRegister)
+      return "gamma";
+    if (info.hasVelocitySampler || info.hasMotionBlurConstants)
+      return "motion blur";
+
+    const bool targetIsBackbuffer =
+      m_ngxFrameBackbufferImage != nullptr && renderTargetImage == m_ngxFrameBackbufferImage.ptr();
+    if (!targetIsBackbuffer && !ngxShaderHasPostProcessNames(info) && m_ngxSceneColorImage != nullptr &&
+        rtSamplerMask != 0 && (rtSamplerMask & (rtSamplerMask - 1)) == 0) {
+      for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+        D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+        if (texture != nullptr && texture->GetImage().ptr() == m_ngxSceneColorImage.ptr())
+          return "resolve";
+      }
+    }
+
+    return "other";
+  }
+
   void D3D9Rtx::dumpNgxPostChainDraw(const DrawContext& drawContext) {
     if (m_ngxPostChainDumpLinesThisFrame >= kNgxPostChainDumpMaxLinesPerFrame)
       return;
@@ -8809,7 +8830,8 @@ namespace dxvk {
                         " z=", int(d3d9State().renderStates[D3DRS_ZENABLE]),
                         " zw=", int(d3d9State().renderStates[D3DRS_ZWRITEENABLE]),
                         " st=", int(d3d9State().renderStates[D3DRS_STENCILENABLE]),
-                        " ab=", int(d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]));
+                        " ab=", int(d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]),
+                        " kind=", classifyNgxPassForDump(rtSamplerMask, renderTargetImage));
 
     for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
       D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
@@ -8840,27 +8862,164 @@ namespace dxvk {
         (destImage != nullptr ? str::format(",", destImage->info().extent.width, "x", destImage->info().extent.height) : ""), ")"));
     }
 
-    if (!m_frameOptions.ngxPrePostProcess || m_rtxInjectTriggered)
+    if (m_rtxInjectTriggered || sourceImage == nullptr || destImage == nullptr)
       return;
 
-    if (m_ngxSceneColorImage == nullptr || sourceImage == nullptr || destImage == nullptr ||
-        sourceImage.ptr() != m_ngxSceneColorImage.ptr())
-      return;
-
-    // Only full-size copies qualify as scene color resolves (UE3's CopyToResolveTarget for
-    // a dedicated scene color surface); reduced-size copies are downsamples
+    // Only full-size copies are resolves.
+    // Reduced-size copies are downsamples.
     if (destImage->info().extent.width != sourceImage->info().extent.width ||
         destImage->info().extent.height != sourceImage->info().extent.height)
       return;
 
+    if (ngxImageIsUberEncoded(sourceImage.ptr()))
+      rememberNgxUberEncodedImage(destImage);
+
+    if (!m_frameOptions.ngxPrePostProcess || m_ngxSceneColorImage == nullptr ||
+        sourceImage.ptr() != m_ngxSceneColorImage.ptr())
+      return;
+
+    m_ngxResolvesFromStretchRect = true;
+    rememberNgxSceneColorResolve(destImage);
+  }
+
+  void D3D9Rtx::rememberNgxSceneColorResolve(const Rc<DxvkImage>& image) {
     for (uint32_t i = 0; i < m_ngxSceneColorResolveCount; i++) {
-      if (m_ngxSceneColorResolves[i].ptr() == destImage.ptr())
+      if (m_ngxSceneColorResolves[i].ptr() == image.ptr())
         return;
     }
 
     if (m_ngxSceneColorResolveCount < m_ngxSceneColorResolves.size()) {
-      m_ngxSceneColorResolves[m_ngxSceneColorResolveCount++] = destImage;
+      m_ngxSceneColorResolves[m_ngxSceneColorResolveCount++] = image;
     }
+  }
+
+  // Stock UE3 D3D9 CopyToResolveTarget draws a surface into its resolve texture.
+  // The draw is two opaque triangles with depth off, sampling only that surface.
+  // Its pixel shader is a plain copy with none of the post-process names.
+  // A copy of an image the uber pass encoded is marked as encoded too.
+  void D3D9Rtx::learnNgxDrawResolve(const DrawContext& drawContext) {
+    const bool learnSceneColor = m_frameOptions.ngxPrePostProcess && m_ngxSceneColorImage != nullptr;
+    if ((!learnSceneColor && m_ngxUberEncodedImageCount == 0) ||
+        drawContext.PrimitiveCount == 0 || drawContext.PrimitiveCount > 4)
+      return;
+
+    if (!ngxDepthTestDisabled() ||
+        d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE ||
+        d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE ||
+        d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return;
+
+    D3D9CommonTexture* target = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (target == nullptr || target->GetImage() == nullptr)
+      return;
+
+    const Rc<DxvkImage>& targetImage = target->GetImage();
+    if ((m_ngxSceneColorImage != nullptr && targetImage.ptr() == m_ngxSceneColorImage.ptr()) ||
+        (m_ngxFrameBackbufferImage != nullptr && targetImage.ptr() == m_ngxFrameBackbufferImage.ptr()))
+      return;
+
+    uint32_t sampledTargets = 0;
+    const DxvkImage* source = nullptr;
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      if (texture == nullptr || texture->GetImage() == nullptr)
+        continue;
+
+      sampledTargets++;
+      source = texture->GetImage().ptr();
+    }
+
+    if (sampledTargets != 1 || source == nullptr || source == targetImage.ptr())
+      return;
+
+    const DxvkImageCreateInfo& sourceInfo = source->info();
+    const DxvkImageCreateInfo& targetInfo = targetImage->info();
+    if (targetInfo.format != sourceInfo.format ||
+        targetInfo.extent.width != sourceInfo.extent.width ||
+        targetInfo.extent.height != sourceInfo.extent.height)
+      return;
+
+    Ue3ShaderFeatureInfo info;
+    if (tryGetBoundPixelFeatures(info) && ngxShaderHasPostProcessNames(info))
+      return;
+
+    if (learnSceneColor && source == m_ngxSceneColorImage.ptr()) {
+      m_ngxResolvesFromDraws = true;
+      rememberNgxSceneColorResolve(targetImage);
+      ONCE(Logger::info("[RTX NGX Passthrough] Scene colour resolve learned from a draw (stock UE3 D3D9 CopyToResolveTarget)."));
+    } else if (ngxImageIsUberEncoded(source)) {
+      rememberNgxUberEncodedImage(targetImage);
+    }
+  }
+
+  bool D3D9Rtx::ngxImageIsUberEncoded(const DxvkImage* image) const {
+    for (uint32_t i = 0; i < m_ngxUberEncodedImageCount; i++) {
+      if (m_ngxUberEncodedImages[i].ptr() == image)
+        return true;
+    }
+    return false;
+  }
+
+  void D3D9Rtx::rememberNgxUberEncodedImage(const Rc<DxvkImage>& image) {
+    if (!ngxImageIsUberEncoded(image.ptr()) && m_ngxUberEncodedImageCount < m_ngxUberEncodedImages.size())
+      m_ngxUberEncodedImages[m_ngxUberEncodedImageCount++] = image;
+  }
+
+  bool D3D9Rtx::readNgxBoundUberGamma(Vector4& gammaColorScaleAndInverse, bool requireBlurredImage) {
+    Ue3ShaderFeatureInfo info;
+    if (!tryGetBoundPixelFeatures(info) || info.toneMapGammaColorScaleReg < 0 ||
+        (requireBlurredImage && !info.hasBlurredImageSampler))
+      return false;
+
+    const auto& constants = d3d9State().psConsts.fConsts;
+    const uint32_t gammaReg = uint32_t(info.toneMapGammaColorScaleReg);
+    if (gammaReg >= std::size(constants))
+      return false;
+
+    gammaColorScaleAndInverse = constants[gammaReg];
+    return true;
+  }
+
+  NgxOutputTransform D3D9Rtx::ngxLinearizingTransform(const Vector4& gammaColorScaleAndInverse) {
+    const Vector4& gamma = gammaColorScaleAndInverse;
+    const bool finiteScale =
+      std::isfinite(gamma.x) && std::isfinite(gamma.y) && std::isfinite(gamma.z) &&
+      gamma.x > 0.05f && gamma.y > 0.05f && gamma.z > 0.05f;
+    const bool encoded = std::isfinite(gamma.w) && gamma.w > 0.05f && gamma.w < 0.95f;
+
+    NgxOutputTransform transform;
+    if (finiteScale && encoded) {
+      transform.colorScale[0] = gamma.x;
+      transform.colorScale[1] = gamma.y;
+      transform.colorScale[2] = gamma.z;
+      transform.inverseGamma = gamma.w;
+      transform.enabled = true;
+      transform.linearizeInput = true;
+    }
+    return transform;
+  }
+
+  // An uber pass that writes an offscreen target leaves it display-encoded with GammaColorScaleAndInverse.
+  void D3D9Rtx::noteNgxUberEncode(const DrawContext& drawContext) {
+    if (drawContext.PrimitiveCount == 0 || drawContext.PrimitiveCount > 4 || !ngxDepthTestDisabled() ||
+        d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return;
+
+    D3D9CommonTexture* target = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (target == nullptr || target->GetImage() == nullptr ||
+        (m_ngxFrameBackbufferImage != nullptr && target->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr()))
+      return;
+
+    Vector4 gamma;
+    if (!readNgxBoundUberGamma(gamma, true) || !ngxLinearizingTransform(gamma).enabled)
+      return;
+
+    for (uint32_t i = 0; i < m_ngxUberEncodedImageCount; i++)
+      m_ngxUberEncodedImages[i] = nullptr;
+    m_ngxUberEncodedImageCount = 0;
+    m_ngxUberGammaColorScaleAndInverse = gamma;
+    rememberNgxUberEncodedImage(target->GetImage());
   }
 
   void D3D9Rtx::NotifyClear(DWORD clearFlags) {
@@ -8890,16 +9049,15 @@ namespace dxvk {
     // foreground DPG following the last clear stays live in the depth buffer through the
     // injection point).
     m_ngxDepthClearsThisFrame++;
+    m_ngxMidSceneClearSeen = true;
+    m_ngxLastMidSceneClearFrame = m_ue3FrameCounter;
 
     if (m_ngxFrameClearCount < kNgxFrameShapeSlots) {
       m_ngxFrameClearDraws[m_ngxFrameClearCount++] = m_drawCallID;
     }
 
-    // A later clear restarts the scene-colour read count.
-    // Depth writes restart with it.
-    // The distortion apply requires writes after this clear.
+    // The injection counts reads from the clear, so a later clear restarts the count.
     m_ngxReadsSinceLastClear = 0;
-    m_ngxDepthWritesAfterLastClear = 0;
 
     if (m_ngxDepthClearsThisFrame > 1)
       return;
@@ -9029,10 +9187,12 @@ namespace dxvk {
         for (const char ch : c.name)
           name.push_back(char(std::tolower(static_cast<unsigned char>(ch))));
 
-        if (name.find("screenpositionscalebias") != std::string::npos) {
+        if (!result.present && name.find("screenpositionscalebias") != std::string::npos) {
           result.present = true;
           result.reg = c.registerIndex;
-          break;
+        } else if (!result.clampPresent && name.find("rendertargetclampparameter") != std::string::npos) {
+          result.clampPresent = true;
+          result.clampReg = c.registerIndex;
         }
       }
     } catch (...) {
@@ -9063,24 +9223,64 @@ namespace dxvk {
       return;
 
     const NgxSpsbCtabReg& patch = stage == DxsoProgramTypes::VertexShader ? m_ngxSpsbPatchVs : m_ngxSpsbPatchPs;
-    if (!patch.present || patch.reg >= floatConstantCount)
-      return;
+    float* constants = reinterpret_cast<float*>(floatConstants);
 
     // UV.x = clip.x * SPSB.x + SPSB.w; UV.y = clip.y * SPSB.y + SPSB.z (UE3 samples with
     // ".xy * SPSB.xy + SPSB.wz").
-    float* constant = reinterpret_cast<float*>(floatConstants) + size_t(patch.reg) * 4;
     if (m_ngxSpsbReplaceFull) {
       // Clip ±1 maps across the whole target.
       // The scale the game uploaded still addresses the subrect the scene was rasterized into.
-      constant[0] = 0.5f;
-      constant[1] = -0.5f;
-      constant[2] = 0.5f;
-      constant[3] = 0.5f;
+      if (patch.present && patch.reg < floatConstantCount) {
+        const Vector4 full = ngxFullBufferScaleBias();
+        float* constant = constants + size_t(patch.reg) * 4;
+        constant[0] = full.x;
+        constant[1] = full.y;
+        constant[2] = full.z;
+        constant[3] = full.w;
+      }
+
+      // UE3 sets the clamp to the view rect in buffer UVs, shifted back by half a pixel.
+      // The view now spans the whole buffer.
+      if (patch.clampPresent && patch.clampReg < floatConstantCount && m_ngxSceneColorImage != nullptr) {
+        const VkExtent3D& extent = m_ngxSceneColorImage->info().extent;
+        if (extent.width != 0 && extent.height != 0) {
+          float* constant = constants + size_t(patch.clampReg) * 4;
+          constant[0] = -0.5f / float(extent.width);
+          constant[1] = -0.5f / float(extent.height);
+          constant[2] = (float(extent.width) - 0.5f) / float(extent.width);
+          constant[3] = (float(extent.height) - 0.5f) / float(extent.height);
+        }
+      }
       return;
     }
 
+    if (!patch.present || patch.reg >= floatConstantCount)
+      return;
+
+    float* constant = constants + size_t(patch.reg) * 4;
     constant[3] += m_ngxSpsbPatchAdd[0];
     constant[2] += m_ngxSpsbPatchAdd[1];
+  }
+
+  int32_t D3D9Rtx::ngxPatchRegisterKey(const NgxSpsbCtabReg& patch, bool replaceFull) {
+    const int32_t scaleBias = patch.present ? int32_t(patch.reg) + 1 : 0;
+    const int32_t clamp = (replaceFull && patch.clampPresent) ? int32_t(patch.clampReg) + 1 : 0;
+    return (scaleBias | (clamp << 16)) - 1;
+  }
+
+  Vector4 D3D9Rtx::ngxFullBufferScaleBias() const {
+    // GPixelCenterOffset is 0.5 in every UE3 D3D9 renderer.
+    constexpr float kPixelCenterOffset = 0.5f;
+
+    Vector4 full(0.5f, -0.5f, 0.5f, 0.5f);
+    if (m_ngxSceneColorImage != nullptr) {
+      const VkExtent3D& extent = m_ngxSceneColorImage->info().extent;
+      if (extent.width != 0 && extent.height != 0) {
+        full.z += kPixelCenterOffset / float(extent.height);
+        full.w += kPixelCenterOffset / float(extent.width);
+      }
+    }
+    return full;
   }
 
   void D3D9Rtx::armNgxFullBufferScreenPositionScaleBias() {
@@ -9089,13 +9289,19 @@ namespace dxvk {
     m_ngxSpsbPatchPs = lookupNgxSpsbCtabReg(d3d9State().pixelShader.ptr() != nullptr
                                               ? d3d9State().pixelShader->GetCommonShader() : nullptr);
     m_ngxSpsbReplaceFull = true;
-    m_ngxSpsbPatchActive = m_ngxSpsbPatchVs.present || m_ngxSpsbPatchPs.present;
+    m_ngxSpsbPatchActive =
+      m_ngxSpsbPatchVs.present || m_ngxSpsbPatchPs.present ||
+      m_ngxSpsbPatchVs.clampPresent || m_ngxSpsbPatchPs.clampPresent;
+
+    if (m_ngxSpsbPatchPs.clampPresent) {
+      ONCE(Logger::info("[RTX NGX Passthrough] Motion blur clamp now covers the upscaled scene colour."));
+    }
 
     // The constant buffer is shared by every shader on the stage.
     // A register patched for one shader is re-uploaded when the next shader patches a different register.
     // It is also re-uploaded when the next shader has no patch.
-    const int32_t vsReg = (m_ngxSpsbPatchActive && m_ngxSpsbPatchVs.present) ? int32_t(m_ngxSpsbPatchVs.reg) : -1;
-    const int32_t psReg = (m_ngxSpsbPatchActive && m_ngxSpsbPatchPs.present) ? int32_t(m_ngxSpsbPatchPs.reg) : -1;
+    const int32_t vsReg = ngxPatchRegisterKey(m_ngxSpsbPatchVs, true);
+    const int32_t psReg = ngxPatchRegisterKey(m_ngxSpsbPatchPs, true);
 
     if (vsReg != m_ngxSpsbLastVsReg) {
       m_parent->m_consts[DxsoProgramTypes::VertexShader].dirty = true;
@@ -9133,26 +9339,40 @@ namespace dxvk {
     if (!m_ngxPrePostUpscaled || viewport == nullptr || m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0)
       return false;
 
-    // Distortion accumulation depth-tests against the scene depth.
-    // That depth exists only in the screen-percentage rect.
-    // A full-target viewport would rasterize the offsets across the whole image.
+    // Depth-tested draws test against the scene depth, which exists only in the screen-percentage rect.
+    // A full-target viewport would rasterize them across the whole image.
     if (!ngxDepthTestDisabled())
       return false;
-
-    const auto withinPixels = [](uint32_t a, uint32_t b) {
-      return a + kNgxViewportMatchPixels >= b && b + kNgxViewportMatchPixels >= a;
-    };
-    const D3DVIEWPORT9& scene = m_ngxSceneViewport;
-    if (!withinPixels(viewport->X, scene.X) || !withinPixels(viewport->Y, scene.Y) ||
-        !withinPixels(viewport->Width, scene.Width) || !withinPixels(viewport->Height, scene.Height)) {
-      return false;
-    }
 
     if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
       return false;
 
     D3D9CommonTexture* renderTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
     if (renderTarget == nullptr || renderTarget->GetImage() == nullptr)
+      return false;
+
+    const auto withinPixels = [](uint32_t a, uint32_t b) {
+      return a + kNgxViewportMatchPixels >= b && b + kNgxViewportMatchPixels >= a;
+    };
+    const D3DVIEWPORT9& scene = m_ngxSceneViewport;
+    const bool sizeMatchesScene =
+      withinPixels(viewport->Width, scene.Width) && withinPixels(viewport->Height, scene.Height);
+    const bool atSceneRect =
+      sizeMatchesScene && withinPixels(viewport->X, scene.X) && withinPixels(viewport->Y, scene.Y);
+
+    // A final pass on the backbuffer draws at the centred view rect from ScaleScreenCoords.
+    bool atCentredRect = false;
+    if (sizeMatchesScene && m_activePresentParams.has_value() && m_ngxFrameBackbufferImage != nullptr &&
+        renderTarget->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr()) {
+      const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+      const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+      atCentredRect =
+        backBufferWidth > scene.Width && backBufferHeight > scene.Height &&
+        withinPixels(viewport->X, (backBufferWidth - scene.Width) / 2) &&
+        withinPixels(viewport->Y, (backBufferHeight - scene.Height) / 2);
+    }
+
+    if (!atSceneRect && !atCentredRect)
       return false;
 
     const VkExtent3D& extent = renderTarget->GetImage()->info().extent;
@@ -9168,19 +9388,15 @@ namespace dxvk {
     return true;
   }
 
-  bool D3D9Rtx::ngxBoundPixelIsDistortionApply() {
-    Ue3ShaderFeatureInfo info;
-    if (!tryGetBoundPixelFeatures(info))
-      return false;
+  // A title that stops clearing depth mid-scene is not held to the clear after this many frames.
+  static constexpr uint32_t kNgxMidSceneClearMemoryFrames = 120;
 
-    return info.hasDistortionSampler && info.hasSceneColorSampler &&
-           !info.hasBlurredImageSampler && !info.hasFilterSampleWeights;
-  }
+  bool D3D9Rtx::ngxPastForegroundClear() const {
+    if (m_ngxDepthClearsThisFrame > 0)
+      return true;
 
-  // Requires the foreground depth clear and depth writes after it.
-  // World distortion is before that clear.
-  bool D3D9Rtx::ngxDistortionApplyFollowsScene() const {
-    return m_ngxDepthClearsThisFrame > 0 && m_ngxDepthWritesAfterLastClear > 0;
+    return !m_ngxMidSceneClearSeen ||
+           m_ue3FrameCounter - m_ngxLastMidSceneClearFrame > kNgxMidSceneClearMemoryFrames;
   }
 
   bool D3D9Rtx::ngxBoundPixelIsUpscaleBoundary() {
@@ -9195,28 +9411,43 @@ namespace dxvk {
            info.hasExposureOrToneSampler;
   }
 
-  Rc<DxvkImage> D3D9Rtx::ngxBoundDistortionAccumulationImage() const {
-    const uint32_t samplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
-    for (const uint32_t i : bit::BitMask(samplerMask)) {
-      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-      if (texture == nullptr || texture->GetImage() == nullptr)
-        continue;
+  void D3D9Rtx::stretchNgxVelocityBuffer() {
+    if (m_ngxVelocityStretchedThisFrame || m_ngxSceneColorImage == nullptr)
+      return;
 
-      if (matchNgxSceneColorSample(texture->GetImage().ptr()) != nullptr)
-        continue;
+    Ue3ShaderFeatureInfo info;
+    if (!tryGetBoundPixelFeatures(info) || info.velocitySamplerIndex >= caps::MaxTexturesPS)
+      return;
 
-      return texture->GetImage();
+    D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[info.velocitySamplerIndex]);
+    if (texture == nullptr || texture->GetImage() == nullptr)
+      return;
+
+    m_ngxVelocityStretchedThisFrame = true;
+
+    // The velocity pass renders into the same subrect as the scene, so only a scene-sized buffer can be scaled.
+    const Rc<DxvkImage>& image = texture->GetImage();
+    const VkExtent3D& extent = image->info().extent;
+    const VkExtent3D& sceneExtent = m_ngxSceneColorImage->info().extent;
+    if (extent.width != sceneExtent.width || extent.height != sceneExtent.height) {
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] The ", extent.width, "x", extent.height,
+        " velocity buffer is not scene-sized. Motion blur reads it as rendered.")));
+      return;
     }
 
-    return nullptr;
+    if (stretchNgxSubrectToFull(image)) {
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] Motion blur velocity scaled from ", m_ngxSceneViewport.Width, "x",
+        m_ngxSceneViewport.Height, " onto ", extent.width, "x", extent.height, ".")));
+    }
   }
 
-  bool D3D9Rtx::stretchNgxDistortionField() {
-    const Rc<DxvkImage> accumulation = ngxBoundDistortionAccumulationImage();
-    if (accumulation == nullptr || m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0)
+  bool D3D9Rtx::stretchNgxSubrectToFull(const Rc<DxvkImage>& image) {
+    if (image == nullptr || m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0)
       return false;
 
-    const VkExtent3D& fullExtent = accumulation->info().extent;
+    const VkExtent3D& fullExtent = image->info().extent;
     if (fullExtent.width == 0 || fullExtent.height == 0)
       return false;
 
@@ -9228,16 +9459,16 @@ namespace dxvk {
     if (subWidth + 1 >= fullExtent.width && subHeight + 1 >= fullExtent.height)
       return true;
 
-    const DxvkImageCreateInfo& sourceInfo = accumulation->info();
+    const DxvkImageCreateInfo& sourceInfo = image->info();
     const VkImageUsageFlags transferUsage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if ((sourceInfo.usage & transferUsage) != transferUsage)
       return false;
 
-    if (m_ngxDistortionFieldCopy == nullptr ||
-        m_ngxDistortionFieldCopy->info().format != sourceInfo.format ||
-        m_ngxDistortionFieldCopy->info().extent.width != subWidth ||
-        m_ngxDistortionFieldCopy->info().extent.height != subHeight) {
+    if (m_ngxSubrectStretchCopy == nullptr ||
+        m_ngxSubrectStretchCopy->info().format != sourceInfo.format ||
+        m_ngxSubrectStretchCopy->info().extent.width != subWidth ||
+        m_ngxSubrectStretchCopy->info().extent.height != subHeight) {
       DxvkImageCreateInfo imageInfo;
       imageInfo.type = VK_IMAGE_TYPE_2D;
       imageInfo.format = sourceInfo.format;
@@ -9252,12 +9483,12 @@ namespace dxvk {
       imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
       imageInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
 
-      m_ngxDistortionFieldCopy = m_parent->GetDXVKDevice()->createImage(
+      m_ngxSubrectStretchCopy = m_parent->GetDXVKDevice()->createImage(
         imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        DxvkMemoryStats::Category::RTXRenderTarget, "NGX distortion field");
+        DxvkMemoryStats::Category::RTXRenderTarget, "NGX subrect stretch");
     }
 
-    const Rc<DxvkImage> fieldCopy = m_ngxDistortionFieldCopy;
+    const Rc<DxvkImage> subrectCopy = m_ngxSubrectStretchCopy;
     const VkOffset3D subOffset = {
       int32_t(m_ngxSceneViewport.X), int32_t(m_ngxSceneViewport.Y), 0
     };
@@ -9267,18 +9498,18 @@ namespace dxvk {
       return false;
 
     m_parent->EmitCs([
-      cAccumulation = accumulation,
-      cFieldCopy = fieldCopy,
+      cImage = image,
+      cSubrectCopy = subrectCopy,
       cSubOffset = subOffset,
       cSubExtent = subExtent,
       cFullExtent = fullExtent,
       cAspect = formatInfo->aspectMask
     ](DxvkContext* ctx) {
-      ctx->changeImageLayout(cFieldCopy, VK_IMAGE_LAYOUT_GENERAL);
+      ctx->changeImageLayout(cSubrectCopy, VK_IMAGE_LAYOUT_GENERAL);
 
       const VkImageSubresourceLayers layers = { cAspect, 0, 0, 1 };
-      ctx->copyImage(cFieldCopy, layers, VkOffset3D { 0, 0, 0 },
-                     cAccumulation, layers, cSubOffset, cSubExtent);
+      ctx->copyImage(cSubrectCopy, layers, VkOffset3D { 0, 0, 0 },
+                     cImage, layers, cSubOffset, cSubExtent);
 
       VkImageBlit blitInfo = {};
       blitInfo.srcSubresource = layers;
@@ -9292,12 +9523,9 @@ namespace dxvk {
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY
       };
-      ctx->blitImage(cAccumulation, identity, cFieldCopy, identity, blitInfo, VK_FILTER_LINEAR);
+      ctx->blitImage(cImage, identity, cSubrectCopy, identity, blitInfo, VK_FILTER_LINEAR);
     });
 
-    ONCE(Logger::info(str::format(
-      "[RTX NGX Passthrough] Distortion offsets scaled from ",
-      subWidth, "x", subHeight, " onto ", fullExtent.width, "x", fullExtent.height, ".")));
     return true;
   }
 
@@ -9365,9 +9593,28 @@ namespace dxvk {
 
   }
 
+  bool D3D9Rtx::ngxBoundDeclIsFilterVertex() const {
+    if (d3d9State().vertexDecl == nullptr)
+      return false;
+
+    bool positionAtStart = false;
+    bool uvAfterPosition = false;
+    for (const D3DVERTEXELEMENT9& element : d3d9State().vertexDecl->GetElements()) {
+      if (element.Stream != 0 || element.UsageIndex != 0)
+        continue;
+
+      if (element.Usage == D3DDECLUSAGE_POSITION)
+        positionAtStart = element.Offset == 0 && element.Type == D3DDECLTYPE_FLOAT4;
+      else if (element.Usage == D3DDECLUSAGE_TEXCOORD)
+        uvAfterPosition = element.Offset == 16 && element.Type == D3DDECLTYPE_FLOAT2;
+    }
+    return positionAtStart && uvAfterPosition;
+  }
+
   void D3D9Rtx::RetargetNgxUpscaledPostQuad(void* vertices, uint32_t vertexCount, uint32_t stride) {
     if (!m_ngxPrePostUpscaled || vertices == nullptr || vertexCount != 4 || stride < 24 ||
-        m_ngxSceneColorImage == nullptr || m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0) {
+        m_ngxSceneColorImage == nullptr || m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0 ||
+        !ngxBoundDeclIsFilterVertex()) {
       return;
     }
 
@@ -9388,6 +9635,36 @@ namespace dxvk {
     const float clipRight = -1.0f + 2.0f * u1;
     const float clipTop = 1.0f - 2.0f * v0;
     const float clipBottom = 1.0f - 2.0f * v1;
+
+    bool targetsBackbuffer = false;
+    uint32_t targetWidth = 0;
+    uint32_t targetHeight = 0;
+    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      D3D9CommonTexture* renderTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+      if (renderTarget != nullptr && renderTarget->GetImage() != nullptr) {
+        targetWidth = renderTarget->GetImage()->info().extent.width;
+        targetHeight = renderTarget->GetImage()->info().extent.height;
+        targetsBackbuffer = m_ngxFrameBackbufferImage != nullptr &&
+                            renderTarget->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr();
+      }
+    }
+
+    // ScaleScreenCoords centres the same view on the backbuffer.
+    bool centredKnown = false;
+    float centredLeft = 0.0f, centredRight = 0.0f, centredTop = 0.0f, centredBottom = 0.0f;
+    if (targetsBackbuffer && m_activePresentParams.has_value()) {
+      const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
+      const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
+      if (backBufferWidth > m_ngxSceneViewport.Width && backBufferHeight > m_ngxSceneViewport.Height) {
+        const uint32_t centredX = (backBufferWidth - m_ngxSceneViewport.Width) / 2;
+        const uint32_t centredY = (backBufferHeight - m_ngxSceneViewport.Height) / 2;
+        centredLeft = -1.0f + 2.0f * float(centredX) / float(backBufferWidth);
+        centredRight = -1.0f + 2.0f * float(centredX + m_ngxSceneViewport.Width) / float(backBufferWidth);
+        centredTop = 1.0f - 2.0f * float(centredY) / float(backBufferHeight);
+        centredBottom = 1.0f - 2.0f * float(centredY + m_ngxSceneViewport.Height) / float(backBufferHeight);
+        centredKnown = true;
+      }
+    }
 
     Vertex* quad[4];
     float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
@@ -9424,12 +9701,35 @@ namespace dxvk {
       close(minY, std::min(clipTop, clipBottom)) && close(maxY, std::max(clipTop, clipBottom));
     const bool posFullscreen = close(minX, -1.0f) && close(maxX, 1.0f) && close(minY, -1.0f) && close(maxY, 1.0f);
     const bool uvMatchesSubrect = close(minU, u0) && close(maxU, u1) && close(minV, v0) && close(maxV, v1);
+    const bool posMatchesCentred =
+      centredKnown && close(minX, centredLeft) && close(maxX, centredRight) &&
+      close(minY, centredBottom) && close(maxY, centredTop);
 
     const auto remap = [](float value, float lo, float hi, float newLo, float newHi) {
       const float span = hi - lo;
       if (std::abs(span) < 1e-5f)
         return value;
       return newLo + (value - lo) / span * (newHi - newLo);
+    };
+
+    // Expands the quad from the given clip rect onto the whole target.
+    // Each edge keeps its sub-pixel offset from that rect, which UE3 sets to half a pixel on D3D9.
+    // An offset beyond a pixel means the rect was misjudged, and the D3D9 half pixel is used instead.
+    const auto expandPositions = [&](float rectMinX, float rectMaxX, float rectMinY, float rectMaxY) {
+      const float pixelX = targetWidth != 0 ? 2.0f / float(targetWidth) : 0.0f;
+      const float pixelY = targetHeight != 0 ? 2.0f / float(targetHeight) : 0.0f;
+      const auto edgeOffset = [](float offset, float pixel, float halfPixel) {
+        return std::abs(offset) <= pixel ? offset : halfPixel;
+      };
+
+      const float newMinX = -1.0f + edgeOffset(minX - rectMinX, pixelX, -0.5f * pixelX);
+      const float newMaxX = 1.0f + edgeOffset(maxX - rectMaxX, pixelX, -0.5f * pixelX);
+      const float newMinY = -1.0f + edgeOffset(minY - rectMinY, pixelY, 0.5f * pixelY);
+      const float newMaxY = 1.0f + edgeOffset(maxY - rectMaxY, pixelY, 0.5f * pixelY);
+      for (Vertex* vertex : quad) {
+        vertex->x = remap(vertex->x, minX, maxX, newMinX, newMaxX);
+        vertex->y = remap(vertex->y, minY, maxY, newMinY, newMaxY);
+      }
     };
 
     // SampleOffsets are added to InUV.xyyx.
@@ -9458,12 +9758,15 @@ namespace dxvk {
       m_parent->m_consts[DxsoProgramTypes::VertexShader].dirty = true;
     };
 
+    // The gather reads scene colour through the quad UVs.
+    // After the upscale those UVs cover the full image.
     const auto openGatherSceneUvs = [&]() {
       if (!uvMatchesSubrect) {
         ONCE(Logger::info(str::format(
           "[RTX NGX Passthrough] DOF/bloom gather UVs were not the scene subrect (uv ",
           minU, "..", maxU, ", ", minV, "..", maxV,
           ", scene ", u0, "..", u1, ", ", v0, "..", v1, ").")));
+        noteNgxReducedRectDraw("A DOF/bloom gather read outside the scene subrect");
         return;
       }
 
@@ -9481,45 +9784,6 @@ namespace dxvk {
       scaleGatherSampleOffsets(std::min(1.0f / spanU, 8.0f), std::min(1.0f / spanV, 8.0f));
     };
 
-    // The bloom gather reads scene colour through this quad.
-    // Those UVs cover the full image after the upscale.
-    // Filter-buffer positions stay where the gather writes.
-    if (m_ngxRetargetSceneColorUvs) {
-      m_ngxRetargetSceneColorUvs = false;
-      openGatherSceneUvs();
-      return;
-    }
-
-    // The apply reads the offset field and scene colour through one coordinate.
-    // After the upscale, the offsets still occupy the screen-percentage rect.
-    // Scaling that rect onto the full target lets one coordinate read both.
-    if (ngxBoundPixelIsDistortionApply()) {
-      if (!stretchNgxDistortionField())
-        return;
-
-      // Stencil marks exist only inside the screen-percentage rect.
-      // The test rejects every sample outside that rect.
-      Direct3DState9* state = m_parent->GetRawState();
-      state->renderStates[D3DRS_STENCILENABLE] = FALSE;
-      state->renderStates[D3DRS_SCISSORTESTENABLE] = FALSE;
-      m_parent->m_flags.set(D3D9DeviceFlag::DirtyDepthStencilState);
-      m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
-
-      D3DVIEWPORT9& viewport = state->viewport;
-      viewport.X = 0;
-      viewport.Y = 0;
-      viewport.Width = m_ngxSceneColorImage->info().extent.width;
-      viewport.Height = m_ngxSceneColorImage->info().extent.height;
-
-      for (Vertex* vertex : quad) {
-        vertex->u = remap(vertex->u, minU, maxU, 0.0f, 1.0f);
-        vertex->v = remap(vertex->v, minV, maxV, 0.0f, 1.0f);
-        vertex->x = remap(vertex->x, minX, maxX, -1.0f, 1.0f);
-        vertex->y = remap(vertex->y, minY, maxY, -1.0f, 1.0f);
-      }
-      return;
-    }
-
     // Filter-buffer positions stay on the texels the gather wrote.
     // Only the gather's scene UVs open onto the upscaled image.
     if (ngxBoundImageIsDofFilterBuffer() || ngxBoundPixelIsDofGather()) {
@@ -9528,34 +9792,26 @@ namespace dxvk {
       return;
     }
 
-    // Downsample targets are not the presentation quad.
-    // Expanding their positions smears the blur across the buffer.
-    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
-      D3D9CommonTexture* renderTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
-      if (renderTarget != nullptr && renderTarget->GetImage() != nullptr) {
-        const VkExtent3D& targetExtent = renderTarget->GetImage()->info().extent;
-        if (targetExtent.width + 1 < extent.width && targetExtent.height + 1 < extent.height)
-          return;
-      }
-    }
-
     const bool dofBlend = ngxBoundPixelIsDofBlend();
     Ue3ShaderFeatureInfo blendInfo;
     const bool uberBlend = dofBlend && tryGetBoundPixelFeatures(blendInfo) && blendInfo.hasToneMapConstants;
 
     // The scene viewport is the top-left of scene colour.
-    // ScaleScreenCoords centres that view on the backbuffer.
-    // The centred quad is opened on its own.
+    // When NeedsUpscale() reads false, the final composite draws the same view at the centred backbuffer rect.
+    // An uber blend that is reduced on both axes is taken as that composite even off-centre.
     const float spanX = maxX - minX;
     const float spanY = maxY - minY;
     const bool reducedOnBothAxes = spanX < 1.85f && spanY < 1.85f;
-    const bool centredUberQuad = uberBlend && reducedOnBothAxes && !posFullscreen && !posMatchesSubrect;
+    const bool centredComposite = !posFullscreen && !posMatchesSubrect &&
+      (posMatchesCentred || (uberBlend && reducedOnBothAxes));
 
-    if (posMatchesSubrect || centredUberQuad) {
-      for (Vertex* vertex : quad) {
-        vertex->x = remap(vertex->x, minX, maxX, -1.0f, 1.0f);
-        vertex->y = remap(vertex->y, minY, maxY, -1.0f, 1.0f);
-      }
+    if (posMatchesSubrect) {
+      expandPositions(std::min(clipLeft, clipRight), std::max(clipLeft, clipRight),
+                      std::min(clipTop, clipBottom), std::max(clipTop, clipBottom));
+    } else if (posMatchesCentred) {
+      expandPositions(centredLeft, centredRight, centredBottom, centredTop);
+    } else if (centredComposite) {
+      expandPositions(minX, maxX, minY, maxY);
     }
 
     // The blend UV addresses the gathered filter texels.
@@ -9563,7 +9819,7 @@ namespace dxvk {
     // Stretching them reads the rest of the filter buffer, which the gather leaves empty.
     // Scene colour comes from the clip position.
     // Growing the quad is enough.
-    if (!dofBlend && uvMatchesSubrect && (posMatchesSubrect || posFullscreen)) {
+    if (!dofBlend && uvMatchesSubrect && (posMatchesSubrect || posFullscreen || centredComposite)) {
       for (Vertex* vertex : quad) {
         vertex->u = remap(vertex->u, minU, maxU, 0.0f, 1.0f);
         vertex->v = remap(vertex->v, minV, maxV, 0.0f, 1.0f);
@@ -9575,8 +9831,8 @@ namespace dxvk {
     // The uber blend derives scene UVs from clip position.
     // Its scale bias has to match a full-screen quad.
     const bool coverTarget =
-      (!dofBlend && (posMatchesSubrect || (posFullscreen && uvMatchesSubrect))) ||
-      (uberBlend && (posMatchesSubrect || posFullscreen || centredUberQuad));
+      (!dofBlend && (posMatchesSubrect || centredComposite || (posFullscreen && uvMatchesSubrect))) ||
+      (uberBlend && (posMatchesSubrect || posFullscreen || centredComposite));
     if (coverTarget && uberBlend &&
         m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr) {
       const D3D9CommonShader* vertexShader = d3d9State().vertexShader->GetCommonShader();
@@ -9584,7 +9840,7 @@ namespace dxvk {
 
       if (sceneUvReg < caps::MaxFloatConstantsVS) {
         Direct3DState9* state = m_parent->GetRawState();
-        state->vsConsts.fConsts[sceneUvReg] = Vector4(0.5f, -0.5f, 0.5f, 0.5f);
+        state->vsConsts.fConsts[sceneUvReg] = ngxFullBufferScaleBias();
         m_parent->m_consts[DxsoProgramTypes::VertexShader].dirty = true;
         ONCE(Logger::info("[RTX NGX Passthrough] Uber post scene UVs now cover the upscaled scene color."));
       }
@@ -9608,12 +9864,13 @@ namespace dxvk {
       }
     }
 
-    if (dofBlend && !uberBlend && !posMatchesSubrect && !posFullscreen) {
+    if (dofBlend && !uberBlend && !posMatchesSubrect && !posFullscreen && !centredComposite) {
       ONCE(Logger::info(str::format(
         "[RTX NGX Passthrough] DOF/bloom blend quad stayed on a reduced rect after the upscale (clip ",
         minX, "..", maxX, ", ", minY, "..", maxY,
         ", scene ", std::min(clipLeft, clipRight), "..", std::max(clipLeft, clipRight),
         ", ", std::min(clipTop, clipBottom), "..", std::max(clipTop, clipBottom), ").")));
+      noteNgxReducedRectDraw("A DOF/bloom blend quad stayed on a reduced rect");
     }
   }
 
@@ -9663,6 +9920,16 @@ namespace dxvk {
     }
 
     return false;
+  }
+
+  bool D3D9Rtx::ngxDrawFollowsSceneComposite(const DrawContext& drawContext) const {
+    if (!m_ngxHudlessSceneCompositeSeen || m_ngxFrameBackbufferImage == nullptr ||
+        d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return false;
+
+    D3D9CommonTexture* target = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    return target != nullptr && target->GetImage().ptr() == m_ngxFrameBackbufferImage.ptr() &&
+           !ngxDrawIsBackbufferSceneComposite(drawContext);
   }
 
   // Logs a site change immediately.
@@ -9813,8 +10080,203 @@ namespace dxvk {
       return false;
 
     const int debugVis = m_frameOptions.ngxDebugVisualization;
-    return debugVis == 0 ||
-           debugVis == int(dxvk::RtxNgxPassthrough::DebugVisualization::SceneColor);
+    if (debugVis != 0 && debugVis != int(dxvk::RtxNgxPassthrough::DebugVisualization::SceneColor))
+      return false;
+
+    if (m_ngxSubrectPrePostSuspended && m_ngxSceneColorImage != nullptr) {
+      const VkExtent3D& extent = m_ngxSceneColorImage->info().extent;
+      if (ngxSceneViewportIsSubrect(m_ngxSceneViewport, extent.width, extent.height))
+        return false;
+    }
+
+    return true;
+  }
+
+  bool D3D9Rtx::ngxEarlyInjectionSuspended() const {
+    return m_ue3FrameCounter < m_ngxEarlyInjectionSuspendedUntil;
+  }
+
+  std::string D3D9Rtx::describeNgxDraw(const DrawContext& drawContext) const {
+    uint32_t targetWidth = 0;
+    uint32_t targetHeight = 0;
+    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      D3D9CommonTexture* target = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+      if (target != nullptr && target->GetImage() != nullptr) {
+        targetWidth = target->GetImage()->info().extent.width;
+        targetHeight = target->GetImage()->info().extent.height;
+      }
+    }
+
+    const D3D9CommonShader* vertexShader = m_parent->UseProgrammableVS() && d3d9State().vertexShader.ptr() != nullptr
+      ? d3d9State().vertexShader->GetCommonShader() : nullptr;
+    const D3D9CommonShader* pixelShader = m_parent->UseProgrammablePS() && d3d9State().pixelShader.ptr() != nullptr
+      ? d3d9State().pixelShader->GetCommonShader() : nullptr;
+
+    const D3DVIEWPORT9& viewport = d3d9State().viewport;
+    return str::format(
+      "draw ", m_drawCallID, ", target ", targetWidth, "x", targetHeight,
+      ", viewport ", viewport.Width, "x", viewport.Height, " at (", viewport.X, ", ", viewport.Y, "), ",
+      drawContext.PrimitiveCount, " primitives, vs 0x", std::hex,
+      (vertexShader != nullptr ? vertexShader->GetBytecodeHash() : 0),
+      ", ps 0x", (pixelShader != nullptr ? pixelShader->GetBytecodeHash() : 0), std::dec);
+  }
+
+  void D3D9Rtx::checkNgxPostInjectionDraw(const DrawContext& drawContext) {
+    if (m_ngxSceneColorImage == nullptr || d3d9State().renderTargets[kRenderTargetIndex] == nullptr)
+      return;
+
+    D3D9CommonTexture* target = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+    if (target == nullptr || target->GetImage() == nullptr)
+      return;
+
+    // A depth-tested mesh drawn into scene colour is scene geometry.
+    if (!m_ngxSceneDrawAfterInjection && !m_ngxBackbufferDrawSeenThisFrame &&
+        drawContext.PrimitiveCount > 4 && !ngxDepthTestDisabled() &&
+        target->GetImage().ptr() == m_ngxSceneColorImage.ptr() &&
+        d3d9State().depthStencil != nullptr && m_ngxSceneDepthImage != nullptr) {
+      D3D9CommonTexture* depth = d3d9State().depthStencil->GetCommonTexture();
+      if (depth != nullptr && depth->GetImage().ptr() == m_ngxSceneDepthImage.ptr()) {
+        m_ngxSceneDrawAfterInjection = true;
+        m_ngxSceneDrawEvidence = describeNgxDraw(drawContext);
+      }
+    }
+
+    // A depth-off pass through a scene-sized viewport covers only the reduced rect unless that viewport expands.
+    if (m_ngxPrePostUpscaled && !m_ngxReducedRectDrawThisFrame && ngxDepthTestDisabled()) {
+      D3DVIEWPORT9 viewport = d3d9State().viewport;
+      const VkExtent3D& extent = target->GetImage()->info().extent;
+      const auto withinPixels = [](uint32_t a, uint32_t b) {
+        return a + kNgxViewportMatchPixels >= b && b + kNgxViewportMatchPixels >= a;
+      };
+      const bool sceneSized =
+        withinPixels(viewport.Width, m_ngxSceneViewport.Width) &&
+        withinPixels(viewport.Height, m_ngxSceneViewport.Height);
+      if (sceneSized && extent.width > viewport.Width + 1 && extent.height > viewport.Height + 1 &&
+          !GetNgxPassthroughExpandedViewport(&viewport)) {
+        m_ngxReducedRectDrawThisFrame = true;
+        m_ngxReducedRectEvidence = describeNgxDraw(drawContext);
+      }
+    }
+  }
+
+  void D3D9Rtx::noteNgxReducedRectDraw(const char* reason) {
+    if (m_ngxReducedRectDrawThisFrame)
+      return;
+
+    m_ngxReducedRectDrawThisFrame = true;
+    m_ngxReducedRectEvidence = str::format(reason, " at draw ", m_drawCallID);
+  }
+
+  void D3D9Rtx::logNgxUe3Profile() {
+    if (!m_frameOptions.ngxPassthroughMode || m_ngxProfileLogsRemaining == 0)
+      return;
+
+    const char* resolves = m_ngxResolvesFromStretchRect
+      ? (m_ngxResolvesFromDraws ? "StretchRect and draw" : "StretchRect")
+      : (m_ngxResolvesFromDraws ? "draw" : "none");
+
+    const char* prePost = "late";
+    switch (m_ngxFrameInjectionSite) {
+    case NgxInjectionSite::Haze: prePost = "haze"; break;
+    case NgxInjectionSite::Gather: prePost = "gather"; break;
+    case NgxInjectionSite::AimedRead: prePost = "aimed read"; break;
+    case NgxInjectionSite::FinalComposite: prePost = "final composite"; break;
+    case NgxInjectionSite::Stretch: prePost = "stretch"; break;
+    default: break;
+    }
+
+    bool sceneIsSubrect = false;
+    if (m_ngxSceneViewportValid && m_activePresentParams.has_value()) {
+      sceneIsSubrect = ngxSceneViewportIsSubrect(m_ngxSceneViewport,
+                                                 m_activePresentParams->BackBufferWidth,
+                                                 m_activePresentParams->BackBufferHeight);
+    }
+    const char* subFull = !sceneIsSubrect ? "off" : (m_ngxFrameUpscaledInPlace ? "in-place" : "late");
+
+    const char* owner = !m_ngxGameSettingsRedirectsValid ? "unknown"
+                      : (m_ngxRuntimeOwnedUpscale ? "runtime" : "engine");
+
+    const bool earlySuspended = ngxEarlyInjectionSuspended();
+    const char* suspended = earlySuspended
+      ? (m_ngxSubrectPrePostSuspended ? "early and sub-full" : "early")
+      : (m_ngxSubrectPrePostSuspended ? "sub-full" : "none");
+
+    std::string profile = str::format(
+      "resolves=", resolves, ", pre-post=", prePost, ", sub-full=", subFull,
+      ", owner=", owner, ", suspended=", suspended);
+
+    if (profile == m_ngxPendingProfile) {
+      m_ngxPendingProfileFrames++;
+    } else {
+      m_ngxPendingProfile = std::move(profile);
+      m_ngxPendingProfileFrames = 1;
+    }
+
+    if (m_ngxPendingProfileFrames == 2 && m_ngxPendingProfile != m_ngxLoggedProfile) {
+      m_ngxProfileLogsRemaining--;
+      m_ngxLoggedProfile = m_ngxPendingProfile;
+      Logger::info(str::format("[RTX NGX Passthrough] UE3 profile: ", m_ngxLoggedProfile, ".",
+                               m_ngxProfileLogsRemaining == 0 ? " Later profile changes are not logged." : ""));
+    }
+  }
+
+  void D3D9Rtx::updateNgxInjectionFallbacks() {
+    // A fallback needs two frames in a row, so one odd frame cannot move the injection.
+    constexpr uint32_t kNgxFallbackStrikeFrames = 2;
+
+    // Each repeat doubles the early suspension, up to 16 times the base length.
+    // A title that always trips it settles on the later points.
+    constexpr uint32_t kNgxEarlySuspensionFrames = 600;
+    constexpr uint32_t kNgxEarlySuspensionMaxDoublings = 4;
+
+    const bool earlySite =
+      m_ngxFrameInjectionSite == NgxInjectionSite::Haze ||
+      m_ngxFrameInjectionSite == NgxInjectionSite::Gather ||
+      m_ngxFrameInjectionSite == NgxInjectionSite::AimedRead;
+
+    if (earlySite) {
+      m_ngxSceneAfterInjectionStrikes = m_ngxSceneDrawAfterInjection ? m_ngxSceneAfterInjectionStrikes + 1 : 0;
+      if (m_ngxSceneAfterInjectionStrikes >= kNgxFallbackStrikeFrames) {
+        m_ngxSceneAfterInjectionStrikes = 0;
+        const uint32_t suspensionFrames = kNgxEarlySuspensionFrames
+          << std::min(m_ngxEarlyInjectionSuspensions, kNgxEarlySuspensionMaxDoublings);
+        m_ngxEarlyInjectionSuspensions++;
+        m_ngxEarlyInjectionSuspendedUntil = m_ue3FrameCounter + suspensionFrames;
+        Logger::warn(str::format(
+          "[RTX NGX Passthrough] Scene geometry followed the pre-post injection on consecutive frames (",
+          m_ngxSceneDrawEvidence, "). The haze, gather and aimed-read points are suspended for ",
+          suspensionFrames, " frames."));
+      }
+    }
+
+    if (m_ngxFrameUpscaledInPlace) {
+      m_ngxReducedRectStrikes = m_ngxReducedRectDrawThisFrame ? m_ngxReducedRectStrikes + 1 : 0;
+      if (m_ngxReducedRectStrikes >= kNgxFallbackStrikeFrames && !m_ngxSubrectPrePostSuspended) {
+        m_ngxReducedRectStrikes = 0;
+        m_ngxSubrectPrePostSuspended = true;
+        m_ngxSuspendedScreenPercentage = m_ngxGameScreenPercentage;
+        m_ngxSuspendedSceneExtent = m_ngxSceneColorImage != nullptr
+          ? m_ngxSceneColorImage->info().extent : VkExtent3D { 0, 0, 0 };
+        Logger::warn(str::format(
+          "[RTX NGX Passthrough] A post pass kept the reduced view rect after the upscale on consecutive frames (",
+          m_ngxReducedRectEvidence, "). Sub-full pre-post injection is suspended. DLSS upscales at the late point."));
+      }
+    }
+
+    if (m_ngxSubrectPrePostSuspended) {
+      const VkExtent3D sceneExtent = m_ngxSceneColorImage != nullptr
+        ? m_ngxSceneColorImage->info().extent : VkExtent3D { 0, 0, 0 };
+      if (m_ngxGameScreenPercentage != m_ngxSuspendedScreenPercentage ||
+          sceneExtent.width != m_ngxSuspendedSceneExtent.width ||
+          sceneExtent.height != m_ngxSuspendedSceneExtent.height) {
+        m_ngxSubrectPrePostSuspended = false;
+        Logger::info("[RTX NGX Passthrough] Sub-full pre-post injection resumes. ScreenPercentage or the scene extent changed.");
+      }
+    }
+
+    m_ngxSceneDrawAfterInjection = false;
+    m_ngxReducedRectDrawThisFrame = false;
+    m_ngxFrameUpscaledInPlace = false;
   }
 
   Rc<DxvkImage> D3D9Rtx::matchNgxSceneColorSample(const DxvkImage* sampledImage) const {
@@ -9830,6 +10292,56 @@ namespace dxvk {
     }
 
     return nullptr;
+  }
+
+  Rc<DxvkImage> D3D9Rtx::findNgxSceneColorSource() const {
+    const DxvkImage* renderTargetImage = nullptr;
+    if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
+      D3D9CommonTexture* renderTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
+      if (renderTarget != nullptr)
+        renderTargetImage = renderTarget->GetImage().ptr();
+    }
+
+    Rc<DxvkImage> best;
+    bool bestIsFloat = false;
+    uint64_t bestArea = 0;
+
+    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
+    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
+      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
+      if (texture == nullptr || texture->GetImage() == nullptr)
+        continue;
+
+      const Rc<DxvkImage>& image = texture->GetImage();
+      const Rc<DxvkImage> known = matchNgxSceneColorSample(image.ptr());
+      if (known != nullptr)
+        return known;
+
+      if (image.ptr() == renderTargetImage ||
+          (m_ngxFrameBackbufferImage != nullptr && image.ptr() == m_ngxFrameBackbufferImage.ptr()) ||
+          m_ngxSceneViewport.Width == 0 || m_ngxSceneViewport.Height == 0)
+        continue;
+
+      const VkExtent3D& extent = image->info().extent;
+      if (extent.width < m_ngxSceneViewport.X + m_ngxSceneViewport.Width ||
+          extent.height < m_ngxSceneViewport.Y + m_ngxSceneViewport.Height)
+        continue;
+
+      const bool isFloat = RtxNgxPassthrough::isHdrColorFormat(image->info().format);
+      const uint64_t area = uint64_t(extent.width) * extent.height;
+      if (best == nullptr || (isFloat && !bestIsFloat) || (isFloat == bestIsFloat && area > bestArea)) {
+        best = image;
+        bestIsFloat = isFloat;
+        bestArea = area;
+      }
+    }
+
+    if (best != nullptr) {
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] Scene colour is read through a ", best->info().extent.width, "x",
+        best->info().extent.height, " image that was never learned as a resolve. It is used as the scene-colour source.")));
+    }
+    return best;
   }
 
   void D3D9Rtx::recordNgxPrePostSceneColorRead() {
@@ -9925,6 +10437,28 @@ namespace dxvk {
            psInfo.looksLikeDofAndBloomPostProcess();
   }
 
+  bool D3D9Rtx::ngxShaderHasPostProcessNames(const Ue3ShaderFeatureInfo& psInfo) {
+    return psInfo.hasToneMapConstants ||
+           psInfo.hasGammaConstants ||
+           psInfo.hasExposureOrToneSampler ||
+           psInfo.hasBlurredImageSampler ||
+           psInfo.hasFilterTextureSampler ||
+           psInfo.hasFilterSampleWeights ||
+           psInfo.hasDofPackedParameters ||
+           psInfo.hasDofMinMaxBlurClamp ||
+           psInfo.hasBloomScale ||
+           psInfo.hasHazeConstants ||
+           psInfo.hasDistortionSampler ||
+           psInfo.hasFogConstants ||
+           psInfo.hasVelocitySampler ||
+           psInfo.hasMotionBlurConstants ||
+           psInfo.hasSceneDepthSampler ||
+           psInfo.hasLightAttenuationSampler ||
+           psInfo.hasShadowSampler ||
+           psInfo.hasUiSampler ||
+           psInfo.hasUiCompositeConstants;
+  }
+
   void D3D9Rtx::refreshNgxUe3VertexFactory() {
     m_currentUe3VertexFactory = Ue3VertexFactoryType::Unknown;
     if (!m_frameOptions.ue3EngineMode || d3d9State().vertexDecl == nullptr)
@@ -9964,11 +10498,16 @@ namespace dxvk {
     if (filter.width < 8 || filter.height < 8 || scene.width < 16 || scene.height < 16)
       return false;
 
-    const auto quarter = [](uint32_t filterDim, uint32_t sceneDim) {
-      const uint32_t scaled = filterDim * 4u;
-      return scaled >= sceneDim && scaled <= sceneDim + 24u && filterDim * 2u < sceneDim;
-    };
-    return quarter(filter.width, scene.width) && quarter(filter.height, scene.height);
+    // The two-pixel border keeps same-ratio downsample targets without one out of this match.
+    for (const uint32_t factor : { 2u, 4u, 8u }) {
+      const auto matches = [factor](uint32_t filterDim, uint32_t sceneDim) {
+        const uint32_t base = sceneDim / factor;
+        return filterDim >= base + 1u && filterDim <= base + 3u;
+      };
+      if (matches(filter.width, scene.width) && matches(filter.height, scene.height))
+        return true;
+    }
+    return false;
   }
 
   bool D3D9Rtx::ngxBoundImageIsDofFilterBuffer() const {
@@ -9980,18 +10519,6 @@ namespace dxvk {
       return false;
 
     return ngxImageIsDofFilterBuffer(renderTarget->GetImage().ptr());
-  }
-
-  bool D3D9Rtx::ngxDrawSamplesSceneColor() const {
-    const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
-    for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
-      D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-      if (texture != nullptr && texture->GetImage() != nullptr &&
-          matchNgxSceneColorSample(texture->GetImage().ptr()) != nullptr) {
-        return true;
-      }
-    }
-    return false;
   }
 
   bool D3D9Rtx::tryGetBoundPixelFeatures(Ue3ShaderFeatureInfo& info) {
@@ -10011,9 +10538,11 @@ namespace dxvk {
     if (!tryGetBoundPixelFeatures(info))
       return false;
 
-    return info.hasDofPackedParameters && info.hasDofMinMaxBlurClamp &&
-           info.hasSceneColorSampler && !info.hasBlurredImageSampler &&
-           !info.hasFilterSampleWeights;
+    return info.hasSceneColorSampler &&
+           !info.hasBlurredImageSampler &&
+           !info.hasFilterSampleWeights &&
+           !info.hasToneMapConstants &&
+           (info.hasBloomScale || (info.hasDofPackedParameters && info.hasDofMinMaxBlurClamp));
   }
 
   bool D3D9Rtx::ngxBoundPixelIsDofBlend() {
@@ -10023,30 +10552,6 @@ namespace dxvk {
 
     return info.hasBlurredImageSampler &&
            (info.hasDofPackedParameters || info.hasSceneColorSampler);
-  }
-
-  bool D3D9Rtx::ngxDrawIsDofBloomGather() {
-    if (!ngxBoundPixelIsDofGather() || !ngxDrawSamplesSceneColor())
-      return false;
-
-    if (ngxBoundImageIsDofFilterBuffer())
-      return true;
-
-    if (d3d9State().renderTargets[kRenderTargetIndex] == nullptr || m_ngxSceneColorImage == nullptr)
-      return false;
-
-    D3D9CommonTexture* renderTarget = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
-    if (renderTarget == nullptr || renderTarget->GetImage() == nullptr)
-      return false;
-
-    if (renderTarget->GetImage().ptr() == m_ngxSceneColorImage.ptr())
-      return false;
-
-    // Stock UE3 sizes the filter to the full buffer. A reduced view can size it to that view instead.
-    const VkExtent3D& filter = renderTarget->GetImage()->info().extent;
-    const VkExtent3D& scene = m_ngxSceneColorImage->info().extent;
-    return filter.width >= 8 && filter.height >= 8 &&
-           filter.width * 2u < scene.width && filter.height * 2u < scene.height;
   }
 
   bool D3D9Rtx::ngxOffscreenPrePostShape(const DrawContext& drawContext) {
@@ -10197,8 +10702,6 @@ namespace dxvk {
         d3d9State().renderStates[D3DRS_ZWRITEENABLE] != FALSE &&
         d3d9State().depthStencil != nullptr) {
       m_ngxFrameLastGeometryDraw = m_drawCallID;
-      if (m_ngxDepthClearsThisFrame > 0)
-        m_ngxDepthWritesAfterLastClear++;
     }
 
     // Once the game has bound the backbuffer it is finished with the scene and its post chain, and
@@ -10230,7 +10733,7 @@ namespace dxvk {
     // Every draw executes as plain rasterization in this mode. The remaining per-draw work:
     // UE3 camera extraction, scene target identification, and the thin injection trigger.
     if (m_rtxInjectTriggered) {
-      if (m_ngxPrePostUpscaled && ngxDrawIsUi(drawContext)) {
+      if (m_ngxPrePostUpscaled && (ngxDrawIsUi(drawContext) || ngxDrawFollowsSceneComposite(drawContext))) {
         m_ngxPrePostUpscaled = false;
         m_ngxSpsbReplaceFull = false;
         m_ngxSpsbPatchActive = false;
@@ -10240,6 +10743,7 @@ namespace dxvk {
         m_parent->m_consts[DxsoProgramTypes::PixelShader].dirty = true;
       } else if (m_ngxPrePostUpscaled && ngxDepthTestDisabled()) {
         armNgxFullBufferScreenPositionScaleBias();
+        stretchNgxVelocityBuffer();
       } else if (m_ngxPrePostUpscaled) {
         // A depth-tested mesh keeps the bias the game uploaded.
         // That bias addresses the screen-percentage viewport the mesh is projected into.
@@ -10254,6 +10758,7 @@ namespace dxvk {
         m_ngxSpsbLastPsReg = -1;
       }
 
+      checkNgxPostInjectionDraw(drawContext);
       noteNgxPostUpscaleViewport();
       countNgxPostInjectionSceneColorConsumer(drawContext);
       maybeCaptureNgxHudless(drawContext);
@@ -10407,6 +10912,9 @@ namespace dxvk {
     // Dynamic object capture for the velocity raster pass
     tryCaptureNgxVelocityDraw(drawContext);
 
+    learnNgxDrawResolve(drawContext);
+    noteNgxUberEncode(drawContext);
+
     // Scene end detection. Pre-post injection runs DLSS on linear scene colour before the post chain.
     // A lower preset upscales its subrect at that same point.
     // If no pre-post candidate fires, late injection is the first UI draw on the primary target.
@@ -10446,61 +10954,18 @@ namespace dxvk {
       m_ngxDiagSawPostQuad |= upscaleBoundary;
       m_ngxDiagSceneColorReady |= (m_ngxSceneColorImage != nullptr && sceneViewportUsable);
 
-      // The distortion apply samples scene colour and may write it back.
-      // DLSS is committed first.
-      // The apply then refracts the upscaler output.
-      // A title whose shaders include haze keeps that later pass instead.
-      // The apply follows the foreground clear, after that depth has been written.
-      const bool distortionApply =
-        ngxPrePostInjectionAllowed() &&
-        !m_ngxHazeShaderSeen &&
-        !m_ngxBackbufferDrawSeenThisFrame &&
-        ngxDistortionApplyFollowsScene() &&
-        ngxBoundPixelIsDistortionApply() &&
-        ngxDrawSamplesSceneColor();
-
-      if (distortionApply) {
-        const Rc<DxvkImage> matchedTarget = findNgxPrePostSceneColorFromSamplers(false, false);
-        if (matchedTarget != nullptr) {
-          engageNgxPrePostInjection(matchedTarget);
-          triggerInjection = true;
-          ONCE(Logger::info("[RTX NGX Passthrough] Distortion apply samples the upscaler output. Bloom follows it."));
-        }
-      }
-
-      // The gather writes the filter buffer and stays out of the read ordinal.
-      // It is the pre-post point only after an uber blend shader has been compiled.
-      // The separate gamma pass used when that shader is absent is left alone.
-      Ue3ShaderFeatureInfo gatherFeatures;
-      const bool haveGatherFeatures = tryGetBoundPixelFeatures(gatherFeatures);
-      bool gatherTargetIsOther = false;
-      if (m_ngxSceneColorImage != nullptr &&
-          d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
-        D3D9CommonTexture* gatherTarget =
-          d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture();
-        if (gatherTarget != nullptr && gatherTarget->GetImage() != nullptr &&
-            gatherTarget->GetImage().ptr() != m_ngxSceneColorImage.ptr() &&
-            (m_ngxFrameBackbufferImage == nullptr ||
-             gatherTarget->GetImage().ptr() != m_ngxFrameBackbufferImage.ptr())) {
-          gatherTargetIsOther = true;
-        }
-      }
-      const bool shaderIsBloomGather =
-        m_ngxUberPostShaderSeen &&
-        haveGatherFeatures &&
-        gatherFeatures.hasSceneColorSampler &&
-        !gatherFeatures.hasBlurredImageSampler &&
-        !gatherFeatures.hasToneMapConstants &&
-        !gatherFeatures.hasFilterSampleWeights &&
-        (gatherFeatures.hasDofPackedParameters || gatherFeatures.hasDofMinMaxBlurClamp) &&
-        gatherTargetIsOther &&
-        m_ngxSceneViewport.Width >= 8 &&
-        m_ngxSceneViewport.Height >= 8;
+      // The DOF/bloom gather is the first pass of stock UE3's DOF, bloom and uber effects.
+      // It writes the filter buffer and stays out of the read ordinal.
+      // A gather before the foreground clear belongs to an effect in the world group.
       const bool gatherIsUncounted =
         !triggerInjection &&
         drawContext.PrimitiveCount > 0 &&
         drawContext.PrimitiveCount <= 4 &&
-        shaderIsBloomGather;
+        sceneViewportUsable &&
+        m_ngxSceneViewport.Width >= 8 &&
+        m_ngxSceneViewport.Height >= 8 &&
+        ngxPastForegroundClear() &&
+        ngxBoundPixelIsDofGather();
 
       // A pass with the backbuffer bound is the final composite or the UI being drawn over it, and
       // the pre-post point is mid-chain by definition. Letting those count walks the injection past
@@ -10513,54 +10978,16 @@ namespace dxvk {
       const bool candidateShape =
         !triggerInjection &&
         ngxPrePostInjectionAllowed() &&
+        !ngxEarlyInjectionSuspended() &&
         (upscaleBoundary || gatherIsUncounted) &&
         !targetsBackbuffer && !m_ngxBackbufferDrawSeenThisFrame &&
         (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr());
 
       if (candidateShape) {
         // The gather is not recorded, so the ordinal stays with the reads that follow bloom.
-        const Rc<DxvkImage> foundTarget = findNgxPrePostSceneColorFromSamplers(
-          !gatherIsUncounted, !gatherIsUncounted);
-        // The render-target mask can omit the scene-colour sampler.
-        // A known scene-colour image wins.
-        // Otherwise the largest bound colour image that covers the view is used.
-        Rc<DxvkImage> matchedTarget = foundTarget;
-        if (matchedTarget == nullptr && gatherIsUncounted && m_ngxSceneColorImage != nullptr) {
-          const uint32_t samplerMask = m_parent->m_psShaderMasks.samplerMask;
-          uint64_t bestArea = 0;
-          for (const uint32_t i : bit::BitMask(samplerMask)) {
-            D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-            if (texture == nullptr || texture->GetImage() == nullptr || texture->IsDepthStencil())
-              continue;
-
-            const Rc<DxvkImage> image = texture->GetImage();
-            if (renderTargetTexture != nullptr && renderTargetTexture->GetImage() != nullptr &&
-                image.ptr() == renderTargetTexture->GetImage().ptr())
-              continue;
-            if (m_ngxFrameBackbufferImage != nullptr && image.ptr() == m_ngxFrameBackbufferImage.ptr())
-              continue;
-
-            const VkExtent3D& sampledExtent = image->info().extent;
-            if (sampledExtent.width < m_ngxSceneViewport.X + m_ngxSceneViewport.Width ||
-                sampledExtent.height < m_ngxSceneViewport.Y + m_ngxSceneViewport.Height)
-              continue;
-
-            const Rc<DxvkImage> known = matchNgxSceneColorSample(image.ptr());
-            if (known != nullptr) {
-              matchedTarget = known;
-              break;
-            }
-
-            const uint64_t area = uint64_t(sampledExtent.width) * sampledExtent.height;
-            if (area > bestArea) {
-              bestArea = area;
-              matchedTarget = image;
-            }
-          }
-
-          if (matchedTarget == nullptr)
-            matchedTarget = m_ngxSceneColorImage;
-        }
+        const Rc<DxvkImage> matchedTarget = gatherIsUncounted
+          ? findNgxSceneColorSource()
+          : findNgxPrePostSceneColorFromSamplers(true, true);
 
         if (matchedTarget != nullptr) {
           // TdDirHaze's glow is a nonlinear function of the depth in scene-colour alpha.
@@ -10578,11 +11005,11 @@ namespace dxvk {
             ONCE(Logger::info("[RTX NGX Passthrough] TdSunHaze composites on the jittered scene. DLSS runs on its output, before the rest of the post chain."));
           } else {
             if (gatherIsUncounted) {
-              m_ngxRetargetSceneColorUvs = true;
-              ONCE(Logger::info("[RTX NGX Passthrough] DOF/bloom gather is a pre-post candidate (filter buffer)."));
+              ONCE(Logger::info("[RTX NGX Passthrough] The DOF/bloom gather is the pre-post point. Bloom and depth of field read the upscaler output."));
             }
 
             engageNgxPrePostInjection(matchedTarget);
+            m_ngxFrameInjectionSite = gatherIsUncounted ? NgxInjectionSite::Gather : NgxInjectionSite::AimedRead;
             triggerInjection = true;
 
             ONCE(Logger::info(str::format("[RTX NGX Passthrough] Pre-post-process injection engaged: DLSS runs on the ",
@@ -10711,44 +11138,19 @@ namespace dxvk {
             compositeSafeToReplace =
               psInfo.gammaInverseReg != Ue3ShaderFeatureInfo::kNgxNoRegister ||
               (!psInfo.hasToneMapConstants && !psInfo.hasExposureOrToneSampler);
-
-            // This frame's gather has already run.
-            // The flag selects that gather from the next frame.
-            if (psInfo.hasToneMapConstants && psInfo.hasBlurredImageSampler)
-              m_ngxUberPostShaderSeen = true;
           }
 
-          // The stretch samples the largest render-target texture that covers the scene subrect.
           // With pre-post on, the draw still runs over the upscaled image.
           // A plain gamma pass with pre-post off is replaced.
           // An uber pass with pre-post off draws first, and DLSS follows it before the HUD.
           if (likelyUpscaleStretch) {
-            Rc<DxvkImage> sourceImage;
-            const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
-
-            for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
-              D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-              if (texture == nullptr || texture->GetImage() == nullptr) {
-                continue;
-              }
-
-              const VkExtent3D& sourceExtent = texture->GetImage()->info().extent;
-              if (sourceExtent.width < m_ngxSceneViewport.X + m_ngxSceneViewport.Width ||
-                  sourceExtent.height < m_ngxSceneViewport.Y + m_ngxSceneViewport.Height) {
-                continue;
-              }
-
-              if (sourceImage == nullptr ||
-                  uint64_t(sourceExtent.width) * sourceExtent.height >
-                  uint64_t(sourceImage->info().extent.width) * sourceImage->info().extent.height) {
-                sourceImage = texture->GetImage();
-              }
-            }
+            const Rc<DxvkImage> sourceImage = findNgxSceneColorSource();
 
             if (sourceImage != nullptr && ngxPrePostInjectionAllowed()) {
               // DLSS writes the full scene-color image. This draw still runs.
               // Retarget opens the quad onto that image, including when the viewport was left at the view rect.
               engageNgxPrePostInjection(sourceImage);
+              m_ngxFrameInjectionSite = NgxInjectionSite::Stretch;
               triggerInjection = true;
 
               ONCE(Logger::info(str::format(
@@ -10768,6 +11170,15 @@ namespace dxvk {
               m_ngxSubrect.extent = { m_ngxSceneViewport.Width, m_ngxSceneViewport.Height };
               m_ngxColorSubrectOffset = m_ngxSubrect.offset;
               captureNgxOutputTransform();
+
+              // UE3's copy from LDR scene colour uses InverseGamma 1, so the uber pass did the encoding.
+              if (!m_ngxOutputTransform.enabled && ngxImageIsUberEncoded(sourceImage.ptr())) {
+                m_ngxOutputTransform = ngxLinearizingTransform(m_ngxUberGammaColorScaleAndInverse);
+                if (m_ngxOutputTransform.enabled) {
+                  ONCE(Logger::info("[RTX NGX Passthrough] The late input was encoded by the uber pass. It is linearized before DLSS and encoded again afterwards."));
+                }
+              }
+
               triggerInjection = true;
               suppressDraw = true;
 
@@ -10791,28 +11202,9 @@ namespace dxvk {
               // GammaColorScaleAndInverse is already in this image.
               // Those values are removed before DLSS and applied again afterwards.
               m_ngxOutputTransform = NgxOutputTransform();
-              Ue3ShaderFeatureInfo gradeInfo;
-              if (tryGetBoundPixelFeatures(gradeInfo) &&
-                  gradeInfo.toneMapGammaColorScaleReg >= 0) {
-                const auto& constants = d3d9State().psConsts.fConsts;
-                const uint32_t gammaReg = uint32_t(gradeInfo.toneMapGammaColorScaleReg);
-                if (gammaReg < std::size(constants)) {
-                  const Vector4& gammaConst = constants[gammaReg];
-                  const bool finiteScale =
-                    std::isfinite(gammaConst.x) && std::isfinite(gammaConst.y) && std::isfinite(gammaConst.z) &&
-                    gammaConst.x > 0.05f && gammaConst.y > 0.05f && gammaConst.z > 0.05f;
-                  const bool encoded =
-                    std::isfinite(gammaConst.w) && gammaConst.w > 0.05f && gammaConst.w < 0.95f;
-                  if (finiteScale && encoded) {
-                    m_ngxOutputTransform.colorScale[0] = gammaConst.x;
-                    m_ngxOutputTransform.colorScale[1] = gammaConst.y;
-                    m_ngxOutputTransform.colorScale[2] = gammaConst.z;
-                    m_ngxOutputTransform.inverseGamma = gammaConst.w;
-                    m_ngxOutputTransform.enabled = true;
-                    m_ngxOutputTransform.linearizeInput = true;
-                  }
-                }
-              }
+              Vector4 gamma;
+              if (readNgxBoundUberGamma(gamma, false))
+                m_ngxOutputTransform = ngxLinearizingTransform(gamma);
 
               ONCE(Logger::info(
                 "[RTX NGX Passthrough] Uber post pass composites at the reduced rect. DLSS upscales it at the late point, before the HUD."));
@@ -10839,36 +11231,11 @@ namespace dxvk {
             getUe3ShaderFeatureInfo(d3d9State().pixelShader->GetCommonShader());
 
           if (ngxShaderIsFinalBackbufferComposite(psInfo)) {
-            Rc<DxvkImage> matchedTarget = findNgxPrePostSceneColorFromSamplers(false, false);
-
-            // A licensee composite may sample a full-size copy that is not a registered scene-colour resolve.
-            // That copy is still the gamma input.
-            if (matchedTarget == nullptr && m_ngxSceneViewport.Width != 0 && m_ngxSceneViewport.Height != 0) {
-              const uint32_t rtSamplerMask = m_parent->GetActiveRTTextures() & m_parent->m_psShaderMasks.samplerMask;
-              for (const uint32_t i : bit::BitMask(rtSamplerMask)) {
-                D3D9CommonTexture* texture = GetCommonTexture(d3d9State().textures[i]);
-                if (texture == nullptr || texture->GetImage() == nullptr)
-                  continue;
-
-                const DxvkImage* sampled = texture->GetImage().ptr();
-                if (m_ngxFrameBackbufferImage != nullptr && sampled == m_ngxFrameBackbufferImage.ptr())
-                  continue;
-
-                const VkExtent3D& sourceExtent = sampled->info().extent;
-                if (sourceExtent.width < m_ngxSceneViewport.X + m_ngxSceneViewport.Width ||
-                    sourceExtent.height < m_ngxSceneViewport.Y + m_ngxSceneViewport.Height)
-                  continue;
-
-                if (matchedTarget == nullptr ||
-                    uint64_t(sourceExtent.width) * sourceExtent.height >
-                    uint64_t(matchedTarget->info().extent.width) * matchedTarget->info().extent.height) {
-                  matchedTarget = texture->GetImage();
-                }
-              }
-            }
+            const Rc<DxvkImage> matchedTarget = findNgxSceneColorSource();
 
             if (matchedTarget != nullptr) {
               engageNgxPrePostInjection(matchedTarget);
+              m_ngxFrameInjectionSite = NgxInjectionSite::FinalComposite;
               triggerInjection = true;
 
               ONCE(Logger::info(str::format(
@@ -10916,9 +11283,13 @@ namespace dxvk {
     m_ngxSpsbLastVsReg = -1;
     m_ngxSpsbLastPsReg = -1;
 
+    if (m_ngxColorTargetImage == nullptr)
+      m_ngxFrameInjectionSite = NgxInjectionSite::Late;
+
     if (m_ngxColorTargetImage != nullptr && m_ngxSceneColorImage != nullptr) {
       const VkExtent3D& extent = m_ngxSceneColorImage->info().extent;
       m_ngxPrePostUpscaled = ngxSceneViewportIsSubrect(m_ngxSceneViewport, extent.width, extent.height);
+      m_ngxFrameUpscaledInPlace = m_ngxPrePostUpscaled;
       if (m_ngxPrePostUpscaled) {
         if (!m_ngxLoggedPrePostUpscale) {
           m_ngxLoggedPrePostUpscale = true;
@@ -10980,6 +11351,7 @@ namespace dxvk {
       return;
 
     engageNgxPrePostInjection(target);
+    m_ngxFrameInjectionSite = NgxInjectionSite::Haze;
     commitNgxPrePostInjection(m_ngxDeferredPrimitiveType);
   }
 
@@ -11228,7 +11600,7 @@ namespace dxvk {
     m_ngxExpandedViewportHeight = 0;
     m_ngxDeferPrePostInjection = false;
     m_ngxDeferLateSubrectUpscale = false;
-    m_ngxRetargetSceneColorUvs = false;
+    m_ngxVelocityStretchedThisFrame = false;
     m_ngxDeferredPrePostTarget = nullptr;
     m_ngxFrameJitterValid = false;
     // The new frame's jitter differs, so the bound viewport no longer matches anything
@@ -11238,10 +11610,13 @@ namespace dxvk {
     m_ngxFrameDataEmitted = false;
     m_ngxDepthSnapshotTakenThisFrame = false;
     m_ngxDepthClearsThisFrame = 0;
-    m_ngxDepthWritesAfterLastClear = 0;
     m_ngxDiagSawPostQuad = false;
     m_ngxDiagSceneColorReady = false;
     m_ngxBackbufferDrawSeenThisFrame = false;
+
+    logNgxUe3Profile();
+    updateNgxInjectionFallbacks();
+    m_ngxFrameInjectionSite = NgxInjectionSite::None;
 
     updateNgxPrePostInjectionAim();
 
@@ -11333,6 +11708,10 @@ namespace dxvk {
       m_ngxSceneColorResolves[i] = nullptr;
     }
     m_ngxSceneColorResolveCount = 0;
+    for (uint32_t i = 0; i < m_ngxUberEncodedImageCount; i++) {
+      m_ngxUberEncodedImages[i] = nullptr;
+    }
+    m_ngxUberEncodedImageCount = 0;
     m_ngxVelocityDumpSkinnedThisFrame = 0;
     m_ngxVelocityDumpDynamicThisFrame = 0;
     m_ngxVelocityDumpRigidThisFrame = 0;
