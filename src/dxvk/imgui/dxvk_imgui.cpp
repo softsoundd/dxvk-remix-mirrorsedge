@@ -5283,7 +5283,7 @@ namespace dxvk {
 
       ImGui::Separator();
       ImGui::Text("Raster-Only Passes:");
-      RemixGui::SetTooltipToLastWidgetOnHover("Passes the game still renders that Remix discards while ray tracing.");
+      RemixGui::SetTooltipToLastWidgetOnHover("Passes the game renders that ray tracing has no use for.");
       showPatch("Disable Occlusion Queries", D3D9Rtx::ue3DisableOcclusionQueriesObject(), kGamePatchDisableOcclusionQueries,
         "Stops the game issuing hardware occlusion queries, like its toggleocclusion command.");
       showPatch("Disable Scene Captures", D3D9Rtx::ue3DisableSceneCapturesObject(), kGamePatchDisableSceneCaptures,
@@ -5295,6 +5295,9 @@ namespace dxvk {
         "\"viewmode unlit\" does but without changing base pass shaders.");
       showPatch("Disable Velocity Pass", D3D9Rtx::ue3DisableVelocityPassObject(), kGamePatchDisableVelocityPass,
         "Skips the velocity pass the game's motion blur reads, like MotionBlur=False.");
+      showPatch("Disable Distortion", D3D9Rtx::ue3DisableDistortionObject(), kGamePatchDisableDistortion,
+        "Skips the game's distortion pass, like Distortion=False. The pass draws distortion meshes a second time,\n"
+        "with a separate shader, which Remix would ray trace as extra copies under different material hashes.");
       ImGui::Unindent();
     }
 

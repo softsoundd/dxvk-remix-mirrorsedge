@@ -45,6 +45,7 @@ namespace dxvk {
     kGamePatchDisableDynamicShadows = 1u << 5,
     kGamePatchDisableDynamicLighting = 1u << 6,
     kGamePatchDisableVelocityPass = 1u << 7,
+    kGamePatchDisableDistortion = 1u << 8,
   };
 
   // Limits travel as two 16-bit counts of this many game units: the distance within which an off-screen

@@ -696,6 +696,7 @@ Several Mirror's Edge behaviours that matter to Remix are decided inside the gam
 | `rtx.d3d9.ue3DisableDynamicShadows` | False (True in the Mirror's Edge profile) | No dynamic shadow depths or projections, as with `show dynamicshadows` |
 | `rtx.d3d9.ue3DisableDynamicLighting` | False (True in the Mirror's Edge profile) | No per-light passes, modulated shadows or lighting-only post process effects, as with `viewmode unlit` |
 | `rtx.d3d9.ue3DisableVelocityPass` | False (True in the Mirror's Edge profile) | No velocity pass, as with `MotionBlur=False` |
+| `rtx.d3d9.ue3DisableDistortion` | False (True in the Mirror's Edge profile) | No distortion pass, as with `Distortion=False` |
 
 None is requested outside `rtx.d3d9.ue3EngineMode`, nor while ray tracing is disabled, so the rasterised image Remix shows then is the game's own. All are under Rendering > Mirror's Edge Game Patches in the developer menu, each with its status.
 
@@ -734,6 +735,7 @@ The runtime drops the draws of several UE3 passes as soon as they arrive (see `D
 - Dynamic shadows (`show dynamicshadows`): the `bAllowDynamicShadows` tests before `InitDynamicShadows` at the end of InitViews and before `RenderModulatedShadows`. Without the first no projected shadows exist, so no shadow depth or projection pass runs.
 - Dynamic lighting (the light-pass half of `viewmode unlit`): `Render`'s `SHOW_Lighting` block, which holds `RenderLights`, the modulated shadows and the lighting-only post process effects. Its `jz rel32` becomes a `nop` and an unconditional `jmp` with the same operand and target. Base pass shaders keep their lit permutations; only `viewmode unlit` itself changes those.
 - Velocity pass (`MotionBlur=False`): the `bAllowMotionBlur` test before `RenderVelocities`.
+- Distortion (`Distortion=False`): the `bAllowDistortion` test at the start of `RenderDistortion`, the only rendering code that reads the flag. The runtime drops only this pass's fullscreen apply draw as it arrives. The accumulate pass draws every mesh that has a distortion material a second time, with that material's `DistortAccumulate` pixel shader, and those draws classify as material draws, so each would add an extra copy of its mesh to the ray traced scene. The copy's material hash differs from that of the mesh's translucency draw, which is the hash replacements authored with distortion off are anchored to.
 
 ## First person and the player model
 

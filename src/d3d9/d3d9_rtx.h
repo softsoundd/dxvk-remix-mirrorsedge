@@ -305,6 +305,13 @@ namespace dxvk {
                "does. Remix computes its own motion vectors and ignores these draws. "
                "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
                "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
+    RTX_OPTION("rtx.d3d9", bool, ue3DisableDistortion, false,
+               "Mirror's Edge: patch the game to skip its distortion pass, as Distortion=False does. The pass draws "
+               "every mesh that has a distortion material a second time, with a separate pixel shader, and Remix would "
+               "ray trace those draws as extra copies of the meshes, under material hashes that replacements authored "
+               "with distortion off do not match. "
+               "Applied inside the game process by the bridge client, only while rtx.d3d9.ue3EngineMode and ray "
+               "tracing are enabled; see documentation/UE3Compatibility.md, \"Game executable patches\".");
     RTX_OPTION("rtx.d3d9", bool, conservativeOcclusionQueries, false,
                "Answer hardware occlusion queries with conservative results suited to path tracing instead "
                "of GPU-measured raster visibility: readbacks return immediately with full-backbuffer "

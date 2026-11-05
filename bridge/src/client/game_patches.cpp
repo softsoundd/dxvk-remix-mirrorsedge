@@ -144,6 +144,11 @@ namespace {
   constexpr const char* kVelocityTestSignature = "3B F3 74 2E 39 1D ?? ?? ?? ?? 74 26 57 8B CD E8";
   constexpr size_t kVelocityJumpOffset = 10;
 
+  // FSceneRenderer::RenderDistortion first tests GSystemSettings.bAllowDistortion, and renders nothing when it is false.
+  constexpr const char* kDistortionTestSignature =
+    "8B E9 33 FF 39 3D ?? ?? ?? ?? 89 7C 24 ?? 74 ?? 8B 5D 48 3B DF 89 7C 24 ?? 7E";
+  constexpr size_t kDistortionJumpOffset = 14;
+
   constexpr uint8_t kJumpIfZeroShort[] = { 0x74 };
   constexpr uint8_t kJumpIfNotZeroShort[] = { 0x75 };
   constexpr uint8_t kJumpShort[] = { 0xEB };
@@ -164,8 +169,10 @@ namespace {
   GamePatch g_dynamicShadows { "Disable dynamic shadows", dxvk::kGamePatchDisableDynamicShadows };
   GamePatch g_dynamicLighting { "Disable dynamic lighting", dxvk::kGamePatchDisableDynamicLighting };
   GamePatch g_velocityPass { "Disable velocity pass", dxvk::kGamePatchDisableVelocityPass };
+  GamePatch g_distortion { "Disable distortion", dxvk::kGamePatchDisableDistortion };
   GamePatch* const g_patches[] = {
-    &g_thirdPersonModel, &g_occlusionQueries, &g_sceneCaptures, &g_dynamicShadows, &g_dynamicLighting, &g_velocityPass
+    &g_thirdPersonModel, &g_occlusionQueries, &g_sceneCaptures, &g_dynamicShadows, &g_dynamicLighting, &g_velocityPass,
+    &g_distortion
   };
 
   const BranchSite g_branchSites[] = {
@@ -178,6 +185,8 @@ namespace {
     { &g_dynamicLighting, "lighting test", kLightingTestSignature, kLightingJumpOffset,
       kJumpIfZero, kNopThenJump, sizeof(kNopThenJump) },
     { &g_velocityPass, "velocity pass test", kVelocityTestSignature, kVelocityJumpOffset,
+      kJumpIfZeroShort, kJumpShort, sizeof(kJumpShort) },
+    { &g_distortion, "distortion test", kDistortionTestSignature, kDistortionJumpOffset,
       kJumpIfZeroShort, kJumpShort, sizeof(kJumpShort) },
   };
 

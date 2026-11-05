@@ -971,6 +971,7 @@ namespace dxvk {
         { ue3DisableDynamicShadows(), kGamePatchDisableDynamicShadows },
         { ue3DisableDynamicLighting(), kGamePatchDisableDynamicLighting },
         { ue3DisableVelocityPass(), kGamePatchDisableVelocityPass },
+        { ue3DisableDistortion(), kGamePatchDisableDistortion },
       };
       for (const auto& [enabled, bit] : patches) {
         if (enabled) {

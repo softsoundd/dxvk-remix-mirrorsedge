@@ -133,6 +133,7 @@ namespace dxvk {
       { "rtx.d3d9.ue3DisableDynamicShadows",                         "True" },
       { "rtx.d3d9.ue3DisableDynamicLighting",                        "True" },
       { "rtx.d3d9.ue3DisableVelocityPass",                           "True" },
+      { "rtx.d3d9.ue3DisableDistortion",                             "True" },
       // UE3's per-frame FrameSyncEvent otherwise serialises the GPU frame behind injectRTX's CPU time.
       { "rtx.d3d9.eventQueryCsCompletion",                           "True" },
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },
