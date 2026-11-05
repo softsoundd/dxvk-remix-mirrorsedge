@@ -133,6 +133,7 @@ namespace {
       test_constantTiling();
       test_readsBeforeWrites();
       test_selfAdd();
+      test_absLiteralTiling();
       test_panner();
       test_rotatorDp2add();
       test_rotatorMulMad();
@@ -144,6 +145,7 @@ namespace {
       test_mixedHalves();
       test_vsPureMove();
       test_vsAffine();
+      test_vsAbsLiteral();
       test_vsOriginOnly();
       test_vsOutputRegisterLookup();
       std::cout << "All DXSO UV dataflow tests passed" << std::endl;
@@ -194,6 +196,30 @@ namespace {
       expectString(ps.origin(),
                    "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=1 U=[uv*2+0] V=[uv*2+0]",
                    "add r1, v0, v0");
+    }
+
+    // fxc reads a (1, 2) tiling from the normal unpack's (2, -1) literals through an abs modifier.
+    // Escape_p's building trims tile their diffuse this way.
+    // A draw-time constant's abs has no term in the model, so its tiling stays inexact.
+    static void test_absLiteralTiling() {
+      std::cout << "  test_absLiteralTiling" << std::endl;
+      PsShader ps;
+      ps.def(1, 2.0f, -1.0f, 0.0001f, 9.0f)
+        .op2(DxsoOpcode::Mul, rd(0, MaskX | MaskW), c(1, swz(1, 1, 2, 0), kModAbs), v(0, swz(0, 1, 2, 1)))
+        .texld(rd(3), r(0, swz(0, 3, 2, 3)), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(3));
+      expectString(ps.origin(),
+                   "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=1 U=[uv*1+0] V=[uv*2+0]",
+                   "mul r0.xw, c1_abs.yyzx, v0.xyzy");
+
+      PsShader uniform;
+      uniform.op2(DxsoOpcode::Mul, rd(1, MaskXY), v(0), c(3, kXYZW, kModAbs))
+        .texld(rd(0), r(1), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(0));
+      expectString(uniform.origin(),
+                   "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=0"
+                   " U=[uv*1(INEXACT)+0] V=[uv*1(INEXACT)+0]",
+                   "mul r1.xy, v0, c3_abs");
     }
 
     // A Panner's Time * Speed arrives as one uniform added to the coordinate.
@@ -341,6 +367,15 @@ namespace {
       VsShader vs;
       vs.op3(DxsoOpcode::Mad, od(1, MaskXY), v(1), c(4), c(5));
       expectString(vs.trace(), "AffineConst ia=0 v1 U=[uv*c4.x+c5.x] V=[uv*c4.y+c5.y]", "vs affine");
+    }
+
+    // fxc writes float4(uv, 0, 0) as uv.xyxx times the abs of a (-1, -1, 0, 0) literal.
+    static void test_vsAbsLiteral() {
+      std::cout << "  test_vsAbsLiteral" << std::endl;
+      VsShader vs;
+      vs.def(21, 0.0078f, -1.0f, 0.001f, 0.0f)
+        .op2(DxsoOpcode::Mul, od(1), c(21, swz(1, 1, 3, 3), kModAbs), v(1, swz(0, 1, 0, 0)));
+      expectString(vs.trace(), "PureMove ia=0 v1 U=[uv*1+0] V=[uv*1+0]", "vs mul o1, c21_abs.yyww, v1.xyxx");
     }
 
     // A swizzled copy proves the IA set, but not as a float2 stream the surface can use.

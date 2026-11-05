@@ -460,6 +460,34 @@ namespace dxvk {
     float factor = 1.0f;
   };
 
+  // Applies a source modifier to a constant operand. A `def` literal takes abs as well as negation.
+  // Returns false when the affine model cannot represent the result, as with the abs of a draw-time constant.
+  static bool uvConstApplySourceModifier(UvConstComponentRef& ref, const DxsoRegModifier modifier) {
+    if (ref.isImmediate) {
+      switch (modifier) {
+      case DxsoRegModifier::None:
+        return true;
+      case DxsoRegModifier::Neg:
+        ref.immediate = -ref.immediate;
+        return true;
+      case DxsoRegModifier::Abs:
+        ref.immediate = std::abs(ref.immediate);
+        return true;
+      case DxsoRegModifier::AbsNeg:
+        ref.immediate = -std::abs(ref.immediate);
+        return true;
+      default:
+        return false;
+      }
+    }
+    float modifierScale = 1.0f;
+    if (!decodeConstantModifierScale(modifier, modifierScale)) {
+      return false;
+    }
+    ref.factor *= modifierScale;
+    return true;
+  }
+
   static void uvAffineMulConstRef(UvComponentAffine& a, const UvConstComponentRef& ref) {
     if (ref.isImmediate) {
       uvAffineMulImmediate(a, ref.immediate);
@@ -601,29 +629,14 @@ namespace dxvk {
           return ref;
         }
         const uint8_t comp = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
-        const UvConstComponentRef& tracked = m_tempConstExprs[r.id.num][comp];
-        if (!tracked.valid) {
+        UvConstComponentRef tracked = m_tempConstExprs[r.id.num][comp];
+        if (!tracked.valid || !uvConstApplySourceModifier(tracked, r.modifier)) {
           return ref;
         }
-        float modifierScale = 1.0f;
-        if (!decodeConstantModifierScale(r.modifier, modifierScale)) {
-          return ref;
-        }
-        ref = tracked;
-        if (ref.isImmediate) {
-          ref.immediate *= modifierScale;
-        } else {
-          ref.factor *= modifierScale;
-        }
-        return ref;
+        return tracked;
       }
 
       if (!isFloatConstantRegisterType(r.id.type)) {
-        return ref;
-      }
-
-      float modifierScale = 1.0f;
-      if (!decodeConstantModifierScale(r.modifier, modifierScale)) {
         return ref;
       }
 
@@ -633,16 +646,19 @@ namespace dxvk {
       }
 
       const uint8_t comp = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
-      ref.valid = true;
+      UvConstComponentRef constant;
+      constant.valid = true;
       if (reg < int32_t(m_defConstValid.size()) && m_defConstValid[reg]) {
-        ref.isImmediate = true;
-        ref.immediate = modifierScale * m_defConsts[reg][comp];
+        constant.isImmediate = true;
+        constant.immediate = m_defConsts[reg][comp];
       } else {
-        ref.constReg = int16_t(reg);
-        ref.constComp = comp;
-        ref.factor = modifierScale;
+        constant.constReg = int16_t(reg);
+        constant.constComp = comp;
       }
-      return ref;
+      if (!uvConstApplySourceModifier(constant, r.modifier)) {
+        return ref;
+      }
+      return constant;
     }
 
     UvExactComponentOrigin readOrigin(const DxsoRegister& r, const uint32_t dstComponent) const {
