@@ -419,6 +419,11 @@ private:
   Resources::Resource m_reflection[2];
   // The indirect integrator's near-mirror rays into the sky, zeroed by the glossy pass as it consumes them.
   Resources::Resource m_glossyRay;
+  // These hold the glossy pass's filtered layer along those rays, with each texel's ray and age.
+  // The two textures alternate as each other's history.
+  Resources::Resource m_glossyHistory[2];
+  uint32_t m_glossyHistoryIndex = 0;
+  bool m_glossyHistoryValid = false;
   // Holds what camera rays passed through before reaching the sky (world space UI, particles),
   // which composite keeps in front of the layer: the radiance gathered before the sky and its transmittance.
   // Pixels with nothing in front hold no light and full transmittance.

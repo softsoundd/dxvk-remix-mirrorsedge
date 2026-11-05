@@ -97,3 +97,7 @@
 // The screen pass weighs the clouds it marches along reflections by these.
 #define CLOUD_BINDING_PRIMARY_ATTENUATION        54
 #define CLOUD_BINDING_SECONDARY_ATTENUATION      55
+
+// The glossy pass reads its history from a frame ago and writes this frame's.
+#define CLOUD_BINDING_GLOSSY_HISTORY             56
+#define CLOUD_BINDING_GLOSSY_HISTORY_OUTPUT      57

@@ -96,6 +96,12 @@ struct CloudMarchResult {
   float sampleCount;
 };
 
+// A pixel whose ray found no cloud reprojects at this distance, the middle of the cloud layer's typical range.
+static const float kReprojectionFallbackKm = 12.0f;
+
+// A history's age stops counting at this many frames, well past where the tiers' blend weights take over.
+static const float kMaxHistoryAge = 64.0f;
+
 // One march sample of length stepKm at tSample. Returns the sample's extinction (0 when empty), its
 // conservative empty radius and its distance to the displaced surface.
 float cloudMarchSample(

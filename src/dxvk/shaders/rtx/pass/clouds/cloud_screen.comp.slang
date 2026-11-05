@@ -126,9 +126,6 @@ groupshared vec4 tileReflection[8][8];
 // Transmittance that marks a pixel the scene hid the clouds behind, in the history and the tile.
 static const float kHiddenMark = -1.0f;
 
-// Frames of history past which the age is not counted: well past where the tiers' blend weights take over.
-static const float kMaxHistoryAge = 64.0f;
-
 // A reflection whose throughput is at most this marches at cloudReflectionMarchSettings,
 // which near-mirrors use at full weight in cloud_glossy.comp.slang.
 // Composite scales the layer by the throughput, which dims the coarser march's grain with it.
@@ -167,9 +164,6 @@ vec4 sampleHistory(Texture2D<float4> history, bool withAge, vec2 uv, out float w
 // Current frame weight of the reflections' history, which takes the march's jitter out before the upscaler,
 // whose guides on glass describe what the glass shows through it rather than the reflection.
 static const float kReflectionHistoryBlend = 0.1f;
-
-// Distance a pixel whose ray found no cloud reprojects at: the middle of the cloud layer's typical range.
-static const float kReprojectionFallbackKm = 12.0f;
 
 // The pixel of each 2x2 block, as x + 2y, that marches in each of four frames at quarter rate. Consecutive frames
 // take opposite corners.

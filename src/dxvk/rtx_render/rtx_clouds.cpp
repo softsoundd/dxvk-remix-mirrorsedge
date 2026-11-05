@@ -284,6 +284,8 @@ namespace dxvk {
         RW_TEXTURE2D(CLOUD_BINDING_INDIRECT_RADIANCE)
         TEXTURE2D(CLOUD_BINDING_COMPACTED_PIXEL_INDICES)
         TEXTURE2D(CLOUD_BINDING_TILE_ACTIVE_COUNTS)
+        TEXTURE2D(CLOUD_BINDING_GLOSSY_HISTORY)
+        RW_TEXTURE2D(CLOUD_BINDING_GLOSSY_HISTORY_OUTPUT)
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(CloudGlossyShader);
@@ -449,7 +451,7 @@ namespace dxvk {
     CloudArgs invariant = args;
     invariant.frameIndex = 0;
     invariant.flags &= ~(CLOUD_FLAG_HISTORY_VALID | CLOUD_FLAG_SHADOW_MAP_VALID | CLOUD_FLAG_PSR_REFLECTIONS | CLOUD_FLAG_GLOSSY_REFLECTIONS |
-                         CLOUD_FLAG_HALF_RATE_MARCH | CLOUD_FLAG_QUARTER_RATE_MARCH);
+                         CLOUD_FLAG_HALF_RATE_MARCH | CLOUD_FLAG_QUARTER_RATE_MARCH | CLOUD_FLAG_GLOSSY_HISTORY_VALID);
     invariant.debugView = 0;
     invariant.cameraPositionKm = Vector3(0.0f);
     invariant.cameraWorldHeightKm = 0.0f;
@@ -686,11 +688,13 @@ namespace dxvk {
     m_compositeLayer = Resources::createImageResource(ctx, "Cloud Composite Layer", size, VK_FORMAT_R16G16B16A16_SFLOAT);
     for (uint32_t i = 0; i < 2; ++i) {
       m_reflection[i] = Resources::createImageResource(ctx, i == 0 ? "Cloud Reflection Layer 0" : "Cloud Reflection Layer 1", size, VK_FORMAT_R16G16B16A16_SFLOAT);
+      m_glossyHistory[i] = Resources::createImageResource(ctx, i == 0 ? "Cloud Glossy Layer 0" : "Cloud Glossy Layer 1", size, VK_FORMAT_R32G32B32A32_UINT);
     }
     m_glossyRay = Resources::createImageResource(ctx, "Cloud Glossy Sky Rays", size, VK_FORMAT_R32G32_UINT);
     m_missForeground = Resources::createImageResource(ctx, "Cloud Sky Miss Foreground", size, VK_FORMAT_R16G16B16A16_SFLOAT);
     m_screenExtent = size;
     m_screenHistoryValid = false;
+    m_glossyHistoryValid = false;
     // The reference's targets follow the screen's size when it next runs.
     m_referenceFrames = 0;
     releaseReferenceResources();
@@ -725,7 +729,8 @@ namespace dxvk {
            &m_sunGrid, &m_ambientGrid, &m_sunGridFar, &m_ambientGridFar, &m_diffusionCells[0], &m_diffusionCells[1],
            &m_diffusionFluence[0], &m_diffusionFluence[1], &m_skyApInScatter, &m_skyApTransmittance, &m_skySh, &m_skyShParts,
            &m_phaseLut, &m_phaseCdf, &m_shadowMap, &m_dome[0], &m_dome[1], &m_layer[0], &m_layer[1], &m_layerAge[0],
-           &m_layerAge[1], &m_compositeLayer, &m_reflection[0], &m_reflection[1], &m_glossyRay, &m_missForeground }) {
+           &m_layerAge[1], &m_compositeLayer, &m_reflection[0], &m_reflection[1], &m_glossyRay,
+           &m_glossyHistory[0], &m_glossyHistory[1], &m_missForeground }) {
       resource->reset();
     }
     m_detailNoiseMipViews.clear();
@@ -755,6 +760,8 @@ namespace dxvk {
     m_screenExtent = VkExtent3D { 0, 0, 0 };
     m_layerIndex = 0;
     m_screenHistoryValid = false;
+    m_glossyHistoryIndex = 0;
+    m_glossyHistoryValid = false;
     m_referenceFrames = 0;
     m_horizonBiasAnchored = false;
   }
@@ -820,6 +827,7 @@ namespace dxvk {
     a.flags |= marchRate() == CloudMarchRate::Quarter ? CLOUD_FLAG_QUARTER_RATE_MARCH : 0u;
     a.flags |= hexTiling() ? CLOUD_FLAG_HEX_TILING : 0u;
     a.flags |= m_screenHistoryValid ? CLOUD_FLAG_HISTORY_VALID : 0u;
+    a.flags |= m_glossyHistoryValid ? CLOUD_FLAG_GLOSSY_HISTORY_VALID : 0u;
     a.flags |= m_shadowMapState.valid ? CLOUD_FLAG_SHADOW_MAP_VALID : 0u;
     a.baseAltitudeKm = std::max(g.baseAltitudeMeters, 0.0f) * 0.001f;
     a.thicknessKm = std::max(g.thicknessMeters * 0.001f, 0.05f);
@@ -992,6 +1000,7 @@ namespace dxvk {
 
     if (quality() != m_lastQuality || camera.isCameraCut()) {
       m_screenHistoryValid = false;
+      m_glossyHistoryValid = false;
       m_domeHistoryValid = false;
       m_skyApValid = false;
       m_lastQuality = quality();
@@ -999,7 +1008,7 @@ namespace dxvk {
 
     const TierSettings tier = getTierSettings(quality());
     ensureDome(ctx, tier.domeWidth);
-    // Before the arguments, whose history flag a resize clears.
+    // This runs before the arguments are built, because a resize clears their history flags.
     ensureScreenResources(ctx, renderExtent);
 
     // The G-buffer writes the miss foreground only where something lies in front of the sky.
@@ -1657,6 +1666,7 @@ namespace dxvk {
 
   void RtxClouds::dispatchGlossyReflections(RtxContext& rtxCtx, const Resources::RaytracingOutput& rtOutput) {
     if (!m_initialized || !m_args.enabled || (m_args.flags & CLOUD_FLAG_GLOSSY_REFLECTIONS) == 0) {
+      m_glossyHistoryValid = false;
       return;
     }
     Rc<DxvkContext> ctx = &rtxCtx;
@@ -1668,6 +1678,8 @@ namespace dxvk {
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_SHADER_WRITE_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
+    const uint32_t history = m_glossyHistoryIndex;
+    const uint32_t output = m_glossyHistoryIndex ^ 1u;
     Rc<DxvkBuffer> raytraceConstants = rtxCtx.getResourceManager().getConstantsBuffer();
 
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CloudGlossyShader::getShader());
@@ -1679,7 +1691,11 @@ namespace dxvk {
     ctx->bindResourceView(CLOUD_BINDING_GLOSSY_RAY, m_glossyRay.view, nullptr);
     ctx->bindResourceView(CLOUD_BINDING_INDIRECT_RADIANCE, rtOutput.m_indirectRadianceHitDistance.view(Resources::AccessType::ReadWrite), nullptr);
     bindSparseRenderingPixelMaps(ctx, rtOutput);
+    ctx->bindResourceView(CLOUD_BINDING_GLOSSY_HISTORY, m_glossyHistory[history].view, nullptr);
+    ctx->bindResourceView(CLOUD_BINDING_GLOSSY_HISTORY_OUTPUT, m_glossyHistory[output].view, nullptr);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_glossyRay.image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_glossyHistory[history].image);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_glossyHistory[output].image);
 
     // A group per 16x16 tile (cloud_glossy.comp.slang).
     const VkExtent3D groups = util::computeBlockCount(VkExtent3D { m_screenExtent.width, m_screenExtent.height, 1 }, VkExtent3D { 16, 16, 1 });
@@ -1690,6 +1706,9 @@ namespace dxvk {
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+    m_glossyHistoryIndex = output;
+    m_glossyHistoryValid = true;
   }
 
   bool RtxClouds::referenceInputsChanged(const RtCamera& camera, const CloudArgs& args, const AtmosphereArgs& atmosphere) {

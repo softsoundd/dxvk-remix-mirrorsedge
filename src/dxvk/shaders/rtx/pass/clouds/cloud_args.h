@@ -84,6 +84,7 @@
 #define CLOUD_FLAG_GLOSSY_REFLECTIONS     (1u << 9)
 #define CLOUD_FLAG_HALF_RATE_MARCH        (1u << 10)
 #define CLOUD_FLAG_QUARTER_RATE_MARCH     (1u << 11)
+#define CLOUD_FLAG_GLOSSY_HISTORY_VALID   (1u << 12)
 
 struct CloudArgs {
   uint enabled;  // Non-zero when the layer renders this frame

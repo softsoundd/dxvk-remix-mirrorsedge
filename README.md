@@ -29,15 +29,11 @@ All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` t
 
 ### 2) Mirror's Edge/UE3 setup:
 
-1. Enable the bridge's redundant state filtering. Create (or edit) `.trex\bridge.conf` and add `eliminateRedundantSetterCalls = True`.
-> [!NOTE]
-> UE3's D3D9 renderer doesn't filter redundant state on its own. Sampler and render state get resubmitted with nearly every texture bind, multiple state calls per draw even when nothing's changed which can stack to tens of thousands per frame. Under Remix, each of those is handled twice where it gets serialised over the bridge IPC and then replayed by the runtime. This setting has the bridge client drop no-op state calls before they cross the process boundary. UE3 titles often run noticeably faster with it on.
-
-2. *(Recommended)* Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`). This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
+1. *(Recommended)* Disable the game's lightmaps in its config file (`DirectionalLightmaps=False`). This is easiest done with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
 > [!NOTE]
 > Lightmaps are not used as a surface's colour whichever way this is set - Remix's material identity is independent of it. A material hashes the same either way so assets authored under one setting match under the others. `False` is still recommended as it compiles the smaller shaders and binds one lightmap texture per surface instead of three. See [UE3 lightmaps are bypassed](documentation/UE3Compatibility.md#ue3-lightmaps-are-bypassed).
 
-3. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
+2. Make a text file titled "remix" (no extension) in `<path-to-game>\Binaries` and paste the following set of commands:
 ```
 scale set TdBicubicFiltering false
 scale set MaxMultisamples 0
@@ -68,9 +64,9 @@ show fog
 > [!NOTE]
 > The above commands ensures maximum compatibility with Remix. That being said, a lot of consideration has gone into this fork into ensuring that games with less flexibility around commands can still play somewhat nice with these graphics systems active, though game-side modding is recommended to disable them.
 
-4. By default `MirrorsEdge.exe` whitelists only a select few launch arguments, so the above commands will not work out of the box. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Once patched, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
+3. By default `MirrorsEdge.exe` whitelists only a select few launch arguments, so the above commands will not work out of the box. This can be fully unlocked with [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) via the launch argument patcher. Once patched, add `-exec=remix` into your game libray's launch arguments/other shortcuts, or alternatively within the launch argument field in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks) followed by launching via the `Launch Game w/ Args` button.
 
-5. Under the dev menu's `Rendering > Mirror's Edge Game Patches` section, there are the following settings (on by default):
+4. Under the dev menu's `Rendering > Mirror's Edge Game Patches` section, there are the following settings (on by default):
 
     **Third-person model support** - Mirror's Edge hides the third-person player model in the default first-person camera state, which would leave Remix unable to cast shadows or reflect the character as you'd expect in a raytraced scenario. The runtime can patch the game in memory so the third-person model is always drawn. Make sure you have the runtime's `rtx.conf` file which has the necessary player/viewmodel hashes pre-tagged so this renders properly.
     
