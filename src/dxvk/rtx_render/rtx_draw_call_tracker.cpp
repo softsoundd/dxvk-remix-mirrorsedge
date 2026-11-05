@@ -98,6 +98,8 @@ namespace dxvk {
       XXH64_hash_t matHash;
       XXH64_hash_t boneHash;
       XXH64_hash_t overrideMaterialHash;
+      XXH64_hash_t cameraDescriptorHash;
+      uintptr_t cameraResource;
       XXH64_hash_t decomposedInstanceId;
       Matrix4 xform;
       Matrix4 textureTransform;
@@ -111,6 +113,8 @@ namespace dxvk {
 
     data.geoHash = drawCallState.getGeometryData().getHashForRule(rules::FullGeometryHash);
     data.matHash = drawCallState.getMaterialData().getHash();
+    data.cameraDescriptorHash = drawCallState.raytracedRenderTargetDescriptorHash;
+    data.cameraResource = reinterpret_cast<uintptr_t>(drawCallState.raytracedRenderTargetImage.ptr());
     data.overrideMaterialHash = overrideMaterialData != nullptr
         ? overrideMaterialData->getHash()
         : kEmptyHash;
@@ -136,6 +140,8 @@ namespace dxvk {
         &IdentityHashData::matHash,
         &IdentityHashData::boneHash,
         &IdentityHashData::overrideMaterialHash,
+        &IdentityHashData::cameraDescriptorHash,
+        &IdentityHashData::cameraResource,
         &IdentityHashData::decomposedInstanceId,
         &IdentityHashData::xform,
         &IdentityHashData::textureTransform,

@@ -33,6 +33,7 @@
 #include "rtx_point_instancer_system.h"
 
 #include "../d3d9/d3d9_state.h"
+#include "../../util/util_global_time.h"
 #include "rtx_matrix_helpers.h"
 
 #include "dxvk_scoped_annotation.h"
@@ -1116,6 +1117,7 @@ namespace dxvk {
         blasRangesToBuild.push_back(&blasEntry->buildRanges[0]);
 
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
+        selectedBlas->hasOmmAttachments = boundOpacityMicromapHash != kEmptyHash;
       }
 
       for (RtInstance* rtInstance : uniqueBlasEntry.instances) {
@@ -1446,7 +1448,7 @@ namespace dxvk {
 
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
       // Cannot update a blas that contains OMM instances, this leads to sporadic device lost errors
-      if (!bucket->hasOmmInstances && selectedBlas &&
+      if (!bucket->hasOmmInstances && selectedBlas && !selectedBlas->hasOmmAttachments &&
           selectedBlas->topologyHash == newTopologyHash &&
           validateUpdateMode(selectedBlas->buildInfo, buildInfo) &&
           selectedBlas->primitiveCounts == bucket->primitiveCounts) {
@@ -1522,6 +1524,7 @@ namespace dxvk {
 
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
         selectedBlas->primitiveCounts = bucket->primitiveCounts;
+        selectedBlas->hasOmmAttachments = bucket->hasOmmInstances;
 
         // Allocate a scratch buffer slice
         const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
@@ -1715,8 +1718,7 @@ namespace dxvk {
     }
   }
 
-  void AccelManager::dispatchPointInstancerCulling(Rc<DxvkContext> ctx, const CameraManager& cameraManager,
-                                                   const Rc<DxvkBuffer>& surfaceMaterialBuffer) {
+  void AccelManager::dispatchPointInstancerCulling(Rc<DxvkContext> ctx, const CameraManager& cameraManager) {
     if (m_pointInstancerBatches.empty() || m_vkInstanceBuffer == nullptr) {
       return;
     }
@@ -1743,7 +1745,7 @@ namespace dxvk {
     RtxPointInstancerSystem& system = m_device->getCommon()->metaPointInstancerSystem();
     const Vector3 cameraPos = cameraManager.getMainCamera().getPosition();
 
-    system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos);
+    system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, m_pointInstancerBatches, cameraPos);
   }
 
   void AccelManager::buildParticleSurfaceMapping(std::vector<uint32_t>& surfaceIndexMapping) {
@@ -1926,6 +1928,7 @@ namespace dxvk {
     // Write surface data
     std::size_t dataOffset = 0;
     surfacesGPUData.resize(surfacesGPUSize);
+    const uint64_t timeUs = GlobalTime::get().absoluteTimeUs();
 
     const bool autoEnclosingShells =
       D3D9Rtx::ue3EngineMode() && D3D9Rtx::ue3AutoCullEnclosingMeshShadowBackfaces();
@@ -1954,7 +1957,8 @@ namespace dxvk {
       } else {
         // Split instance geometry need to have their first index offset set in their corresponding surface instances
         currentSurface.firstIndex += m_reorderedSurfacesFirstIndexOffset[i];
-        currentSurface.writeGPUData(surfacesGPUData.data(), dataOffset, i);
+        // The material table is laid out per surface, so the material index equals the surface index
+        currentSurface.writeGPUData(surfacesGPUData.data(), dataOffset, i, timeUs, i);
         currentSurface.firstIndex -= m_reorderedSurfacesFirstIndexOffset[i];
       }
 

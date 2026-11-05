@@ -265,6 +265,7 @@ namespace dxvk {
     verifyAndReleaseBufferCache();
 
     // We still need to clear caches even if the scene wasn't rendered
+    m_bindlessResourceManager.releaseBufferDescriptors(ctx, needWfi);
     m_bufferCache.clear();
     m_preCreationSurfaceMaterialMap.clear();
     m_volumeMaterialCache.clear();
@@ -346,9 +347,22 @@ namespace dxvk {
         pInstance->clear();
         continue;
       }
-      if (!changes.dirtyMatHashes.empty() &&
-          changes.dirtyMatHashes.count(pInstance->materialHash) != 0) {
-        pInstance->clear();
+      if (!changes.dirtyMatHashes.empty()) {
+        bool materialChanged = changes.dirtyMatHashes.count(pInstance->materialHash) != 0;
+        for (const auto& prim : pInstance->prims) {
+          if (materialChanged) {
+            break;
+          }
+          const auto* pRtInstance = prim.getInstance();
+          if (pRtInstance == nullptr || pRtInstance->getBlas() == nullptr) {
+            continue;
+          }
+          const auto& drawCall = pRtInstance->getBlas()->input;
+          materialChanged = drawCall.isCameraMaterialDirty(changes.dirtyMatHashes);
+        }
+        if (materialChanged) {
+          pInstance->clear();
+        }
       }
     }
   }
@@ -1132,13 +1146,18 @@ namespace dxvk {
     // UE3 materials look up their materialHash (shader, texture set and constants), then their
     // textureSetShaderHash (every sibling, constants ignored), then the colour texture hash, so the most
     // specific anchor wins. Every tier is a pure function of the draw.
+    // A raytraced camera draw also looks up its render target right after the materialHash.
     const LegacyMaterialData& inputMaterial = input.getMaterialData();
     const XXH64_hash_t materialHash = inputMaterial.getHash();
     const XXH64_hash_t textureHash = inputMaterial.getColorTexture().getImageHash();
     const XXH64_hash_t textureSetShaderHash = inputMaterial.getTextureSetAndShaderHash();
 
     const char* matchedTier = "material";
-    std::shared_ptr<MaterialData> pReplacementMaterial = m_pReplacer->getReplacementMaterial(materialHash);
+    std::shared_ptr<MaterialData> pReplacementMaterial = input.findMaterialReplacement(
+      [this, materialHash, &matchedTier](XXH64_hash_t hash) {
+        matchedTier = hash == materialHash ? "material" : "camera";
+        return m_pReplacer->getReplacementMaterial(hash);
+      });
 
     if (pReplacementMaterial == nullptr &&
         textureSetShaderHash != kEmptyHash && textureSetShaderHash != materialHash) {
@@ -1624,6 +1643,13 @@ namespace dxvk {
   SceneManager::ObjectCacheState SceneManager::onSceneObjectUpdated(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas) {
     if (pBlas->frameLastTouched == m_device->getCurrentFrameId()) {
       pBlas->cacheMaterial(drawCallState.getMaterialData());
+      // Refresh the cached bone matrices for a mesh drawn repeatedly in one frame.
+      // An entry is only reused here when boneHash matches, and that hash covers just
+      // [minBoneIndex, numBones), so this updates the matrices below that range.
+      if (pBlas->input.getSkinningStateMutable().numBones > 0 &&
+          drawCallState.getSkinningState().numBones == pBlas->input.getSkinningState().numBones) {
+        pBlas->input.getSkinningStateMutable().pBoneMatrices = drawCallState.getSkinningState().pBoneMatrices;
+      }
       return SceneManager::ObjectCacheState::kUpdateInstance;
     }
 
@@ -2031,8 +2057,14 @@ namespace dxvk {
       m_instanceManager.notifySceneChanged();
     }
 
+    // A non-zero bone count does not imply the weight buffer is defined.
+    // processSkinning derives the count from D3DRS_VERTEXBLEND and the vertex
+    // declaration, while the buffer is populated only when the stream had a
+    // valid mapped slice. A fixed-function indexed-blend draw may legally
+    // leave the weight stream unbound while still reporting a bone count.
     if (drawCallState.getSkinningState().numBones > 0 &&
         drawCallState.getGeometryData().numBonesPerVertex > 0 &&
+        drawCallState.getGeometryData().blendWeightBuffer.defined() &&
         (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
       m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
       pBlas->markUpdated(pBlas->frameLastTouched);
@@ -2157,6 +2189,9 @@ namespace dxvk {
     preCreationHash = XXH64(&samplerIndex2, sizeof(samplerIndex2), preCreationHash);
     preCreationHash = XXH64(&hasTexcoords, sizeof(hasTexcoords), preCreationHash);
     preCreationHash = XXH64(&drawCallState.isUsingRaytracedRenderTarget, sizeof(drawCallState.isUsingRaytracedRenderTarget), preCreationHash);
+    const bool albedoOpacityIsRenderTarget = renderMaterialDataType == MaterialDataType::Opaque &&
+      drawCallState.isRaytracedRenderTargetTexture(renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
+    preCreationHash = XXH64(&albedoOpacityIsRenderTarget, sizeof(albedoOpacityIsRenderTarget), preCreationHash);
     const bool isHairCard = drawCallState.testCategoryFlags(InstanceCategories::HairCards);
     preCreationHash = XXH64(&isHairCard, sizeof(isHairCard), preCreationHash);
 
@@ -2367,7 +2402,7 @@ namespace dxvk {
         opaqueMaterialData.getDLSSControlMaskStructuralStrength(),
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget, isHairCard,
         samplerFeedbackStamp,
-        secondaryTextureIndex,
+        secondaryTextureIndex, albedoOpacityIsRenderTarget,
         maskLayerIndex
       };
 
@@ -2779,7 +2814,11 @@ namespace dxvk {
     m_terrainBaker->prepareSceneData(ctx);
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
-    m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+    if (m_bindlessResourceManager.prepareSceneData(
+          ctx, textureManager.getTextureTable(), getBufferTable(),
+          m_bufferCache.getUpdatedSlots(), getSamplerTable())) {
+      m_bufferCache.clearUpdatedSlots();
+    }
 
     // If there are no instances, we should do nothing!
     if (m_instanceManager.getActiveCount() == 0) {
@@ -2954,10 +2993,8 @@ namespace dxvk {
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
 
-    // Upload surface material buffer BEFORE the GPU culling dispatch so the
-    // compute shader can copy template material entries to per-instance slots.
-    // For PointInstancer duplicate entries we skip writeGPUData and advance past
-    // the gap - the GPU shader will fill those slots.
+    // PointInstancer duplicate material entries are unused because their copied
+    // surfaces reference the template material slot.
     //
     // When the scene is unchanged (fast-skip path in mergeInstancesIntoBlas),
     // the surface order and material data are normally identical to last frame.
@@ -2996,8 +3033,7 @@ namespace dxvk {
         uint32_t surfaceIndex = 0;
         std::vector<unsigned char> surfaceMaterialsGPUData(surfaceMaterialsGPUSize);
         for (auto&& pInstance : m_accelManager.getOrderedInstances()) {
-          // For PointInstancer duplicates (entries beyond the template), skip
-          // writeGPUData - the GPU culling shader copies the template material.
+          // PointInstancer duplicates reference the template material slot.
           const auto& surf = pInstance->surface;
           if (surf.instancesToObject != nullptr &&
               surf.surfaceIndexOfFirstInstance != SIZE_MAX &&
@@ -3034,10 +3070,10 @@ namespace dxvk {
     }
 
     // GPU-driven PointInstancer culling: overwrites visible instance placeholders
-    // in m_vkInstanceBuffer with proper transforms and masks, copies per-instance
-    // surface and material data from templates. Must run after prepareSceneData
+    // in m_vkInstanceBuffer with proper transforms and masks, and copies per-instance
+    // surface data from templates. Must run after prepareSceneData
     // (which uploads placeholders) and before buildTlas.
-    m_accelManager.dispatchPointInstancerCulling(ctx, m_cameraManager, m_surfaceMaterialBuffer);
+    m_accelManager.dispatchPointInstancerCulling(ctx, m_cameraManager);
 
     // Build the TLAS
     m_accelManager.buildTlas(ctx);
@@ -3143,6 +3179,7 @@ namespace dxvk {
     Rc<DxvkSampler> externalSampler = getOrCreateExternalSampler();
 
     auto& state = *pstate;
+    state.drawCall.isExternalDraw = true;
 
     {
       state.drawCall.modifyMaterialData().samplers[0] = externalSampler;

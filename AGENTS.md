@@ -67,6 +67,7 @@ Full guide: `documentation/CONTRIBUTING-style-guide.md`
   - Describe the code as it is now. Do not contrast the current state with a previous one, or explain a change.
   - Do not explain things that can easily understood from reading class, function, or variable names.
   - Focus on recording non-obvious interactions and pitfalls.
+  - Keep material parameter documentation in MDL. Reserve code comments about material parameters for implementation details.
   - If a long plain-english explanation of how a complicated set of systems interact is needed, that should go in a .md file in the `documentation/` folder.
     - Documentation about how to use a feature should be clearly separated from technical documenation about how a feature works.
     - In code comments should reference sections of that .md file, rather than repeating or trying to summarize.
@@ -97,6 +98,10 @@ See [the full rule](documentation/CONTRIBUTING-style-guide.md#changes-to-upstrea
 - Always use REMIXAPI macro for Remix exported functions, do NOT use DLLEXPORT macro.
 - Always use REMIXAPI_CALL macro for calling convention for exported function.
 - Always add new export function shims to d3d9_rtx_shim.cpp for correct shimming on WoA.
+
+### Changing the Remix API
+
+- Follow the rules in the Extensibility section of `documentation/RemixSDK.md` for every change to `public/include/remix/remix_c.h`: bump `REMIXAPI_VERSION_PATCH`, only append interface pointers and struct fields, ensure a zero-initialized new field leaves behavior unchanged, and add a changelog entry.
 
 ## RTX Options
 
@@ -161,7 +166,7 @@ When modifying shared headers, ensure both C++ and Slang code paths remain consi
 
 - Squash into a single commit before submitting.
 - Limit changes to those required for the PR goal — no drive-by style fixes.
-- Add your name to `src/dxvk/imgui/dxvk_imgui_about.cpp` under "GitHub Contributors" (A-Z by last name).
+- Credit contributors in `src/dxvk/imgui/dxvk_imgui_about.cpp` (A-Z by last name). NVIDIA employees belong in the appropriate Engineering, Art, or Production section, not "Github Contributors". Reserve "Github Contributors" for external community contributors. Check existing entries before adding a name, and move any incorrectly categorized NVIDIA employee rather than duplicating that entry.
 
 
 ## Key Directories

@@ -296,6 +296,15 @@ namespace dxvk {
   }
 
   void RtxContext::resetScreenResolution(const VkExtent3D& upscaleExtent) {
+    // Defer NGX-dependent resolution setup until a scene needs a camera. This
+    // keeps device creation and raster loading screens independent of NGX, without
+    // temporarily choosing a fallback resolution that would alter camera jitter.
+    if (RtxOptions::isDLSSOrRayReconstructionEnabled() && !m_common->metaNGXContext().isInitializationComplete()) {
+      m_pendingScreenResolution = upscaleExtent;
+      return;
+    }
+    m_pendingScreenResolution.reset();
+
     // Calculate extents based on if DLSS is enabled or not
     const VkExtent3D downscaleExtent = setDownscaleExtent(upscaleExtent);
 
@@ -327,6 +336,14 @@ namespace dxvk {
     // Therefore reloadTextureWhenResolutionChanged is set to OFF by default to improve performance. 
     if (RtxOptions::reloadTextureWhenResolutionChanged()) {
       getSceneManager().requestTextureVramFree();
+    }
+  }
+
+  void RtxContext::prepareScreenResolution() {
+    if (m_pendingScreenResolution) {
+      const VkExtent3D upscaleExtent = *m_pendingScreenResolution;
+      m_common->metaNGXContext().waitForInitialization();
+      resetScreenResolution(upscaleExtent);
     }
   }
 
@@ -689,11 +706,22 @@ namespace dxvk {
       m_frameLastInjected = m_device->getCurrentFrameId();
     }
 
-    if (RtxOptions::upscalerType() == UpscalerType::DLSS && !common->metaDLSS().supportsDLSS()) {
+    // Loading screens can present while NGX initializes, but the first ray-traced
+    // scene must wait for its capabilities. Skipping valid scene frames here would
+    // make temporal history and frame-based screenshots/captures depend on NGX timing.
+    auto& ngxContext = common->metaNGXContext();
+    if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive && !ngxContext.isInitializationComplete()) {
+      ngxContext.waitForInitialization();
+    }
+    const bool ngxInitializationComplete = ngxContext.isInitializationComplete();
+
+    // Pending capabilities are not unsupported capabilities. Preserve the user's
+    // requested features while the loading screen is being rendered.
+    if (ngxInitializationComplete && RtxOptions::upscalerType() == UpscalerType::DLSS && !common->metaDLSS().supportsDLSS()) {
       RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
     }
 
-    if (DxvkDLFG::enable() && !common->metaDLFG().supportsDLFG()) {
+    if (ngxInitializationComplete && DxvkDLFG::enable() && !common->metaDLFG().supportsDLFG()) {
       DxvkDLFG::enable.setDeferred(false);
     }
     
@@ -726,7 +754,8 @@ namespace dxvk {
     bool raytracedThisFrame = false;
 
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
-    // trying to render before shaders are done compiling will cause Remix to block).
+    // trying to render before shaders are done compiling will cause Remix to block). NGX capabilities are ready
+    // here because a renderable scene waits for initialization above.
     if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
       if (targetImage == nullptr) {
         targetImage = m_state.om.renderTargets.color[0].view->image();  
@@ -965,7 +994,11 @@ namespace dxvk {
 
   void RtxContext::outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
                                bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage) {
-    dispatchToneMapping(rtOutput, updateAutoExposure, !m_common->metaPostFx().isLensEffectsEnabled());
+    // The UE3 tonemapper takes over the final pass's dither only when nothing runs after it.
+    // Lens effects run after it, and the final pass also applies the colour inversion.
+    const bool allowToneMapperDither =
+      !m_common->metaPostFx().isLensEffectsEnabled() && DxvkPostFx::inversionAmount() <= 0.0f;
+    dispatchToneMapping(rtOutput, updateAutoExposure, allowToneMapperDither);
 
     // Lens effects (chromatic aberration, vignette) run AFTER tonemapping. They are
     // display-space artifacts so they operate on post-tonemap LDR data.
@@ -976,8 +1009,8 @@ namespace dxvk {
     // captures (WAR for TREX-553: NVTT implicitly applies sRGB during dds->png conversion
     // for 16bit float formats), and when the Mirror's Edge (UE3) tonemapper ran: its
     // output is already display-encoded (gamma 2.0 + colour curves), matching what the
-    // game wrote to its backbuffer, so only dithering applies, and that tonemapper
-    // usually applies it itself.
+    // game wrote to its backbuffer, so only dithering and the colour inversion apply,
+    // and that tonemapper usually applies the dither itself.
     if (!m_ue3DitherApplied) {
       const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput && !m_ue3DisplayTransformApplied;
       dispatchSRGBDither(rtOutput, performSRGBConversion);
@@ -1224,6 +1257,8 @@ namespace dxvk {
       if (drawCallState.applyUe3ForegroundDpg(getSceneManager().getInstanceManager().isExternalCameraRegime())) {
         getSceneManager().recordUe3ForegroundDemotion();
       }
+      // Camera projection jitter must use the final DLSS/RR render resolution.
+      prepareScreenResolution();
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
       if (drawCallState.cameraType == CameraType::Unknown) {
@@ -1262,7 +1297,8 @@ namespace dxvk {
       // Note: TerrainBaking already applies this transform for TexGenMode::CascadedViewPositions 
       if ((transformData.texgenMode == TexGenMode::ViewPositions
            || transformData.texgenMode == TexGenMode::ViewNormals)
-          && RtCamera::enableFreeCamera()) {
+          && RtCamera::enableFreeCamera()
+          && !drawCallState.isEye()) {
         if (cameraManager.isCameraValid(CameraType::Main)) {
           const RtCamera& camera = cameraManager.getMainCamera();
           // Revert the main camera's viewToWorld transform and then apply the free camera's one
@@ -1583,6 +1619,11 @@ namespace dxvk {
     // TODO: should be a spec.const
     constants.enableObjectPicking = bool { rtOutput.m_primaryObjectPicking.isValid() };
 
+    constants.rawAovMask = (rtOutput.m_primaryWorldPositionRaw.isValid() ? kRawAovWorldPosition : 0u)
+                        | (rtOutput.m_primaryTexcoordsRaw.isValid() ? kRawAovTexcoords : 0u)
+                        | (rtOutput.m_primaryNormalF32.isValid() ? kRawAovNormal : 0u);
+    constants.enableCoverageAov = rtOutput.m_primaryCoverage.isValid() ? 1u : 0u;
+
     // Debug View
     {
       const DebugView& debugView = m_common->metaDebugView();
@@ -1590,8 +1631,7 @@ namespace dxvk {
       constants.debugKnob = debugView.debugKnob();
       constants.forceFirstHitInGBufferPass = debugView.showFirstGBufferHit();
       constants.enableDlssNrControlMask =
-        m_common->metaDlssNeuralRendering().useDlssNeuralRendering() &&
-        !DlssNeuralRendering::useAutoMask();
+        m_common->metaDlssNeuralRendering().useDlssNeuralRendering();
       constants.enableDlssNrVolumetricControlMask =
         constants.enableDlssNrControlMask &&
         DlssNeuralRendering::enableVolumetricControlMask();
@@ -1642,11 +1682,7 @@ namespace dxvk {
     ViewDistanceOptions::fillShaderParams(constants.viewDistanceArgs, RtxOptions::getMeterToWorldUnitScale());
     constants.alphaBlendSurfacePackMult = RtxOptions::getMeterToWorldUnitScale();
 
-    // We are going to use this value to perform some animations on GPU, to mitigate precision related issues loop time
-    // at the 24 bit boundary (as we use a 8 bit scalar on top of this time which we want to fit into 32 bits without issues,
-    // plus we also convert this value to a floating point value at some point as well which has 23 bits of precision).
-    // Bitwise and used rather than modulus as well for slightly better performance.
-    constants.timeSinceStartSeconds = (static_cast<uint32_t>(GlobalTime::get().absoluteTimeMs()) & ((1U << 24U) - 1U)) / 1000.f;
+    constants.timeSinceStartSeconds = GlobalTime::get().animationTimeSeconds();
 
     m_common->metaRtxdiRayQuery().setRaytraceArgs(rtOutput);
     getSceneManager().getLightManager().setRaytraceArgs(
@@ -1765,6 +1801,13 @@ namespace dxvk {
     constants.eyeArgs.whitesAlbedoScale = RtxOptions::Eye::eyeWhitesAlbedoScale();
     constants.eyeArgs.irisRadius = RtxOptions::Eye::irisRadius();
     constants.eyeArgs.irisDepth = RtxOptions::Eye::irisDepth();
+    const auto& eyeShadingToWorld = getSceneManager().getInstanceManager().getEyeShadingToWorld();
+    const auto& eyeWorldToShading = getSceneManager().getInstanceManager().getEyeWorldToShading();
+
+    for (uint32_t i = 0; i < std::size(constants.eyeArgs.corrections); i++) {
+      constants.eyeArgs.corrections[i].shadingToWorld = eyeShadingToWorld[i];
+      constants.eyeArgs.corrections[i].worldToShading = eyeWorldToShading[i];
+    }
 
     constants.shadowTerminatorArgs.soften = RtxOptions::ShadowTerminator::soften();
 
@@ -3053,14 +3096,9 @@ namespace dxvk {
         D3D9RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
         newState = prevCB.programmablePipeline;
 
-        // Create cube plane projection
-        Matrix4 proj = viewToProj;
-        proj[0][0] = 1.f;
-        proj[1][1] = 1.f;
-        proj[2][2] = 1.f;
-        proj[2][3] = 1.f;
-
-        newState.customWorldToProjection = proj * makeViewMatrixForCubePlane(plane, camPos);
+        newState.customWorldToProjection =
+          makeProjectionMatrixForCube(viewToProj) *
+          makeViewMatrixForCubePlane(plane, camPos);
       } else {
         // Push new state to the fixed function constants
         D3D9FixedFunctionVS& newState = allocAndMapFixedFunctionVSConstantBuffer();
@@ -3070,11 +3108,8 @@ namespace dxvk {
         // Set to identity, as we use custom matrices that transform from world to cube side projection
         newState.View      = view;
         newState.WorldView = view * prevCB.fixedFunction.World;
-        // And cube plane projection
-        newState.Projection[0][0] = 1.f;
-        newState.Projection[1][1] = 1.f;
-        newState.Projection[2][2] = 1.f;
-        newState.Projection[2][3] = 1.f;
+        newState.Projection =
+          makeProjectionMatrixForCube(prevCB.fixedFunction.Projection);
       }
 
       DxvkRenderTargets skyRt;

@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_draw_call_cache.h"
+#include "rtx_options.h"
 #include "../d3d9/d3d9_state.h"
 
 namespace dxvk 
@@ -84,15 +85,33 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
   // Bucket has multiple BlasEntries
 
   float bestScore = std::numeric_limits<float>::min();
-  Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
+
+  // Read once because RtxOption::operator() takes a global mutex per read.
+  const bool worldSpaceBones = RtxOptions::assumeWorldSpaceSkinnedBones();
+
+  // Pairs a draw with one of several candidates sharing a topological hash. World-placement bones
+  // give every instance the same centroid, so a representative bone from the previous frame is used.
+  auto pairingCentroid = [worldSpaceBones](const DrawCallState& dc) -> Vector3 {
+    const SkinningData& sk = dc.getSkinningState();
+    if (worldSpaceBones &&
+        sk.numBones > sk.minBoneIndex && sk.minBoneIndex < sk.pBoneMatrices.size()) {
+      // Pairing only needs a point near where the instance sat last frame, so the bone's
+      // world position is enough. minBoneIndex stands in for a root bone, because rigging
+      // places roots first and a fast-moving limb would destabilize pairing.
+      // objectToWorld is identity for world-space bones, but external draws retain it.
+      const Matrix4 bonePlacement = dc.getTransformData().objectToWorld * sk.pBoneMatrices[sk.minBoneIndex];
+      return bonePlacement[3].xyz();
+    }
+    return dc.getGeometryData().boundingBox.getTransformedCentroid(dc.getTransformData().objectToWorld);
+  };
   // for UE3 vertex shader skinned draws, objectToWorld is identity and the bounding box is
   // bindpose, so the transformed centroid is identical for every instance of a shared skeletal
   // mesh and cannot separate them - so we should use the bone derived world anchor instead and fall back to the
-  // transformed centroid for everything else
+  // pairing centroid for everything else
   const bool useSkinnedAnchor = drawCall.hasSkinnedWorldAnchor();
   const Vector3 newWorldPosition = useSkinnedAnchor
     ? drawCall.getSkinnedWorldAnchor()
-    : drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
+    : pairingCentroid(drawCall);
 
   for (auto bucketIter = range.first; bucketIter != range.second; bucketIter++) {
     BlasEntry& blas  = bucketIter->second;
@@ -115,10 +134,9 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     if (blas.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash()) {
       score += 1000.f;
     }
-    // TODO this is only checking the distance to the first instance that created the BlasEntry, not to
-    // each instance.  It also doesn't include the portal logic from InstanceManager.
+    // Portal logic is omitted. blas.input holds the previous-frame position, so a match is one frame away.
     // only compare positions when both sides live in the same space, bone-derived world anchors
-    // for skinned draws or transformed bindpose centroids otherwise. Mixing the two would be
+    // for skinned draws or pairing centroids otherwise. Mixing the two would be
     // meaningless so in that case the spatial term is left at zero and matching relies on the
     // hash scores above
     if (useSkinnedAnchor) {
@@ -126,8 +144,7 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
         score -= lengthSqr(newWorldPosition - blas.input.getSkinnedWorldAnchor());
       }
     } else {
-      Matrix4 oldTransform = blas.input.getTransformData().objectToWorld;
-      const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(oldTransform);
+      const Vector3 worldPosition = pairingCentroid(blas.input);
       score -= lengthSqr(newWorldPosition - worldPosition);
     }
     if (score > bestScore) {

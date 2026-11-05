@@ -551,9 +551,11 @@ namespace dxvk {
 
     m_instanceOmmRequests.clear();
 
-    // Note: m_ommCandidates is intentionally NOT cleared here. It tracks
-    // instances that need a retry, while processOmmCandidates() also scans
-    // the instance table for stale generation data after this generation bump.
+    // The candidate set holds raw instance pointers. Any path that destroys
+    // instances in bulk, without removing each one individually, leaves those
+    // pointers dangling and faults the next scan. A generation counter would
+    // not help, because reading it means dereferencing the stale pointer.
+    m_ommCandidates.clear();
 
     m_ommGeneration++;
 
@@ -702,7 +704,9 @@ namespace dxvk {
 
   void OpacityMicromapManager::seedCandidates(const std::vector<RtInstance*>& instances) {
     for (RtInstance* inst : instances) {
-      if (inst && !inst->isMarkedForGC()) {
+      // Renderer-created instances do not raise the destroyed callback, so
+      // tracking them here would leave a dangling pointer.
+      if (inst && !inst->isMarkedForGC() && !inst->isCreatedByRenderer()) {
         m_ommCandidates.insert(inst);
       }
     }
@@ -849,7 +853,9 @@ namespace dxvk {
     }
 
     const GeometryBufferData bufferData(geometryData);
-    const bool hasNonIdentityTextureTransform = instance.surface.textureTransform != Matrix4();
+    // The scroll offset is left out, the same way spritesheet animation is not baked.
+    const Matrix4& textureTransform = instance.surface.textureTransform;
+    const bool hasNonIdentityTextureTransform = textureTransform != Matrix4();
     const bool usesIndices = geometryData.usesIndices();
     const bool has16bitIndices = usesIndices ? geometryData.indexBuffer.indexType() == VK_INDEX_TYPE_UINT16 : false;
     const uint32_t subdivisionLevel = OpacityMicromapOptions::Building::subdivisionLevel();
@@ -911,7 +917,7 @@ namespace dxvk {
           texcoords[i] = bufferData.getTexCoord(index);
 
           if (hasNonIdentityTextureTransform) {
-            texcoords[i] = (instance.surface.textureTransform * Vector4(texcoords[i].x, texcoords[i].y, 0.f, 1.f)).xy();
+            texcoords[i] = transformTexcoord(textureTransform, texcoords[i]);
           }
         }
 
@@ -1364,7 +1370,8 @@ namespace dxvk {
     std::vector<RtInstance*> retryCandidates;
 
     auto keepCandidateForRetry = [this](RtInstance* inst) {
-      if (inst && !inst->isMarkedForGC()) {
+      // See seedCandidates() for why m_isCreatedByRenderer is filtered out.
+      if (inst && !inst->isMarkedForGC() && !inst->isCreatedByRenderer()) {
         m_ommCandidates.insert(inst);
       }
     };
@@ -1557,7 +1564,8 @@ namespace dxvk {
     }
 
     for (RtInstance* inst : retryCandidates) {
-      if (!inst->isMarkedForGC()) {
+      // See seedCandidates() for why m_isCreatedByRenderer is filtered out.
+      if (!inst->isMarkedForGC() && !inst->isCreatedByRenderer()) {
         m_ommCandidates.insert(inst);
       }
     }

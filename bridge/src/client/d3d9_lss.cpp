@@ -128,6 +128,7 @@ SceneState gSceneState = WaitBeginScene;
 std::chrono::steady_clock::time_point gTimeStart;
 bool gbBridgeRunning = true;
 std::mutex gSwapChainMapMutex;
+std::mutex gPresentMutex;
 SwapChainMap gSwapChainMap;
 const char* gServerExecutable = "NvRemixBridge.exe";
 
@@ -362,7 +363,10 @@ void InitServer() {
 
   BridgeState::setServerState(BridgeState::ProcessState::Handshaking);
   Logger::info("Ack received! Handshake completed! Telling server to continue waiting for commands...");
-  ClientMessage { Commands::Bridge_Continue };
+  {
+    ClientMessage c(Commands::Bridge_Continue);
+    c.send_data(GlobalOptions::getResponsePolicyFlags());
+  }
 
 #ifdef DEBUG
   {
@@ -502,9 +506,8 @@ bool RemixAttach(HMODULE hModule) {
     initModuleBridge();
     initDeviceBridge();
 
-    // Created here, before the server is launched, so these counts are the ones that apply.
-    gpPresent = new NamedSemaphore("Present", GlobalOptions::getPresentSemaphoreMaxFrames(),
-                                   std::max<uint8_t>(1, GlobalOptions::getPresentSemaphoreMaxFrames()));
+    // The initial count lets the client run presentSemaphoreMaxFrames frames ahead of the server.
+    gpPresent = NamedSemaphore::createPresent(GlobalOptions::getPresentSemaphoreMaxFrames());
 
     BridgeState::setClientState(BridgeState::ProcessState::Init);
 

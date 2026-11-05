@@ -20,12 +20,14 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <cstddef>
 #include <cstring>
 
 #include "log/log.h"
 #include "util_bridgecommand.h"
 #include "util_devicecommand.h"
 #include "util_remixapi.h"
+#include "../../../src/util/util_remix_api_version.h"
 
 using namespace remixapi::util;
 
@@ -41,16 +43,7 @@ bool isRemixApiVersionCompatible(uint64_t appVersion) {
     REMIXAPI_VERSION_MINOR,
     REMIXAPI_VERSION_PATCH);
 
-  const bool isDevelopment =
-    REMIXAPI_VERSION_GET_MAJOR(appVersion) == 0 &&
-    REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) == 0;
-
-  if (isDevelopment) {
-    return REMIXAPI_VERSION_GET_MINOR(appVersion) == REMIXAPI_VERSION_GET_MINOR(kCompiledVersion);
-  }
-
-  return REMIXAPI_VERSION_GET_MAJOR(appVersion) == REMIXAPI_VERSION_GET_MAJOR(kCompiledVersion) &&
-         REMIXAPI_VERSION_GET_MINOR(appVersion) <= REMIXAPI_VERSION_GET_MINOR(kCompiledVersion);
+  return remixapi_version::isClientVersionCompatible(appVersion, kCompiledVersion);
 }
 
 }
@@ -134,12 +127,13 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMaterial(
           auto* pOpaqueMat = static_cast<const remixapi_MaterialInfoOpaqueEXT* const>(infoItr);
           remixapi_MaterialInfoOpaqueEXT opaqueMat = { };
           if (g_appRemixApiVersion < REMIXAPI_VERSION_MAKE(0, 6, 5)) {
-            constexpr size_t kOpaqueMaterialInfoSizeAtVersion064 = 92;
-            std::memcpy(&opaqueMat, pOpaqueMat, kOpaqueMaterialInfoSizeAtVersion064);
+            std::memcpy(&opaqueMat, pOpaqueMat, offsetof(remixapi_MaterialInfoOpaqueEXT, enableDlssControlMask));
             opaqueMat.enableDlssControlMask = true;
             opaqueMat.dlssControlMaskIntensity = 1.f;
             opaqueMat.dlssControlMaskToneStrength = 1.f;
             opaqueMat.dlssControlMaskStructuralStrength = 1.f;
+          } else if (g_appRemixApiVersion < REMIXAPI_VERSION_MAKE(0, 6, 6)) {
+            std::memcpy(&opaqueMat, pOpaqueMat, offsetof(remixapi_MaterialInfoOpaqueEXT, textureScrollRate));
           } else {
             opaqueMat = *pOpaqueMat;
           }
@@ -157,8 +151,14 @@ remixapi_ErrorCode REMIXAPI_CALL remixapi_CreateMaterial(
         case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT:
         {
           auto* pTranslucentMat = static_cast<const remixapi_MaterialInfoTranslucentEXT* const>(infoItr);
+          remixapi_MaterialInfoTranslucentEXT translucentMat = { };
+          if (g_appRemixApiVersion < REMIXAPI_VERSION_MAKE(0, 6, 6)) {
+            std::memcpy(&translucentMat, pTranslucentMat, offsetof(remixapi_MaterialInfoTranslucentEXT, textureScrollRate));
+          } else {
+            translucentMat = *pTranslucentMat;
+          }
           send(c, Bool::True);
-          serializeAndSend<serialize::MaterialInfoTranslucent>(c, *pTranslucentMat);
+          serializeAndSend<serialize::MaterialInfoTranslucent>(c, translucentMat);
           break;
         }
         case REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_PORTAL_EXT:
@@ -494,7 +494,7 @@ extern "C" {
         return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
       }
       status = static_cast<remixapi_ErrorCode>(DeviceBridge::get_data());
-      DeviceBridge::pop_front();
+      DeviceBridge::consumeResponse();
     }
     if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
       return status;
@@ -525,7 +525,8 @@ extern "C" {
       // interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
 
-    *out_result = interf;
+    // Older apps allocate a shorter interface, so only the prefix they know is written.
+    std::memcpy(out_result, &interf, remixapi_version::clientInterfaceSize(info->version));
     remixapi::g_appRemixApiVersion = info->version;
     remixapi::g_bInterfaceInitialized = true;
 

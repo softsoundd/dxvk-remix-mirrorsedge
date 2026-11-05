@@ -79,7 +79,8 @@ vec3 marchCloudCorrection(uint2 pixel, vec3 worldDirection, CloudArgs cloud, Atm
   const vec3 dirYUp = normalize(cloudWorldToYUp(worldDirection, atmosphere.isZUp != 0));
 
   const CloudMarchSettings settings = cloudReflectionMarchSettings(cloud);
-  const float jitter = BlueNoise[uint3(pixel & 127u, cloud.frameIndex & 63u)].y;
+  // BlueNoise is single channel. The layer offset keeps this jitter apart from cloud_screen.comp.slang's.
+  const float jitter = BlueNoise[uint3(pixel & 127u, (cloud.frameIndex + 32u) & 63u)].x;
   const CloudMarchResult marched = cloudMarch(dirYUp, settings, jitter, cloud, atmosphere);
 
   // The sky the integrator's miss took, under the dome's clouds as it composited them and under the march's.

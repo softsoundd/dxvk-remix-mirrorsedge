@@ -413,6 +413,11 @@ namespace dxvk {
       }
       assert(instanceId != UINT64_MAX);
 
+      // Remix API draws are mod content with per-session geometry hashes and no legacy game material, so they are not captured.
+      if (pRtInstance->getBlas()->input.isExternalDraw) {
+        continue;
+      }
+
       if (pRtInstance->getBlas()->input.cameraType == CameraType::Sky) {
         if (!m_pCap->bSkyProbeBaked) {
           const std::string skyProbeFilename = getBakedSkyProbeName(m_pCap->instance.stageName);
@@ -475,17 +480,18 @@ namespace dxvk {
     // their shared BlasEntry no longer knows (see BlasEntry::tryGetMaterialData). Fall back to
     // the BlasEntry's current material, keyed by its own hash so the exported binding stays
     // consistent.
-    XXH64_hash_t matHash = rtInstance.getMaterialDataHash();
-    const LegacyMaterialData* pMaterial = pBlas->tryGetMaterialData(matHash);
+    XXH64_hash_t legacyMatHash = rtInstance.getMaterialDataHash();
+    const LegacyMaterialData* pMaterial = pBlas->tryGetMaterialData(legacyMatHash);
     if (pMaterial == nullptr) {
       pMaterial = &pBlas->input.getMaterialData();
       Logger::warn(str::format(
-        "[GameCapturer][", m_pCap->idStr, "] Instance material 0x", std::hex, matHash,
+        "[GameCapturer][", m_pCap->idStr, "] Instance material 0x", std::hex, legacyMatHash,
         " is no longer resident on its BlasEntry - capturing with the BlasEntry's current material 0x",
         pMaterial->getHash(), std::dec, " instead."));
-      matHash = pMaterial->getHash();
+      legacyMatHash = pMaterial->getHash();
     }
     const LegacyMaterialData& material = *pMaterial;
+    const XXH64_hash_t matHash = pBlas->input.getCapturedMaterialHash(legacyMatHash);
 
     const bool bIsNewMat = (matHash != 0x0) && (m_pCap->materials.count(matHash) == 0);
     if (bIsNewMat) {
@@ -493,7 +499,7 @@ namespace dxvk {
       // to export - a render-target-only or evicted texture, or a UE3 draw whose whole sampler set
       // was lightmaps. Skipping one leaves the mesh bound to a prim the stage never declares, which
       // the Toolkit can neither select nor author.
-      captureMaterial(ctx, material, !rtInstance.surface.alphaState.isFullyOpaque);
+      captureMaterial(ctx, material, matHash, !rtInstance.surface.alphaState.isFullyOpaque);
     }
 
     bool bIsNewMesh = false;
@@ -556,11 +562,12 @@ namespace dxvk {
     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Inst:" + hashToString(instanceId) + "] New");
   }
 
-  void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData, const bool bEnableOpacity) {
+  void GameCapturer::captureMaterial(const Rc<DxvkContext> ctx, const LegacyMaterialData& materialData,
+                                   const XXH64_hash_t materialHash, const bool bEnableOpacity) {
     lss::Material lssMat; // to be populated
 
     // Resolve material name
-    const std::string matName = dxvk::hashToString(materialData.getHash());
+    const std::string matName = dxvk::hashToString(materialHash);
     lssMat.matName = matName;
     // A UE3 composite bake (rtx.ue3CompositeMaterialTextures) is what the surface renders, and the
     // captured UVs already span its repeat, so it is what the stage shows.
@@ -610,7 +617,7 @@ namespace dxvk {
     lssMat.enableOpacity = bEnableOpacity;
 
     // Set populated LSS Material in our cache
-    m_pCap->materials[materialData.getHash()].lssData = lssMat;
+    m_pCap->materials[materialHash].lssData = lssMat;
     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Mat:" + matName + "] New");
   }
 

@@ -27,6 +27,7 @@
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/packing.slangh"
 #include "rtx/utility/froxel.slangh"
+#include "rtx/concept/billboard.slangh"
 #include "rtx/concept/ray/ray.slangh"
 #include "rtx/concept/surface/surface.slangh"
 #include "rtx/concept/surface_material/surface_material.slangh"
@@ -337,7 +338,8 @@ void resolveVertexFinalMiss<let overrideRayInteraction : bool, T : IBasePayloadS
 // Emissive radiance and attenuation may be accumulated immediately but the continueResolving flag must be checked to see if the
 // function should return and continue attempting to resolve an interaction. If false, the Ray Interaction can then be checked
 // for a hit and hit logic can be performed.
-void resolveVertex<T: IBasePayloadState>(
+// Returns only the opacity transmittance of skipped approximation hits.
+float resolveVertex<T: IBasePayloadState>(
   uint8_t resolveMode,
   RayHitInfo rayHitInfo, inout T resolveVertexState,
   inout Ray ray, inout RayInteraction rayInteraction,
@@ -345,7 +347,7 @@ void resolveVertex<T: IBasePayloadState>(
   inout PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction,
   inout vec3 radianceAttenuation, inout vec3 emissiveRadiance,
   uint4 decalMemory,
-  vec3 decalEmissiveRadiance,
+  f16vec3 decalEmissiveRadiance,
   float coneSpreadAngle,
   inout bool isStochasticAlphaBlend,
   inout uint8_t firstRayPortal,
@@ -382,7 +384,7 @@ void resolveVertex<T: IBasePayloadState>(
     // Note: Ray interaction is already a miss here, so no need for this function to override it.
     resolveVertexFinalMiss<false>(resolveVertexState, rayInteraction, radianceAttenuation);
 
-    return;
+    return 1.0f;
   }
 
   resolveVertexState.segmentHitDistance = rayInteraction.hitDistance;
@@ -409,7 +411,7 @@ void resolveVertex<T: IBasePayloadState>(
   {
     // Continue resolving when we hit a clipped geometry to find possible objects behind it.
     resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
-    return;
+    return 1.0f;
   }
 
   if (!evalViewDistance(cb.viewDistanceArgs, cb.isZUp, camera, surfaceInteraction.position))
@@ -417,12 +419,12 @@ void resolveVertex<T: IBasePayloadState>(
     // Note: Treat view distance interactions as misses as no geometry should be processed past them
     // (since these operations essentially clip out everything beyond them in a specific direction).
     resolveVertexFinalMiss<true>(resolveVertexState, rayInteraction, radianceAttenuation);
-    return;
+    return 1.0f;
   }
 
   // Create a Surface Material and Surface Material Interaction from the Surface
 
-  const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
+  const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[surface.surfaceMaterialIndex];
   
   const uint8_t polymorphicType = rayInteraction.materialType;
 
@@ -444,11 +446,11 @@ void resolveVertex<T: IBasePayloadState>(
     {
       MemoryDecalMaterialInteraction memory;
       memory.packed = decalMemory;
-      memory.emissiveRadiance = f16vec3(decalEmissiveRadiance);
+      memory.emissiveRadiance = decalEmissiveRadiance;
       DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
 
       decalMaterialInteractionBlend(decalMaterialInteraction, opaqueSurfaceMaterialInteraction);
-      
+
       resolveVertexState.decalEncountered = false;
     }
 
@@ -461,11 +463,19 @@ void resolveVertex<T: IBasePayloadState>(
     // the texture coordinates of the surface we hit
     if (cb.enableRaytracedRenderTarget && opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET)
     {
+      // NV-DXVK start: Transparent camera surfaces contribute neither image nor light.
+      if (opaqueSurfaceMaterialInteraction.opacity <= 0.0f)
+      {
+        isRaytracedRenderTarget = false;
+        resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
+        return 1.0f;
+      }
+      // NV-DXVK end
       isRaytracedRenderTarget = true;
 
       resolveVertexFinalHit(resolveVertexState);
 
-      return;
+      return 1.0f;
     }
     else
     {
@@ -481,7 +491,7 @@ void resolveVertex<T: IBasePayloadState>(
 
       resolveVertexFinalHit(resolveVertexState);
 
-      return;
+      return 1.0f;
     }
 
     // Note: Backfacing hits on opaque materials for now are not considered as they have no relevant contribution for lighting. This may change however if thin opaque surfaces are added.
@@ -504,7 +514,7 @@ void resolveVertex<T: IBasePayloadState>(
       pomOpaqueSurfaceEncountered = opaqueSurfaceMaterial.hasValidDisplacement();
 
       resolveVertexFinalHit(resolveVertexState);
-      return;
+      return 1.0f;
     }
 
     // Handle opaque approximations
@@ -527,7 +537,7 @@ void resolveVertex<T: IBasePayloadState>(
         // Note: Must call resolve final on any return which expects resolving to continue.
         resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-        return;
+        return opaqueApproximationOutgoingAttenuation;
       }
     }
 
@@ -550,7 +560,7 @@ void resolveVertex<T: IBasePayloadState>(
       // Note: Must call resolve final on any return which expects resolving to continue.
       resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-      return;
+      return 1.0f;
     }
   }
   else if (SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK & SURFACE_MATERIAL_RESOLVE_TYPE_TRANSLUCENT &&
@@ -566,7 +576,7 @@ void resolveVertex<T: IBasePayloadState>(
     {
       MemoryDecalMaterialInteraction memory;
       memory.packed = decalMemory;
-      memory.emissiveRadiance = f16vec3(decalEmissiveRadiance);
+      memory.emissiveRadiance = decalEmissiveRadiance;
       DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
 
       decalMaterialInteractionBlend(decalMaterialInteraction, translucentSurfaceMaterialInteraction);
@@ -597,14 +607,14 @@ void resolveVertex<T: IBasePayloadState>(
         // Note: Must call resolve final on any return which expects resolving to continue.
         resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-        return;
+        return 1.0f;
       }
     }
   }
   else if ((SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK & SURFACE_MATERIAL_RESOLVE_TYPE_RAY_PORTAL || forceEnableResolveRayPortal) &&
            polymorphicType == surfaceMaterialTypeRayPortal)
   {
-    const RayPortalSurfaceMaterial rayPortalSurfaceMaterial = rayPortalSurfaceMaterialCreate(uint(rayInteraction.surfaceIndex), memoryPolymorphicSurfaceMaterial);
+    const RayPortalSurfaceMaterial rayPortalSurfaceMaterial = rayPortalSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
     const RayPortalSurfaceMaterialInteraction rayPortalSurfaceMaterialInteraction =
       rayPortalSurfaceMaterialInteractionCreate(rayPortalSurfaceMaterial, surface, surfaceInteraction);
@@ -640,7 +650,7 @@ void resolveVertex<T: IBasePayloadState>(
       // Note: Must call resolve final on any return which expects resolving to continue.
       resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
-      return;
+      return 1.0f;
     }
 
     // Find Ray Portal Hit Info
@@ -661,7 +671,7 @@ void resolveVertex<T: IBasePayloadState>(
       {
         resolveVertexFinalMiss<true>(resolveVertexState, rayInteraction, radianceAttenuation);
 
-        return;
+        return 1.0f;
       }
 
       teleportMatrix = rayPortalHitInfo.encodedPortalToOpposingPortalDirection.unpack();
@@ -692,12 +702,13 @@ void resolveVertex<T: IBasePayloadState>(
     resolveVertexFinalContinue(ray, surfaceInteraction, teleport, teleportMatrix, resolveVertexState);
 
     // Note: Continue resolving if the Ray Portal was inactive or if it was traversed.
-    return;
+    return 1.0f;
   }
 
   // Indicate resolving is finished in the absence of any need to continue
 
   resolveVertexFinalHit(resolveVertexState);
+  return 1.0f;
 }
 
 #ifndef UNORDERED_RESOLVE_WBOIT
@@ -879,7 +890,7 @@ bool resolveUnorderedOpaqueParticleCandidate(
   return true;
 }
 
-void resolveVertexUnorderedParticles<
+float resolveVertexUnorderedParticles<
   let RAY_FLAGS : uint>(
   uint8_t resolveMode, Ray ray, uint rayMask,
   PortalSpace2BitsType portalSpace,
@@ -897,12 +908,14 @@ void resolveVertexUnorderedParticles<
 {
   surfaceIndex = -1;
 
+  float opacityTransmittance = 1.0f;
+
   const bool separateUnorderedApproximations = packedFlagGet(resolveMode, resolveModeSeparateUnorderedApproximations);
 
   if (!separateUnorderedApproximations)
   {
     numInteractions = 0;
-    return;
+    return 1.0f;
   }
 
   if (useIntersectionBillboards)
@@ -1059,8 +1072,7 @@ void resolveVertexUnorderedParticles<
       surfaceInteraction.position = p;
       surfaceInteraction.positionError = 0;
       surfaceInteraction.geometryNormal = normal;
-      surfaceInteraction.geometryTangent = billboard.xAxis;
-      surfaceInteraction.geometryBitangent = billboard.yAxis;
+      calcBillboardTangents(billboard, normal, surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent);
       surfaceInteraction.motion = 0;
       surfaceInteraction.textureCoordinates = uv;
       surfaceInteraction.textureGradientX = dUVRatio.x * billboard.xAxisUV;
@@ -1069,8 +1081,8 @@ void resolveVertexUnorderedParticles<
     }
 
     const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
-    // Note: Read alongside the Surface rather than after the vertex fetch so the two loads overlap.
-    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
+    // Note: Read before the vertex fetch rather than after it so the two loads overlap.
+    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[surface.surfaceMaterialIndex];
 
     // Decals are left to the deferred decal pass, which only needs to know one may cover the surface.
     if (isTriangle && surfaceIsDecal(surface))
@@ -1149,6 +1161,7 @@ void resolveVertexUnorderedParticles<
     const float blendFactor = surface.isParticle ? softBlendFactor : 1.0f;
 
     currentRadianceAttenuation = mix(1.0f, currentRadianceAttenuation, blendFactor);
+    opacityTransmittance *= currentRadianceAttenuation;
     currentEmissiveRadiance = mix(vec3(0.0f), currentEmissiveRadiance, blendFactor);
 
     if (any(currentEmissiveRadiance > 0.0f))
@@ -1216,7 +1229,7 @@ void resolveVertexUnorderedParticles<
 
   if (numInteractions == 0)
   {
-    return;
+    return 1.0f;
   }
 
 #ifdef UNORDERED_RESOLVE_WBOIT
@@ -1250,6 +1263,7 @@ void resolveVertexUnorderedParticles<
 #endif
 
   emissiveRadiance *= 1.0f / pathSelectionProbability;
+  return opacityTransmittance;
 }
 
 // Handles unordered Resolve operations within the resolve loop which do not depend on the typical ordered execution
@@ -1271,7 +1285,7 @@ void resolveVertexUnordered<
   out uint numInteractions,
   inout bool decalEncountered,
   inout uint4 decalMemory,
-  inout vec3 decalEmissiveRadiance,
+  inout f16vec3 decalEmissiveRadiance,
   inout int surfaceIndex)
 {
   // Early out if approximations are not desired to be separated out
@@ -1463,8 +1477,7 @@ void resolveVertexUnordered<
       surfaceInteraction.position = p;
       surfaceInteraction.positionError = 0;
       surfaceInteraction.geometryNormal = normal;
-      surfaceInteraction.geometryTangent = billboard.xAxis;
-      surfaceInteraction.geometryBitangent = billboard.yAxis;
+      calcBillboardTangents(billboard, normal, surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent);
       surfaceInteraction.motion = 0;
       surfaceInteraction.textureCoordinates = uv;
       surfaceInteraction.textureGradientX = dUVRatio.x * billboard.xAxisUV;
@@ -1472,9 +1485,9 @@ void resolveVertexUnordered<
       surfaceInteraction.vertexColor = vertexColor;
     }
 
-    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
-    // Note: Read alongside the Surface rather than after the vertex fetch so the two loads overlap.
-    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
+    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
+    // Note: Read before the vertex fetch rather than after it so the two loads overlap.
+    const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[surface.surfaceMaterialIndex];
 
     // Whether this instantiation handles the candidate is known from the Surface alone, so decide
     // before the vertex fetch and the material evaluation (the decal-only pass would otherwise
@@ -1485,6 +1498,15 @@ void resolveVertexUnordered<
     {
       continue;
     }
+
+#ifndef RAY_TRACING_PRIMARY_RAY
+    // Back-facing opaque decals never contribute.
+    // Primary rays still create their materials, because material creation writes sampler feedback and debug views.
+    if (ENABLE_DECALS && isDecal && rayInteraction.materialType == surfaceMaterialTypeOpaque && !rayInteraction.frontHit)
+    {
+      continue;
+    }
+#endif
 
     if (isTriangle)
     {
@@ -1574,7 +1596,7 @@ void resolveVertexUnordered<
               // use this decal
               MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteraction);
               decalMemory = memory.packed;
-              decalEmissiveRadiance = vec3(memory.emissiveRadiance);
+              decalEmissiveRadiance = memory.emissiveRadiance;
               surfaceIndex = rayInteraction.surfaceIndex;
               sampledSortOrder = decalSortKey;
               minDecalSample = rngValue;
@@ -1809,12 +1831,13 @@ void resolveVertexUnordered<
     // write it to output values
     MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteractionComposited);
     decalMemory = memory.packed;
-    decalEmissiveRadiance = vec3(memory.emissiveRadiance);
+    decalEmissiveRadiance = memory.emissiveRadiance;
   }
 #endif
 
   emissiveRadiance *= 1.0f / pathSelectionProbability;
-  decalEmissiveRadiance *= 1.0f / pathSelectionProbability;
+  // Scaled in full precision. Every reader rounds it to half precision anyway.
+  decalEmissiveRadiance = f16vec3(vec3(decalEmissiveRadiance) * (1.0f / pathSelectionProbability));
 }
 
 #if 0

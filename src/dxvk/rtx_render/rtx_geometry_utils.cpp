@@ -326,7 +326,8 @@ namespace dxvk {
     // At some point, its more efficient to do these calculations on the GPU, this limit is somewhat arbitrary however, and might require better tuning...
     const uint32_t kNumVerticesToProcessOnCPU = 256;
 
-    // Check we have appropriate CPU access
+    // The early return above guarantees blendWeightBuffer is defined.
+    // blendIndicesBuffer is optional, so it still needs its own check.
     const bool pendingGpuWrite = drawCallState.getGeometryData().positionBuffer.isPendingGpuWrite() ||
                                  drawCallState.getGeometryData().normalBuffer.isPendingGpuWrite() ||
                                  drawCallState.getGeometryData().blendWeightBuffer.isPendingGpuWrite() ||
@@ -522,14 +523,15 @@ namespace dxvk {
     // Fill out the arguments
     BakeOpacityMicromapArgs args {};
     size_t surfaceWriteOffset = 0;
+    // Time 0 bakes without the scroll offset, the same way spritesheet animation is not baked.
     if (instance.surface.hasAnimatedVertexOpacity) {
       // The source hash has no vertex opacity in it, so a micromap baked with one would freeze the
       // alpha the vertices had at the time. Without it the bake only ever over-estimates opacity.
       RtSurface bakeSurface = instance.surface;
       bakeSurface.color0BufferIndex = kSurfaceInvalidBufferIndex;
-      bakeSurface.writeGPUData(&args.surface[0], surfaceWriteOffset);
+      bakeSurface.writeGPUData(&args.surface[0], surfaceWriteOffset, SIZE_MAX, 0);
     } else {
-      instance.surface.writeGPUData(&args.surface[0], surfaceWriteOffset);
+      instance.surface.writeGPUData(&args.surface[0], surfaceWriteOffset, SIZE_MAX, 0);
     }
     args.numTriangles = desc.numTriangles;
     args.numMicroTrianglesPerTriangle = desc.numMicroTrianglesPerTriangle;

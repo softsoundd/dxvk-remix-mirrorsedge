@@ -112,6 +112,13 @@ struct SssArgs {
   u16vec2 diffusionProfileDebuggingPixel;
 };
 
+// Linear transforms only: positions are relative to the transported eye origin.
+// CPU-computed matrices, consumed directly by the shader in column-vector convention.
+struct EyeCorrectionArgs {
+  mat3 shadingToWorld;
+  mat3 worldToShading;
+};
+
 struct EyeArgs {
   uint  enableEyes;
   float normalBendingEyeball;
@@ -122,6 +129,9 @@ struct EyeArgs {
   float irisDepth;
   uint  pad0;
   uint  pad1;
+
+  // One real viewmodel space and the single supported virtual portal space.
+  EyeCorrectionArgs corrections[2];
 };
 
 struct ShadowTerminatorArgs
@@ -135,6 +145,12 @@ struct ShadowTerminatorArgs
 #define OBJECT_PICKING_INVALID (cb.clearColorPicking)
 
 // Constant buffer
+// Bits correspond to remixapi_dxvk_CopyRenderingOutputType values.
+static const uint kRawAovWorldPosition = 1u << 5;
+static const uint kRawAovTexcoords = 1u << 6;
+static const uint kRawAovNormal = 1u << 7;
+static const uint kRawAovAll = kRawAovWorldPosition | kRawAovTexcoords | kRawAovNormal;
+
 struct RaytraceArgs {
   // NOTE: this class should be kept as all structs, then all non-structs.  This is because the padding rules are different between C++ and shaders.
   Camera camera;
@@ -397,6 +413,8 @@ struct RaytraceArgs {
   u16vec2 gpuPrintThreadIndex;
   uint gpuPrintElementIndex;
   uint enableObjectPicking;
+  uint rawAovMask;
+  uint enableCoverageAov;
 
   DisplacementMode pomMode;
   uint pomEnableDirectLighting;
@@ -445,6 +463,8 @@ struct RaytraceArgs {
   uint writeSecondaryDenoisingGuides;
   uint writePrimaryVirtualMotionVector;
 
+  uint enableRtxdiBestLightJitter;
+
   // Candidate limits of the unordered (particle/decal) resolve loops for primary and secondary rays.
   uint unorderedResolveMaxPrimaryCandidates;
   uint unorderedResolveMaxSecondaryCandidates;
@@ -454,3 +474,7 @@ struct RaytraceArgs {
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };
+
+#ifdef __cplusplus
+static_assert(sizeof(RaytraceArgs) % 16 == 0, "RaytraceArgs must preserve constant-buffer alignment");
+#endif

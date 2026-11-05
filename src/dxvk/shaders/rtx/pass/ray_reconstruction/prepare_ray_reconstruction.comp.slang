@@ -244,11 +244,15 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
   {
     bool hasSecondarySurface = geometryFlags.hasSecondarySurface();
 
-    vec4 primaryAttenuation = vec4(r11g11b10ToColor(PrimaryAttenuation[pixelCoordinate]), 1.0);
+    // NV-DXVK start: Decode HDR attenuation before deriving RR color guides.
+    vec4 primaryAttenuation = vec4(unpackAttenuation(PrimaryAttenuation[pixelCoordinate]), 1.0);
+    // NV-DXVK end
     vec4 secondaryAttenuation = vec4(0, 0, 0, 1);
     if (hasSecondarySurface)
     {
-      secondaryAttenuation = vec4(r11g11b10ToColor(SecondaryAttenuation[pixelCoordinate]), 1.0);
+      // NV-DXVK start: Decode HDR attenuation before deriving RR color guides.
+      secondaryAttenuation = vec4(unpackAttenuation(SecondaryAttenuation[pixelCoordinate]), 1.0);
+      // NV-DXVK end
     }
 
     // Normalize attenuation to get the color tinting without any dimmming
@@ -261,17 +265,17 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
     vec4 primaryAlbedo          = PrimaryAlbedo[pixelCoordinate] * primaryAttenuation;
     vec4 primarySpecularAlbedo  = PrimarySpecularAlbedo[pixelCoordinate] * primaryAttenuation;
 
-    vec4 secondaryAlbedo         = vec4(SecondaryAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
-    vec4 secondarySpecularAlbedo = vec4(SecondarySpecularAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
-
     const float primaryPerceptualRoughness = PrimaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].w;
-    const float secondaryPerceptualRoughness = SecondaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].w;
 
     primarySpecularAlbedo *= getRoughnessFactor(primaryPerceptualRoughness);
 
     // Combine secondary albedo to improve reflection quality.
     if (hasSecondarySurface)
     {
+      const vec4 secondaryAlbedo         = vec4(SecondaryAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
+      const vec4 secondarySpecularAlbedo = vec4(SecondarySpecularAlbedo[pixelCoordinate].xyz, 0.0) * secondaryAttenuation;
+      const float secondaryPerceptualRoughness = SecondaryVirtualWorldNormalPerceptualRoughness[pixelCoordinate].w;
+
       primaryAlbedo += secondaryAlbedo;
       primarySpecularAlbedo += secondarySpecularAlbedo * getRoughnessFactor(secondaryPerceptualRoughness);
     }

@@ -38,6 +38,7 @@ struct CompositeArgs {
   VolumeArgs volumeArgs;
   AccumulationArgs accumulationArgs;
   SparseRenderingArgs sparseRenderingArgs;
+  ViewDistanceArgs viewDistanceArgs;
   // Needed for the aerial perspective volume's frustum basis and depth range.
   AtmosphereArgs atmosphereArgs;
   CloudArgs cloudArgs;
@@ -122,9 +123,9 @@ struct CompositeArgs {
 
   uint stochasticAlphaBlendAverageSearchMatches;
   uint skyUseProbeForPrimaryRays;
-  // Two pads keep CompositeArgs 16-byte aligned after the upstream flags.
-  uint padCompositeTail0;
-  uint padCompositeTail1;
+
+  uint isZUp;
+  uint enableCoverageAov;
 };
 
 #ifdef __cplusplus

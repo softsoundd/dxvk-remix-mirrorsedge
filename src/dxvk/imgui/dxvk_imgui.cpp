@@ -327,6 +327,7 @@ namespace dxvk {
         {ViewDistanceMode::None, "None"},
         {ViewDistanceMode::HardCutoff, "Hard Cutoff"},
         {ViewDistanceMode::CoherentNoise, "Coherent Noise"},
+        {ViewDistanceMode::CoherentNoiseSmoothPrimary, "Coherent Noise, Smooth Primary"},
     } }
   };
 
@@ -334,7 +335,8 @@ namespace dxvk {
     "View Distance Function",
     RemixGui::ComboWithKey<ViewDistanceFunction>::ComboEntries { {
         {ViewDistanceFunction::Euclidean, "Euclidean"},
-        {ViewDistanceFunction::PlanarEuclidean, "Planar Euclidean"},
+        {ViewDistanceFunction::PlanarEuclidean, "Horizontal"},
+        {ViewDistanceFunction::Vertical, "Vertical"},
     } }
   };
 
@@ -466,6 +468,14 @@ namespace dxvk {
         {3, "4x"},
         {4, "5x"},
         {5, "6x"},
+    } }
+  };
+
+  RemixGui::ComboWithKey<int> dlfgPresetCombo {
+    "DLSS Frame Generation Preset",
+    RemixGui::ComboWithKey<int>::ComboEntries { {
+        {0, "A"},
+        {1, "C"},
     } }
   };
 
@@ -603,7 +613,7 @@ namespace dxvk {
   constexpr ImGuiWindowFlags popupWindowFlags = ImGuiWindowFlags_NoSavedSettings;
 
   RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkRayReconstruction& rayReconstruction) {
-    if (dlss.supportsDLSS()) {
+    if (!dlss.isSupportChecked() || dlss.supportsDLSS()) {
       return upscalerDLSSCombo;
     } else {
       // Drop DLSS item if unsupported.
@@ -2647,7 +2657,10 @@ namespace dxvk {
 
       // Lazily create the tex ID ImGUI wants
       if (texImgui.texID == VK_NULL_HANDLE) {
-        texImgui.texID = ImGui_ImplDxvk::AddTexture(nullptr, texImgui.imageView);
+        // Nearest magnification keeps small textures legible, and linear minification keeps large textures smooth.
+        const Rc<DxvkSampler> thumbnailSampler = common->getResources().getSampler(VK_FILTER_NEAREST, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST,
+          VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        texImgui.texID = ImGui_ImplDxvk::AddTexture(thumbnailSampler, texImgui.imageView);
 
         if (texImgui.texID == VK_NULL_HANDLE) {
           ONCE(Logger::err("Failed to allocate ImGUI handle for texture, likely because we're trying to render more textures than VkDescriptorPoolCreateInfo::maxSets.  As such, we will truncate the texture list to show only what we can."));
@@ -3280,6 +3293,7 @@ namespace dxvk {
         RemixGui::Checkbox("Pre-Transformed Vertices Is UI", &D3D9Rtx::preTransformedVerticesIsUIObject());
         RemixGui::Checkbox("Allow Cubemaps", &D3D9Rtx::allowCubemapsObject());
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
+        RemixGui::Checkbox("Assume World-Space Skinned Bones", &RtxOptions::assumeWorldSpaceSkinnedBonesObject());
         RemixGui::Checkbox("Skip Sky Fog Values", &RtxOptions::fogIgnoreSkyObject());
         RemixGui::Checkbox("Recompute Texture Hash On Write", &RtxOptions::recomputeTextureHashOnWriteObject());
         ImGui::Unindent();
@@ -4013,7 +4027,7 @@ namespace dxvk {
       ImGui::BeginDisabled();
     }
 
-    bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
+    const bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
     if (supportsMultiFrame) {
       dlfgMfgModeCombo.getKey(&DxvkDLFG::maxInterpolatedFramesObject());
     }
@@ -4026,6 +4040,11 @@ namespace dxvk {
 
     if (!supportsDLFG) {
       ImGui::EndDisabled();
+    }
+
+    // Keep FG preset recovery available after a feature failure.
+    if (RtxOptions::showUI() == UIType::Advanced && ctx->getCommonObjects()->metaNGXContext().supportsDLFG()) {
+      dlfgPresetCombo.getKey(&DxvkDLFG::litePresetObject());
     }
 
     // Need to change Reflex in sync with DLFG, not on the next frame.
@@ -4484,7 +4503,7 @@ namespace dxvk {
 
       RtxOptions::updatePresetFromUpscaler();
 
-      if (RtxOptions::upscalerType() == UpscalerType::DLSS && !ctx->getCommonObjects()->metaDLSS().supportsDLSS()) {
+      if (dlss.isSupportChecked() && RtxOptions::upscalerType() == UpscalerType::DLSS && !dlss.supportsDLSS()) {
         RtxOptions::upscalerType.setDeferred(UpscalerType::TAAU);
       }
 
@@ -4526,9 +4545,9 @@ namespace dxvk {
       if (dlssNeuralRendering.supportsDlssNeuralRendering()) {
         RemixGui::Separator();
 
-        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Generation [Experimental]", collapsingHeaderClosedFlags)) {
+        if (RemixGui::CollapsingHeader("DLSS 3D-Guided Neural Rendering", collapsingHeaderClosedFlags)) {
           ImGui::Indent();
-          ImGui::PushID("DLSS 3D-Guided Neural Generation");
+          ImGui::PushID("DLSS 3D-Guided Neural Rendering");
           dlssNeuralRendering.showDlssNeuralRenderingImguiSettings();
           ImGui::PopID();
           ImGui::Unindent();
@@ -5400,7 +5419,8 @@ namespace dxvk {
 
         if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::HardCutoff) {
           RemixGui::DragFloat("Distance Threshold", &ViewDistanceOptions::distanceThresholdObject(), 0.1f, 0.0f, 0.0f, "%.2f", sliderFlags);
-        } else if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::CoherentNoise) {
+        } else if (ViewDistanceOptions::distanceMode() == ViewDistanceMode::CoherentNoise ||
+                   ViewDistanceOptions::distanceMode() == ViewDistanceMode::CoherentNoiseSmoothPrimary) {
           RemixGui::DragFloat("Distance Fade Min", &ViewDistanceOptions::distanceFadeMinObject(), 0.1f, 0.0f, ViewDistanceOptions::distanceFadeMax(), "%.2f", sliderFlags);
           RemixGui::DragFloat("Distance Fade Max", &ViewDistanceOptions::distanceFadeMaxObject(), 0.1f, ViewDistanceOptions::distanceFadeMin(), 0.0f, "%.2f", sliderFlags);
           RemixGui::DragFloat("Noise Scale", &ViewDistanceOptions::noiseScaleObject(), 0.1f, 0.0f, 0.0f, "%.2f", sliderFlags);

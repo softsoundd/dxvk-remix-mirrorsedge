@@ -254,6 +254,10 @@ struct Surface
   {
     get { return asfloat(data12.xyz); }
   }
+  property uint eyeCorrectionIndex
+  {
+    get { return data11.w; }
+  }
 
   // Buffers
 
@@ -516,9 +520,10 @@ struct Surface
     get { return packedFlagGet(data13.z, 1 << 16); }
   }
 
+  // A 12 bit unorm in the data0b.z bits above the flags.
   property float fadeCoverage
   {
-    get { return f16tof32(data15.w); }
+    get { return float(uint(data0b.z) >> 4) * (1.0f / 4095.0f); }
   }
 
   property uint tFactor
@@ -553,6 +558,13 @@ struct Surface
   {
     get { return asfloat(data15.xyz); }
   }
+
+  // Index into the surfaceMaterials table.
+  property uint surfaceMaterialIndex
+  {
+    get { return data15.w; }
+    set { data15.w = newValue; }
+  }
 };
 
 // Note: Minimal version of typical Surface Interaction for transmission across passes.
@@ -577,9 +589,11 @@ struct MinimalSurfaceInteraction
 
 struct SurfaceInteraction : MinimalSurfaceInteraction
 {
+  // Raw AOVs retain the triangle normal before normal bending.
+  vec3 triangleNormal = 0.f;
+
 #ifdef GBUFFER_FEATURE_DEBUG_VIEW
 #if GBUFFER_FEATURE_DEBUG_VIEW
-  vec3 debugTriangleNormal = 0.f;
   vec3 debugInterpolatedVertexNormal = 0.f;
 #endif
 #endif

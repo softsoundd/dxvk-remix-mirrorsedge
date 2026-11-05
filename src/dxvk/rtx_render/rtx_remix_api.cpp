@@ -41,6 +41,7 @@
 #include "../dxvk_image.h"
 
 #include "../../util/util_math.h"
+#include "../../util/util_remix_api_version.h"
 #include "../../util/util_vector.h"
 #include "../../util/util_string.h"
 #include "../../util/util_sentry.h"
@@ -49,6 +50,7 @@
 
 #include <windows.h>
 
+#include <cstring>
 #include <optional>
 
 namespace dxvk {
@@ -335,7 +337,12 @@ namespace {
           src.getEnableDLSSControlMask(),
           src.getDLSSControlMaskIntensity(),
           src.getDLSSControlMaskToneStrength(),
-          src.getDLSSControlMaskStructuralStrength()
+          src.getDLSSControlMaskStructuralStrength(),
+          src.getTextureScrollRate(),
+          src.getTextureScrollAngle(),
+          src.getTextureScale(),
+          src.getTextureOffset(),
+          src.getTextureRotation()
         } };
       }
       case MaterialDataType::Translucent: 
@@ -359,7 +366,12 @@ namespace {
           src.getEnableDiffuseLayer(),
           src.getFilterMode(),
           src.getWrapModeU(),
-          src.getWrapModeV()
+          src.getWrapModeV(),
+          src.getTextureScrollRate(),
+          src.getTextureScrollAngle(),
+          src.getTextureScale(),
+          src.getTextureOffset(),
+          src.getTextureRotation()
         } };
       }
       case MaterialDataType::RayPortal:
@@ -385,6 +397,7 @@ namespace {
     }
 
     MaterialData toRtMaterialWithoutTexturePreload(const remixapi_MaterialInfo& info) {
+      const bool hasTextureTransform = s_apiVersion >= REMIXAPI_VERSION_MAKE(0, 6, 6);
       if (auto extOpaque = pnext::find<remixapi_MaterialInfoOpaqueEXT>(&info)) {
         auto extSubsurface = pnext::find<remixapi_MaterialInfoOpaqueSubsurfaceEXT>(&info);
         const bool hasDlssControlMask = s_apiVersion >= REMIXAPI_VERSION_MAKE(0, 6, 5);
@@ -438,6 +451,11 @@ namespace {
           hasDlssControlMask ? extOpaque->dlssControlMaskIntensity : 1.f,
           hasDlssControlMask ? extOpaque->dlssControlMaskToneStrength : 1.f,
           hasDlssControlMask ? extOpaque->dlssControlMaskStructuralStrength : 1.f,
+          hasTextureTransform ? extOpaque->textureScrollRate : 0.f,
+          hasTextureTransform ? extOpaque->textureScrollAngle : 0.f,
+          hasTextureTransform && extOpaque->textureScale_hasvalue ? tovec2(extOpaque->textureScale_value) : Vector2(1.f),
+          hasTextureTransform ? tovec2(extOpaque->textureOffset) : Vector2(0.f),
+          hasTextureTransform ? extOpaque->textureRotation : 0.f,
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {
@@ -460,6 +478,11 @@ namespace {
           info.filterMode,
           info.wrapModeU,
           info.wrapModeV,
+          hasTextureTransform ? extTranslucent->textureScrollRate : 0.f,
+          hasTextureTransform ? extTranslucent->textureScrollAngle : 0.f,
+          hasTextureTransform && extTranslucent->textureScale_hasvalue ? tovec2(extTranslucent->textureScale_value) : Vector2(1.f),
+          hasTextureTransform ? tovec2(extTranslucent->textureOffset) : Vector2(0.f),
+          hasTextureTransform ? extTranslucent->textureRotation : 0.f,
         } };
       }
       if (auto extPortal = pnext::find<remixapi_MaterialInfoPortalEXT>(&info)) {
@@ -999,8 +1022,11 @@ namespace {
     dst.color0Buffer = dxvk::RasterBuffer { vertexSlice, offsetof(remixapi_HardcodedVertex, color), sizeof(remixapi_HardcodedVertex), VK_FORMAT_B8G8R8A8_UNORM };
     if (src.skinning_hasvalue) {
       dst.numBonesPerVertex = src.skinning_value.bonesPerVertex;
-      dst.blendWeightBuffer = dxvk::RasterBuffer { blendWeightsSlice, 0, sizeof(float), VK_FORMAT_R32_SFLOAT };
-      dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, sizeof(uint32_t), VK_FORMAT_R8G8B8A8_USCALED };
+      // Skinning advances by the stride per vertex, so it spans the whole tuple of each vertex.
+      const uint32_t weightStride = src.skinning_value.bonesPerVertex * sizeof(float);
+      const uint32_t indexStride = dxvk::divCeil(src.skinning_value.bonesPerVertex, 4u) * sizeof(uint32_t);
+      dst.blendWeightBuffer = dxvk::RasterBuffer { blendWeightsSlice, 0, weightStride, VK_FORMAT_R32_SFLOAT };
+      dst.blendIndicesBuffer = dxvk::RasterBuffer { blendIndicesSlice, 0, indexStride, VK_FORMAT_R8G8B8A8_USCALED };
     }
 
     dst.indexCount = src.indices_count;
@@ -1079,6 +1105,7 @@ namespace {
       const_cast<bool&>(dxvk::RtxOptions::enableNearPlaneOverride()) = false;
     }
     remixDevice->EmitCs([cRtCamera = convert::toRtCamera(*info)](dxvk::DxvkContext* ctx) {
+      static_cast<dxvk::RtxContext*>(ctx)->prepareScreenResolution();
       ctx->getCommonObjects()->getSceneManager().getCameraManager()
         .processExternalCamera(cRtCamera.type, cRtCamera.worldToView, cRtCamera.viewToProjection);
     });
@@ -1269,7 +1296,12 @@ namespace {
 
     dxvk::Config newSetting;
     newSetting.setOptionMove(std::move(strKey), std::string{ value });
-    option->readOption(newSetting, dxvk::RtxOptionLayer::getUserLayer());
+    {
+      // readOption() writes the option's layer values and the global dirty-option map, which the CS thread
+      // reads and clears under this mutex in RtxOptionManager::applyPendingValues(). Lock order: s_mutex first.
+      std::lock_guard<std::mutex> optionLock(dxvk::RtxOptionImpl::getUpdateMutex());
+      option->readOption(newSetting, dxvk::RtxOptionLayer::getUserLayer());
+    }
 
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
@@ -1452,9 +1484,10 @@ namespace {
     return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
   }
 
-  remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CopyRenderingOutput(
+  remixapi_ErrorCode copyRenderingOutput(
     IDirect3DSurface9* destination,
-    remixapi_dxvk_CopyRenderingOutputType type) {
+    remixapi_dxvk_CopyRenderingOutputType type,
+    bool copyOnPresent) {
     dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
     if (!remixDevice) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
@@ -1487,6 +1520,10 @@ namespace {
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH:
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS:
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32:
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_COVERAGE:
       break;
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI:
       if (!dxvk::ImGUI::enableExternalPresenter()) {
@@ -1505,12 +1542,10 @@ namespace {
     dxvk::D3D9Surface* backBufferSurface = static_cast<dxvk::D3D9Surface*>(pSurface);
     dxvk::Rc<dxvk::DxvkImage> backbuffer0 = backBufferSurface->GetCommonTexture()->GetImage();
 
-    remixDevice->EmitCs([cDest = std::move(destImage), 
+    auto copyTask = [cDest = std::move(destImage),
                          cDestView = std::move(destImageView),
                          cBackbuffer = std::move(backbuffer0),
-                         type = type] (dxvk::DxvkContext* dxvkCtx) {
-      auto* ctx = static_cast<dxvk::RtxContext*>(dxvkCtx);
-
+                         type = type] (dxvk::DxvkContext* ctx) {
       dxvk::Resources& resourceManager = ctx->getCommonObjects()->getResources();
       const dxvk::Resources::RaytracingOutput& rtOutput = resourceManager.getRaytracingOutput();
 
@@ -1542,6 +1577,18 @@ namespace {
 
         break;
       }
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW:
+        srcImage = rtOutput.m_primaryWorldPositionRaw.image;
+        break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW:
+        srcImage = rtOutput.m_primaryTexcoordsRaw.image;
+        break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32:
+        srcImage = rtOutput.m_primaryNormalF32.image;
+        break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_COVERAGE:
+        srcImage = rtOutput.m_primaryCoverage.image;
+        break;
       default:
         assert(!"unexpected remixapi_dxvk_CopyRenderingOutputType value");
         return;
@@ -1550,11 +1597,24 @@ namespace {
       if (srcImage.ptr()) {
         dxvk::RtxContext::blitImageHelper(ctx, srcImage, cDest, VkFilter::VK_FILTER_NEAREST);
       }
-    });
+    };
+
+    auto* presenter = remixDevice->GetExternalPresenter();
+    if (copyOnPresent && presenter) {
+      presenter->queuePresentTask(std::move(copyTask));
+    } else {
+      remixDevice->EmitCs(std::move(copyTask));
+    }
 
 #pragma warning(pop)
 
     return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_dxvk_CopyRenderingOutput(
+    IDirect3DSurface9* destination,
+    remixapi_dxvk_CopyRenderingOutputType type) {
+    return copyRenderingOutput(destination, type, false);
   }
 
 
@@ -1673,6 +1733,9 @@ namespace {
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_Shutdown(void) {
     if (s_dxvkDevice) {
+      if (dxvk::D3D9SwapchainExternal* presenter = s_dxvkDevice->GetExternalPresenter()) {
+        presenter->clearPresentTasks();
+      }
       dxvk::g_dxvkDeviceNative = nullptr;
       while (true) {
         ULONG left = s_dxvkDevice->Release();
@@ -1746,29 +1809,36 @@ namespace {
   bool isVersionCompatible(uint64_t userVersion) {
     constexpr uint64_t compiledVersion = REMIXAPI_VERSION_MAKE(REMIXAPI_VERSION_MAJOR, REMIXAPI_VERSION_MINOR, REMIXAPI_VERSION_PATCH);
 
-    bool isDevelopment = 
-      REMIXAPI_VERSION_GET_MAJOR(userVersion) == 0 &&
-      REMIXAPI_VERSION_GET_MAJOR(compiledVersion) == 0;
-
-    if (isDevelopment) {
-      // each minor change is breaking
-      return REMIXAPI_VERSION_GET_MINOR(userVersion) == REMIXAPI_VERSION_GET_MINOR(compiledVersion);
-    }
-
-    if (REMIXAPI_VERSION_GET_MAJOR(userVersion) == REMIXAPI_VERSION_GET_MAJOR(compiledVersion)) {
-      // user version must be before the currently compiled version:
-      // features that are requested by a user must be available in the current binary
-      if (REMIXAPI_VERSION_GET_MINOR(userVersion) <= REMIXAPI_VERSION_GET_MINOR(compiledVersion)) {
-        return true;
-      }
-    }
-
-    return false;
+    return remixapi_version::isClientVersionCompatible(userVersion, compiledVersion);
   }
 }
 
 extern "C"
 {
+  // HdRemix queues its bound AOV copies before Present so the completion signal includes them.
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixinternal_QueueAovCopy(
+    IDirect3DSurface9* destination, remixapi_dxvk_CopyRenderingOutputType type) {
+    return copyRenderingOutput(destination, type, true);
+  }
+
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixinternal_SetAovRequests(uint32_t raw, uint32_t coverage) {
+    static_assert(kRawAovWorldPosition == (1u << REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW));
+    static_assert(kRawAovTexcoords == (1u << REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW));
+    static_assert(kRawAovNormal == (1u << REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32));
+    if ((raw & ~kRawAovAll) || coverage > 1) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    std::lock_guard lock { s_mutex };
+    auto* device = tryAsDxvk();
+    if (!device) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    device->EmitCs([raw, coverage](dxvk::DxvkContext* ctx) {
+      ctx->getCommonObjects()->getResources().setAovRequests(raw, coverage);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(const remixapi_InitializeLibraryInfo* info,
                                                                        remixapi_Interface* out_result) {
     if (!info || info->sType != REMIXAPI_STRUCT_TYPE_INITIALIZE_LIBRARY_INFO) {
@@ -1780,6 +1850,7 @@ extern "C"
     if (!isVersionCompatible(info->version)) {
       return REMIXAPI_ERROR_CODE_INCOMPATIBLE_VERSION;
     }
+    // The version is process-global, so the most recent initialize wins.
     s_apiVersion = info->version;
 
     auto interf = remixapi_Interface {};
@@ -1809,7 +1880,8 @@ extern "C"
     }
     static_assert(sizeof(interf) == 176, "Add/remove function registration");
 
-    *out_result = interf;
+    // Older clients allocate a shorter interface, so only the prefix they know is written.
+    std::memcpy(out_result, &interf, remixapi_version::clientInterfaceSize(info->version));
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 

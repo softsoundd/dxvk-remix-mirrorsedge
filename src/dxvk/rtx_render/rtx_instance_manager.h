@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <deque>
@@ -446,6 +447,9 @@ public:
   // Creates view model instances and their virtual counterparts
   void createViewModelInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
+  const std::array<Matrix3, 2>& getEyeShadingToWorld() const { return m_eyeShadingToWorld; }
+  const std::array<Matrix3, 2>& getEyeWorldToShading() const { return m_eyeWorldToShading; }
+
   void createPlayerModelVirtualInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager);
 
   // Classifies the world-space shadow copies of held equipment as player-model instances:
@@ -501,6 +505,10 @@ private:
   uint64_t m_sceneGeneration = 0;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
+  // Shared per-frame corrective transforms for viewmodel and portal cases
+  std::array<Matrix3, 2> m_eyeShadingToWorld;
+  std::array<Matrix3, 2> m_eyeWorldToShading;
+  bool m_hasViewModelEyeCorrection = false;
 
   // Previous frame's view-model FOV, for detecting in-progress zoom transitions.
   float m_heldEquipmentPrevFovDegrees = -1.f;

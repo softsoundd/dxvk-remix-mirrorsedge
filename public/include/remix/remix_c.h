@@ -62,7 +62,7 @@
 
 #define REMIXAPI_VERSION_MAJOR 0
 #define REMIXAPI_VERSION_MINOR 6
-#define REMIXAPI_VERSION_PATCH 5
+#define REMIXAPI_VERSION_PATCH 6
 
 
 // External
@@ -259,6 +259,13 @@ extern "C" {
     float               dlssControlMaskIntensity;
     float               dlssControlMaskToneStrength;
     float               dlssControlMaskStructuralStrength;
+
+    float               textureScrollRate;
+    float               textureScrollAngle;
+    remixapi_Bool       textureScale_hasvalue;
+    remixapi_Float2D    textureScale_value;
+    remixapi_Float2D    textureOffset;
+    float               textureRotation;
   } remixapi_MaterialInfoOpaqueEXT;
 
   // Valid only if remixapi_MaterialInfo contains remixapi_MaterialInfoOpaqueEXT in pNext chain
@@ -289,6 +296,13 @@ extern "C" {
     remixapi_Bool       thinWallThickness_hasvalue;
     float               thinWallThickness_value;
     remixapi_Bool       useDiffuseLayer;
+
+    float               textureScrollRate;
+    float               textureScrollAngle;
+    remixapi_Bool       textureScale_hasvalue;
+    remixapi_Float2D    textureScale_value;
+    remixapi_Float2D    textureOffset;
+    float               textureRotation;
   } remixapi_MaterialInfoTranslucentEXT;
 
   typedef struct remixapi_MaterialInfoPortalEXT {
@@ -764,6 +778,12 @@ extern "C" {
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS = 2,
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING = 3,
     REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI = 4,
+    // RGBA32F raw AOVs, allocated on Hydra request or with rtx.enableRawAovOutputs.
+    REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_WORLD_POSITION_RAW = 5,
+    REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_TEXCOORDS_RAW      = 6,
+    REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMAL_F32         = 7,
+    // R32_SFLOAT coverage, allocated on Hydra request or with rtx.enableCoverageAov.
+    REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_COVERAGE           = 8,
   } remixapi_dxvk_CopyRenderingOutputType;
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_dxvk_CopyRenderingOutput)(
@@ -781,8 +801,9 @@ extern "C" {
     uint64_t            version;
   } remixapi_InitializeLibraryInfo;
 
-  // NOTE: If adding a new function, append at the end of the struct.
-  //       Reordering breaks backwards compatibility.
+  // NOTE: If adding a new function, append at the end of the struct and bump REMIXAPI_VERSION_PATCH.
+  //       Never insert, reorder, remove or reuse a slot: a client only knows the prefix of the struct
+  //       that existed at its own version, and the runtime writes only that prefix.
   typedef struct remixapi_Interface {
     PFN_remixapi_Shutdown           Shutdown;
     PFN_remixapi_CreateMaterial     CreateMaterial;

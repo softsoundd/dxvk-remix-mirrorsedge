@@ -37,6 +37,7 @@
 
 #include "../d3d9/d3d9_state.h"
 #include "../dxvk_format.h"
+#include "../../util/util_global_time.h"
 #include "rtx_matrix_helpers.h"
 #include "dxvk_scoped_annotation.h"
 
@@ -176,7 +177,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 816, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 832, "RtInstance size has changed. Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1081,6 +1082,8 @@ namespace dxvk {
        !currentInstance.isCameraRegistered(CameraType::Main));
 
     const RtSurface::AlphaState alphaState = calculateAlphaState(drawCall, *materialData);
+    // The patched material must remain alive until preserveInstance invokes material binding callbacks.
+    std::optional<MaterialData> patchedMaterialData;
     bool hasTransformChanged = false;
     bool hasPreviousPositions = false;
 
@@ -1091,6 +1094,18 @@ namespace dxvk {
     
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate) {
+      // Read here because the camera override path also assigns the texture transform,
+      // and the patched material copy below is out of scope by then.
+      Vector2 textureScrollSpeed(0.f);
+      Vector2 textureScale(1.f);
+      Vector2 textureOffset(0.f);
+      float textureRotation = 0.f;
+
+      // Animated water and camera-space-normal texgen use only the captured mapping.
+      if (drawCall.getTransformData().texgenMode != TexGenMode::ViewNormals &&
+          !currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater)) {
+        materialData->getTextureTransformData(textureScrollSpeed, textureScale, textureOffset, textureRotation);
+      }
 
       if (isFirstUpdateThisFrame) {
         currentInstance.m_materialType = materialData->getType();
@@ -1149,32 +1164,31 @@ namespace dxvk {
         currentInstance.surface.blendModeState = drawCall.getMaterialData().blendMode;
 
         materialData->getSpriteSheetData(currentInstance.surface.spriteSheetRows, currentInstance.surface.spriteSheetCols, currentInstance.surface.spriteSheetFPS);
-        currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
+        currentInstance.surface.textureScrollSpeed = textureScrollSpeed;
+        currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0 || currentInstance.surface.textureScrollSpeed != Vector2(0.f);
         currentInstance.surface.objectPickingValue = drawCall.drawCallID;
-
-        // Temp storage for the case we need to patch the material data
-        MaterialData tmpMaterialData;
 
         if (materialData->getType() == MaterialDataType::Opaque)
         {
           const bool useLegacyAlphaState = materialData->getOpaqueMaterialData().getUseLegacyAlphaState();
 
-          if (currentInstance.m_isWorldSpaceUI) {
+          // Camera materials retain authored emission independently of legacy alpha blending.
+          if (!drawCall.isUsingRaytracedRenderTarget && currentInstance.m_isWorldSpaceUI) {
             // Here we need to do deep copy and patch the material
-            tmpMaterialData = *materialData;
-            materialData = &tmpMaterialData;
+            patchedMaterialData.emplace(*materialData);
+            materialData = &*patchedMaterialData;
             // For worldspace UI, we want to show the UI (unlit) in the world.  So configure the blend mode if blending is used accordingly.
-            tmpMaterialData.getOpaqueMaterialData().setEnableEmission(true);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(2.0f);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
-          } else if (currentInstance.surface.alphaState.emissiveBlend && RtxOptions::enableEmissiveBlendEmissiveOverride() && useLegacyAlphaState) {
+            patchedMaterialData->getOpaqueMaterialData().setEnableEmission(true);
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveIntensity(2.0f);
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveColorTexture(patchedMaterialData->getOpaqueMaterialData().getAlbedoOpacityTexture());
+          } else if (!drawCall.isUsingRaytracedRenderTarget && currentInstance.surface.alphaState.emissiveBlend && RtxOptions::enableEmissiveBlendEmissiveOverride() && useLegacyAlphaState) {
             // Here we need to do deep copy and patch the material
-            tmpMaterialData = *materialData;
-            materialData = &tmpMaterialData;
+            patchedMaterialData.emplace(*materialData);
+            materialData = &*patchedMaterialData;
             // If the user has decided to override the legacy alpha state, assume they know what they are doing and allow for explicit emission controls.
-            tmpMaterialData.getOpaqueMaterialData().setEnableEmission(true);
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
-            tmpMaterialData.getOpaqueMaterialData().setEmissiveColorTexture(tmpMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
+            patchedMaterialData->getOpaqueMaterialData().setEnableEmission(true);
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
+            patchedMaterialData->getOpaqueMaterialData().setEmissiveColorTexture(patchedMaterialData->getOpaqueMaterialData().getAlbedoOpacityTexture());
           }
 
           currentInstance.m_isSubsurface = materialData->getOpaqueMaterialData().getSubsurfaceDiffusionProfile();
@@ -1271,7 +1285,8 @@ namespace dxvk {
           // NV-DXVK end
         }
 
-        currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
+        currentInstance.surface.textureTransform = composeTextureTransform(drawCall.getTransformData().textureTransform,
+                                                                           textureScale, textureOffset, textureRotation);
 
         currentInstance.surface.isStatic = !(hasTransformChanged || hasPreviousPositions) || currentInstance.m_materialType == MaterialDataType::RayPortal;
 
@@ -1585,6 +1600,24 @@ namespace dxvk {
       // If matrices are not convoluted, don't modify the vertex data: just set the transforms directly
       if (isOrdinary(corrected) && isOrdinary(prevCorrected)) {
         viewModelInstance->teleport(corrected, prevCorrected);
+
+        if (auto& eyeParams = viewModelInstance->surface.eyeParams) {
+          // Eye UVs are world-space plane projections, so move their origin with the geometry
+          // and transform U/V by the inverse transpose, without normalizing away iris scale.
+          // Reuse (C * M)^-T from teleport: (C * M)^-T * M^T = C^-T.
+          const Matrix3 eyeBasisCorrection = viewModelInstance->surface.normalObjectToWorld
+                                          * transpose(Matrix3(reference.getTransform()));
+          const Vector4d eyeOrigin(Vector3d(eyeParams->eyeballOrigin), 1.0);
+          eyeParams->eyeballOrigin = Vector3((perspectiveCorrection * eyeOrigin).xyz());
+          eyeParams->eyeRightU = eyeBasisCorrection * eyeParams->eyeRightU;
+          eyeParams->eyeUpV = eyeBasisCorrection * eyeParams->eyeUpV;
+          eyeParams->eyeViewModelMode = 1;
+          if (!m_hasViewModelEyeCorrection) {
+            m_eyeShadingToWorld[0] = Matrix3(perspectiveCorrection);
+            m_eyeWorldToShading[0] = transpose(eyeBasisCorrection);
+            m_hasViewModelEyeCorrection = true;
+          }
+        }
       } else {
         ONCE(Logger::info("[RTX-Compatibility-Info] Unexpected values in the perspective-corrected transform of a view model. Fallback to geometry modification"));
         // Only need to run this on BVH op (maybe this could be moved to geometry processing?)
@@ -1609,6 +1642,7 @@ namespace dxvk {
                                                  const CameraManager& cameraManager,
                                                  const RayPortalManager& rayPortalManager) {
     ScopedGpuProfileZone(ctx, "ViewModel");
+    m_hasViewModelEyeCorrection = false;
 
     auto cleanupAllPersistentViewModelInstances = [this]() {
       for (auto& [ref, inst] : m_persistentViewModelInstances) {
@@ -2299,6 +2333,12 @@ namespace dxvk {
     
     const uint32_t frameId = m_device->getCurrentFrameId();
 
+    if (m_hasViewModelEyeCorrection) {
+      const Matrix3 portalRotation(closestPortalInfo.portalToOpposingPortalDirection);
+      m_eyeShadingToWorld[1] = portalRotation * m_eyeShadingToWorld[0];
+      m_eyeWorldToShading[1] = m_eyeWorldToShading[0] * transpose(portalRotation);
+    }
+
     // Create or update virtual instances for view model instances that are close to portals
     std::unordered_set<RtInstance*> activeVirtualViewModelReferences;
     for (RtInstance* referenceInstance : viewModelReferenceInstances) {
@@ -2330,6 +2370,9 @@ namespace dxvk {
       // Update virtual instance transforms given the reference and the portal transform
       {
         virtualInstance->teleportWithHistory(closestPortalInfo.portalToOpposingPortalDirection);
+        if (virtualInstance->surface.eyeParams && virtualInstance->surface.eyeParams->eyeViewModelMode != 0) {
+          virtualInstance->surface.eyeParams->eyeViewModelMode = 2;
+        }
       }
     }
 
@@ -2417,7 +2460,11 @@ namespace dxvk {
     if (!bufferData.indexData || !bufferData.positionData || !bufferData.texcoordData)
       return;
 
-    const bool hasNonIdentityTextureTransform = instance.surface.textureTransform != Matrix4();
+    // The texcoords leave out the scroll offset, so that the opacity micromap hash stays stable
+    // the same way it does for spritesheet animation. The offset is only added to the shaded UVs.
+    const Matrix4& textureTransform = instance.surface.textureTransform;
+    const bool hasNonIdentityTextureTransform = textureTransform != Matrix4();
+    const Vector2 textureScrollOffset = instance.surface.getTextureScrollOffset(GlobalTime::get().absoluteTimeUs());
     bool bSuccess = true;
     bool areAllBillboardsValidIntersectionCandidates = true;
     uint32_t billboardCount = 0;
@@ -2458,8 +2505,9 @@ namespace dxvk {
 
         texcoords[idx] = bufferData.getTexCoord(currentIndex);
 
-        if (hasNonIdentityTextureTransform)
-          texcoords[idx] = (instance.surface.textureTransform * Vector4(texcoords[idx].x, texcoords[idx].y, 0.f, 1.f)).xy();
+        if (hasNonIdentityTextureTransform) {
+          texcoords[idx] = transformTexcoord(textureTransform, texcoords[idx]);
+        }
 
         if (bufferData.vertexColorData)
           vertexOpacities8bit[idx] = bufferData.getVertexColor(indices[idx]) >> 24;
@@ -2507,7 +2555,7 @@ namespace dxvk {
 
       const Vector2 xVectorUV { texcoords[2] - texcoords[1] };
       const Vector2 yVectorUV { texcoords[1] - texcoords[0] };
-      const Vector2 centerUV { (texcoords[2] + texcoords[0]) * 0.5f };
+      const Vector2 centerUV { (texcoords[2] + texcoords[0]) * 0.5f + textureScrollOffset };
 
       // Fill in data for the quad's last/4th vertex
       texcoords[3] = bufferData.getTexCoord(indices[5]);
@@ -2575,6 +2623,9 @@ namespace dxvk {
     if (!bufferData.indexData || !bufferData.positionData || !bufferData.texcoordData)
       return;
 
+    const Matrix4 textureTransform = instance.surface.getTextureTransform(GlobalTime::get().absoluteTimeUs());
+    const bool hasNonIdentityTextureTransform = textureTransform != Matrix4();
+
     // Extract the beams from the triangle strip.
     // Start by loading the first 2 indices.
     uint16_t indices[4];
@@ -2603,6 +2654,9 @@ namespace dxvk {
       for (int i = 0; i < 4; ++i) {
         positions[i] = bufferData.getPosition(indices[i]);
         texcoords[i] = bufferData.getTexCoord(indices[i]);
+        if (hasNonIdentityTextureTransform) {
+          texcoords[i] = transformTexcoord(textureTransform, texcoords[i]);
+        }
       }
 
       // Load one vertex color - assuming that the entire beam uses the same color

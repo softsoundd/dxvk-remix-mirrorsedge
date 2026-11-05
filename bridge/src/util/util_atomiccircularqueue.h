@@ -22,12 +22,14 @@
 #pragma once
 
 #include "util_common.h"
+#include "util_perfcounters.h"
 
 #include "../tracy/tracy.hpp"
 
 #include <cstdio>
 #include <atomic>
 #include <assert.h>
+#include <thread>
 #include <vector>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -37,29 +39,38 @@ namespace bridge_util {
   // Intra/Inter-process thread safe, shared circular queue.
   // Constructed from a shared pool of memory - and synchronized using static atomics
   // Single Producer, Single Consumer ONLY!
+  // A waiting side spins, then sets its sleeping flag and blocks on an event that the other side signals
+  // only while that flag is set. Seq_cst fences on both sides keep a wake-up from being lost.
   template<typename T, bridge_util::Accessor Accessor>
   class AtomicCircularQueue {
-    // Next slot the reader takes; only the reader stores it.
+    // m_write holds the consumer's position and m_read holds the producer's position.
     std::atomic<uint32_t>* m_write;
-    // Next slot the writer fills; only the writer stores it.
     std::atomic<uint32_t>* m_read;
+
+    std::atomic<uint32_t>* m_readerSleeping;
+    std::atomic<uint32_t>* m_writerSleeping;
 
     T* m_data;
     T m_default;
-    T m_pulled;
 
     const size_t m_queueSize;
 
-    // Each side's last seen value of the other side's index, so the shared one, which the other
-    // process keeps storing to, is only re-read when this says the queue is full (writer) or empty
-    // (reader). A stale value is always behind the real one: the queue just looks fuller or emptier.
-    uint32_t m_cachedWrite = 0;
-    mutable uint32_t m_cachedRead = 0;
+    HANDLE m_hDataAvailable = nullptr;
+    HANDLE m_hSpaceAvailable = nullptr;
+    int64_t m_spinTicks = 0;
+
+    QueueWaitStats m_fullStats;
+    QueueWaitStats m_emptyStats;
 
     static const size_t kAlignment = 128;
     static const size_t kWriteAtomicOffset = 0;
     static const size_t kReadAtomicOffset = kAlignment + kWriteAtomicOffset;
-    static const size_t kMemoryPoolOffset = kAlignment + kReadAtomicOffset;
+    static const size_t kReaderSleepingOffset = kAlignment + kReadAtomicOffset;
+    static const size_t kWriterSleepingOffset = kAlignment + kReaderSleepingOffset;
+    static const size_t kMemoryPoolOffset = kAlignment + kWriterSleepingOffset;
+
+    // Blocking waits are sliced so that early-out signals, timeouts and wake-ups lost during init are still seen.
+    static constexpr DWORD kSleepSliceMs = 2;
 
   public:
     static size_t getExtraMemoryRequirements() {
@@ -79,18 +90,21 @@ namespace bridge_util {
         m_data = (T*) ((uintptr_t) pMemory + kMemoryPoolOffset);
         m_write = (std::atomic<uint32_t>*)((uintptr_t) pMemory + kWriteAtomicOffset);
         m_read = (std::atomic<uint32_t>*)((uintptr_t) pMemory + kReadAtomicOffset);
+        m_readerSleeping = (std::atomic<uint32_t>*)((uintptr_t) pMemory + kReaderSleepingOffset);
+        m_writerSleeping = (std::atomic<uint32_t>*)((uintptr_t) pMemory + kWriterSleepingOffset);
       } else if constexpr (IS_WRITER(Accessor)) {
         m_data = new((void*) ((uintptr_t) pMemory + kMemoryPoolOffset)) T[m_queueSize];
         m_write = new((void*) ((uintptr_t) pMemory + kWriteAtomicOffset)) std::atomic<uint32_t>(0);
         m_read = new((void*) ((uintptr_t) pMemory + kReadAtomicOffset)) std::atomic<uint32_t>(0);
+        m_readerSleeping = new((void*) ((uintptr_t) pMemory + kReaderSleepingOffset)) std::atomic<uint32_t>(0);
+        m_writerSleeping = new((void*) ((uintptr_t) pMemory + kWriterSleepingOffset)) std::atomic<uint32_t>(0);
       }
 
       assert(m_read->is_lock_free() && m_write->is_lock_free()); // Must be runtime check as it's CPU specific
 
-      // Both start at the reader's index: current for the writer, and "empty" for the reader, which
-      // then fetches m_read on first use.
-      m_cachedWrite = m_write->load(std::memory_order_acquire);
-      m_cachedRead = m_write->load(std::memory_order_acquire);
+      LARGE_INTEGER frequency;
+      QueryPerformanceFrequency(&frequency);
+      m_spinTicks = int64_t(double(frequency.QuadPart) * double(GlobalOptions::getIpcSpinMicroseconds()) / 1e6);
     }
 
     AtomicCircularQueue(const AtomicCircularQueue& q) = delete;
@@ -98,29 +112,34 @@ namespace bridge_util {
     ~AtomicCircularQueue() {
     }
 
+    void attachWakeEvents(HANDLE hDataAvailable, HANDLE hSpaceAvailable) {
+      m_hDataAvailable = hDataAvailable;
+      m_hSpaceAvailable = hSpaceAvailable;
+    }
+
+    const QueueWaitStats& fullWaitStats() const {
+      return m_fullStats;
+    }
+
+    const QueueWaitStats& emptyWaitStats() const {
+      return m_emptyStats;
+    }
+
     // Push object to queue
     Result push(const T& obj) {
       const auto currentRead = m_read->load(std::memory_order_relaxed);
       const auto nextRead = queueIdxInc(currentRead);
-      if (nextRead == m_cachedWrite) {
-        // Full as of the last seen reader index: fetch the current one, and wait while it really is full.
-        // Acquire, so the reader is done with a slot before it is overwritten.
-        ULONGLONG start = 0, curTick;
-        const DWORD timeoutMS = GlobalOptions::getCommandTimeout();
-        while ((m_cachedWrite = m_write->load(std::memory_order_acquire)) == nextRead) {
-          std::this_thread::yield();
-
-          curTick = GetTickCount64();
-          start = start > 0 ? start : curTick;
-          if (timeoutMS != 0 && start + timeoutMS <= curTick) {
-            return Result::Failure;
-          }
-        }
+      const auto hasRoom = [&]() { return nextRead != m_write->load(std::memory_order_acquire); };
+      if (!hasRoom() &&
+          !waitUntil(hasRoom, m_writerSleeping, m_hSpaceAvailable, GlobalOptions::getCommandTimeout(), nullptr, m_fullStats)) {
+        return Result::Failure;
       }
-
       m_data[currentRead] = obj;
-      // Release: the slot's contents become visible to the reader before the index that publishes it.
+      // The store above is not atomic. Issue a membar after it to ensure
+      // it is not reordered.
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       m_read->store(nextRead, std::memory_order_release);
+      wakeIfSleeping(m_readerSleeping, m_hDataAvailable, m_fullStats);
       return Result::Success;
     }
 
@@ -131,29 +150,33 @@ namespace bridge_util {
 
     // Returns a ref to the first element in the queue
     // Note: Blocks if the queue is empty
-    const T& peek(Result& result, const DWORD timeoutMS = 0, std::atomic<bool>* const pbEarlyOutSignal = nullptr) const {
-      const auto currentWrite = m_write->load(std::memory_order_relaxed);
-      if (!waitForData(currentWrite, timeoutMS, pbEarlyOutSignal)) {
+    const T& peek(Result& result, const DWORD timeoutMS = 0, std::atomic<bool>* const pbEarlyOutSignal = nullptr) {
+      if (!waitForData(timeoutMS, pbEarlyOutSignal)) {
         result = Result::Timeout;
         return m_default;
       }
+      // Issue a membar before reading the data since it is not atomic
+      std::atomic_thread_fence(std::memory_order_seq_cst);
       result = Result::Success;
-      return m_data[currentWrite];
+      return m_data[m_write->load(std::memory_order_acquire)];
     }
 
     // Returns a copy to the first element in queue, AND removes it
     // Note: Blocks if queue is empty
-    const T& pull(Result& result, const DWORD timeoutMS = 0, std::atomic<bool>* const pbEarlyOutSignal = nullptr) {
-      const auto currentWrite = m_write->load(std::memory_order_relaxed);
-      if (!waitForData(currentWrite, timeoutMS, pbEarlyOutSignal)) {
+    T pull(Result& result, const DWORD timeoutMS = 0, std::atomic<bool>* const pbEarlyOutSignal = nullptr) {
+      if (!waitForData(timeoutMS, pbEarlyOutSignal)) {
         result = Result::Timeout;
         return m_default;
       }
-      // Copy the slot out before handing it back to the writer.
-      m_pulled = m_data[currentWrite];
+      const auto currentWrite = m_write->load(std::memory_order_relaxed);
+      // Issue a membar before reading the data since it is not atomic
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      // The producer may overwrite the slot once the index moves, so it is copied first.
+      const T pulled = m_data[currentWrite];
       m_write->store(queueIdxInc(currentWrite), std::memory_order_release);
+      wakeIfSleeping(m_writerSleeping, m_hSpaceAvailable, m_emptyStats);
       result = Result::Success;
-      return m_pulled;
+      return pulled;
     }
 
     // Check for queue emptiness. The function may guarantee a correct result
@@ -199,28 +222,89 @@ namespace bridge_util {
     }
 
   private:
-    // Waits until the slot at currentWrite (the reader's index) has been filled. False on timeout or
-    // early out. Acquire, so the slot's contents are visible once its index is.
-    bool waitForData(const uint32_t currentWrite, const DWORD timeoutMS, std::atomic<bool>* const pbEarlyOutSignal) const {
-      if (currentWrite != m_cachedRead) {
-        return true;
+    bool waitForData(const DWORD timeoutMS, std::atomic<bool>* const pbEarlyOutSignal) {
+      const auto hasData = [&]() {
+        return m_write->load(std::memory_order_relaxed) != m_read->load(std::memory_order_acquire);
+      };
+      return hasData() || waitUntil(hasData, m_readerSleeping, m_hDataAvailable, timeoutMS, pbEarlyOutSignal, m_emptyStats);
+    }
+
+    // The fence orders the caller's index store before the sleeping flag load.
+    void wakeIfSleeping(std::atomic<uint32_t>* sleeping, HANDLE hEvent, QueueWaitStats& stats) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      if (hEvent != nullptr && sleeping->load(std::memory_order_relaxed)) {
+        SetEvent(hEvent);
+        stats.wakesSent.fetch_add(1, std::memory_order_relaxed);
       }
+    }
 
-      ULONGLONG start = 0, curTick;
-      while ((m_cachedRead = m_read->load(std::memory_order_acquire)) == currentWrite) {
-        std::this_thread::yield();
+    // A timeoutMS of 0 waits without a time limit.
+    template<typename Ready>
+    bool waitUntil(const Ready& ready, std::atomic<uint32_t>* sleeping, HANDLE hEvent, const DWORD timeoutMS,
+                   std::atomic<bool>* const pbEarlyOutSignal, QueueWaitStats& stats) {
+      ZoneScoped;
+      stats.waits.fetch_add(1, std::memory_order_relaxed);
+      const ULONGLONG startTick = GetTickCount64();
+      const auto timedOut = [&]() {
+        return timeoutMS != 0 && GetTickCount64() - startTick >= timeoutMS;
+      };
+      const auto earlyOut = [&]() {
+        return pbEarlyOutSignal != nullptr && pbEarlyOutSignal->load();
+      };
 
-        curTick = GetTickCount64();
-        start = start > 0 ? start : curTick;
-
-        if (pbEarlyOutSignal && pbEarlyOutSignal->load()) {
-          return false;
+      LARGE_INTEGER spinStart, now;
+      QueryPerformanceCounter(&spinStart);
+      now = spinStart;
+      uint32_t iteration = 0;
+      while (true) {
+        YieldProcessor();
+        if (ready()) {
+          QueryPerformanceCounter(&now);
+          stats.spinTicks.fetch_add(uint64_t(now.QuadPart - spinStart.QuadPart), std::memory_order_relaxed);
+          return true;
         }
-        if (timeoutMS != 0 && start + timeoutMS <= curTick) {
-          return false;
+        if ((++iteration & 63) == 0) {
+          QueryPerformanceCounter(&now);
+          if (now.QuadPart - spinStart.QuadPart >= m_spinTicks) {
+            break;
+          }
+          std::this_thread::yield();
+          if (earlyOut()) {
+            stats.spinTicks.fetch_add(uint64_t(now.QuadPart - spinStart.QuadPart), std::memory_order_relaxed);
+            return false;
+          }
         }
       }
-      return true;
+      stats.spinTicks.fetch_add(uint64_t(now.QuadPart - spinStart.QuadPart), std::memory_order_relaxed);
+
+      const LARGE_INTEGER blockStart = now;
+      bool success = false;
+      while (true) {
+        if (hEvent != nullptr) {
+          sleeping->store(1, std::memory_order_relaxed);
+          std::atomic_thread_fence(std::memory_order_seq_cst);
+          if (ready()) {
+            sleeping->store(0, std::memory_order_relaxed);
+            success = true;
+            break;
+          }
+          stats.blocks.fetch_add(1, std::memory_order_relaxed);
+          WaitForSingleObject(hEvent, kSleepSliceMs);
+          sleeping->store(0, std::memory_order_relaxed);
+        } else {
+          std::this_thread::yield();
+        }
+        if (ready()) {
+          success = true;
+          break;
+        }
+        if (earlyOut() || timedOut()) {
+          break;
+        }
+      }
+      QueryPerformanceCounter(&now);
+      stats.blockTicks.fetch_add(uint64_t(now.QuadPart - blockStart.QuadPart), std::memory_order_relaxed);
+      return success;
     }
   };
 

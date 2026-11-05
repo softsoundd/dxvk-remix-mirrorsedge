@@ -735,6 +735,11 @@ struct DrawCallState {
     return skinningData;
   }
 
+  // Refreshes cached bone matrices only. Geometry, material and hash fields must stay stable for pairing.
+  SkinningData& getSkinningStateMutable() {
+    return skinningData;
+  }
+
   bool hasSkinnedWorldAnchor() const {
     return m_hasSkinnedWorldAnchor;
   }
@@ -808,8 +813,46 @@ struct DrawCallState {
 
   uint32_t drawCallID = 0;
 
+  // Set for draws submitted through the Remix API rather than by the game.
+  bool isExternalDraw = false;
+
   bool isDrawingToRaytracedRenderTarget = false;
   bool isUsingRaytracedRenderTarget = false;
+
+  void setRaytracedRenderTarget(const Rc<DxvkImage>& pImage) {
+    raytracedRenderTargetImage = pImage;
+    raytracedRenderTargetDescriptorHash = pImage != nullptr ? pImage->getDescriptorHash() : kEmptyHash;
+    isUsingRaytracedRenderTarget = pImage != nullptr;
+  }
+
+  XXH64_hash_t getCapturedMaterialHash(XXH64_hash_t legacyMaterialHash) const {
+    return isUsingRaytracedRenderTarget && raytracedRenderTargetDescriptorHash != kEmptyHash
+      ? raytracedRenderTargetDescriptorHash : legacyMaterialHash;
+  }
+
+  template<typename LookupMaterial>
+  std::shared_ptr<MaterialData> findMaterialReplacement(LookupMaterial&& lookupMaterial) const {
+    auto pMaterial = lookupMaterial(getMaterialData().getHash());
+    if (pMaterial == nullptr && isUsingRaytracedRenderTarget && raytracedRenderTargetDescriptorHash != kEmptyHash) {
+      pMaterial = lookupMaterial(raytracedRenderTargetDescriptorHash);
+    }
+    return pMaterial;
+  }
+
+  bool isCameraMaterialDirty(const std::unordered_set<XXH64_hash_t>& dirtyMaterialHashes) const {
+    return isUsingRaytracedRenderTarget && raytracedRenderTargetDescriptorHash != kEmptyHash &&
+      dirtyMaterialHashes.count(raytracedRenderTargetDescriptorHash) != 0;
+  }
+
+  bool isRaytracedRenderTargetTexture(const TextureRef& texture) const {
+    const auto* pImageView = texture.getImageView();
+    return isUsingRaytracedRenderTarget && raytracedRenderTargetImage != nullptr &&
+      pImageView != nullptr && pImageView->image() == raytracedRenderTargetImage;
+  }
+
+  // Retain the categorized resource independently of the primary albedo/opacity input.
+  Rc<DxvkImage> raytracedRenderTargetImage;
+  XXH64_hash_t raytracedRenderTargetDescriptorHash = kEmptyHash;
 
   // Set when the Sky category was assigned by skyAutoDetect heuristic
   // (as opposed to explicit methods like skyBoxTextures/skyBoxGeometries/skyMinZThreshold).
@@ -959,6 +1002,8 @@ struct PooledBlas : public RcObject {
   // Hash of a bound opacity micromap
   // Note: only used for tracking of OMMs for static BLASes
   XXH64_hash_t opacityMicromapSourceHash = kEmptyHash;
+  // Attachment presence from the actual last build, including dynamic BLASes returned to the pool.
+  bool hasOmmAttachments = false;
 
   // Keep a copy of the build info so we can validate BLAS update compatibility
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};

@@ -558,6 +558,40 @@ namespace dxvk {
     m_dlssNeuralRenderingResourcesAllocated = resourcesAreNeeded;
   }
 
+  void Resources::setAovRequests(uint32_t raw, bool coverage) {
+    m_rawAovRequests = raw;
+    m_coverageAovRequested = coverage;
+  }
+
+  void Resources::updateOptionalAovResources(Rc<DxvkContext>& ctx) {
+    struct OptionalAov {
+      Resource& resource;
+      const char* name;
+      VkFormat format;
+      bool enabled;
+    };
+    OptionalAov aovs[] = {
+      { m_raytracingOutput.m_primaryWorldPositionRaw, "primary world position raw", VK_FORMAT_R32G32B32A32_SFLOAT, rawAovEnabled(kRawAovWorldPosition) },
+      { m_raytracingOutput.m_primaryTexcoordsRaw, "primary texcoords raw", VK_FORMAT_R32G32B32A32_SFLOAT, rawAovEnabled(kRawAovTexcoords) },
+      { m_raytracingOutput.m_primaryNormalF32, "primary normal F32", VK_FORMAT_R32G32B32A32_SFLOAT, rawAovEnabled(kRawAovNormal) },
+      { m_raytracingOutput.m_primaryCoverage, "primary coverage", VK_FORMAT_R32_SFLOAT, coverageAovEnabled() },
+    };
+    const auto needsUpdate = [&](const OptionalAov& aov) {
+      return aov.enabled ? !aov.resource.isValid() || aov.resource.image->info().extent != m_downscaledExtent
+                         : aov.resource.isValid();
+    };
+    if (std::none_of(std::begin(aovs), std::end(aovs), needsUpdate)) {
+      return;
+    }
+
+    ctx->getDevice()->waitForIdle();
+    for (auto& aov : aovs) {
+      if (needsUpdate(aov)) {
+        aov.resource = aov.enabled ? createImageResource(ctx, aov.name, m_downscaledExtent, aov.format) : Resource{};
+      }
+    }
+  }
+
   void Resources::onFrameBegin(
     Rc<DxvkContext> ctx,
     RtxTextureManager& textureManager,
@@ -566,6 +600,7 @@ namespace dxvk {
     const VkExtent3D& targetExtent,
     bool resetHistory,
     bool isCameraCut) {
+    updateOptionalAovResources(ctx);
 
     FrameBeginContext frameBeginCtx;
     frameBeginCtx.downscaledExtent = downscaledExtent;
@@ -854,13 +889,26 @@ namespace dxvk {
     const VkClearColorValue borderColor/* = VkClearColorValue()*/,
     const float mipBias/* = 0*/,
     const bool useAnisotropy/* = false*/) {
+    return getSampler(filter, filter, mipFilter, addressModeU, addressModeV, addressModeW, borderColor, mipBias, useAnisotropy);
+  }
+
+  Rc<DxvkSampler> dxvk::Resources::getSampler(
+    const VkFilter magFilter,
+    const VkFilter minFilter,
+    const VkSamplerMipmapMode mipFilter,
+    const VkSamplerAddressMode addressModeU,
+    const VkSamplerAddressMode addressModeV,
+    const VkSamplerAddressMode addressModeW,
+    const VkClearColorValue borderColor/* = VkClearColorValue()*/,
+    const float mipBias/* = 0*/,
+    const bool useAnisotropy/* = false*/) {
     const VkPhysicalDeviceLimits& limits = m_device->properties().core.properties.limits;
     const float maxAniso = std::min(limits.maxSamplerAnisotropy, RtxOptions::maxAnisotropySamples());
 
     // Fill out the rest of the sample create info
     DxvkSamplerCreateInfo samplerInfo;
-    samplerInfo.magFilter = filter;
-    samplerInfo.minFilter = filter;
+    samplerInfo.magFilter = magFilter;
+    samplerInfo.minFilter = minFilter;
     samplerInfo.mipmapMode = mipFilter;
     samplerInfo.mipmapLodBias = mipBias;
     samplerInfo.mipmapLodMin = 0.0f;

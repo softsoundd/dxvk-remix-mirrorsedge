@@ -39,6 +39,7 @@
 
 #include "rtx/algorithm/volume_composite_helpers.slangh"
 #include "rtx/algorithm/accumulate.slangh"
+#include "rtx/algorithm/view_distance.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 #include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/sparse_rendering/compact_active_pixels.slangh"
@@ -939,13 +940,17 @@ vec4 compositeResult(
   vec3 secondarySpecularAlbedo = vec3(0);
   if (geometryFlags.secondarySurfaceMask)
   {
-    secondaryAttenuation = r11g11b10ToColor(imageLoad(SecondaryAttenuation, ivec2(compactedCoordinate)));
+    // NV-DXVK start: Preserve emissive camera gain in composite.
+    secondaryAttenuation = unpackAttenuation(imageLoad(SecondaryAttenuation, ivec2(compactedCoordinate)));
+    // NV-DXVK end
     secondaryAlbedo = SecondaryAlbedo[compactedCoordinate].xyz;
     secondarySpecularAlbedo = SecondarySpecularAlbedo[compactedCoordinate].xyz;
   }
   if (pixelIsActive)
   {
-    primaryAttenuation = r11g11b10ToColor(PrimaryAttenuation[compactedCoordinate]);
+    // NV-DXVK start: Preserve emissive camera gain in composite.
+    primaryAttenuation = unpackAttenuation(PrimaryAttenuation[compactedCoordinate]);
+    // NV-DXVK end
     primaryAlbedo = PrimaryAlbedo[compactedCoordinate].xyz;
     primarySpecularAlbedo = PrimarySpecularAlbedo[compactedCoordinate].xyz;
     perceptualRoughness = PrimaryVirtualWorldNormalPerceptualRoughness[compactedCoordinate].w;
@@ -1140,10 +1145,28 @@ vec4 compositeResult(
 
   applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
 
+  // Blend distant primary surfaces into the sky, keeping the volumetric inscattering in front of them
+  // WARN: 'rtx.sparseRendering.enableSparsePrimaryRayMissComposition' ON makes the fade end shimmer against the sky
+  if (cb.viewDistanceArgs.distanceMode == viewDistanceModeCoherentNoiseSmoothPrimary && !primaryMiss)
+  {
+    const vec3 worldPosition = cameraGetWorldPosition(cb.camera) + primaryRayDirections.worldDirection * viewDistance;
+    vec3 skyRadiance = volumetricPreintegratedRadiance * volumetricRadianceScale;
+    // The sky is attenuated as infinitely distant, as at primary misses.
+    const VolumeDefinitionCamera volumeCamera = cb.volumeArgs.cameras[froxelVolumeMain];
+    const vec3 skyVolumeAttenuation = volumeAttenuation * calcVolumetricAttenuation(
+      cb.volumeArgs, volumeCamera, true, 0.0f, worldToTranslatedWorld(volumeCamera, worldPosition), primaryRayDirections.worldDirection);
+    applySkyContribution(pixelCoordinate, primaryRayDirections, true, radianceScale, skyVolumeAttenuation, skyRadiance);
+    radianceOutput = lerp(radianceOutput, skyRadiance, calcViewDistanceFade(cb.viewDistanceArgs, cb.isZUp, cb.camera, worldPosition));
+  }
+
   // Apply fog
   const float fogTransmittance = applyFog(viewDistance, radianceScale, radianceOutput);
   controlMaskTransmittance = calcBt709Luminance(saturate(controlMaskVolumeAttenuation));
   controlMaskTransmittance *= fogTransmittance * backgroundAlpha * cloudLayerTransmittance;
+
+  if (cb.enableCoverageAov != 0) {
+    PrimaryCoverage[pixelCoordinate] = saturate(1.0f - PrimaryCoverage[pixelCoordinate] * backgroundAlpha);
+  }
 
   // Combine the alpha-blended foreground with the background before upscaling.
   return vec4(radianceOutput * backgroundAlpha + alphaBlendOutput, 1.f);

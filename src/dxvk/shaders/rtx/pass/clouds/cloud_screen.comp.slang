@@ -423,7 +423,7 @@ void main(uint2 threadId : SV_DispatchThreadID, uint2 localId : SV_GroupThreadID
     const uint packedThroughput = glassReflectedSky
       ? SecondaryAttenuation[psrCoordinate]
       : PrimaryAttenuation[psrCoordinate];
-    const vec3 throughput = r11g11b10ToColor(packedThroughput);
+    const vec3 throughput = unpackAttenuation(packedThroughput);
     CloudMarchSettings reflectionSettings = cloudReflectionMarchSettings(cloud);
     if (max(throughput.r, max(throughput.g, throughput.b)) > kDimReflectionThroughput) {
       reflectionSettings = settings;
