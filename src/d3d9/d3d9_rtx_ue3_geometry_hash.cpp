@@ -420,6 +420,16 @@ namespace dxvk {
     geoData.sourceVertexBufferAddress = indexContext.ibo->GetBuffer<D3D9_COMMON_BUFFER_TYPE_MAPPING>().ptr();
   }
 
+  // All sections of a mesh LOD draw from its one static index buffer,
+  // while ring pools share dynamic ones between unrelated meshes.
+  // See "First person and the player model" in UE3Compatibility.md.
+  void D3D9Rtx::updateUe3MeshIndexBuffer(const IndexContext& indexContext, RasterGeometry& geoData) {
+    if (m_frameOptions.ue3EngineMode && indexContext.ibo != nullptr &&
+        (indexContext.ibo->Desc()->Usage & D3DUSAGE_DYNAMIC) == 0) {
+      geoData.ue3MeshIndexBuffer = indexContext.ibo;
+    }
+  }
+
   // Serves static IA draws' geometry hashes from the memo. A first sighting hashes on a worker, which
   // publishes into the entry.
   D3D9Rtx::Ue3GeometryMemoLookup D3D9Rtx::lookupUe3GeometryMemo(const IndexContext& indexContext,

@@ -404,6 +404,11 @@ struct RasterGeometry {
   // Address of DXVK buffer object mapped to source D3D9 VB (L2 match key) that is captured from drawCallState.Used in instance matching.
   const void* sourceVertexBufferAddress = nullptr;
 
+  // Holds the static index buffer the draw reads, which all sections of a UE3 mesh LOD share, so it identifies the mesh.
+  // It stays null for dynamic index buffers and outside UE3 engine mode.
+  // It is only ever compared, as cached geometry can outlive the buffer.
+  const void* ue3MeshIndexBuffer = nullptr;
+
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;
 

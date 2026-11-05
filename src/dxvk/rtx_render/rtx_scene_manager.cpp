@@ -329,6 +329,9 @@ namespace dxvk {
     m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
     m_lastResolvedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
     m_lastUploadedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
+
+    // The scene's meshes can be released after a clear, and new meshes can reuse their index buffer addresses.
+    m_playerModelMeshClassifier.clear();
   }
 
   void SceneManager::invalidateChangedReplacements(const AssetChanges& changes) {
@@ -863,6 +866,30 @@ namespace dxvk {
       geoRec.geometryHash = geometryHash;
       geoRec.positionsHash = positionsHash;
       geoRec.valid = true;
+    }
+  }
+
+  // See "First person and the player model" in UE3Compatibility.md.
+  void SceneManager::classifyPlayerModelMeshSection(DrawCallState& drawCallState) {
+    const void* pMesh = drawCallState.getGeometryData().ue3MeshIndexBuffer;
+    // Foreground draws are left to applyUe3ForegroundDpg, which makes them view model in first person.
+    if (pMesh == nullptr || drawCallState.isUe3ForegroundDpg || !RtxOptions::PlayerModel::autoDetectMeshSections()) {
+      return;
+    }
+
+    const PlayerModelMeshClassifier::Change change = m_playerModelMeshClassifier.classifySection(
+      pMesh,
+      drawCallState.getGeometryData().getHashForRule<rules::TopologicalHash>(),
+      drawCallState.getMaterialData().getHash(),
+      drawCallState.testCategoryFlags(InstanceCategories::ThirdPersonPlayerModel));
+
+    CategoryFlags& categories = drawCallState.modifyCategoryFlags();
+    if (change == PlayerModelMeshClassifier::Change::AddPlayerModel) {
+      // ViewModel is cleared for the same reason as for a geometry tag (see setupCategoriesForGeometry).
+      categories.set(InstanceCategories::ThirdPersonPlayerModel);
+      categories.clr(InstanceCategories::ViewModel);
+    } else if (change == PlayerModelMeshClassifier::Change::RemovePlayerModel) {
+      categories.clr(InstanceCategories::ThirdPersonPlayerModel, InstanceCategories::ThirdPersonPlayerBody);
     }
   }
 
@@ -2985,6 +3012,14 @@ namespace dxvk {
     // foreground DPG) are often submitted after RTX injection and accumulate for the next
     // injection's scene - a frame-end clear would wipe them before they are ever consumed.
     m_viewModelTopologyHashes.clear();
+
+    // Meshes are forgotten while the option is off, so turning it back on cannot apply stale decisions.
+    if (RtxOptions::PlayerModel::autoDetectMeshSections()) {
+      m_playerModelMeshClassifier.endScene();
+    } else {
+      m_playerModelMeshClassifier.clear();
+    }
+
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());

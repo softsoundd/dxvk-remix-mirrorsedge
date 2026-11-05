@@ -126,6 +126,11 @@ exe = executable('test_preserved_object_picking',  files('test_preserved_object_
 test('test_preserved_object_picking', exe, env: test_env)
 tests += exe
 
+exe = executable('test_player_model_mesh_classifier',  files('test_player_model_mesh_classifier.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ dxvk_lib ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_player_model_mesh_classifier', exe, env: test_env)
+tests += exe
+
 exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_f16tof32', exe, env: test_env)
 tests += exe

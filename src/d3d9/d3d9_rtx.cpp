@@ -1380,6 +1380,7 @@ namespace dxvk {
     readUe3DrawInstances(vertexContext, drawContext, geoData);
     updateUe3SkinnedDrawIdentity();
     updateUe3DynamicMeshIdentity(indexContext, vertexContext, geoData);
+    updateUe3MeshIndexBuffer(indexContext, geoData);
 
     if (!resolveUe3DrawCaptureSource(indexContext, vertexContext, geoData)) {
       return finishPrepare(prepareFlagsForIgnoredDraws);

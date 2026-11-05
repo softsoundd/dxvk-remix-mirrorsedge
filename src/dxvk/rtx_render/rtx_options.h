@@ -261,7 +261,8 @@ namespace dxvk {
                   "Remix uses the tagged body instance as the anchor for filtering nearby player-model parts and for creating or positioning virtual player-model instances through portals.");
     RTX_OPTION("rtx", fast_unordered_set, playerModelGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) for third-person player model draw calls.\n"
-                  "Use when the third-person mesh shares materials with the first-person one.");
+                  "Use when the third-person mesh shares materials with the first-person one.\n"
+                  "The untagged sections of a mostly tagged mesh follow it (rtx.playerModel.autoDetectMeshSections).");
     RTX_OPTION("rtx", fast_unordered_set, playerModelBodyGeometries, {},
                   "Topology-stable geometry hashes (indices + geometry descriptor) identifying the player model body/root position.\n"
                   "Geometry-based equivalent of rtx.playerModelBodyTextures; implies the player-model category.\n"
@@ -546,6 +547,12 @@ namespace dxvk {
       RTX_OPTION("rtx.playerModel", float, heldEquipmentMaxDistance, 200.f,
                  "Maximum distance (world units) from the camera for autoDetectHeldEquipment candidates.\n"
                  "Guards against classifying a distant duplicate when the real held copy is absent (e.g. culled).");
+      RTX_OPTION("rtx.playerModel", bool, autoDetectMeshSections, true,
+                 "Settles player-model tags per mesh. A mesh with most of its sections tagged is the player's, and its untagged\n"
+                 "sections are player model too. On any other mesh, a tagged section that shares its geometry or material with\n"
+                 "the player's mesh stays world geometry, so another character's matching eyes or teeth still render.\n"
+                 "Meshes are told apart by the static index buffer they draw from, so this only applies in rtx.d3d9.ue3EngineMode;\n"
+                 "see \"First person and the player model\" in documentation/UE3Compatibility.md.");
       RTX_OPTION("rtx.playerModel", float, backwardOffset, 0.f, "");
       RTX_OPTION("rtx.playerModel", float, horizontalDetectionDistance, 34.f, "");
       RTX_OPTION("rtx.playerModel", float, verticalDetectionDistance, 64.f, "");

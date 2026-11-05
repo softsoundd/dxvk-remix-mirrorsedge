@@ -341,6 +341,8 @@ dxvk_src = files([
   'rtx_render/rtx_pathtracer_integrate_indirect.cpp',
   'rtx_render/rtx_pathtracer_integrate_indirect.h',
   'rtx_render/rtx_pending_slot_queues.h',
+  'rtx_render/rtx_player_model_mesh_classifier.cpp',
+  'rtx_render/rtx_player_model_mesh_classifier.h',
   'rtx_render/rtx_postFx.cpp',
   'rtx_render/rtx_postFx.h',
   'rtx_render/rtx_preserved_object_picking.h',

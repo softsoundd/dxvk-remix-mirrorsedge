@@ -47,6 +47,7 @@
 #include "rtx_light_manager.h"
 #include "rtx_instance_manager.h"
 #include "rtx_accel_manager.h"
+#include "rtx_player_model_mesh_classifier.h"
 #include "rtx_ray_portal_manager.h"
 #include "rtx_bindless_resource_manager.h"
 #include "rtx_objectpicking.h"
@@ -172,6 +173,11 @@ public:
   const InstanceManager& getInstanceManager() const { return m_instanceManager; }
 
   void recordUe3ForegroundDemotion() { ++m_ue3ForegroundDemotedDrawCount; }
+
+  // Settles a draw's player-model category by its mesh (rtx.playerModel.autoDetectMeshSections).
+  // It must run once the draw's geometry tags are applied, and before its camera is classified.
+  void classifyPlayerModelMeshSection(DrawCallState& drawCallState);
+
   const AccelManager& getAccelManager() const { return m_accelManager; }
   const LightManager& getLightManager() const { return m_lightManager; }
   const GraphManager& getGraphManager() const { return m_graphManager; }
@@ -420,6 +426,10 @@ private:
   // injections (view-model draws often happen after injection and belong to the next scene).
   // Consumed and cleared by the detectHeldEquipmentInstances call during scene preparation.
   fast_unordered_set m_viewModelTopologyHashes;
+
+  // Accumulates the draws between RTX injections, like m_viewModelTopologyHashes, and ends a scene at each preparation.
+  PlayerModelMeshClassifier m_playerModelMeshClassifier;
+
   std::mutex m_startInMediumMaterialMutex;
   std::optional<MaterialData> m_pendingStartInMediumMaterial;
   bool m_pendingClearStartInMediumMaterial = false;

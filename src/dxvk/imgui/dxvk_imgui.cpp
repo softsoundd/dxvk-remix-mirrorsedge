@@ -5350,6 +5350,7 @@ namespace dxvk {
           "(no ViewModel camera), such as cutscenes. Auto Primary Space Body Distance is a separate rule.");
       }
       RemixGui::Checkbox("Create Virtual Instances", &RtxOptions::PlayerModel::enableVirtualInstancesObject());
+      RemixGui::Checkbox("Auto-Detect Mesh Sections", &RtxOptions::PlayerModel::autoDetectMeshSectionsObject());
       if (RemixGui::CollapsingHeader("Calibration", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
         RemixGui::DragFloat("Backward Offset", &RtxOptions::PlayerModel::backwardOffsetObject(), 0.01f, 0.f, 100.f);
