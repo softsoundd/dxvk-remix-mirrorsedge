@@ -3163,6 +3163,7 @@ void ProcessDeviceCommandQueue() {
           serialize::InstanceInfoBlend blend;
           serialize::InstanceInfoTransforms boneXforms;
           serialize::InstanceInfoParticleSystem particleSystem;
+          serialize::InstanceInfoParticleSpawnDistribution particleSpawnDistribution;
         } exts;
         memset(&exts, 0, sizeof(InstanceExtensions));
 
@@ -3215,6 +3216,14 @@ void ProcessDeviceCommandQueue() {
               deserializeFromQueue(exts.particleSystem);
               pInfoProto->pNext = &(exts.particleSystem);
               pInfoProto = &getInfoProto(exts.particleSystem);
+              break;
+            }
+            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SPAWN_DISTRIBUTION_EXT:
+            {
+              assert(!exts.particleSpawnDistribution.pNext);
+              deserializeFromQueue(exts.particleSpawnDistribution);
+              pInfoProto->pNext = &exts.particleSpawnDistribution;
+              pInfoProto = &getInfoProto(exts.particleSpawnDistribution);
               break;
             }
             default:
@@ -3758,6 +3767,17 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
     return 1;
   }
   LocalFree(argList);
+
+  // Windows gives the highest QoS to the process that owns the foreground window, which is the game, not this server.
+  // The server's threads then run at a lower QoS, often on efficiency cores, while the game's frames wait on them.
+  // Opting out of execution speed throttling gives this process HighQoS.
+  PROCESS_POWER_THROTTLING_STATE powerThrottling = {};
+  powerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  powerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+  powerThrottling.StateMask = 0;
+  if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &powerThrottling, sizeof(powerThrottling))) {
+    Logger::warn(format_string("Could not opt out of power throttling, error %u", GetLastError()));
+  }
 
   initModuleBridge();
   initDeviceBridge();

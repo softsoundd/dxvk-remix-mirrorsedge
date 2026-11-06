@@ -178,6 +178,7 @@ public:
 
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
+  const std::vector<PointInstancerBatch>& getPointInstancerBatches() const { return m_pointInstancerBatches; }
 
   bool hasShadowBackfaceSkipInstances() const { return m_hasShadowBackfaceSkipInstances; }
 
