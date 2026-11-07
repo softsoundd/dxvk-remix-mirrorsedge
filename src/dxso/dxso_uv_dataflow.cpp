@@ -488,6 +488,11 @@ namespace dxvk {
     return true;
   }
 
+  // A literal zero absorbs any finite factor it multiplies, known or not.
+  static bool uvConstIsZero(const UvConstComponentRef& ref) {
+    return ref.valid && ref.isImmediate && ref.immediate == 0.0f;
+  }
+
   static void uvAffineMulConstRef(UvComponentAffine& a, const UvConstComponentRef& ref) {
     if (ref.isImmediate) {
       uvAffineMulImmediate(a, ref.immediate);
@@ -588,14 +593,22 @@ namespace dxvk {
     return s;
   }
 
+  // UE3's base pass interpolates the tangent-space camera vector, CameraVector_FogA, as TEXCOORD6.
+  // It is a direction read as seen face-on (see "Bump offset and the camera vector" in UE3Compatibility.md).
+  constexpr int8_t kUe3CameraVectorTexcoord = 6;
+
   class UvDataflowTracer {
   public:
+    // cameraVectorTexcoord is the TEXCOORD index of the interpolant read as the camera vector.
+    // It is -1 when no interpolant is read that way.
     UvDataflowTracer(const std::array<int8_t, 2 * DxsoMaxInterfaceRegs>& inputRegToTexcoord,
                      const bool texcoordRegsAreInterpolants,
-                     const bool originIsSemanticIndex)
+                     const bool originIsSemanticIndex,
+                     const int8_t cameraVectorTexcoord)
       : m_inputRegToTexcoord(inputRegToTexcoord)
       , m_texcoordRegsAreInterpolants(texcoordRegsAreInterpolants)
-      , m_originIsSemanticIndex(originIsSemanticIndex) {
+      , m_originIsSemanticIndex(originIsSemanticIndex)
+      , m_cameraVectorTexcoord(cameraVectorTexcoord) {
       m_defConstValid.fill(0);
     }
 
@@ -620,6 +633,23 @@ namespace dxvk {
       UvConstComponentRef ref;
       if (r.hasRelative) {
         return ref;
+      }
+
+      // The camera vector seen face-on is (0, 0, |v|), so its x and y lanes read as the constant 0.
+      // Its length and the fog in its w lane are unknown.
+      if (readsCameraVector(r)) {
+        const uint8_t comp = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
+        if (comp >= 2u) {
+          return ref;
+        }
+        UvConstComponentRef faceOn;
+        faceOn.valid = true;
+        faceOn.isImmediate = true;
+        faceOn.immediate = 0.0f;
+        if (!uvConstApplySourceModifier(faceOn, r.modifier)) {
+          return ref;
+        }
+        return faceOn;
       }
 
       // temps holding tracked pure-constant expressions (fxc hoists constant
@@ -664,6 +694,11 @@ namespace dxvk {
     UvExactComponentOrigin readOrigin(const DxsoRegister& r, const uint32_t dstComponent) const {
       const uint8_t srcComponent = uint8_t(r.swizzle[dstComponent & 0x3u] & 0x3u);
       UvExactComponentOrigin origin;
+
+      // The camera vector is a direction, so it is never a texture coordinate's origin.
+      if (readsCameraVector(r)) {
+        return origin;
+      }
 
       switch (r.id.type) {
       case DxsoRegisterType::Texture: // == Addr in VS; only meaningful for PS
@@ -866,6 +901,21 @@ namespace dxvk {
     }
 
   private:
+    bool readsCameraVector(const DxsoRegister& r) const {
+      if (m_cameraVectorTexcoord < 0) {
+        return false;
+      }
+      switch (r.id.type) {
+      case DxsoRegisterType::Texture:
+      case DxsoRegisterType::PixelTexcoord:
+        return m_texcoordRegsAreInterpolants && mapRegToSemantic(r.id.num, true) == uint8_t(m_cameraVectorTexcoord);
+      case DxsoRegisterType::Input:
+        return r.id.num < m_inputRegToTexcoord.size() && m_inputRegToTexcoord[r.id.num] == m_cameraVectorTexcoord;
+      default:
+        return false;
+      }
+    }
+
     UvExactComponentOrigin traceComponent(const DxsoInstructionContext& ctx, const uint32_t c) const {
       switch (ctx.instruction.opcode) {
       case DxsoOpcode::Mov:
@@ -886,6 +936,11 @@ namespace dxvk {
         const UvExactComponentOrigin o1 = readOrigin(ctx.src[1], c);
         const UvConstComponentRef k0 = readConst(ctx.src[0], c);
         const UvConstComponentRef k1 = readConst(ctx.src[1], c);
+
+        // The product is the constant 0, which traceConstExpr records.
+        if (uvConstIsZero(k0) || uvConstIsZero(k1)) {
+          return UvExactComponentOrigin{};
+        }
 
         if (o0.valid && !o1.valid && k1.valid) {
           UvExactComponentOrigin origin = o0;
@@ -981,6 +1036,11 @@ namespace dxvk {
         const UvConstComponentRef k0 = readConst(ctx.src[0], c);
         const UvConstComponentRef k1 = readConst(ctx.src[1], c);
         const UvConstComponentRef k2 = readConst(ctx.src[2], c);
+
+        // A zero factor leaves only the addend.
+        if (uvConstIsZero(k0) || uvConstIsZero(k1)) {
+          return o2;
+        }
 
         UvExactComponentOrigin product;
         if (o0.valid && !o1.valid && k1.valid) {
@@ -1207,6 +1267,7 @@ namespace dxvk {
     std::array<int8_t, 2 * DxsoMaxInterfaceRegs> m_inputRegToTexcoord;
     bool m_texcoordRegsAreInterpolants = false;
     bool m_originIsSemanticIndex = false;
+    int8_t m_cameraVectorTexcoord = -1;
     uint32_t m_trackedOutputReg = std::numeric_limits<uint32_t>::max();
 
     // Temp components holding a constant expression, which fxc hoists before applying it to a UV
@@ -1215,6 +1276,12 @@ namespace dxvk {
     UvConstComponentRef traceConstExpr(const DxsoInstructionContext& ctx, const uint32_t c) const {
       auto mulRefs = [](const UvConstComponentRef& a, const UvConstComponentRef& b) -> UvConstComponentRef {
         UvConstComponentRef result;
+        if (uvConstIsZero(a) || uvConstIsZero(b)) {
+          result.valid = true;
+          result.isImmediate = true;
+          result.immediate = 0.0f;
+          return result;
+        }
         if (!a.valid || !b.valid) {
           return result;
         }
@@ -1287,6 +1354,12 @@ namespace dxvk {
             : std::max(k0.immediate, k1.immediate);
         }
         return result;
+      }
+
+      // Normalising a vector leaves its zero lanes at zero.
+      case DxsoOpcode::Nrm: {
+        const UvConstComponentRef k0 = readConst(ctx.src[0], c);
+        return uvConstIsZero(k0) ? k0 : UvConstComponentRef{};
       }
 
       // unary math on compile-time immediates stays computable
@@ -1382,7 +1455,8 @@ namespace dxvk {
       }
     }
 
-    UvDataflowTracer tracer(inputRegToTexcoord, true /*texcoordRegsAreInterpolants*/, true /*originIsSemanticIndex*/);
+    UvDataflowTracer tracer(inputRegToTexcoord, true /*texcoordRegsAreInterpolants*/, true /*originIsSemanticIndex*/,
+                            kUe3CameraVectorTexcoord);
 
     struct SiteRecord {
       bool valid = false;
@@ -1686,7 +1760,8 @@ namespace dxvk {
       }
     }
 
-    UvDataflowTracer tracer(inputRegToTexcoord, false /*texcoordRegsAreInterpolants*/, false /*originIsSemanticIndex*/);
+    UvDataflowTracer tracer(inputRegToTexcoord, false /*texcoordRegsAreInterpolants*/, false /*originIsSemanticIndex*/,
+                            -1 /*cameraVectorTexcoord*/);
     tracer.setTrackedOutputRegister(outputRegNumber);
 
     const uint32_t* tokens = vertexShader.tokens;

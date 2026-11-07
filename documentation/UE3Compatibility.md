@@ -597,6 +597,12 @@ The pixel shader consumes that as a `dp2add` of the UV pair against each matrix 
 
 `rtx.d3d9.ue3LogUvAffineDetail` reports a resolved rotator with `exact=1 psResolved=1 applied=1`, its `ps=` and `final=` values as `(a,b,c,d,tx,ty)`, and the matrix registers named in the `ctab:` list.
 
+## Bump offset and the camera vector
+
+UE3's `MaterialExpressionBumpOffset` shifts its `Coordinate` input by `CameraVector.xy * (HeightRatio * Height - ReferencePlane * HeightRatio)`. The camera vector is the base pass's tangent-space `CameraVector_FogA` interpolant (`TEXCOORD6`), normalised in `CalcMaterialParameters`, and the height is usually a texture read, so the shift varies per pixel and with the view. A texture transform cannot hold the shift, but the coordinate under it still needs its own. Factory_p's banner flags sample their ad through a bump offset of `(u, 1 - v)`, which renders upside down through the raw `(u, v)`.
+
+The UV tracer reads the camera vector as seen face-on, as the [composite bake](#what-the-bake-renders) renders a surface. Face-on it is `(0, 0, |v|)`, so the shift is exactly 0 whatever the height, and the sampler resolves to its `Coordinate` input's transform. For the flags, `rtx.d3d9.ue3LogUvAffineDetail` reports `V:[uv*-1+1]` and `final=(1,0,0,-1,0,1)`. The camera vector's length and the fog in its w lane are not known face-on, so a shift along its z keeps the coordinate's origin but applies no transform. The camera vector is a direction rather than a texture coordinate, so a lookup by it, as a cube map reflection is, resolves as `originValid=0`.
+
 ## Streaming-stable texture hashes
 
 UE3's texture streamer creates a new D3D9 texture object whenever a texture's resident mip count changes. A hash of the top mip therefore differs for every streamed variant of one texture, and everything keyed on texture hashes - replacements, categories, tags and material identity - stops matching while a lower-mip variant is bound.

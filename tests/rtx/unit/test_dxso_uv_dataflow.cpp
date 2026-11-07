@@ -137,6 +137,10 @@ namespace {
       test_panner();
       test_rotatorDp2add();
       test_rotatorMulMad();
+      test_bumpOffsetFlippedCoordinate();
+      test_bumpOffsetNrm();
+      test_cameraVectorLookup();
+      test_cameraVectorLength();
       test_highestFrequencyTilingWins();
       test_flowControlDropsDerivedCoordinates();
       test_flowControlKeepsInterpolantReads();
@@ -269,6 +273,77 @@ namespace {
                    " U=[uv.y*c4.y+uv.x*c4.x+0.5+c4.y*-0.5+c4.x*-0.5]"
                    " V=[uv.y*c5.y+uv.x*c5.x+0.5+c5.y*-0.5+c5.x*-0.5]",
                    "rotator, mul/mad form");
+    }
+
+    // BumpOffset adds normalize(CameraVector).xy * (HeightRatio * height - ReferencePlane * HeightRatio) to a coordinate.
+    // The camera vector, TEXCOORD6, has x and y of 0 when seen face-on.
+    // Factory_p's banner flags shift (u, 1 - v), which fxc folds into the shift's mad.
+    static void test_bumpOffsetFlippedCoordinate() {
+      std::cout << "  test_bumpOffsetFlippedCoordinate" << std::endl;
+      PsShader ps;
+      ps.dclInput(DxsoUsage::Texcoord, 6, 2, MaskXYZ)
+        .dclSampler(1)
+        .def(6, 2.0f, -1.0f, -0.5f, 0.5f)
+        .def(7, 0.05f, -0.025f, 0.0f, 0.0f)
+        .texld(rd(1), v(0), 1)
+        .op3(DxsoOpcode::Mad, rd(0, MaskX), r(1, kYYYY), c(7, kXXXX), c(7, kYYYY))
+        .op2(DxsoOpcode::Dp3, rd(0, MaskY), v(2), v(2))
+        .op1(DxsoOpcode::Rsq, rd(0, MaskY), r(0, kYYYY))
+        .op2(DxsoOpcode::Mul, rd(0, MaskY | MaskZ), r(0, kYYYY), v(2, swz(0, 0, 1, 3)))
+        .op2(DxsoOpcode::Mul, rd(0, MaskY), r(0, kXXXX), r(0, kYYYY))
+        .op3(DxsoOpcode::Mad, rd(0, MaskZ), r(0, kXXXX), r(0, kZZZZ), v(0, kYYYY, kModNeg))
+        .op1(DxsoOpcode::Mov, rd(0, MaskW), c(6, kYYYY, kModNeg))
+        .op1(DxsoOpcode::Mov, rd(0, MaskX), v(0, kXXXX))
+        .op2(DxsoOpcode::Add, rd(0, MaskXY), r(0, swz(1, 3, 2, 3)), r(0, swz(0, 2, 2, 3)))
+        .texld(rd(0), r(0), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(0));
+      expectString(ps.origin(),
+                   "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=1 U=[uv*1+0] V=[uv*-1+1]",
+                   "bump offset of (u, 1 - v)");
+    }
+
+    // The same shift where fxc normalises the camera vector with nrm, over the plain coordinate.
+    static void test_bumpOffsetNrm() {
+      std::cout << "  test_bumpOffsetNrm" << std::endl;
+      PsShader ps;
+      ps.dclInput(DxsoUsage::Texcoord, 6, 2, MaskXYZ)
+        .dclSampler(1)
+        .def(6, 0.2f, -0.1f, 0.0f, 0.0f)
+        .texld(rd(1), v(0), 1)
+        .op3(DxsoOpcode::Mad, rd(0, MaskW), r(1, kWWWW), c(6, kXXXX), c(6, kYYYY))
+        .op1(DxsoOpcode::Nrm, rd(3, MaskXYZ), v(2))
+        .op3(DxsoOpcode::Mad, rd(2, MaskXY), r(0, kWWWW), r(3), v(0))
+        .texld(rd(0), r(2), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(0));
+      expectString(ps.origin(),
+                   "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=1 U=[uv*1+0] V=[uv*1+0]",
+                   "bump offset, nrm form");
+    }
+
+    // A lookup by the camera vector itself, as cube map reflections are, is view-dependent and has no UV origin.
+    static void test_cameraVectorLookup() {
+      std::cout << "  test_cameraVectorLookup" << std::endl;
+      PsShader ps;
+      ps.dclInput(DxsoUsage::Texcoord, 6, 2, MaskXYZ)
+        .texld(rd(0), v(2), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(0));
+      expectString(ps.origin(),
+                   "origin=0 sem=0 comps=(0,1) sites=0/1 agree=1 preferHF=0 exact=0 U=[uv*1+0] V=[uv*1+0]",
+                   "camera vector lookup");
+    }
+
+    // The camera vector's length is not known face-on, so a shift by its z keeps the origin but not the affine.
+    static void test_cameraVectorLength() {
+      std::cout << "  test_cameraVectorLength" << std::endl;
+      PsShader ps;
+      ps.dclInput(DxsoUsage::Texcoord, 6, 2, MaskXYZ)
+        .op3(DxsoOpcode::Mad, rd(1, MaskXY), v(2, kZZZZ), c(3, kXXXX), v(0))
+        .texld(rd(0), r(1), 0)
+        .op1(DxsoOpcode::Mov, oC0(), r(0));
+      expectString(ps.origin(),
+                   "origin=1 sem=0 comps=(0,1) sites=1/0 agree=1 preferHF=0 exact=0"
+                   " U=[uv*1+0(INEXACT)] V=[uv*1+0(INEXACT)]",
+                   "shift by the camera vector's length");
     }
 
     // UE3's distance-fade anti-tiling samples one texture at two literal tilings; the higher

@@ -104,7 +104,7 @@ namespace dxvk {
     // Stored picks are only meaningful under the scoring that produced them. Bump this whenever
     // the albedo score or the header changes, so a build re-derives instead of serving decisions
     // its own scoring would no longer make.
-    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 7;
+    constexpr uint32_t kUe3DiffuseSelectionScoringVersion = 8;
 
     // How many loaded picks to re-score and check against current scoring per session. A scoring
     // change disagrees broadly, so a small sample finds one; the cost is bounded to that many draws.
