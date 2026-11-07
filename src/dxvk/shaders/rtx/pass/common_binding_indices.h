@@ -50,17 +50,18 @@
 #define BINDING_SAMPLER_READBACK_BUFFER          19
 #define BINDING_LIGHT_IDENTITY_BUFFER            20
 
-// Atmosphere LUTs use high binding slots to avoid conflicts with pass-specific bindings.
-#define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     200
-#define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   201
-#define BINDING_ATMOSPHERE_SKY_VIEW_LUT          202
-#define BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT     203
+// The atmosphere and cloud bindings sit above every pass-specific binding and below the D3D9 resource slots,
+// which start at baseSlotOffset (1000) in dxso_util.h.
+#define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     900
+#define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   901
+#define BINDING_ATMOSPHERE_SKY_VIEW_LUT          902
+#define BINDING_ATMOSPHERE_AEROSOL_PHASE_LUT     903
 
 // Volumetric clouds (rtx_clouds.cpp): what the path tracer needs of the layer.
-#define BINDING_CLOUD_SUN_GRID                   204
-#define BINDING_CLOUD_DOME                       205
-#define BINDING_CLOUD_SHADOW_MAP                 206
-#define BINDING_CLOUD_SAMPLER                    207
+#define BINDING_CLOUD_SUN_GRID                   904
+#define BINDING_CLOUD_DOME                       905
+#define BINDING_CLOUD_SHADOW_MAP                 906
+#define BINDING_CLOUD_SAMPLER                    907
 
 #define COMMON_MAX_BINDING                       BINDING_LIGHT_IDENTITY_BUFFER
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
