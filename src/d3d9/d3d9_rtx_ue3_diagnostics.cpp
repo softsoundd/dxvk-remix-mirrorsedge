@@ -903,6 +903,39 @@ namespace dxvk {
       instanceTransforms));
   }
 
+  void D3D9Rtx::logUe3MainViewChange() {
+    const D3DVIEWPORT9& vp = m_ue3MainView->viewport;
+    const VkExtent3D sceneExtent = m_ue3MainView->sceneImage != nullptr
+      ? m_ue3MainView->sceneImage->info().extent
+      : VkExtent3D {};
+    const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+    const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+    const VkRect2D presented = presentedBackBufferRect();
+    const std::array<uint32_t, 12> key = {
+      vp.X, vp.Y, vp.Width, vp.Height, sceneExtent.width, sceneExtent.height, bbW, bbH,
+      uint32_t(presented.offset.x), uint32_t(presented.offset.y), presented.extent.width, presented.extent.height };
+    if (key == m_ue3LoggedMainViewKey) {
+      return;
+    }
+    m_ue3LoggedMainViewKey = key;
+
+    std::string notes;
+    if (presented.extent.width != bbW || presented.extent.height != bbH) {
+      notes += str::format(", presenting ", presented.extent.width, "x", presented.extent.height, " at (",
+                           presented.offset.x, ", ", presented.offset.y, ") of it (a windowed UE3 device's backbuffer only grows)");
+    }
+    if (const std::optional<VkRect2D> letterboxedRect = ue3LetterboxedMainViewRect()) {
+      notes += str::format("; letterboxed, so the ray traced image is rendered at the view's size and placed at (",
+                           letterboxedRect->offset.x, ", ", letterboxedRect->offset.y, ") of the backbuffer");
+    }
+    if (sceneExtent.width > presented.extent.width || sceneExtent.height > presented.extent.height) {
+      notes += "; the scene target is larger than the presented image and is ray traced as the primary target";
+    }
+    Logger::info(str::format("[RTX-Compatibility][UE3] Main view ", vp.Width, "x", vp.Height, " at (", vp.X, ", ", vp.Y,
+                             ") of a ", sceneExtent.width, "x", sceneExtent.height, " scene target, backbuffer ",
+                             bbW, "x", bbH, notes, "."));
+  }
+
   void D3D9Rtx::logNonPrimaryRenderTargetOnce() const {
     if (Logger::logLevel() <= LogLevel::Debug) {
       if (D3D9CommonTexture* rtTex = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()) {

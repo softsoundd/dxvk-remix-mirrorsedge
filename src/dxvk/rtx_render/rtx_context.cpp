@@ -111,14 +111,27 @@ namespace dxvk {
   }
 
   void RtxContext::blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter) {
+    blitImageHelper(ctx, srcImage, resolveImageRect(srcImage, {}), dstImage, resolveImageRect(dstImage, {}), filter);
+  }
+
+  VkRect2D RtxContext::resolveImageRect(const Rc<DxvkImage>& image, const VkRect2D& requestedRect) {
+    const VkExtent3D extent = image->mipLevelExtent(0);
+    const bool fits = requestedRect.extent.width != 0 && requestedRect.extent.height != 0 &&
+                      requestedRect.offset.x >= 0 && requestedRect.offset.y >= 0 &&
+                      uint64_t(requestedRect.offset.x) + requestedRect.extent.width <= extent.width &&
+                      uint64_t(requestedRect.offset.y) + requestedRect.extent.height <= extent.height;
+    return fits
+      ? requestedRect
+      : VkRect2D { VkOffset2D { 0, 0 }, VkExtent2D { extent.width, extent.height } };
+  }
+
+  void RtxContext::blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const VkRect2D& srcRect,
+                                   const Rc<DxvkImage>& dstImage, const VkRect2D& dstRect, VkFilter filter) {
     const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(dstImage->info().format);
     const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(srcImage->info().format);
 
     const VkImageSubresource dstSubresource = { dstFormatInfo->aspectMask, 0, 0 };
     const VkImageSubresource srcSubresource = { srcFormatInfo->aspectMask, 0, 0 };
-
-    VkExtent3D srcExtent = srcImage->mipLevelExtent(srcSubresource.mipLevel);
-    VkExtent3D dstExtent = dstImage->mipLevelExtent(dstSubresource.mipLevel);
 
     VkImageSubresourceLayers dstSubresourceLayers = {
       dstSubresource.aspectMask,
@@ -135,11 +148,11 @@ namespace dxvk {
     blitInfo.dstSubresource = dstSubresourceLayers;
     blitInfo.srcSubresource = srcSubresourceLayers;
 
-    blitInfo.dstOffsets[0] = VkOffset3D{ 0,                        0,                       0 };
-    blitInfo.dstOffsets[1] = VkOffset3D{ int32_t(dstExtent.width),  int32_t(dstExtent.height),  1 };
+    blitInfo.dstOffsets[0] = VkOffset3D{ dstRect.offset.x, dstRect.offset.y, 0 };
+    blitInfo.dstOffsets[1] = VkOffset3D{ dstRect.offset.x + int32_t(dstRect.extent.width), dstRect.offset.y + int32_t(dstRect.extent.height), 1 };
 
-    blitInfo.srcOffsets[0] = VkOffset3D{ 0,                          0,                         0 };
-    blitInfo.srcOffsets[1] = VkOffset3D{ int32_t(srcExtent.width),    int32_t(srcExtent.height),    1 };
+    blitInfo.srcOffsets[0] = VkOffset3D{ srcRect.offset.x, srcRect.offset.y, 0 };
+    blitInfo.srcOffsets[1] = VkOffset3D{ srcRect.offset.x + int32_t(srcRect.extent.width), srcRect.offset.y + int32_t(srcRect.extent.height), 1 };
 
     VkComponentMapping swizzle = {
       VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -582,15 +595,17 @@ namespace dxvk {
 #endif
 
   // Hooked into D3D9 presentImage (same place HUD rendering is)
-  void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, Rc<DxvkImage> hdrCanvas) {
+  void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, Rc<DxvkImage> hdrCanvas,
+                             const VkRect2D& outputRect) {
     m_pendingInjectFinish = PendingInjectFinish { hdrCanvas };
 
-    injectFrame(cachedReflexFrameId, targetImage);
+    injectFrame(cachedReflexFrameId, targetImage, outputRect);
 
     // With no HDR image this frame, the canvas carries the target so overlays drawn into it land
     // where they would on the target itself
     if (hdrCanvas != nullptr && !m_pendingInjectFinish.raytraced && targetImage != nullptr) {
-      blitImageHelper(this, targetImage, hdrCanvas, VK_FILTER_NEAREST);
+      m_pendingInjectFinish.outputRect = resolveImageRect(targetImage, outputRect);
+      blitImageHelper(this, targetImage, m_pendingInjectFinish.outputRect, hdrCanvas, resolveImageRect(hdrCanvas, {}), VK_FILTER_NEAREST);
       m_pendingInjectFinish.targetImage = targetImage;
       m_pendingInjectFinish.seeded = true;
     }
@@ -617,9 +632,10 @@ namespace dxvk {
         m_common->metaUe3ToneMapping().dispatchSceneUnitScale(this, finalOutput, 1.f / pending.sceneScale);
       }
 
-      outputFrame(rtOutput, pending.targetImage, pending.updateAutoExposure, pending.captureScreenImage, pending.captureDebugImage);
+      outputFrame(rtOutput, pending.targetImage, pending.outputRect,
+                  pending.updateAutoExposure, pending.captureScreenImage, pending.captureDebugImage);
     } else if (pending.seeded) {
-      blitImageHelper(this, pending.canvas, pending.targetImage, VK_FILTER_NEAREST);
+      blitImageHelper(this, pending.canvas, resolveImageRect(pending.canvas, {}), pending.targetImage, pending.outputRect, VK_FILTER_NEAREST);
     }
 
     if (pending.needsCompletion) {
@@ -627,7 +643,7 @@ namespace dxvk {
     }
   }
 
-  void RtxContext::injectFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
+  void RtxContext::injectFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, const VkRect2D& requestedOutputRect) {
     ScopedCpuProfileZone();
     // NV-DXVK start: CPU frame breakdown for the built-in pass timer
     RtxGpuPassTimer::CpuScope injectCpuScope(RtxGpuPassTimer::isEnabled() ? &getCommonObjects()->metaGpuPassTimer() : nullptr,
@@ -761,6 +777,9 @@ namespace dxvk {
         targetImage = m_state.om.renderTargets.color[0].view->image();  
       }
 
+      const VkRect2D outputRect = resolveImageRect(targetImage, requestedOutputRect);
+      const VkExtent3D outputExtent = { outputRect.extent.width, outputRect.extent.height, 1 };
+
       const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
       const bool captureScreenImage = s_triggerScreenshot || (captureTestScreenshot && !s_capturePrePresentTestScreenshot);
       const bool captureDebugImage = RtxOptions::captureDebugImage();
@@ -824,7 +843,7 @@ namespace dxvk {
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
 
-        VkExtent3D downscaledExtent = onInjectRtxFrameBegin(targetImage->info().extent);
+        VkExtent3D downscaledExtent = onInjectRtxFrameBegin(outputExtent);
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -840,7 +859,7 @@ namespace dxvk {
         getCommonObjects()->getTextureManager().prepareSamplerFeedback(this);
 
         // Generate ray tracing constant buffer
-        updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
+        updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, outputExtent);
 
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
@@ -902,7 +921,7 @@ namespace dxvk {
 
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
 
-        dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
+        dispatchObjectPicking(rtOutput, downscaledExtent, outputExtent, outputRect.offset);
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
         if (m_currentUpscaler == InternalUpscaler::DLSS) {
@@ -955,9 +974,9 @@ namespace dxvk {
         }
 
         if (m_pendingInjectFinish.canvas != nullptr) {
-          stageHdrCanvas(rtOutput, targetImage, !dlssNrEnabled, captureScreenImage, captureDebugImage);
+          stageHdrCanvas(rtOutput, targetImage, outputRect, !dlssNrEnabled, captureScreenImage, captureDebugImage);
         } else {
-          outputFrame(rtOutput, targetImage, !dlssNrEnabled, captureScreenImage, captureDebugImage);
+          outputFrame(rtOutput, targetImage, outputRect, !dlssNrEnabled, captureScreenImage, captureDebugImage);
         }
 
         raytracedThisFrame = true;
@@ -992,7 +1011,7 @@ namespace dxvk {
     }
   }
 
-  void RtxContext::outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+  void RtxContext::outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage, const VkRect2D& outputRect,
                                bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage) {
     // The UE3 tonemapper takes over the final pass's dither only when nothing runs after it.
     // Lens effects run after it, and the final pass also applies the colour inversion.
@@ -1041,10 +1060,19 @@ namespace dxvk {
     {
       ScopedGpuProfileZone(this, "Blit to Game");
       
-      // Note: the resolution between srcImage and dstImage always matches
+      // Note: the resolution between srcImage and outputRect always matches
       // so we can use the same blit with nearest neighbor filtering
-      assert(srcImage->info().extent == targetImage->info().extent);
-      blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+      assert(srcImage->info().extent.width == outputRect.extent.width && srcImage->info().extent.height == outputRect.extent.height);
+
+      // Outside outputRect, the target would keep earlier frames' content wherever the game draws nothing over it.
+      // Letterbox bars the game does not redraw are one such case.
+      const VkExtent3D targetExtent = targetImage->info().extent;
+      if (outputRect.extent.width != targetExtent.width || outputRect.extent.height != targetExtent.height) {
+        const VkImageSubresourceRange colorRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        clearColorImage(targetImage, VkClearColorValue { { 0.f, 0.f, 0.f, 1.f } }, colorRange);
+      }
+
+      blitImageHelper(this, srcImage, resolveImageRect(srcImage, {}), targetImage, outputRect, VkFilter::VK_FILTER_NEAREST);
     }
 
     // Log stats when an image is taken
@@ -1053,12 +1081,13 @@ namespace dxvk {
     }
   }
 
-  void RtxContext::stageHdrCanvas(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+  void RtxContext::stageHdrCanvas(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage, const VkRect2D& outputRect,
                                   bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage) {
     ScopedGpuProfileZone(this, "Stage HDR Canvas");
 
     PendingInjectFinish& pending = m_pendingInjectFinish;
     pending.targetImage = targetImage;
+    pending.outputRect = resolveImageRect(targetImage, outputRect);
     pending.updateAutoExposure = updateAutoExposure;
     pending.captureScreenImage = captureScreenImage;
     pending.captureDebugImage = captureDebugImage;
@@ -1090,7 +1119,8 @@ namespace dxvk {
     m_resetHistory = false;
   }
 
-  void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
+  void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx,
+                            const VkRect2D& outputRect) {
     if (m_pendingInjectFinish.canvas != nullptr) {
       ONCE(Logger::warn("[RTX] A staged RTX injection was never finished; finishing it at the end of the frame."));
       finishInjectRTX();
@@ -1098,7 +1128,7 @@ namespace dxvk {
 
     if (callInjectRtx) {
       // Fallback inject (is a no-op if already injected this frame, or no valid RT scene)
-      injectRTX(cachedReflexFrameId, targetImage);
+      injectRTX(cachedReflexFrameId, targetImage, nullptr, outputRect);
     }
 
 #ifdef REMIX_DEVELOPMENT
@@ -2573,7 +2603,8 @@ namespace dxvk {
 
   void RtxContext::dispatchObjectPicking(Resources::RaytracingOutput& rtOutput,
                                          const VkExtent3D& srcExtent,
-                                         const VkExtent3D& targetExtent) {
+                                         const VkExtent3D& targetExtent,
+                                         const VkOffset2D& targetOffset) {
     ScopedCpuProfileZone();
     DebugView& debugView = m_common->metaDebugView();
     SceneManager& sceneManager = m_common->getSceneManager();
@@ -2632,8 +2663,9 @@ namespace dxvk {
 
     // process one request per frame, to readback in the future
     if (auto request = debugView.ObjectPicking.popRequest()) {
+      const Vector2i offset { targetOffset.x, targetOffset.y };
       if (auto pixRegion = nonzero(clamp(srcExtent, rescale(downscale,
-                                                            PixRegion { request->pixelFrom, request->pixelTo })))) {
+                                                            PixRegion { request->pixelFrom - offset, request->pixelTo - offset })))) {
         assert(objectPickingSrc.isValid());
         assert(objectPickingSrc.image->formatInfo()->elementSize == onePixelInBytes);
         assert(getSceneManager().getGlobals().clearColorPicking <= (1ull << (8 * onePixelInBytes)) - 1);

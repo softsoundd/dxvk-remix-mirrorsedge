@@ -95,17 +95,22 @@ namespace dxvk {
       * consistent frame IDs throughout the dispatches of an application frame.
       * \param [in] targetImage: Image to store raytraced result in
       * \param [in] hdrCanvas: When set, stops before tone mapping and leaves the linear HDR image in this
-      *        R16G16B16A16_SFLOAT image (the target's size) for overlays to draw into; finishInjectRTX
+      *        R16G16B16A16_SFLOAT image (outputRect's size) for overlays to draw into; finishInjectRTX
       *        completes the frame. See documentation/UE3Compatibility.md, "Deferred overlays".
+      * \param [in] outputRect: Region of the target the raytraced image covers, and the size it is rendered at.
+      *        An empty rect, or one outside the target, uses the whole target.
       */
-    void injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, Rc<DxvkImage> hdrCanvas = nullptr);
+    void injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, Rc<DxvkImage> hdrCanvas = nullptr,
+                   const VkRect2D& outputRect = {});
 
     /**
       * \brief Completes an injectRTX call that was given an hdrCanvas. No-op when none is pending.
       */
     void finishInjectRTX();
 
-    void endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, bool callInjectRtx = true);
+    // outputRect is passed to the fallback injectRTX call.
+    void endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, bool callInjectRtx = true,
+                  const VkRect2D& outputRect = {});
 
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
@@ -143,6 +148,12 @@ namespace dxvk {
     void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
 
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
+    static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const VkRect2D& srcRect,
+                                const Rc<DxvkImage>& dstImage, const VkRect2D& dstRect, VkFilter filter);
+
+    // Returns requestedRect when it is non-empty and lies within the image.
+    // Returns the whole image otherwise.
+    static VkRect2D resolveImageRect(const Rc<DxvkImage>& image, const VkRect2D& requestedRect);
 
     virtual void flushCommandList() override;
 
@@ -229,11 +240,11 @@ namespace dxvk {
     VkExtent3D onInjectRtxFrameBegin(const VkExtent3D& upscaleExtent);
     void onInjectRtxFrameEnd(bool raytracedThisFrame);
 
-    void injectFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage);
+    void injectFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, const VkRect2D& requestedOutputRect);
     // Tone mapping through the blit to the game target, on the finished linear HDR image
-    void outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+    void outputFrame(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage, const VkRect2D& outputRect,
                      bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage);
-    void stageHdrCanvas(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage,
+    void stageHdrCanvas(Resources::RaytracingOutput& rtOutput, const Rc<DxvkImage>& targetImage, const VkRect2D& outputRect,
                         bool updateAutoExposure, bool captureScreenImage, bool captureDebugImage);
     void completeInjection(bool raytracedThisFrame, float gpuIdleTimeMilliseconds);
 
@@ -260,7 +271,9 @@ namespace dxvk {
     void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
     void dispatchSRGBDither(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
-    void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
+    // targetOffset is where the raytraced image starts in the target, which picking requests are relative to.
+    void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent,
+                               const VkOffset2D& targetOffset);
     void dispatchDLFG();
     void updateMetrics(const float gpuIdleTimeMilliseconds, const bool raytracedThisFrame);
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
@@ -330,6 +343,7 @@ namespace dxvk {
     struct PendingInjectFinish {
       Rc<DxvkImage> canvas;
       Rc<DxvkImage> targetImage;
+      VkRect2D outputRect {};        // the region of targetImage the canvas maps onto
       bool raytraced = false;        // the canvas holds the scene-unit HDR image
       bool seeded = false;           // the canvas holds a copy of the target
       bool needsCompletion = false;  // completeInjection is deferred to finishInjectRTX

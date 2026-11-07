@@ -193,6 +193,11 @@ exe = executable('test_player_model_mesh_classifier',  files('test_player_model_
 test('test_player_model_mesh_classifier', exe, env: test_env)
 tests += exe
 
+exe = executable('test_ue3_view_layout',  files('test_ue3_view_layout.cpp'),
+  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_ue3_view_layout', exe, env: test_env)
+tests += exe
+
 exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_f16tof32', exe, env: test_env)
 tests += exe

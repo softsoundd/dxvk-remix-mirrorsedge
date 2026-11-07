@@ -21,12 +21,16 @@ namespace dxvk {
 
   // NV-DXVK start: resolution-agnostic render target tagging
   XXH64_hash_t D3D9_COMMON_TEXTURE_DESC::CalculateResolutionAgnosticHash() const {
+    const UINT aspectGcd = std::max(1u, std::gcd(Width, Height));
+    return CalculateResolutionAgnosticHashAtAspect(Width / aspectGcd, Height / aspectGcd);
+  }
+
+  XXH64_hash_t D3D9_COMMON_TEXTURE_DESC::CalculateResolutionAgnosticHashAtAspect(UINT aspectWidth, UINT aspectHeight) const {
     assert(sizeof(D3D9_COMMON_TEXTURE_DESC) == 44);
 
     D3D9_COMMON_TEXTURE_DESC normalized = *this;
-    const UINT aspectGcd = std::max(1u, std::gcd(Width, Height));
-    normalized.Width = Width / aspectGcd;
-    normalized.Height = Height / aspectGcd;
+    normalized.Width = aspectWidth;
+    normalized.Height = aspectHeight;
     return XXH3_64bits(&normalized, sizeof(normalized));
   }
   // NV-DXVK end

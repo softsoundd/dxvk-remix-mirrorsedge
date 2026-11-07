@@ -845,6 +845,13 @@ namespace dxvk {
     void ResetSwapChain(const D3DPRESENT_PARAMETERS& presentationParameters);
 
     /**
+      * \brief: Records the region of the backbuffer a present shows. Call before that present's EndFrame.
+      *
+      * \param [in] pSourceRect: IDirect3DSwapChain9::Present's source rect, null for the whole backbuffer.
+      */
+    void SetPresentSourceRect(const RECT* pSourceRect);
+
+    /**
       * \brief: Signal that we've reached the end of the frame.
       */
     void EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx = true);
@@ -1008,6 +1015,41 @@ namespace dxvk {
     bool m_ue3SeenMainViewWorldDraw = false;
     bool m_ue3ForegroundDpgActive = false;
 
+    // Holds the viewport and scene target of the frame's first draw allowed to update the Main camera.
+    // EndFrame resets it only after its fallback injection, which places the ray traced image by it.
+    struct Ue3MainView {
+      D3DVIEWPORT9 viewport = {};
+      Rc<DxvkImage> sceneImage;
+    };
+    std::optional<Ue3MainView> m_ue3MainView;
+    // Holds the size of the last recorded main view's scene target.
+    // It is kept across frames, as draws tagged against scene targets can come before a frame's main view.
+    VkExtent2D m_ue3SceneTargetExtent = {};
+    // Returns the 16:9 resolution-agnostic hash of a render target in proportion to a UE3 scene buffer of another aspect ratio,
+    // for matching tags authored at 16:9 (see "Deferred overlays" in UE3Compatibility.md).
+    // Returns kEmptyHash for any other target.
+    XXH64_hash_t ue3SceneTargetTagHash(const D3D9_COMMON_TEXTURE_DESC& desc) const;
+    // Logs m_ue3MainView's viewport, scene target, backbuffer and presented region
+    // when they differ from the last ones logged.
+    void logUe3MainViewChange();
+    std::array<uint32_t, 12> m_ue3LoggedMainViewKey = {};
+
+    // Holds the region of the backbuffer the last present showed, which the UE3 main view is measured against.
+    // A windowed UE3 device keeps its backbuffer at the largest size it has used, and presents only its viewport.
+    VkRect2D m_presentedRect = {};
+    // Returns m_presentedRect.
+    // Returns the whole backbuffer when m_presentedRect does not lie within it.
+    VkRect2D presentedBackBufferRect() const;
+
+    // Returns where in the backbuffer the game composites this frame's main view, when it is letterboxed or pillarboxed.
+    // FViewport::CalculateViewExtents centres such a view in the presented region.
+    // Returns nothing for any other view.
+    std::optional<VkRect2D> ue3LetterboxedMainViewRect() const;
+    // Returns the rect of targetImage that RtxContext::injectRTX renders the ray traced image at and places it in.
+    // Returns an empty rect, which stands for the whole target, unless targetImage is the backbuffer
+    // and the main view covers only part of it.
+    VkRect2D ue3MainViewOutputRect(const Rc<DxvkImage>& targetImage) const;
+
     static Ue3VertexFactoryType classifyUe3VertexFactory(const D3D9VertexElements& elements);
     static bool isUe3WorldGeometryVertexFactory(Ue3VertexFactoryType type);
 
@@ -1059,11 +1101,6 @@ namespace dxvk {
     // Keeps UE3's vertex lightmap coefficient streams and per-instance transform streams from
     // being mistaken for the surface's UVs.
     uint32_t resolveIaTexcoordIndex(uint32_t iaTexcoordIdx) const;
-
-    // Half-or-larger in both dims (allows ScreenPercentage >50%) and aspect-matched to the
-    // backbuffer so square SceneCapture RTs cannot pass as main-view-sized on widescreen.
-    static bool ue3ViewportAspectMatchesBackbuffer(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
-    static bool ue3ViewportIsMainViewSized(uint32_t vpW, uint32_t vpH, uint32_t bbW, uint32_t bbH);
 
     fast_unordered_cache<Ue3ShaderFeatureInfo> m_ue3ShaderFeatureCache;
     Ue3ShaderFeatureInfo getUe3ShaderFeatureInfo(const D3D9CommonShader* shader);
@@ -1449,8 +1486,9 @@ namespace dxvk {
     bool ignoreOcclusionTestDrawEarly();
 
     // A null targetImage injects into the backend's bound RT0. An hdrCanvas stages the injection
-    // (see RtxContext::injectRTX), and finishInjectRTX must follow.
-    void triggerInjectRTX(const Rc<DxvkImage>& targetImage = nullptr, const Rc<DxvkImage>& hdrCanvas = nullptr);
+    // (see RtxContext::injectRTX), and finishInjectRTX must follow. outputRect is RtxContext::injectRTX's.
+    void triggerInjectRTX(const Rc<DxvkImage>& targetImage = nullptr, const Rc<DxvkImage>& hdrCanvas = nullptr,
+                          const VkRect2D& outputRect = {});
 
     // Deferred UI draws (see "Deferred overlays" in UE3Compatibility.md), snapshotted with their vertex and index ranges
     // because the game may re-lock its buffers before the replay.
@@ -1518,14 +1556,17 @@ namespace dxvk {
       uint32_t sourceRenderTargetWidth = 0;
       uint32_t sourceRenderTargetHeight = 0;
       bool sceneLinear = false;
+      // Set when the draw used the frame's main view viewport (see m_ue3MainView),
+      // so it replays over the ray traced image wherever that lies in the replay target.
+      bool capturedWithMainViewViewport = false;
     };
 
     std::vector<DeferredUiDraw> m_deferredUiDraws;
     uint32_t m_deferredUiFrameVertexBytes = 0;
     bool m_replayingDeferredUiDraws = false;
 
-    // The injection target's size; scene-linear overlays replay onto it before tone mapping.
-    // Private ref: a public one would keep the device alive.
+    // Has the ray traced image's size, which is the injection target's unless the main view covers only part of it.
+    // Scene-linear overlays replay onto it before tone mapping. Private ref: a public one would keep the device alive.
     Com<D3D9Surface, false> m_deferredUiHdrCanvas;
 
     // one-shot log keys (pixel shader hash mixed with the defer/refuse decision) for the
@@ -1583,6 +1624,9 @@ namespace dxvk {
     std::optional<DrawCallType> classifyUe3DrawPass(const DrawContext& drawContext, DeferredUiTagQuery& deferredUiTag);
     std::optional<DrawCallType> decideDeferredUiDraw(const DrawContext& drawContext, DeferredUiTagQuery& deferredUiTag);
     bool isUe3ShadowDepthPass() const;
+    // Returns whether the draw is a main-view world draw into UE3's scene buffer,
+    // which counts as primary whatever the buffer's size.
+    bool isUe3MainViewSceneTargetDraw() const;
     void logNonPrimaryRenderTargetOnce() const;
     std::optional<DrawCallType> classifyRenderTargetSamplingDraw(const DrawContext& drawContext);
     DrawCallType makeDrawCallType(const DrawContext& drawContext);
@@ -1765,6 +1809,10 @@ namespace dxvk {
     void updateUe3GamePatchRequest();
 
     bool isRenderingUI();
+
+    // Returns whether the draw is a non-world draw over the whole presented region of a letterboxed UE3 frame.
+    // FCanvas draws the letterbox bars and the HUD this way, after the scene.
+    bool isUe3OverlayOnLetterboxedMainView() const;
 
     Future<SkinningData> processSkinning(const RasterGeometry& geoData);
 

@@ -9,9 +9,27 @@ UE3 renders the world several times a frame, and only the base pass carries the 
 - **Depth prepass**: draws with a position-only vertex declaration. The base pass draws the same geometry with its material.
 - **Shadow depth**: draws into a square render target at most 2048 texels wide and narrower than half the backbuffer, with depth writes on.
 - **Depth-test-disabled translucency**: alpha-blended draws with depth test and depth write both off (`NeedsDepthTestDisabled` materials such as fullscreen overlays and fog volume composites), unless a bound texture is tagged as UI or deferred UI.
-- **SceneCapture probes** (`SceneCapture2D`, reflect and portal actors: security monitors, mirrors, scripted window reflections) re-render the world from their own camera before the main view, with genuine `ViewProjectionMatrix`/`CameraPosition` constants. Their world geometry is dropped when the viewport is smaller than half the backbuffer in both dimensions (exact-half splitscreen viewports excepted), when a smaller-than-full viewport's aspect ratio differs from the backbuffer's, when the view-projection is mirrored, or when the camera cannot be decomposed (reflect and portal probes clip their near plane obliquely). Probe target textures keep their last resolved content, as with `show scenecapture` toggled off.
+- **SceneCapture probes** (`SceneCapture2D`, reflect and portal actors: security monitors, mirrors, scripted window reflections) re-render the world from their own camera before the main view, with genuine `ViewProjectionMatrix`/`CameraPosition` constants. Their world geometry is dropped when the viewport is smaller than half the backbuffer in both dimensions, when a smaller-than-full viewport's aspect ratio differs from the backbuffer's and it spans neither backbuffer dimension (a viewport spanning one is a [letterboxed main view](#letterboxed-views-and-resolution-changes) or a split-screen half), when the view-projection is mirrored, or when the camera cannot be decomposed (reflect and portal probes clip their near plane obliquely). Probe target textures keep their last resolved content, as with `show scenecapture` toggled off.
 
 Only draws whose vertex shader CTAB names both `ViewProjectionMatrix` and `CameraPosition`, on a viewport the size of the main view, may update the Main camera. Engine utility shaders (shadow depth, filters) declare neither, and whatever sits in the fallback camera registers `c0..c4` - a light-space matrix during light environment updates, for example - would otherwise be taken for a one-frame camera. Their geometry still renders.
+
+## Letterboxed views and resolution changes
+
+The main view does not always fill a backbuffer-sized render target:
+
+- **Constrained aspect ratio.** Stock Mirror's Edge sets `bConstrainAspectRatio` and a `ConstrainedAspectRatio` of 1.7778 in `Camera.UpdateCamera` every frame. At an aspect ratio more than 0.01 away from that, `FViewport::CalculateViewExtents` shrinks the view to the largest 16:9 rect and centres it in the backbuffer. The view still renders from the scene buffer's origin. Only the final composite places it in the centre, and `UGameViewportClient::Draw` tiles black bars over the rest.
+- **Scene buffer larger than the backbuffer.** `FSceneRenderTargets::Allocate` only ever grows the scene buffer, so after a change to a smaller resolution the scene target stays at the largest size used in the session. Stock Mirror's Edge also allocates it `width * 0.5625` high, whatever the backbuffer's height. It does so again after a device reset, such as a switch between fullscreen and windowed, even with MirrorsEdgeTweaks' fix to `Allocate`.
+- **Backbuffer larger than the presented image.** `FD3D9DynamicRHI::UpdateD3DDeviceFromViewports` only recreates a windowed device when the window grows, so its backbuffer also stays at the largest size used, and `FD3D9Viewport` presents just its top-left viewport-sized region through `Present`'s source rect.
+
+Taking the backbuffer for the main view fails in each case. The constrained view's world geometry looks like a SceneCapture probe, draws into an oversized scene target look non-primary, and an image filling a backbuffer larger than the presented region shows cropped to its top-left. As the game's own scene composite is skipped, a frame with nothing ray traced would keep the backbuffer's last image, with the UI drawn over it every frame. The runtime takes the main view from the game instead:
+
+- The main view is measured against the region the last `Present` showed, which is its source rect or the whole backbuffer. The ray traced image is rendered at that region's size and placed in it.
+- A viewport that spans one dimension of that region and fits in the other counts as main-view sized, as an aspect-matched one does, for the SceneCapture rule, the Main camera and the foreground DPG clear. Only the size is compared, as the view renders from the scene buffer's origin.
+- A world draw with a main-view-sized viewport counts as drawing to the primary render target even when its scene target is not backbuffer-sized.
+- The first draw allowed to update the Main camera is the frame's main view. When it is letterboxed, the ray traced image is rendered at its size and placed in its centred rect of the presented region, offset by `appRound(0.5f * (size - viewSize))` (`cvtss2si` rounds a half to even). The rest of the backbuffer is cleared to black. A non-world draw over the whole presented region of such a frame, which is how `FCanvas` draws the bars and the HUD, rasterizes and triggers injection.
+- [Deferred overlays](#deferred-overlays) follow the main view. The scene colour refresh copies the ray traced image into the main view's rect of any target sized like the scene buffer, and an overlay captured with the main view's viewport replays onto the ray traced image's rect.
+
+A view smaller than the presented region in both dimensions (screen percentage below 100%) is still ray traced at the presented region's size. The presented region comes from the previous frame's `Present`, so the first frame after a windowed resolution change can still be placed by the old one. The `[RTX-Compatibility][UE3] Main view` log line reports the main view's viewport, scene target, backbuffer and presented region whenever they change.
 
 ## Exact vertex position capture
 
@@ -243,6 +261,8 @@ Path-traced radiance is unbounded where the original renderer clipped at exposed
 
 UE3 draws its `MaterialEffect` overlays (damage and health effects, the scope, reaction time) mid-frame, before the frame's 3D rendering has finished, so they must not trigger RTX injection. Tag the scene colour render target they sample in `rtx.deferredUiTextures`, or their pixel shaders in `rtx.d3d9.deferredUiPixelShaders`; the draws are then captured and replayed once injection fires.
 
+A render target tag is a resolution-agnostic hash, which still includes the target's aspect ratio. Stock Mirror's Edge allocates its scene buffer at 16:9 whatever the backbuffer's aspect, so when the scene buffer has another aspect, a target in proportion to it also matches its 16:9 hash. Tag scene targets at a 16:9 resolution, as a tag taken at another aspect ratio matches only at that aspect ratio.
+
 Where a captured overlay replays depends on the render target the game drew it into:
 
 - **Floating-point target** (the HDR `SceneColor`): the game ran the overlay on linear scene colour, before its display transform (`TdToneMapping`, or the `GammaCorrection` pass with `TdTonemapping` off). With `rtx.d3d9.deferredUiHdrReplay` it replays on Remix's linear HDR image, in the game's scene units, and the Mirror's Edge display transform runs after it, as the game's did.
@@ -262,7 +282,7 @@ Replaying a linear overlay on the display-encoded image runs its maths in the wr
 
 When scene-linear overlays are pending, the injection runs in two stages with the replay between them:
 
-1. `RtxContext::injectRTX` is given an HDR canvas: an `A16B16G16R16F` D3D9 render target the size of the injection target. It renders the frame through motion blur, scales `m_finalOutput` into scene units (`exp2(rtx.tonemap.ue3.exposureBias)`, Mirror's Edge tonemapping mode only), copies it into the canvas, and stops before tone mapping.
+1. `RtxContext::injectRTX` is given an HDR canvas: an `A16B16G16R16F` D3D9 render target the size of the ray traced image, which is the injection target's size unless the main view [covers only part of it](#letterboxed-views-and-resolution-changes). It renders the frame through motion blur, scales `m_finalOutput` into scene units (`exp2(rtx.tonemap.ue3.exposureBias)`, Mirror's Edge tonemapping mode only), copies it into the canvas, and stops before tone mapping.
 2. The D3D9 layer replays the scene-linear overlays onto the canvas. The scene colour refresh copies the canvas into the textures they sample, as UE3's resolve would.
 3. `RtxContext::finishInjectRTX` copies the canvas back, undoes the scale, and runs tone mapping through the blit to the target.
 4. Overlays drawn into 8-bit targets replay on the target, and the game's UI draws follow.

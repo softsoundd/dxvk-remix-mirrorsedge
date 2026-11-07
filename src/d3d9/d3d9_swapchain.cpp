@@ -492,7 +492,8 @@ namespace dxvk {
       return D3D_OK;
     // NV-DXVK end
 
-    // NV-DXVK start: Restart RTX capture on the new frame
+    // NV-DXVK start: Restart RTX capture on the new frame, telling it the region this present shows
+    m_parent->m_rtx.SetPresentSourceRect(pSourceRect);
     m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
     // NV-DXVK end
 

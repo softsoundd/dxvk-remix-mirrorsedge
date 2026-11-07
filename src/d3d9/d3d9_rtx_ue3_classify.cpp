@@ -21,6 +21,7 @@
 */
 #include "d3d9_rtx.h"
 #include "d3d9_rtx_ue3_helpers.h"
+#include "d3d9_rtx_ue3_view_layout.h"
 
 #include "d3d9_include.h"
 #include "d3d9_state.h"
@@ -488,24 +489,6 @@ namespace dxvk {
     }
   }
 
-  bool D3D9Rtx::ue3ViewportAspectMatchesBackbuffer(
-      const uint32_t vpW, const uint32_t vpH, const uint32_t bbW, const uint32_t bbH) {
-    if (vpW == 0 || vpH == 0 || bbW == 0 || bbH == 0) {
-      return false;
-    }
-    const double a = double(vpW) * double(bbH);
-    const double b = double(vpH) * double(bbW);
-    const double denom = std::max(a, b);
-    return denom > 0.0 && (std::abs(a - b) / denom) < 0.05;
-  }
-
-  bool D3D9Rtx::ue3ViewportIsMainViewSized(
-      const uint32_t vpW, const uint32_t vpH, const uint32_t bbW, const uint32_t bbH) {
-    return bbW != 0 && bbH != 0 &&
-           vpW * 2 >= bbW && vpH * 2 >= bbH &&
-           ue3ViewportAspectMatchesBackbuffer(vpW, vpH, bbW, bbH);
-  }
-
   Ue3PassType D3D9Rtx::classifyUe3Pass(const DrawContext& drawContext) {
     if (!m_frameOptions.ue3EngineMode) {
       return Ue3PassType::Unknown;
@@ -571,19 +554,18 @@ namespace dxvk {
         isWorldGeometry &&
         m_activePresentParams.has_value()) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
-      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
-      const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+      const VkExtent2D presented = presentedBackBufferRect().extent;
+      const uint32_t bbW = presented.width;
+      const uint32_t bbH = presented.height;
       if (bbW != 0 && bbH != 0 && vp.Width != 0 && vp.Height != 0) {
         if (vp.Width * 2 < bbW && vp.Height * 2 < bbH) {
           return Ue3PassType::SceneCapture;
         }
-        // Exact-half splitscreen must not be treated as a mismatched-aspect probe.
-        const bool exactHalfSplit =
-          (vp.Width * 2 == bbW && vp.Height == bbH) ||
-          (vp.Height * 2 == bbH && vp.Width == bbW);
-        if (!exactHalfSplit &&
-            (vp.Width < bbW || vp.Height < bbH) &&
-            !ue3ViewportAspectMatchesBackbuffer(vp.Width, vp.Height, bbW, bbH)) {
+        // A viewport spanning a backbuffer axis is a constrained-aspect main view
+        // or a split-screen half, not a mismatched-aspect probe.
+        if ((vp.Width < bbW || vp.Height < bbH) &&
+            !ue3ViewportAspectMatchesBackbuffer(vp.Width, vp.Height, bbW, bbH) &&
+            !ue3ViewportFillsBackbufferAxis(vp.Width, vp.Height, bbW, bbH)) {
           return Ue3PassType::SceneCapture;
         }
       }
@@ -911,9 +893,8 @@ namespace dxvk {
 
     // Shadow / SceneCapture depth clears use sub-main-view viewports; ignore those.
     const D3DVIEWPORT9& vp = d3d9State().viewport;
-    const uint32_t bbW = m_activePresentParams->BackBufferWidth;
-    const uint32_t bbH = m_activePresentParams->BackBufferHeight;
-    if (!ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
+    const VkExtent2D presented = presentedBackBufferRect().extent;
+    if (!ue3ViewportIsMainViewSized(vp.Width, vp.Height, presented.width, presented.height)) {
       return;
     }
 
@@ -1086,9 +1067,8 @@ namespace dxvk {
         isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
         m_activePresentParams.has_value()) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
-      const uint32_t bbW = m_activePresentParams->BackBufferWidth;
-      const uint32_t bbH = m_activePresentParams->BackBufferHeight;
-      if (ue3ViewportIsMainViewSized(vp.Width, vp.Height, bbW, bbH)) {
+      const VkExtent2D presented = presentedBackBufferRect().extent;
+      if (ue3ViewportIsMainViewSized(vp.Width, vp.Height, presented.width, presented.height)) {
         m_ue3SeenMainViewWorldDraw = true;
       }
     }
@@ -1112,6 +1092,78 @@ namespace dxvk {
       }
     }
     return false;
+  }
+
+  // The scene buffer can be larger than the presented region,
+  // as "Letterboxed views and resolution changes" in UE3Compatibility.md describes.
+  // The main view renders into it from its origin, at the size it is presented at.
+  bool D3D9Rtx::isUe3MainViewSceneTargetDraw() const {
+    if (!m_frameOptions.ue3EngineMode ||
+        !m_activePresentParams.has_value() ||
+        !isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory)) {
+      return false;
+    }
+
+    const D3DVIEWPORT9& vp = d3d9State().viewport;
+    const VkExtent2D rtExt = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+    const VkExtent2D presented = presentedBackBufferRect().extent;
+    return uint64_t(vp.X) + vp.Width <= rtExt.width &&
+           uint64_t(vp.Y) + vp.Height <= rtExt.height &&
+           ue3ViewportIsMainViewSized(vp.Width, vp.Height, presented.width, presented.height);
+  }
+
+  std::optional<VkRect2D> D3D9Rtx::ue3LetterboxedMainViewRect() const {
+    if (!m_ue3MainView.has_value() || !m_activePresentParams.has_value()) {
+      return std::nullopt;
+    }
+
+    const VkRect2D presented = presentedBackBufferRect();
+    const uint32_t screenW = presented.extent.width;
+    const uint32_t screenH = presented.extent.height;
+    const uint32_t viewW = m_ue3MainView->viewport.Width;
+    const uint32_t viewH = m_ue3MainView->viewport.Height;
+    if ((viewW == screenW && viewH == screenH) || !ue3ViewportFillsBackbufferAxis(viewW, viewH, screenW, screenH)) {
+      return std::nullopt;
+    }
+
+    return VkRect2D {
+      VkOffset2D {
+        presented.offset.x + ue3CentredViewOffset(screenW, viewW),
+        presented.offset.y + ue3CentredViewOffset(screenH, viewH) },
+      VkExtent2D { viewW, viewH }
+    };
+  }
+
+  VkRect2D D3D9Rtx::ue3MainViewOutputRect(const Rc<DxvkImage>& targetImage) const {
+    if (!m_ue3MainView.has_value() || !isBackBufferSizedImage(targetImage)) {
+      return VkRect2D {};
+    }
+
+    if (const std::optional<VkRect2D> letterboxedRect = ue3LetterboxedMainViewRect()) {
+      return *letterboxedRect;
+    }
+
+    const VkRect2D presented = presentedBackBufferRect();
+    const VkExtent3D targetExtent = targetImage->info().extent;
+    if (presented.extent.width == targetExtent.width && presented.extent.height == targetExtent.height) {
+      return VkRect2D {};
+    }
+    return presented;
+  }
+
+  bool D3D9Rtx::isUe3OverlayOnLetterboxedMainView() const {
+    if (isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) || !ue3LetterboxedMainViewRect().has_value()) {
+      return false;
+    }
+
+    // FCanvas sets the viewport to its FViewport, which is the presented region
+    const VkRect2D presented = presentedBackBufferRect();
+    const VkExtent2D rtExt = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
+    const D3DVIEWPORT9& vp = d3d9State().viewport;
+    return rtExt.width == m_activePresentParams->BackBufferWidth &&
+           rtExt.height == m_activePresentParams->BackBufferHeight &&
+           int32_t(vp.X) == presented.offset.x && int32_t(vp.Y) == presented.offset.y &&
+           vp.Width == presented.extent.width && vp.Height == presented.extent.height;
   }
 
   void D3D9Rtx::classifyUe3DrawVertexFactory() {

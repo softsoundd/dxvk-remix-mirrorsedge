@@ -21,6 +21,7 @@
 */
 #include "d3d9_rtx.h"
 #include "d3d9_rtx_ue3_helpers.h"
+#include "d3d9_rtx_ue3_view_layout.h"
 
 #include "d3d9_include.h"
 #include "d3d9_state.h"
@@ -756,16 +757,22 @@ namespace dxvk {
         }
 
         // Non-main-view-sized world draws (below half and/or wrong aspect) must not steer Main.
+        // The first draw that may is the frame's main view.
         if (isUe3Mode &&
             isUe3WorldGeometryVertexFactory(m_currentUe3VertexFactory) &&
             m_activePresentParams.has_value() &&
             m_activeDrawCallState.allowMainCameraUpdate) {
           const D3DVIEWPORT9& vp = d3d9State().viewport;
-          if (!ue3ViewportIsMainViewSized(
-                vp.Width, vp.Height,
-                m_activePresentParams->BackBufferWidth,
-                m_activePresentParams->BackBufferHeight)) {
+          const VkExtent2D presented = presentedBackBufferRect().extent;
+          if (!ue3ViewportIsMainViewSized(vp.Width, vp.Height, presented.width, presented.height)) {
             m_activeDrawCallState.allowMainCameraUpdate = false;
+          } else if (!m_ue3MainView.has_value() && !m_activeDrawCallState.isDrawingToRaytracedRenderTarget) {
+            m_ue3MainView = Ue3MainView { vp, getCurrentRenderTargetImage() };
+            if (m_ue3MainView->sceneImage != nullptr) {
+              const VkExtent3D sceneExtent = m_ue3MainView->sceneImage->info().extent;
+              m_ue3SceneTargetExtent = VkExtent2D { sceneExtent.width, sceneExtent.height };
+            }
+            logUe3MainViewChange();
           }
         }
 

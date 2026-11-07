@@ -21,6 +21,7 @@
 */
 #include "d3d9_rtx.h"
 #include "d3d9_rtx_ue3_helpers.h"
+#include "d3d9_rtx_ue3_view_layout.h"
 
 #include "d3d9_include.h"
 #include "d3d9_state.h"
@@ -106,9 +107,26 @@ namespace dxvk {
       if (matchedHash != kEmptyHash) {
         return reportMatch(matchedHash);
       }
+
+      const XXH64_hash_t sceneTargetTagHash = entry.texture != nullptr && entry.texture->Desc() != nullptr
+        ? ue3SceneTargetTagHash(*entry.texture->Desc())
+        : kEmptyHash;
+      if (sceneTargetTagHash != kEmptyHash && lookupHash(*m_frameOptions.deferredUiTextures, sceneTargetTagHash)) {
+        return reportMatch(sceneTargetTagHash);
+      }
     }
 
     return false;
+  }
+
+  XXH64_hash_t D3D9Rtx::ue3SceneTargetTagHash(const D3D9_COMMON_TEXTURE_DESC& desc) const {
+    const VkExtent2D scene = m_ue3SceneTargetExtent;
+    if (!m_frameOptions.ue3EngineMode ||
+        isInProportion(scene.width, scene.height, 16, 9) ||
+        !isInProportion(desc.Width, desc.Height, scene.width, scene.height)) {
+      return kEmptyHash;
+    }
+    return desc.CalculateResolutionAgnosticHashAtAspect(16, 9);
   }
 
   bool D3D9Rtx::isSceneLinearRenderTarget() const {
@@ -355,6 +373,10 @@ namespace dxvk {
 
     draw.viewport = d3d9State().viewport;
     draw.scissorRect = d3d9State().scissorRect;
+    draw.capturedWithMainViewViewport =
+      m_ue3MainView.has_value() &&
+      draw.viewport.X == m_ue3MainView->viewport.X && draw.viewport.Y == m_ue3MainView->viewport.Y &&
+      draw.viewport.Width == m_ue3MainView->viewport.Width && draw.viewport.Height == m_ue3MainView->viewport.Height;
 
     if (d3d9State().renderTargets[kRenderTargetIndex] != nullptr) {
       const auto rtExtent = d3d9State().renderTargets[kRenderTargetIndex]->GetSurfaceExtent();
@@ -398,25 +420,40 @@ namespace dxvk {
         return;
       }
 
+      // The ray traced image can cover only part of the backbuffer (see ue3MainViewOutputRect)
+      const VkRect2D srcRect = RtxContext::resolveImageRect(sceneSourceImage, ue3MainViewOutputRect(sceneSourceImage));
+
       for (const auto& binding : draw.textures) {
         const Rc<DxvkImage>& sceneImage = binding.renderTargetImage;
         if (sceneImage == nullptr || sceneImage == sceneSourceImage) {
           continue;
         }
 
-        // Only refresh plausible scene-color targets (aspect ratio matching the final
-        // image); small utility render targets keep their game-rendered content.
         const VkExtent3D dstExtent = sceneImage->info().extent;
-        const VkExtent3D srcExtent = sceneSourceImage->info().extent;
-        const double a = double(dstExtent.width) * double(srcExtent.height);
-        const double b = double(dstExtent.height) * double(srcExtent.width);
-        const double denom = std::max(a, b);
-        if (denom <= 0.0 || (std::abs(a - b) / denom) >= 0.01) {
-          continue;
+        VkRect2D dstRect = { VkOffset2D { 0, 0 }, VkExtent2D { dstExtent.width, dstExtent.height } };
+        const VkExtent3D mainSceneExtent = m_ue3MainView.has_value() && m_ue3MainView->sceneImage != nullptr
+          ? m_ue3MainView->sceneImage->info().extent
+          : VkExtent3D {};
+        if (dstExtent.width == mainSceneExtent.width && dstExtent.height == mainSceneExtent.height) {
+          // A target sized like UE3's scene buffer holds the main view where it rendered.
+          // That is only part of the target when the buffer is larger than the presented region,
+          // or when the view is constrained to another aspect ratio.
+          const D3DVIEWPORT9& view = m_ue3MainView->viewport;
+          dstRect = RtxContext::resolveImageRect(sceneImage, VkRect2D {
+            VkOffset2D { int32_t(view.X), int32_t(view.Y) }, VkExtent2D { view.Width, view.Height } });
+        } else {
+          // Only targets with the final image's aspect ratio are plausible scene-color targets.
+          // Small utility render targets keep their game-rendered content.
+          const double a = double(dstExtent.width) * double(srcRect.extent.height);
+          const double b = double(dstExtent.height) * double(srcRect.extent.width);
+          const double denom = std::max(a, b);
+          if (denom <= 0.0 || (std::abs(a - b) / denom) >= 0.01) {
+            continue;
+          }
         }
 
-        m_parent->EmitCs([cSrcImage = sceneSourceImage, cDstImage = sceneImage](DxvkContext* ctx) {
-          RtxContext::blitImageHelper(ctx, cSrcImage, cDstImage, VkFilter::VK_FILTER_NEAREST);
+        m_parent->EmitCs([cSrcImage = sceneSourceImage, srcRect, cDstImage = sceneImage, dstRect](DxvkContext* ctx) {
+          RtxContext::blitImageHelper(ctx, cSrcImage, srcRect, cDstImage, dstRect, VkFilter::VK_FILTER_NEAREST);
         });
       }
     };
@@ -497,6 +534,13 @@ namespace dxvk {
       replayTargetHeight = rtExtent.height;
     }
 
+    // Finds where the ray traced image lies in the replay target
+    VkRect2D replayViewRect = { VkOffset2D { 0, 0 }, VkExtent2D { replayTargetWidth, replayTargetHeight } };
+    const VkRect2D replayOutputRect = ue3MainViewOutputRect(getCurrentRenderTargetImage());
+    if (replayOutputRect.extent.width != 0) {
+      replayViewRect = replayOutputRect;
+    }
+
     for (const auto& draw : draws) {
       // Sync the overlay's scene inputs with the target's current content (ray-traced blit
       // plus any previously replayed overlays) before it draws
@@ -539,11 +583,24 @@ namespace dxvk {
       m_parent->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
       m_parent->SetRenderState(D3DRS_STENCILENABLE, FALSE);
 
-      // Rescale the captured viewport/scissor when the capture-time render target and the
-      // replay target differ in size (e.g. overlays captured on a scaled scene target)
+      // An overlay drawn over the main view maps from its viewport onto the ray traced image's rect,
+      // as UE3's scene buffer can be larger than the view and a constrained view sits centred in the backbuffer.
+      // Other overlays rescale the captured viewport/scissor when the capture-time render target
+      // and the replay target differ in size, as with overlays captured on a scaled scene target.
       D3DVIEWPORT9 viewport = draw.viewport;
       RECT scissor = draw.scissorRect;
-      if (replayTargetWidth != 0 && replayTargetHeight != 0 &&
+      if (draw.capturedWithMainViewViewport && replayViewRect.extent.width != 0 && replayViewRect.extent.height != 0) {
+        const double scaleX = double(replayViewRect.extent.width) / double(draw.viewport.Width);
+        const double scaleY = double(replayViewRect.extent.height) / double(draw.viewport.Height);
+        viewport.X = DWORD(replayViewRect.offset.x);
+        viewport.Y = DWORD(replayViewRect.offset.y);
+        viewport.Width = replayViewRect.extent.width;
+        viewport.Height = replayViewRect.extent.height;
+        scissor.left = replayViewRect.offset.x + LONG((scissor.left - LONG(draw.viewport.X)) * scaleX);
+        scissor.right = replayViewRect.offset.x + LONG((scissor.right - LONG(draw.viewport.X)) * scaleX);
+        scissor.top = replayViewRect.offset.y + LONG((scissor.top - LONG(draw.viewport.Y)) * scaleY);
+        scissor.bottom = replayViewRect.offset.y + LONG((scissor.bottom - LONG(draw.viewport.Y)) * scaleY);
+      } else if (replayTargetWidth != 0 && replayTargetHeight != 0 &&
           draw.sourceRenderTargetWidth != 0 && draw.sourceRenderTargetHeight != 0 &&
           (draw.sourceRenderTargetWidth != replayTargetWidth || draw.sourceRenderTargetHeight != replayTargetHeight)) {
         const double scaleX = double(replayTargetWidth) / double(draw.sourceRenderTargetWidth);
@@ -624,11 +681,15 @@ namespace dxvk {
   }
 
   void D3D9Rtx::injectRtxWithOverlays(const Rc<DxvkImage>& targetImage, IDirect3DSurface9* pDisplayOverlayTarget) {
+    const VkRect2D outputRect = ue3MainViewOutputRect(targetImage);
     const bool hasSceneLinearDraws = std::any_of(m_deferredUiDraws.begin(), m_deferredUiDraws.end(),
                                                  [](const DeferredUiDraw& draw) { return draw.sceneLinear; });
+    // The canvas holds the ray traced image alone, so it is outputRect's size when that is set
     const bool staged = hasSceneLinearDraws && m_frameOptions.deferredUiReplay && m_frameOptions.deferredUiHdrReplay &&
                         targetImage != nullptr && !m_parent->ShouldRecord() &&
-                        ensureDeferredUiHdrCanvas(targetImage->info().extent);
+                        ensureDeferredUiHdrCanvas(outputRect.extent.width != 0
+                                                    ? VkExtent3D { outputRect.extent.width, outputRect.extent.height, 1 }
+                                                    : targetImage->info().extent);
 
     // Take the draws up front: every path must drop them rather than leave them queued for a
     // later, incorrectly ordered replay point
@@ -636,7 +697,7 @@ namespace dxvk {
     m_deferredUiDraws.clear();
 
     if (!staged) {
-      triggerInjectRTX(targetImage);
+      triggerInjectRTX(targetImage, nullptr, outputRect);
       replayDeferredUiDraws(std::move(draws), pDisplayOverlayTarget, targetImage);
       return;
     }
@@ -657,7 +718,7 @@ namespace dxvk {
 
     const Rc<DxvkImage> canvasImage = m_deferredUiHdrCanvas->GetCommonTexture()->GetImage();
 
-    triggerInjectRTX(targetImage, canvasImage);
+    triggerInjectRTX(targetImage, canvasImage, outputRect);
     replayDeferredUiDraws(std::move(sceneLinearDraws), m_deferredUiHdrCanvas.ptr(), canvasImage);
     m_parent->EmitCs([](DxvkContext* ctx) {
       static_cast<RtxContext*>(ctx)->finishInjectRTX();

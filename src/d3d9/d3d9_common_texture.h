@@ -60,6 +60,8 @@ namespace dxvk {
     // (W/gcd, H/gcd) so RT identity survives resolution changes while still distinguishing
     // format, usage, MSAA, and aspect.
     XXH64_hash_t CalculateResolutionAgnosticHash() const;
+    // Returns the CalculateResolutionAgnosticHash this texture would have at the aspect ratio aspectWidth:aspectHeight.
+    XXH64_hash_t CalculateResolutionAgnosticHashAtAspect(UINT aspectWidth, UINT aspectHeight) const;
     // NV-DXVK end
   };
 

@@ -888,7 +888,8 @@ namespace dxvk {
 
     if (!s_isDxvkResolutionEnvVarSet) {
       // NOTE: This can fail when setting DXVK_RESOLUTION_WIDTH or HEIGHT
-      const bool isPrimary = isRenderTargetPrimary(*m_activePresentParams, d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()->Desc());
+      const bool isPrimary = isRenderTargetPrimary(*m_activePresentParams, d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()->Desc()) ||
+                             isUe3MainViewSceneTargetDraw();
 
       if (!isPrimary) {
         logNonPrimaryRenderTargetOnce();
@@ -919,6 +920,11 @@ namespace dxvk {
         RtxGeometryStatus::Rasterized,
         true, // UI rendering detected => trigger RTX injection
       };
+    }
+
+    if (isUe3OverlayOnLetterboxedMainView()) {
+      ONCE(Logger::info("[RTX-Compatibility-Info] Rasterizing a full-screen overlay over a letterboxed UE3 main view, which triggers RTX injection."));
+      return { RtxGeometryStatus::Rasterized, true };
     }
 
     // TODO(REMIX-760): Support reverse engineering pre-transformed vertices
@@ -1478,13 +1484,13 @@ namespace dxvk {
       (preserveOriginalDraw ? PrepareDrawFlag::PreserveDrawCallAndItsState : 0));
   }
 
-  void D3D9Rtx::triggerInjectRTX(const Rc<DxvkImage>& targetImage, const Rc<DxvkImage>& hdrCanvas) {
+  void D3D9Rtx::triggerInjectRTX(const Rc<DxvkImage>& targetImage, const Rc<DxvkImage>& hdrCanvas, const VkRect2D& outputRect) {
     // Flush any pending game and RTX work
     m_parent->Flush();
 
     // Send command to inject RTX
-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), cTargetImage = targetImage, cHdrCanvas = hdrCanvas](DxvkContext* ctx) {
-      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId, cTargetImage, cHdrCanvas);
+    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId(), cTargetImage = targetImage, cHdrCanvas = hdrCanvas, outputRect](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId, cTargetImage, cHdrCanvas, outputRect);
     });
   }
 
@@ -2250,11 +2256,53 @@ namespace dxvk {
     // Recreated at the new size on the next staged injection
     m_deferredUiHdrCanvas = nullptr;
 
+    // The main view and the presented region were measured against the old backbuffer
+    m_ue3MainView.reset();
+    m_presentedRect = VkRect2D { VkOffset2D { 0, 0 },
+                                 VkExtent2D { m_activePresentParams->BackBufferWidth, m_activePresentParams->BackBufferHeight } };
+
     // Inform the backend about potential presenter update
     m_parent->EmitCs([cWidth = m_activePresentParams->BackBufferWidth,
                       cHeight = m_activePresentParams->BackBufferHeight](DxvkContext* ctx) {
       static_cast<RtxContext*>(ctx)->resetScreenResolution({ cWidth, cHeight , 1 });
     });
+  }
+
+  void D3D9Rtx::SetPresentSourceRect(const RECT* pSourceRect) {
+    if (!m_activePresentParams.has_value()) {
+      return;
+    }
+
+    const LONG bbW = LONG(m_activePresentParams->BackBufferWidth);
+    const LONG bbH = LONG(m_activePresentParams->BackBufferHeight);
+    RECT rect = { 0, 0, bbW, bbH };
+    if (pSourceRect != nullptr) {
+      rect.left = std::clamp<LONG>(pSourceRect->left, 0, bbW);
+      rect.top = std::clamp<LONG>(pSourceRect->top, 0, bbH);
+      rect.right = std::clamp<LONG>(pSourceRect->right, 0, bbW);
+      rect.bottom = std::clamp<LONG>(pSourceRect->bottom, 0, bbH);
+      if (rect.right <= rect.left || rect.bottom <= rect.top) {
+        rect = { 0, 0, bbW, bbH };
+      }
+    }
+
+    m_presentedRect = VkRect2D { VkOffset2D { int32_t(rect.left), int32_t(rect.top) },
+                                 VkExtent2D { uint32_t(rect.right - rect.left), uint32_t(rect.bottom - rect.top) } };
+  }
+
+  VkRect2D D3D9Rtx::presentedBackBufferRect() const {
+    if (!m_activePresentParams.has_value()) {
+      return VkRect2D {};
+    }
+
+    const uint32_t bbW = m_activePresentParams->BackBufferWidth;
+    const uint32_t bbH = m_activePresentParams->BackBufferHeight;
+    const bool insideBackBuffer =
+      m_presentedRect.extent.width != 0 && m_presentedRect.extent.height != 0 &&
+      m_presentedRect.offset.x >= 0 && m_presentedRect.offset.y >= 0 &&
+      uint64_t(m_presentedRect.offset.x) + m_presentedRect.extent.width <= bbW &&
+      uint64_t(m_presentedRect.offset.y) + m_presentedRect.extent.height <= bbH;
+    return insideBackBuffer ? m_presentedRect : VkRect2D { VkOffset2D { 0, 0 }, VkExtent2D { bbW, bbH } };
   }
 
   void D3D9Rtx::EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx) {
@@ -2317,8 +2365,9 @@ namespace dxvk {
     m_parent->Flush();
 
     // Inform backend of end-frame
-    m_parent->EmitCs([currentReflexFrameId, targetImage, cCallInjectRtx = callInjectRtx && !injected](DxvkContext* ctx) { 
-      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, cCallInjectRtx); 
+    m_parent->EmitCs([currentReflexFrameId, targetImage, cCallInjectRtx = callInjectRtx && !injected,
+                      cOutputRect = ue3MainViewOutputRect(targetImage)](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, cCallInjectRtx, cOutputRect);
     });
 
     const uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
@@ -2335,6 +2384,7 @@ namespace dxvk {
 
     // Reset for the next frame
     m_rtxInjectTriggered = false;
+    m_ue3MainView.reset();
     m_drawCallID = 0;
     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
     ++m_ue3FrameCounter;
