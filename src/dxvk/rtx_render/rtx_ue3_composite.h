@@ -178,8 +178,10 @@ namespace dxvk {
       return m_failedKeys.count(key) != 0;
     }
 
-    // Returns false once this frame's bakes are spent (rtx.d3d9.ue3CompositeMaxBakesPerFrame).
-    bool takeBakeSlot(uint32_t frame);
+    // Returns whether a bake may run this frame.
+    // A first bake, without which the surface renders its albedo pick, is limited only by pass target memory.
+    // A re-bake, whose surface keeps rendering the earlier bake, is also limited by ue3CompositeMaxBakesPerFrame.
+    bool takeBakeSlot(uint32_t frame, const Ue3CompositeBakeRequest& request, bool rebake);
 
     // Returns rtx.d3d9.ue3CompositeEmissiveIntensity, read once a frame.
     float emissiveIntensity(uint32_t frame);
@@ -208,6 +210,7 @@ namespace dxvk {
     VkDeviceSize m_totalBytes = 0;
     uint32_t m_bakeFrame = ~0u;
     uint32_t m_bakesThisFrame = 0;
+    VkDeviceSize m_passTargetBytesThisFrame = 0;
     uint32_t m_maxBakesPerFrame = 0;
     uint32_t m_optionsFrame = ~0u;
     float m_emissiveIntensity = 1.0f;

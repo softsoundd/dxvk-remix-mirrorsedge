@@ -566,7 +566,7 @@ A replacement authored against the material before it was tagged was authored in
 
 ### Performance
 
-A bake is one to four full-target passes of the game's pixel shader, an encode pass per albedo and mips, and runs once per key. It is timed as `UE3 Composite Bake` in `rtx.gpuPassTimings`. The passes share one float target, plus a second for emission that varies over the bake, so a bake briefly needs 8 or 16 bytes per texel on top of its textures. At most `rtx.d3d9.ue3CompositeMaxBakesPerFrame` run per frame, and a draw whose first bake has not landed yet renders its pick. Once baked, a surface costs what it did before: one albedo fetch, plus emission where it keeps some, plus the mask and one or two more albedos where a mask is lifted.
+A bake is one to four full-target passes of the game's pixel shader, an encode pass per albedo and mips, and runs once per key. It is timed as `UE3 Composite Bake` in `rtx.gpuPassTimings`. The passes share one float target, plus a second for emission that varies over the bake, so a bake briefly needs 8 or 16 bytes per texel on top of its textures. A material bakes in the frame it is first drawn, so its surface does not show its pick first, unless that frame's bakes already hold 256 MB of these targets, as a level's first frames can. The rest bake in the frames that follow. Re-bakes, during which a surface keeps rendering its earlier bake, run at most `rtx.d3d9.ue3CompositeMaxBakesPerFrame` per frame. Once baked, a surface costs what it did before: one albedo fetch, plus emission where it keeps some, plus the mask and one or two more albedos where a mask is lifted.
 
 Memory is 4 bytes per texel per texture, plus mips: about 21 MB at 2048 and 85 MB at 4096, and as much again for each further albedo of a lifted mask, and for kept emission that a texture layer carries. Emission that comes from the material's constants alone is the same everywhere, so it is rendered and stored as a single texel. UE3 streams a material's layers in a mip at a time while a level loads, and each step is a new key. A material already baked through the same shader and UV set keeps rendering that bake until its newest key has been drawn for about a second, then bakes that once. The bake it replaces is released when no draw has used it for 120 frames, while the bakes of the material's other lightmap compiles stay. Above `rtx.d3d9.ue3CompositeVramBudgetMB`, bakes no draw has used for 120 frames are released too, oldest first, and bake again when next drawn.
 
@@ -584,7 +584,7 @@ The dev menu's "UE3 Composite Materials" section holds the options, a list of th
 | `rtx.ue3CompositeMaterialTextures` | | Materials (material, textureSet+shader, albedo pick or layer texture hash) rendered from a bake of their own pixel shader |
 | `rtx.d3d9.ue3CompositeMaxResolution` | 4096 | Largest side of a bake, in texels |
 | `rtx.d3d9.ue3CompositeVramBudgetMB` | 1024 | Memory above which idle bakes are released |
-| `rtx.d3d9.ue3CompositeMaxBakesPerFrame` | 2 | Bakes run per frame |
+| `rtx.d3d9.ue3CompositeMaxBakesPerFrame` | 2 | Re-bakes run per frame, such as those of streamed-in mips. A material's first bake is not limited by it |
 | `rtx.d3d9.ue3CompositeEmission` | False | Keep the emission a bake separates as the surface's emissive texture, and export it in captures |
 | `rtx.d3d9.ue3CompositeEmissiveIntensity` | 1 | Scale on the kept emission |
 | `rtx.d3d9.ue3LogCompositeMaterials` | False | Log each material's decision, its bakes and the candidates |

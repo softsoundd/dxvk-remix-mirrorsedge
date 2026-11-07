@@ -73,6 +73,18 @@ namespace dxvk {
     // A key waiting this long has stopped being drawn.
     constexpr uint32_t kUe3CompositeMaxWaitFrames = 600;
 
+    constexpr VkFormat kUe3CompositePassFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+
+    // Bounds the pass targets a frame's bakes allocate, which the frame holds until the GPU is done with them.
+    // A level's first frames bring every composite material's first bake, which this spreads over a few frames.
+    constexpr VkDeviceSize kUe3CompositeFramePassTargetBytes = VkDeviceSize(256) << 20;
+
+    VkDeviceSize passTargetBytes(const Ue3CompositeBakeRequest& request) {
+      const VkDeviceSize texels = VkDeviceSize(request.width) * VkDeviceSize(request.height);
+      const VkDeviceSize emissionTexels = !request.emissivePass ? 0 : request.uniformEmission ? 1 : texels;
+      return (texels + emissionTexels) * imageFormatInfo(kUe3CompositePassFormat)->elementSize;
+    }
+
     uint32_t mipLevelCount(const uint32_t width, const uint32_t height) {
       return 1u + uint32_t(std::floor(std::log2(double(std::max(width, height)))));
     }
@@ -171,16 +183,23 @@ namespace dxvk {
     markSettled(key);
   }
 
-  bool Ue3CompositeBaker::takeBakeSlot(const uint32_t frame) {
+  bool Ue3CompositeBaker::takeBakeSlot(const uint32_t frame, const Ue3CompositeBakeRequest& request, const bool rebake) {
     if (m_bakeFrame != frame) {
       m_bakeFrame = frame;
       m_bakesThisFrame = 0;
+      m_passTargetBytesThisFrame = 0;
       m_maxBakesPerFrame = D3D9Rtx::ue3CompositeMaxBakesPerFrame();
     }
-    if (m_bakesThisFrame >= m_maxBakesPerFrame) {
+    if (rebake && m_bakesThisFrame >= m_maxBakesPerFrame) {
+      return false;
+    }
+    // A bake bigger than the whole budget still runs alone in a frame.
+    const VkDeviceSize bytes = passTargetBytes(request);
+    if (m_bakesThisFrame > 0 && m_passTargetBytesThisFrame + bytes > kUe3CompositeFramePassTargetBytes) {
       return false;
     }
     m_bakesThisFrame++;
+    m_passTargetBytesThisFrame += bytes;
     return true;
   }
 
@@ -423,7 +442,7 @@ namespace dxvk {
         entry = previous;
       } else if (previous != nullptr && !baker.hasHeld(request->key, frame)) {
         entry = previous;
-      } else if (baker.takeBakeSlot(frame) && bakeUe3CompositeNow(*request)) {
+      } else if (baker.takeBakeSlot(frame, *request, previous != nullptr) && bakeUe3CompositeNow(*request)) {
         entry = baker.find(request->key, frame);
       } else {
         entry = previous;
@@ -513,12 +532,12 @@ namespace dxvk {
     const VkExtent3D extent = { request.width, request.height, 1 };
     const VkExtent3D emissiveExtent = request.uniformEmission ? VkExtent3D { 1, 1, 1 } : extent;
     const Resources::Resource passTarget = Resources::createImageResource(
-      ctx, "UE3 composite bake", extent, VK_FORMAT_R16G16B16A16_SFLOAT, 1, VK_IMAGE_TYPE_2D,
+      ctx, "UE3 composite bake", extent, kUe3CompositePassFormat, 1, VK_IMAGE_TYPE_2D,
       VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     Resources::Resource emissiveTarget;
     if (request.emissivePass) {
       emissiveTarget = Resources::createImageResource(
-        ctx, "UE3 composite bake emission", emissiveExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 1, VK_IMAGE_TYPE_2D,
+        ctx, "UE3 composite bake emission", emissiveExtent, kUe3CompositePassFormat, 1, VK_IMAGE_TYPE_2D,
         VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     }
     const bool masked = request.mask.has_value();

@@ -597,8 +597,9 @@ namespace dxvk {
                "UE3 compat: video memory kept for composite material bakes. Above it, bakes no draw has used for 120 "
                "frames are released at the end of a frame, oldest first, and bake again when next drawn.");
     RTX_OPTION("rtx.d3d9", uint32_t, ue3CompositeMaxBakesPerFrame, 2,
-               "UE3 compat: composite material bakes run per frame. A bake runs the material's pixel shader over every "
-               "texel of the bake up to four times. A material waiting for its bake renders its albedo pick meanwhile.");
+               "UE3 compat: composite material re-bakes run per frame, such as those of streamed-in mips. The surface "
+               "keeps rendering its earlier bake meanwhile. A material's first bake is not limited by this, and runs as "
+               "soon as the material is drawn.");
     RTX_OPTION("rtx.d3d9", bool, ue3CompositeEmission, false,
                "UE3 compat: keeps the emission a composite material bake separates from its colour, the unlit part of the "
                "game's output, as the surface's emissive texture, and exports it in captures. The bake takes it out of the "

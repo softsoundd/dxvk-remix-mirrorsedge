@@ -5315,7 +5315,7 @@ namespace dxvk {
                          "pixel shader over one repeat of all their layers, instead of their albedo pick.");
       RemixGui::DragInt("Max Bake Resolution", &D3D9Rtx::ue3CompositeMaxResolutionObject(), 16.f, 64, 8192, "%d", sliderFlags);
       RemixGui::DragInt("VRAM Budget (MB)", &D3D9Rtx::ue3CompositeVramBudgetMBObject(), 16.f, 0, 16384, "%d", sliderFlags);
-      RemixGui::DragInt("Max Bakes Per Frame", &D3D9Rtx::ue3CompositeMaxBakesPerFrameObject(), 0.1f, 1, 16, "%d", sliderFlags);
+      RemixGui::DragInt("Max Re-bakes Per Frame", &D3D9Rtx::ue3CompositeMaxBakesPerFrameObject(), 0.1f, 1, 16, "%d", sliderFlags);
       RemixGui::Checkbox("Keep Emission", &D3D9Rtx::ue3CompositeEmissionObject());
       RemixGui::DragFloat("Emissive Intensity", &D3D9Rtx::ue3CompositeEmissiveIntensityObject(), 0.01f, 0.f, 1000.f);
       RemixGui::Checkbox("Log Composite Materials", &D3D9Rtx::ue3LogCompositeMaterialsObject());
