@@ -79,7 +79,9 @@ namespace dxvk {
   }
 
   void RtxMipmap::updateMipmap(Rc<RtxContext> ctx, Resource mipmap, MipmapMethod method) {
-    VkFilter samplerType = method == MipmapMethod::Maximum ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    VkFilter samplerType = method == MipmapMethod::Maximum || method == MipmapMethod::AlphaWeighted
+      ? VK_FILTER_NEAREST
+      : VK_FILTER_LINEAR;
     Rc<DxvkSampler> sampler = ctx->getResourceManager().getSampler(samplerType, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
 
     for (size_t i = 1; i < mipmap.views.size(); i++) {

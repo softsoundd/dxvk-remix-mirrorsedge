@@ -69,5 +69,28 @@ void main(uint2 threadId : SV_DispatchThreadID)
         OutputTexture[threadId] = maxValue;
       }
       break;
+    case MipmapMethod::AlphaWeighted:
+      {
+        // Weighting each colour by its alpha keeps what the 4 underlying pixels blend over any background.
+        vec2 dUv = 0.25 / cb.resolution;
+        vec4 values[4] = {
+          InputTexture.SampleLevel(uv + vec2(-dUv.x, -dUv.y), 0),
+          InputTexture.SampleLevel(uv + vec2(-dUv.x, dUv.y), 0),
+          InputTexture.SampleLevel(uv + vec2(dUv.x, -dUv.y), 0),
+          InputTexture.SampleLevel(uv + vec2(dUv.x, dUv.y), 0)
+        };
+        vec4 weightedSum = 0;
+        vec3 colorSum = 0;
+        for (uint i = 0; i < 4; i++)
+        {
+          weightedSum += vec4(values[i].rgb * values[i].a, values[i].a);
+          colorSum += values[i].rgb;
+        }
+        // Pixels that are all transparent keep their plain average colour.
+        OutputTexture[threadId] = weightedSum.a > 0
+          ? vec4(weightedSum.rgb / weightedSum.a, weightedSum.a * 0.25)
+          : vec4(colorSum * 0.25, 0);
+      }
+      break;
   }
 }

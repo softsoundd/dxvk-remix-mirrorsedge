@@ -69,6 +69,21 @@ void main(uvec2 threadId : SV_DispatchThreadID)
     coverage = full.a >= 0.5f ? 1.0f : 0.0f;
   }
 
+  // Remix can only blend a surface over the one beneath.
+  // A multiply is stored as the alpha blend that matches it over a surface of albedo 1/2.
+  // See "What the bake renders" in UE3Compatibility.md.
+  if (cb.multiplyScale > 0.0f)
+  {
+    const vec3 multiplier = max(full.rgb, vec3(0.0f, 0.0f, 0.0f)) * cb.multiplyScale;
+    const vec3 change = abs(multiplier - 1.0f);
+    const float opacity = saturate(max(max(change.r, change.g), change.b));
+    const vec3 color = opacity > 0.0f
+      ? saturate(0.5f * (multiplier - 1.0f + opacity) / opacity)
+      : vec3(0.5f, 0.5f, 0.5f);
+    AlbedoOutput[threadId] = vec4(linearToGamma(color), opacity * coverage);
+    return;
+  }
+
   AlbedoOutput[threadId] = vec4(linearToGamma(saturate(full.rgb - emission)), coverage);
   if ((cb.flags & UE3_COMPOSITE_ENCODE_FLAG_STORE_EMISSION) != 0 && (!uniformEmission || all(threadId == uvec2(0, 0))))
   {

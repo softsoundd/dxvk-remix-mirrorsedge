@@ -70,6 +70,8 @@ namespace dxvk {
     bool uniformEmission = false;
     // Is set when the main pass's alpha marks the texels the shader did not clip.
     bool coverageFromAlpha = false;
+    // Is Ue3CompositeDomain::multiplyScale. A multiplying draw's albedo is encoded as an alpha blend.
+    float multiplyScale = 0.0f;
 
     struct ConstantOverride {
       uint32_t reg = 0;
@@ -117,6 +119,8 @@ namespace dxvk {
       RtxMipmap::Resource maskedAlbedo;
       RtxMipmap::Resource maskedHalfAlbedo;
       std::optional<Ue3CompositeBakeRequest::Mask> mask;
+      // Is set when the albedo holds a multiply as a colour and opacity, which the surface alpha blends.
+      bool alphaBlend = false;
       Rc<DxvkSampler> sampler;
       // Hashes the key and the bake's generation. The surface's material identity carries it, so the
       // preserve path rebinds when a key bakes again.

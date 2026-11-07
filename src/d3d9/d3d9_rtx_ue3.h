@@ -603,6 +603,9 @@ namespace dxvk {
     // Is set when the bake keeps its emission as the surface's emissive texture, which needs rtx.d3d9.ue3CompositeEmission.
     // It is not when an emissive layer reads another UV set or a coordinate the bake cannot place.
     bool storeEmission = false;
+    // Is 1 when the draw multiplies the surface beneath by its colour, and 2 when it multiplies by twice its colour.
+    // Is 0 when it does not multiply. A multiplying draw bakes as an alpha blend and keeps no emission.
+    float multiplyScale = 0.0f;
     // Lists the interpolant lanes of colour layers on another UV set, which the bake samples at their average.
     struct AveragedLanes {
       uint8_t semanticIndex;

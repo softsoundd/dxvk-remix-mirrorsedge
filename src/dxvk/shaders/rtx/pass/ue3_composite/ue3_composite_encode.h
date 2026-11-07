@@ -46,5 +46,7 @@ struct Ue3CompositeEncodeArgs
 {
   uvec2 resolution;
   uint flags;
-  uint padding;
+  // Is 1 when the draw multiplies the surface beneath by the pass, and 2 when it multiplies by twice the pass.
+  // Is 0 when it does not multiply.
+  float multiplyScale;
 };

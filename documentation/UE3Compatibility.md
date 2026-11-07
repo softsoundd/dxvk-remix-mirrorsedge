@@ -505,7 +505,9 @@ When the shader has an emissive term, the albedo is the difference of the two pa
 
 A material that `clip()`s keeps its coverage in the albedo's alpha, since a clipped texel keeps the target's cleared alpha of 0. UE3 clips in the shader with D3D9's alpha test off, so Remix renders such a surface opaque, composite or not. The coverage is for captures, where a tool that cuts alpha cards into opaque geometry can trace the game's own clip. Tracing the pick's alpha instead often goes wrong. Some masks are a separate texture or another channel: a Scraper_p material clips by the red channel of a mask texture that its diffuse tiles four times over. Many others clip at 1/3 rather than a tracing tool's usual 1/2.
 
-A draw that blends by colour alone, as a modulated overlay or an additive glow does, bakes too. The passes render the shader's output unblended, and Remix derives such a blend from the surface colour, so the surface blends the bake's colour where the game blended the shader's. Escape_p's RP&A reception paints its green panels this way, by multiplying the surface beneath with a tinted stripe texture that its pick would render raw. Like any overlay, such a draw also needs a decal category to layer onto the surface beneath it. A blend by alpha, as translucency uses, would need the shader's alpha, which the bake keeps only as coverage.
+A draw that blends by colour alone, as a modulated overlay or an additive glow does, bakes too. The passes render the shader's output unblended, and Remix derives such a blend from the surface colour, so the surface blends the bake's colour where the game blended the shader's. Like any overlay, such a draw also needs a decal category to layer onto the surface beneath it. A blend by alpha, as translucency uses, would need the shader's alpha, which the bake keeps only as coverage.
+
+A draw that multiplies the surface beneath, by `(DESTCOLOR, ZERO)`, `(ZERO, SRCCOLOR)` or the doubling `(DESTCOLOR, SRCCOLOR)`, bakes as an alpha blend instead. Remix takes a multiply's opacity from the luminance of its colour, which renders a saturated tint pale, such as the (2, 0.2, 0) that Factory_p's facade numbers multiply their wall by. The bake's opacity is instead the multiply's largest change to any channel, and its colour is what the multiply gives over a surface of linear albedo 1/2. That is exact wherever the multiply is grey and darkens, as the stripes over Escape_p's RP&A reception wall are, and keeps a tint saturated elsewhere. Its mips weight colour by opacity, so the blend holds at a distance. The material's log line marks such a draw `baked as an alpha blend`.
 
 ### The repeat
 
@@ -558,6 +560,7 @@ For a tagged material, these are unchanged:
 These change:
 - The rendered albedo, and the emission with `rtx.d3d9.ue3CompositeEmission` on.
 - The surface's texture transform, which becomes the repeat rather than the pick's own tiling.
+- The blend of a draw that multiplies the surface beneath, which becomes an alpha blend by the bake's opacity, in captures too.
 - A capture's albedo DDS, which is the bake with any lifted mask at 0, and with a clipped material's coverage in its alpha.
 - A capture's UVs, which follow the surface's transform and so cover the bake's repeat.
 - With `rtx.d3d9.ue3CompositeEmission` on, a capture also exports the emission as a `_emissive` DDS, with emission enabled. Turning it on for one capture gives a material's lights as a starting point for authoring them.

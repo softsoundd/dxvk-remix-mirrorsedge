@@ -29,7 +29,8 @@
 enum class MipmapMethod : uint32_t {
   Simple = 0, // use sampler at center of 4 pixels to find average value
   Gaussian = 1, // use 3x3 gaussian kernel
-  Maximum = 2 // use max of the 4 underlying pixels
+  Maximum = 2, // use max of the 4 underlying pixels
+  AlphaWeighted = 3 // Averages the 4 underlying pixels, weighting each colour by its alpha.
 };
 
 struct GenerateMipmapArgs

@@ -248,6 +248,18 @@ namespace dxvk {
       }
     }
 
+    // Returns Ue3CompositeDomain::multiplyScale for a draw's blend.
+    float multiplyBlendScale(const DWORD blendOp, const DWORD srcBlend, const DWORD dstBlend) {
+      if (blendOp != D3DBLENDOP_ADD) {
+        return 0.0f;
+      }
+      if ((srcBlend == D3DBLEND_DESTCOLOR && dstBlend == D3DBLEND_ZERO) ||
+          (srcBlend == D3DBLEND_ZERO && dstBlend == D3DBLEND_SRCCOLOR)) {
+        return 1.0f;
+      }
+      return srcBlend == D3DBLEND_DESTCOLOR && dstBlend == D3DBLEND_SRCCOLOR ? 2.0f : 0.0f;
+    }
+
     std::string formatBakeSize(const Ue3CompositeDomain& domain) {
       std::string size = str::format(domain.width, "x", domain.height);
       if (domain.width < domain.neededWidth || domain.height < domain.neededHeight) {
@@ -294,6 +306,8 @@ namespace dxvk {
       return refuse("alpha blend", "the draw blends by alpha (", describeBlendFactor(srcBlend), ", ",
                     describeBlendFactor(dstBlend), "), and the bake keeps its alpha only as coverage");
     }
+    domain.multiplyScale = blended ? multiplyBlendScale(d3d9State().renderStates[D3DRS_BLENDOP], srcBlend, dstBlend) : 0.0f;
+
     // Decals are not among them: a decal category only changes how the surface layers over the one
     // beneath, and a decal the game blends by alpha is refused above.
     if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::Sky, InstanceCategories::Particle, InstanceCategories::Beam,
@@ -608,7 +622,7 @@ namespace dxvk {
       return std::abs(s.x - colorScales.front().x) > 1e-4f || std::abs(s.y - colorScales.front().y) > 1e-4f;
     });
     domain.storeEmission = m_frameOptions.ue3CompositeEmission && info.hasEmissive &&
-                           info.lighting != DxsoUe3CompositeLighting::Unlit && !emissionLeftOut;
+                           info.lighting != DxsoUe3CompositeLighting::Unlit && !emissionLeftOut && domain.multiplyScale == 0.0f;
     domain.texturesHash = textureRecords.empty()
       ? kEmptyHash
       : XXH3_64bits(textureRecords.data(), textureRecords.size() * sizeof(TextureRecord));
@@ -692,8 +706,10 @@ namespace dxvk {
     request->height = domain.height;
     request->period = domain.period;
     request->domainTransform = domain.transform;
-    request->emissivePass = info.hasEmissive && info.lighting != DxsoUe3CompositeLighting::Unlit;
+    // A multiplying draw multiplies by its whole output, emission included.
+    request->emissivePass = info.hasEmissive && info.lighting != DxsoUe3CompositeLighting::Unlit && domain.multiplyScale == 0.0f;
     request->storeEmission = domain.storeEmission;
+    request->multiplyScale = domain.multiplyScale;
     request->uniformEmission = request->emissivePass &&
       std::none_of(info.layers.begin(), info.layers.end(), [](const DxsoUe3CompositeLayer& layer) { return layer.emissive; });
     request->coverageFromAlpha = info.hasTexkill;
@@ -930,12 +946,14 @@ namespace dxvk {
       uint32_t texcoordIdx;
       uint32_t texcoordComps;
       uint32_t storeEmission;
+      float multiplyScale;
+      uint32_t padding;
       XXH64_hash_t materialHash;
       XXH64_hash_t psHash;
       XXH64_hash_t texturesHash;
       XXH64_hash_t constantsHash;
     };
-    static_assert(sizeof(KeyRecord) == 64, "KeyRecord is hashed by memory.");
+    static_assert(sizeof(KeyRecord) == 72, "KeyRecord is hashed by memory.");
     KeyRecord record = {};
     record.lighting = uint32_t(info.lighting);
     record.width = domain.width;
@@ -945,6 +963,7 @@ namespace dxvk {
     record.texcoordIdx = texcoordIdx;
     record.texcoordComps = (uint32_t(m_texcoordCompU) << 8) | uint32_t(m_texcoordCompV);
     record.storeEmission = domain.storeEmission;
+    record.multiplyScale = domain.multiplyScale;
     record.materialHash = materialHash;
     record.psHash = ue3.inferredPsHash;
     record.texturesHash = domain.texturesHash;
@@ -1003,7 +1022,8 @@ namespace dxvk {
           " coverage=", request->coverageFromAlpha ? 1 : 0,
           d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]
             ? str::format(" blend=(", describeBlendFactor(d3d9State().renderStates[D3DRS_SRCBLEND]), ", ",
-                          describeBlendFactor(d3d9State().renderStates[D3DRS_DESTBLEND]), ")")
+                          describeBlendFactor(d3d9State().renderStates[D3DRS_DESTBLEND]), ")",
+                          domain.multiplyScale > 0.0f ? " baked as an alpha blend" : "")
             : std::string(),
           info.viewDependent ? " view-dependent terms baked face-on" : "",
           " layers=[", described.description, "] constants=[", constants, "] repeat=(", domain.period.x, ",", domain.period.y, ")",

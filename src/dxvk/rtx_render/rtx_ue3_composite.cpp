@@ -467,6 +467,10 @@ namespace dxvk {
       material.ue3CompositeMaskChannel = entry->mask->channel;
       material.ue3CompositeMaskIsSrgb = entry->mask->isSrgb;
     }
+    if (entry->alphaBlend) {
+      material.blendMode.colorSrcFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+      material.blendMode.colorDstFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    }
     useBakeUvs(drawCallState, *request);
   }
 
@@ -640,6 +644,7 @@ namespace dxvk {
                    (request.uniformEmission ? UE3_COMPOSITE_ENCODE_FLAG_UNIFORM_EMISSION : 0u) |
                    (request.coverageFromAlpha ? UE3_COMPOSITE_ENCODE_FLAG_COVERAGE_ALPHA : 0u) |
                    (storeEmission ? UE3_COMPOSITE_ENCODE_FLAG_STORE_EMISSION : 0u);
+      args.multiplyScale = request.multiplyScale;
       setPushConstantBank(DxvkPushConstantBank::RTX);
       pushConstants(0, sizeof(args), &args);
       bindResourceView(UE3_COMPOSITE_ENCODE_PASS_INPUT, passTarget.view, nullptr);
@@ -683,7 +688,9 @@ namespace dxvk {
       bindResourceView(slot, view, nullptr);
     }
 
-    RtxMipmap::updateMipmap(this, entry.albedo, MipmapMethod::Simple);
+    // A multiply's albedo is alpha blended, so its mips weight colour by opacity.
+    const MipmapMethod albedoMips = request.multiplyScale > 0.0f ? MipmapMethod::AlphaWeighted : MipmapMethod::Simple;
+    RtxMipmap::updateMipmap(this, entry.albedo, albedoMips);
     if (request.storeEmission) {
       RtxMipmap::updateMipmap(this, entry.emissive, MipmapMethod::Simple);
     }
@@ -718,6 +725,7 @@ namespace dxvk {
     entry.width = request.width;
     entry.height = request.height;
     entry.period = request.period;
+    entry.alphaBlend = request.multiplyScale > 0.0f;
     entry.description = request.description;
 
     if (request.log) {
