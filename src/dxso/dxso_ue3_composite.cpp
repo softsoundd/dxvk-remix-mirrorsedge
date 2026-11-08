@@ -322,6 +322,11 @@ namespace dxvk {
       std::remove_if(info.materialConstantRegisters.begin(), info.materialConstantRegisters.end(),
                      [&](const uint32_t r) { return !terms.constReach[r]; }),
       info.materialConstantRegisters.end());
+    for (const uint32_t r : info.materialConstantRegisters) {
+      if (terms.constReach[r] == DxsoColorTermReach_Coordinate) {
+        info.coordinateConstants.push_back({ r, terms.constCoordTargets[r] });
+      }
+    }
 
     bool anyPureAmbientTerm = false;
     bool anyVertexLightmapTerm = false;
@@ -332,6 +337,13 @@ namespace dxvk {
       anyPureAmbientTerm |= setHasPureAmbientTerm(set);
       anyVertexLightmapTerm |= setHasFactor(set, DxsoColorTermFactor_Interpolant);
     };
+
+    uint32_t cubeSamplerMask = 0;
+    for (uint32_t s = 0; s < kDxsoColorTermMaxSamplers; s++) {
+      if (samplerTypes[s] == DxsoTextureType::TextureCube) {
+        cubeSamplerMask |= 1u << s;
+      }
+    }
 
     for (uint32_t s = 0; s < kDxsoColorTermMaxSamplers; s++) {
       if (((inputs.trackedSamplerMask >> s) & 1u) == 0) {
@@ -373,6 +385,9 @@ namespace dxvk {
         noteColorSet(set);
       }
       layer.opacity = (reach & DxsoColorTermReach_Opacity) != 0;
+      const uint32_t coordTargets = terms.samplerCoordTargets[s];
+      layer.steersOnlyCubes =
+        role == DxsoColorTermRole::Coordinate && coordTargets != 0 && (coordTargets & ~cubeSamplerMask) == 0;
       info.layers.push_back(std::move(layer));
     }
 

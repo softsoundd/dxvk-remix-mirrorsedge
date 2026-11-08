@@ -409,10 +409,12 @@ namespace dxvk {
          origin.compV == m_texcoordCompU || origin.compV == m_texcoordCompV);
       const bool emits = layer.emissive && info.lighting != DxsoUe3CompositeLighting::Unlit;
       if (!readsSurfaceUvSet && origin.originValid && origin.sitesAgree && !sharesSurfaceLanes &&
-          layer.contributesColor() && !layer.opacity) {
+          (layer.contributesColor() || layer.steersOnlyCubes) && !layer.opacity) {
         // A layer on the mesh's other UV channel has no one place in a repeat of this one, so the bake
         // samples it at its average, through a ramp too steep for its mips. Its emission is left out
         // rather than glowing evenly. It is the same in both passes, so it cancels out of the albedo.
+        // A layer that only bends a cube map lookup, such as a detail normal map, is averaged as well,
+        // since the bake looks the cube map up face-on anyway.
         // The ramp only averages a texture, so colour math on the channel's coordinate itself is refused.
         const uint8_t averagedLanes = uint8_t((1u << (origin.compU & 3u)) | (1u << (origin.compV & 3u)));
         if (origin.semanticIndex < info.colorTexcoordLanes.size() &&
@@ -422,9 +424,13 @@ namespace dxvk {
                         "), and the bake can only average that UV set");
         }
         domain.averagedLanes.push_back({ origin.semanticIndex, origin.compU, origin.compV });
+        domain.averagedSamplerMask |= 1u << stage;
         emissionLeftOut |= emits;
+        const char* treatment = layer.emissive && !layer.diffuse
+          ? "emission left out"
+          : emits ? "averaged, emission left out" : "averaged";
         describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", roles, " on another UV set (",
-                      layer.diffuse ? (emits ? "averaged, emission left out" : "averaged") : "emission left out", ")");
+                      treatment, ")");
         continue;
       }
       if (!readsSurfaceUvSet && !origin.originValid && emits && !layer.diffuse && !layer.opacity) {
@@ -937,17 +943,25 @@ namespace dxvk {
     // A bake is only current for the material constant values it ran with, so they are part of its key. A flow layer's
     // samples are bound flat for the bake and scroll over it instead (rtx.d3d9.ue3FlowLayers), so the registers only they
     // are offset by, its panners, are not.
+    // Nor are the registers that only move layers the bake averages, such as a detail layer's panner,
+    // since an average does not depend on where it is read.
     const DxsoUe3FlowShaderInfo* const flow = getUe3FlowShaderForBake(ue3);
     auto isFlowOnlyRegister = [&](const uint32_t reg) {
       return flow != nullptr &&
              std::find(flow->exclusiveOffsetRegisters.begin(), flow->exclusiveOffsetRegisters.end(), reg) != flow->exclusiveOffsetRegisters.end();
+    };
+    auto movesOnlyAveragedLayers = [&](const uint32_t reg) {
+      const auto constant = std::find_if(info.coordinateConstants.begin(), info.coordinateConstants.end(),
+                                         [&](const DxsoUe3CompositeCoordinateConstant& c) { return c.reg == reg; });
+      return constant != info.coordinateConstants.end() && constant->samplerMask != 0 &&
+             (constant->samplerMask & ~domain.averagedSamplerMask) == 0;
     };
     XXH3_state_t* const hashState = getThreadLocalXxh3State();
     XXH64_hash_t constantsHash = kEmptyHash;
     if (hashState != nullptr && !info.materialConstantRegisters.empty()) {
       XXH3_64bits_reset(hashState);
       for (const uint32_t reg : info.materialConstantRegisters) {
-        if (reg < caps::MaxFloatConstantsPS && !isFlowOnlyRegister(reg)) {
+        if (reg < caps::MaxFloatConstantsPS && !isFlowOnlyRegister(reg) && !movesOnlyAveragedLayers(reg)) {
           XXH3_64bits_update(hashState, &d3d9State().psConsts.fConsts[reg], sizeof(Vector4));
         }
       }

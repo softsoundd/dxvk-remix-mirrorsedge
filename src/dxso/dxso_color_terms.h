@@ -128,6 +128,11 @@ namespace dxvk {
     std::array<std::bitset<kDxsoColorTermMaxConstRegs>, kDxsoColorTermMaxSamplers> samplerCoordConstRegs = {};
     std::array<uint8_t, kDxsoColorTermMaxSamplers>  samplerCoordExpr = {};
     std::array<uint16_t, kDxsoColorTermMaxSamplers> samplerSampleCount = {};
+
+    // These hold, for each tracked sampler and constant register, the samplers whose coordinates it reaches.
+    // A dependent read's result is a fresh value, so the sources of its coordinate do not steer what it steers.
+    std::array<uint16_t, kDxsoColorTermMaxSamplers>  samplerCoordTargets = {};
+    std::array<uint16_t, kDxsoColorTermMaxConstRegs> constCoordTargets = {};
   };
 
   DxsoColorTermResult analyzeDxsoColorTerms(

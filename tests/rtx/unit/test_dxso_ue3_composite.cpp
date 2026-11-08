@@ -467,6 +467,64 @@ namespace {
     check(info.colorTexcoordLanes[6] == 0, "the normalised camera vector is not a coordinate the colour reads");
   }
 
+  // Builds a construction tarp, which tints its diffuse on TEXCOORD0.zw by a material constant,
+  // and adds a little of a cube map reflected off a detail normal map on TEXCOORD0.xy, panned by UniformVector_1.
+  // The variant also offsets the diffuse by the normal map.
+  DxsoTestShader buildTarp(const bool normalMapOffsetsDiffuse) {
+    DxsoTestShader ps(kPs30Header);
+    ps.ctab({
+        { "UniformVector_1", kFloat4, 2 },
+        { "UniformVector_2", kFloat4, 3 },
+        { "AmbientColorAndSkyFactor", kFloat4, 4 },
+        { "Texture2D_1", kSampler, 1 },
+        { "Texture2D_2", kSampler, 2 },
+        { "TextureCube_0", kSampler, 3 },
+      })
+      .def(1, 2.0f, -1.0f, 0.1f, 1.0f)
+      .dclInput(DxsoUsage::Texcoord, 0, 0, MaskAll)
+      .dclInput(DxsoUsage::Texcoord, 6, 1, MaskXYZ)
+      .dclSampler(1)
+      .dclSampler(2)
+      .dclSampler(3, DxsoTextureType::TextureCube)
+      .op2(DxsoOpcode::Add, rd(6, MaskXY), v(0), c(2))
+      .texld(rd(1), r(6), 1)
+      .op3(DxsoOpcode::Mad, rd(1, MaskXYZ), r(1), c(1, kXXXX), c(1, kYYYY));
+    if (normalMapOffsetsDiffuse) {
+      ps.op2(DxsoOpcode::Add, rd(5, MaskXY), v(0, swz(3, 2, 2, 3)), r(1))
+        .texld(rd(0), r(5), 2);
+    } else {
+      ps.texld(rd(0), v(0, swz(3, 2, 2, 3)), 2);
+    }
+    ps.op1(DxsoOpcode::Nrm, rd(2, MaskXYZ), r(1))
+      .op1(DxsoOpcode::Nrm, rd(3, MaskXYZ), v(1))
+      .op2(DxsoOpcode::Dp3, rd(2, MaskW), r(2), r(3))
+      .op2(DxsoOpcode::Mul, rd(4, MaskXYZ), r(2), r(2, kWWWW))
+      .op3(DxsoOpcode::Mad, rd(4, MaskXYZ), r(4), c(1, kXXXX), r(3, kXYZW, kModNeg))
+      .texld(rd(4), r(4), 3)
+      .op2(DxsoOpcode::Mul, rd(0, MaskXYZ), r(0), c(3))
+      .op3(DxsoOpcode::Mad, rd(0, MaskXYZ), r(4), c(1, kZZZZ), r(0))
+      .op2(DxsoOpcode::Mul, oC0(MaskXYZ), r(0), c(4))
+      .op1(DxsoOpcode::Mov, oC0(MaskW), c(1, kWWWW));
+    return ps;
+  }
+
+  void testCubeOnlyCoordinateLayers() {
+    const DxsoUe3CompositeShaderInfo tarp = analyzeDxsoUe3CompositeShader(buildTarp(false).view());
+    check(tarp.refusal == DxsoUe3CompositeRefusal::None, "the tarp is analysed");
+    const DxsoUe3CompositeLayer* normalMap = findLayer(tarp, 1);
+    check(normalMap != nullptr && !normalMap->contributesColor() && normalMap->steersOnlyCubes,
+          "the detail normal map only steers the cube map");
+    check(findLayer(tarp, 2) != nullptr && findLayer(tarp, 2)->diffuse && !findLayer(tarp, 2)->steersOnlyCubes,
+          "the tinted diffuse is a colour layer");
+    check(tarp.coordinateConstants.size() == 1 && tarp.coordinateConstants[0].reg == 2 &&
+            tarp.coordinateConstants[0].samplerMask == (1u << 1),
+          "the panner moves only the detail normal map, not the cube map its sample steers");
+
+    const DxsoUe3CompositeShaderInfo offset = analyzeDxsoUe3CompositeShader(buildTarp(true).view());
+    check(findLayer(offset, 1) != nullptr && !findLayer(offset, 1)->steersOnlyCubes,
+          "a normal map that also offsets the diffuse steers more than the cube map");
+  }
+
   void testRefusals() {
     {
       // A vertex colour blend has no value over a texture repeat.
@@ -582,6 +640,7 @@ namespace {
       const PsSamplerUvOrigin& origin = origins[layer.sampler];
       std::cout << "   s" << uint32_t(layer.sampler) << " " << layer.name << (layer.isCube ? " cube" : "")
                 << " emissive=" << layer.emissive << " diffuse=" << layer.diffuse << " opacity=" << layer.opacity
+                << " steersOnlyCubes=" << layer.steersOnlyCubes
                 << " origin=" << origin.originValid << " sem=" << uint32_t(origin.semanticIndex)
                 << " comps=(" << uint32_t(origin.compU) << "," << uint32_t(origin.compV) << ")"
                 << " exact=" << origin.affineExact
@@ -656,6 +715,7 @@ int main(int argc, char** argv) {
     testMaskLayers();
     testLightingLayers();
     testTexcoordInColor();
+    testCubeOnlyCoordinateLayers();
     testRefusals();
     testPeriod();
     testResolution();

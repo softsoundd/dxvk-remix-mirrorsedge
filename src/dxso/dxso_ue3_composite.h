@@ -93,6 +93,8 @@ namespace dxvk {
 
     // Is set when the layer reaches oC0.a or texkill.
     bool opacity = false;
+    // Is set when the layer reaches nothing but the coordinates of cube maps, which the bake looks up face-on.
+    bool steersOnlyCubes = false;
     std::string name;
 
     bool contributesColor() const { return emissive || diffuse; }
@@ -112,6 +114,13 @@ namespace dxvk {
     uint8_t sampler = 0;
     uint8_t channel = 0;
     uint8_t degree = 1;
+  };
+
+  // Describes a material constant register that reaches nothing but texture coordinates.
+  struct DxsoUe3CompositeCoordinateConstant {
+    uint32_t reg = 0;
+    // Holds a bit for each sampler whose coordinate the register moves.
+    uint16_t samplerMask = 0;
   };
 
   struct DxsoUe3CompositeShaderInfo {
@@ -148,6 +157,9 @@ namespace dxvk {
     std::array<uint8_t, 8> colorTexcoordLanes = {};
     // Lists the UniformVector_* and UniformScalar_* registers that reach an output, whose live values make a bake current.
     std::vector<uint32_t> materialConstantRegisters;
+    // Lists those of them that reach nothing but texture coordinates.
+    // A bake that averages every sampler one of them moves does not depend on it.
+    std::vector<DxsoUe3CompositeCoordinateConstant> coordinateConstants;
   };
 
   DxsoUe3CompositeShaderInfo analyzeDxsoUe3CompositeShader(const DxsoShaderView& pixelShader);

@@ -350,6 +350,11 @@ namespace dxvk {
           }
           result.samplerCoordExpr[s] = m_samplerCoordExpr[s];
           result.samplerSampleCount[s] = m_samplerSampleCount[s];
+          result.samplerCoordTargets[s] = m_coordTargets[s];
+        }
+        for (uint32_t reg = 0; reg < kDxsoColorTermMaxConstRegs; reg++) {
+          const int32_t idx = m_constSourceIndex[reg];
+          result.constCoordTargets[reg] = idx >= 0 ? m_coordTargets[size_t(idx)] : 0;
         }
       }
 
@@ -614,6 +619,11 @@ namespace dxvk {
         } else {
           markReach(coordValue, DxsoColorTermReach_Coordinate);
           if (sampler < kDxsoColorTermMaxSamplers) {
+            for (uint32_t i = 0; i < kMaxSources; i++) {
+              if ((coordValue.touch[i / 32u] >> (i % 32u)) & 1u) {
+                m_coordTargets[i] |= uint16_t(1u << sampler);
+              }
+            }
             for (uint32_t w = 0; w < coordValue.constDeps.size(); w++) {
               m_samplerCoordConstDeps[sampler][w] |= coordValue.constDeps[w];
             }
@@ -921,6 +931,7 @@ namespace dxvk {
       std::array<ConstDepSet, kDxsoColorTermMaxSamplers> m_samplerCoordConstDeps = {};
       std::array<uint8_t, kDxsoColorTermMaxSamplers>     m_samplerCoordExpr = {};
       std::array<uint16_t, kDxsoColorTermMaxSamplers>    m_samplerSampleCount = {};
+      std::array<uint16_t, kMaxSources>                  m_coordTargets = {};
     };
 
   }

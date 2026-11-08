@@ -677,6 +677,8 @@ namespace dxvk {
       uint8_t compV;
     };
     std::vector<AveragedLanes> averagedLanes;
+    // Holds a bit for each sampler the bake averages.
+    uint32_t averagedSamplerMask = 0;
     // Describes a mask layer the repeat leaves out because its tiling would lengthen it. See "Masks" in
     // UE3Compatibility.md.
     struct LiftedMask {
