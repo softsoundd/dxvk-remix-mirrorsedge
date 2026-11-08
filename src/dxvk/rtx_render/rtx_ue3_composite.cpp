@@ -273,6 +273,17 @@ namespace dxvk {
     return m_halfTexture;
   }
 
+  const Rc<DxvkImageView>& Ue3CompositeBaker::getFlatNormalTexture(Rc<DxvkContext>& ctx) {
+    if (m_flatNormalTexture == nullptr) {
+      // 0x3800 is 0.5 and 0x3C00 is 1 as half floats, so 2 * t - 1 decodes to exactly (0, 0, 1), and to a flat normal
+      // too for a two-channel map that keeps x in alpha.
+      const std::array<uint16_t, 4> texel = { 0x3800, 0x3800, 0x3C00, 0x3800 };
+      m_flatNormalTexture = createConstantTexture(ctx, VK_FORMAT_R16G16B16A16_SFLOAT, texel.data(), sizeof(texel),
+                                                  "UE3 composite flat normal");
+    }
+    return m_flatNormalTexture;
+  }
+
   void Ue3CompositeBaker::release(Rc<DxvkContext>& ctx, const XXH64_hash_t key, Entry& entry, const char* reason) {
     // The texture cache holds GPU-made textures until told to drop them (REMIX-1557).
     RtxTextureManager& textureManager = ctx->getCommonObjects()->getTextureManager();
@@ -483,6 +494,7 @@ namespace dxvk {
     const bool slotsInRange =
       slotInRange(request.psConstantBufferSlot) &&
       std::all_of(request.whiteTextureSlots.begin(), request.whiteTextureSlots.end(), slotInRange) &&
+      std::all_of(request.flatNormalTextureSlots.begin(), request.flatNormalTextureSlots.end(), slotInRange) &&
       (!request.mask.has_value() || slotInRange(request.mask->slot));
     const DxvkBufferSlice liveConstants = slotsInRange ? m_rc[request.psConstantBufferSlot].bufferSlice : DxvkBufferSlice();
     const void* liveConstantData = liveConstants.defined() ? liveConstants.mapPtr(0) : nullptr;
@@ -583,6 +595,9 @@ namespace dxvk {
     for (const uint32_t slot : request.whiteTextureSlots) {
       prevTextures.emplace_back(slot, m_rc[slot].imageView);
     }
+    for (const uint32_t slot : request.flatNormalTextureSlots) {
+      prevTextures.emplace_back(slot, m_rc[slot].imageView);
+    }
     if (masked) {
       prevTextures.emplace_back(request.mask->slot, m_rc[request.mask->slot].imageView);
     }
@@ -611,6 +626,9 @@ namespace dxvk {
     const Rc<DxvkImageView> white = getResourceManager().getWhiteTexture(ctx);
     for (const uint32_t slot : request.whiteTextureSlots) {
       bindResourceView(slot, white, nullptr);
+    }
+    for (const uint32_t slot : request.flatNormalTextureSlots) {
+      bindResourceView(slot, baker.getFlatNormalTexture(ctx), nullptr);
     }
     if (masked) {
       bindResourceView(request.mask->slot, baker.getBlackTexture(ctx), nullptr);

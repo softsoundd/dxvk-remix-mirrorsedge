@@ -723,6 +723,242 @@ void opaqueSurfaceMaterialApplyMaskLayer(
   albedo = linearToGamma(mix(gammaToLinear(albedo), gammaToLinear(maskedAlbedoSample.rgb), mask));
 }
 
+// Scrolls one of a flow layer's reads to (dot(r0, uv), dot(r1, uv)) + offset + velocity * time, from the surface's texture
+// coordinates or, with secondary, its second UV set.
+SurfaceInteraction flowLayerReadInteraction(
+  SurfaceInteraction surfaceInteraction, vec2 r0, vec2 r1, f16vec2 offset, f16vec2 velocity, bool secondary)
+{
+  const vec2 uv = secondary ? surfaceInteraction.secondaryTextureCoordinates : surfaceInteraction.textureCoordinates;
+  const vec2 gradientX = secondary ? surfaceInteraction.secondaryTextureGradientX : surfaceInteraction.textureGradientX;
+  const vec2 gradientY = secondary ? surfaceInteraction.secondaryTextureGradientY : surfaceInteraction.textureGradientY;
+  SurfaceInteraction readInteraction = surfaceInteraction;
+  // The phase is kept within one repeat, as UE3's panners keep theirs, so float precision holds however long the game runs.
+  readInteraction.textureCoordinates = vec2(dot(r0, uv), dot(r1, uv)) + vec2(offset) + frac(vec2(velocity) * cb.timeSinceStartSeconds);
+  readInteraction.textureGradientX = vec2(dot(r0, gradientX), dot(r1, gradientX));
+  readInteraction.textureGradientY = vec2(dot(r0, gradientY), dot(r1, gradientY));
+  return readInteraction;
+}
+
+// Reads one of a flow layer's samples at its scrolled texture coordinates, as a tangent space vector in the surface's frame.
+bool opaqueSurfaceMaterialReadFlowSample(
+  uint16_t textureIndex,
+  uint16_t samplerIndex,
+  f16vec2 row0,
+  f16vec2 row1,
+  f16vec2 offset,
+  f16vec2 velocity,
+  uint components,
+  bool octahedral,
+  bool secondary,
+  SurfaceInteraction surfaceInteraction,
+  float lodBias,
+  inout vec3 sampleVector)
+{
+  const vec2 r0 = vec2(row0);
+  const vec2 r1 = vec2(row1);
+  vec4 texel = vec4(0.0f);
+  if (!surfaceMaterialInteractionTextureReadHelper(
+        textureIndex, samplerIndex, flowLayerReadInteraction(surfaceInteraction, r0, r1, offset, velocity, secondary), texel, lodBias))
+  {
+    return false;
+  }
+
+  vec3 n;
+  if (octahedral)
+  {
+    n = unsignedOctahedralToHemisphereDirection(texel.xy);
+  }
+  else
+  {
+    // Decoded as UE3 unpacks its normal maps, with z rebuilt for the two channel formats.
+    n.x = texel[components & 3u] * 2.0f - 1.0f;
+    n.y = texel[(components >> 2u) & 3u] * 2.0f - 1.0f;
+    n.z = (components & FLOW_LAYER_MATERIAL_COMPONENT_Z_ABSENT) != 0
+      ? sqrt(saturate(1.0f - n.x * n.x - n.y * n.y))
+      : texel[(components >> 4u) & 3u] * 2.0f - 1.0f;
+    if ((components & FLOW_LAYER_MATERIAL_COMPONENT_NEGATE_Y) != 0)
+    {
+      n.y = -n.y;
+    }
+  }
+
+  // The texel's x and y run along the sample's texture axes. The transform's transpose with its scale divided out
+  // carries them onto the surface's, so a rotated or mirrored sample still leans the way its texels do. The second UV
+  // set's axes keep no relation to the surface's, as a lightmap unwrap's charts turn every which way, so a sample on it
+  // leans in the surface's frame as its texel says, as UE3 applies it.
+  const float determinant = r0.x * r1.y - r0.y * r1.x;
+  if (!secondary && abs(determinant) > 1e-6f)
+  {
+    n.xy = vec2(r0.x * n.x + r1.x * n.y, r0.y * n.x + r1.y * n.y) / sqrt(abs(determinant));
+  }
+
+  sampleVector = n;
+  return true;
+}
+
+// The tangent space normal an opaque surface's flow layer gives at a hit, and how far it applies.
+// See "Flow layers" in UE3Compatibility.md.
+struct FlowLayerRead
+{
+  vec3 normal;
+  // Is 0 where the layer does not apply.
+  float mask;
+  // Is the roughness the surface takes where the mask is 1, or negative to keep the surface's own.
+  float roughness;
+  // Is set when the surface's normal blends towards the layer's by the mask, rather than taking it on through reoriented
+  // normal mapping.
+  bool blends;
+};
+
+FlowLayerRead flowLayerReadCreateEmpty()
+{
+  FlowLayerRead flow;
+  flow.normal = vec3(0.0f, 0.0f, 1.0f);
+  flow.mask = 0.0f;
+  flow.roughness = -1.0f;
+  flow.blends = false;
+  return flow;
+}
+
+// Reads an opaque surface's flow layer (rtx.d3d9.ue3FlowLayers, or a material's flow_* parameters).
+FlowLayerRead opaqueSurfaceMaterialReadFlowLayer(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  SurfaceInteraction surfaceInteraction,
+  float lodBias)
+{
+  FlowLayerRead flow = flowLayerReadCreateEmpty();
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_FLOW_LAYER) == 0)
+  {
+    return flow;
+  }
+
+  const FlowLayerMaterial flowLayer = flowLayerMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.flowLayerIndex]);
+  const uint flags = flowLayer.flags;
+
+  // A replacement mesh does not carry the draw's second UV set.
+  const uint secondaryFlags =
+    FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_0 | FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_1 | FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_MASK;
+  if ((flags & secondaryFlags) != 0 && !surfaceInteraction.hasSecondaryTextureCoordinates)
+  {
+    return flow;
+  }
+
+  float mask = 1.0f;
+  if ((flags & FLOW_LAYER_MATERIAL_FLAG_HAS_MASK) != 0)
+  {
+    const bool maskSecondary = (flags & FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_MASK) != 0;
+    const vec2 maskScale = vec2(flowLayer.maskTransform.xy);
+    SurfaceInteraction maskInteraction = surfaceInteraction;
+    maskInteraction.textureCoordinates =
+      (maskSecondary ? surfaceInteraction.secondaryTextureCoordinates : surfaceInteraction.textureCoordinates) * maskScale +
+      vec2(flowLayer.maskTransform.zw);
+    maskInteraction.textureGradientX =
+      (maskSecondary ? surfaceInteraction.secondaryTextureGradientX : surfaceInteraction.textureGradientX) * maskScale;
+    maskInteraction.textureGradientY =
+      (maskSecondary ? surfaceInteraction.secondaryTextureGradientY : surfaceInteraction.textureGradientY) * maskScale;
+    vec4 maskSample = vec4(0.0f);
+    if (!surfaceMaterialInteractionTextureReadHelper(flowLayer.maskTextureIndex, opaqueSurfaceMaterial.samplerIndex, maskInteraction, maskSample, lodBias))
+    {
+      return flow;
+    }
+
+    // The mask is decoded as the game samples it. Alpha never is.
+    const uint channel = (flags >> FLOW_LAYER_MATERIAL_MASK_CHANNEL_SHIFT) & 3u;
+    float value = maskSample[channel];
+    if ((flags & FLOW_LAYER_MATERIAL_FLAG_MASK_SRGB) != 0 && channel != 3)
+    {
+      value = pow(value, kSRGBGamma);
+    }
+    mask = saturate(float(flowLayer.maskScaleBias.y) + float(flowLayer.maskScaleBias.x) * value);
+  }
+  if (mask <= 0.0f)
+  {
+    return flow;
+  }
+
+  const uint sampleCount = flags & FLOW_LAYER_MATERIAL_SAMPLE_COUNT_MASK;
+  vec3 sampleVector = vec3(0.0f, 0.0f, 1.0f);
+  if ((flags & FLOW_LAYER_MATERIAL_FLAG_BLEND) != 0)
+  {
+    // Sample 1 is the scrolling weight, as UE3 lerps between two normal maps by a panned texture's channel.
+    vec4 weightSample = vec4(0.0f);
+    if (sampleCount < 2 ||
+        !surfaceMaterialInteractionTextureReadHelper(
+          flowLayer.normalTextureIndex1, flowLayer.samplerIndex,
+          flowLayerReadInteraction(surfaceInteraction, vec2(flowLayer.row0Sample1), vec2(flowLayer.row1Sample1),
+                                   flowLayer.offsetSample1, flowLayer.velocitySample1,
+                                   (flags & FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_1) != 0),
+          weightSample, lodBias))
+    {
+      return flow;
+    }
+    const uint channel = (flowLayer.components >> 8u) & 3u;
+    float value = weightSample[channel];
+    if ((flags & FLOW_LAYER_MATERIAL_FLAG_BLEND_SRGB) != 0 && channel != 3)
+    {
+      value = pow(value, kSRGBGamma);
+    }
+    const float weight = saturate(float(flowLayer.weights.y) * value) * mask;
+    if (weight <= 0.0f ||
+        !opaqueSurfaceMaterialReadFlowSample(
+          flowLayer.normalTextureIndex0, flowLayer.samplerIndex,
+          flowLayer.row0Sample0, flowLayer.row1Sample0, flowLayer.offsetSample0, flowLayer.velocitySample0,
+          flowLayer.components & 0xFFu, (flags & FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_0) != 0,
+          (flags & FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_0) != 0, surfaceInteraction, lodBias, sampleVector))
+    {
+      return flow;
+    }
+    sampleVector.xy *= float(flowLayer.strength);
+    const float sampleLength = length(sampleVector);
+    if (sampleLength > 1e-4f)
+    {
+      flow.normal = sampleVector / sampleLength;
+    }
+    flow.mask = weight;
+    flow.blends = true;
+    return flow;
+  }
+
+  vec3 sum = vec3(0.0f);
+  bool loaded = false;
+  if (sampleCount > 0 &&
+      opaqueSurfaceMaterialReadFlowSample(
+        flowLayer.normalTextureIndex0, flowLayer.samplerIndex,
+        flowLayer.row0Sample0, flowLayer.row1Sample0, flowLayer.offsetSample0, flowLayer.velocitySample0,
+        flowLayer.components & 0xFFu, (flags & FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_0) != 0,
+        (flags & FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_0) != 0, surfaceInteraction, lodBias, sampleVector))
+  {
+    sum += float(flowLayer.weights.x) * sampleVector;
+    loaded = true;
+  }
+  if (sampleCount > 1 &&
+      opaqueSurfaceMaterialReadFlowSample(
+        flowLayer.normalTextureIndex1, flowLayer.samplerIndex,
+        flowLayer.row0Sample1, flowLayer.row1Sample1, flowLayer.offsetSample1, flowLayer.velocitySample1,
+        (flowLayer.components >> 8u) & 0xFFu, (flags & FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_1) != 0,
+        (flags & FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_1) != 0, surfaceInteraction, lodBias, sampleVector))
+  {
+    sum += float(flowLayer.weights.y) * sampleVector;
+    loaded = true;
+  }
+  if (!loaded)
+  {
+    return flow;
+  }
+
+  // As UE3 lerps a material normal before normalising it, the samples' weighted sum replaces the flat normal under the mask.
+  sum.xy *= float(flowLayer.strength);
+  const vec3 blended = mix(vec3(0.0f, 0.0f, 1.0f), sum, mask);
+  const float blendedLength = length(blended);
+  if (blendedLength > 1e-4f)
+  {
+    flow.normal = blended / blendedLength;
+  }
+  flow.mask = mask;
+  flow.roughness = float(flowLayer.roughness);
+  return flow;
+}
+
 // Particle path
 //
 // The unordered particle resolve consumes only a hit's albedo, opacity and emissive radiance (see
@@ -1090,6 +1326,15 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   vec3 normal = surfaceInteraction.geometryNormal;
   // Note: Defaults to 0 as this indicates no normal detail (which should be the case when a normal map is not present).
   float normalDetail = 0.0f;
+  // The flow layer reorients its normal onto this one, or blends from it. It is flat without a normal map.
+  vec3 surfaceTangentNormal = vec3(0.0f, 0.0f, 1.0f);
+
+  // A baked terrain's texture coordinates are not the ones its flow layer was built against.
+  FlowLayerRead flow = flowLayerReadCreateEmpty();
+  if (!isBakedTerrain)
+  {
+    flow = opaqueSurfaceMaterialReadFlowLayer(opaqueSurfaceMaterial, surfaceInteraction, materialLodBias);
+  }
 
   if (normalLoaded)
   {
@@ -1110,6 +1355,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
     const f16mat3 tangentToWorld = transpose(worldToTangent);
 
     normal = normalize(mul(tangentToWorld, tangentNormal));
+    surfaceTangentNormal = tangentNormal;
 
     // REMIX-2224: Normals blended during terrain baking using programmable shaders can sometimes end up being invalid
     // after being transformed to world space so we sanitize them here
@@ -1129,8 +1375,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
       
       tangentNormal2 = normalBlendRNM(tangentNormal2, tangentNormal);
       normal = normalize(mul(tangentToWorld, tangentNormal2));
-
+      surfaceTangentNormal = tangentNormal2;
     }
+  }
+
+  if (flow.mask > 0.0f)
+  {
+    // A blend lerps from the surface's own normal as UE3 lerps from its first normal map, which a Toolkit-authored normal
+    // map stands in for.
+    vec3 flowedTangentNormal;
+    if (flow.blends)
+    {
+      const vec3 blended = mix(surfaceTangentNormal, flow.normal, flow.mask);
+      const float blendedLength = length(blended);
+      flowedTangentNormal = blendedLength > 1e-4f ? blended / blendedLength : surfaceTangentNormal;
+    }
+    else
+    {
+      flowedTangentNormal = normalBlendRNM(surfaceTangentNormal, flow.normal);
+    }
+    normal = normalize(mul(transpose(worldToTangent), flowedTangentNormal));
   }
   
 #if defined(RAY_TRACING_PRIMARY_RAY)
@@ -1150,6 +1414,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   if (roughnessLoaded)
   {
     roughness = roughnessSample.x;
+  }
+
+  if (flow.mask > 0.0f && flow.roughness >= 0.0f)
+  {
+    roughness = mix(roughness, flow.roughness, flow.mask);
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)

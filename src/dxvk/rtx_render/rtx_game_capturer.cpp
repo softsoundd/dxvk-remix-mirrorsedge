@@ -108,6 +108,28 @@ namespace dxvk {
       const std::string bakedSkyProbeSuffix("_T_SkyProbe" + lss::ext::dds);
       return captureName + bakedSkyProbeSuffix;
     }
+
+    // Splits a flow sample's transform into the flow_texture_* parameters, T(offset) * R(rotation) * S(scale).
+    // Returns false for a shear they cannot express.
+    static bool splitFlowTransform(const UvAffine& m, pxr::GfVec2f& scale, pxr::GfVec2f& offset, float& rotationDegrees) {
+      const float scaleU = std::hypot(m[0], m[2]);
+      if (!(scaleU > 1.0e-8f)) {
+        return false;
+      }
+      const float cosine = m[0] / scaleU;
+      const float sine = m[2] / scaleU;
+      // The second column is scaleV * (-sine, cosine), with nothing along the first.
+      const float scaleV = cosine * m[3] - sine * m[1];
+      const float shear = cosine * m[1] + sine * m[3];
+      if (std::abs(shear) > 1.0e-3f * std::max(scaleU, std::abs(scaleV))) {
+        return false;
+      }
+      scale = pxr::GfVec2f(scaleU, scaleV);
+      // The samples repeat, so the offset is kept within one repeat.
+      offset = pxr::GfVec2f(m[4] - std::floor(m[4]), m[5] - std::floor(m[5]));
+      rotationDegrees = std::atan2(sine, cosine) * (180.f / kPi);
+      return true;
+    }
   }
 
   // For capture tests, we cannot include the config data because it may contain paths/settings which are respective to the users PC.
@@ -616,6 +638,58 @@ namespace dxvk {
     // Opacity
     lssMat.enableOpacity = bEnableOpacity;
 
+    // Exports the game's flow layer (rtx.d3d9.ue3FlowLayers) as a starting point. The runtime keeps rendering the game's own
+    // layer for a material that does not author a flow normal map, whatever is exported here.
+    const Ue3FlowLayer& flowLayer = materialData.ue3FlowLayer;
+    if (flowLayer.isValid() && flowLayer.samples[0].texture.getImageView() != nullptr) {
+      const Ue3FlowLayer::Sample& sample = flowLayer.samples[0];
+      lss::Material::FlowLayer& flowOut = lssMat.flowLayer;
+      const std::string logPrefix = "[GameCapturer][" + m_pCap->idStr + "][Mat:" + matName + "] ";
+      if (flowLayer.blend) {
+        Logger::info(logPrefix + "The flow layer blends the surface's normal towards another by a scrolling weight, which the "
+                     "flow_* parameters cannot describe, so the flow layer is not exported.");
+      } else if (flowLayer.readsSecondaryUv()) {
+        Logger::info(logPrefix + "The flow layer reads a second UV set, which a captured mesh does not carry, so the flow layer "
+                     "is not exported.");
+      } else if (sample.components[0] != 0 || sample.components[1] != 1) {
+        Logger::info(logPrefix + "The flow layer's normal map keeps x and y in other channels than red and green, which "
+                     "flow_normalmap_encoding cannot describe, so the flow layer is not exported.");
+      } else if (!splitFlowTransform(sample.transform, flowOut.textureScale, flowOut.textureOffset, flowOut.textureRotation)) {
+        Logger::info(logPrefix + "The flow layer's normal map is sheared against the surface, which flow_texture_scale and "
+                     "flow_texture_rotation cannot describe, so the flow layer is not exported.");
+      } else {
+        const std::string flowTexFilename(matName + "_flow" + lss::ext::dds);
+        m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir, flowTexFilename,
+                                   sample.texture.getImageView()->image());
+        flowOut.normalTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, flowTexFilename);
+        flowOut.scrollRate = length(sample.velocity);
+        flowOut.scrollAngle = flowOut.scrollRate > 0.f
+          ? std::atan2(sample.velocity.y, sample.velocity.x) * (180.f / kPi)
+          : 0.f;
+        flowOut.normalStrength = flowLayer.strength;
+        flowOut.roughness = flowLayer.roughness;
+        if (flowLayer.sampleCount > 1) {
+          Logger::info(logPrefix + "The flow layer blends " + std::to_string(flowLayer.sampleCount) + " normal maps, and the "
+                       "flow_* parameters describe one, so only the heaviest is exported.");
+        }
+
+        if (flowLayer.mask.getImageView() != nullptr) {
+          if (std::abs(flowLayer.maskScale - 1.f) > 1.0e-3f || std::abs(flowLayer.maskBias) > 1.0e-3f || flowLayer.maskIsSrgb) {
+            Logger::info(logPrefix + "The flow layer's mask is rescaled or gamma decoded, which the flow_mask_* parameters "
+                         "cannot describe, so the mask is not exported.");
+          } else {
+            const std::string flowMaskFilename(matName + "_flowmask" + lss::ext::dds);
+            m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir, flowMaskFilename,
+                                       flowLayer.mask.getImageView()->image());
+            flowOut.maskTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, flowMaskFilename);
+            flowOut.maskChannel = flowLayer.maskChannel;
+            flowOut.maskScale = pxr::GfVec2f(flowLayer.maskTransform.x, flowLayer.maskTransform.y);
+            flowOut.maskOffset = pxr::GfVec2f(flowLayer.maskTransform.z, flowLayer.maskTransform.w);
+          }
+        }
+      }
+    }
+
     // Set populated LSS Material in our cache
     m_pCap->materials[materialHash].lssData = lssMat;
     Logger::debug("[GameCapturer][" + m_pCap->idStr + "][Mat:" + matName + "] New");
@@ -711,7 +785,8 @@ namespace dxvk {
       captureMeshTexCoords(ctx, geomData, textureTransform, m_pCap->currentFrameNum, pMesh);
     }
 
-    if (bIsNewMesh && geomData.color0Buffer.defined()) {
+    // A UE3 flow layer's second UV set is no vertex colour.
+    if (bIsNewMesh && geomData.color0Buffer.defined() && !rasterGeomData.color0IsTexcoord) {
       captureMeshColor(ctx, geomData, m_pCap->currentFrameNum, pMesh);
     }
 

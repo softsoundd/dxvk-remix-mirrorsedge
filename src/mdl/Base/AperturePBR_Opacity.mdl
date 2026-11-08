@@ -227,6 +227,125 @@ export material AperturePBR_Opacity(
     anno::in_group("Texture Transform"),
     anno::unused()
   ]],
+  // -------------------- FLOW LAYER ----------------------
+  uniform bool enable_flow_layer = true
+  [[
+    anno::display_name("Enable Flow Layer"),
+    anno::description("Renders a flow layer: a normal map scrolling across the surface, blended into the surface normal under an optional mask. The layer is the Flow Normal Map when one is set, or else the game's, which the Runtime detects in UE3 games' materials. Disable to render neither. Used by the Runtime."),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  // Note: The flow normal map texture should always be treated as linear.
+  uniform texture_2d flow_normalmap_texture = texture_2d("", tex::gamma_linear)
+  [[
+    anno::display_name("Flow Normal Map"),
+    anno::description("The normal map the flow layer scrolls. When set, it replaces the game's flow layer. Used by the Runtime."),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform AperturePBR_Normal::normalmap_encoding flow_normalmap_encoding = AperturePBR_Normal::octahedral
+  [[
+    anno::display_name("Flow Normal Map Encoding"),
+    anno::description("Encoding of the Flow Normal Map. Octahedral for a normal map the Toolkit ingested, tangent_space_dx for a 3 channel normal map such as one a capture exports from the game, and tangent_space_ogl for a 3 channel normal map with an inverted (OpenGL style) G channel. Used by the Runtime."),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float2 flow_texture_scale = float2(1.0f)
+  [[
+    anno::display_name("Flow Texture Scale"),
+    anno::description("Per-axis scale of the Flow Normal Map's UVs, applied before rotation: X scales U, Y scales V. The flow layer's UVs are relative to the material's UVs after its Texture Transform. Values above 1 tile the normal map more often. Used by the Runtime."),
+    anno::hard_range(float2(-65504.0), float2(65504.0)),
+    anno::soft_range(float2(0.0), float2(10.0)),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float2 flow_texture_offset = float2(0.0f)
+  [[
+    anno::display_name("Flow Texture Offset"),
+    anno::description("Static offset of the Flow Normal Map's UVs, added after scale and rotation. Positive V points down the image. Used by the Runtime."),
+    anno::hard_range(float2(-65504.0), float2(65504.0)),
+    anno::soft_range(float2(-1.0), float2(1.0)),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float flow_texture_rotation = 0.0f
+  [[
+    anno::display_name("Flow Texture Rotation"),
+    anno::description("Rotation of the Flow Normal Map's UVs in degrees around the UV origin, after scale and before offset. Positive angles rotate +U toward +V, which points down the image. The normal map's slopes turn with it, so its lighting stays consistent. Used by the Runtime."),
+    anno::hard_range(-65504.0, 65504.0),
+    anno::soft_range(-180.0, 180.0),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float flow_texture_scroll_rate = 0.0f
+  [[
+    anno::display_name("Flow Scroll Rate"),
+    anno::description("How fast the Flow Normal Map's UVs scroll, in its own UV units per second, after its scale and rotation. Visible features move opposite the UV offset. Used by the Runtime."),
+    anno::hard_range(-65504.0, 65504.0),
+    anno::soft_range(-1.0, 1.0),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float flow_texture_scroll_angle = 0.0f
+  [[
+    anno::display_name("Flow Scroll Angle"),
+    anno::description("Direction of the Flow Normal Map's scrolling UV offset in degrees: 0 is positive U, 90 is positive V, and -90 is negative V. Positive V points down the image. Used by the Runtime."),
+    anno::hard_range(-65504.0, 65504.0),
+    anno::soft_range(0.0, 360.0),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  // Note: The flow mask texture should always be treated as linear.
+  uniform texture_2d flow_mask_texture = texture_2d("", tex::gamma_linear)
+  [[
+    anno::display_name("Flow Mask"),
+    anno::description("Confines the flow layer: 1 renders it fully and 0 not at all. When set, it replaces the mask of the game's flow layer. Without either mask, the flow layer covers the whole surface. Used by the Runtime."),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform int flow_mask_channel = 0
+  [[
+    anno::display_name("Flow Mask Channel"),
+    anno::description("The Flow Mask's channel the mask reads: 0 red, 1 green, 2 blue, 3 alpha. Used by the Runtime."),
+    anno::hard_range(0, 3),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float2 flow_mask_scale = float2(1.0f)
+  [[
+    anno::display_name("Flow Mask Scale"),
+    anno::description("Per-axis scale of the Flow Mask's UVs, relative to the material's UVs after its Texture Transform. Used by the Runtime."),
+    anno::hard_range(float2(-65504.0), float2(65504.0)),
+    anno::soft_range(float2(0.0), float2(10.0)),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float2 flow_mask_offset = float2(0.0f)
+  [[
+    anno::display_name("Flow Mask Offset"),
+    anno::description("Offset of the Flow Mask's UVs, added after its scale. Used by the Runtime."),
+    anno::hard_range(float2(-65504.0), float2(65504.0)),
+    anno::soft_range(float2(-1.0), float2(1.0)),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float flow_normal_strength = 1.0f
+  [[
+    anno::display_name("Flow Normal Strength"),
+    anno::description("Scales how far the flow layer tilts the surface normal. 1 tilts it as far as the normal map does, and 0 leaves the surface's own normal. Over the game's flow layer, it multiplies the Runtime's strength. Used by the Runtime."),
+    anno::hard_range(0.0, 16.0),
+    anno::soft_range(0.0, 2.0),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
+  uniform float flow_roughness = -1.0f
+  [[
+    anno::display_name("Flow Roughness"),
+    anno::description("The roughness the surface takes where the Flow Mask is 1. Negative keeps the material's own roughness. Used by the Runtime."),
+    anno::hard_range(-1.0, 1.0),
+    anno::in_group("Flow Layer"),
+    anno::unused()
+  ]],
   // -------------------- REMIX FLAGS ----------------------
   uniform bool preload_textures = false
   [[

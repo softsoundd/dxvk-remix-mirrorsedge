@@ -39,6 +39,7 @@ OpaqueSurfaceMaterial opaqueSurfaceMaterialCreate(MemoryPolymorphicSurfaceMateri
     opaqueSurfaceMaterial.anisotropy = 0.h;
     opaqueSurfaceMaterial.emissiveColorConstant = 0.h;
     opaqueSurfaceMaterial.emissiveIntensity = 0.h;
+    opaqueSurfaceMaterial.flags &= uint16_t(~OPAQUE_SURFACE_MATERIAL_FLAG_HAS_FLOW_LAYER);
     return opaqueSurfaceMaterial;
   }
   else
@@ -80,6 +81,11 @@ SubsurfaceMaterial subsurfaceMaterialCreate(const SubsurfaceMaterialInteraction 
 MaskLayerMaterial maskLayerMaterialCreate(MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial)
 {
   return reinterpret<MaskLayerMaterial>(memoryPolymorphicSurfaceMaterial);
+}
+
+FlowLayerMaterial flowLayerMaterialCreate(MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial)
+{
+  return reinterpret<FlowLayerMaterial>(memoryPolymorphicSurfaceMaterial);
 }
 
 uint getSubsurfaceMaterialIndex(const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial, inout uint16_t samplerIndex)

@@ -646,6 +646,7 @@ namespace dxvk {
       createTextureRef(ReplacementMaterialTextureType::Metallic),
       createTextureRef(ReplacementMaterialTextureType::Emissive),
       TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), // SSS textures
+      TextureRef(), TextureRef(), // Flow layer textures
       Material::Properties::roughnessAnisotropy(),
       Material::Properties::emissiveIntensity(),
       Vector3(1, 1, 1), // AlbedoConstant - unused since the AlbedoOpacity texture must be always present for baking
@@ -688,7 +689,14 @@ namespace dxvk {
       0.f, // TextureScrollAngle
       Vector2(1.f), // TextureScale
       Vector2(0.f), // TextureOffset
-      0.f          // TextureRotation
+      0.f,          // TextureRotation
+      // Baked terrain has no flow layer, since its texture coordinates are not the ones the layer was built against.
+      false, // EnableFlowLayer
+      0, 0, // FlowNormalEncoding, FlowMaskChannel
+      Vector2(1.f), Vector2(0.f), // FlowMaskScale, FlowMaskOffset
+      Vector2(1.f), Vector2(0.f), 0.f, // FlowTextureScale, FlowTextureOffset, FlowTextureRotation
+      0.f, 0.f, // FlowTextureScrollRate, FlowTextureScrollAngle
+      1.f, -1.f // FlowNormalStrength, FlowRoughness
     ));
 
     m_hasInitializedMaterialDataThisFrame = true;

@@ -514,6 +514,13 @@ struct Surface
     get { return (data13.z >> 21) & 0x3; }
   }
 
+  // Is set when the color0 buffer holds the second UV set a flow layer reads (rtx.d3d9.ue3FlowLayers), as half2 (u, v),
+  // rather than a vertex colour.
+  property bool color0IsTexcoord
+  {
+    get { return packedFlagGet(data13.z, 1 << 23); }
+  }
+
   // rtx.d3d9.ue3MaterialFades: how far the material parameters that fade this draw have faded it in.
   property bool hasFadeCoverage
   {
@@ -602,6 +609,12 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec2 textureCoordinates = 0..xx;
   vec2 textureGradientX = 0..xx;
   vec2 textureGradientY = 0..xx;
+  // The second UV set a flow layer reads (Surface::color0IsTexcoord), untransformed, with its gradients over the same
+  // footprint as the texture coordinates'.
+  vec2 secondaryTextureCoordinates = 0..xx;
+  vec2 secondaryTextureGradientX = 0..xx;
+  vec2 secondaryTextureGradientY = 0..xx;
+  bool hasSecondaryTextureCoordinates = false;
   vec3 rawTangent = 0.f;
   vec3 rawBitangent = 0.f;
   // Populated only for render-target motion, before material/POM tangent adjustments.

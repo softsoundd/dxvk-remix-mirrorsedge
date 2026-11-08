@@ -6,10 +6,12 @@
 #include "../dxvk/dxvk_shader.h"
 #include "../util/util_threadpool.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <optional>
 #include <unordered_map>
@@ -615,6 +617,28 @@ namespace dxvk {
                "logs its layers with their tiling and the repeat and size of its bake, or why it cannot be baked. Every "
                "other material logs once if it is built from layers at different tilings, which makes it a candidate for "
                "the list. Bakes log their size and memory as they run and as they are released.");
+    RTX_OPTION("rtx.d3d9", bool, ue3FlowLayers, true,
+               "UE3 compat: renders the normal detail a material moves over its surface as a flow layer, at the speed the "
+               "game moves it. Normal maps the material pans, as on Stormdrain_p's canals, are blended into the surface "
+               "normal by the material's own mask. A panned texture that blends between two normal maps, as on the "
+               "construction tarps, blends the surface's own normal towards the second. Remix does not otherwise shade with "
+               "the game's normal maps, so without it that detail stands still. The layer applies over a Toolkit-authored "
+               "material too, unless that material authors a flow layer of its own or turns it off. See \"Flow layers\" in "
+               "UE3Compatibility.md.");
+    RTX_OPTION("rtx.d3d9", float, ue3FlowLayerStrength, 1.0f,
+               "UE3 compat: scales how far a flow layer's samples tilt the surface normal. 1 tilts it as far as the game's "
+               "normal maps do.");
+    RTX_OPTION("rtx.d3d9", float, ue3FlowLayerRoughness, 0.15f,
+               "UE3 compat: the roughness a surface without a Toolkit-authored material takes where its flow layer's mask is "
+               "1. A game material that pans its normal maps often shows them through a reflection, which the rough default "
+               "of a legacy material would blur away. Negative keeps the surface's own roughness, as a blend between two "
+               "normal maps always does.");
+    RTX_OPTION("rtx.d3d9", fast_unordered_set, ue3FlowLayerExcludedTextures, {},
+               "UE3 compat: materials whose flow layer is not rendered, by material, textureSet+shader or albedo pick hash.");
+    RTX_OPTION("rtx.d3d9", bool, ue3LogFlowLayers, false,
+               "UE3 compat diagnostics: logs [UE3-Flow] lines. Each pixel shader that pans a texture logs whether it has a "
+               "flow layer, with its samples, their weights, any blend and its mask, or why not. Each material then logs the "
+               "speeds it measured once they settle, and why a layer is not rendered.");
     RTX_OPTION("rtx.d3d9", bool, ue3LogCapturePrecision, false,
                "UE3 compat: log vertex capture precision diagnostics - the resolved position source per unique "
                "(vertex shader, vertex factory) with the reason any draw fell back to clip-space reconstruction, "
@@ -928,7 +952,39 @@ namespace dxvk {
       return result;
     }
 
+    // A material with a flow layer (rtx.d3d9.ue3FlowLayers), for the dev menu.
+    struct Ue3FlowLayerStatus {
+      XXH64_hash_t materialHash = kEmptyHash;
+      XXH64_hash_t pickHash = kEmptyHash;
+      uint32_t sampleCount = 0;
+      std::array<Vector2, 2> velocities = {};
+      std::array<float, 2> weights = {};
+      bool masked = false;
+      // Is set when the layer blends the surface's normal towards the first sample by the second's channel.
+      bool blend = false;
+      // Is set when the layer reads the draw's second UV set.
+      bool secondaryUv = false;
+      // Is empty while the layer renders, and otherwise says why it does not.
+      std::string state;
+    };
+    static std::vector<Ue3FlowLayerStatus> getUe3FlowLayerStatus() {
+      std::lock_guard<std::mutex> lock(s_ue3FlowStatusMutex);
+      std::vector<Ue3FlowLayerStatus> result;
+      result.reserve(s_ue3FlowStatus.size());
+      for (const auto& entry : s_ue3FlowStatus) {
+        result.push_back(entry.second);
+      }
+      std::sort(result.begin(), result.end(),
+                [](const Ue3FlowLayerStatus& a, const Ue3FlowLayerStatus& b) { return a.materialHash < b.materialHash; });
+      return result;
+    }
+
   private: 
+    // Is read by the dev menu, which libdxvk builds without this class's sources, so it lives in the header.
+    inline static std::mutex s_ue3FlowStatusMutex;
+    inline static fast_unordered_cache<Ue3FlowLayerStatus> s_ue3FlowStatus;
+    static void publishUe3FlowLayerStatus(const Ue3FlowLayerStatus& status);
+
     // Written on the bridge message channel's thread: the active mask in bits 0-15, the not-found
     // mask in bits 16-31, and whether any answer has arrived.
     static constexpr uint64_t kUe3GamePatchAnswered = 1ull << 63;
@@ -1413,6 +1469,9 @@ namespace dxvk {
     void registerUe3TexturelessMaterial();
     void markUe3MovieTextureMaterial(const Ue3TextureState& ue3, XXH64_hash_t materialHash, XXH64_hash_t textureHash);
     bool resolveUe3PsAffineTerm(const UvAffineTerm& term, float identity, float& outValue) const;
+    bool resolveUe3VsAffineTerm(const UvAffineTerm& term, float identity, float& outValue) const;
+    // Which IA texcoord set feeds components compU and compV of a vertex shader's output register, traced once per shader.
+    const Ue3VsTexcoordTraceEntry* getOrTraceUe3VsTexcoord(const D3D9CommonShader* vs, uint32_t outputReg, uint8_t compU, uint8_t compV);
     void resolveUe3Texcoords(Ue3TextureState& ue3, uint32_t firstStage, uint32_t stageStateIdx, uint32_t& texcoordIdx, uint32_t& iaTexcoordIdx);
     // Is set by resolveUe3Texcoords for the draw being prepared.
     Ue3UvFacts m_ue3UvFacts;
@@ -1444,6 +1503,27 @@ namespace dxvk {
     fast_unordered_cache<std::shared_ptr<const Ue3CompositeBakeRequest>> m_ue3CompositeRequests;
     fast_unordered_cache<Rc<DxvkShader>> m_ue3CompositeVertexShaders;
     fast_unordered_cache<Ue3CompositeMaterialState> m_ue3CompositeMaterials;
+
+    // The members below implement rtx.d3d9.ue3FlowLayers. See "Flow layers" in UE3Compatibility.md.
+    const DxsoUe3FlowShaderInfo& getOrAnalyzeUe3FlowShader(XXH64_hash_t psHash, const D3D9CommonShader* pixelShader);
+    // Attaches the draw's flow layer to its material data. `compositePeriod` is the repeat of the bake the surface renders,
+    // whose texture coordinates are the interpolant over it, or null when it renders no bake.
+    void resolveUe3FlowLayers(const Ue3TextureState& ue3, const Vector2* compositePeriod);
+    // Is the IA texcoord set the draw's flow layer reads besides the surface's own, or UINT32_MAX.
+    // resolveUe3FlowLayers decides it from the shaders alone, so a geometry carries the set from its first draw.
+    uint32_t m_ue3FlowSecondaryTexcoordSet = UINT32_MAX;
+    // Holds that set as half2 in a 32 bit element, which processVertices finds in the draw's streams.
+    RasterBuffer m_ue3FlowSecondaryTexcoords;
+    // Carries the set in the geometry's color0 slot, after the vertex capture has settled what color0 holds.
+    void attachUe3FlowSecondaryTexcoords(RasterGeometry& geoData);
+    bool isUe3FlowLayerExcluded(const LegacyMaterialData& material) const;
+    // Returns the draw's flow layer analysis when a composite bake binds the layer's samples flat, since they scroll over the
+    // bake instead, or null when the bake renders them as the game does.
+    const DxsoUe3FlowShaderInfo* getUe3FlowShaderForBake(const Ue3TextureState& ue3);
+    Rc<DxvkSampler> getOrCreateStageSampler(uint32_t stage);
+    fast_unordered_cache<DxsoUe3FlowShaderInfo> m_ue3FlowShaders;
+    fast_unordered_cache<Ue3FlowMaterialState> m_ue3FlowMaterials;
+    Ue3FlowSpeedCache m_ue3FlowSpeedCache;
 
     PrepareDrawFlags internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext);
 
@@ -1718,6 +1798,10 @@ namespace dxvk {
       uint32_t ue3CompositeMaxResolution = 0;
       bool ue3CompositeEmission = false;
       bool ue3LogCompositeMaterials = false;
+      bool ue3FlowLayers = false;
+      float ue3FlowLayerStrength = 1.f;
+      float ue3FlowLayerRoughness = -1.f;
+      bool ue3LogFlowLayers = false;
       bool ue3LogCapturePrecision = false;
       bool ue3LogInstancedDraws = false;
       bool deferredUiReplay = false;
@@ -1767,6 +1851,7 @@ namespace dxvk {
       const fast_unordered_set* ue3MicIdentityExcludedTextureDescHashes = nullptr;
       const fast_unordered_set* ue3HighlightTintExcludedMaterials = nullptr;
       const fast_unordered_set* ue3MaterialFadeExcludedMaterials = nullptr;
+      const fast_unordered_set* ue3FlowLayerExcludedTextures = nullptr;
       const fast_unordered_set* ue3TraceDrawTextureHashes = nullptr;
       const fast_unordered_set* replacementDebugHashes = nullptr;
     };
@@ -1792,6 +1877,7 @@ namespace dxvk {
       fast_unordered_set ue3MicIdentityExcludedTextureDescHashes;
       fast_unordered_set ue3HighlightTintExcludedMaterials;
       fast_unordered_set ue3MaterialFadeExcludedMaterials;
+      fast_unordered_set ue3FlowLayerExcludedTextures;
       fast_unordered_set ue3TraceDrawTextureHashes;
       fast_unordered_set replacementDebugHashes;
       Ue3AlbedoTagDigests albedoTagDigests;

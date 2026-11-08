@@ -129,6 +129,23 @@ struct Material {
     VkFilter             filter = VK_FILTER_LINEAR;
     VkClearColorValue    borderColor = {};
   } sampler;
+
+  // The game's flow layer (rtx.d3d9.ue3FlowLayers), as the flow_* parameters author one. They describe one normal map,
+  // so this is the layer's heaviest sample. Nothing is exported while normalTexPath is empty.
+  struct FlowLayer {
+    std::string  normalTexPath;
+    pxr::GfVec2f textureScale{ 1.f, 1.f };
+    pxr::GfVec2f textureOffset{ 0.f, 0.f };
+    float        textureRotation = 0.f;
+    float        scrollRate = 0.f;
+    float        scrollAngle = 0.f;
+    std::string  maskTexPath;
+    int          maskChannel = 0;
+    pxr::GfVec2f maskScale{ 1.f, 1.f };
+    pxr::GfVec2f maskOffset{ 0.f, 0.f };
+    float        normalStrength = 1.f;
+    float        roughness = -1.f;
+  } flowLayer;
   // TODO: std::string normalTexPath;
   // TODO: etc...
 };

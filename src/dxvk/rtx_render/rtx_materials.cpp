@@ -41,6 +41,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
     XXH64_hash_t highlightGlowTextureHash;
     XXH64_hash_t highlightGlowTextureDescriptorHash;
     XXH64_hash_t compositeIdentity;
+    XXH64_hash_t flowLayerIdentity;
     XXH64_hash_t samplerHash0;
     XXH64_hash_t samplerHash1;
     uint32_t alphaTestCompareOp;
@@ -102,6 +103,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
   data.highlightGlowTextureHash = ue3HighlightGlowTexture.getImageHash();
   data.highlightGlowTextureDescriptorHash = textureVariantHash(ue3HighlightGlowTexture);
   data.compositeIdentity = ue3CompositeIdentity;
+  data.flowLayerIdentity = ue3FlowLayer.identity;
   data.samplerHash0 = samplers[0].ptr() != nullptr ? samplers[0]->info().calculateHash() : kEmptyHash;
   data.samplerHash1 = samplers[1].ptr() != nullptr ? samplers[1]->info().calculateHash() : kEmptyHash;
   data.alphaTestCompareOp = static_cast<uint32_t>(alphaTestCompareOp);
@@ -134,6 +136,7 @@ XXH64_hash_t LegacyMaterialData::computeIdentityHash() const {
       &LegacyMaterialIdentityHashData::highlightGlowTextureHash,
       &LegacyMaterialIdentityHashData::highlightGlowTextureDescriptorHash,
       &LegacyMaterialIdentityHashData::compositeIdentity,
+      &LegacyMaterialIdentityHashData::flowLayerIdentity,
       &LegacyMaterialIdentityHashData::samplerHash0,
       &LegacyMaterialIdentityHashData::samplerHash1,
       &LegacyMaterialIdentityHashData::alphaTestCompareOp,

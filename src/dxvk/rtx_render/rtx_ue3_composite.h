@@ -85,6 +85,9 @@ namespace dxvk {
     uint32_t psFloatConstantsOffset = 0;
     // Lists the resource slots bound to white for the bake, which hold the simple lightmap compile's lightmap.
     std::vector<uint32_t> whiteTextureSlots;
+    // Lists the resource slots bound to a flat normal for the bake, which hold a flow layer's samples
+    // (rtx.d3d9.ue3FlowLayers). The surface scrolls them over the bake instead.
+    std::vector<uint32_t> flatNormalTextureSlots;
 
     // Describes a mask the repeat leaves out (DxsoUe3CompositeMaskLayer). Its resource slot is bound black for
     // the passes and white for a third, which bakes the albedo the surface blends towards by the mask. A
@@ -200,6 +203,8 @@ namespace dxvk {
     const Rc<DxvkImageView>& getBlackTexture(Rc<DxvkContext>& ctx);
     // Returns a 1x1 float texture of exactly 1/2, for a quadratic mask's middle pass.
     const Rc<DxvkImageView>& getHalfTexture(Rc<DxvkContext>& ctx);
+    // Returns a 1x1 texture of (1/2, 1/2, 1, 1/2), the flat normal a flow layer's samples are bound to.
+    const Rc<DxvkImageView>& getFlatNormalTexture(Rc<DxvkContext>& ctx);
 
     void onFrameEnd(Rc<DxvkContext> ctx, uint32_t frame);
 
@@ -222,6 +227,7 @@ namespace dxvk {
     Resources::Resource m_dummyStorage;
     Rc<DxvkImageView> m_blackTexture;
     Rc<DxvkImageView> m_halfTexture;
+    Rc<DxvkImageView> m_flatNormalTexture;
 
     inline static std::mutex s_mutex;
     inline static fast_unordered_set s_settledKeys;

@@ -285,6 +285,19 @@ namespace dxvk::dxso_symbolic {
            (symbol.kind == SymbolKind::Sample && symbol.reg < 32u && ((m_options.modulatorSamplerMask >> symbol.reg) & 1u) != 0);
   }
 
+  bool Evaluator::dependsOnModulator(const Poly& p) const {
+    for (const Term& t : p) {
+      for (uint32_t i = 0; i < t.count; i++) {
+        const uint16_t s = t.syms[i];
+        if (isModulator(m_symbols[s]) ||
+            (m_symbols[s].kind == SymbolKind::Atom && m_atomModulators.find(s) != m_atomModulators.end())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   // --- symbols ------------------------------------------------------------------------
 
   uint16_t Evaluator::makeSymbol(const uint64_t key, const Symbol& proto) {
@@ -611,6 +624,7 @@ namespace dxvk::dxso_symbolic {
       s.kind = SymbolKind::Sample;
       s.reg = uint16_t(sampler);
       s.component = uint8_t(samplerReg.swizzle[lane]);
+      s.site = uint16_t(ctx.instructionIdx);
       s.lighting = lighting;
       s.color = !lighting;
       results[lane] = polySymbol(makeSymbol(baseKey(s.kind, sampler, instance, s.component), s));
@@ -752,6 +766,17 @@ namespace dxvk::dxso_symbolic {
         return opaque((uint32_t(op) << 8) | lane, {
           &in[0], &in[1], &in[2], &in[3], &in[4], &in[5], &in[6], &in[7], &in[8], &in[9], &in[10], &in[11] });
       });
+      if (op == DxsoOpcode::Nrm && m_options.recordNormalizeSites && m_failure == DxsoHighlightFailure::None &&
+          (dependsOnModulator(in[0]) || dependsOnModulator(in[1]) || dependsOnModulator(in[2]))) {
+        NormalizeSite site;
+        for (uint32_t lane = 0; lane < 3; lane++) {
+          site.lanes[lane] = in[lane];
+          if (mask[lane] && results[lane].size() == 1 && results[lane][0].count == 1) {
+            site.outputs[lane] = results[lane][0].syms[0];
+          }
+        }
+        m_normalizeSites.push_back(std::move(site));
+      }
       break;
     }
     }

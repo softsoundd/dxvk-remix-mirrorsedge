@@ -1146,6 +1146,7 @@ namespace dxvk {
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
+        currentInstance.surface.color0IsTexcoord = drawCall.getGeometryData().color0IsTexcoord;
         bool colorTextureIsSrgb = drawCall.getMaterialData().colorTextureIsSrgb;
         if (materialData->getType() == MaterialDataType::Opaque) {
           const TextureRef& albedoTexture = materialData->getOpaqueMaterialData().getAlbedoOpacityTexture();
@@ -2454,6 +2455,8 @@ namespace dxvk {
       return;
     
     const GeometryBufferData bufferData(geometryData);
+    // A UE3 flow layer's second UV set is no vertex colour.
+    const bool hasVertexColors = bufferData.vertexColorData != nullptr && !geometryData.color0IsTexcoord;
 
     // Check if the necessary buffers exist
     // Warning: do not generate billboards for instances without indices as other code sections using billboards expect indices to be present
@@ -2509,13 +2512,13 @@ namespace dxvk {
           texcoords[idx] = transformTexcoord(textureTransform, texcoords[idx]);
         }
 
-        if (bufferData.vertexColorData)
+        if (hasVertexColors)
           vertexOpacities8bit[idx] = bufferData.getVertexColor(indices[idx]) >> 24;
       }
 
       // Load one vertex color - assuming that the entire billboard uses the same color
       uint32_t vertexColor = ~0u;
-      if (bufferData.vertexColorData)
+      if (hasVertexColors)
         vertexColor = bufferData.getVertexColor(indices[0]);
 
       // Compute the normal
@@ -2559,7 +2562,7 @@ namespace dxvk {
 
       // Fill in data for the quad's last/4th vertex
       texcoords[3] = bufferData.getTexCoord(indices[5]);
-      if (bufferData.vertexColorData)
+      if (hasVertexColors)
         vertexOpacities8bit[3] = bufferData.getVertexColor(indices[5]) >> 24;
 
       billboard.center = center;
@@ -2661,7 +2664,7 @@ namespace dxvk {
 
       // Load one vertex color - assuming that the entire beam uses the same color
       uint32_t vertexColor = ~0u;
-      if (bufferData.vertexColorData)
+      if (bufferData.vertexColorData != nullptr && !geometryData.color0IsTexcoord)
         vertexColor = bufferData.getVertexColor(indices[0]);
 
       // Extract the beam cylinder axis, length and width from the vertices.

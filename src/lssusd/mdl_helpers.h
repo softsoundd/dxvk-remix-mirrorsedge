@@ -77,7 +77,15 @@ static inline VkSamplerAddressMode mdlToVk(const uint8_t mdlWrapMode, VkClearCol
   };
 }
 }
-  
+
+namespace NormalEncoding {
+// Matches AperturePBR_Normal::normalmap_encoding.
+enum {
+  Octahedral = 0,
+  TangentSpaceOgl = 1,
+  TangentSpaceDx = 2
+};
+}
 
 }
 }

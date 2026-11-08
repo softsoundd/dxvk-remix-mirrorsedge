@@ -69,6 +69,8 @@ namespace dxvk {
       SymbolKind kind = SymbolKind::Atom;
       uint16_t   reg = 0;
       uint8_t    component = 0;
+      // the instruction index of the read a Sample came from, which tells apart reads of one sampler
+      uint16_t   site = 0;
       // a lightmap sample or lighting constant, or derived from one
       bool       lighting = false;
       // a material texture sample, or derived from one
@@ -115,6 +117,17 @@ namespace dxvk {
       // Lists the samplers whose samples count as modulators, as material parameters do. They are never folded
       // into an atom and are recorded in every atom computed from them, so a proof sees everywhere they reach.
       uint32_t modulatorSamplerMask = 0;
+      // Keeps the vector each nrm reads, when a modulator reaches it, for proofs about what a normal is made of.
+      bool recordNormalizeSites = false;
+    };
+
+    constexpr uint16_t kNoSymbol = 0xFFFFu;
+
+    // The three lanes an nrm instruction read and the atoms it wrote for them (kNoSymbol for a lane it did not
+    // write), in program order.
+    struct NormalizeSite {
+      std::array<Poly, 3> lanes;
+      std::array<uint16_t, 3> outputs = { kNoSymbol, kNoSymbol, kNoSymbol };
     };
 
     class Evaluator {
@@ -144,6 +157,11 @@ namespace dxvk {
         return m_symbols.size();
       }
 
+      // Recorded with EvaluatorOptions::recordNormalizeSites.
+      const std::vector<NormalizeSite>& normalizeSites() const {
+        return m_normalizeSites;
+      }
+
       // A material texture sample or material vector, or derived from one.
       bool isColorBearing(const Term& t) const;
       bool hasLighting(const Term& t) const;
@@ -157,6 +175,8 @@ namespace dxvk {
       void fail(DxsoHighlightFailure failure);
 
       bool isModulator(const Symbol& symbol) const;
+      // A modulator, or an atom computed from one.
+      bool dependsOnModulator(const Poly& p) const;
       uint16_t makeSymbol(uint64_t key, const Symbol& proto);
       uint16_t makeAtom(uint64_t key, const Symbol& proto, std::initializer_list<const Poly*> inputs);
       void collectModulators(const Poly& p, std::vector<uint16_t>& modulators) const;
@@ -195,6 +215,7 @@ namespace dxvk {
       std::array<std::array<Poly, 4>, kMaxTemps> m_temps;
       std::array<Poly, 4>                        m_output;
       std::array<bool, 4>                        m_outputWritten = { false, false, false, false };
+      std::vector<NormalizeSite>                 m_normalizeSites;
 
       std::array<uint8_t, kDxsoHighlightMaxConstRegs>                m_isDef;
       std::array<std::array<float, 4>, kDxsoHighlightMaxConstRegs>   m_defValues = {};

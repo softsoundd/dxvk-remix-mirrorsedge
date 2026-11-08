@@ -148,6 +148,42 @@ inline Matrix4 composeTextureTransform(const Matrix4& capturedTransform, const V
   return transform;
 }
 
+// Maps texture coordinates as (a, b, c, d, tx, ty): u' = a * u + b * v + tx and v' = c * u + d * v + ty.
+using UvAffine = std::array<float, 6>;
+
+// Returns a * b, which maps through b first.
+inline UvAffine composeUvAffine(const UvAffine& a, const UvAffine& b) {
+  return {
+    a[0] * b[0] + a[1] * b[2],
+    a[0] * b[1] + a[1] * b[3],
+    a[2] * b[0] + a[3] * b[2],
+    a[2] * b[1] + a[3] * b[3],
+    a[0] * b[4] + a[1] * b[5] + a[4],
+    a[2] * b[4] + a[3] * b[5] + a[5],
+  };
+}
+
+inline bool invertUvAffine(const UvAffine& m, UvAffine& out) {
+  const float det = m[0] * m[3] - m[1] * m[2];
+  if (!(std::abs(det) > 1.0e-12f) || !std::isfinite(det)) {
+    return false;
+  }
+  const float invDet = 1.0f / det;
+  out[0] = m[3] * invDet;
+  out[1] = -m[1] * invDet;
+  out[2] = -m[2] * invDet;
+  out[3] = m[0] * invDet;
+  out[4] = -(out[0] * m[4] + out[1] * m[5]);
+  out[5] = -(out[2] * m[4] + out[3] * m[5]);
+  return true;
+}
+
+// Returns T(offset) * R(rotation) * S(scale), with the rotation in degrees, as composeTextureTransform applies them.
+inline UvAffine uvAffineFromTextureTransform(const Vector2& scale, const Vector2& offset, float rotation) {
+  const Vector2 direction = calcScrollDirection(rotation);
+  return { direction.x * scale.x, -direction.y * scale.y, direction.y * scale.x, direction.x * scale.y, offset.x, offset.y };
+}
+
 // Matches the triangle and OMM-baking shaders' padding of loaded 2D texture coordinates.
 inline Vector2 transformTexcoord(const Matrix4& transform, const Vector2& texcoord) {
   return (transform * Vector4(texcoord.x, texcoord.y, 1.f, 1.f)).xy();
@@ -371,7 +407,8 @@ struct RtSurface {
     textureFlags |= highlightGlowFromEmissiveTexture ? (1 << 19) : 0;
     textureFlags |= highlightGlowTextureIsLinear ? (1 << 20) : 0;
     textureFlags |= (static_cast<uint32_t>(highlightGlowTextureChannel) & 0x3) << 21;
-    // textureFlags bits 23-30 unused
+    textureFlags |= color0IsTexcoord ? (1 << 23) : 0;
+    // textureFlags bits 24-30 unused
 
     writeGPUHelper(data, offset, textureFlags);
 
@@ -442,6 +479,8 @@ struct RtSurface {
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
   bool cullBackfacesInShadows = false;
+  // Is set when the color0 buffer holds a second UV set rather than a vertex colour (RasterGeometry::color0IsTexcoord).
+  bool color0IsTexcoord = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
   RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
@@ -678,6 +717,7 @@ enum class RtSurfaceMaterialType {
   // Extensions
   Subsurface,
   MaskLayer,
+  FlowLayer,
 
   Count
 };
@@ -700,7 +740,8 @@ struct RtOpaqueSurfaceMaterial {
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget, bool isHairCard,
     uint16_t samplerFeedbackStamp,
     uint32_t secondaryTextureIndex = 0, bool albedoOpacityIsRenderTarget = false,
-    uint32_t maskLayerIndex = SURFACE_INDEX_INVALID
+    uint32_t maskLayerIndex = SURFACE_INDEX_INVALID,
+    uint32_t flowLayerIndex = SURFACE_INDEX_INVALID
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -717,7 +758,8 @@ struct RtOpaqueSurfaceMaterial {
     m_dlssControlMaskToneStrength{ dlssControlMaskToneStrength },
     m_dlssControlMaskStructuralStrength{ dlssControlMaskStructuralStrength },
     m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp }, m_maskLayerIndex{ maskLayerIndex }
+    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp }, m_maskLayerIndex{ maskLayerIndex },
+    m_flowLayerIndex{ flowLayerIndex }
   {
     updateCachedData();
     updateCachedHash();
@@ -764,6 +806,11 @@ struct RtOpaqueSurfaceMaterial {
     const bool hasMaskLayer = m_maskLayerIndex < BINDING_INDEX_INVALID;
     if (hasMaskLayer) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER;
+    }
+    // data[30] holds the flow layer's extension index the same way.
+    const bool hasFlowLayer = m_flowLayerIndex < BINDING_INDEX_INVALID;
+    if (hasFlowLayer) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_HAS_FLOW_LAYER;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -829,7 +876,10 @@ struct RtOpaqueSurfaceMaterial {
 
     writeGPUHelper(data, offset, m_cachedDLSSControlMask);
 
-    writeGPUPadding<4>(data, offset);
+    // data[30]
+    writeGPUHelperExplicit<2>(data, offset, hasFlowLayer ? m_flowLayerIndex : 0u);
+
+    writeGPUPadding<2>(data, offset);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -930,6 +980,10 @@ struct RtOpaqueSurfaceMaterial {
     return m_maskLayerIndex;
   }
 
+  uint32_t getFlowLayerIndex() const {
+    return m_flowLayerIndex;
+  }
+
   uint32_t getIsRaytracedRenderTarget() const {
     return m_isRaytracedRenderTarget;
   }
@@ -982,6 +1036,7 @@ private:
       uint32_t secondaryTextureIndex;
       uint32_t albedoOpacityIsRenderTarget;
       uint32_t maskLayerIndex;
+      uint32_t flowLayerIndex;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     HashStruct hashData = HashStruct{
@@ -1014,6 +1069,7 @@ private:
       m_secondaryTextureIndex,
       m_albedoOpacityIsRenderTarget,
       m_maskLayerIndex,
+      m_flowLayerIndex,
     };
     m_cachedHash = hashStructByMemory<HashStruct,
       &HashStruct::albedoOpacityTextureIndex,
@@ -1044,7 +1100,8 @@ private:
       &HashStruct::samplerFeedbackStamp,
       &HashStruct::secondaryTextureIndex,
       &HashStruct::albedoOpacityIsRenderTarget,
-      &HashStruct::maskLayerIndex>(hashData);
+      &HashStruct::maskLayerIndex,
+      &HashStruct::flowLayerIndex>(hashData);
   }
 
   void updateCachedData() {
@@ -1107,6 +1164,8 @@ private:
 
   // Indexes an RtMaskLayerMaterial in the surface material extensions, or is SURFACE_INDEX_INVALID.
   uint32_t m_maskLayerIndex;
+  // Indexes an RtFlowLayerMaterial in the surface material extensions, or is SURFACE_INDEX_INVALID.
+  uint32_t m_flowLayerIndex;
 
   XXH64_hash_t m_cachedHash;
 
@@ -1761,6 +1820,229 @@ private:
   XXH64_hash_t m_cachedHash;
 };
 
+// Describes a surface's flow layer, the scrolling normal maps the game's material moves (rtx.d3d9.ue3FlowLayers) or a
+// Toolkit material's flow_* parameters author. See "Flow layers" in UE3Compatibility.md.
+struct RtFlowLayerMaterial {
+  static constexpr uint32_t kMaxSamples = 2;
+
+  struct Sample {
+    uint32_t textureIndex = kSurfaceMaterialInvalidTextureIndex;
+    // Maps the surface's texture coordinates to the sample's, as (a, b, c, d, tx, ty).
+    std::array<float, 6> transform = { 1.f, 0.f, 0.f, 1.f, 0.f, 0.f };
+    // Is the sample's velocity in its own texture coordinates per second.
+    Vector2 velocity = Vector2(0.f);
+    float weight = 1.f;
+    // Holds the texel channels the normal's x, y and z read. z is reconstructed when it is Ue3FlowLayer::kNoComponent.
+    std::array<uint8_t, 3> components = { 0, 1, 2 };
+    // Is set for an octahedral normal map, as the Toolkit ingests them, and clear for an RGB one decoded as 2 * t - 1.
+    bool octahedral = false;
+    // Negates an RGB normal map's y, for an OpenGL style green channel.
+    bool negateY = false;
+    // Is set when the transform maps the surface's second UV set rather than its texture coordinates.
+    bool secondaryUv = false;
+  };
+
+  // With blend, the layer blends the surface's normal towards samples[0] by samples[1].weight times the channel
+  // samples[1].components[0] names, times the mask (Ue3FlowLayer::blend).
+  RtFlowLayerMaterial(
+    const uint32_t samplerIndex,
+    const std::array<Sample, kMaxSamples>& samples,
+    const uint32_t sampleCount,
+    const uint32_t maskTextureIndex,
+    const Vector4& maskTransform,
+    const uint32_t maskChannel,
+    const bool maskIsSrgb,
+    const float maskScale,
+    const float maskBias,
+    const float strength,
+    const float roughness,
+    const bool maskSecondaryUv = false,
+    const bool blend = false,
+    const bool blendIsSrgb = false)
+    : m_samplerIndex { samplerIndex },
+      m_samples { samples },
+      m_sampleCount { std::min(sampleCount, kMaxSamples) },
+      m_maskTextureIndex { maskTextureIndex },
+      m_maskTransform { maskTransform },
+      m_maskChannel { maskChannel & 3u },
+      m_maskIsSrgb { maskIsSrgb ? 1u : 0u },
+      m_maskScale { maskScale },
+      m_maskBias { maskBias },
+      m_strength { strength },
+      m_roughness { roughness },
+      m_maskSecondaryUv { maskSecondaryUv },
+      m_blend { blend },
+      m_blendIsSrgb { blendIsSrgb } {
+    updateCachedHash();
+  }
+
+  void writeGPUData(unsigned char* data, std::size_t& offset) const {
+    [[maybe_unused]] const std::size_t oldOffset = offset;
+
+    // For decode process, see surface_material.h
+    // this data is accessed from uint16_t data[32], so data[n] refers to a pair of bytes.
+    const bool hasMask = m_maskTextureIndex != kSurfaceMaterialInvalidTextureIndex;
+
+    // data[0]
+    uint16_t flags = uint16_t(m_sampleCount & FLOW_LAYER_MATERIAL_SAMPLE_COUNT_MASK);
+    flags |= m_samples[0].octahedral ? FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_0 : 0;
+    flags |= m_samples[1].octahedral ? FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_1 : 0;
+    flags |= hasMask ? FLOW_LAYER_MATERIAL_FLAG_HAS_MASK : 0;
+    flags |= uint16_t(m_maskChannel << FLOW_LAYER_MATERIAL_MASK_CHANNEL_SHIFT);
+    flags |= m_maskIsSrgb ? FLOW_LAYER_MATERIAL_FLAG_MASK_SRGB : 0;
+    flags |= m_blend ? FLOW_LAYER_MATERIAL_FLAG_BLEND : 0;
+    flags |= m_blendIsSrgb ? FLOW_LAYER_MATERIAL_FLAG_BLEND_SRGB : 0;
+    flags |= m_samples[0].secondaryUv ? FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_0 : 0;
+    flags |= m_sampleCount > 1 && m_samples[1].secondaryUv ? FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_1 : 0;
+    flags |= hasMask && m_maskSecondaryUv ? FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_MASK : 0;
+    writeGPUHelper(data, offset, flags);
+
+    // data[1 - 4]
+    writeGPUHelperExplicit<2>(data, offset, m_samplerIndex);
+    writeGPUHelperExplicit<2>(data, offset, m_samples[0].textureIndex);
+    const uint32_t secondTextureIndex = m_sampleCount > 1
+      ? m_samples[1].textureIndex
+      : kSurfaceMaterialInvalidTextureIndex;
+    writeGPUHelperExplicit<2>(data, offset, secondTextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, hasMask ? m_maskTextureIndex : kSurfaceMaterialInvalidTextureIndex);
+
+    // data[5]
+    auto packComponents = [](const Sample& sample) {
+      uint16_t packed = uint16_t((sample.components[0] & 3u) | ((sample.components[1] & 3u) << 2));
+      packed |= sample.components[2] > 3u
+        ? FLOW_LAYER_MATERIAL_COMPONENT_Z_ABSENT
+        : uint16_t((sample.components[2] & 3u) << 4);
+      packed |= sample.negateY ? FLOW_LAYER_MATERIAL_COMPONENT_NEGATE_Y : 0;
+      return packed;
+    };
+    const uint16_t components = uint16_t(packComponents(m_samples[0]) | (packComponents(m_samples[1]) << 8));
+    writeGPUHelper(data, offset, components);
+
+    // The samples wrap, repeating every unit, so their offsets are kept within one, where half precision holds them.
+    // The mask reads through the surface's own sampler, which may clamp.
+    auto wrap = [](const float v) { return v - std::floor(v); };
+
+    // data[6 - 21]
+    for (const Sample& sample : m_samples) {
+      writeGPUHelper(data, offset, glm::packHalf1x16(sample.transform[0]));
+      writeGPUHelper(data, offset, glm::packHalf1x16(sample.transform[1]));
+      writeGPUHelper(data, offset, glm::packHalf1x16(sample.transform[2]));
+      writeGPUHelper(data, offset, glm::packHalf1x16(sample.transform[3]));
+      writeGPUHelper(data, offset, glm::packHalf1x16(wrap(sample.transform[4])));
+      writeGPUHelper(data, offset, glm::packHalf1x16(wrap(sample.transform[5])));
+      writeGPUHelper(data, offset, glm::packHalf1x16(sample.velocity.x));
+      writeGPUHelper(data, offset, glm::packHalf1x16(sample.velocity.y));
+    }
+
+    // data[22 - 23]
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_samples[0].weight));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_sampleCount > 1 ? m_samples[1].weight : 0.f));
+
+    // data[24 - 27]
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_maskTransform.x));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_maskTransform.y));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_maskTransform.z));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_maskTransform.w));
+
+    // data[28 - 31]
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_maskScale));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_maskBias));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_strength));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_roughness));
+
+    assert(offset - oldOffset == kSurfaceMaterialGPUSize);
+  }
+
+  bool operator==(const RtFlowLayerMaterial& r) const {
+    return m_cachedHash == r.m_cachedHash;
+  }
+
+  bool validate() const {
+    return m_sampleCount > 0 && m_samplerIndex != kSurfaceMaterialInvalidTextureIndex &&
+           m_samples[0].textureIndex != kSurfaceMaterialInvalidTextureIndex &&
+           (m_sampleCount < 2 || m_samples[1].textureIndex != kSurfaceMaterialInvalidTextureIndex);
+  }
+
+  XXH64_hash_t getHash() const {
+    return m_cachedHash;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_samples[0].textureIndex);
+    fn(m_samples[1].textureIndex);
+    fn(m_maskTextureIndex);
+  }
+
+private:
+  void updateCachedHash() {
+    struct SampleHash {
+      uint32_t textureIndex;
+      float transform[6];
+      Vector2 velocity;
+      float weight;
+      uint32_t components;
+      uint32_t decode;
+    };
+    struct HashStruct {
+      uint32_t samplerIndex;
+      uint32_t sampleCount;
+      SampleHash samples[kMaxSamples];
+      uint32_t maskTextureIndex;
+      Vector4 maskTransform;
+      uint32_t maskChannel;
+      uint32_t maskIsSrgb;
+      float maskScale;
+      float maskBias;
+      float strength;
+      float roughness;
+      uint32_t modeFlags;
+      // NOTE: There must be NO padding between members, as the struct is used for hashing
+    };
+    static_assert(alignof(HashStruct) == 4 && sizeof(SampleHash) == 48 && sizeof(HashStruct) == 152);
+    HashStruct hashData = {};
+    hashData.samplerIndex = m_samplerIndex;
+    hashData.sampleCount = m_sampleCount;
+    for (uint32_t i = 0; i < m_sampleCount; i++) {
+      const Sample& sample = m_samples[i];
+      SampleHash& out = hashData.samples[i];
+      out.textureIndex = sample.textureIndex;
+      std::copy(sample.transform.begin(), sample.transform.end(), out.transform);
+      out.velocity = sample.velocity;
+      out.weight = sample.weight;
+      out.components = uint32_t(sample.components[0]) | (uint32_t(sample.components[1]) << 8) | (uint32_t(sample.components[2]) << 16);
+      out.decode = (sample.octahedral ? 1u : 0u) | (sample.negateY ? 2u : 0u) | (sample.secondaryUv ? 4u : 0u);
+    }
+    hashData.maskTextureIndex = m_maskTextureIndex;
+    hashData.maskTransform = m_maskTransform;
+    hashData.maskChannel = m_maskChannel;
+    hashData.maskIsSrgb = m_maskIsSrgb;
+    hashData.maskScale = m_maskScale;
+    hashData.maskBias = m_maskBias;
+    hashData.strength = m_strength;
+    hashData.roughness = m_roughness;
+    hashData.modeFlags = (m_maskSecondaryUv ? 1u : 0u) | (m_blend ? 2u : 0u) | (m_blendIsSrgb ? 4u : 0u);
+    m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
+  }
+
+  uint32_t m_samplerIndex;
+  std::array<Sample, kMaxSamples> m_samples;
+  uint32_t m_sampleCount;
+  uint32_t m_maskTextureIndex;
+  Vector4 m_maskTransform;
+  uint32_t m_maskChannel;
+  uint32_t m_maskIsSrgb;
+  float m_maskScale;
+  float m_maskBias;
+  float m_strength;
+  float m_roughness;
+  bool m_maskSecondaryUv;
+  bool m_blend;
+  bool m_blendIsSrgb;
+
+  XXH64_hash_t m_cachedHash;
+};
+
 struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtOpaqueSurfaceMaterial& opaqueSurfaceMaterial) :
     m_type{ RtSurfaceMaterialType::Opaque },
@@ -1781,6 +2063,10 @@ struct RtSurfaceMaterial {
   RtSurfaceMaterial(const RtMaskLayerMaterial& maskLayerMaterial) :
     m_type { RtSurfaceMaterialType::MaskLayer },
     m_maskLayerMaterial { maskLayerMaterial } {}
+
+  RtSurfaceMaterial(const RtFlowLayerMaterial& flowLayerMaterial) :
+    m_type { RtSurfaceMaterialType::FlowLayer },
+    m_flowLayerMaterial { flowLayerMaterial } {}
 
   RtSurfaceMaterial(const RtSurfaceMaterial& surfaceMaterial) :
     m_type{ surfaceMaterial.m_type } {
@@ -1803,6 +2089,9 @@ struct RtSurfaceMaterial {
       break;
     case RtSurfaceMaterialType::MaskLayer:
       new (&m_maskLayerMaterial) RtMaskLayerMaterial { surfaceMaterial.m_maskLayerMaterial };
+      break;
+    case RtSurfaceMaterialType::FlowLayer:
+      new (&m_flowLayerMaterial) RtFlowLayerMaterial { surfaceMaterial.m_flowLayerMaterial };
       break;
     }
   }
@@ -1828,6 +2117,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::MaskLayer:
       m_maskLayerMaterial.~RtMaskLayerMaterial();
       break;
+    case RtSurfaceMaterialType::FlowLayer:
+      m_flowLayerMaterial.~RtFlowLayerMaterial();
+      break;
     }
   }
 
@@ -1852,6 +2144,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::MaskLayer:
       m_maskLayerMaterial.writeGPUData(data, offset);
       break;
+    case RtSurfaceMaterialType::FlowLayer:
+      m_flowLayerMaterial.writeGPUData(data, offset);
+      break;
     }
   }
 
@@ -1871,6 +2166,8 @@ struct RtSurfaceMaterial {
       return m_subsurfaceMaterial.validate();
     case RtSurfaceMaterialType::MaskLayer:
       return m_maskLayerMaterial.validate();
+    case RtSurfaceMaterialType::FlowLayer:
+      return m_flowLayerMaterial.validate();
     }
 
     return false;
@@ -1900,6 +2197,9 @@ struct RtSurfaceMaterial {
       case RtSurfaceMaterialType::MaskLayer:
         m_maskLayerMaterial = rtSurfaceMaterial.m_maskLayerMaterial;
         break;
+      case RtSurfaceMaterialType::FlowLayer:
+        m_flowLayerMaterial = rtSurfaceMaterial.m_flowLayerMaterial;
+        break;
       }
     }
 
@@ -1927,6 +2227,8 @@ struct RtSurfaceMaterial {
       return m_subsurfaceMaterial == rhs.m_subsurfaceMaterial;
     case RtSurfaceMaterialType::MaskLayer:
       return m_maskLayerMaterial == rhs.m_maskLayerMaterial;
+    case RtSurfaceMaterialType::FlowLayer:
+      return m_flowLayerMaterial == rhs.m_flowLayerMaterial;
     }
   }
 
@@ -1946,6 +2248,8 @@ struct RtSurfaceMaterial {
       return m_subsurfaceMaterial.getHash();
     case RtSurfaceMaterialType::MaskLayer:
       return m_maskLayerMaterial.getHash();
+    case RtSurfaceMaterialType::FlowLayer:
+      return m_flowLayerMaterial.getHash();
     }
   }
 
@@ -1999,6 +2303,9 @@ struct RtSurfaceMaterial {
     case RtSurfaceMaterialType::MaskLayer:
       m_maskLayerMaterial.forEachTextureIndex(fn);
       break;
+    case RtSurfaceMaterialType::FlowLayer:
+      m_flowLayerMaterial.forEachTextureIndex(fn);
+      break;
     }
   }
 
@@ -2012,6 +2319,7 @@ private:
     RtRayPortalSurfaceMaterial m_rayPortalSurfaceMaterial;
     RtSubsurfaceMaterial m_subsurfaceMaterial;
     RtMaskLayerMaterial m_maskLayerMaterial;
+    RtFlowLayerMaterial m_flowLayerMaterial;
   };
 };
 
@@ -2061,6 +2369,66 @@ enum class MaterialDataType {
   RayPortal,
   Count,
   Invalid
+};
+
+// Describes the normal detail a UE3 material moves over its surface (rtx.d3d9.ue3FlowLayers): normal maps it pans and
+// blends into the surface normal by a mask, or a panned weight that blends the surface normal towards a normal map.
+// See "Flow layers" in UE3Compatibility.md.
+struct Ue3FlowLayer {
+  static constexpr uint32_t kMaxSamples = 2;
+  // Marks a normal lane no texel channel feeds, which the shader reconstructs from the others.
+  static constexpr uint8_t kNoComponent = 0xFFu;
+
+  struct Sample {
+    TextureRef texture;
+    // Maps the surface's texture coordinates to the sample's, as (a, b, c, d, tx, ty):
+    // u' = a * u + b * v + tx and v' = c * u + d * v + ty.
+    std::array<float, 6> transform = { 1.f, 0.f, 0.f, 1.f, 0.f, 0.f };
+    // Is the sample's velocity in its own texture coordinates per second.
+    Vector2 velocity = Vector2(0.f);
+    float weight = 1.f;
+    // Holds the texel channels the normal's x, y and z read.
+    std::array<uint8_t, 3> components = { 0, 1, 2 };
+    // Is set when the transform maps the draw's second UV set (RasterGeometry::color0IsTexcoord) rather than the surface's
+    // texture coordinates.
+    bool secondaryUv = false;
+  };
+
+  std::array<Sample, kMaxSamples> samples;
+  uint8_t sampleCount = 0;
+  Rc<DxvkSampler> sampler;
+  // Is set when the layer blends the surface's normal towards samples[0] instead of adding its samples up.
+  // The blend's weight is samples[1].weight times the channel components[0] names of samples[1], times the mask.
+  bool blend = false;
+  bool blendIsSrgb = false;
+  // The mask is maskBias + maskScale * one channel of the mask texture, read through maskTransform from the
+  // surface's texture coordinates as (scale U, scale V, offset U, offset V). Without a mask texture it is 1.
+  TextureRef mask;
+  Vector4 maskTransform = Vector4(1.f, 1.f, 0.f, 0.f);
+  uint8_t maskChannel = 0;
+  bool maskIsSrgb = false;
+  // Is set when maskTransform maps the draw's second UV set.
+  bool maskSecondaryUv = false;
+  float maskScale = 1.f;
+  float maskBias = 0.f;
+  // Scales the samples' perturbation of the normal.
+  float strength = 1.f;
+  // Is the roughness the surface takes where the mask is 1, or negative to keep the surface's own.
+  float roughness = -1.f;
+  // Hashes everything above but the textures' contents, so the preserve path rebinds when a layer changes.
+  XXH64_hash_t identity = kEmptyHash;
+
+  bool isValid() const {
+    return sampleCount > 0;
+  }
+
+  bool readsSecondaryUv() const {
+    bool reads = mask.isValid() && maskSecondaryUv;
+    for (uint32_t i = 0; i < sampleCount; i++) {
+      reads |= samples[i].secondaryUv;
+    }
+    return reads;
+  }
 };
 
 // Note: For use with "Legacy" D3D9 material information
@@ -2217,6 +2585,9 @@ struct LegacyMaterialData {
   Vector4 ue3CompositeMaskTransform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
   uint8_t ue3CompositeMaskChannel = 0;
   bool ue3CompositeMaskIsSrgb = false;
+  // Holds the material's flow layer (rtx.d3d9.ue3FlowLayers), which layers over whichever material renders the surface.
+  // It never reaches getHash(), so the preserve path rebinds through its identity.
+  Ue3FlowLayer ue3FlowLayer;
 
   void setHashOverride(XXH64_hash_t hash) {
     m_cachedHash = hash;
@@ -2306,6 +2677,8 @@ private:
 
 struct MaterialData {
   bool m_ignored = false;
+  // Is set when the material comes from a replacement or the Remix API rather than from the game's draw.
+  bool m_isReplacement = false;
 
   using MaterialVariant = std::variant<
     OpaqueMaterialData,

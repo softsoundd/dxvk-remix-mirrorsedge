@@ -393,6 +393,10 @@ struct RasterGeometry {
   // Used by replacements mostly, to force the cull bit to that set by the geometry data
   bool forceCullBit = false;
 
+  // Is set when color0Buffer holds a second UV set as half2 (u, v) rather than a vertex colour, for a UE3 flow layer that
+  // reads it (rtx.d3d9.ue3FlowLayers).
+  bool color0IsTexcoord = false;
+
   RasterBuffer positionBuffer;
   RasterBuffer normalBuffer;
   RasterBuffer texcoordBuffer;

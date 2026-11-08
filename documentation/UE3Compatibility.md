@@ -478,7 +478,7 @@ So under UE3 the interpolant is borrowed from the shader's other material sample
 
 A Remix surface carries a single texcoord buffer, and the UV set it uses is resolved from the winning albedo sampler. UE3 materials routinely sample two textures from *different* IA texcoord sets - a base map plus a decal, blend or overlay layer will read one each. Only the winner's set reaches the surface, so on such a material exactly one of the two textures can be mapped correctly; the other is drawn through the wrong channel and appears at the wrong scale.
 
-No scoring threshold resolves this - it is one UV set for two demands. `rtx.d3d9.ue3LogUvResolution` identifies it: two lines for the same pixel shader with different `iaSet=` values means that material has the conflict, and the `stage=` on each says which texture claims which set. Choose which texture should be correct with `rtx.preferredAlbedoTextures`, and expect the other layer to be mapped wrongly.
+No scoring threshold resolves this - it is one UV set for two demands. `rtx.d3d9.ue3LogUvResolution` identifies it: two lines for the same pixel shader with different `iaSet=` values means that material has the conflict, and the `stage=` on each says which texture claims which set. Choose which texture should be correct with `rtx.preferredAlbedoTextures`, and expect the other layer to be mapped wrongly. A [flow layer](#flow-layers) is the one exception: it can carry a second set in the vertex colour slot for its own samples.
 
 ## Composite materials
 
@@ -545,7 +545,7 @@ A tagged material that cannot be baked renders its albedo pick, as an untagged o
 - The colour reads a vertex colour, an engine texture (scene colour or depth, light attenuation, ...) or a volume texture.
 - The shader is the directional vertex lightmap compile, whose diffuse arrives through several lighting interpolants weighted by the normal.
 - The shader `clip()`s, but its alpha output is not an interpolant the bake can mark coverage with.
-- An input animates. The live constants that reach an output are part of a bake's key, so a material drawn with more than 8 different values of them is taken to be animating (a panner, a time-driven tint) and renders its pick for the rest of the session. Layer textures and their mips are part of the key too, but a streamed-in mip only re-bakes the material.
+- An input animates. The live constants that reach an output are part of a bake's key, so a material drawn with more than 8 different values of them is taken to be animating (a panner, a time-driven tint) and renders its pick for the rest of the session. A [flow layer](#flow-layers)'s panners are left out of the key, since the bake binds its samples flat. Layer textures and their mips are part of the key too, but a streamed-in mip only re-bakes the material.
 
 View-dependent terms (Fresnel, reflection vectors, cube maps) are baked as seen face-on, which the material's log line notes.
 
@@ -591,6 +591,121 @@ The dev menu's "UE3 Composite Materials" section holds the options, a list of th
 | `rtx.d3d9.ue3CompositeEmission` | False | Keep the emission a bake separates as the surface's emissive texture, and export it in captures |
 | `rtx.d3d9.ue3CompositeEmissiveIntensity` | 1 | Scale on the kept emission |
 | `rtx.d3d9.ue3LogCompositeMaterials` | False | Log each material's decision, its bakes and the candidates |
+
+## Flow layers
+
+Some UE3 materials move their normal detail over the surface. Stormdrain_p's canals pan a pair of normal maps across the concrete, which bend a cube map reflection in a strip down the middle. The construction tarps found throughout the game blend their normal map towards a wrinkled one by a panned texture, so wrinkles drift across them. Remix does not shade with the game's normal maps, so such surfaces render still.
+
+`rtx.d3d9.ue3FlowLayers` (on by default) finds that motion in the pixel shader and renders it as a flow layer, at the speed the game moves it. Panned normal maps scroll over the surface, blended into its shading normal under the material's own mask. A panned blend moves the surface's normal towards the second normal map wherever its weight is high. Where the mask is 1, a surface with panned normal maps and no Toolkit material also takes `rtx.d3d9.ue3FlowLayerRoughness` (0.15). The game often shows panned normal maps through a reflection, which the default roughness of a legacy material would blur away.
+
+### Finding the layer
+
+A pixel shader's flow layer is decided from its bytecode once. A candidate is a read of a material 2D texture (`Texture2D_*`) that reaches the colour neither as a colour nor as an opacity, through a coordinate that is an exact affine of an interpolant offset by a constant register. Each read is a sample of its own, with its own coordinate, since a material can pan one normal map several ways: Stormdrain_p's spillway reads its ripple map at (1, 2) and (1.15, 1) repeats per UV, panned by c8 and c9. Symbolic evaluation then finds the last normalisation that the candidates reach only linearly. That is usually `CalcMaterialParameters` normalising the material normal, though a material can normalise its own expression first. There each candidate has to arrive as a vector times a weight, with its channels in any order: a two-channel map read as `.wy`, with z rebuilt or constant, qualifies. A squared sample, or one that passes through a normalisation of its own, does not.
+
+The samples' weights must be multiples of one weight, which has to be `constant + linear * m` in one channel `m` of one other material texture: the mask. The mask's value is `saturate(bias + scale * m)`, normalised so that it is 1 where the weight peaks. A sample's weight is then its share of the material normal there, in units of a normal decoded as `2t - 1`. Any other texture in the weight, such as a debris layer that lerps the concrete back over the water, is left out and noted in the log. A layer keeps its two heaviest samples.
+
+`M_StormDrainCanals_01` compiles `normalize(lerp(N_concrete, lerp(decode(A), B, 0.5), mask))`. Ripple A tiles (-5, 5) times per UV and ripple B 4 times, panned by c8 and c9, and the strip mask is `Texture2D_4.x` at 1x. Its layer weighs A 0.5 and B 0.25, with the mask as it is. `M_StormDrainCanals_01b` adds the ripples instead, at weights 1 and 0.5. The material adds B undecoded, which only adds a constant tilt to the sum. The layer leaves that tilt out and decodes every sample.
+
+When no normalisation takes the panned reads as weighted vectors, the analysis looks for a blend: a normalisation whose lanes are `a * X + b + w * c * (Y - X)` for two other reads X and Y, decoded alike, with the panned read's channel in `w`. Every lane must share one `c`: a constant, or that times one channel of one other material texture, which becomes the mask. The blend's weight is then `c / a` times the panned channel, times the mask, as the game weighs it. The construction tarp compiles `normalize(lerp(decode(N0), decode(N1), 0.8 * Texture2D_3.y * Texture2D_2.y))`. `N0` is the tarp's own normal map on its UVs, `N1` the wrinkles at four times the scale on the mesh's other UV set, rotated a quarter turn. That set is the tarp's lightmap unwrap, which the vertex shader also scales into the lightmap coordinate. The weight `Texture2D_3.y` pans by c8 at twice the scale on that set, and the static factor `Texture2D_2.y` is the diffuse's green.
+
+A shader without a flow layer logs one of these:
+
+| Refusal | Meaning |
+| --- | --- |
+| `NoPannedSampler` | No read of a material texture outside the colour has a coordinate offset by a constant |
+| `NotNormalized` | No panned texture reaches a normalised vector |
+| `NotLinear` | A panned texture reaches the normal squared, through a normalisation of its own, or with its channels mixed across lanes |
+| `NotProportional` | The panned textures are weighted by different masks |
+| `MaskNotSingleChannel` | The weight reads more than one texture channel |
+| `NoWeight` | The panned textures carry no positive weight where their mask peaks |
+| `MaskUnresolved` | The mask's coordinate cannot be resolved |
+| `FoldedBlend` | The shader is too complex to evaluate with every texture kept, and the blend may be in what the evaluation folded |
+| `EvaluationFailed` | Flow control, relative addressing or the term budget stopped the evaluation |
+
+### Speed
+
+UE3 uploads a panner as `frac(GameTime * Speed)`, so its register jumps back by 1 as it wraps. Each sample's offset is read from its registers once per frame, each step unwrapped into [-0.5, 0.5] and scaled by the term's factor. A blend's weight is tracked as a sample is, and a read whose offset reads no register, as a blend's normal map, is static from the start. A speed settles over 32 frames in which the read moved, once the window's two halves agree to within 5%, and is rounded to 1/8192 UV per second. Frame steps outside 1-250 ms, as hitches and loads make, are skipped. A window that disagrees, as the game's slow motion or a pause partway through makes one, waits for the next. A read that has not moved for 3 seconds is static, and a layer whose reads are all static is not rendered.
+
+Speeds are measured per material and pixel shader, since materials that compile to one shader can pan at different speeds. Settled speeds are kept in `rtx-remix/ue3FlowLayers.cache`, keyed by material, pixel shader and read, so later sessions and captures have them from the first frame. Deleting the file has them measured again. A layer renders once each of its reads has settled, about half a second after its first draw in a level's first session.
+
+The layer moves by Remix's animation clock, the one sprite sheets use, rather than by the game's. It keeps its speed through Runner Vision's slow motion, and keeps moving while the game is paused.
+
+### Rendering
+
+A surface material's flow layer is an extension record of up to two samples, each with its texture, its affine of the surface's texture coordinates, its velocity and its weight, plus the mask, a strength and a roughness. For a sample read at `M * uv + offset`:
+
+```text
+sampleUv  = M * uv + offset + frac(velocity * t)
+n_i       = decode(texel_i), its xy turned onto the surface's axes by M^T / sqrt(|det M|)
+F         = sum_i weight_i * n_i, with F.xy scaled by the strength
+flow      = normalize(lerp((0, 0, 1), F, mask))
+normal    = RNM(surface normal, flow)
+roughness = lerp(roughness, layer roughness, mask), unless the layer's roughness is negative
+```
+
+A surface without a normal map of its own is flat, so its normal is exactly the game's `normalize(lerp(N, F, mask))` with `N` flat. Over a normal map that a replacement authors, reoriented normal mapping lays the layer onto it rather than replacing it. Texture gradients follow `M`, so the samples mip as the game's do, and they are read only where the mask is above 0. The game's normal maps decode as `2t - 1`, as UE3 unpacks them. The layer's samples always repeat, whatever the game's addressing. The mask reads through the surface's own sampler.
+
+A blend layer's two samples are the normal map it blends towards and the weight:
+
+```text
+weight    = saturate(scale * channel(weight texel)) * mask
+toward    = decode(texel_0), with its xy scaled by the strength
+normal    = normalize(lerp(surface normal, normalize(toward), weight))
+```
+
+The game blends from its first normal map, which never moves. In Remix the surface's own normal stands in for it. That is flat on a legacy material, which then shows only the second normal map where the weight is high, and is the authored normal map under a replacement. A blend leaves the roughness alone.
+
+Each sample's coordinate, and the mask's, has to be an affine of the interpolant the surface's texture coordinates come from, or of another IA texcoord set that the vertex shader passes through unchanged or through an affine of its constants. The mask has to be axis-aligned to its set. A sample whose tiling changes from draw to draw stops the layer for the session. A surface rendering a [composite bake](#composite-materials) reads the interpolant over the bake's repeat, and its layer is built relative to that.
+
+A Remix surface carries [one texcoord set](#one-texcoord-set-per-surface), so a layer that reads another set has the geometry carry it in the vertex colour slot, which UE3 draws leave empty. The set travels as two halves in the 32-bit colour element. The vertex buffer is read in place when it already stores the set as halves, and a float set is converted into a staging copy. A layer may read one other set. The set is chosen from the shaders alone, so a mesh carries the same vertex data from its first draw, while its speeds are still being measured. Such a surface renders a vertex colour of 1, and opacity micromaps and mesh particle spawning ignore its colour slot. The surface interaction reads the set with its own texture gradients over the surface's footprint, so its samples mip as the game's do. A sample on it is not turned by `M`. The set's axes keep no relation to the surface's: the tarp's is a lightmap unwrap whose charts lie every which way. UE3 leans the texel in the surface's tangent frame as it is, and so does the layer. A replacement mesh does not carry the set, so a layer that reads one does not render on it.
+
+### Composite materials and flow layers
+
+A composite bake binds a flow layer's samples to the flat normal (1/2, 1/2, 1, 1/2), and the registers that only offset them leave the bake's key. A tagged canal therefore bakes once rather than being taken to animate after 8 sets of constants, and the layer scrolls over the bake, lit by Remix rather than by the bake's face-on reflection. A panner that another sampler's coordinate also reads stays in the key. Samples that turn out never to move are baked as the game draws them, after one more bake.
+
+### Hashes and cost
+
+Material identity is unchanged. The layer stays out of `mat_*` and the textureSet+shader hash, and identity already leaves the panners' registers out. The layer changes only the surface material, which is cached on the layer's contents, so a layer that appears once its speeds settle creates one new surface material.
+
+A surface with a flow layer reads its mask per shaded hit, and up to two normal maps where the mask is above 0. A blend reads its weight wherever the mask is above 0, and its normal map wherever the weight is. A surface that carries a second UV set reads it per hit, with a second gradient computation. On the CPU, each draw of a material with a layer resolves its samples' affines and reads their registers, and each pixel shader is analysed once.
+
+### Toolkit materials
+
+The game's layer renders over a Toolkit material too. `AperturePBR_Opacity`'s "Flow Layer" group controls it:
+
+- `enable_flow_layer` false renders no layer, neither the game's nor an authored one.
+- `flow_normalmap_texture` authors a layer of its own, which replaces the game's. It is one normal map placed by `flow_texture_scale`, `flow_texture_offset` and `flow_texture_rotation` relative to the material's texture coordinates after its own texture transform, and scrolled by `flow_texture_scroll_rate` and `flow_texture_scroll_angle` in its own UVs. These follow the conventions of the [texture transform](TextureTransforms.md) parameters. `flow_normalmap_encoding` says how it decodes: `octahedral` for a normal map the Toolkit ingested, and `tangent_space_dx` for a raw 3-channel one such as a capture exports.
+- `flow_mask_texture` confines either layer, read from `flow_mask_channel` through `flow_mask_scale` and `flow_mask_offset`. Without one, the game's layer keeps the game's mask, and an authored layer covers the whole surface.
+- `flow_normal_strength` scales the tilt, multiplying `rtx.d3d9.ue3FlowLayerStrength` over the game's layer.
+- `flow_roughness`, when 0 or more, is the roughness under the mask. Otherwise a Toolkit material keeps its own roughness, since `rtx.d3d9.ue3FlowLayerRoughness` stands in for the game material's specular.
+
+The game's layer stays aligned under a replacement that scales, offsets or rotates its textures. A mask cannot follow a rotation, so a replacement that rotates its textures over a masked game layer renders no layer unless it authors `flow_mask_texture`, and says so once in the log. The parameters are marked `anno::unused()`, like the texture transform's, so only this runtime renders them, and the Toolkit's viewport shows the layer only when it runs this fork's runtime. Captured materials embed the fork's MDL from `src/mdl/Base`, and the Toolkit needs the same `AperturePBR_Opacity.mdl` for materials it creates itself.
+
+### Captures
+
+A capture exports a material's game layer as `flow_*` parameters, as a starting point for authoring. They describe one normal map, so the layer's heaviest sample is exported as `<material>_flow.dds` in the game's format, with `flow_normalmap_encoding` set to `tangent_space_dx`. Its affine becomes a scale, rotation and offset relative to the captured UVs, and its settled velocity a scroll rate and angle. The mask is exported as `<material>_flowmask.dds` with its channel, scale and offset, unless the game rescales or gamma decodes it, which the parameters cannot describe. Strength and roughness are exported as the runtime renders them. A sample that keeps x and y in other channels than red and green, or one sheared against the surface, is not exported, and the log says why.
+
+A blend layer, or one that reads another UV set, is not exported, since the parameters describe neither, and the log says so. A mesh whose vertex colour slot carries a layer's UV set is captured without vertex colours.
+
+The runtime does not load a capture, so exporting the layer changes nothing in game. A mod material that copies `flow_normalmap_texture` from a capture replaces the game's samples with that one, so leave it out to keep the game's layer.
+
+### Diagnostics
+
+`rtx.d3d9.ue3LogFlowLayers` logs `[RTX-Compatibility][UE3-Flow]` lines:
+- For each pixel shader that pans a texture: its samples, weights, blend, offset registers and mask, or why it has no layer.
+- Each speed as it settles.
+- Each material's layer once it renders, with its samples' affines and velocities.
+- Why a material's layer is not rendered.
+
+The dev menu's "UE3 Flow Layers" section holds the options and lists the materials with layers, with their speeds or what they wait for, marking blends and layers on a second UV set. The unit test `tests/rtx/unit/test_dxso_ue3_flow_layers.cpp` covers the analysis. Invoked with `.dxso` files from `DXVK_SHADER_DUMP_PATH`, it prints each shader's samples with their UV origins, its blend and mask, and its offset registers, marking those another sampler shares.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `rtx.d3d9.ue3FlowLayers` | True | Render the normal detail a material moves, as panned normal maps or a panned blend between two, as a flow layer |
+| `rtx.d3d9.ue3FlowLayerStrength` | 1 | Scale on how far a flow layer tilts the normal. 1 tilts it as far as the game's normal maps do |
+| `rtx.d3d9.ue3FlowLayerRoughness` | 0.15 | Roughness under the mask of a surface without a Toolkit material. Negative keeps the surface's own, as a blend always does |
+| `rtx.d3d9.ue3FlowLayerExcludedTextures` | | Materials (material, textureSet+shader or albedo pick hash) whose flow layer is not rendered |
+| `rtx.d3d9.ue3LogFlowLayers` | False | Log each shader's layer or refusal, settled speeds and each material's layer |
 
 ## Rotators and UV matrices
 

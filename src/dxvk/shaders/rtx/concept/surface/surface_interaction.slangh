@@ -712,6 +712,21 @@ SurfaceInteraction surfaceInteractionCreateImpl<let GenerateTangents : bool, let
 #endif
     }
 
+    // Reads the second UV set a flow layer uses, which the color0 slot carries as half2.
+    vec2 secondaryTexcoords[3];
+    const bool hasSecondaryTexcoords = surface.color0IsTexcoord && surface.color0BufferIndex != BINDING_INDEX_INVALID;
+    if (hasSecondaryTexcoords)
+    {
+      for (uint i = 0; i < 3; i++)
+      {
+        const uint color0ElementIndex = (idx[i] * uint(surface.color0Stride) + surface.color0Offset) / 4;
+        const uint halves = floatBitsToUint(BUFFER_ARRAY(geometries, surface.color0BufferIndex, color0ElementIndex));
+        secondaryTexcoords[i] = sanitize(vec2(f16tof32(halves), f16tof32(halves >> 16)), vec2(0.0f, 0.0f));
+      }
+      surfaceInteraction.secondaryTextureCoordinates = interpolateHitAttribute(secondaryTexcoords, bary);
+      surfaceInteraction.hasSecondaryTextureCoordinates = true;
+    }
+
     // Compute texture gradients
     // Note: This is done here as it depends on the triangle normal and texture coordinates being calculated first
 
@@ -728,6 +743,14 @@ SurfaceInteraction surfaceInteractionCreateImpl<let GenerateTangents : bool, let
         coneRadius, worldPositions, texcoords, surfaceInteraction.textureCoordinates,
         surfaceInteraction.textureGradientX, surfaceInteraction.textureGradientY);
 
+      if (hasSecondaryTexcoords)
+      {
+        computeAnisotropicEllipseAxes(
+          hitPosition, triangleNormal, worldTwoTriangleArea, direction,
+          coneRadius, worldPositions, secondaryTexcoords, surfaceInteraction.secondaryTextureCoordinates,
+          surfaceInteraction.secondaryTextureGradientX, surfaceInteraction.secondaryTextureGradientY);
+      }
+
       if (footprintMode == kFootprintFromRayOriginClamped)
       {
         vec2 dUV1 = texcoords[1] - texcoords[0];
@@ -735,14 +758,24 @@ SurfaceInteraction surfaceInteractionCreateImpl<let GenerateTangents : bool, let
         float dUVCross = abs(dUV1.x * dUV2.y - dUV2.x * dUV1.y);
         float radius = dUVCross / (length(dUV1) + length(dUV2) + length(dUV2 - dUV1));
         float maxFootprint = radius * 1.5;
-        surfaceInteraction.textureGradientX *= min(1.0, maxFootprint / length(surfaceInteraction.textureGradientX));
-        surfaceInteraction.textureGradientY *= min(1.0, maxFootprint / length(surfaceInteraction.textureGradientY));
+        const float clampX = min(1.0, maxFootprint / length(surfaceInteraction.textureGradientX));
+        const float clampY = min(1.0, maxFootprint / length(surfaceInteraction.textureGradientY));
+        surfaceInteraction.textureGradientX *= clampX;
+        surfaceInteraction.textureGradientY *= clampY;
+        // The footprint is clamped once, for both sets.
+        surfaceInteraction.secondaryTextureGradientX *= clampX;
+        surfaceInteraction.secondaryTextureGradientY *= clampY;
       }
     }
     else
     {
       surfaceInteraction.textureGradientX = (texcoords[1] - texcoords[0]) / 3.0f;
       surfaceInteraction.textureGradientY = (texcoords[2] - texcoords[0]) / 3.0f;
+      if (hasSecondaryTexcoords)
+      {
+        surfaceInteraction.secondaryTextureGradientX = (secondaryTexcoords[1] - secondaryTexcoords[0]) / 3.0f;
+        surfaceInteraction.secondaryTextureGradientY = (secondaryTexcoords[2] - secondaryTexcoords[0]) / 3.0f;
+      }
     }
   }
   else
@@ -812,7 +845,8 @@ SurfaceInteraction surfaceInteractionCreateImpl<let GenerateTangents : bool, let
   if (surface.color0BufferIndex != BINDING_INDEX_INVALID &&
      // Baked terrain has vertex colors already baked in, so default to neutral vertex color of 1.
      // They won't get reapplied later anyway
-     !isBakedTerrain)
+     !isBakedTerrain &&
+     !surface.color0IsTexcoord)
   {
     vec4 color[3];
 

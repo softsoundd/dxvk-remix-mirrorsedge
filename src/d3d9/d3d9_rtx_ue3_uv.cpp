@@ -239,6 +239,66 @@ namespace dxvk {
     return std::isfinite(outValue);
   }
 
+  // As resolveUe3PsAffineTerm, against the draw's live vertex shader constants.
+  bool D3D9Rtx::resolveUe3VsAffineTerm(const UvAffineTerm& term, const float identity, float& outValue) const {
+    outValue = identity;
+    if (term.inexact) {
+      return false;
+    }
+    if (!uvAffineTermPresent(term)) {
+      return true;
+    }
+    float value = term.immValid ? term.imm : 0.0f;
+    if (term.constReg >= 0) {
+      if (uint32_t(term.constReg) >= caps::MaxFloatConstantsSoftware) {
+        return false;
+      }
+      value += d3d9State().vsConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
+    }
+    if (term.constReg2 >= 0) {
+      if (uint32_t(term.constReg2) >= caps::MaxFloatConstantsSoftware) {
+        return false;
+      }
+      value += d3d9State().vsConsts.fConsts[uint32_t(term.constReg2)][term.constComp2 & 0x3u] * term.factor2;
+    }
+    outValue = value;
+    return std::isfinite(outValue);
+  }
+
+  const Ue3VsTexcoordTraceEntry* D3D9Rtx::getOrTraceUe3VsTexcoord(const D3D9CommonShader* vs, const uint32_t outputReg,
+                                                                   const uint8_t compU, const uint8_t compV) {
+    if (vs == nullptr || outputReg == std::numeric_limits<uint32_t>::max()) {
+      return nullptr;
+    }
+
+    const XXH64_hash_t vsHash = vs->GetBytecodeHash();
+    if (vsHash == 0) {
+      return nullptr;
+    }
+
+    XXH64_hash_t traceKey = vsHash;
+    auto mix = [&](const uint64_t v) {
+      traceKey ^= v + 0x9E3779B97F4A7C15ull + (traceKey << 6) + (traceKey >> 2);
+    };
+    mix(outputReg);
+    mix(compU);
+    mix(uint64_t(compV) << 8);
+
+    auto& entry = m_ue3VsTexcoordTraceCache[traceKey];
+    if (!entry.initialized) {
+      entry.initialized = true;
+      const Ue3VsTexcoordTraceResult trace =
+        traceVsOutputTexcoordToInputUsageIndex(makeDxsoShaderView(vs->GetBytecode(), vs), outputReg, compU, compV);
+      entry.kind = trace.kind;
+      entry.iaTexcoordIndex = trace.iaTexcoordIndex;
+      entry.inputReg = trace.inputReg;
+      entry.affineU = trace.affineU;
+      entry.affineV = trace.affineV;
+    }
+
+    return &entry;
+  }
+
   // UE3's deterministic UV resolution: the texcoord set and components the surface reads, proven
   // from the pixel and vertex shader bytecode where possible.
   void D3D9Rtx::resolveUe3Texcoords(Ue3TextureState& ue3, const uint32_t firstStage, const uint32_t stageStateIdx,
@@ -248,67 +308,6 @@ namespace dxvk {
     XXH64_hash_t& inferredPsHash = ue3.inferredPsHash;
     PsSamplerTexcoordEntry*& inferredPsEntry = ue3.inferredPsEntry;
     const bool forceIaTexcoordForOutlier = m_forceIaTexcoordForOutlier;
-
-    auto getOrInitVsTexcoordTraceEntry = [&](const D3D9CommonShader* vs,
-                                             const uint32_t outputReg,
-                                             const uint8_t compU,
-                                             const uint8_t compV) -> Ue3VsTexcoordTraceEntry* {
-      if (vs == nullptr || outputReg == std::numeric_limits<uint32_t>::max()) {
-        return nullptr;
-      }
-
-      const XXH64_hash_t vsHash = vs->GetBytecodeHash();
-      if (vsHash == 0) {
-        return nullptr;
-      }
-
-      XXH64_hash_t traceKey = vsHash;
-      auto mix = [&](const uint64_t v) {
-        traceKey ^= v + 0x9E3779B97F4A7C15ull + (traceKey << 6) + (traceKey >> 2);
-      };
-      mix(outputReg);
-      mix(compU);
-      mix(uint64_t(compV) << 8);
-
-      auto& entry = m_ue3VsTexcoordTraceCache[traceKey];
-      if (!entry.initialized) {
-        entry.initialized = true;
-        const Ue3VsTexcoordTraceResult trace =
-          traceVsOutputTexcoordToInputUsageIndex(makeDxsoShaderView(vs->GetBytecode(), vs), outputReg, compU, compV);
-        entry.kind = trace.kind;
-        entry.iaTexcoordIndex = trace.iaTexcoordIndex;
-        entry.inputReg = trace.inputReg;
-        entry.affineU = trace.affineU;
-        entry.affineV = trace.affineV;
-      }
-
-      return &entry;
-    };
-
-    auto resolveVsAffineTermValue = [&](const UvAffineTerm& term, const float identity, float& outValue) -> bool {
-      outValue = identity;
-      if (term.inexact) {
-        return false;
-      }
-      if (!uvAffineTermPresent(term)) {
-        return true;
-      }
-      float value = term.immValid ? term.imm : 0.0f;
-      if (term.constReg >= 0) {
-        if (uint32_t(term.constReg) >= caps::MaxFloatConstantsSoftware) {
-          return false;
-        }
-        value += d3d9State().vsConsts.fConsts[uint32_t(term.constReg)][term.constComp & 0x3u] * term.factor;
-      }
-      if (term.constReg2 >= 0) {
-        if (uint32_t(term.constReg2) >= caps::MaxFloatConstantsSoftware) {
-          return false;
-        }
-        value += d3d9State().vsConsts.fConsts[uint32_t(term.constReg2)][term.constComp2 & 0x3u] * term.factor2;
-      }
-      outValue = value;
-      return std::isfinite(outValue);
-    };
 
     if (m_frameOptions.ue3EngineMode &&
         d3d9State().pixelShader.ptr() != nullptr) {
@@ -438,7 +437,7 @@ namespace dxvk {
           if (vs != nullptr) {
             vsTexcoordOutputReg = findVsTexcoordOutputRegister(vs->GetOsgn(), texcoordIdx);
             if (vsTexcoordOutputReg != std::numeric_limits<uint32_t>::max()) {
-              traceEntry = getOrInitVsTexcoordTraceEntry(vs, vsTexcoordOutputReg, m_texcoordCompU, m_texcoordCompV);
+              traceEntry = getOrTraceUe3VsTexcoord(vs, vsTexcoordOutputReg, m_texcoordCompU, m_texcoordCompV);
             }
           }
 
@@ -454,10 +453,10 @@ namespace dxvk {
               provenIaIndex = traceEntry->iaTexcoordIndex;
             } else if (traceEntry->kind == Ue3VsUvTraceKind::AffineConst) {
               // the IA set is only usable if the VS transform resolves against live constants
-              if (resolveVsAffineTermValue(traceEntry->affineU.scale, 1.0f, vsScaleU) &&
-                  resolveVsAffineTermValue(traceEntry->affineU.offset, 0.0f, vsOffsetU) &&
-                  resolveVsAffineTermValue(traceEntry->affineV.scale, 1.0f, vsScaleV) &&
-                  resolveVsAffineTermValue(traceEntry->affineV.offset, 0.0f, vsOffsetV)) {
+              if (resolveUe3VsAffineTerm(traceEntry->affineU.scale, 1.0f, vsScaleU) &&
+                  resolveUe3VsAffineTerm(traceEntry->affineU.offset, 0.0f, vsOffsetU) &&
+                  resolveUe3VsAffineTerm(traceEntry->affineV.scale, 1.0f, vsScaleV) &&
+                  resolveUe3VsAffineTerm(traceEntry->affineV.offset, 0.0f, vsOffsetV)) {
                 provenIaIndex = traceEntry->iaTexcoordIndex;
                 vsAffineFold = true;
               }
@@ -639,6 +638,14 @@ namespace dxvk {
             texXform[1].y = finalD;
             texXform[3].y = finalTy;
           }
+          m_ue3UvFacts.surfaceAffineResolved =
+            psAffineResolved && transformIsUsable &&
+            (m_uvResolutionMode == UvResolutionMode::ProvenIa || m_uvResolutionMode == UvResolutionMode::CaptureInterpolant);
+          m_ue3UvFacts.surfaceAffineResolved &= !forceIaTexcoordForOutlier;
+          m_ue3UvFacts.semanticIndex = uvOrigin.semanticIndex;
+          m_ue3UvFacts.compU = uvOrigin.compU;
+          m_ue3UvFacts.compV = uvOrigin.compV;
+          m_ue3UvFacts.psAffine = { psA, psB, psC, psD, psTx, psTy };
 
           // rtx.d3d9.ue3LogUvAffineDetail: per-draw affine resolution outcome, logged once
           // per distinct resolved transform and capped per shader+stage

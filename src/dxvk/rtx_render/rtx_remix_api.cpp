@@ -301,6 +301,7 @@ namespace {
           preloadTexture(preload.subsurfaceSingleScatteringAlbedoTexture),
           preloadTexture(preload.subsurfaceRadiusTexture),
           TextureRef(),
+          TextureRef(), TextureRef(), // Flow layer textures
           src.getAnisotropyConstant(),
           src.getEmissiveIntensity(),
           src.getAlbedoConstant(),
@@ -342,7 +343,19 @@ namespace {
           src.getTextureScrollAngle(),
           src.getTextureScale(),
           src.getTextureOffset(),
-          src.getTextureRotation()
+          src.getTextureRotation(),
+          src.getEnableFlowLayer(),
+          src.getFlowNormalEncoding(),
+          src.getFlowMaskChannel(),
+          src.getFlowMaskScale(),
+          src.getFlowMaskOffset(),
+          src.getFlowTextureScale(),
+          src.getFlowTextureOffset(),
+          src.getFlowTextureRotation(),
+          src.getFlowTextureScrollRate(),
+          src.getFlowTextureScrollAngle(),
+          src.getFlowNormalStrength(),
+          src.getFlowRoughness()
         } };
       }
       case MaterialDataType::Translucent: 
@@ -414,6 +427,8 @@ namespace {
           {},
           {},
           {},
+          {}, // FlowNormalTexture
+          {}, // FlowMaskTexture
           extOpaque->anisotropy,
           info.emissiveIntensity,
           tovec3(extOpaque->albedoConstant),
@@ -456,6 +471,13 @@ namespace {
           hasTextureTransform && extOpaque->textureScale_hasvalue ? tovec2(extOpaque->textureScale_value) : Vector2(1.f),
           hasTextureTransform ? tovec2(extOpaque->textureOffset) : Vector2(0.f),
           hasTextureTransform ? extOpaque->textureRotation : 0.f,
+          // The API has no flow layer parameters, so these are the defaults.
+          true, // EnableFlowLayer
+          0, 0, // FlowNormalEncoding, FlowMaskChannel
+          Vector2(1.f), Vector2(0.f), // FlowMaskScale, FlowMaskOffset
+          Vector2(1.f), Vector2(0.f), 0.f, // FlowTextureScale, FlowTextureOffset, FlowTextureRotation
+          0.f, 0.f, // FlowTextureScrollRate, FlowTextureScrollAngle
+          1.f, -1.f, // FlowNormalStrength, FlowRoughness
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {

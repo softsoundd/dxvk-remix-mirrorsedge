@@ -1166,7 +1166,9 @@ namespace dxvk {
     ScopedCpuProfileZone();
     // First see if we have an explicit override
     if (overrideMaterialData != nullptr) {
-      return *overrideMaterialData;
+      MaterialData renderMaterialData = *overrideMaterialData;
+      renderMaterialData.m_isReplacement = true;
+      return renderMaterialData;
     } 
 
     // test if any direct material replacements exist
@@ -1218,6 +1220,7 @@ namespace dxvk {
       MaterialData renderMaterialData = *pReplacementMaterial;
       // merge in the input material from game
       renderMaterialData.mergeLegacyMaterial(input.getMaterialData());
+      renderMaterialData.m_isReplacement = true;
       return renderMaterialData;
     }
 
@@ -1780,6 +1783,12 @@ namespace dxvk {
           textureManager.retainTexture(texIdx);
         });
       }
+      const uint32_t flowLayerIdx = opaque.getFlowLayerIndex();
+      if (flowLayerIdx != SURFACE_INDEX_INVALID && flowLayerIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
+        m_surfaceMaterialExtensionCache.getObjectTable()[flowLayerIdx].forEachTextureIndex([&](uint32_t texIdx) {
+          textureManager.retainTexture(texIdx);
+        });
+      }
     }
   }
 
@@ -1834,6 +1843,12 @@ namespace dxvk {
       const uint32_t maskLayerIdx = opaque.getMaskLayerIndex();
       if (maskLayerIdx != SURFACE_INDEX_INVALID && maskLayerIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
         m_surfaceMaterialExtensionCache.getObjectTable()[maskLayerIdx].forEachTextureIndex([&](uint32_t texIdx) {
+          textureManager.releaseTexture(texIdx);
+        });
+      }
+      const uint32_t flowLayerIdx = opaque.getFlowLayerIndex();
+      if (flowLayerIdx != SURFACE_INDEX_INVALID && flowLayerIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
+        m_surfaceMaterialExtensionCache.getObjectTable()[flowLayerIdx].forEachTextureIndex([&](uint32_t texIdx) {
           textureManager.releaseTexture(texIdx);
         });
       }
@@ -2245,6 +2260,16 @@ namespace dxvk {
       texturePresenceMask |= opaqueMaterialData.getSubsurfaceSingleScatteringAlbedoTexture().isImageEmpty() ? 0u : (1u << 10);
       texturePresenceMask |= opaqueMaterialData.getSubsurfaceRadiusTexture().isImageEmpty()          ? 0u : (1u << 11);
       preCreationHash = XXH64(&texturePresenceMask, sizeof(texturePresenceMask), preCreationHash);
+
+      // The game's flow layer is kept out of the material hash, and a replacement keeps its own roughness under it.
+      // A replacement mesh lacks the second UV set the game's draw carries.
+      const Ue3FlowLayer& gameFlowLayer = drawCallState.getMaterialData().ue3FlowLayer;
+      if (gameFlowLayer.isValid()) {
+        preCreationHash = XXH64(&gameFlowLayer.identity, sizeof(gameFlowLayer.identity), preCreationHash);
+        preCreationHash = XXH64(&renderMaterialData.m_isReplacement, sizeof(renderMaterialData.m_isReplacement), preCreationHash);
+        const bool carriesSecondaryUv = drawCallState.getGeometryData().color0IsTexcoord;
+        preCreationHash = XXH64(&carriesSecondaryUv, sizeof(carriesSecondaryUv), preCreationHash);
+      }
     }
 
     auto iter = m_preCreationSurfaceMaterialMap.find(preCreationHash);
@@ -2414,6 +2439,12 @@ namespace dxvk {
         }
       }
 
+      uint32_t flowLayerIndex = SURFACE_INDEX_INVALID;
+      if (const std::optional<RtFlowLayerMaterial> flowLayerMaterial = createFlowLayerMaterial(renderMaterialData, drawCallState, hasTexcoords);
+          flowLayerMaterial.has_value() && flowLayerMaterial->validate()) {
+        flowLayerIndex = m_surfaceMaterialExtensionCache.track(*flowLayerMaterial);
+      }
+
       const RtOpaqueSurfaceMaterial opaqueSurfaceMaterial{
         albedoOpacityTextureIndex, normalTextureIndex,
         tangentTextureIndex, heightTextureIndex, roughnessTextureIndex,
@@ -2431,7 +2462,7 @@ namespace dxvk {
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget, isHairCard,
         samplerFeedbackStamp,
         secondaryTextureIndex, albedoOpacityIsRenderTarget,
-        maskLayerIndex
+        maskLayerIndex, flowLayerIndex
       };
 
       surfaceMaterial.emplace(opaqueSurfaceMaterial);
@@ -2470,6 +2501,119 @@ namespace dxvk {
     return m_surfaceMaterialCache.at(index);
   }
 
+  std::optional<RtFlowLayerMaterial> SceneManager::createFlowLayerMaterial(const MaterialData& renderMaterialData,
+                                                                           const DrawCallState& drawCallState,
+                                                                           const bool hasTexcoords) {
+    const OpaqueMaterialData& material = renderMaterialData.getOpaqueMaterialData();
+    const Ue3FlowLayer& gameLayer = drawCallState.getMaterialData().ue3FlowLayer;
+    const bool authored = material.getFlowNormalTexture().isValid();
+    if (!material.getEnableFlowLayer() || (!authored && (!gameLayer.isValid() || gameLayer.sampler == nullptr))) {
+      return std::nullopt;
+    }
+
+    std::array<RtFlowLayerMaterial::Sample, RtFlowLayerMaterial::kMaxSamples> samples;
+    uint32_t sampleCount = 0;
+    VkFilter filter = VK_FILTER_LINEAR;
+    uint32_t maskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+    Vector4 maskTransform(1.f, 1.f, 0.f, 0.f);
+    uint32_t maskChannel = 0;
+    bool maskIsSrgb = false;
+    bool maskSecondaryUv = false;
+    float maskScale = 1.f;
+    float maskBias = 0.f;
+    float strength = material.getFlowNormalStrength();
+    float roughness = material.getFlowRoughness();
+    bool blend = false;
+    bool blendIsSrgb = false;
+
+    if (authored) {
+      RtFlowLayerMaterial::Sample& sample = samples[0];
+      trackTexture(material.getFlowNormalTexture(), sample.textureIndex, hasTexcoords, true);
+      sample.transform = uvAffineFromTextureTransform(material.getFlowTextureScale(), material.getFlowTextureOffset(),
+                                                      material.getFlowTextureRotation());
+      const float rate = material.getFlowTextureScrollRate();
+      sample.velocity = rate == 0.f
+        ? Vector2(0.f)
+        : rate * calcScrollDirection(material.getFlowTextureScrollAngle());
+      sample.octahedral = material.getFlowNormalEncoding() == lss::Mdl::NormalEncoding::Octahedral;
+      sample.negateY = material.getFlowNormalEncoding() == lss::Mdl::NormalEncoding::TangentSpaceOgl;
+      // An RGB normal map may be stored in two channels, so z is rebuilt from x and y.
+      sample.components = { 0, 1, Ue3FlowLayer::kNoComponent };
+      sampleCount = 1;
+      filter = lss::Mdl::Filter::mdlToVk(material.getFilterMode());
+    } else {
+      if (gameLayer.readsSecondaryUv() && !drawCallState.getGeometryData().color0IsTexcoord) {
+        return std::nullopt;
+      }
+      // The game layer's transforms are relative to the draw's texture coordinates, which a replacement's own texture
+      // transform then scales, rotates and offsets. The second UV set takes no texture transform.
+      UvAffine materialInverse;
+      if (!invertUvAffine(uvAffineFromTextureTransform(material.getTextureScale(), material.getTextureOffset(), material.getTextureRotation()),
+                          materialInverse)) {
+        return std::nullopt;
+      }
+      for (uint32_t i = 0; i < gameLayer.sampleCount; i++) {
+        const Ue3FlowLayer::Sample& in = gameLayer.samples[i];
+        RtFlowLayerMaterial::Sample& out = samples[i];
+        trackTexture(in.texture, out.textureIndex, hasTexcoords, true);
+        out.transform = in.secondaryUv ? in.transform : composeUvAffine(in.transform, materialInverse);
+        out.velocity = in.velocity;
+        out.weight = in.weight;
+        out.components = in.components;
+        out.secondaryUv = in.secondaryUv;
+      }
+      sampleCount = gameLayer.sampleCount;
+      filter = gameLayer.sampler->info().magFilter;
+      blend = gameLayer.blend;
+      blendIsSrgb = gameLayer.blendIsSrgb;
+
+      if (gameLayer.mask.isValid() && !material.getFlowMaskTexture().isValid()) {
+        const UvAffine gameMask = { gameLayer.maskTransform.x, 0.f, 0.f, gameLayer.maskTransform.y,
+                                    gameLayer.maskTransform.z, gameLayer.maskTransform.w };
+        const UvAffine mask = gameLayer.maskSecondaryUv ? gameMask : composeUvAffine(gameMask, materialInverse);
+        const float diagonal = std::abs(mask[0]) + std::abs(mask[3]);
+        if (std::abs(mask[1]) > 1.0e-4f * diagonal || std::abs(mask[2]) > 1.0e-4f * diagonal) {
+          ONCE(Logger::warn("[RTX] A replacement material rotates its textures against the game's flow layer mask, which a "
+                            "mask cannot follow, so the flow layer is not rendered. Author a flow_mask_texture on it instead."));
+          return std::nullopt;
+        }
+        trackTexture(gameLayer.mask, maskTextureIndex, hasTexcoords, true);
+        maskTransform = Vector4(mask[0], mask[3], mask[4], mask[5]);
+        maskChannel = gameLayer.maskChannel;
+        maskIsSrgb = gameLayer.maskIsSrgb;
+        maskSecondaryUv = gameLayer.maskSecondaryUv;
+        maskScale = gameLayer.maskScale;
+        maskBias = gameLayer.maskBias;
+      }
+
+      // A material scales the game layer's strength. The layer's roughness stands in for the game material's specular,
+      // so a material a replacement authored keeps its own roughness unless it authors flow_roughness.
+      strength *= gameLayer.strength;
+      if (!renderMaterialData.m_isReplacement) {
+        roughness = gameLayer.roughness;
+      }
+    }
+
+    if (material.getFlowMaskTexture().isValid()) {
+      trackTexture(material.getFlowMaskTexture(), maskTextureIndex, hasTexcoords, true);
+      maskTransform = Vector4(material.getFlowMaskScale().x, material.getFlowMaskScale().y,
+                              material.getFlowMaskOffset().x, material.getFlowMaskOffset().y);
+      maskChannel = material.getFlowMaskChannel();
+      maskSecondaryUv = false;
+    }
+    if (RtxOptions::useWhiteMaterialMode()) {
+      roughness = -1.f;
+    }
+
+    // The record keeps the samples' offsets and phase within one repeat, so they repeat whatever the material's addressing.
+    const uint32_t samplerIndex = trackSampler(patchSampler(filter, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                                                            VK_SAMPLER_ADDRESS_MODE_REPEAT, {}));
+    return RtFlowLayerMaterial {
+      samplerIndex, samples, sampleCount,
+      maskTextureIndex, maskTransform, maskChannel, maskIsSrgb, maskScale, maskBias,
+      strength, roughness, maskSecondaryUv, blend, blendIsSrgb
+    };
+  }
 
   RtTranslucentSurfaceMaterial SceneManager::createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
                                                                               uint32_t samplerIndex,

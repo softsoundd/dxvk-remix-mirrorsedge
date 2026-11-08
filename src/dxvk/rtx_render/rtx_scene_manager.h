@@ -312,6 +312,10 @@ private:
   RtTranslucentSurfaceMaterial createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
                                                                 uint32_t samplerIndex,
                                                                 bool hasTexcoords);
+  // Builds an opaque surface's flow layer, the one its Toolkit material authors or else the game's.
+  std::optional<RtFlowLayerMaterial> createFlowLayerMaterial(const MaterialData& renderMaterialData,
+                                                             const DrawCallState& drawCallState,
+                                                             bool hasTexcoords);
   Rc<DxvkSampler> getOrCreateExternalSampler();
 
   // Acquire/update stable buffer-cache slots for all geometry buffers in geo.

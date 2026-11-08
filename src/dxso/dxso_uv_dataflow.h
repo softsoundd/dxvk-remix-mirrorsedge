@@ -106,10 +106,21 @@ namespace dxvk {
   // Output register of a vertex shader's TEXCOORD<usageIndex> interpolant, or UINT32_MAX.
   uint32_t findVsTexcoordOutputRegister(const DxsoIsgn& osgn, uint32_t usageIndex);
 
+  // Describes one texture read's coordinate, before analyzePsSamplerUvOrigins folds a sampler's reads together.
+  struct PsSampleSiteUv {
+    // Is the read's instruction index.
+    uint32_t instruction = 0;
+    uint8_t sampler = 0;
+    // Holds the read's own origin, as if the sampler were read only there.
+    PsSamplerUvOrigin uv;
+  };
+
   // trace, when given, collects an instruction-level trace (test_dxso_uv_dataflow's dump mode).
+  // outSites, when given, receives every read in program order.
   void analyzePsSamplerUvOrigins(const DxsoShaderView& pixelShader,
                                  std::array<PsSamplerUvOrigin, kDxsoMaxPsSamplers>& outOrigins,
-                                 std::vector<std::string>* trace = nullptr);
+                                 std::vector<std::string>* trace = nullptr,
+                                 std::vector<PsSampleSiteUv>* outSites = nullptr);
 
   // Which IA texcoord set feeds components compU and compV of a vertex shader output, and how.
   Ue3VsTexcoordTraceResult traceVsOutputTexcoordToInputUsageIndex(const DxsoShaderView& vertexShader,

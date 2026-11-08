@@ -1422,9 +1422,13 @@ namespace dxvk {
   // Resolves the exact coordinate origin for every sampler of a pixel shader in one pass.
   void analyzePsSamplerUvOrigins(const DxsoShaderView& pixelShader,
                                  std::array<PsSamplerUvOrigin, kDxsoMaxPsSamplers>& outOrigins,
-                                 std::vector<std::string>* trace) {
+                                 std::vector<std::string>* trace,
+                                 std::vector<PsSampleSiteUv>* outSites) {
     for (auto& origin : outOrigins) {
       origin = PsSamplerUvOrigin{};
+    }
+    if (outSites != nullptr) {
+      outSites->clear();
     }
 
     if (pixelShader.tokens == nullptr || pixelShader.info == nullptr || pixelShader.isgn == nullptr) {
@@ -1581,6 +1585,21 @@ namespace dxvk {
             projected ? " projected" : "",
             " => valid=", site.valid ? 1 : 0,
             siteDetail));
+        }
+
+        if (outSites != nullptr) {
+          PsSampleSiteUv& out = outSites->emplace_back();
+          out.instruction = ctx.instructionIdx;
+          out.sampler = uint8_t(sampledSampler);
+          out.uv.originValid = site.valid;
+          out.uv.semanticIndex = site.semanticIndex;
+          out.uv.compU = site.compU;
+          out.uv.compV = site.compV;
+          out.uv.affineU = site.affineU;
+          out.uv.affineV = site.affineV;
+          out.uv.affineExact = site.affineExact;
+          out.uv.validSiteCount = site.valid ? 1 : 0;
+          out.uv.invalidSiteCount = site.valid ? 0 : 1;
         }
 
         if (site.valid) {

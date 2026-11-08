@@ -342,6 +342,19 @@ enum Enum {
   EmissiveTex,
   EnableEmission,
   EmissiveIntensity,
+  FlowNormalTex,
+  FlowNormalEncoding,
+  FlowTextureScale,
+  FlowTextureOffset,
+  FlowTextureRotation,
+  FlowScrollRate,
+  FlowScrollAngle,
+  FlowNormalStrength,
+  FlowRoughness,
+  FlowMaskTex,
+  FlowMaskChannel,
+  FlowMaskScale,
+  FlowMaskOffset,
 };
 static std::unordered_map<Enum,std::string> attrNames {
   {OutputsOut,       "outputs:out"},
@@ -357,6 +370,19 @@ static std::unordered_map<Enum,std::string> attrNames {
   {EmissiveTex,      "inputs:emissive_mask_texture"},
   {EnableEmission,   "inputs:enable_emission"},
   {EmissiveIntensity,"inputs:emissive_intensity"},
+  {FlowNormalTex,      "inputs:flow_normalmap_texture"},
+  {FlowNormalEncoding, "inputs:flow_normalmap_encoding"},
+  {FlowTextureScale,   "inputs:flow_texture_scale"},
+  {FlowTextureOffset,  "inputs:flow_texture_offset"},
+  {FlowTextureRotation,"inputs:flow_texture_rotation"},
+  {FlowScrollRate,     "inputs:flow_texture_scroll_rate"},
+  {FlowScrollAngle,    "inputs:flow_texture_scroll_angle"},
+  {FlowNormalStrength, "inputs:flow_normal_strength"},
+  {FlowRoughness,      "inputs:flow_roughness"},
+  {FlowMaskTex,        "inputs:flow_mask_texture"},
+  {FlowMaskChannel,    "inputs:flow_mask_channel"},
+  {FlowMaskScale,      "inputs:flow_mask_scale"},
+  {FlowMaskOffset,     "inputs:flow_mask_offset"},
 };
 static std::unordered_map<Enum,AttrDesc> attrDescs{
   AttrDescMapEntry(OutputsOut,       Token, false, Varying),
@@ -372,7 +398,28 @@ static std::unordered_map<Enum,AttrDesc> attrDescs{
   AttrDescMapEntry(EmissiveTex,       Asset, false, Varying),
   AttrDescMapEntry(EnableEmission,    Bool, false, Uniform),
   AttrDescMapEntry(EmissiveIntensity, Float, false, Varying),
+  AttrDescMapEntry(FlowNormalTex,       Asset, false, Varying),
+  AttrDescMapEntry(FlowNormalEncoding,  Int, false, Uniform),
+  AttrDescMapEntry(FlowTextureScale,    Float2, false, Uniform),
+  AttrDescMapEntry(FlowTextureOffset,   Float2, false, Uniform),
+  AttrDescMapEntry(FlowTextureRotation, Float, false, Uniform),
+  AttrDescMapEntry(FlowScrollRate,      Float, false, Uniform),
+  AttrDescMapEntry(FlowScrollAngle,     Float, false, Uniform),
+  AttrDescMapEntry(FlowNormalStrength,  Float, false, Uniform),
+  AttrDescMapEntry(FlowRoughness,       Float, false, Uniform),
+  AttrDescMapEntry(FlowMaskTex,         Asset, false, Varying),
+  AttrDescMapEntry(FlowMaskChannel,     Int, false, Uniform),
+  AttrDescMapEntry(FlowMaskScale,       Float2, false, Uniform),
+  AttrDescMapEntry(FlowMaskOffset,      Float2, false, Uniform),
 };
+
+bool isFlowMaskAttr(const Enum attr) {
+  return attr == FlowMaskTex || attr == FlowMaskChannel || attr == FlowMaskScale || attr == FlowMaskOffset;
+}
+
+bool isFlowAttr(const Enum attr) {
+  return attr >= FlowNormalTex && attr <= FlowMaskOffset;
+}
 }
 }
 
@@ -424,6 +471,10 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
            attrEnum == ShaderAttr::EmissiveIntensity) && matData.emissiveTexPath.empty()) {
         continue;
       }
+      if ((ShaderAttr::isFlowAttr(attrEnum) && matData.flowLayer.normalTexPath.empty()) ||
+          (ShaderAttr::isFlowMaskAttr(attrEnum) && matData.flowLayer.maskTexPath.empty())) {
+        continue;
+      }
       shaderAttrs[attrEnum] =
         shaderPrim.CreateAttribute(desc.attrName, desc.typeName, desc.custom, desc.sdfVariability);
       // Cannot assert. Attr "outputs:out" asserts false, but authoring + Setting works just fine.
@@ -459,6 +510,32 @@ void GameExporter::exportMaterials(const Export& exportData, ExportContext& ctx)
       shaderAttrs[ShaderAttr::EmissiveTex].SetColorSpace(pxr::TfToken("auto"));
       ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::EnableEmission].Set(true));
       ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::EmissiveIntensity].Set(matData.emissiveIntensity));
+    }
+
+    const lss::Material::FlowLayer& flowLayer = matData.flowLayer;
+    if (!flowLayer.normalTexPath.empty()) {
+      const auto relToMaterialsTexPath =
+        std::filesystem::relative(computeLocalPath(flowLayer.normalTexPath), fullMaterialBasePath).string();
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowNormalTex].Set(pxr::SdfAssetPath(relToMaterialsTexPath)));
+      shaderAttrs[ShaderAttr::FlowNormalTex].SetColorSpace(pxr::TfToken("raw"));
+      // The game's normal maps are exported as they are, 3 channels decoded as 2 * t - 1.
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowNormalEncoding].Set(int(lss::Mdl::NormalEncoding::TangentSpaceDx)));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowTextureScale].Set(flowLayer.textureScale));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowTextureOffset].Set(flowLayer.textureOffset));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowTextureRotation].Set(flowLayer.textureRotation));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowScrollRate].Set(flowLayer.scrollRate));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowScrollAngle].Set(flowLayer.scrollAngle));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowNormalStrength].Set(flowLayer.normalStrength));
+      ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowRoughness].Set(flowLayer.roughness));
+      if (!flowLayer.maskTexPath.empty()) {
+        const auto relToMaterialsMaskPath =
+          std::filesystem::relative(computeLocalPath(flowLayer.maskTexPath), fullMaterialBasePath).string();
+        ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowMaskTex].Set(pxr::SdfAssetPath(relToMaterialsMaskPath)));
+        shaderAttrs[ShaderAttr::FlowMaskTex].SetColorSpace(pxr::TfToken("raw"));
+        ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowMaskChannel].Set(flowLayer.maskChannel));
+        ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowMaskScale].Set(flowLayer.maskScale));
+        ASSERT_OR_EXECUTE(shaderAttrs[ShaderAttr::FlowMaskOffset].Set(flowLayer.maskOffset));
+      }
     }
 
     // Create and set OmniPBR MDL boilerplate attributes on shader

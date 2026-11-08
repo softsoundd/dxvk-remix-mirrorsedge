@@ -51,6 +51,31 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // NV-DXVK end
 // Is set when maskLayerIndex names a MaskLayerMaterial in the surface material extensions.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(8))
+// Is set when flowLayerIndex names a FlowLayerMaterial in the surface material extensions.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_FLOW_LAYER (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(9))
+
+// FlowLayerMaterial::flags holds the sample count in its low bits and these flags above it.
+#define FLOW_LAYER_MATERIAL_SAMPLE_COUNT_MASK 0x3
+// Is set when a sample's normal map is octahedral, as the Toolkit ingests them, rather than RGB decoded as 2 * t - 1.
+#define FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_0 (1 << 2)
+#define FLOW_LAYER_MATERIAL_FLAG_OCTAHEDRAL_1 (1 << 3)
+#define FLOW_LAYER_MATERIAL_FLAG_HAS_MASK (1 << 4)
+#define FLOW_LAYER_MATERIAL_MASK_CHANNEL_SHIFT 5
+#define FLOW_LAYER_MATERIAL_FLAG_MASK_SRGB (1 << 7)
+// Is set when the layer blends the surface's normal towards sample 0 rather than adding its samples up. The blend's weight is
+// weights.y times the texel channel sample 1's x component names, times the mask.
+#define FLOW_LAYER_MATERIAL_FLAG_BLEND (1 << 8)
+// Is set when the game samples the blend's weight as sRGB.
+#define FLOW_LAYER_MATERIAL_FLAG_BLEND_SRGB (1 << 9)
+// Are set when sample 0, sample 1 or the mask reads the surface's second UV set rather than its texture coordinates.
+#define FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_0 (1 << 10)
+#define FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_1 (1 << 11)
+#define FLOW_LAYER_MATERIAL_FLAG_SECONDARY_UV_MASK (1 << 12)
+// FlowLayerMaterial::components holds 8 bits per sample, sample 0 lowest: the texel channels of the normal's x, y and z in
+// 2 bits each, this bit when z is reconstructed from x and y,
+#define FLOW_LAYER_MATERIAL_COMPONENT_Z_ABSENT (1 << 6)
+// and this bit when y is negated, for an RGB normal map with an OpenGL style green channel.
+#define FLOW_LAYER_MATERIAL_COMPONENT_NEGATE_Y (1 << 7)
 
 // MaskLayerMaterial::maskChannelAndFlags holds the mask channel in its low bits and these flags above it.
 #define MASK_LAYER_MATERIAL_CHANNEL_MASK 0x3

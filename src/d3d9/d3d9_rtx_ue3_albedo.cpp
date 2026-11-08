@@ -60,27 +60,22 @@
 
 namespace dxvk {
 
+  bool ue3CacheFileExists(const char* path) {
+    std::error_code error;
+    return std::filesystem::exists(path, error);
+  }
+
+  bool ue3CommitCacheFile(const char* tempPath, const char* path) {
+    std::error_code error;
+    std::filesystem::rename(tempPath, path, error);
+    if (error) {
+      std::filesystem::remove(tempPath, error);
+      return false;
+    }
+    return true;
+  }
+
   namespace {
-    // A save rewrites the whole file from memory, so a load that read less than the file holds must block
-    // saving for the session. "Absent" is told apart from "unreadable" so that a first run still saves.
-    bool ue3CacheFileExists(const char* path) {
-      std::error_code error;
-      return std::filesystem::exists(path, error);
-    }
-
-    // Publishes a fully written temp file over the real one, so a process that dies mid-write
-    // leaves the previous cache intact rather than a truncated file that the next load would
-    // read as a short but well-formed one.
-    bool ue3CommitCacheFile(const char* tempPath, const char* path) {
-      std::error_code error;
-      std::filesystem::rename(tempPath, path, error);
-      if (error) {
-        std::filesystem::remove(tempPath, error);
-        return false;
-      }
-      return true;
-    }
-
     // Both learned caches are rewritten whole, so they are saved on an interval rather than on
     // every change; the destructor flushes whatever the last interval missed.
     constexpr uint32_t kUe3CacheSaveIntervalFrames = 600;

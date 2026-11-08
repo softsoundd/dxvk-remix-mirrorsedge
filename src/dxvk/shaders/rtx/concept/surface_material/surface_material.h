@@ -105,10 +105,14 @@ struct OpaqueSurfaceMaterial
   // 28-29
   uint dlssControlMask;
 
+  // 30
+  // Indexes a FlowLayerMaterial in surfaceMaterialExtensions when OPAQUE_SURFACE_MATERIAL_FLAG_HAS_FLOW_LAYER is set.
+  uint16_t flowLayerIndex;
+
   // Todo: Fixed function blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[2];
+  uint16_t data[1];
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
@@ -203,6 +207,54 @@ struct MaskLayerMaterial
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
   uint16_t data[19];
+};
+
+// Describes the normal maps a flow layer scrolls over an opaque surface, blended into its normal by a mask.
+// Each sample maps the surface's texture coordinates, or its second UV set, through its own affine and scrolls at its
+// own velocity. With FLOW_LAYER_MATERIAL_FLAG_BLEND, sample 1 is instead the scrolling weight by which the surface's
+// normal blends towards sample 0's. See "Flow layers" in UE3Compatibility.md.
+struct FlowLayerMaterial
+{
+  // 0-3
+  // Holds the sample count and the FLOW_LAYER_MATERIAL_FLAG_* bits.
+  uint16_t flags;
+  // Is the samples' sampler, which repeats. The mask reads through the surface's own.
+  uint16_t samplerIndex;
+  uint16_t normalTextureIndex0;
+  uint16_t normalTextureIndex1;
+
+  // 4-5
+  uint16_t maskTextureIndex;
+  // Holds each sample's normal channels, as FlowLayerMaterial::components describes in shared_constants.h.
+  uint16_t components;
+
+  // 6-13
+  // The sample's coordinates are (dot(row0, uv), dot(row1, uv)) + offset, plus velocity times the time.
+  f16vec2 row0Sample0;
+  f16vec2 row1Sample0;
+  f16vec2 offsetSample0;
+  f16vec2 velocitySample0;
+
+  // 14-21
+  f16vec2 row0Sample1;
+  f16vec2 row1Sample1;
+  f16vec2 offsetSample1;
+  f16vec2 velocitySample1;
+
+  // 22-23
+  // Weigh the samples. With a blend, y scales the weight's channel instead.
+  f16vec2 weights;
+
+  // 24-27
+  // Maps the surface's texture coordinates to the mask's, as coordinates * scale + offset: (scale U, scale V, offset U, offset V).
+  f16vec4 maskTransform;
+
+  // 28-31
+  // The mask is saturate(maskScaleBias.y + maskScaleBias.x * channel).
+  f16vec2 maskScaleBias;
+  float16_t strength;
+  // Is the roughness where the mask is 1, or negative to keep the surface's own.
+  float16_t roughness;
 };
 
 struct SubsurfaceMaterialInteraction

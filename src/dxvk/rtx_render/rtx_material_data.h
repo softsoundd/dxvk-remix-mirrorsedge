@@ -22,6 +22,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bitset>
 #include <cmath>
 #include <cstring>
 #include <type_traits>
@@ -44,6 +45,21 @@
   X(TextureOffset,      texture_offset,       Vector2, Vector2(-65504.f), Vector2(65504.f), Vector2(0.f)) \
   X(TextureRotation,    texture_rotation,     float,   -65504.f,         65504.f,         0.f)
 
+// See "Flow layers" in UE3Compatibility.md.
+#define LIST_FLOW_LAYER_CONSTANTS(X) \
+  X(EnableFlowLayer,        enable_flow_layer,         bool,    false,             true,             true) \
+  X(FlowNormalEncoding,     flow_normalmap_encoding,   uint8_t, 0,                 2,                0) \
+  X(FlowMaskChannel,        flow_mask_channel,         uint8_t, 0,                 3,                0) \
+  X(FlowMaskScale,          flow_mask_scale,           Vector2, Vector2(-65504.f), Vector2(65504.f), Vector2(1.f)) \
+  X(FlowMaskOffset,         flow_mask_offset,          Vector2, Vector2(-65504.f), Vector2(65504.f), Vector2(0.f)) \
+  X(FlowTextureScale,       flow_texture_scale,        Vector2, Vector2(-65504.f), Vector2(65504.f), Vector2(1.f)) \
+  X(FlowTextureOffset,      flow_texture_offset,       Vector2, Vector2(-65504.f), Vector2(65504.f), Vector2(0.f)) \
+  X(FlowTextureRotation,    flow_texture_rotation,     float,   -65504.f,          65504.f,          0.f) \
+  X(FlowTextureScrollRate,  flow_texture_scroll_rate,  float,   -65504.f,          65504.f,          0.f) \
+  X(FlowTextureScrollAngle, flow_texture_scroll_angle, float,   -65504.f,          65504.f,          0.f) \
+  X(FlowNormalStrength,     flow_normal_strength,      float,   0.f,               16.f,             1.f) \
+  X(FlowRoughness,          flow_roughness,            float,   -1.f,              1.f,              -1.f)
+
 #define LIST_OPAQUE_MATERIAL_TEXTURES(X) \
   /*Parameter Name,                          USD Token String,                     Type,       UNUSED...   Default Value */ \
   X(AlbedoOpacityTexture,                    diffuse_texture,                      TextureRef, void, void, {}) \
@@ -57,7 +73,9 @@
   X(SubsurfaceThicknessTexture,              subsurface_thickness_texture,         TextureRef, void, void, {}) \
   X(SubsurfaceSingleScatteringAlbedoTexture, subsurface_single_scattering_texture, TextureRef, void, void, {}) \
   X(SubsurfaceRadiusTexture,                 subsurface_radius_texture,            TextureRef, void, void, {}) \
-  X(SecondaryTexture,                        secondary_texture,                    TextureRef, void, void, {})
+  X(SecondaryTexture,                        secondary_texture,                    TextureRef, void, void, {}) \
+  X(FlowNormalTexture,                       flow_normalmap_texture,               TextureRef, void, void, {}) \
+  X(FlowMaskTexture,                         flow_mask_texture,                    TextureRef, void, void, {})
 
 
 #define LIST_OPAQUE_MATERIAL_CONSTANTS(X) \
@@ -105,7 +123,8 @@
   X(DLSSControlMaskIntensity,         dlss_control_mask_intensity,            float,          0.f,                        1.f,                        1.f) \
   X(DLSSControlMaskToneStrength,      dlss_control_mask_tone_strength,        float,          0.f,                        1.f,                        0.3f) \
   X(DLSSControlMaskStructuralStrength, dlss_control_mask_structural_strength, float,          0.f,                        1.f,                        0.7f) \
-  LIST_TEXTURE_TRANSFORM_CONSTANTS(X)
+  LIST_TEXTURE_TRANSFORM_CONSTANTS(X) \
+  LIST_FLOW_LAYER_CONSTANTS(X)
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \
@@ -195,7 +214,7 @@
 
 #define WRITE_CONSTANT_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
       if(shader.HasAttribute(get##name##Token())) { \
-        static_assert(uint64_t(DirtyFlags::k_##name) < 64); \
+        static_assert(uint64_t(DirtyFlags::k_##name) < kMaterialDirtyFlagCount); \
         target.m_dirty.set(DirtyFlags::k_##name); \
         pxr::VtValue val; \
         shader.GetAttribute(get##name##Token()).Get(&val); \
@@ -205,7 +224,7 @@
 
 #define WRITE_TEXTURE_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
       if(shader.HasAttribute(get##name##Token())) { \
-        static_assert(uint64_t(DirtyFlags::k_##name) < 64); \
+        static_assert(uint64_t(DirtyFlags::k_##name) < kMaterialDirtyFlagCount); \
         target.m_dirty.set(DirtyFlags::k_##name); \
         target.m_##name = TextureRef(getTexture(shader, get##name##Token())); \
       }
@@ -332,7 +351,7 @@ private:                                                                        
     X_PARAMS(WRITE_DIRTY_FLAGS)                                                                      \
   };                                                                                                 \
                                                                                                      \
-  Flags<DirtyFlags> m_dirty { 0 };                                                                   \
+  MaterialDirtyFlags<DirtyFlags> m_dirty { 0 };                                                      \
   XXH64_hash_t m_cachedHash { 0 };                                                                   \
   Rc<DxvkSampler> m_samplerOverride = nullptr;                                                       \
   bool m_ignoreAlphaChannelOverride = false;                                                         \
@@ -340,6 +359,19 @@ private:                                                                        
 };
 
 namespace dxvk {
+  constexpr size_t kMaterialDirtyFlagCount = 128;
+
+  // Marks the parameters a material sets, one flag each. The opaque material has more parameters than a 64-bit Flags holds.
+  template<typename T>
+  class MaterialDirtyFlags {
+  public:
+    MaterialDirtyFlags(const uint64_t bits = 0) : m_bits(bits) { }
+    void set(const T flag) { m_bits.set(static_cast<size_t>(flag)); }
+    bool test(const T flag) const { return m_bits.test(static_cast<size_t>(flag)); }
+  private:
+    std::bitset<kMaterialDirtyFlagCount> m_bits;
+  };
+
   // USD holds what the MDL declares: 'int' for the enum and 8-bit count parameters and 'float' for the
   // 0..1 alpha test reference, while the material stores uint8_t. VtValue::UncheckedGet reinterprets the
   // held storage when the types differ (a float 0.5 read as uint8_t is its low byte, 0), so convert by
@@ -386,6 +418,7 @@ namespace dxvk {
 }
 
 #undef LIST_TEXTURE_TRANSFORM_CONSTANTS
+#undef LIST_FLOW_LAYER_CONSTANTS
 #undef LIST_OPAQUE_MATERIAL_TEXTURES
 #undef LIST_OPAQUE_MATERIAL_CONSTANTS
 #undef LIST_OPAQUE_MATERIAL_PARAMS

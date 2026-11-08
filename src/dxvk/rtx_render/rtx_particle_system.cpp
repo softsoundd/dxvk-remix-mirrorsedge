@@ -882,7 +882,10 @@ namespace dxvk {
       gpuCtx.spawnMeshPositionsIdx = pTargetInstance->surface.positionBufferIndex;
       gpuCtx.spawnMeshPrevPositionsIdx = pTargetInstance->surface.previousPositionBufferIndex;
 
-      gpuCtx.spawnMeshColorsIdx = pTargetInstance->surface.color0BufferIndex;
+      // A UE3 flow layer's second UV set is no colour to spawn with.
+      gpuCtx.spawnMeshColorsIdx = pTargetInstance->surface.color0IsTexcoord
+        ? kSurfaceInvalidBufferIndex
+        : pTargetInstance->surface.color0BufferIndex;
       gpuCtx.spawnMeshTexcoordsIdx = pTargetInstance->surface.texcoordBufferIndex;
       gpuCtx.spawnMeshPositionsOffset = pTargetInstance->surface.positionOffset;
       gpuCtx.spawnMeshPositionsStride = pTargetInstance->surface.positionStride;

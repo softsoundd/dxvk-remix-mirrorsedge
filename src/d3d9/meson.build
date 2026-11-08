@@ -97,6 +97,9 @@ d3d9_src = [
   'd3d9_rtx_ue3_classify.cpp',
   'd3d9_rtx_ue3_composite.cpp',
   'd3d9_rtx_ue3_diagnostics.cpp',
+  # NV-DXVK start: UE3 flow layers
+  'd3d9_rtx_ue3_flow.cpp',
+  # NV-DXVK end
   'd3d9_rtx_ue3_geometry_hash.cpp',
   'd3d9_rtx_ue3_instancing.cpp',
   'd3d9_rtx_ue3_material.cpp',

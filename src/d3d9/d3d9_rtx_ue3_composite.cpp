@@ -752,6 +752,16 @@ namespace dxvk {
     setRegisters(info.upperSkyColorRegister, 1, zero, zero);
     setRegisters(info.lowerSkyColorRegister, 1, zero, zero);
 
+    if (const DxsoUe3FlowShaderInfo* flow = getUe3FlowShaderForBake(ue3)) {
+      for (uint32_t s = 0; s < caps::MaxTexturesPS; s++) {
+        if ((flow->flowSamplerMask >> s) & 1u) {
+          const auto shaderSampler = RemapStateSamplerShader(s);
+          request->flatNormalTextureSlots.push_back(
+            computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second)));
+        }
+      }
+    }
+
     if (domain.mask.has_value()) {
       const uint32_t stage = domain.mask->stage;
       Ue3CompositeBakeRequest::Mask mask;
@@ -924,13 +934,20 @@ namespace dxvk {
       state.hasDomain = false;
     }
 
-    // A bake is only current for the material constant values it ran with, so they are part of its key.
+    // A bake is only current for the material constant values it ran with, so they are part of its key. A flow layer's
+    // samples are bound flat for the bake and scroll over it instead (rtx.d3d9.ue3FlowLayers), so the registers only they
+    // are offset by, its panners, are not.
+    const DxsoUe3FlowShaderInfo* const flow = getUe3FlowShaderForBake(ue3);
+    auto isFlowOnlyRegister = [&](const uint32_t reg) {
+      return flow != nullptr &&
+             std::find(flow->exclusiveOffsetRegisters.begin(), flow->exclusiveOffsetRegisters.end(), reg) != flow->exclusiveOffsetRegisters.end();
+    };
     XXH3_state_t* const hashState = getThreadLocalXxh3State();
     XXH64_hash_t constantsHash = kEmptyHash;
     if (hashState != nullptr && !info.materialConstantRegisters.empty()) {
       XXH3_64bits_reset(hashState);
       for (const uint32_t reg : info.materialConstantRegisters) {
-        if (reg < caps::MaxFloatConstantsPS) {
+        if (reg < caps::MaxFloatConstantsPS && !isFlowOnlyRegister(reg)) {
           XXH3_64bits_update(hashState, &d3d9State().psConsts.fConsts[reg], sizeof(Vector4));
         }
       }
@@ -947,7 +964,7 @@ namespace dxvk {
       uint32_t texcoordComps;
       uint32_t storeEmission;
       float multiplyScale;
-      uint32_t padding;
+      uint32_t flatNormalSamplers;
       XXH64_hash_t materialHash;
       XXH64_hash_t psHash;
       XXH64_hash_t texturesHash;
@@ -964,6 +981,7 @@ namespace dxvk {
     record.texcoordComps = (uint32_t(m_texcoordCompU) << 8) | uint32_t(m_texcoordCompV);
     record.storeEmission = domain.storeEmission;
     record.multiplyScale = domain.multiplyScale;
+    record.flatNormalSamplers = flow != nullptr ? flow->flowSamplerMask : 0u;
     record.materialHash = materialHash;
     record.psHash = ue3.inferredPsHash;
     record.texturesHash = domain.texturesHash;

@@ -65,6 +65,7 @@ namespace dxvk {
     // EndFrame saves on an interval, so the tail of a session would otherwise be lost.
     m_ue3TextureSpreadCache.save();
     m_ue3DiffuseSelectionCache.save();
+    m_ue3FlowSpeedCache.save();
   }
 
   D3D9Rtx::GeometryProcessor& D3D9Rtx::getGeometryWorkers() {
@@ -186,6 +187,10 @@ namespace dxvk {
     o.ue3CompositeMaxResolution = ue3CompositeMaxResolutionObject().get();
     o.ue3CompositeEmission = ue3CompositeEmissionObject().get();
     o.ue3LogCompositeMaterials = ue3LogCompositeMaterialsObject().get();
+    o.ue3FlowLayers = ue3FlowLayersObject().get() && o.ue3EngineMode;
+    o.ue3FlowLayerStrength = ue3FlowLayerStrengthObject().get();
+    o.ue3FlowLayerRoughness = ue3FlowLayerRoughnessObject().get();
+    o.ue3LogFlowLayers = ue3LogFlowLayersObject().get();
     o.ue3LogCapturePrecision = ue3LogCapturePrecisionObject().get();
     o.ue3LogInstancedDraws = ue3LogInstancedDrawsObject().get();
     o.deferredUiReplay = deferredUiReplayObject().get();
@@ -230,6 +235,7 @@ namespace dxvk {
     o.ue3MicIdentityExcludedTextureDescHashes = &s.ue3MicIdentityExcludedTextureDescHashes;
     o.ue3HighlightTintExcludedMaterials = &s.ue3HighlightTintExcludedMaterials;
     o.ue3MaterialFadeExcludedMaterials = &s.ue3MaterialFadeExcludedMaterials;
+    o.ue3FlowLayerExcludedTextures = &s.ue3FlowLayerExcludedTextures;
     o.ue3TraceDrawTextureHashes = &s.ue3TraceDrawTextureHashes;
     o.replacementDebugHashes = &s.replacementDebugHashes;
 
@@ -261,6 +267,7 @@ namespace dxvk {
       { &s.ue3MicIdentityExcludedTextureDescHashes, &ue3MicIdentityExcludedTextureDescHashesObject().get() },
       { &s.ue3HighlightTintExcludedMaterials, &ue3HighlightTintExcludedMaterialsObject().get() },
       { &s.ue3MaterialFadeExcludedMaterials, &ue3MaterialFadeExcludedMaterialsObject().get() },
+      { &s.ue3FlowLayerExcludedTextures, &ue3FlowLayerExcludedTexturesObject().get() },
       { &s.ue3TraceDrawTextureHashes, &ue3TraceDrawTextureHashesObject().get() },
       { &s.replacementDebugHashes, &RtxOptions::replacementDebugHashesObject().get() },
     };
@@ -534,6 +541,8 @@ namespace dxvk {
     const bool normalFromBinormal =
       m_currentUe3VertexFactory == Ue3VertexFactoryType::ParticleInstancedMesh;
 
+    m_ue3FlowSecondaryTexcoords = RasterBuffer();
+
     // Process vertex buffers from CPU
     for (const auto& element : d3d9State().vertexDecl->GetElements()) {
       // Get vertex context
@@ -606,10 +615,8 @@ namespace dxvk {
         break;
       }
 
-      if (targetBuffer != nullptr) {
-        assert(!targetBuffer->defined());
-
-        // Only do once for each stream
+      // Only do once for each stream
+      auto ensureStreamCopy = [&]() -> const DxvkBufferSlice& {
         if (!streamCopies[element.Stream].defined()) {
           // Deep clonning a buffer object is not cheap (320 bytes to copy and other work). Set a min-size threshold.
           const uint32_t kMinSizeToClone = 512;
@@ -638,6 +645,41 @@ namespace dxvk {
             memcpy(streamCopies[element.Stream].mapPtr(0), (uint8_t*) ctx.mappedSlice.mapPtr + vertexOffset, numVertexBytes);
           }
         }
+        return streamCopies[element.Stream];
+      };
+
+      // Keeps a flow layer's second UV set as half2 in a 32 bit element, which is how the geometry's color0 slot carries it.
+      if (element.Usage == D3DDECLUSAGE_TEXCOORD && element.UsageIndex == m_ue3FlowSecondaryTexcoordSet &&
+          element.Type != D3DDECLTYPE_D3DCOLOR && !m_ue3FlowSecondaryTexcoords.defined()) {
+        const VkFormat format = DecodeDecltype(D3DDECLTYPE(element.Type));
+        const bool halves = format == VK_FORMAT_R16G16_SFLOAT || format == VK_FORMAT_R16G16B16A16_SFLOAT;
+        const bool floats = format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32_SFLOAT ||
+                            format == VK_FORMAT_R32G32B32A32_SFLOAT;
+        // The color0 slot is read a 32 bit word at a time.
+        if (halves && (vertexOffset + element.Offset) % 4 == 0 && ctx.stride % 4 == 0) {
+          m_ue3FlowSecondaryTexcoords = RasterBuffer(ensureStreamCopy(), element.Offset, ctx.stride, VK_FORMAT_B8G8R8A8_UNORM);
+        } else if ((halves || floats) && ctx.mappedSlice.mapPtr != nullptr && vertexOffset >= 0 &&
+                   ctx.mappedSlice.length >= VkDeviceSize(vertexOffset) + numVertexBytes) {
+          DxvkBufferSlice packed = m_rtStagingData.alloc(CACHE_LINE_SIZE, geoData.vertexCount * sizeof(uint32_t));
+          packed.buffer()->acquire(DxvkAccess::Read);
+          const uint8_t* source = static_cast<const uint8_t*>(ctx.mappedSlice.mapPtr) + vertexOffset + element.Offset;
+          uint32_t* destination = static_cast<uint32_t*>(packed.mapPtr(0));
+          for (uint32_t i = 0; i < geoData.vertexCount; i++) {
+            if (halves) {
+              memcpy(&destination[i], source + size_t(i) * ctx.stride, sizeof(uint32_t));
+            } else {
+              float uv[2];
+              memcpy(uv, source + size_t(i) * ctx.stride, sizeof(uv));
+              destination[i] = uint32_t(glm::packHalf1x16(uv[0])) | (uint32_t(glm::packHalf1x16(uv[1])) << 16);
+            }
+          }
+          m_ue3FlowSecondaryTexcoords = RasterBuffer(packed, 0, sizeof(uint32_t), VK_FORMAT_B8G8R8A8_UNORM);
+        }
+      }
+
+      if (targetBuffer != nullptr) {
+        assert(!targetBuffer->defined());
+        const DxvkBufferSlice& streamCopy = ensureStreamCopy();
 
         VkFormat fmt = DecodeDecltype(D3DDECLTYPE(element.Type));
         uint32_t elementOffset = element.Offset;
@@ -650,7 +692,7 @@ namespace dxvk {
         if (targetBuffer == &geoData.normalBuffer && fmt == VK_FORMAT_R8G8B8A8_USCALED) {
           fmt = VK_FORMAT_R8G8B8A8_UNORM;
         }
-        *targetBuffer = RasterBuffer(streamCopies[element.Stream], elementOffset, ctx.stride, fmt);
+        *targetBuffer = RasterBuffer(streamCopy, elementOffset, ctx.stride, fmt);
         assert(targetBuffer->offset() % 4 == 0);
       }
     }
@@ -668,6 +710,7 @@ namespace dxvk {
     m_activeDrawCallState.ue3CompositeDrawStateApplied = false;
     m_activeDrawCallState.ue3PassDescription = describeUe3PassType(m_currentUe3PassType);
     m_activeDrawCallState.isUe3ForegroundDpg = m_ue3ForegroundDpgActive;
+    m_ue3FlowSecondaryTexcoordSet = UINT32_MAX;
 
     const bool isUe3Mode = m_frameOptions.ue3EngineMode;
     const bool effectiveUseWorldMatricesForShaders = m_frameOptions.useWorldMatricesForShaders && !isUe3Mode;
@@ -1435,6 +1478,7 @@ namespace dxvk {
     if (needVertexCapture) {
       recordUe3StaticVertexCapture(staticCapture, reusedCachedVertexCapture, geoData);
     }
+    attachUe3FlowSecondaryTexcoords(geoData);
     phaseTimer.lap(RtxGpuPassTimer::CpuCounter::AppPrepCapture);
 
     m_activeDrawCallState.usesVertexShader = m_parent->UseProgrammableVS();
@@ -2041,7 +2085,8 @@ namespace dxvk {
       const uint8_t tssCompV = m_texcoordCompV;
       const Matrix4 shaderTextureTransform = m_activeDrawCallState.transformData.textureTransform;
       resolveUe3Texcoords(ue3, uvStage, stageStateIdx, texcoordIdx, iaTexcoordIdx);
-      if (!resolveUe3Composite(ue3, texcoordIdx) && uvStage != firstStage) {
+      const bool composite = resolveUe3Composite(ue3, texcoordIdx);
+      if (!composite && uvStage != firstStage) {
         // The composite does not apply after all, so the surface renders its pick through the pick's own UVs.
         texcoordIdx = tssTexcoordIdx;
         iaTexcoordIdx = tssIaTexcoordIdx;
@@ -2050,6 +2095,11 @@ namespace dxvk {
         m_uvResolutionMode = UvResolutionMode::LegacyTss;
         m_activeDrawCallState.transformData.textureTransform = shaderTextureTransform;
         resolveUe3Texcoords(ue3, firstStage, stageStateIdx, texcoordIdx, iaTexcoordIdx);
+      }
+      if (m_frameOptions.ue3FlowLayers) {
+        const auto compositeState = composite ? m_ue3CompositeMaterials.find(m_activeDrawCallState.materialData.getHash())
+                                              : m_ue3CompositeMaterials.end();
+        resolveUe3FlowLayers(ue3, compositeState != m_ue3CompositeMaterials.end() ? &compositeState->second.period : nullptr);
       }
     }
 
@@ -2345,6 +2395,7 @@ namespace dxvk {
     // persist what this session learned so the next one scores from it rather than re-converging
     m_ue3TextureSpreadCache.saveIfDue(currentReflexFrameId);
     m_ue3DiffuseSelectionCache.saveIfDue(currentReflexFrameId);
+    m_ue3FlowSpeedCache.saveIfDue(currentReflexFrameId);
 
     // Deferred overlays still pending mean no trigger draw fired this frame: inject here rather
     // than in endFrame's fallback, so they replay onto this frame's image. Frames not presenting

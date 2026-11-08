@@ -23,6 +23,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -36,6 +37,7 @@
 #include "../dxso/dxso_material_fades.h"
 #include "../dxso/dxso_sampler_inference.h"
 #include "../dxso/dxso_ue3_composite.h"
+#include "../dxso/dxso_ue3_flow_layers.h"
 #include "../dxso/dxso_ue3_material_identity.h"
 #include "../dxso/dxso_uv_dataflow.h"
 
@@ -584,6 +586,68 @@ namespace dxvk {
     float vsScaleV = 1.0f;
     float vsOffsetU = 0.0f;
     float vsOffsetV = 0.0f;
+    // Is set when the surface's texcoords are psAffine of the interpolant (semanticIndex, compU, compV), through the vertex
+    // shader's affine where vsAffineFold is set. psAffine is (a, b, c, d, tx, ty): u' = a u + b v + tx, v' = c u + d v + ty.
+    bool surfaceAffineResolved = false;
+    uint8_t semanticIndex = 0;
+    uint8_t compU = 0;
+    uint8_t compV = 1;
+    std::array<float, 6> psAffine = { 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f };
+  };
+
+  // Tracks the reads of a flow layer (rtx.d3d9.ue3FlowLayers) across draws of one material and pixel shader, measuring how
+  // fast each one pans. See "Flow layers" in UE3Compatibility.md.
+  struct Ue3FlowMaterialState {
+    struct SampleTrack {
+      // Describes a constant register component the read's coordinate is offset by, with its factor on one axis.
+      struct Contribution {
+        uint16_t reg = 0;
+        uint8_t component = 0;
+        uint8_t axis = 0;
+        float factor = 0.0f;
+        float lastValue = 0.0f;
+      };
+      std::vector<Contribution> contributions;
+      // Holds a window of frames in which the read moved, with each frame's displacement and duration.
+      std::vector<Vector2> windowDisplacement;
+      std::vector<double> windowSeconds;
+      double stillSeconds = 0.0;
+      bool latched = false;
+      Vector2 velocity = Vector2(0.0f);
+      // Holds the read's tiling when first seen, which a later draw has to repeat.
+      std::array<float, 4> linear = { 1.0f, 0.0f, 0.0f, 1.0f };
+      bool hasLinear = false;
+    };
+    std::array<SampleTrack, 2> samples;
+    bool initialized = false;
+    uint32_t lastObservedFrame = 0;
+    std::chrono::steady_clock::time_point lastObservedTime;
+    // Is set when the layer cannot be rendered, with refusal saying why, so that is decided and logged once.
+    bool refused = false;
+    std::string refusal;
+    bool loggedAttach = false;
+    // Is set when no read has moved for long enough to call the layer static.
+    bool still = false;
+  };
+
+  // Persists each panned read's measured speed to rtx-remix/ue3FlowLayers.cache, keyed by material, pixel shader and
+  // read, so a session, or a capture taken on its first frames, has it from the material's first draw.
+  class Ue3FlowSpeedCache {
+  public:
+    // Loads the file on first use.
+    const Vector2* find(XXH64_hash_t key);
+    void store(XXH64_hash_t key, const Vector2& velocity);
+    void saveIfDue(uint64_t frameId);
+    void save();
+
+  private:
+    void load();
+
+    fast_unordered_cache<Vector2> m_speeds;
+    bool m_loaded = false;
+    bool m_dirty = false;
+    bool m_saveBlocked = false;
+    uint32_t m_lastSaveFrame = 0;
   };
 
   // Describes one repeat of every layer of a composite material (rtx.ue3CompositeMaterialTextures), as solved

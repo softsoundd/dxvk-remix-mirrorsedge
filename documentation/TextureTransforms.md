@@ -17,6 +17,26 @@ The following parameters are available on the `AperturePBR_Opacity` and `Apertur
 | `texture_offset` | `(0, 0)` | Static sampling offset for all textures in UV units, added after scale and rotation. (0, 0) adds no offset. Positive V points down the image. Visible texture features move opposite the sampling offset. |
 | `texture_rotation` | `0` | Sampling rotation for all textures in degrees around the UV origin, which is the image's top-left corner, after scale and before offset. Positive angles rotate +U toward +V, which points down the image. 0 preserves orientation. |
 
+### Flow layer
+
+`AperturePBR_Opacity` can also scroll one normal map of its own over the surface, blended into its normal under a mask.
+The flow layer's controls work like the ones above, applied to the flow normal map alone and on top of the material's own transform:
+
+| Parameter | Default | Effect |
+| --- | --- | --- |
+| `flow_normalmap_texture` | | The normal map the flow layer scrolls. |
+| `flow_normalmap_encoding` | `octahedral` | `octahedral` for an ingested normal map, `tangent_space_dx` for a raw 3-channel one, and `tangent_space_ogl` for one with an OpenGL style green channel. |
+| `flow_texture_scale`, `flow_texture_offset`, `flow_texture_rotation` | `(1, 1)`, `(0, 0)`, `0` | Place the flow normal map relative to the material's UVs after `texture_scale`, `texture_offset` and `texture_rotation`, in the same order: scale, then rotation, then offset. The normal map's slopes turn with its rotation. |
+| `flow_texture_scroll_rate`, `flow_texture_scroll_angle` | `0`, `0` | Scroll the flow normal map in its own UVs, after its scale and rotation. |
+| `flow_mask_texture`, `flow_mask_channel` | | Confine the layer to where the chosen channel is 1. Without a mask, the layer covers the whole surface. |
+| `flow_mask_scale`, `flow_mask_offset` | `(1, 1)`, `(0, 0)` | Place the mask relative to the material's UVs after its own transform. |
+| `flow_normal_strength` | `1` | How far the layer tilts the surface normal. |
+| `flow_roughness` | `-1` | The roughness under the mask. Negative keeps the material's own. |
+| `enable_flow_layer` | `True` | Turns the layer off, including one the runtime detects in the game's material. |
+
+The flow layer is only rendered on opaque surfaces. In UE3 games the runtime also renders the normal detail the game's own material moves, unless a material authors its own flow normal map or turns the layer off.
+See [Flow layers](UE3Compatibility.md#flow-layers) for how the layers combine and how captures export them.
+
 ### How the controls combine
 
 The texture is scaled, then rotated, then offset and scrolled.

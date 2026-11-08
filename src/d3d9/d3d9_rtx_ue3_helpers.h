@@ -187,6 +187,15 @@ namespace dxvk {
 
   uint32_t digestTextureTags(const fast_unordered_set& tags);
 
+  // A save rewrites the whole file from memory, so a load that read less than the file holds must block
+  // saving for the session. "Absent" is told apart from "unreadable" so that a first run still saves.
+  bool ue3CacheFileExists(const char* path);
+
+  // Publishes a fully written temp file over the real one, so a process that dies mid-write
+  // leaves the previous cache intact rather than a truncated file that the next load would
+  // read as a short but well-formed one.
+  bool ue3CommitCacheFile(const char* tempPath, const char* path);
+
   extern fast_unordered_cache<Ue3MicIdentitySample> s_ue3MicIdentityByFamily;
 
   extern fast_unordered_set s_ue3MicRtPoisonWarnedFamilies;

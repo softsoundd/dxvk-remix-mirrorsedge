@@ -20,6 +20,9 @@ dxso_src = files([
   'dxso_sampler_inference.cpp',
   'dxso_ue3_material_identity.cpp',
   'dxso_ue3_composite.cpp',
+  # NV-DXVK start: UE3 flow layers
+  'dxso_ue3_flow_layers.cpp',
+  # NV-DXVK end
   'dxso_compiler.cpp',
   'dxso_enums.cpp'
 ])

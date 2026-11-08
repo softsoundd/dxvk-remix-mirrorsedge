@@ -5338,6 +5338,37 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
+    if (D3D9Rtx::ue3EngineMode() &&
+        RemixGui::CollapsingHeader("UE3 Flow Layers", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      ImGui::TextWrapped("The normal detail a material moves over its surface renders as a flow layer, at the speed the game "
+                         "moves it: normal maps it pans, blended into the surface normal by its own mask, or a panned texture "
+                         "that blends the surface normal towards another normal map.");
+      RemixGui::Checkbox("Enable Flow Layers", &D3D9Rtx::ue3FlowLayersObject());
+      RemixGui::DragFloat("Strength", &D3D9Rtx::ue3FlowLayerStrengthObject(), 0.01f, 0.f, 4.f);
+      RemixGui::SetTooltipToLastWidgetOnHover("Scales how far the flow layer tilts the surface normal. 1 matches the game.");
+      RemixGui::DragFloat("Roughness", &D3D9Rtx::ue3FlowLayerRoughnessObject(), 0.01f, -1.f, 1.f);
+      RemixGui::SetTooltipToLastWidgetOnHover(
+        "The roughness a surface without a Toolkit-authored material takes where the flow layer's mask is 1.\n"
+        "Negative keeps the surface's own roughness, as a blend between two normal maps always does.");
+      RemixGui::Checkbox("Log Flow Layers", &D3D9Rtx::ue3LogFlowLayersObject());
+
+      for (const D3D9Rtx::Ue3FlowLayerStatus& layer : D3D9Rtx::getUe3FlowLayerStatus()) {
+        std::string speeds;
+        for (uint32_t i = 0; i < layer.sampleCount && i < layer.velocities.size(); i++) {
+          speeds += str::format(i == 0 ? "" : ", ", "(", layer.velocities[i].x, ", ", layer.velocities[i].y, ") x", layer.weights[i]);
+        }
+        ImGui::Text("mat_%016llX  pick %016llX  %s%s%s%s",
+                    static_cast<unsigned long long>(layer.materialHash),
+                    static_cast<unsigned long long>(layer.pickHash),
+                    layer.state.empty() ? speeds.c_str() : layer.state.c_str(),
+                    layer.blend ? "  blend" : "",
+                    layer.masked ? "  masked" : "",
+                    layer.secondaryUv ? "  second UV set" : "");
+      }
+      ImGui::Unindent();
+    }
+
     if (RemixGui::CollapsingHeader("Player Model", collapsingHeaderClosedFlags)) {
       ImGui::Indent();
       RemixGui::Checkbox("Primary Shadows", &RtxOptions::PlayerModel::enablePrimaryShadowsObject());

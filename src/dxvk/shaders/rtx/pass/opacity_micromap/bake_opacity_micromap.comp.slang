@@ -91,7 +91,7 @@ void loadVertexData(uint triIdx, Surface surface, out float2 vertexTexcoords[3],
     // Get opacity
     vertexOpacities[i] = 1.0f;
 
-    if (surface.color0BufferIndex != BINDING_INDEX_INVALID)
+    if (surface.color0BufferIndex != BINDING_INDEX_INVALID && !surface.color0IsTexcoord)
     {
       const uint color0BufferIndex = surface.color0BufferIndex;
       const uint color0ElementIndex = (surface.color0Offset + index * uint(surface.color0Stride)) / 4;
@@ -110,7 +110,7 @@ void applyVertexAndTextureOperationsToOpacity(inout float opacity, vec3 albedo, 
   {
     float vertexInterpolatedOpacity = 1.0f;
 
-    if (surface.color0BufferIndex != BINDING_INDEX_INVALID)
+    if (surface.color0BufferIndex != BINDING_INDEX_INVALID && !surface.color0IsTexcoord)
     {
       vertexInterpolatedOpacity = interpolateHitAttribute(vertexOpacities, bary); 
     }
