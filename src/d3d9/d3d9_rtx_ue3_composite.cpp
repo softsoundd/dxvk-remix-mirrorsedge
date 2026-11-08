@@ -298,18 +298,22 @@ namespace dxvk {
       return info.refusalDetail.empty() ? refuse(reason) : refuse(reason, reason, " (", info.refusalDetail, ")");
     }
     // Remix derives a blend by colour alone, such as a modulated or additive one, from the surface colour,
-    // which the bake supplies. A blend by alpha would need the shader's alpha, which the bake keeps only as coverage.
+    // which the bake supplies. It renders the standard alpha blend by the albedo's alpha,
+    // which the bake fills with the shader's. Remix renders no other blend by alpha the way the game does.
     const bool blended = d3d9State().renderStates[D3DRS_ALPHABLENDENABLE];
     const DWORD srcBlend = d3d9State().renderStates[D3DRS_SRCBLEND];
     const DWORD dstBlend = d3d9State().renderStates[D3DRS_DESTBLEND];
-    if (blended && (blendFactorReadsAlpha(srcBlend) || blendFactorReadsAlpha(dstBlend))) {
+    const bool standardAlphaBlend = blended && d3d9State().renderStates[D3DRS_BLENDOP] == D3DBLENDOP_ADD &&
+                                    srcBlend == D3DBLEND_SRCALPHA && dstBlend == D3DBLEND_INVSRCALPHA;
+    if (blended && !standardAlphaBlend && (blendFactorReadsAlpha(srcBlend) || blendFactorReadsAlpha(dstBlend))) {
       return refuse("alpha blend", "the draw blends by alpha (", describeBlendFactor(srcBlend), ", ",
-                    describeBlendFactor(dstBlend), "), and the bake keeps its alpha only as coverage");
+                    describeBlendFactor(dstBlend),
+                    "), and the bake keeps the shader's alpha only for (SRCALPHA, INVSRCALPHA)");
     }
+    domain.opacityAlpha = standardAlphaBlend;
     domain.multiplyScale = blended ? multiplyBlendScale(d3d9State().renderStates[D3DRS_BLENDOP], srcBlend, dstBlend) : 0.0f;
 
-    // Decals are not among them: a decal category only changes how the surface layers over the one
-    // beneath, and a decal the game blends by alpha is refused above.
+    // Decals are not among them: a decal category only changes how the surface layers over the one beneath.
     if (m_activeDrawCallState.testCategoryFlags(InstanceCategories::Sky, InstanceCategories::Particle, InstanceCategories::Beam,
                                                 InstanceCategories::Terrain, InstanceCategories::WorldUI,
                                                 InstanceCategories::WorldMatte, InstanceCategories::AnimatedWater)) {
@@ -677,6 +681,10 @@ namespace dxvk {
       if (int32_t(element.regNumber) == info.alphaInputRegister) {
         interpolant.value.w = 1.0f;
       }
+      // A translucent material bakes unfogged, as Color * 1 + 0.
+      if (int32_t(element.regNumber) == info.fogInputRegister) {
+        interpolant.value = Vector4(0.0f, 0.0f, 0.0f, 1.0f);
+      }
       if (interpolant.slot < 32) {
         interpolants.push_back(interpolant);
       }
@@ -716,6 +724,7 @@ namespace dxvk {
     request->emissivePass = info.hasEmissive && info.lighting != DxsoUe3CompositeLighting::Unlit && domain.multiplyScale == 0.0f;
     request->storeEmission = domain.storeEmission;
     request->multiplyScale = domain.multiplyScale;
+    request->opacityAlpha = domain.opacityAlpha;
     request->uniformEmission = request->emissivePass &&
       std::none_of(info.layers.begin(), info.layers.end(), [](const DxsoUe3CompositeLayer& layer) { return layer.emissive; });
     request->coverageFromAlpha = info.hasTexkill;
@@ -979,12 +988,14 @@ namespace dxvk {
       uint32_t storeEmission;
       float multiplyScale;
       uint32_t flatNormalSamplers;
+      uint32_t opacityAlpha;
+      uint32_t padding;
       XXH64_hash_t materialHash;
       XXH64_hash_t psHash;
       XXH64_hash_t texturesHash;
       XXH64_hash_t constantsHash;
     };
-    static_assert(sizeof(KeyRecord) == 72, "KeyRecord is hashed by memory.");
+    static_assert(sizeof(KeyRecord) == 80, "KeyRecord is hashed by memory.");
     KeyRecord record = {};
     record.lighting = uint32_t(info.lighting);
     record.width = domain.width;
@@ -996,6 +1007,7 @@ namespace dxvk {
     record.storeEmission = domain.storeEmission;
     record.multiplyScale = domain.multiplyScale;
     record.flatNormalSamplers = flow != nullptr ? flow->flowSamplerMask : 0u;
+    record.opacityAlpha = domain.opacityAlpha;
     record.materialHash = materialHash;
     record.psHash = ue3.inferredPsHash;
     record.texturesHash = domain.texturesHash;
@@ -1045,6 +1057,9 @@ namespace dxvk {
             constants += str::format(constants.empty() ? "" : " ", "c", reg, "=(", value.x, ",", value.y, ",", value.z, ",", value.w, ")");
           }
         }
+        const char* blendNote = domain.multiplyScale > 0.0f
+          ? " baked as an alpha blend"
+          : domain.opacityAlpha ? " baked with its opacity" : "";
         Logger::info(str::format(
           "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash,
           " textureSetShader=0x", textureSetShaderHash, " pick=0x", pickHash, " key=0x", key, std::dec,
@@ -1054,8 +1069,7 @@ namespace dxvk {
           " coverage=", request->coverageFromAlpha ? 1 : 0,
           d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]
             ? str::format(" blend=(", describeBlendFactor(d3d9State().renderStates[D3DRS_SRCBLEND]), ", ",
-                          describeBlendFactor(d3d9State().renderStates[D3DRS_DESTBLEND]), ")",
-                          domain.multiplyScale > 0.0f ? " baked as an alpha blend" : "")
+                          describeBlendFactor(d3d9State().renderStates[D3DRS_DESTBLEND]), ")", blendNote)
             : std::string(),
           info.viewDependent ? " view-dependent terms baked face-on" : "",
           " layers=[", described.description, "] constants=[", constants, "] repeat=(", domain.period.x, ",", domain.period.y, ")",

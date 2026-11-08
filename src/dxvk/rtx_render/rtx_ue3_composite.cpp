@@ -661,6 +661,7 @@ namespace dxvk {
       args.flags = (request.emissivePass ? UE3_COMPOSITE_ENCODE_FLAG_EMISSION_PASS : 0u) |
                    (request.uniformEmission ? UE3_COMPOSITE_ENCODE_FLAG_UNIFORM_EMISSION : 0u) |
                    (request.coverageFromAlpha ? UE3_COMPOSITE_ENCODE_FLAG_COVERAGE_ALPHA : 0u) |
+                   (request.opacityAlpha ? UE3_COMPOSITE_ENCODE_FLAG_OPACITY_ALPHA : 0u) |
                    (storeEmission ? UE3_COMPOSITE_ENCODE_FLAG_STORE_EMISSION : 0u);
       args.multiplyScale = request.multiplyScale;
       setPushConstantBank(DxvkPushConstantBank::RTX);
@@ -706,17 +707,18 @@ namespace dxvk {
       bindResourceView(slot, view, nullptr);
     }
 
-    // A multiply's albedo is alpha blended, so its mips weight colour by opacity.
-    const MipmapMethod albedoMips = request.multiplyScale > 0.0f ? MipmapMethod::AlphaWeighted : MipmapMethod::Simple;
+    // The albedos of a multiply or an alpha blend have mips that weight colour by opacity.
+    const MipmapMethod albedoMips =
+      request.multiplyScale > 0.0f || request.opacityAlpha ? MipmapMethod::AlphaWeighted : MipmapMethod::Simple;
     RtxMipmap::updateMipmap(this, entry.albedo, albedoMips);
     if (request.storeEmission) {
       RtxMipmap::updateMipmap(this, entry.emissive, MipmapMethod::Simple);
     }
     if (masked) {
-      RtxMipmap::updateMipmap(this, entry.maskedAlbedo, MipmapMethod::Simple);
+      RtxMipmap::updateMipmap(this, entry.maskedAlbedo, albedoMips);
     }
     if (maskedHalf) {
-      RtxMipmap::updateMipmap(this, entry.maskedHalfAlbedo, MipmapMethod::Simple);
+      RtxMipmap::updateMipmap(this, entry.maskedHalfAlbedo, albedoMips);
     }
 
     // Each bake gets hashes of its own. The render material and its surface material are cached on their

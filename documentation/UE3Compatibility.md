@@ -488,7 +488,7 @@ A Remix surface renders one colour texture, and [albedo selection](#albedo-selec
 
 ### What the bake renders
 
-Under `viewmode unlit`, UE3 draws every opaque surface with no lightmap and `AmbientColorAndSkyFactor = (1,1,1,0)`, so its base pass outputs the material's `Emissive + Diffuse`: the whole expression network, masks and tilings included. The bake re-runs the game's own pixel shader, with the draw's own textures, samplers and constants, into an offscreen target covering one repeat of every layer. A vertex shader generated for the pixel shader's input signature stands in for the mesh. It writes a UV ramp over the repeat into the lanes the layers read, the camera and sky vectors face-on (`(0,0,1)` in tangent space), a white vertex colour (the tangent basis under `WORLD_COORDS`), and 1 into the `PixelPosition.w` the alpha output copies.
+Under `viewmode unlit`, UE3 draws every opaque surface with no lightmap and `AmbientColorAndSkyFactor = (1,1,1,0)`, so its base pass outputs the material's `Emissive + Diffuse`: the whole expression network, masks and tilings included. The bake re-runs the game's own pixel shader, with the draw's own textures, samplers and constants, into an offscreen target covering one repeat of every layer. A vertex shader generated for the pixel shader's input signature stands in for the mesh. It writes a UV ramp over the repeat into the lanes the layers read, the camera and sky vectors face-on (`(0,0,1)` in tangent space), a white vertex colour (the tangent basis under `WORLD_COORDS`), 1 into the `PixelPosition.w` the alpha output copies, and no fog into the interpolant UE3's translucent base pass fogs the colour by (`Color * Fog.a + Fog.rgb`).
 
 The lighting the shader was compiled against is overridden, with the sky colours zeroed throughout. Its constants are found by name in the constant table, and the vertex lightmap's interpolant is the one `TEXCOORD` the colour-term analysis finds multiplying the diffuse as a vector:
 
@@ -505,9 +505,11 @@ When the shader has an emissive term, the albedo is the difference of the two pa
 
 A material that `clip()`s keeps its coverage in the albedo's alpha, since a clipped texel keeps the target's cleared alpha of 0. UE3 clips in the shader with D3D9's alpha test off, so Remix renders such a surface opaque, composite or not. The coverage is for captures, where a tool that cuts alpha cards into opaque geometry can trace the game's own clip. Tracing the pick's alpha instead often goes wrong. Some masks are a separate texture or another channel: a Scraper_p material clips by the red channel of a mask texture that its diffuse tiles four times over. Many others clip at 1/3 rather than a tracing tool's usual 1/2.
 
-A draw that blends by colour alone, as a modulated overlay or an additive glow does, bakes too. The passes render the shader's output unblended, and Remix derives such a blend from the surface colour, so the surface blends the bake's colour where the game blended the shader's. Like any overlay, such a draw also needs a decal category to layer onto the surface beneath it. A blend by alpha, as translucency uses, would need the shader's alpha, which the bake keeps only as coverage.
+A draw that blends by colour alone, as a modulated overlay or an additive glow does, bakes too. The passes render the shader's output unblended, and Remix derives such a blend from the surface colour, so the surface blends the bake's colour where the game blended the shader's. Like any overlay, such a draw also needs a decal category to layer onto the surface beneath it.
 
 A draw that multiplies the surface beneath, by `(DESTCOLOR, ZERO)`, `(ZERO, SRCCOLOR)` or the doubling `(DESTCOLOR, SRCCOLOR)`, bakes as an alpha blend instead. Remix takes a multiply's opacity from the luminance of its colour, which renders a saturated tint pale, such as the (2, 0.2, 0) that Factory_p's facade numbers multiply their wall by. The bake's opacity is instead the multiply's largest change to any channel, and its colour is what the multiply gives over a surface of linear albedo 1/2. That is exact wherever the multiply is grey and darkens, as the stripes over Escape_p's RP&A reception wall are, and keeps a tint saturated elsewhere. Its mips weight colour by opacity, so the blend holds at a distance. The material's log line marks such a draw `baked as an alpha blend`.
+
+A draw that blends by `(SRCALPHA, INVSRCALPHA)`, as translucent decals do, bakes the shader's alpha as the albedo's opacity, which Remix blends by. Escape_p's grime decals take their opacity from one channel of a texture and their colour from another texture or a constant, so the pick alone renders the channels as colours and its own alpha as the opacity. Such a material bakes even when no texture reaches its colour, and its mips weight colour by opacity. The material's log line marks it `baked with its opacity`. Any other blend by alpha needs the shader's alpha in a form Remix does not render, and is refused.
 
 ### The repeat
 
@@ -540,7 +542,7 @@ The extra textures reach the surface material through an extension record, and a
 
 A tagged material that cannot be baked renders its albedo pick, as an untagged one does, and logs why once as an `[RTX-Compatibility][UE3-Composite]` warning:
 
-- The draw blends by alpha, as translucency does, is tagged sky, particle, beam, terrain, world UI or water, or uses a vertex factory other than local, skinned, foliage or instanced mesh.
+- The draw blends by alpha other than `(SRCALPHA, INVSRCALPHA)`, is tagged sky, particle, beam, terrain, world UI or water, or uses a vertex factory other than local, skinned, foliage or instanced mesh.
 - A layer that masks the output or moves the coordinate of a layer other than a cube map reads another UV set, a colour layer reads other lanes of the baked set or a coordinate that cannot be proven, the colour computes with the coordinate of a UV set it averages, a layer is rotated, or the layers share no repeat within 32 of the coarsest one's.
 - The colour reads a vertex colour, an engine texture (scene colour or depth, light attenuation, ...) or a volume texture.
 - The shader is the directional vertex lightmap compile, whose diffuse arrives through several lighting interpolants weighted by the normal.
@@ -561,7 +563,7 @@ These change:
 - The rendered albedo, and the emission with `rtx.d3d9.ue3CompositeEmission` on.
 - The surface's texture transform, which becomes the repeat rather than the pick's own tiling.
 - The blend of a draw that multiplies the surface beneath, which becomes an alpha blend by the bake's opacity, in captures too.
-- A capture's albedo DDS, which is the bake with any lifted mask at 0, and with a clipped material's coverage in its alpha.
+- A capture's albedo DDS, which is the bake with any lifted mask at 0, and with a clipped material's coverage or an alpha-blended material's opacity in its alpha.
 - A capture's UVs, which follow the surface's transform and so cover the bake's repeat.
 - With `rtx.d3d9.ue3CompositeEmission` on, a capture also exports the emission as a `_emissive` DDS, with emission enabled. Turning it on for one capture gives a material's lights as a starting point for authoring them.
 

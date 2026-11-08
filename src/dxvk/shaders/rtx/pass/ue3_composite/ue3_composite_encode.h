@@ -41,6 +41,8 @@
 #define UE3_COMPOSITE_ENCODE_FLAG_STORE_EMISSION (1u << 2)
 // The emission pass and output are one texel, which holds the emission everywhere.
 #define UE3_COMPOSITE_ENCODE_FLAG_UNIFORM_EMISSION (1u << 3)
+// The pass's alpha is the opacity the draw blends by, which the albedo keeps.
+#define UE3_COMPOSITE_ENCODE_FLAG_OPACITY_ALPHA (1u << 4)
 
 struct Ue3CompositeEncodeArgs
 {

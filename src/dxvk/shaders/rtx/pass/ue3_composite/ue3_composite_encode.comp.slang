@@ -84,7 +84,9 @@ void main(uvec2 threadId : SV_DispatchThreadID)
     return;
   }
 
-  AlbedoOutput[threadId] = vec4(linearToGamma(saturate(full.rgb - emission)), coverage);
+  // A draw that blends by the shader's alpha keeps it as the albedo's opacity, which is 0 where the shader clipped.
+  const float alpha = (cb.flags & UE3_COMPOSITE_ENCODE_FLAG_OPACITY_ALPHA) != 0 ? saturate(full.a) : coverage;
+  AlbedoOutput[threadId] = vec4(linearToGamma(saturate(full.rgb - emission)), alpha);
   if ((cb.flags & UE3_COMPOSITE_ENCODE_FLAG_STORE_EMISSION) != 0 && (!uniformEmission || all(threadId == uvec2(0, 0))))
   {
     EmissionOutput[emissionTexel] = vec4(linearToGamma(emission), 1.0f);

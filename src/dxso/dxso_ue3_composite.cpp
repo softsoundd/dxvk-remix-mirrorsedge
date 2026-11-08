@@ -41,7 +41,8 @@ namespace dxvk {
     switch (refusal) {
     case DxsoUe3CompositeRefusal::None: return "none";
     case DxsoUe3CompositeRefusal::NotAnalyzed: return "not an analysable ps_2_0+ shader with a constant table";
-    case DxsoUe3CompositeRefusal::NoColorLayer: return "no material texture reaches the colour output";
+    case DxsoUe3CompositeRefusal::NoColorOrOpacityLayer:
+      return "no material texture reaches the colour or opacity output";
     case DxsoUe3CompositeRefusal::EngineSampler: return "an engine texture reaches the output";
     case DxsoUe3CompositeRefusal::VolumeLayer: return "a volume texture reaches the output";
     case DxsoUe3CompositeRefusal::VertexLightmap:
@@ -200,6 +201,10 @@ namespace dxvk {
     bool readsColor0 = false;
     bool readsColor1 = false;
     int32_t alphaInputRegister = -1;
+    int32_t fogInputRegister = -1;
+    auto isPlainInput = [](const DxsoRegister& reg) {
+      return reg.id.type == DxsoRegisterType::Input && !reg.hasRelative && reg.modifier == DxsoRegModifier::None;
+    };
 
     DxsoDecodeContext decoder(programInfo);
     DxsoCodeIter iter(pixelShader.tokens + 1);
@@ -222,16 +227,28 @@ namespace dxvk {
         info.hasTexkill = true;
         continue;
       }
-      if (!writesDestination(op) ||
-          ctx.dst.id.type != DxsoRegisterType::ColorOut || ctx.dst.id.num != 0 || !ctx.dst.mask[3]) {
+      if (!writesDestination(op) || ctx.dst.id.type != DxsoRegisterType::ColorOut || ctx.dst.id.num != 0) {
+        continue;
+      }
+      if (ctx.dst.mask[0] || ctx.dst.mask[1] || ctx.dst.mask[2]) {
+        // UE3's translucent base pass fogs the colour last, as Color * Fog.a + Fog.rgb.
+        const DxsoRegister& fogFactor = ctx.src[1];
+        const DxsoRegister& fogColor = ctx.src[2];
+        const bool fogs =
+          op == DxsoOpcode::Mad && ctx.dst.mask[0] && ctx.dst.mask[1] && ctx.dst.mask[2] &&
+          isPlainInput(fogFactor) && isPlainInput(fogColor) && fogFactor.id.num == fogColor.id.num &&
+          fogFactor.swizzle[0] == 3u && fogFactor.swizzle[1] == 3u && fogFactor.swizzle[2] == 3u &&
+          fogColor.swizzle[0] == 0u && fogColor.swizzle[1] == 1u && fogColor.swizzle[2] == 2u;
+        fogInputRegister = fogs ? int32_t(fogFactor.id.num) : -1;
+      }
+      if (!ctx.dst.mask[3]) {
         continue;
       }
       // The last write to oC0.w decides what the alpha output carries.
       const DxsoRegister& source = ctx.src[0];
       const bool plainInputRead =
         op == DxsoOpcode::Mov && !ctx.dst.saturate && ctx.dst.shift == 0 &&
-        source.id.type == DxsoRegisterType::Input && !source.hasRelative &&
-        source.modifier == DxsoRegModifier::None && source.swizzle[3] == 3u;
+        isPlainInput(source) && source.swizzle[3] == 3u;
       alphaInputRegister = plainInputRead ? int32_t(source.id.num) : -1;
     }
 
@@ -400,8 +417,11 @@ namespace dxvk {
       noteColorSet(literal.terms);
     }
 
-    if (!anyColorLayer) {
-      info.refusal = DxsoUe3CompositeRefusal::NoColorLayer;
+    // A material whose textures only shape its opacity, as a grime decal of one constant colour does, still bakes.
+    const bool anyOpacityLayer = std::any_of(info.layers.begin(), info.layers.end(),
+                                             [](const DxsoUe3CompositeLayer& layer) { return layer.opacity; });
+    if (!anyColorLayer && !anyOpacityLayer) {
+      info.refusal = DxsoUe3CompositeRefusal::NoColorOrOpacityLayer;
       return info;
     }
 
@@ -427,6 +447,7 @@ namespace dxvk {
     }
 
     info.alphaInputRegister = alphaInputRegister;
+    info.fogInputRegister = fogInputRegister;
     if (info.hasTexkill && alphaInputRegister < 0) {
       info.refusal = DxsoUe3CompositeRefusal::MaskedWithoutCoverage;
       return info;

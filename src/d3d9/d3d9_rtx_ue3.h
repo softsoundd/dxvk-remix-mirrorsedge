@@ -670,6 +670,8 @@ namespace dxvk {
     // Is 1 when the draw multiplies the surface beneath by its colour, and 2 when it multiplies by twice its colour.
     // Is 0 when it does not multiply. A multiplying draw bakes as an alpha blend and keeps no emission.
     float multiplyScale = 0.0f;
+    // Is set when the draw blends by (SRCALPHA, INVSRCALPHA), so the bake keeps the shader's alpha as the opacity.
+    bool opacityAlpha = false;
     // Lists the interpolant lanes of colour layers on another UV set, which the bake samples at their average.
     struct AveragedLanes {
       uint8_t semanticIndex;

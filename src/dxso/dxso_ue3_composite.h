@@ -61,8 +61,8 @@ namespace dxvk {
     None = 0,
     // The shader is not a ps_2_0+ pixel shader with a constant table.
     NotAnalyzed,
-    // No material texture reaches the colour output.
-    NoColorLayer,
+    // No material texture reaches the colour or opacity output.
+    NoColorOrOpacityLayer,
     // An engine texture, such as scene colour, scene depth or light attenuation, reaches an output.
     EngineSampler,
     // A volume texture reaches an output.
@@ -143,6 +143,9 @@ namespace dxvk {
     // oC0.w is a plain read of this input register's w lane, UE3's PixelPosition.w. The bake sets it to 1
     // so the alpha of a clip()ped material marks its coverage.
     int32_t alphaInputRegister = -1;
+    // Is the input register UE3's translucent base pass fogs the colour output by, as Color * Fog.a + Fog.rgb.
+    // The bake sets it to no fog.
+    int32_t fogInputRegister = -1;
     int32_t ambientColorAndSkyFactorRegister = -1;
     int32_t upperSkyColorRegister = -1;
     int32_t lowerSkyColorRegister = -1;

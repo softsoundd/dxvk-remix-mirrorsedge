@@ -72,6 +72,8 @@ namespace dxvk {
     bool coverageFromAlpha = false;
     // Is Ue3CompositeDomain::multiplyScale. A multiplying draw's albedo is encoded as an alpha blend.
     float multiplyScale = 0.0f;
+    // Is set when the draw blends by the shader's alpha, which the albedo's alpha keeps as opacity.
+    bool opacityAlpha = false;
 
     struct ConstantOverride {
       uint32_t reg = 0;

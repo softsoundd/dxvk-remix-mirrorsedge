@@ -525,6 +525,33 @@ namespace {
           "a normal map that also offsets the diffuse steers more than the cube map");
   }
 
+  void testTranslucentDecal() {
+    // Escape_p's grime decals blend by alpha. One paints a constant colour, which UE3's translucent base pass fogs,
+    // with the green channel of its texture as the opacity.
+    auto buildDecal = [](const bool fogged) {
+      DxsoTestShader ps(kPs30Header);
+      ps.ctab({ { "UniformVector_0", kFloat4, 0 }, { "Texture2D_0", kSampler, 0 } })
+        .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+        .dclInput(DxsoUsage::Texcoord, 4, 1, MaskAll)
+        .dclSampler(0);
+      if (fogged) {
+        ps.op3(DxsoOpcode::Mad, oC0(MaskXYZ), c(0), v(1, kWWWW), v(1));
+      } else {
+        ps.op1(DxsoOpcode::Mov, oC0(MaskXYZ), c(0));
+      }
+      ps.texld(rd(0), v(0), 0)
+        .op1(DxsoOpcode::Mov, oC0(MaskW), r(0, kYYYY));
+      return ps;
+    };
+    const DxsoUe3CompositeShaderInfo info = analyzeDxsoUe3CompositeShader(buildDecal(true).view());
+    check(info.refusal == DxsoUe3CompositeRefusal::None, "a decal whose texture only shapes its opacity bakes");
+    check(info.fogInputRegister == 1, "the colour is fogged by v1 (TEXCOORD4)");
+    check(findLayer(info, 0) != nullptr && findLayer(info, 0)->opacity && !findLayer(info, 0)->contributesColor(),
+          "the texture is an opacity layer");
+    check(analyzeDxsoUe3CompositeShader(buildDecal(false).view()).fogInputRegister < 0,
+          "an unfogged colour has no fog input");
+  }
+
   void testRefusals() {
     {
       // A vertex colour blend has no value over a texture repeat.
@@ -609,7 +636,7 @@ namespace {
     std::cout << "\n   lighting=" << describeDxsoUe3CompositeLighting(info.lighting)
               << " emissive=" << info.hasEmissive << " viewDependent=" << info.viewDependent
               << " texkill=" << info.hasTexkill << " worldCoords=" << info.worldCoords
-              << " alphaInput=" << info.alphaInputRegister
+              << " alphaInput=" << info.alphaInputRegister << " fogInput=" << info.fogInputRegister
               << " ambient=c" << info.ambientColorAndSkyFactorRegister
               << " lightMapScale=c" << info.lightMapScaleRegister << "+" << info.lightMapScaleCount
               << " lightmapSamplers=0x" << std::hex << info.lightmapTextureSamplerMask
@@ -716,6 +743,7 @@ int main(int argc, char** argv) {
     testLightingLayers();
     testTexcoordInColor();
     testCubeOnlyCoordinateLayers();
+    testTranslucentDecal();
     testRefusals();
     testPeriod();
     testResolution();
