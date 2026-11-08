@@ -22,10 +22,9 @@
 
 // Tests the static half of a UE3 flow layer (rtx.d3d9.ue3FlowLayers), which finds the reads that move a material's
 // normal detail, their weights in the material normal and the texture channel that confines them.
-// The hand-assembled canal is the network Stormdrain_p's M_StormDrainCanals_01 compiles to: two ripple maps panned at
-// different tilings, one decoded and one added as it was sampled, lerped into the concrete's normal by a strip mask
-// before the normal bends a reflection lookup. The hand-assembled tarp blends its normal map towards a wrinkled one by
-// a panned texture.
+// The hand-assembled networks are the shapes UE3 materials compile to. One pans two normal maps at different tilings,
+// one decoded and one added as it was sampled, and lerps them into a base normal by a mask before the normal bends a
+// reflection lookup. The other blends a surface's normal map towards a second one by a panned texture.
 //
 // Run as test_dxso_ue3_flow_layers <shader.dxso> [...], it prints the flow layer analysis of pixel shaders dumped
 // through DXVK_SHADER_DUMP_PATH, with each read's UV origin and tiling.
@@ -69,39 +68,39 @@ namespace {
     return std::abs(a - b) <= 1e-4f;
   }
 
-  enum class Water {
-    // The normal is lerp(concrete, lerp(decode(A), B, 0.5), mask), as M_StormDrainCanals_01 compiles.
+  enum class Panned {
+    // The normal is lerp(base, lerp(decode(A), B, 0.5), mask).
     Lerp,
-    // The normal is lerp(concrete, decode(A) + B, mask), as M_StormDrainCanals_01b compiles.
+    // The normal is lerp(base, decode(A) + B, mask).
     Add,
-    // The water shows where the mask is 0.
+    // The panned normal maps show where the mask is 0.
     InvertedMask,
-    // The water is added to the concrete everywhere.
+    // The panned normal maps are added to the base everywhere.
     NoMask,
-    // A debris layer lerps the concrete back over the water by a second mask.
-    Debris,
+    // A second mask lerps the base back over the panned normal maps.
+    Overlay,
     // A is a two-channel normal map read from .wy, with a constant z.
     TwoChannel,
-    // The water is normalised on its own before the mask blends it in.
+    // The panned normal maps are normalised on their own before the mask blends them in.
     NormalizedFirst,
     // A is squared on the way.
     Squared,
     // B is weighted by the diffuse's green rather than by the mask.
     OtherMask,
-    // The ripple coordinates have no constant offset.
+    // The panned coordinates have no constant offset.
     StaticOffsets,
     // The normal is never normalised.
     NoNormalize,
-    // The diffuse pans with ripple B's panner.
+    // The diffuse pans with B's panner.
     SharedPanner,
-    // Ripple B is a second read of ripple A's texture, as Stormdrain_p's spillway pans one normal map twice.
+    // B is a second read of A's texture, panned another way.
     SharedSampler,
   };
 
-  // Texture2D_0 is the concrete's normal map, Texture2D_1 ripple A at 4x panned by UniformVector_1, Texture2D_2 ripple B
-  // at 1x panned by UniformVector_2, Texture2D_3 the strip mask, Texture2D_4 the diffuse, Texture2D_5 a debris mask and
+  // Texture2D_0 is the base normal map, Texture2D_1 normal map A at 4x panned by UniformVector_1, Texture2D_2 normal map
+  // B at 1x panned by UniformVector_2, Texture2D_3 the mask, Texture2D_4 the diffuse, Texture2D_5 an overlay mask and
   // TextureCube_0 the reflection. TEXCOORD6 is the tangent-space camera vector.
-  DxsoTestShader buildCanal(const Water water) {
+  DxsoTestShader buildPannedNormals(const Panned variant) {
     DxsoTestShader ps(kPs30Header);
     ps.ctab({
         { "UniformVector_1", kFloat4, 8 },
@@ -124,56 +123,56 @@ namespace {
 
     ps.texld(rd(0), v(0), 0)
       .op3(DxsoOpcode::Mad, rd(0, MaskXYZ), r(0), c(1, kXXXX), c(1, kYYYY));
-    if (water == Water::StaticOffsets) {
+    if (variant == Panned::StaticOffsets) {
       ps.op2(DxsoOpcode::Mul, rd(1, MaskXY), v(0), c(1, kWWWW));
     } else {
       ps.op3(DxsoOpcode::Mad, rd(1, MaskXY), v(0), c(1, kWWWW), c(8));
     }
     ps.texld(rd(1), r(1), 1);
-    if (water == Water::Squared) {
+    if (variant == Panned::Squared) {
       ps.op2(DxsoOpcode::Mul, rd(1, MaskXYZ), r(1), r(1));
     }
-    if (water == Water::TwoChannel) {
+    if (variant == Panned::TwoChannel) {
       ps.op3(DxsoOpcode::Mad, rd(1, MaskXY), r(1, swz(3, 1, 2, 2)), c(1, kXXXX), c(1, kYYYY))
         .op1(DxsoOpcode::Mov, rd(1, MaskZ), c(1, kZZZZ));
     } else {
       ps.op3(DxsoOpcode::Mad, rd(1, MaskXYZ), r(1), c(1, kXXXX), c(1, kYYYY));
     }
-    if (water == Water::StaticOffsets) {
+    if (variant == Panned::StaticOffsets) {
       ps.op1(DxsoOpcode::Mov, rd(2, MaskXY), v(0));
     } else {
       ps.op2(DxsoOpcode::Add, rd(2, MaskXY), v(0), c(9));
     }
-    ps.texld(rd(2), r(2), water == Water::SharedSampler ? 1 : 2)
+    ps.texld(rd(2), r(2), variant == Panned::SharedSampler ? 1 : 2)
       .texld(rd(3), v(0), 3);
 
-    if (water == Water::OtherMask) {
+    if (variant == Panned::OtherMask) {
       ps.op3(DxsoOpcode::Lrp, rd(4, MaskXYZ), r(3, kXXXX), r(1), r(0))
         .texld(rd(8), v(0), 4)
         .op3(DxsoOpcode::Mad, rd(4, MaskXYZ), r(2), r(8, kYYYY), r(4));
     } else {
-      if (water == Water::Add) {
+      if (variant == Panned::Add) {
         ps.op2(DxsoOpcode::Add, rd(1, MaskXYZ), r(1), r(2));
       } else {
         ps.op3(DxsoOpcode::Lrp, rd(1, MaskXYZ), c(1, kZZZZ), r(2), r(1));
       }
-      if (water == Water::NormalizedFirst) {
+      if (variant == Panned::NormalizedFirst) {
         ps.op1(DxsoOpcode::Nrm, rd(1, MaskXYZ), r(1));
       }
-      if (water == Water::NoMask) {
+      if (variant == Panned::NoMask) {
         ps.op2(DxsoOpcode::Add, rd(4, MaskXYZ), r(0), r(1));
-      } else if (water == Water::InvertedMask) {
+      } else if (variant == Panned::InvertedMask) {
         ps.op3(DxsoOpcode::Lrp, rd(4, MaskXYZ), r(3, kXXXX), r(0), r(1));
       } else {
         ps.op3(DxsoOpcode::Lrp, rd(4, MaskXYZ), r(3, kXXXX), r(1), r(0));
       }
     }
-    if (water == Water::Debris) {
+    if (variant == Panned::Overlay) {
       ps.texld(rd(5), v(0), 5)
         .op3(DxsoOpcode::Lrp, rd(4, MaskXYZ), r(5, kXXXX), r(0), r(4));
     }
 
-    if (water == Water::NoNormalize) {
+    if (variant == Panned::NoNormalize) {
       ps.op1(DxsoOpcode::Mov, rd(5, MaskXYZ), r(4));
     } else {
       ps.op1(DxsoOpcode::Nrm, rd(5, MaskXYZ), r(4));
@@ -183,7 +182,7 @@ namespace {
       .op2(DxsoOpcode::Mul, rd(5, MaskXYZ), r(5), r(0, kWWWW))
       .op3(DxsoOpcode::Mad, rd(5, MaskXYZ), r(5), c(1, kXXXX), r(6, kXYZW, kModNeg))
       .texld(rd(7), r(5), 6);
-    if (water == Water::SharedPanner) {
+    if (variant == Panned::SharedPanner) {
       ps.op2(DxsoOpcode::Add, rd(9, MaskXY), v(0), c(9))
         .texld(rd(8), r(9), 4);
     } else {
@@ -194,15 +193,14 @@ namespace {
     return ps;
   }
 
-  DxsoUe3FlowShaderInfo analyze(const Water water) {
-    DxsoTestShader ps = buildCanal(water);
+  DxsoUe3FlowShaderInfo analyze(const Panned variant) {
+    DxsoTestShader ps = buildPannedNormals(variant);
     return analyzeDxsoUe3FlowLayers(ps.view());
   }
 
-  // Texture2D_0 is the tarp's own normal map, Texture2D_1 the wrinkles at 4x, Texture2D_2 the wind, panned by
-  // UniformVector_1, and Texture2D_3 the diffuse, whose green also weighs the wind, as Mirror's Edge's construction
-  // tarps compile.
-  DxsoTestShader buildTarp(const bool diffuseWeighsWind) {
+  // Texture2D_0 is the surface's normal map, Texture2D_1 a second normal map at 4x, Texture2D_2 the blend weight, panned
+  // by UniformVector_1, and Texture2D_3 the diffuse, whose green also weighs the blend.
+  DxsoTestShader buildBlend(const bool diffuseWeighsBlend) {
     DxsoTestShader ps(kPs30Header);
     ps.ctab({
         { "UniformVector_1", kFloat4, 8 },
@@ -228,7 +226,7 @@ namespace {
       .op3(DxsoOpcode::Mad, rd(2, MaskXY), v(0), c(1, kXXXX), c(8))
       .texld(rd(2), r(2), 2)
       .texld(rd(3), v(0), 3);
-    if (diffuseWeighsWind) {
+    if (diffuseWeighsBlend) {
       ps.op2(DxsoOpcode::Mul, rd(4, MaskW), r(2, kYYYY), r(3, kYYYY))
         .op2(DxsoOpcode::Mul, rd(4, MaskW), r(4, kWWWW), c(1, kZZZZ));
     } else {
@@ -250,118 +248,119 @@ namespace {
     check(info.refusal == DxsoUe3FlowRefusal::None,
           str::format(what, " refused: ", describeDxsoUe3FlowRefusal(info.refusal), " ", info.refusalDetail));
     check(info.samples.size() == 2, str::format(what, " pans 2 samples, found ", info.samples.size()));
-    check(info.samples[0].sampler == 1 && info.samples[1].sampler == 2, str::format(what, ": ripple A is the heavier"));
+    check(info.samples[0].sampler == 1 && info.samples[1].sampler == 2, str::format(what, ": A is the heavier"));
     check(info.flowSamplerMask == ((1u << 1) | (1u << 2)), str::format(what, ": the flow samplers are s1 and s2"));
     check(info.offsetRegisters == std::vector<uint32_t>({ 8, 9 }), str::format(what, ": the panners are c8 and c9"));
   }
 
-  void testCanal() {
-    const DxsoUe3FlowShaderInfo info = analyze(Water::Lerp);
-    checkAccepted(info, "the canal");
+  void testPannedNormals() {
+    const DxsoUe3FlowShaderInfo info = analyze(Panned::Lerp);
+    checkAccepted(info, "the lerped normal maps");
     // A is 0.5 * (2A - 1) and B adds 0.5 * B, which is 0.25 of a decoded normal.
     check(approximately(info.samples[0].weight, 0.5f) && approximately(info.samples[1].weight, 0.25f),
-          str::format("the canal weighs its ripples 0.5 and 0.25, found ", info.samples[0].weight, " and ", info.samples[1].weight));
-    check(info.samples[0].components == std::array<uint8_t, 3>({ 0, 1, 2 }), "ripple A's xyz are the normal's xyz");
-    check(info.samples[1].components == std::array<uint8_t, 3>({ 0, 1, 2 }), "ripple B's xyz are the normal's xyz");
-    check(info.mask.present && info.mask.sampler == 3 && info.mask.channel == 0, "the strip mask is Texture2D_3.x");
-    check(approximately(info.mask.scale, 1.0f) && approximately(info.mask.bias, 0.0f), "the strip mask is used as it is");
-    check(!info.ignoresOtherFactors, "nothing else weighs the canal's water");
+          str::format("the normal maps weigh 0.5 and 0.25, found ", info.samples[0].weight, " and ", info.samples[1].weight));
+    check(info.samples[0].components == std::array<uint8_t, 3>({ 0, 1, 2 }), "A's xyz are the normal's xyz");
+    check(info.samples[1].components == std::array<uint8_t, 3>({ 0, 1, 2 }), "B's xyz are the normal's xyz");
+    check(info.mask.present && info.mask.sampler == 3 && info.mask.channel == 0, "the mask is Texture2D_3.x");
+    check(approximately(info.mask.scale, 1.0f) && approximately(info.mask.bias, 0.0f), "the mask is used as it is");
+    check(!info.ignoresOtherFactors, "nothing else weighs the normal maps");
 
-    const DxsoUe3FlowShaderInfo added = analyze(Water::Add);
-    checkAccepted(added, "the canal that adds its ripples");
+    const DxsoUe3FlowShaderInfo added = analyze(Panned::Add);
+    checkAccepted(added, "the added normal maps");
     check(approximately(added.samples[0].weight, 1.0f) && approximately(added.samples[1].weight, 0.5f),
-          "added ripples keep their 2:1 weighting at twice the scale");
+          "added normal maps keep their 2:1 weighting at twice the scale");
   }
 
   void testMasks() {
-    const DxsoUe3FlowShaderInfo inverted = analyze(Water::InvertedMask);
+    const DxsoUe3FlowShaderInfo inverted = analyze(Panned::InvertedMask);
     checkAccepted(inverted, "an inverted mask");
     check(inverted.mask.present && inverted.mask.sampler == 3 && approximately(inverted.mask.scale, -1.0f) &&
             approximately(inverted.mask.bias, 1.0f),
           "an inverted mask is 1 - mask");
 
-    const DxsoUe3FlowShaderInfo unmasked = analyze(Water::NoMask);
-    checkAccepted(unmasked, "unmasked water");
-    check(!unmasked.mask.present, "water added everywhere has no mask");
+    const DxsoUe3FlowShaderInfo unmasked = analyze(Panned::NoMask);
+    checkAccepted(unmasked, "unmasked normal maps");
+    check(!unmasked.mask.present, "normal maps added everywhere have no mask");
 
-    const DxsoUe3FlowShaderInfo debris = analyze(Water::Debris);
-    checkAccepted(debris, "water under debris");
-    check(debris.mask.present && debris.mask.sampler == 3 && approximately(debris.mask.scale, 1.0f),
-          "the strip is still the mask under a debris layer");
-    check(debris.ignoresOtherFactors, "the debris mask is reported as left out");
+    const DxsoUe3FlowShaderInfo overlaid = analyze(Panned::Overlay);
+    checkAccepted(overlaid, "normal maps under an overlay");
+    check(overlaid.mask.present && overlaid.mask.sampler == 3 && approximately(overlaid.mask.scale, 1.0f),
+          "the mask is still Texture2D_3 under an overlay");
+    check(overlaid.ignoresOtherFactors, "the overlay mask is reported as left out");
 
-    const DxsoUe3FlowShaderInfo normalized = analyze(Water::NormalizedFirst);
-    checkAccepted(normalized, "water normalised before it is masked");
+    const DxsoUe3FlowShaderInfo normalized = analyze(Panned::NormalizedFirst);
+    checkAccepted(normalized, "normal maps normalised before they are masked");
     check(normalized.mask.present && normalized.mask.sampler == 3,
-          "the mask comes from the normalisation that blends the normalised water in");
-    check(approximately(normalized.samples[1].weight / normalized.samples[0].weight, 0.5f), "normalised water keeps the ripple weighting");
+          "the mask comes from the normalisation that blends the normalised normal maps in");
+    check(approximately(normalized.samples[1].weight / normalized.samples[0].weight, 0.5f),
+          "normalised normal maps keep their weighting");
   }
 
   void testTwoChannel() {
-    const DxsoUe3FlowShaderInfo info = analyze(Water::TwoChannel);
-    checkAccepted(info, "a two-channel ripple map");
+    const DxsoUe3FlowShaderInfo info = analyze(Panned::TwoChannel);
+    checkAccepted(info, "a two-channel normal map");
     check(info.samples[0].components == std::array<uint8_t, 3>({ 3, 1, kDxsoUe3FlowNoComponent }),
-          "ripple A's normal is .wy with a reconstructed z");
+          "A's normal is .wy with a reconstructed z");
   }
 
   void testSharedSampler() {
-    const DxsoUe3FlowShaderInfo info = analyze(Water::SharedSampler);
+    const DxsoUe3FlowShaderInfo info = analyze(Panned::SharedSampler);
     check(info.refusal == DxsoUe3FlowRefusal::None,
-          str::format("two reads of one ripple map refused: ", describeDxsoUe3FlowRefusal(info.refusal), " ", info.refusalDetail));
-    check(info.samples.size() == 2, str::format("two reads of one ripple map make 2 samples, found ", info.samples.size()));
+          str::format("two reads of one normal map refused: ", describeDxsoUe3FlowRefusal(info.refusal), " ", info.refusalDetail));
+    check(info.samples.size() == 2, str::format("two reads of one normal map make 2 samples, found ", info.samples.size()));
     check(info.samples[0].sampler == 1 && info.samples[1].sampler == 1, "both reads are of Texture2D_1");
     check(info.samples[0].site != info.samples[1].site, "the reads are told apart");
     check(approximately(info.samples[0].weight, 0.5f) && approximately(info.samples[1].weight, 0.25f),
-          str::format("the reads keep the canal's weights, found ", info.samples[0].weight, " and ", info.samples[1].weight));
+          str::format("the reads keep their weights, found ", info.samples[0].weight, " and ", info.samples[1].weight));
     check(info.samples[0].uv.affineU.offset.constReg == 8 && info.samples[1].uv.affineU.offset.constReg == 9,
           "each read keeps its own panner");
     check(approximately(info.samples[0].uv.affineU.scale.imm, 4.0f) && !info.samples[1].uv.affineU.scale.immValid,
           "each read keeps its own tiling");
     check(info.flowSamplerMask == (1u << 1), "the flow sampler is s1 alone");
     check(info.offsetRegisters == std::vector<uint32_t>({ 8, 9 }) && info.exclusiveOffsetRegisters == info.offsetRegisters,
-          "the panners are c8 and c9, and only the ripples read them");
+          "the panners are c8 and c9, and only the panned reads read them");
   }
 
   void testBlend() {
-    for (const bool diffuseWeighsWind : { true, false }) {
-      DxsoTestShader ps = buildTarp(diffuseWeighsWind);
+    for (const bool diffuseWeighsBlend : { true, false }) {
+      DxsoTestShader ps = buildBlend(diffuseWeighsBlend);
       const DxsoUe3FlowShaderInfo info = analyzeDxsoUe3FlowLayers(ps.view());
-      const char* what = diffuseWeighsWind ? "the tarp" : "the tarp without its diffuse weight";
+      const char* what = diffuseWeighsBlend ? "the blend" : "the blend without its diffuse weight";
       check(info.refusal == DxsoUe3FlowRefusal::None,
             str::format(what, " refused: ", describeDxsoUe3FlowRefusal(info.refusal), " ", info.refusalDetail));
       check(info.blend.present && info.blend.sampler == 2 && info.blend.channel == 1,
-            str::format(what, ": the wind blends by Texture2D_2.y"));
-      check(approximately(info.blend.scale, 0.8f), str::format(what, ": the wind blends by 0.8 of the texel, found ", info.blend.scale));
-      check(info.blend.uv.affineU.offset.constReg == 8, str::format(what, ": the wind pans with c8"));
+            str::format(what, ": the blend's weight is Texture2D_2.y"));
+      check(approximately(info.blend.scale, 0.8f), str::format(what, ": the blend weighs 0.8 of the texel, found ", info.blend.scale));
+      check(info.blend.uv.affineU.offset.constReg == 8, str::format(what, ": the blend's weight pans with c8"));
       check(info.samples.size() == 2 && info.samples[0].sampler == 0 && info.samples[1].sampler == 1,
-            str::format(what, ": the wind blends Texture2D_0 towards Texture2D_1"));
+            str::format(what, ": Texture2D_0 blends towards Texture2D_1"));
       check(info.samples[0].components == std::array<uint8_t, 3>({ 0, 1, 2 }) &&
             info.samples[1].components == std::array<uint8_t, 3>({ 0, 1, 2 }),
             str::format(what, ": both normal maps are read as xyz"));
-      check(info.mask.present == diffuseWeighsWind && (!diffuseWeighsWind || (info.mask.sampler == 3 && info.mask.channel == 1)),
-            str::format(what, ": the diffuse's green is the mask when it weighs the wind"));
+      check(info.mask.present == diffuseWeighsBlend && (!diffuseWeighsBlend || (info.mask.sampler == 3 && info.mask.channel == 1)),
+            str::format(what, ": the diffuse's green is the mask when it weighs the blend"));
       check(info.flowSamplerMask == 0x7u, str::format(what, ": the layer's samplers are s0 to s2"));
       check(info.offsetRegisters == std::vector<uint32_t>({ 8 }) && info.exclusiveOffsetRegisters == info.offsetRegisters,
-            str::format(what, ": the panner is c8, and only the wind reads it"));
+            str::format(what, ": the panner is c8, and only the blend's weight reads it"));
     }
   }
 
   void testSharedPanner() {
-    const DxsoUe3FlowShaderInfo canal = analyze(Water::Lerp);
-    check(canal.exclusiveOffsetRegisters == std::vector<uint32_t>({ 8, 9 }), "only the canal's ripples pan with c8 and c9");
+    const DxsoUe3FlowShaderInfo lerped = analyze(Panned::Lerp);
+    check(lerped.exclusiveOffsetRegisters == std::vector<uint32_t>({ 8, 9 }), "only the normal maps pan with c8 and c9");
 
-    const DxsoUe3FlowShaderInfo shared = analyze(Water::SharedPanner);
-    checkAccepted(shared, "ripples sharing a panner with the diffuse");
+    const DxsoUe3FlowShaderInfo shared = analyze(Panned::SharedPanner);
+    checkAccepted(shared, "normal maps sharing a panner with the diffuse");
     check(shared.exclusiveOffsetRegisters == std::vector<uint32_t>({ 8 }),
           "c9 also pans the diffuse, so a composite bake still depends on it");
   }
 
   void testRefusals() {
-    auto refusal = [](const Water water) { return analyze(water).refusal; };
-    check(refusal(Water::Squared) == DxsoUe3FlowRefusal::NotLinear, "a squared ripple is not linear");
-    check(refusal(Water::OtherMask) == DxsoUe3FlowRefusal::NotProportional, "ripples with different masks are refused");
-    check(refusal(Water::StaticOffsets) == DxsoUe3FlowRefusal::NoPannedSampler, "ripples without a constant offset cannot pan");
-    check(refusal(Water::NoNormalize) == DxsoUe3FlowRefusal::NotNormalized, "a normal never normalised is not found");
+    auto refusal = [](const Panned variant) { return analyze(variant).refusal; };
+    check(refusal(Panned::Squared) == DxsoUe3FlowRefusal::NotLinear, "a squared normal map is not linear");
+    check(refusal(Panned::OtherMask) == DxsoUe3FlowRefusal::NotProportional, "normal maps with different masks are refused");
+    check(refusal(Panned::StaticOffsets) == DxsoUe3FlowRefusal::NoPannedSampler, "normal maps without a constant offset cannot pan");
+    check(refusal(Panned::NoNormalize) == DxsoUe3FlowRefusal::NotNormalized, "a normal never normalised is not found");
 
     DxsoTestShader empty(kPs30Header);
     empty.op1(DxsoOpcode::Mov, oC0(MaskAll), c(0));
@@ -437,7 +436,7 @@ int main(int argc, char** argv) {
   }
 
   try {
-    testCanal();
+    testPannedNormals();
     testMasks();
     testTwoChannel();
     testSharedSampler();

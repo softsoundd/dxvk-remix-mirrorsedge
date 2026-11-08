@@ -100,7 +100,7 @@ namespace dxvk {
     std::string name;
   };
 
-  // Describes the panned read that blends a layer between its two samples, as a tarp's wind does. The normal is
+  // Describes the panned read that blends a layer between its two samples. The normal is
   // normalize(lerp(samples[0], samples[1], scale * channel)), with the weight multiplied by the mask when there is one.
   struct DxsoUe3FlowBlend {
     bool present = false;
@@ -131,7 +131,7 @@ namespace dxvk {
     // Lists the offset registers no other read's coordinate reads, so a composite bake that binds the layer's samplers
     // flat does not depend on them.
     std::vector<uint32_t> exclusiveOffsetRegisters;
-    // Is set when other textures weigh the samples as well, as a debris layer drawn over the canals does.
+    // Is set when other textures weigh the samples as well, such as a mask that lerps another normal back over them.
     // The layer leaves them out.
     bool ignoresOtherFactors = false;
   };

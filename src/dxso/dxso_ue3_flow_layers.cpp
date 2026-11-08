@@ -369,8 +369,8 @@ namespace dxvk {
     }
 
     // Fits a normalised vector whose lanes are a * X[k] + b + w * c * (Y[k] - X[k]): the normal map X blended towards Y by
-    // w, one channel of the panned read, as a tarp's wind blends its normal map towards a wrinkled one. c is a constant,
-    // or that times one channel of another texture, which the layer keeps as its mask.
+    // w, one channel of the panned read. c is a constant, or that times one channel of another texture, which the layer
+    // keeps as its mask.
     std::optional<DxsoUe3FlowShaderInfo> fitBlend(const Evaluator& evaluator, const ShaderFacts& facts,
                                                   const NormalizeSite& site, const CandidateRead& weightRead) {
       auto isWeight = [&](const uint16_t s) {

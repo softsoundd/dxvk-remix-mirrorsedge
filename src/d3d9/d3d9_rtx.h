@@ -619,12 +619,11 @@ namespace dxvk {
                "the list. Bakes log their size and memory as they run and as they are released.");
     RTX_OPTION("rtx.d3d9", bool, ue3FlowLayers, true,
                "UE3 compat: renders the normal detail a material moves over its surface as a flow layer, at the speed the "
-               "game moves it. Normal maps the material pans, as on Stormdrain_p's canals, are blended into the surface "
-               "normal by the material's own mask. A panned texture that blends between two normal maps, as on the "
-               "construction tarps, blends the surface's own normal towards the second. Remix does not otherwise shade with "
-               "the game's normal maps, so without it that detail stands still. The layer applies over a Toolkit-authored "
-               "material too, unless that material authors a flow layer of its own or turns it off. See \"Flow layers\" in "
-               "UE3Compatibility.md.");
+               "game moves it. Normal maps the material pans are blended into the surface normal by the material's own "
+               "mask. A panned texture that blends between two normal maps blends the surface's own normal towards the "
+               "second. Remix does not otherwise shade with the game's normal maps, so without it that detail stands still. "
+               "The layer applies over a Toolkit-authored material too, unless that material authors a flow layer of its own "
+               "or turns it off. See \"Flow layers\" in UE3Compatibility.md.");
     RTX_OPTION("rtx.d3d9", float, ue3FlowLayerStrength, 1.0f,
                "UE3 compat: scales how far a flow layer's samples tilt the surface normal. 1 tilts it as far as the game's "
                "normal maps do.");
