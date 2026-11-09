@@ -135,6 +135,7 @@ namespace dxvk {
       { "rtx.d3d9.ue3DisableVelocityPass",                           "True" },
       { "rtx.d3d9.ue3DisableDistortion",                             "True" },
       // UE3's per-frame FrameSyncEvent otherwise serialises the GPU frame behind injectRTX's CPU time.
+      // The game does not lock buffers with D3DLOCK_NOOVERWRITE, so it does not need the event's GPU completion.
       { "rtx.d3d9.eventQueryCsCompletion",                           "True" },
       { "rtx.ignoreAllVertexColorBakedLighting",                     "True" },
       { "rtx.fallbackLightMode",                                     "0" },

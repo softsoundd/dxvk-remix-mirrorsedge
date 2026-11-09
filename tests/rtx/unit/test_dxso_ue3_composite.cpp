@@ -23,7 +23,7 @@
 // Tests the static half of a UE3 composite material bake (rtx.ue3CompositeMaterialTextures), which finds the
 // material textures that make up a pixel shader's colour and the lighting constants the bake neutralises,
 // and the repeat and resolution solvers the per-draw domain uses. The hand-assembled ceiling case is the
-// instruction stream fxc emitted for the Escape_p office ceiling under viewmode unlit.
+// instruction stream fxc emitted for a shipped office ceiling material under viewmode unlit.
 //
 // Run as test_dxso_ue3_composite <shader.dxso> [...], it prints the composite analysis of pixel shaders
 // dumped through DXVK_SHADER_DUMP_PATH, with each layer's UV origin and tiling, the mask layers,
@@ -75,7 +75,7 @@ namespace {
     return nullptr;
   }
 
-  // Builds the Escape_p ceiling, a 1x mask choosing between vents (Texture2D_6 * Texture2D_7) and panels
+  // Builds an office ceiling, a 1x mask choosing between vents (Texture2D_6 * Texture2D_7) and panels
   // (UniformVector_2 * Texture2D_7, with a 32x Texture2D_8 where the 4x Texture2D_4 says so), lit by
   // AmbientColorAndSkyFactor, plus lights emitting 200 * UniformVector_1 * Texture2D_4 * Texture2D_5.
   DxsoTestShader buildCeiling() {
@@ -183,7 +183,7 @@ namespace {
   }
 
   void testSimpleVertexLightmap() {
-    // Scraper_p's buildings draw with the simple vertex lightmap compile, which outputs Emissive + max(|LightMapA|, 1e-4) * Diffuse.
+    // Vertex-lit buildings draw with the simple vertex lightmap compile, which outputs Emissive + max(|LightMapA|, 1e-4) * Diffuse.
     // The lighting is in TEXCOORD2 and the emissive layer is on the mesh's other UV channel.
     DxsoTestShader ps(kPs30Header);
     ps.ctab({
@@ -272,7 +272,7 @@ namespace {
 
   enum class MaskUse { Tint, AlsoAlpha, Squared, Cubed, Folded };
 
-  // Builds Boat_p's deck without its reflection, which is Texture2D_1 at 6x times Texture2D_0, tinted by
+  // Builds a ship's deck without its reflection, which is Texture2D_1 at 6x times Texture2D_0, tinted by
   // lerp(1, UniformVector_1, Texture2D_2.x) at 0.85x, plus an untinted 0.4 * UniformVector_0, all lit
   // by AmbientColorAndSkyFactor.
   DxsoTestShader buildDeck(const MaskUse use) {
@@ -330,7 +330,7 @@ namespace {
     check(analyzeDxsoUe3CompositeShader(buildDeck(MaskUse::Folded).view()).maskLayers.empty(),
           "a mask through rsq is not a polynomial");
 
-    // Escape_p's RPA carpet computes lerp(UniformVector_1 * Texture2D_2, UniformVector_2 * m * Texture2D_2, m)
+    // A corridor carpet computes lerp(UniformVector_1 * Texture2D_2, UniformVector_2 * m * Texture2D_2, m)
     // with m = Texture2D_1.x at uv * UniformScalar_1 - UniformScalar_2. The mask weights the lerp and scales
     // what it lerps towards, and the tiling is computed in the register the coordinate is then written to.
     DxsoTestShader carpet(kPs30Header);
@@ -388,7 +388,7 @@ namespace {
   }
 
   void testLightingLayers() {
-    // RPA_Lower's white paint in its directional lightmap compile weights the lightmap by a normal map at 1x and
+    // A white paint material in its directional lightmap compile weights the lightmap by a normal map at 1x and
     // tints its paint at 2x. The normal map only feeds the lighting, so the bake leaves it out of what it renders.
     DxsoTestShader ps(kPs30Header);
     ps.ctab({
@@ -430,7 +430,7 @@ namespace {
   }
 
   void testTexcoordInColor() {
-    // Escape_p's Avenue overpass tints its floor tile yellow or blue by which half of TEXCOORD2 it is on, and a
+    // An overpass tints its floor tile yellow or blue by which half of TEXCOORD2 it is on, and a
     // mask on TEXCOORD2 fades the tint out between them. Only TEXCOORD2.y feeds the colour other than as a
     // coordinate, and the normalised camera vector is a direction rather than a coordinate.
     DxsoTestShader ps(kPs30Header);
@@ -526,7 +526,7 @@ namespace {
   }
 
   void testTranslucentDecal() {
-    // Escape_p's grime decals blend by alpha. One paints a constant colour, which UE3's translucent base pass fogs,
+    // Grime decals blend by alpha. One paints a constant colour, which UE3's translucent base pass fogs,
     // with the green channel of its texture as the opacity.
     auto buildDecal = [](const bool fogged) {
       DxsoTestShader ps(kPs30Header);
@@ -600,7 +600,7 @@ namespace {
     check(std::abs(period({ 1.0f, 0.3f }) - 10.0f) < 1e-3f, "three repeats of a 0.3 layer");
     check(std::abs(period({ 3.0f, 3.0f * 1.0000333f }) - 1.0f / 3.0f) < 1e-4f, "float noise within the tolerance");
     check(period({ 1.0f, 1.37f }) == 0.0f, "no common repeat within 32 of the coarsest");
-    // Boat_p's stripe mask tiles 0.85 times beside layers at 1 and 6, so 17 of its repeats are 20 of theirs.
+    // The deck's stripe mask tiles 0.85 times beside layers at 1 and 6, so 17 of its repeats are 20 of theirs.
     check(std::abs(period({ 1.0f, 6.0f, 1.0f, 0.85f }) - 20.0f) < 1e-3f, "a 0.85 tiling repeats with whole ones every 20");
     check(solveUe3CompositePeriod(std::vector<float>({ 1.0f, 0.85f }).data(), 2, 8) == 0.0f, "but not within 8");
     check(period({ 1.0f, 0.0f }) == 0.0f, "a zero tiling does not repeat");

@@ -609,7 +609,7 @@ namespace dxvk {
     }
 
     // Explicit DOFAndBloom/Uber signals (also covered by the catch-all below for typical
-    // ME shaders); kept so FilterColor blur is classified even if z-write state is atypical.
+    // UE3 shaders); kept so FilterColor blur is classified even if z-write state is atypical.
     if (!isWorldGeometry &&
         (likelyFullscreen || psSamplesRenderTarget) &&
         psInfo.looksLikeDofAndBloomPostProcess()) {

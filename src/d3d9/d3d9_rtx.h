@@ -79,7 +79,7 @@ namespace dxvk {
                "this gain, clamped to 1, is the weight blending from the legacy albedo constant to the register's "
                "fully saturated hue, so a register at zero leaves the surface at the legacy constant and a tint "
                "ramping up fades smoothly to its colour rather than stepping to it. The default reaches full "
-               "saturation at 0.125, the peak Mirror's Edge's menu highlight reaches. Set to 0 to use the register "
+               "saturation at a register value of 0.125. Set to 0 to use the register "
                "value directly instead, which is faithful to the constant but renders these surfaces very dark.");
     RTX_OPTION("rtx.d3d9", bool, ue3HighlightTints, true,
                "UE3 compat: reproduce the tint a game fades in through a material strength parameter, such as Mirror's "
@@ -157,10 +157,8 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3MicConstantIdentity, true,
                "UE3 MaterialInstanceConstant support: fold the material's Uniform* constants into its "
                "identity, distinguishing instances that share a parent and its textures but differ in "
-               "VectorParameterValues/ScalarParameterValues. Mirror's Edge relies on this - its colour "
-               "variants (RooftopPropsClusters and its Blue/Orange/Yellow siblings, and many others) are "
-               "one texture set with a different tint parameter, and without this tier they collapse onto "
-               "a single anchor.\n"
+               "VectorParameterValues/ScalarParameterValues. Colour variants that are one texture set with a "
+               "different tint parameter collapse onto a single anchor without this tier.\n"
                "Only UniformVector_* parameters contribute. The scalars are where the two lightmap "
                "compiles genuinely disagree - DiffusePower exponents the lightmap under SIMPLE_LIGHTING "
                "and a LightMapBasis-derived transfer coefficient otherwise, and SpecularPower is its "
@@ -205,8 +203,7 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", bool, ue3MicExcludeRenderTargetsFromIdentity, true,
                "UE3 MaterialInstanceConstant support: exclude render-target-backed textures from the material "
                "texture-set identity hash. Render targets bound as material samplers (scene captures, "
-               "reflection buffers - e.g. the capture Mirror's Edge routes into the first-person body "
-               "materials) receive a new image hash every time the game recreates them (respawn, checkpoint "
+               "reflection buffers) receive a new image hash every time the game recreates them (respawn, checkpoint "
                "reload, level load). Folding that hash into material identity re-mints the material hash on "
                "every recreation, silently breaking texture tags and asset replacements anchored on the "
                "identity: they only match again when the render target happens to reproduce its capture-time "
@@ -339,7 +336,7 @@ namespace dxvk {
                     "draws have been captured lets the GPU keep a frame queued; frame time becomes the larger of the "
                     "CPU and GPU frame times. Costs up to one frame of input latency when the CPU is faster than the "
                     "GPU (Reflex re-paces the CPU against the GPU queue). Games that rely on the event to protect "
-                    "D3DLOCK_NOOVERWRITE buffer reuse need GPU completion; Mirror's Edge does not use that lock mode. "
+                    "D3DLOCK_NOOVERWRITE buffer reuse need GPU completion. "
                     "Only active while ray tracing is enabled.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION_ARGS("rtx.d3d9", bool, skipRenderTargetCopies, true,
@@ -416,8 +413,7 @@ namespace dxvk {
                "It is off by default because it is a trade-off, not a pure win. That same hash is also what separates "
                "one placement of a mesh from another, so excluding the transform collapses every instance of a mesh "
                "into a single BlasEntry that must then disambiguate them internally. A title with stable transforms "
-               "and dense instancing is already in the good case and measurably loses throughput from the collapse - "
-               "Mirror's Edge loses roughly a tenth of its frame rate in a heavy scene.\n"
+               "and dense instancing is already in the good case and measurably loses throughput from the collapse.\n"
                "Skinned meshes churn the hash through their bone registers either way, which stay included, so "
                "genuine vertex changes are never lost. Asset and replacement hashes are unaffected regardless, "
                "because rtx.geometryAssetHashRuleString excludes vertexshader.");
@@ -495,9 +491,8 @@ namespace dxvk {
     RTX_OPTION("rtx.d3d9", uint32_t, ue3MaxDecomposedInstances, 4096,
                "UE3 compat: upper bound on the hardware instances rtx.d3d9.ue3DecomposeInstancedDraws expands from one "
                "draw. Each instance becomes its own ray-traced submission, so a pathological batch would otherwise cost "
-               "unbounded CPU time; the excess is dropped with a one-shot warning naming the draw. The default clears "
-               "Mirror's Edge's densest debris scatters with headroom and stays well inside the draw call state queue's "
-               "capacity.\n"
+               "unbounded CPU time; the excess is dropped with a one-shot warning naming the draw. The default stays "
+               "well inside the draw call state queue's capacity.\n"
                "Cost is linear in instances, so lowering this is the reliable way to trade density for frame time. What "
                "it keeps is a fixed subset - the instances the game lists first, which is spawn order, so a batch thins "
                "out roughly evenly rather than losing one side of itself. Deliberately not the instances nearest the "

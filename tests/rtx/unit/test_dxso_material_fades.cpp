@@ -24,7 +24,7 @@
 // the output formulas of BasePassPixelShader.usf per blend mode - translucent (Color * Fog.a +
 // Fog.rgb, Opacity), additive (Color * Fog.a * Opacity, 0) and modulate (Color, Opacity) - with
 // the particle colour interpolant and material parameters that fade them, and the shapes the
-// analysis must not be fooled by. Two are transcribed from Mirror's Edge's shader cache.
+// analysis must not be fooled by. Two are transcribed from shipped shaders.
 //
 // Dump mode: test_dxso_material_fades [--summary] [--particle-color N] <shader.dxso | directory> [...]
 // prints the fade candidates of dumped pixel shaders (DXVK_SHADER_DUMP_PATH), with the inputs
@@ -216,7 +216,7 @@ namespace {
     static void run() {
       std::cout << "Running DXSO material fade analysis tests..." << std::endl;
       test_subUvSmokeFadesByParticleAlpha();
-      test_mirrorsEdgeVentSmoke();
+      test_ventSmoke();
       test_tintWithoutParticleOpacity();
       test_additiveParticleFoldsAlphaIntoColor();
       test_particleAlphaOnlyScalesColor();
@@ -228,7 +228,7 @@ namespace {
       test_modulateLerpFromWhite();
       test_modulateLrpFromWhite();
       test_inverseLerpRestsAtOne();
-      test_mirrorsEdgeSootDecal();
+      test_sootDecal();
       test_translucentOpacityScalar();
       test_vectorLaneOpacity();
       test_additiveBrightnessScalar();
@@ -244,7 +244,7 @@ namespace {
     }
 
   private:
-    // M_FX_LevelFX_Smoke_CheapSmoke_01-style translucent SubUV smoke: the two sub-images lerped by
+    // Translucent SubUV smoke: the two sub-images lerped by
     // Interp_Sizer.x, times the particle colour (TEXCOORD3), with a soft-particle depth fade read
     // from the scene colour's alpha.
     //   oC0.rgb = Sub.rgb * Color.rgb * Fog.a + Fog.rgb
@@ -280,11 +280,10 @@ namespace {
       expectParticleColor(res, true, false, true, label);
     }
 
-    // PS_FX_LevelFX_Smoke_VentSmoke_05_Quick's shader, as Mirror's Edge's cache holds it: the
-    // sub-images' green channel as colour, a UniformVector_0 emissive offset, and the opacity
-    // clamped to [0, 15] by a max and a min.
-    static void test_mirrorsEdgeVentSmoke() {
-      std::cout << "  test_mirrorsEdgeVentSmoke" << std::endl;
+    // A shipped vent smoke shader: the sub-images' green channel as colour, a UniformVector_0
+    // emissive offset, and the opacity clamped to [0, 15] by a max and a min.
+    static void test_ventSmoke() {
+      std::cout << "  test_ventSmoke" << std::endl;
       PsBuilder ps;
       ps.def(2, 0.005f, 0.0f, 15.0f, 0.0f)
         .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
@@ -307,7 +306,7 @@ namespace {
         .op3(DxsoOpcode::Mad, oC0(MaskXYZ), r(1), v(4, kWWWW), v(4));
 
       const DxsoMaterialFadeResult res = ps.analyze(makeInputs({}, { 0 }), 3);
-      const char* label = "Mirror's Edge vent smoke";
+      const char* label = "vent smoke";
       expectAnalyzed(res, label);
       expectFadeCount(res, 0, label);
       // The tint holds while the emissive offset is black, which is how the vent smoke draws.
@@ -531,11 +530,11 @@ namespace {
       expectCoverage(res, 3, 0, kDxsoFadeColorLanes, 1.0f, Constants().set(3, 1.0f), 0.0f, label);
     }
 
-    // The soot decal on The Shard, as Mirror's Edge's cache holds it. The lerp's ends are folded
-    // into two UniformVectors, so the colour is 1 - Soot + V0 + S * Soot * V1: a fade only while
-    // V1 is white and V0 black, which only the draw's constants say.
-    static void test_mirrorsEdgeSootDecal() {
-      std::cout << "  test_mirrorsEdgeSootDecal" << std::endl;
+    // A shipped soot decal shader. The lerp's ends are folded into two UniformVectors, so the
+    // colour is 1 - Soot + V0 + S * Soot * V1: a fade only while V1 is white and V0 black, which
+    // only the draw's constants say.
+    static void test_sootDecal() {
+      std::cout << "  test_sootDecal" << std::endl;
       PsBuilder ps;
       ps.def(1, -1.0f, 1.0f, 0.0f, 0.0f)
         .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
@@ -549,7 +548,7 @@ namespace {
         .op1(DxsoOpcode::Mov, oC0(MaskW), c(1, kYYYY));
 
       const DxsoMaterialFadeResult res = ps.analyze(makeInputs({ 3 }, { 0, 2 }));
-      const char* label = "Mirror's Edge soot decal";
+      const char* label = "soot decal";
       expectAnalyzed(res, label);
       // V0 and V1's components each reach one lane, and tint it rather than fade the colour.
       expectFadeCount(res, 1, label);

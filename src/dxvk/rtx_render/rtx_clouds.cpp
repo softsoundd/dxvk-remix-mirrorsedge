@@ -1734,8 +1734,8 @@ namespace dxvk {
     const CloudArgs previous = converged(m_referenceArgs);
     m_referenceArgs = args;
 
-    // Against the view the accumulation started from, so a first person camera's idle sway (Mirror's Edge turns
-    // the view up to a degree) keeps accumulating while a slow drift still restarts it.
+    // Against the view the accumulation started from, so a first person camera's idle sway (which can turn
+    // the view by up to a degree) keeps accumulating while a slow drift still restarts it.
     const char* reason = nullptr;
     if (m_referenceFrames == 0) {
       reason = "start";

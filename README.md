@@ -14,18 +14,17 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ### 1) Mirror's Edge (UE3/D3D9) compatibility improvements
 
-All UE3-specific behavior sits behind a single master `rtx.d3d9.ue3EngineMode` toggle which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
+All UE3-specific behaviour sits behind one `rtx.d3d9.ue3EngineMode` toggle, which the Mirror's Edge game profile turns on automatically. The main differences from upstream:
 
-- Camera and object transforms are read from UE3's reserved shader constants (CTAB parsing).
-- Vertex positions are captured from the register the game's vertex shader multiplies by ViewProjectionMatrix. See [Exact vertex position capture](documentation/UE3Compatibility.md#exact-vertex-position-capture).
-- Depth prepass, shadow depth, SceneCapture, depth-test-disabled translucency, and fullscreen postprocess are skipped so only real base-pass geometry gets ray traced.
-- Texture and material identity is stable at the [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html) level.
-- Sampler UVs (tiling, panning, rotation, atlas tiles, etc.) are resolved.
-- Albedo selection is deterministic per material, with `rtx.preferredAlbedoTextures/rtx.neverAlbedoTextures` as overrides where albedo selection is missed. Textureless, constant colour materials supported too.
-- Materials built from several layers at different tilings (masks, detail and light layers) can opt into rendering a bake of the game's own pixel shader over one repeat of all their layers instead of one picked texture (`rtx.ue3CompositeMaterialTextures`), with the game's emission taken out of its colour and left to be authored. A tint or stripe mask that would lengthen that repeat is blended in at render time at its own tiling instead. See [Composite materials](documentation/UE3Compatibility.md#composite-materials).
-- Mid-frame fullscreen overlays (fades, scope/damage effects) cannot terminate the raytraced scene; they're replayed after RTX injection (`rtx.deferredUiTextures`). See [Deferred overlays](documentation/UE3Compatibility.md#deferred-overlays).
-- First person geometry (arms, held weapon) is detected via UE3's `SDPG_Foreground` boundary (mid-scene depth-only clear) and classified as ViewModel, overriding player-model tags (`rtx.d3d9.ue3ForegroundDpgIsViewModel`).
-- A "Mirror's Edge (UE3)" tonemapping mode (`rtx.tonemappingMode = 2`, the game profile's default) reproduces the game's display transform in Remix, which includes the game's own exposure model, the per-channel highlights/shadows/midtones grade, and the per-map colour grading curves. See [Mirror's Edge tonemapper and colour curves](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves).
+- Camera, transforms and vertex positions are read exactly from UE3's shaders, and only base-pass geometry is ray traced.
+- Material hashes are stable per [MaterialInstanceConstant](https://docs.unrealengine.com/udk/Three/MaterialInstanceConstant.html), whatever the lightmap setting or texture streaming state.
+- Albedo selection is deterministic, UV transforms are resolved, and layered materials can render a [bake of their own shader](documentation/UE3Compatibility.md#composite-materials).
+- Particle colour, fading decals and panned normal detail are reproduced.
+- Instanced foliage and debris are split per instance, and first-person arms and weapons become view-model geometry.
+- Tagged [mid-frame overlays](documentation/UE3Compatibility.md#deferred-overlays) (fades, damage, scopes) are replayed over the ray-traced image, and letterboxed and resized views are placed correctly.
+- Mirror's Edge also gets Runner Vision highlights, in-memory game patches, per-map settings and a [tonemapper](documentation/UE3Compatibility.md#mirrors-edge-tonemapper-and-colour-curves) that reproduces the game's exposure and colour curves.
+
+Implementation notes and debugging guidance live in [documentation/UE3Compatibility.md](documentation/UE3Compatibility.md).
 
 ### 2) Mirror's Edge/UE3 setup:
 
@@ -72,11 +71,7 @@ show fog
     
     **Disabled frustum culling** - UE3 employs frustum culling in native C++ land, so geometry outside the camera's view never reaches Remix and results in missing reflections and shadows. The runtime can patch the game in memory so these primitives are always inside the view. Doing this looks nicer compared to relying on Remix's anti-culling system, but note that performance will take a hit! The `Off-Screen Max Distance`/`Off-Screen Min Radius` settings beneath it can win some of that back by leaving far, small off-screen geometry culled.
 
-### 3) Extra fork notes/debugging
-
-Implementation notes and debugging guidance for the UE3-specific behaviour live in [documentation/UE3Compatibility.md](documentation/UE3Compatibility.md).
-
-### 4) Acknowledgements
+### 3) Acknowledgements
 - sambow23 for their [physically based sky implementation](https://github.com/sambow23/dxvk-remix-gmod/tree/atmos).
 - xoxor4d for their research into UE3 → Remix support and other tidbits of info that helped guide the initial work around this.
 

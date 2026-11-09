@@ -177,7 +177,7 @@ namespace {
                    "constant tiling");
     }
 
-    // An instruction reads every operand before it writes any lane. Escape_p's carpet scales both
+    // An instruction reads every operand before it writes any lane. A carpet material scales both
     // lanes by r0.x while writing r0.xy, which the second lane must still read as the tiling.
     static void test_readsBeforeWrites() {
       std::cout << "  test_readsBeforeWrites" << std::endl;
@@ -203,7 +203,7 @@ namespace {
     }
 
     // fxc reads a (1, 2) tiling from the normal unpack's (2, -1) literals through an abs modifier.
-    // Escape_p's building trims tile their diffuse this way.
+    // Some building trim materials tile their diffuse this way.
     // A draw-time constant's abs has no term in the model, so its tiling stays inexact.
     static void test_absLiteralTiling() {
       std::cout << "  test_absLiteralTiling" << std::endl;
@@ -277,7 +277,7 @@ namespace {
 
     // BumpOffset adds normalize(CameraVector).xy * (HeightRatio * height - ReferencePlane * HeightRatio) to a coordinate.
     // The camera vector, TEXCOORD6, has x and y of 0 when seen face-on.
-    // Factory_p's banner flags shift (u, 1 - v), which fxc folds into the shift's mad.
+    // A banner flag material shifts (u, 1 - v), which fxc folds into the shift's mad.
     static void test_bumpOffsetFlippedCoordinate() {
       std::cout << "  test_bumpOffsetFlippedCoordinate" << std::endl;
       PsShader ps;

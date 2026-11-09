@@ -21,8 +21,9 @@
 */
 
 // Colour-term analysis of UE3 base-pass pixel shaders. The hand-assembled cases follow the
-// instruction streams fxc emits for Mirror's Edge's BasePassPixelShader.usf under each
-// lightmap policy, so a material's inputs classify the same way in every permutation.
+// instruction streams fxc emits for UE3's BasePassPixelShader.usf under each lightmap policy,
+// including Mirror's Edge's bicubic lightmap filter, so a material's inputs classify the same
+// way in every permutation.
 //
 // Dump mode: test_dxso_color_terms <shader.dxso> [...]  prints the classification of a
 // dumped pixel shader (DXVK_SHADER_DUMP_PATH), deriving the inputs from its CTAB the same
@@ -275,7 +276,7 @@ namespace {
                  "lightmap coord expr = Arith|Offset|Wrap", "packed lightmap math");
       expectCoordRegs(res, 1, { 5 }, "packed lightmap math: lightmap coordinate depends on LightMapResolution");
     }
-    // Mirror's Edge base pass, SIMPLE_VERTEX_LIGHTMAP: `pow(LightMapA, 1) * Diffuse + Emissive`
+    // UE3 base pass, SIMPLE_VERTEX_LIGHTMAP: `pow(LightMapA, 1) * Diffuse + Emissive`
     // with the coefficient arriving in TEXCOORD2. fxc lowers the pow to max(|v1|, eps).
     static void test_simpleVertexLightmap() {
       std::cout << "  test_simpleVertexLightmap" << std::endl;

@@ -296,7 +296,7 @@ namespace {
                       "diffuse beside a clip mask");
     }
 
-    // Reduces Scraper_p's lit-window buildings to a lightmapped diffuse and an emissive pattern times
+    // Reduces a lit-window building material to a lightmapped diffuse and an emissive pattern times
     // its mask, added after the lighting. The `mad` that accumulates the lighting leaves the lit
     // register in the third src slot, which the two-operand `mul`s that follow still name, so the
     // mask looks lightmap-derived and the pattern looks like the anchored diffuse.
