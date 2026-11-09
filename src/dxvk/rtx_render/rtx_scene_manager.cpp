@@ -492,6 +492,13 @@ namespace dxvk {
       output.smoothNormalsApplied = false;
     }
 
+    // Vertices cached without a color are rebuilt to take one when a draw brings a color buffer,
+    // since their layout can differ from the draw's.
+    if (input.color0Buffer.defined() && !output.color0Buffer.defined() && !output.hiddenColor0Buffer.defined() &&
+        result == ObjectCacheState::kUpdateInstance) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+
     // If forceNormals is true, we can't use the fast "already interleaved" path since
     // we need to change the layout to include normal space.
     const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals)
@@ -583,17 +590,20 @@ namespace dxvk {
         break;
     }
 
-    // Update color buffer in BVH with DrawCallState
-    // The user can disable/enable color buffer for specific materials, so we manually sync the DrawCallState and BVH here to keep the color buffer in BVH updated.
-    // Note, we don't setup kUpdateBVH because it's too waste to update all buffers if only the color buffer needs to be updated.
-    if (output.color0Buffer.defined() && !drawCallState.getGeometryData().color0Buffer.defined()) {
-      // Remove the color buffer in BVH if the color buffer from drawcall is removed by ignoreBakedLighting
+    // A draw can drop its color buffer, as rtx.ignoreBakedLightingTextures does, and a later draw can bring it back.
+    // Vertices that are not rebuilt keep the color meanwhile, so it is only hidden from the geometry's surfaces.
+    const bool rebuilt = result != ObjectCacheState::kUpdateInstance;
+    if (rebuilt) {
+      output.hiddenColor0Buffer = RaytraceBuffer();
+    }
+    if (output.color0Buffer.defined() && !input.color0Buffer.defined()) {
+      if (!rebuilt) {
+        output.hiddenColor0Buffer = output.color0Buffer;
+      }
       output.color0Buffer = RaytraceBuffer();
-    } else if (!output.color0Buffer.defined() && drawCallState.getGeometryData().color0Buffer.defined()) {
-      // Write the color buffer back to BVH if the color buffer is enabled again
-      const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
-      const auto& colorBuffer = drawCallState.getGeometryData().color0Buffer;
-      output.color0Buffer = RaytraceBuffer(slice, colorBuffer.offsetFromSlice(), colorBuffer.stride(), colorBuffer.vertexFormat());
+    } else if (output.hiddenColor0Buffer.defined() && input.color0Buffer.defined()) {
+      output.color0Buffer = output.hiddenColor0Buffer;
+      output.hiddenColor0Buffer = RaytraceBuffer();
     }
 
     return result;

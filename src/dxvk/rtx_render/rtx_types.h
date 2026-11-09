@@ -357,6 +357,10 @@ struct RaytraceGeometry {
   Rc<DxvkBuffer> historyBuffer[2] = {nullptr};
   Rc<DxvkBuffer> indexCacheBuffer = nullptr;
 
+  // Holds color0Buffer while draws bring no color buffer.
+  // The cached vertices keep the color, so a draw that brings one back exposes it again without rebuilding them.
+  RaytraceBuffer hiddenColor0Buffer;
+
   // Set to true after the smooth normals compute pass has been applied to this geometry.
   // Used to avoid redundant recomputation on subsequent frames for static geometry.
   bool smoothNormalsApplied = false;
