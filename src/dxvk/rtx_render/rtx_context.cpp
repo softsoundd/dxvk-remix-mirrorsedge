@@ -1783,6 +1783,7 @@ namespace dxvk {
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
     constants.enableShadowBackfaceSkip = getSceneManager().getAccelManager().hasShadowBackfaceSkipInstances();
+    constants.enablePointSampledOpacityInSecondaryRays = RtxOptions::enablePointSampledOpacityInSecondaryRays();
 
     constants.domeLightArgs = getSceneManager().getLightManager().getDomeLightArgs();
 
