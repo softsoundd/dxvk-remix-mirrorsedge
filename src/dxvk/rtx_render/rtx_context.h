@@ -291,7 +291,8 @@ namespace dxvk {
     // Binds the draw's composite bake (rtx.ue3CompositeMaterialTextures), and bakes it first from the draw's
     // own state when it has none.
     void bakeUe3Composite(DrawCallState& drawCallState);
-    bool bakeUe3CompositeNow(const Ue3CompositeBakeRequest& request);
+    // `inPlace` re-renders a live bake into the textures its surface already reads.
+    bool bakeUe3CompositeNow(const Ue3CompositeBakeRequest& request, bool inPlace);
 
     InternalUpscaler getCurrentFrameUpscaler();
 

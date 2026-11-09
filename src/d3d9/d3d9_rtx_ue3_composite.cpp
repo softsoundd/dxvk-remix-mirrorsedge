@@ -202,6 +202,43 @@ namespace dxvk {
       return stream;
     }
 
+    // Formats the scales of a layer's reads, separated by slashes.
+    struct TilingsText {
+      const std::vector<Vector4>& tilings;
+    };
+
+    std::ostream& operator<<(std::ostream& stream, const TilingsText& text) {
+      for (size_t i = 0; i < text.tilings.size(); i++) {
+        stream << (i == 0 ? "" : "/") << TilingText { text.tilings[i].x, text.tilings[i].y };
+      }
+      return stream;
+    }
+
+    // Returns the coordinate origins of a sampler's reads: the one they share,
+    // or each read's own where their tilings differ, as a waterfall's reads of its foam texture do.
+    // Returns none when the reads are not all of one UV set's lanes.
+    std::vector<const PsSamplerUvOrigin*> findLayerReads(const PsSamplerTexcoordEntry& entry, const uint32_t stage) {
+      const PsSamplerUvOrigin& origin = entry.samplerUvOrigin[stage];
+      if (!origin.originValid) {
+        return {};
+      }
+      if (origin.sitesAgree) {
+        return { &origin };
+      }
+      std::vector<const PsSamplerUvOrigin*> reads;
+      for (const PsSampleSiteUv& site : entry.sampleSites) {
+        if (site.sampler != stage) {
+          continue;
+        }
+        if (!site.uv.originValid || site.uv.semanticIndex != origin.semanticIndex ||
+            site.uv.compU != origin.compU || site.uv.compV != origin.compV) {
+          return {};
+        }
+        reads.push_back(&site.uv);
+      }
+      return reads;
+    }
+
     // `inputMask` has the bit layout of DxsoColorTermResult::interpolantFactorInputs, where a ps_2_x t#
     // register's number is its TEXCOORD index.
     bool readsVertexLightmap(const uint32_t inputMask, const DxsoIsgnEntry& element) {
@@ -258,6 +295,13 @@ namespace dxvk {
         return 1.0f;
       }
       return srcBlend == D3DBLEND_DESTCOLOR && dstBlend == D3DBLEND_SRCCOLOR ? 2.0f : 0.0f;
+    }
+
+    // Caps a live bake's sides at rtx.d3d9.ue3CompositeLiveBakeMaxResolution, since it re-renders every frame.
+    void fitLiveBake(Ue3CompositeDomain& domain, const uint32_t maxResolution) {
+      const uint32_t cap = std::max(maxResolution, kUe3CompositeMinResolution);
+      domain.width = std::min(domain.width, cap);
+      domain.height = std::min(domain.height, cap);
     }
 
     std::string formatBakeSize(const Ue3CompositeDomain& domain) {
@@ -404,15 +448,16 @@ namespace dxvk {
       }
 
       const PsSamplerUvOrigin& origin = entry.samplerUvOrigin[stage];
+      const std::vector<const PsSamplerUvOrigin*> reads = findLayerReads(entry, stage);
       const bool readsSurfaceUvSet =
-        origin.originValid && origin.sitesAgree && origin.semanticIndex == texcoordIdx &&
+        !reads.empty() && origin.semanticIndex == texcoordIdx &&
         origin.compU == m_texcoordCompU && origin.compV == m_texcoordCompV;
       const bool sharesSurfaceLanes =
         origin.semanticIndex == texcoordIdx &&
         (origin.compU == m_texcoordCompU || origin.compU == m_texcoordCompV ||
          origin.compV == m_texcoordCompU || origin.compV == m_texcoordCompV);
       const bool emits = layer.emissive && info.lighting != DxsoUe3CompositeLighting::Unlit;
-      if (!readsSurfaceUvSet && origin.originValid && origin.sitesAgree && !sharesSurfaceLanes &&
+      if (!readsSurfaceUvSet && !reads.empty() && !sharesSurfaceLanes &&
           (layer.contributesColor() || layer.steersOnlyCubes) && !layer.opacity) {
         // A layer on the mesh's other UV channel has no one place in a repeat of this one, so the bake
         // samples it at its average, through a ramp too steep for its mips. Its emission is left out
@@ -445,28 +490,33 @@ namespace dxvk {
                       " without a provable UV origin (emission left out)");
         continue;
       }
-      if (!origin.originValid || !origin.sitesAgree) {
-        return refuse("layer UV origin", "layer s", stage, " (", layer.name, ") has no single provable UV origin");
+      if (reads.empty()) {
+        return refuse("layer UV origin", "layer s", stage, " (", layer.name,
+                      ") has no provable UV origin on one UV set");
       }
       if (origin.semanticIndex != texcoordIdx || origin.compU != m_texcoordCompU || origin.compV != m_texcoordCompV) {
         return refuse("layer UV set", "layer s", stage, " (", layer.name, ") reads TEXCOORD", uint32_t(origin.semanticIndex),
                       " (", uint32_t(origin.compU), ",", uint32_t(origin.compV), ") but the surface reads TEXCOORD",
                       texcoordIdx, " (", uint32_t(m_texcoordCompU), ",", uint32_t(m_texcoordCompV), ")");
       }
-      if (!origin.affineExact || origin.affineU.hasCross || origin.affineV.hasCross) {
-        return refuse("layer tiling", "layer s", stage, " (", layer.name,
-                      ") is not an exact axis-aligned tiling of the surface's UV set");
-      }
-      float scaleU = 1.0f;
-      float scaleV = 1.0f;
-      float offsetU = 0.0f;
-      float offsetV = 0.0f;
-      if (!resolveUe3PsAffineTerm(origin.affineU.scale, 1.0f, scaleU) ||
-          !resolveUe3PsAffineTerm(origin.affineU.offset, 0.0f, offsetU) ||
-          !resolveUe3PsAffineTerm(origin.affineV.scale, 1.0f, scaleV) ||
-          !resolveUe3PsAffineTerm(origin.affineV.offset, 0.0f, offsetV)) {
-        return refuse("layer tiling constants", "layer s", stage, " (", layer.name,
-                      ")'s tiling does not resolve against the draw's constants");
+
+      // Holds each read's scale and offset. The repeat covers every tiling a layer is read at,
+      // as a waterfall reads its foam at four.
+      std::vector<Vector4> tilings;
+      for (const PsSamplerUvOrigin* read : reads) {
+        if (!read->affineExact || read->affineU.hasCross || read->affineV.hasCross) {
+          return refuse("layer tiling", "layer s", stage, " (", layer.name,
+                        ") is not an exact axis-aligned tiling of the surface's UV set");
+        }
+        Vector4 tiling(1.0f, 1.0f, 0.0f, 0.0f);
+        if (!resolveUe3PsAffineTerm(read->affineU.scale, 1.0f, tiling.x) ||
+            !resolveUe3PsAffineTerm(read->affineV.scale, 1.0f, tiling.y) ||
+            !resolveUe3PsAffineTerm(read->affineU.offset, 0.0f, tiling.z) ||
+            !resolveUe3PsAffineTerm(read->affineV.offset, 0.0f, tiling.w)) {
+          return refuse("layer tiling constants", "layer s", stage, " (", layer.name,
+                        ")'s tiling does not resolve against the draw's constants");
+        }
+        tilings.push_back(tiling);
       }
 
       // The surface reads a lifted mask through a wrapping sampler, so only a mask the game wraps is lifted.
@@ -477,25 +527,30 @@ namespace dxvk {
       const bool maskWraps = d3d9State().samplerStates[stage][D3DSAMP_ADDRESSU] == D3DTADDRESS_WRAP &&
                              d3d9State().samplerStates[stage][D3DSAMP_ADDRESSV] == D3DTADDRESS_WRAP;
       if (mask != info.maskLayers.end() && maskWraps && !blended && !maskCandidate.has_value() &&
-          getRemixSampleView(texture, false) != nullptr) {
-        colorScales.push_back(Vector2(scaleU, scaleV));
-        describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", TilingText { scaleU, scaleV }, " ", roles);
-        maskCandidate = MaskCandidate { uint8_t(stage), mask->channel, mask->degree, scaleU, scaleV, offsetU, offsetV,
-                                        std::abs(scaleU) * float(desc->Width), std::abs(scaleV) * float(desc->Height),
+          tilings.size() == 1 && getRemixSampleView(texture, false) != nullptr) {
+        const Vector4& tiling = tilings.front();
+        colorScales.push_back(Vector2(tiling.x, tiling.y));
+        describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", TilingsText { tilings }, " ", roles);
+        maskCandidate = MaskCandidate { uint8_t(stage), mask->channel, mask->degree,
+                                        tiling.x, tiling.y, tiling.z, tiling.w,
+                                        std::abs(tiling.x) * float(desc->Width),
+                                        std::abs(tiling.y) * float(desc->Height),
                                         description.size() };
         continue;
       }
 
-      scalesU.push_back(std::abs(scaleU));
-      scalesV.push_back(std::abs(scaleV));
       // Every layer's detail shows in the bake. A coordinate layer's shows through what it steers, as a normal
       // map's tiles show through the reflection it bends.
-      texelsU.push_back(std::abs(scaleU) * float(desc->Width));
-      texelsV.push_back(std::abs(scaleV) * float(desc->Height));
-      if (layer.contributesColor()) {
-        colorScales.push_back(Vector2(scaleU, scaleV));
+      for (const Vector4& tiling : tilings) {
+        scalesU.push_back(std::abs(tiling.x));
+        scalesV.push_back(std::abs(tiling.y));
+        texelsU.push_back(std::abs(tiling.x) * float(desc->Width));
+        texelsV.push_back(std::abs(tiling.y) * float(desc->Height));
+        if (layer.contributesColor()) {
+          colorScales.push_back(Vector2(tiling.x, tiling.y));
+        }
       }
-      describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", TilingText { scaleU, scaleV }, " ", roles);
+      describeLayer("s", stage, " ", layer.name, " ", desc->Width, "x", desc->Height, " ", TilingsText { tilings }, " ", roles);
     }
 
     // A lighting-only layer never refuses a bake. One that is not a plain tiling of the surface's UV set is left out.
@@ -705,10 +760,12 @@ namespace dxvk {
                                                                                    const DxsoUe3CompositeShaderInfo& info,
                                                                                    const Ue3CompositeDomain& domain,
                                                                                    const uint32_t texcoordIdx,
-                                                                                   const XXH64_hash_t key) {
+                                                                                   const XXH64_hash_t key,
+                                                                                   const bool live) {
     const LegacyMaterialData& material = m_activeDrawCallState.materialData;
     auto request = std::make_shared<Ue3CompositeBakeRequest>();
     request->key = key;
+    request->live = live;
     const uint64_t lineage[] = {
       material.getHash(), ue3.inferredPsHash, texcoordIdx, (uint64_t(m_texcoordCompU) << 8) | uint64_t(m_texcoordCompV),
     };
@@ -857,7 +914,7 @@ namespace dxvk {
     const bool pickIsDiffuse = std::any_of(info.layers.begin(), info.layers.end(), [&](const DxsoUe3CompositeLayer& layer) {
       return layer.sampler == pickStage && layer.diffuse && !layer.isCube;
     });
-    if (pickIsDiffuse && pickOrigin.originValid && pickOrigin.sitesAgree) {
+    if (pickIsDiffuse && !findLayerReads(entry, pickStage).empty()) {
       return pickStage;
     }
     for (const bool diffuseOnly : { true, false }) {
@@ -867,7 +924,7 @@ namespace dxvk {
           continue;
         }
         const PsSamplerUvOrigin& origin = entry.samplerUvOrigin[layer.sampler];
-        if (!origin.originValid || !origin.sitesAgree) {
+        if (findLayerReads(entry, layer.sampler).empty()) {
           continue;
         }
         const bool pickReadsSameSet = pickOrigin.originValid && pickOrigin.semanticIndex == origin.semanticIndex &&
@@ -900,7 +957,7 @@ namespace dxvk {
         return false;
       }
       state.candidateChecked = true;
-    } else if (state.animated) {
+    } else if (state.refused) {
       return false;
     }
 
@@ -954,6 +1011,7 @@ namespace dxvk {
     // are offset by, its panners, are not.
     // Nor are the registers that only move layers the bake averages, such as a detail layer's panner,
     // since an average does not depend on where it is read.
+    // A live bake re-renders with the current values every frame, so none of them are in its key.
     const DxsoUe3FlowShaderInfo* const flow = getUe3FlowShaderForBake(ue3);
     auto isFlowOnlyRegister = [&](const uint32_t reg) {
       return flow != nullptr &&
@@ -977,6 +1035,39 @@ namespace dxvk {
       constantsHash = XXH3_64bits_digest(hashState);
     }
 
+    // A live bake shows one set of values each frame, so it cannot stand in for draws that differ in them.
+    if (state.constantsFrame != m_ue3FrameCounter) {
+      state.constantsFrame = m_ue3FrameCounter;
+      state.frameShaderHash = ue3.inferredPsHash;
+      state.frameConstantsHash = constantsHash;
+    } else if (state.frameShaderHash == ue3.inferredPsHash && state.frameConstantsHash != constantsHash) {
+      state.variesPerDraw = true;
+    }
+    const bool manyValues =
+      state.live || (state.constantSets.insert(constantsHash).second &&
+                     state.constantSets.size() > kUe3CompositeMaxConstantSetsPerMaterial);
+    if (manyValues && state.variesPerDraw) {
+      state.refused = true;
+      Logger::warn(str::format(
+        "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash, " pick=0x", pickHash, std::dec,
+        " has been drawn with more than ", kUe3CompositeMaxConstantSetsPerMaterial,
+        " different values of its material constants, two of them in one frame, as instances that differ are. "
+        "Neither a bake for each value nor one live bake can show them, so it renders its albedo pick from now on."));
+      return false;
+    }
+    if (manyValues && !state.live) {
+      state.live = true;
+      state.constantSets.clear();
+      Logger::info(str::format(
+        "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash, " pick=0x", pickHash, std::dec,
+        " has been drawn with ", kUe3CompositeMaxConstantSetsPerMaterial + 1,
+        " different values of its material constants, so one of them is animating (a panner or a time-driven tint). "
+        "It bakes live from now on, re-rendering every frame within rtx.d3d9.ue3CompositeLiveBakeTexelsPerFrame."));
+    }
+    if (state.live) {
+      fitLiveBake(domain, m_frameOptions.ue3CompositeLiveBakeMaxResolution);
+    }
+
     struct KeyRecord {
       uint32_t lighting;
       uint32_t width;
@@ -989,7 +1080,7 @@ namespace dxvk {
       float multiplyScale;
       uint32_t flatNormalSamplers;
       uint32_t opacityAlpha;
-      uint32_t padding;
+      uint32_t live;
       XXH64_hash_t materialHash;
       XXH64_hash_t psHash;
       XXH64_hash_t texturesHash;
@@ -1008,20 +1099,12 @@ namespace dxvk {
     record.multiplyScale = domain.multiplyScale;
     record.flatNormalSamplers = flow != nullptr ? flow->flowSamplerMask : 0u;
     record.opacityAlpha = domain.opacityAlpha;
+    record.live = state.live;
     record.materialHash = materialHash;
     record.psHash = ue3.inferredPsHash;
     record.texturesHash = domain.texturesHash;
-    record.constantsHash = constantsHash;
+    record.constantsHash = state.live ? kEmptyHash : constantsHash;
     const XXH64_hash_t key = XXH3_64bits(&record, sizeof(record));
-
-    if (state.constantSets.insert(constantsHash).second && state.constantSets.size() > kUe3CompositeMaxConstantSetsPerMaterial) {
-      state.animated = true;
-      Logger::warn(str::format(
-        "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash, " pick=0x", pickHash, std::dec,
-        " has been drawn with ", state.constantSets.size(), " different values of its material constants, so one of "
-        "them is animating (a panner or a time-driven tint). It renders its albedo pick for the rest of the session."));
-      return false;
-    }
 
     if (!state.hasDomain) {
       state.hasDomain = true;
@@ -1045,7 +1128,10 @@ namespace dxvk {
     if (request == nullptr) {
       Ue3CompositeDomain described;
       solveUe3CompositeDomain(ue3, info, texcoordIdx, state.lightingScales, true, described, refusal);
-      request = buildUe3CompositeRequest(ue3, info, described, texcoordIdx, key);
+      if (state.live) {
+        fitLiveBake(described, m_frameOptions.ue3CompositeLiveBakeMaxResolution);
+      }
+      request = buildUe3CompositeRequest(ue3, info, described, texcoordIdx, key, state.live);
       if (logging) {
         const double textures = 1.0 + (request->mask.has_value() ? double(request->mask->degree) : 0.0) +
                                 (request->storeEmission && !request->uniformEmission ? 1.0 : 0.0);
@@ -1072,6 +1158,7 @@ namespace dxvk {
                           describeBlendFactor(d3d9State().renderStates[D3DRS_DESTBLEND]), ")", blendNote)
             : std::string(),
           info.viewDependent ? " view-dependent terms baked face-on" : "",
+          state.live ? " re-baked every frame" : "",
           " layers=[", described.description, "] constants=[", constants, "] repeat=(", domain.period.x, ",", domain.period.y, ")",
           " bake=", formatBakeSize(domain), " (~", megabytes, " MB)",
           " uvTransform=(", domain.transform[0].x, ",", domain.transform[1].y, ",",
@@ -1080,7 +1167,18 @@ namespace dxvk {
     }
 
     m_activeDrawCallState.ue3CompositeRequest = request;
-    m_activeDrawCallState.ue3CompositeDrawStateApplied = !Ue3CompositeBaker::isSettled(key);
+    bool applyDrawState = !Ue3CompositeBaker::isSettled(key);
+    if (state.live) {
+      // An opacity micromap built from one frame of a live bake would not follow the next.
+      m_activeDrawCallState.setCategory(InstanceCategories::IgnoreOpacityMicromap, true);
+      // A live bake re-renders from the first draw of its key each frame, which needs that draw's state.
+      if (state.liveDrawStateFrame != m_ue3FrameCounter || state.liveDrawStateKey != key) {
+        state.liveDrawStateFrame = m_ue3FrameCounter;
+        state.liveDrawStateKey = key;
+        applyDrawState = true;
+      }
+    }
+    m_activeDrawCallState.ue3CompositeDrawStateApplied = applyDrawState;
     return true;
   }
 

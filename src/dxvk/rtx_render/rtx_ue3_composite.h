@@ -74,6 +74,9 @@ namespace dxvk {
     float multiplyScale = 0.0f;
     // Is set when the draw blends by the shader's alpha, which the albedo's alpha keeps as opacity.
     bool opacityAlpha = false;
+    // Is set when the material animates. Its bake re-renders in place every frame from the draw's constants,
+    // within rtx.d3d9.ue3CompositeLiveBakeTexelsPerFrame.
+    bool live = false;
 
     struct ConstantOverride {
       uint32_t reg = 0;
@@ -126,6 +129,11 @@ namespace dxvk {
       std::optional<Ue3CompositeBakeRequest::Mask> mask;
       // Is set when the albedo holds a multiply as a colour and opacity, which the surface alpha blends.
       bool alphaBlend = false;
+      // Is Ue3CompositeBakeRequest::live.
+      bool live = false;
+      // These hold a live bake's pass targets, which it renders into again every frame.
+      Resources::Resource passTarget;
+      Resources::Resource emissivePassTarget;
       Rc<DxvkSampler> sampler;
       // Hashes the key and the bake's generation. The surface's material identity carries it, so the
       // preserve path rebinds when a key bakes again.
@@ -151,6 +159,7 @@ namespace dxvk {
       uint32_t height = 0;
       Vector2 period = Vector2(1.0f, 1.0f);
       bool hasEmission = false;
+      bool live = false;
       VkDeviceSize bytes = 0;
       uint32_t lastUsedFrame = 0;
       std::string description;
@@ -191,6 +200,12 @@ namespace dxvk {
     // A first bake, without which the surface renders its albedo pick, is limited only by pass target memory.
     // A re-bake, whose surface keeps rendering the earlier bake, is also limited by ue3CompositeMaxBakesPerFrame.
     bool takeBakeSlot(uint32_t frame, const Ue3CompositeBakeRequest& request, bool rebake);
+    // Returns whether a live bake may re-render this frame.
+    // A frame's live bakes re-render within ue3CompositeLiveBakeTexelsPerFrame,
+    // the ones re-rendered longest ago first, whatever order they are drawn in.
+    bool takeLiveBakeSlot(uint32_t frame, const Ue3CompositeBakeRequest& request, const Entry& entry);
+    // Records that a live bake re-rendered in place this frame.
+    void markRebaked(XXH64_hash_t key, uint32_t frame);
 
     // Returns rtx.d3d9.ue3CompositeEmissiveIntensity, read once a frame.
     float emissiveIntensity(uint32_t frame);
@@ -213,6 +228,8 @@ namespace dxvk {
   private:
     void release(Rc<DxvkContext>& ctx, XXH64_hash_t key, Entry& entry, const char* reason);
     void publishStatus();
+    // Admits the frame's live re-renders from the live bakes drawn last frame, before the first of them runs.
+    void planLiveBakes(uint32_t frame);
 
     fast_unordered_cache<Entry> m_entries;
     fast_unordered_set m_failedKeys;
@@ -223,6 +240,10 @@ namespace dxvk {
     uint32_t m_bakesThisFrame = 0;
     VkDeviceSize m_passTargetBytesThisFrame = 0;
     uint32_t m_maxBakesPerFrame = 0;
+    uint32_t m_liveBakeFrame = ~0u;
+    uint64_t m_liveTexelsThisFrame = 0;
+    uint64_t m_liveTexelBudget = 0;
+    fast_unordered_set m_plannedLiveBakes;
     uint32_t m_optionsFrame = ~0u;
     float m_emissiveIntensity = 1.0f;
     uint64_t m_generation = 0;

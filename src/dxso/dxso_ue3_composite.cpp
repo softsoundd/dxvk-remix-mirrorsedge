@@ -81,9 +81,22 @@ namespace dxvk {
       return ((set >> uint32_t(DxsoColorTermFactor_LightConst)) & 1u) != 0;
     }
 
+    constexpr uint8_t kLitFactors =
+      DxsoColorTermFactor_Lightmap | DxsoColorTermFactor_LightConst | DxsoColorTermFactor_Interpolant;
+
     bool setHasLitTerm(const DxsoColorTermSet set) {
-      constexpr uint8_t kLit = DxsoColorTermFactor_Lightmap | DxsoColorTermFactor_LightConst | DxsoColorTermFactor_Interpolant;
-      return setHasFactor(set, kLit);
+      return setHasFactor(set, kLitFactors);
+    }
+
+    // Returns whether a term carries no lighting factor, as the emissive input's terms do.
+    // The view may still weight it, as Fresnel weights a reflection.
+    bool setHasUnlitTerm(const DxsoColorTermSet set) {
+      for (uint32_t signature = 0; signature < kDxsoColorTermSignatureCount; signature++) {
+        if (((set >> signature) & 1u) != 0 && (signature & kLitFactors) == 0) {
+          return true;
+        }
+      }
+      return false;
     }
 
     // Returns whether the opcode's destination token names the register it writes.
@@ -202,6 +215,7 @@ namespace dxvk {
     bool readsColor1 = false;
     int32_t alphaInputRegister = -1;
     int32_t fogInputRegister = -1;
+    uint32_t texcoordInputMask = 0;
     auto isPlainInput = [](const DxsoRegister& reg) {
       return reg.id.type == DxsoRegisterType::Input && !reg.hasRelative && reg.modifier == DxsoRegModifier::None;
     };
@@ -220,6 +234,9 @@ namespace dxvk {
         } else if (ctx.dst.id.type == DxsoRegisterType::Input && ctx.dcl.semantic.usage == DxsoUsage::Color) {
           readsColor0 |= ctx.dcl.semantic.usageIndex == 0;
           readsColor1 |= ctx.dcl.semantic.usageIndex == 1;
+        } else if (ctx.dst.id.type == DxsoRegisterType::Input && ctx.dcl.semantic.usage == DxsoUsage::Texcoord &&
+                   ctx.dst.id.num < 32) {
+          texcoordInputMask |= 1u << ctx.dst.id.num;
         }
         continue;
       }
@@ -231,14 +248,18 @@ namespace dxvk {
         continue;
       }
       if (ctx.dst.mask[0] || ctx.dst.mask[1] || ctx.dst.mask[2]) {
-        // UE3's translucent base pass fogs the colour last, as Color * Fog.a + Fog.rgb.
+        // UE3's translucent base pass fogs the colour last, as Color * Fog.a + Fog.rgb,
+        // or as Color * Fog.a when the draw adds its colour. Fog is a TEXCOORD interpolant.
         const DxsoRegister& fogFactor = ctx.src[1];
         const DxsoRegister& fogColor = ctx.src[2];
-        const bool fogs =
-          op == DxsoOpcode::Mad && ctx.dst.mask[0] && ctx.dst.mask[1] && ctx.dst.mask[2] &&
-          isPlainInput(fogFactor) && isPlainInput(fogColor) && fogFactor.id.num == fogColor.id.num &&
-          fogFactor.swizzle[0] == 3u && fogFactor.swizzle[1] == 3u && fogFactor.swizzle[2] == 3u &&
+        const bool readsFogFactor =
+          isPlainInput(fogFactor) && fogFactor.id.num < 32 && ((texcoordInputMask >> fogFactor.id.num) & 1u) != 0 &&
+          fogFactor.swizzle[0] == 3u && fogFactor.swizzle[1] == 3u && fogFactor.swizzle[2] == 3u;
+        const bool addsFogColor =
+          isPlainInput(fogColor) && fogColor.id.num == fogFactor.id.num &&
           fogColor.swizzle[0] == 0u && fogColor.swizzle[1] == 1u && fogColor.swizzle[2] == 2u;
+        const bool fogs = ctx.dst.mask[0] && ctx.dst.mask[1] && ctx.dst.mask[2] && readsFogFactor &&
+                          (op == DxsoOpcode::Mul || (op == DxsoOpcode::Mad && addsFogColor));
         fogInputRegister = fogs ? int32_t(fogFactor.id.num) : -1;
       }
       if (!ctx.dst.mask[3]) {
@@ -349,7 +370,7 @@ namespace dxvk {
     bool anyVertexLightmapTerm = false;
     bool anyColorLayer = false;
     auto noteColorSet = [&](const DxsoColorTermSet set) {
-      info.hasEmissive |= dxsoColorTermSetHasUnlitTerm(set);
+      info.hasEmissive |= setHasUnlitTerm(set);
       info.viewDependent |= setHasFactor(set, DxsoColorTermFactor_View);
       anyPureAmbientTerm |= setHasPureAmbientTerm(set);
       anyVertexLightmapTerm |= setHasFactor(set, DxsoColorTermFactor_Interpolant);
@@ -396,7 +417,7 @@ namespace dxvk {
       layer.isCube = samplerTypes[s] == DxsoTextureType::TextureCube;
       layer.name = samplerNames[s];
       if (role == DxsoColorTermRole::Color) {
-        layer.emissive = dxsoColorTermSetHasUnlitTerm(set);
+        layer.emissive = setHasUnlitTerm(set);
         layer.diffuse = setHasLitTerm(set);
         anyColorLayer |= layer.emissive || layer.diffuse;
         noteColorSet(set);

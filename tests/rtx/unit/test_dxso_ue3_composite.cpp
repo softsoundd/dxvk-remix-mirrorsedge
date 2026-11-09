@@ -26,7 +26,7 @@
 // instruction stream fxc emitted for a shipped office ceiling material under viewmode unlit.
 //
 // Run as test_dxso_ue3_composite <shader.dxso> [...], it prints the composite analysis of pixel shaders
-// dumped through DXVK_SHADER_DUMP_PATH, with each layer's UV origin and tiling, the mask layers,
+// dumped through DXVK_SHADER_DUMP_PATH, with each layer's UV origin and tilings, the mask layers,
 // and the repeat the immediate tilings solve to, with and without the masks.
 
 #include <algorithm>
@@ -552,6 +552,83 @@ namespace {
           "an unfogged colour has no fog input");
   }
 
+  void testViewWeightedLayers() {
+    // Stormdrain_p's unlit waterfall sheet weights a mask and a cube map only by a Fresnel term of the camera vector.
+    DxsoTestShader ps(kPs30Header);
+    ps.ctab({ { "UniformVector_0", kFloat4, 0 }, { "Texture2D_1", kSampler, 1 }, { "TextureCube_0", kSampler, 2 } })
+      .def(1, 1.0f, 0.5f, 0.0f, 0.0f)
+      .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+      .dclInput(DxsoUsage::Texcoord, 6, 1, MaskXYZ)
+      .dclSampler(1)
+      .dclSampler(2, DxsoTextureType::TextureCube)
+      .op1(DxsoOpcode::Nrm, rd(0, MaskXYZ), v(1))
+      .op2(DxsoOpcode::Add, rd(0, MaskW), r(0, kZZZZ, kModNeg), c(1, kXXXX))
+      .op2(DxsoOpcode::Max, rd(0, MaskW), r(0, kWWWW), c(1, kYYYY))
+      .texld(rd(1), r(0), 2)
+      .op2(DxsoOpcode::Mul, rd(1, MaskXYZ), r(1), r(0, kWWWW))
+      .texld(rd(2), v(0), 1)
+      .op3(DxsoOpcode::Mad, oC0(MaskXYZ), r(2, kXXXX), r(1), c(0))
+      .op1(DxsoOpcode::Mov, oC0(MaskW), c(1, kXXXX));
+    const DxsoUe3CompositeShaderInfo info = analyzeDxsoUe3CompositeShader(ps.view());
+    check(info.refusal == DxsoUe3CompositeRefusal::None, "a material whose layers only the view weights bakes");
+    check(info.lighting == DxsoUe3CompositeLighting::Unlit && info.hasEmissive && info.viewDependent,
+          "the view-weighted terms are unlit");
+    check(findLayer(info, 1) != nullptr && findLayer(info, 1)->emissive, "the Fresnel-weighted mask emits");
+    check(findLayer(info, 2) != nullptr && findLayer(info, 2)->emissive, "the Fresnel-weighted cube map emits");
+  }
+
+  void testAdditiveFog() {
+    // Stormdrain_p's waterfall mist adds its colour, which UE3 fogs as Color * Fog.a.
+    auto buildMist = [](const uint32_t fogSwizzle) {
+      DxsoTestShader ps(kPs30Header);
+      ps.ctab({ { "Texture2D_0", kSampler, 0 } })
+        .def(1, 0.0f, 0.0f, 0.0f, 0.0f)
+        .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+        .dclInput(DxsoUsage::Texcoord, 4, 1, MaskAll)
+        .dclSampler(0)
+        .texld(rd(0), v(0), 0)
+        .op2(DxsoOpcode::Mul, oC0(MaskXYZ), r(0), v(1, fogSwizzle))
+        .op1(DxsoOpcode::Mov, oC0(MaskW), c(1, kXXXX));
+      return ps;
+    };
+    const DxsoUe3CompositeShaderInfo info = analyzeDxsoUe3CompositeShader(buildMist(kWWWW).view());
+    check(info.refusal == DxsoUe3CompositeRefusal::None && info.fogInputRegister == 1,
+          "an added colour is fogged by v1 (TEXCOORD4)");
+    check(analyzeDxsoUe3CompositeShader(buildMist(kXXXX).view()).fogInputRegister < 0,
+          "a colour scaled by another lane of an interpolant is not fogged");
+  }
+
+  void testLayerReadAtSeveralTilings() {
+    // Stormdrain_p's waterfall foam reads one texture at a panned half tiling and at its own.
+    DxsoTestShader ps(kPs30Header);
+    ps.ctab({ { "UniformVector_1", kFloat4, 2 }, { "Texture2D_0", kSampler, 0 } })
+      .def(6, 0.5f, 1.0f, 1.8f, 4.0f)
+      .dclInput(DxsoUsage::Texcoord, 0, 0, MaskXY)
+      .dclSampler(0)
+      .op3(DxsoOpcode::Mad, rd(1, MaskXY), v(0), c(6), c(2))
+      .texld(rd(1), r(1), 0)
+      .texld(rd(2), v(0), 0)
+      .op2(DxsoOpcode::Mul, oC0(MaskXYZ), r(1), r(2))
+      .op1(DxsoOpcode::Mov, oC0(MaskW), c(6, kYYYY));
+    std::array<PsSamplerUvOrigin, kDxsoMaxPsSamplers> origins;
+    std::vector<PsSampleSiteUv> sites;
+    analyzePsSamplerUvOrigins(ps.view(), origins, nullptr, &sites);
+    check(origins[0].originValid && !origins[0].sitesAgree, "the reads disagree on their tiling");
+    check(sites.size() == 2 && sites[0].uv.originValid && sites[1].uv.originValid &&
+            sites[0].uv.semanticIndex == 0 && sites[1].uv.semanticIndex == 0,
+          "both reads are of TEXCOORD0");
+    check(formatUvComponentAffine(sites[0].uv.affineU) == "uv*0.5+c2.x" &&
+            formatUvComponentAffine(sites[1].uv.affineU) == "uv*1+0",
+          "each read keeps its own tiling");
+
+    // The foam's six reads of two textures repeat together every 10 by 4.
+    const float foamU[] = { 0.5f, 1.8f, 1.0f, 1.0f, 4.0f, 1.7f };
+    const float foamV[] = { 1.0f, 1.0f, 0.25f, 1.0f, 1.0f, 1.0f };
+    check(std::abs(solveUe3CompositePeriod(foamU, 6) - 10.0f) < 1e-3f &&
+            std::abs(solveUe3CompositePeriod(foamV, 6) - 4.0f) < 1e-3f,
+          "the foam repeats every (10, 4)");
+  }
+
   void testRefusals() {
     {
       // A vertex colour blend has no value over a texture repeat.
@@ -627,7 +704,8 @@ namespace {
     const DxsoShaderView view = shader.view();
     const DxsoUe3CompositeShaderInfo info = analyzeDxsoUe3CompositeShader(view);
     std::array<PsSamplerUvOrigin, kDxsoMaxPsSamplers> origins;
-    analyzePsSamplerUvOrigins(view, origins);
+    std::vector<PsSampleSiteUv> sites;
+    analyzePsSamplerUvOrigins(view, origins, nullptr, &sites);
 
     std::cout << "== " << path << "\n   refusal=" << describeDxsoUe3CompositeRefusal(info.refusal);
     if (!info.refusalDetail.empty()) {
@@ -665,28 +743,45 @@ namespace {
     bool allImmediate = true;
     for (const DxsoUe3CompositeLayer& layer : info.layers) {
       const PsSamplerUvOrigin& origin = origins[layer.sampler];
+      // A sampler read at several tilings lists each read, as the bake's repeat covers them all.
+      std::vector<const PsSamplerUvOrigin*> reads;
+      if (origin.sitesAgree) {
+        reads.push_back(&origin);
+      } else {
+        for (const PsSampleSiteUv& site : sites) {
+          if (site.sampler == layer.sampler) {
+            reads.push_back(&site.uv);
+          }
+        }
+      }
       std::cout << "   s" << uint32_t(layer.sampler) << " " << layer.name << (layer.isCube ? " cube" : "")
                 << " emissive=" << layer.emissive << " diffuse=" << layer.diffuse << " opacity=" << layer.opacity
                 << " steersOnlyCubes=" << layer.steersOnlyCubes
                 << " origin=" << origin.originValid << " sem=" << uint32_t(origin.semanticIndex)
                 << " comps=(" << uint32_t(origin.compU) << "," << uint32_t(origin.compV) << ")"
-                << " exact=" << origin.affineExact
-                << " U=[" << formatUvComponentAffine(origin.affineU) << "] V=[" << formatUvComponentAffine(origin.affineV) << "]\n";
+                << " exact=" << origin.affineExact;
+      for (const PsSamplerUvOrigin* read : reads) {
+        std::cout << " U=[" << formatUvComponentAffine(read->affineU) << "] V=["
+                  << formatUvComponentAffine(read->affineV) << "]";
+      }
+      std::cout << "\n";
       if (layer.isCube) {
         continue;
       }
-      const UvAffineTerm& u = origin.affineU.scale;
-      const UvAffineTerm& v = origin.affineV.scale;
-      const bool immediate = origin.affineExact && !origin.affineU.hasCross && !origin.affineV.hasCross &&
-                             u.constReg < 0 && v.constReg < 0;
-      allImmediate &= immediate;
-      scalesU.push_back(u.immValid ? u.imm : 1.0f);
-      scalesV.push_back(v.immValid ? v.imm : 1.0f);
       const bool isMask = std::any_of(info.maskLayers.begin(), info.maskLayers.end(),
                                       [&](const DxsoUe3CompositeMaskLayer& mask) { return mask.sampler == layer.sampler; });
-      if (!isMask) {
-        unmaskedScalesU.push_back(scalesU.back());
-        unmaskedScalesV.push_back(scalesV.back());
+      for (const PsSamplerUvOrigin* read : reads) {
+        const UvAffineTerm& u = read->affineU.scale;
+        const UvAffineTerm& v = read->affineV.scale;
+        const bool immediate = read->affineExact && !read->affineU.hasCross && !read->affineV.hasCross &&
+                               u.constReg < 0 && v.constReg < 0;
+        allImmediate &= immediate;
+        scalesU.push_back(u.immValid ? u.imm : 1.0f);
+        scalesV.push_back(v.immValid ? v.imm : 1.0f);
+        if (!isMask) {
+          unmaskedScalesU.push_back(scalesU.back());
+          unmaskedScalesV.push_back(scalesV.back());
+        }
       }
     }
     std::vector<float> coveringScalesU = scalesU;
@@ -744,6 +839,9 @@ int main(int argc, char** argv) {
     testTexcoordInColor();
     testCubeOnlyCoordinateLayers();
     testTranslucentDecal();
+    testViewWeightedLayers();
+    testAdditiveFog();
+    testLayerReadAtSeveralTilings();
     testRefusals();
     testPeriod();
     testResolution();

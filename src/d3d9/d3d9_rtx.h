@@ -597,6 +597,14 @@ namespace dxvk {
                "UE3 compat: composite material re-bakes run per frame, such as those of streamed-in mips. The surface "
                "keeps rendering its earlier bake meanwhile. A material's first bake is not limited by this, and runs as "
                "soon as the material is drawn.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3CompositeLiveBakeMaxResolution, 2048,
+               "UE3 compat: the largest side of a live composite material bake, in texels. A tagged material that animates, "
+               "such as one that pans its textures, bakes live, re-rendering its bake in place every frame from the game's "
+               "current constants, so it bakes smaller than a still material would.");
+    RTX_OPTION("rtx.d3d9", uint32_t, ue3CompositeLiveBakeTexelsPerFrame, 16777216,
+               "UE3 compat: texels of live composite material bakes re-rendered per frame. When the live bakes drawn need "
+               "more, the ones re-rendered longest ago go first, so they all slow evenly whichever order they are drawn in. "
+               "0 keeps every live bake as it first rendered.");
     RTX_OPTION("rtx.d3d9", bool, ue3CompositeEmission, false,
                "UE3 compat: keeps the emission a composite material bake separates from its colour, the unlit part of the "
                "game's output, as the surface's emissive texture, and exports it in captures. The bake takes it out of the "
@@ -1489,7 +1497,8 @@ namespace dxvk {
     std::shared_ptr<const Ue3CompositeBakeRequest> buildUe3CompositeRequest(const Ue3TextureState& ue3,
                                                                             const DxsoUe3CompositeShaderInfo& info,
                                                                             const Ue3CompositeDomain& domain,
-                                                                            uint32_t texcoordIdx, XXH64_hash_t key);
+                                                                            uint32_t texcoordIdx, XXH64_hash_t key,
+                                                                            bool live);
     // `vertexLightmap` is the value of the simple vertex lightmap compile's lighting interpolant.
     Rc<DxvkShader> getOrBuildUe3CompositeVertexShader(const D3D9CommonShader* pixelShader, const DxsoUe3CompositeShaderInfo& info,
                                                       const Ue3CompositeDomain& domain, uint32_t texcoordIdx, float vertexLightmap);
@@ -1790,6 +1799,7 @@ namespace dxvk {
       bool ue3LogUvAffineDetail = false;
       bool ue3LogAlbedoSelection = false;
       uint32_t ue3CompositeMaxResolution = 0;
+      uint32_t ue3CompositeLiveBakeMaxResolution = 0;
       bool ue3CompositeEmission = false;
       bool ue3LogCompositeMaterials = false;
       bool ue3FlowLayers = false;

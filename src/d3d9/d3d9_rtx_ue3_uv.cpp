@@ -185,7 +185,7 @@ namespace dxvk {
     if (!entry.initialized) {
       entry.initialized = true;
       const DxsoShaderView psView = makeDxsoShaderView(ps->GetBytecode(), ps);
-      analyzePsSamplerUvOrigins(psView, entry.samplerUvOrigin);
+      analyzePsSamplerUvOrigins(psView, entry.samplerUvOrigin, nullptr, &entry.sampleSites);
       // Any other sampler infers to the defaults.
       uint32_t inferredSamplerMask = ps->GetShaderMask().samplerMask;
       for (const auto& [samplerRegister, name] : getUe3PsSamplerNames(outHash, ps->GetBytecode())) {

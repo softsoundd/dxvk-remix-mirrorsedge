@@ -5316,6 +5316,10 @@ namespace dxvk {
       RemixGui::DragInt("Max Bake Resolution", &D3D9Rtx::ue3CompositeMaxResolutionObject(), 16.f, 64, 8192, "%d", sliderFlags);
       RemixGui::DragInt("VRAM Budget (MB)", &D3D9Rtx::ue3CompositeVramBudgetMBObject(), 16.f, 0, 16384, "%d", sliderFlags);
       RemixGui::DragInt("Max Re-bakes Per Frame", &D3D9Rtx::ue3CompositeMaxBakesPerFrameObject(), 0.1f, 1, 16, "%d", sliderFlags);
+      RemixGui::DragInt("Live Bake Max Resolution", &D3D9Rtx::ue3CompositeLiveBakeMaxResolutionObject(), 16.f, 64, 8192,
+                        "%d", sliderFlags);
+      RemixGui::DragInt("Live Bake Texels Per Frame", &D3D9Rtx::ue3CompositeLiveBakeTexelsPerFrameObject(),
+                        65536.f, 0, 67108864, "%d", sliderFlags);
       RemixGui::Checkbox("Keep Emission", &D3D9Rtx::ue3CompositeEmissionObject());
       RemixGui::DragFloat("Emissive Intensity", &D3D9Rtx::ue3CompositeEmissiveIntensityObject(), 0.01f, 0.f, 1000.f);
       RemixGui::Checkbox("Log Composite Materials", &D3D9Rtx::ue3LogCompositeMaterialsObject());
@@ -5327,11 +5331,12 @@ namespace dxvk {
       }
       RemixGui::SetTooltipToLastWidgetOnHover("Releases every bake at the end of the frame. Each bakes again when next drawn.");
       for (const Ue3CompositeBaker::Status& bake : bakes) {
-        ImGui::Text("mat_%016llX  pick %016llX  %ux%u  repeat (%g, %g)%s  %.1f MB",
+        ImGui::Text("mat_%016llX  pick %016llX  %ux%u  repeat (%g, %g)%s%s  %.1f MB",
                     static_cast<unsigned long long>(bake.materialHash),
                     static_cast<unsigned long long>(bake.pickTextureHash),
                     bake.width, bake.height, bake.period.x, bake.period.y,
                     bake.hasEmission ? "  emissive" : "",
+                    bake.live ? "  live" : "",
                     double(bake.bytes) / (1024.0 * 1024.0));
         RemixGui::SetTooltipToLastWidgetOnHover(bake.description.c_str());
       }

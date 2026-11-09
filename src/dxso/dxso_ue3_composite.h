@@ -143,8 +143,8 @@ namespace dxvk {
     // oC0.w is a plain read of this input register's w lane, UE3's PixelPosition.w. The bake sets it to 1
     // so the alpha of a clip()ped material marks its coverage.
     int32_t alphaInputRegister = -1;
-    // Is the input register UE3's translucent base pass fogs the colour output by, as Color * Fog.a + Fog.rgb.
-    // The bake sets it to no fog.
+    // Is the input register UE3's translucent base pass fogs the colour output by, as Color * Fog.a + Fog.rgb,
+    // or as Color * Fog.a for a draw that adds its colour. The bake sets it to no fog.
     int32_t fogInputRegister = -1;
     int32_t ambientColorAndSkyFactorRegister = -1;
     int32_t upperSkyColorRegister = -1;

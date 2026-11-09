@@ -185,6 +185,7 @@ namespace dxvk {
     o.ue3LogUvAffineDetail = ue3LogUvAffineDetailObject().get();
     o.ue3LogAlbedoSelection = ue3LogAlbedoSelectionObject().get();
     o.ue3CompositeMaxResolution = ue3CompositeMaxResolutionObject().get();
+    o.ue3CompositeLiveBakeMaxResolution = ue3CompositeLiveBakeMaxResolutionObject().get();
     o.ue3CompositeEmission = ue3CompositeEmissionObject().get();
     o.ue3LogCompositeMaterials = ue3LogCompositeMaterialsObject().get();
     o.ue3FlowLayers = ue3FlowLayersObject().get() && o.ue3EngineMode;

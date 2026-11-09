@@ -297,6 +297,8 @@ namespace dxvk {
     bool initialized = false;
     // exact per-sampler coordinate origin resolution (authoritative for the UV decision)
     std::array<PsSamplerUvOrigin, caps::MaxTexturesPS> samplerUvOrigin;
+    // Holds each texture read's own coordinate origin, in program order.
+    std::vector<PsSampleSiteUv> sampleSites;
     // statistical inference below is used for diffuse-sampler *scoring* only
     std::array<PsSamplerTexcoordInference, caps::MaxTexturesPS> samplers;
     // Holds the flags getPsSamplerFlagsRuledOutByLanes cleared from `samplers`, which
@@ -708,7 +710,21 @@ namespace dxvk {
     // Holds the lighting-only layer tilings any compile of the material has drawn with. Every compile extends its
     // repeat by them, because the simple lightmap compiles strip the normal map that the directional ones sample.
     std::vector<Vector2> lightingScales;
-    bool animated = false;
+    // Is set once an animating input has changed the constants too often to bake each set of values.
+    // The material bakes live from then on, re-rendering its bake every frame.
+    bool live = false;
+    // These hold the frame and key of the draw a live bake last had its state applied for.
+    uint32_t liveDrawStateFrame = ~0u;
+    XXH64_hash_t liveDrawStateKey = kEmptyHash;
+    // These hold the shader and constants of the material's first draw this frame. A later draw through the same
+    // shader with other values means the constants vary per draw, as those of instances that differ do.
+    uint32_t constantsFrame = ~0u;
+    XXH64_hash_t frameShaderHash = kEmptyHash;
+    XXH64_hash_t frameConstantsHash = kEmptyHash;
+    bool variesPerDraw = false;
+    // Is set when the constants vary per draw and take more values than a bake for each allows, which one live bake
+    // cannot show either. The material renders its albedo pick from then on.
+    bool refused = false;
     bool hasDomain = false;
     Vector2 period = Vector2(1.0f, 1.0f);
     Matrix4 domainTransform;

@@ -203,6 +203,64 @@ namespace dxvk {
     return true;
   }
 
+  void Ue3CompositeBaker::planLiveBakes(const uint32_t frame) {
+    m_liveBakeFrame = frame;
+    m_liveTexelsThisFrame = 0;
+    m_liveTexelBudget = D3D9Rtx::ue3CompositeLiveBakeTexelsPerFrame();
+    m_plannedLiveBakes.clear();
+    if (m_liveTexelBudget == 0) {
+      return;
+    }
+
+    // These hold the live bakes drawn last frame or already this one, in the order they last re-rendered.
+    struct Waiting {
+      uint32_t bakedFrame;
+      XXH64_hash_t key;
+      uint64_t texels;
+    };
+    std::vector<Waiting> waiting;
+    for (const auto& [key, entry] : m_entries) {
+      if (entry.live && entry.bakedFrame != frame && entry.lastUsedFrame + 1 >= frame) {
+        waiting.push_back({ entry.bakedFrame, key, uint64_t(entry.width) * uint64_t(entry.height) });
+      }
+    }
+    std::sort(waiting.begin(), waiting.end(), [](const Waiting& a, const Waiting& b) {
+      return a.bakedFrame != b.bakedFrame ? a.bakedFrame < b.bakedFrame : a.key < b.key;
+    });
+
+    // The first always re-renders, even past the budget, so that none of them stands still.
+    for (const Waiting& live : waiting) {
+      if (m_plannedLiveBakes.empty() || m_liveTexelsThisFrame + live.texels <= m_liveTexelBudget) {
+        m_plannedLiveBakes.insert(live.key);
+        m_liveTexelsThisFrame += live.texels;
+      }
+    }
+  }
+
+  bool Ue3CompositeBaker::takeLiveBakeSlot(const uint32_t frame, const Ue3CompositeBakeRequest& request,
+                                           const Entry& entry) {
+    if (m_liveBakeFrame != frame) {
+      planLiveBakes(frame);
+    }
+    if (m_plannedLiveBakes.count(request.key) != 0) {
+      return true;
+    }
+    // A live bake its surface did not draw last frame re-renders if the plan left room for it.
+    const uint64_t texels = uint64_t(entry.width) * uint64_t(entry.height);
+    if (m_liveTexelBudget == 0 || m_liveTexelsThisFrame + texels > m_liveTexelBudget) {
+      return false;
+    }
+    m_liveTexelsThisFrame += texels;
+    return true;
+  }
+
+  void Ue3CompositeBaker::markRebaked(const XXH64_hash_t key, const uint32_t frame) {
+    auto it = m_entries.find(key);
+    if (it != m_entries.end()) {
+      it->second.bakedFrame = frame;
+    }
+  }
+
   float Ue3CompositeBaker::emissiveIntensity(const uint32_t frame) {
     if (m_optionsFrame != frame) {
       m_optionsFrame = frame;
@@ -303,6 +361,8 @@ namespace dxvk {
     releaseResource(entry.emissive);
     releaseResource(entry.maskedAlbedo);
     releaseResource(entry.maskedHalfAlbedo);
+    entry.passTarget.reset();
+    entry.emissivePassTarget.reset();
     m_totalBytes -= std::min(m_totalBytes, entry.bytes);
 
     if (D3D9Rtx::ue3LogCompositeMaterials()) {
@@ -379,6 +439,7 @@ namespace dxvk {
       row.height = entry.height;
       row.period = entry.period;
       row.hasEmission = entry.emissive.isValid();
+      row.live = entry.live;
       row.bytes = entry.bytes;
       row.lastUsedFrame = entry.lastUsedFrame;
       row.description = entry.description;
@@ -453,11 +514,15 @@ namespace dxvk {
         entry = previous;
       } else if (previous != nullptr && !baker.hasHeld(request->key, frame)) {
         entry = previous;
-      } else if (baker.takeBakeSlot(frame, *request, previous != nullptr) && bakeUe3CompositeNow(*request)) {
+      } else if (baker.takeBakeSlot(frame, *request, previous != nullptr) && bakeUe3CompositeNow(*request, false)) {
         entry = baker.find(request->key, frame);
       } else {
         entry = previous;
       }
+    } else if (entry != nullptr && request->live && entry->bakedFrame != frame &&
+               drawCallState.ue3CompositeDrawStateApplied && !baker.hasFailed(request->key) &&
+               baker.takeLiveBakeSlot(frame, *request, *entry)) {
+      bakeUe3CompositeNow(*request, true);
     }
     if (entry == nullptr) {
       return;
@@ -485,10 +550,15 @@ namespace dxvk {
     useBakeUvs(drawCallState, *request);
   }
 
-  bool RtxContext::bakeUe3CompositeNow(const Ue3CompositeBakeRequest& request) {
+  bool RtxContext::bakeUe3CompositeNow(const Ue3CompositeBakeRequest& request, const bool inPlace) {
     ScopedGpuProfileZone(this, "UE3 Composite Bake");
     Ue3CompositeBaker& baker = getSceneManager().getUe3CompositeBaker();
     Rc<DxvkContext> ctx = this;
+    const uint32_t frame = m_device->getCurrentFrameId();
+    const Ue3CompositeBaker::Entry* const target = inPlace ? baker.find(request.key, frame) : nullptr;
+    if (inPlace && (target == nullptr || !target->passTarget.isValid())) {
+      return false;
+    }
 
     auto slotInRange = [&](const uint32_t slot) { return slot < m_rc.size(); };
     const bool slotsInRange =
@@ -513,7 +583,7 @@ namespace dxvk {
       baker.markFailed(request.key);
       Logger::warn(str::format(
         "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, request.materialHash, std::dec,
-        " cannot be baked: ", failure, ". It renders its albedo pick."));
+        " cannot be baked: ", failure, inPlace ? ". It keeps the bake it has." : ". It renders its albedo pick."));
       return false;
     }
 
@@ -547,40 +617,54 @@ namespace dxvk {
     // Every pass but the emission one renders into the same target, which is encoded before the next pass.
     const VkExtent3D extent = { request.width, request.height, 1 };
     const VkExtent3D emissiveExtent = request.uniformEmission ? VkExtent3D { 1, 1, 1 } : extent;
-    const Resources::Resource passTarget = Resources::createImageResource(
-      ctx, "UE3 composite bake", extent, kUe3CompositePassFormat, 1, VK_IMAGE_TYPE_2D,
-      VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    Resources::Resource passTarget;
     Resources::Resource emissiveTarget;
-    if (request.emissivePass) {
-      emissiveTarget = Resources::createImageResource(
-        ctx, "UE3 composite bake emission", emissiveExtent, kUe3CompositePassFormat, 1, VK_IMAGE_TYPE_2D,
+    if (target != nullptr) {
+      passTarget = target->passTarget;
+      emissiveTarget = target->emissivePassTarget;
+    } else {
+      passTarget = Resources::createImageResource(
+        ctx, "UE3 composite bake", extent, kUe3CompositePassFormat, 1, VK_IMAGE_TYPE_2D,
         VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      if (request.emissivePass) {
+        emissiveTarget = Resources::createImageResource(
+          ctx, "UE3 composite bake emission", emissiveExtent, kUe3CompositePassFormat, 1, VK_IMAGE_TYPE_2D,
+          VK_IMAGE_VIEW_TYPE_2D, 0, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      }
     }
     const bool masked = request.mask.has_value();
     const bool maskedHalf = masked && request.mask->degree == 2;
 
-    // The material renders with these textures.
-    const uint32_t mipLevels = mipLevelCount(request.width, request.height);
-    const VkClearColorValue clear = { 0.0f, 0.0f, 0.0f, 0.0f };
+    // The material renders with these textures. A live bake re-renders the ones its surface already reads.
     Ue3CompositeBaker::Entry entry;
-    entry.albedo = RtxMipmap::createResource(ctx, "UE3 composite albedo", extent, VK_FORMAT_R8G8B8A8_UNORM, 0, clear, mipLevels);
     VkFormat emissiveFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-    if (request.storeEmission) {
-      const VkFormatProperties properties = m_device->adapter()->formatProperties(emissiveFormat);
-      if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
-        emissiveFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (target != nullptr) {
+      entry.albedo = target->albedo;
+      entry.emissive = target->emissive;
+      entry.maskedAlbedo = target->maskedAlbedo;
+      entry.maskedHalfAlbedo = target->maskedHalfAlbedo;
+    } else {
+      const uint32_t mipLevels = mipLevelCount(request.width, request.height);
+      const VkClearColorValue clear = { 0.0f, 0.0f, 0.0f, 0.0f };
+      entry.albedo = RtxMipmap::createResource(ctx, "UE3 composite albedo", extent, VK_FORMAT_R8G8B8A8_UNORM, 0, clear,
+                                               mipLevels);
+      if (request.storeEmission) {
+        const VkFormatProperties properties = m_device->adapter()->formatProperties(emissiveFormat);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
+          emissiveFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+        }
+        entry.emissive = RtxMipmap::createResource(ctx, "UE3 composite emission", emissiveExtent, emissiveFormat, 0,
+                                                   clear, mipLevelCount(emissiveExtent.width, emissiveExtent.height));
       }
-      entry.emissive = RtxMipmap::createResource(ctx, "UE3 composite emission", emissiveExtent, emissiveFormat, 0, clear,
-                                                 mipLevelCount(emissiveExtent.width, emissiveExtent.height));
-    }
-    if (masked) {
-      entry.maskedAlbedo = RtxMipmap::createResource(ctx, "UE3 composite albedo with mask", extent, VK_FORMAT_R8G8B8A8_UNORM, 0,
-                                                     clear, mipLevels);
-      entry.mask = request.mask;
-    }
-    if (maskedHalf) {
-      entry.maskedHalfAlbedo = RtxMipmap::createResource(ctx, "UE3 composite albedo with half mask", extent,
-                                                         VK_FORMAT_R8G8B8A8_UNORM, 0, clear, mipLevels);
+      if (masked) {
+        entry.maskedAlbedo = RtxMipmap::createResource(ctx, "UE3 composite albedo with mask", extent,
+                                                       VK_FORMAT_R8G8B8A8_UNORM, 0, clear, mipLevels);
+        entry.mask = request.mask;
+      }
+      if (maskedHalf) {
+        entry.maskedHalfAlbedo = RtxMipmap::createResource(ctx, "UE3 composite albedo with half mask", extent,
+                                                           VK_FORMAT_R8G8B8A8_UNORM, 0, clear, mipLevels);
+      }
     }
 
     // The bake swaps these out of the draw's state and puts them back after its passes.
@@ -721,6 +805,12 @@ namespace dxvk {
       RtxMipmap::updateMipmap(this, entry.maskedHalfAlbedo, albedoMips);
     }
 
+    // A live bake keeps its hashes, so its surface's materials stay bound to the textures it re-renders.
+    if (target != nullptr) {
+      baker.markRebaked(request.key, frame);
+      return true;
+    }
+
     // Each bake gets hashes of its own. The render material and its surface material are cached on their
     // textures' hashes, and a bake that lands again under the same key must look new to them.
     const uint64_t generation = baker.nextGeneration();
@@ -737,8 +827,8 @@ namespace dxvk {
     entry.sampler = getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT);
     entry.bytes = mipChainBytes(request.width, request.height, 4) * albedoTextures +
                   (entry.emissive.isValid() ? mipChainBytes(emissiveExtent.width, emissiveExtent.height, emissiveTexelBytes) : 0);
-    entry.lastUsedFrame = m_device->getCurrentFrameId();
-    entry.bakedFrame = entry.lastUsedFrame;
+    entry.lastUsedFrame = frame;
+    entry.bakedFrame = frame;
     entry.lineage = request.lineage;
     entry.materialHash = request.materialHash;
     entry.pickTextureHash = request.pickTextureHash;
@@ -746,6 +836,12 @@ namespace dxvk {
     entry.height = request.height;
     entry.period = request.period;
     entry.alphaBlend = request.multiplyScale > 0.0f;
+    entry.live = request.live;
+    if (request.live) {
+      entry.passTarget = passTarget;
+      entry.emissivePassTarget = emissiveTarget;
+      entry.bytes += passTargetBytes(request);
+    }
     entry.description = request.description;
 
     if (request.log) {
