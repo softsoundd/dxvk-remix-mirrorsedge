@@ -34,6 +34,7 @@
 #include "dxvk_context.h"
 #include "dxvk_buffer.h"
 #include "rtx_context.h"
+#include "rtx_water_sim.h"
 #include "rtx_options.h"
 #include "rtx_preserved_object_picking.h"
 #include "rtx_terrain_baker.h"
@@ -159,10 +160,6 @@ namespace dxvk {
     instanceEvents.onInstanceUpdatedCallback = [this](RtInstance& instance, const DrawCallState& drawCall, const MaterialData* material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
     instanceEvents.onInstanceDestroyedCallback = [this](RtInstance& instance) { onInstanceDestroyed(instance); };
     m_instanceManager.addEventHandler(instanceEvents);
-    
-    if (env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME") != "") {
-      m_beginUsdExportFrameNum = stoul(env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME"));
-    }
   }
 
   SceneManager::~SceneManager() {
@@ -330,6 +327,9 @@ namespace dxvk {
     m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
     m_lastResolvedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
     m_lastUploadedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
+    m_sludgeWaterMaterialIndex = SURFACE_INDEX_INVALID;
+    m_sludgeWaterMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    m_lastUploadedSludgeWaterMaterialIndexInCache = kInvalidMaterialCacheIndex;
 
     // The scene's meshes can be released after a clear, and new meshes can reuse their index buffer addresses.
     m_playerModelMeshClassifier.clear();
@@ -451,6 +451,11 @@ namespace dxvk {
     }
 
     RaytraceGeometry& output = inOutGeometry;
+
+    output.particlePickingBuffer = input.particlePickingBuffer.defined()
+      ? RaytraceBuffer(input.particlePickingBuffer, 0, sizeof(uint32_t), VK_FORMAT_R32_UINT)
+      : RaytraceBuffer();
+    output.particlePickingPrimitivesPerParticle = input.particlePickingPrimitivesPerParticle;
 
     output.lastBoneHash = drawCallState.getSkinningState().boneHash;
 
@@ -672,6 +677,8 @@ namespace dxvk {
     m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
     m_fogStartInMediumMaterialIndex_inCache = UINT32_MAX;
     m_startInMediumMaterialIndex_inCache = UINT32_MAX;
+    m_sludgeWaterMaterialIndex = SURFACE_INDEX_INVALID;
+    m_sludgeWaterMaterialIndex_inCache = kInvalidMaterialCacheIndex;
 
     if (m_uniqueObjectSearchDistance != RtxOptions::uniqueObjectDistance()) {
       m_uniqueObjectSearchDistance = RtxOptions::uniqueObjectDistance();
@@ -1493,6 +1500,7 @@ namespace dxvk {
     updateSlot(geo.texcoordBuffer,         geo.texcoordBufferIndex);
     updateSlot(geo.positionBuffer,         geo.positionBufferIndex);
     updateSlot(geo.previousPositionBuffer, geo.previousPositionBufferIndex);
+    updateSlot(geo.particlePickingBuffer,  geo.particlePickingBufferIndex);
 
     if (changed) {
       syncLinkedInstances(pBlas);
@@ -1518,6 +1526,7 @@ namespace dxvk {
     releaseSlot(geo.texcoordBufferIndex);
     releaseSlot(geo.positionBufferIndex);
     releaseSlot(geo.previousPositionBufferIndex);
+    releaseSlot(geo.particlePickingBufferIndex);
   }
 
   void SceneManager::verifyAndReleaseBufferCache() {
@@ -2994,6 +3003,7 @@ namespace dxvk {
     m_graphManager.applySceneOverrides(ctx);
 
     m_terrainBaker->prepareSceneData(ctx);
+    m_device->getCommon()->metaWaterSim().prepareSceneData(ctx.ptr());
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     if (m_bindlessResourceManager.prepareSceneData(
@@ -3004,6 +3014,8 @@ namespace dxvk {
 
     // If there are no instances, we should do nothing!
     if (m_instanceManager.getActiveCount() == 0) {
+      m_device->getCommon()->capturer()->reportPendingCaptureBlocked("there are no active instances in the scene");
+
       // Clear the ray portal data before the next frame
       m_rayPortalManager.clear();
       return;
@@ -3076,6 +3088,39 @@ namespace dxvk {
       m_lastResolvedStartInMediumMaterialIndexInCache = m_startInMediumMaterialIndex_inCache;
     }
 
+    // The water that sludge opens into is a translucent material of its own, uploaded after the camera medium.
+    m_sludgeWaterMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    if (RtxWaterSim::Sludge::enable()) {
+      const TranslucentMaterialData sludgeWater {
+        {},
+        {},
+        {},
+        RtxWaterSim::Sludge::kWaterRefractiveIndex,
+        RtxWaterSim::Sludge::waterTransmittance(),
+        RtxWaterSim::Sludge::waterMeasurementDistanceMeters() * RtxOptions::getMeterToWorldUnitScale(),
+        false, // EnableEmission
+        0.f, // EmissiveIntensity
+        Vector3(0.f), // EmissiveColorConstant
+        0, // SpriteSheetRows
+        0, // SpriteSheetCols
+        0, // SpriteSheetFPS
+        false, // EnableThinWalled
+        0.001f, // ThinWallThickness
+        false, // EnableDiffuseLayer
+        lss::Mdl::Filter::Linear,
+        lss::Mdl::WrapMode::Repeat, // U
+        lss::Mdl::WrapMode::Repeat, // V
+        0.f, // TextureScrollRate
+        0.f, // TextureScrollAngle
+        Vector2(1.f), // TextureScale
+        Vector2(0.f), // TextureOffset
+        0.f, // TextureRotation
+      };
+      const auto samplerIndex = trackSampler(getOrCreateExternalSampler());
+      m_sludgeWaterMaterialIndex_inCache = m_surfaceMaterialCache.track(
+        RtSurfaceMaterial(createTranslucentSurfaceMaterial(sludgeWater, samplerIndex, true)));
+    }
+
     if (m_cameraManager.isCameraCutThisFrame()) {
       // Ignore camera cut events on teleportation so we don't flush the caches
       if (!didTeleport) {
@@ -3108,6 +3153,7 @@ namespace dxvk {
 
     RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
     particles.simulate(ctx.ptr());
+    m_device->getCommon()->metaWaterSim().update(ctx.ptr());
 
     m_instanceManager.findPortalForVirtualInstances(m_cameraManager, m_rayPortalManager);
     m_instanceManager.updatePlayerModelBodyCameraDistance(m_cameraManager);
@@ -3191,10 +3237,12 @@ namespace dxvk {
     // Baked terrain materials are updated independently of acceleration-structure
     // scene generation, so keep their surface-material upload live.
     const bool startInMediumStateChanged = m_startInMediumMaterialIndex_inCache != m_lastUploadedStartInMediumMaterialIndexInCache;
+    const bool sludgeWaterStateChanged = m_sludgeWaterMaterialIndex_inCache != m_lastUploadedSludgeWaterMaterialIndexInCache;
     const bool updateSurfaceMaterials =
       !m_accelManager.wasSceneUnchangedThisFrame() ||
       TerrainBaker::needsTerrainBaking() ||
-      startInMediumStateChanged;
+      startInMediumStateChanged ||
+      sludgeWaterStateChanged;
     if (updateSurfaceMaterials) {
       DxvkBufferCreateInfo matInfo;
       matInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
@@ -3209,8 +3257,12 @@ namespace dxvk {
         // Note: We duplicate the materials in the buffer so we don't have to do pointer chasing on the GPU
         size_t surfaceMaterialsGPUSize = m_accelManager.getSurfaceCount() * kSurfaceMaterialGPUSize;
         const uint32_t expectedSurfaceMaterialEntries = m_accelManager.getSurfaceCount()
-          + (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex ? 1u : 0u);
+          + (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex ? 1u : 0u)
+          + (m_sludgeWaterMaterialIndex_inCache != kInvalidMaterialCacheIndex ? 1u : 0u);
         if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
+          surfaceMaterialsGPUSize += kSurfaceMaterialGPUSize;
+        }
+        if (m_sludgeWaterMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
           surfaceMaterialsGPUSize += kSurfaceMaterialGPUSize;
         }
 
@@ -3248,10 +3300,20 @@ namespace dxvk {
           m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
         }
 
+        if (m_sludgeWaterMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
+          auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[m_sludgeWaterMaterialIndex_inCache];
+          surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
+          m_sludgeWaterMaterialIndex = surfaceIndex;
+          surfaceIndex++;
+        } else {
+          m_sludgeWaterMaterialIndex = SURFACE_INDEX_INVALID;
+        }
+
         assert(surfaceIndex == expectedSurfaceMaterialEntries);
         assert(dataOffset == surfaceMaterialsGPUSize);
         assert(surfaceMaterialsGPUData.size() == surfaceMaterialsGPUSize);
         m_lastUploadedStartInMediumMaterialIndexInCache = m_startInMediumMaterialIndex_inCache;
+        m_lastUploadedSludgeWaterMaterialIndexInCache = m_sludgeWaterMaterialIndex_inCache;
 
         // PointInstancer copies use the template material slot, so leave theirs out
         if (!surfaceMaterialsGPUData.empty()) {
@@ -3265,6 +3327,12 @@ namespace dxvk {
     } else {
       m_startInMediumMaterialIndex = m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex
         ? m_accelManager.getSurfaceCount()
+        : SURFACE_INDEX_INVALID;
+      // The upload that this frame skips put the sludge water after the camera medium, as it would now.
+      const uint32_t sludgeWaterIndex = m_accelManager.getSurfaceCount() +
+        (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex ? 1u : 0u);
+      m_sludgeWaterMaterialIndex = m_sludgeWaterMaterialIndex_inCache != kInvalidMaterialCacheIndex
+        ? sludgeWaterIndex
         : SURFACE_INDEX_INVALID;
     }
 
@@ -3358,11 +3426,7 @@ namespace dxvk {
     m_device->statCounters().setCtr(DxvkStatCounter::RtxLightCount, m_lightManager.getActiveCount());
     m_device->statCounters().setCtr(DxvkStatCounter::RtxSamplers, m_samplerCache.getActiveCount());
 
-    auto capturer = m_device->getCommon()->capturer();
-    if (m_device->getCurrentFrameId() == m_beginUsdExportFrameNum) {
-      capturer->triggerNewCapture();
-    }
-    capturer->step(ctx, ctx->getCommonObjects()->getLastKnownWindowHandle());
+    m_device->getCommon()->capturer()->step(ctx, ctx->getCommonObjects()->getLastKnownWindowHandle());
 
     // Clear the ray portal data before the next frame
     m_rayPortalManager.clear();

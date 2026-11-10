@@ -50,6 +50,7 @@
 
 #include <windows.h>
 
+#include <cmath>
 #include <cstring>
 #include <optional>
 
@@ -719,10 +720,11 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS)                { result.set(InstanceCategories::HairCards); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SLUDGE)                    { result.set(InstanceCategories::Sludge); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL)                { result.set(InstanceCategories::ViewModel); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_CULL_BACKFACES_IN_SHADOWS) { result.set(InstanceCategories::CullBackfacesInShadows); }
       
-      static_assert((int)InstanceCategories::Count == 27, "Instance categories changed, please update Remix SDK");
+      static_assert((int)InstanceCategories::Count == 28, "Instance categories changed, please update Remix SDK");
       return result;
     }
 
@@ -855,6 +857,9 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
   if (auto objectPicking = pnext::find<remixapi_InstanceInfoObjectPickingEXT>(&info)) {
     prototype.drawCallID = objectPicking->objectPickingValue;
   }
+  if (auto particlePicking = pnext::find<remixapi_InstanceInfoParticleObjectPickingEXT>(&info)) {
+    prototype.particleObjectPickingValue = particlePicking->objectPickingValue;
+  }
 
   if (auto extBones = pnext::find<remixapi_InstanceInfoBoneTransformsEXT>(&info)) {
     const uint32_t boneCount =
@@ -902,6 +907,14 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
   if (auto distribution = pnext::find<remixapi_InstanceInfoParticleSpawnDistributionEXT>(&info)) {
     if (state->optionalParticleDesc) {
       state->optionalParticleDesc->spawnDistribution = distribution->spawnDistribution == REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_SURFACE_AREA;
+    }
+  }
+
+  if (auto screenSize = pnext::find<remixapi_InstanceInfoParticleScreenSizeEXT>(&info)) {
+    if (state->optionalParticleDesc) {
+      state->optionalParticleDesc->minScreenSize = screenSize->minScreenSize;
+      state->optionalParticleDesc->maxScreenSize = screenSize->maxScreenSize;
+      state->optionalParticleDesc->screenSizeCoverage = screenSize->screenSizeCoverage;
     }
   }
 
@@ -1174,6 +1187,43 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_SetWaterSim(
+    const remixapi_WaterSimInfo* info) {
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_WATER_SIM_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    std::lock_guard lock { s_mutex };
+    remixDevice->EmitCs([cInfo = *info](dxvk::DxvkContext* ctx) {
+      ctx->getCommonObjects()->metaWaterSim().setState(cInfo);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_AddWaterDisturbance(
+    const remixapi_WaterDisturbanceInfo* info) {
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_WATER_DISTURBANCE_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    // A NaN or infinity in the height field would never decay.
+    if (!std::isfinite(info->position.x) || !std::isfinite(info->position.y) || !std::isfinite(info->position.z) ||
+        !std::isfinite(info->radius) || !std::isfinite(info->strength)) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    std::lock_guard lock { s_mutex };
+    remixDevice->EmitCs([cInfo = *info](dxvk::DxvkContext* ctx) {
+      ctx->getCommonObjects()->metaWaterSim().addDisturbance(cInfo);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawInstance(
     const remixapi_InstanceInfo* info) {
     dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
@@ -1185,6 +1235,15 @@ namespace {
     if (auto distribution = pnext::find<remixapi_InstanceInfoParticleSpawnDistributionEXT>(info)) {
       if (distribution->spawnDistribution != REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_TRIANGLE
           && distribution->spawnDistribution != REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_SURFACE_AREA) {
+        return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+      }
+    }
+    if (auto screenSize = pnext::find<remixapi_InstanceInfoParticleScreenSizeEXT>(info)) {
+      if (!std::isfinite(screenSize->minScreenSize) || screenSize->minScreenSize < 0.f
+          || !std::isfinite(screenSize->maxScreenSize) || screenSize->maxScreenSize < 0.f
+          || (screenSize->maxScreenSize > 0.f && screenSize->maxScreenSize < screenSize->minScreenSize)
+          || !std::isfinite(screenSize->screenSizeCoverage)
+          || screenSize->screenSizeCoverage < 0.f || screenSize->screenSizeCoverage > 1.f) {
         return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
       }
     }
@@ -1898,6 +1957,8 @@ extern "C"
       interf.DestroyMesh = remixapi_DestroyMesh;
       interf.SetupCamera = remixapi_SetupCamera;
       interf.SetCameraMediumMaterial = remixapi_SetCameraMediumMaterial;
+      interf.SetWaterSim = remixapi_SetWaterSim;
+      interf.AddWaterDisturbance = remixapi_AddWaterDisturbance;
       interf.DrawInstance = remixapi_DrawInstance;
       interf.CreateLight = remixapi_CreateLight;
       interf.DestroyLight = remixapi_DestroyLight;
@@ -1912,10 +1973,9 @@ extern "C"
       interf.pick_RequestObjectPicking = remixapi_pick_RequestObjectPicking;
       interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
-    static_assert(sizeof(interf) == 176, "Add/remove function registration");
+    static_assert(sizeof(interf) == 192, "Add/remove function registration");
 
-    // Older clients allocate a shorter interface, so only the prefix they know is written.
-    std::memcpy(out_result, &interf, remixapi_version::clientInterfaceSize(info->version));
+    remixapi_version::writeClientInterface(interf, info->version, out_result);
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 

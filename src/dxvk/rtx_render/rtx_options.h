@@ -340,6 +340,9 @@ namespace dxvk {
                   "Textures on draw calls to be treated as \"animated water\".\n"
                   "Objects with this flag applied will animate their normals to fake a basic water effect based on the layered water material parameters, and only when rtx.opaqueMaterial.layeredWaterNormalEnable is set to true.\n"
                   "Should typically be used on static water planes that the original application may have relied on shaders to animate water on.");
+    RTX_OPTION("rtx", fast_unordered_set, sludgeTextures, {},
+                  "Sludge textures: opaque until the water simulation clears them into water where disturbed (rtx.waterSim.sludge.enable).\n"
+                  "Needs geometry beneath the layer; without it, the holes show empty space.");
     RTX_OPTION("rtx", fast_unordered_set, ignoreBakedLightingTextures, {},
                   "Textures for which to ignore two types of baked lighting, Texture Factors and Vertex Color.\n\n"
                   "Texture Factor disablement:\n"
@@ -575,6 +578,7 @@ namespace dxvk {
       RTX_OPTION("rtx.displacement", bool, enableReSTIRGI, true, "Whether ReSTIR GI accounts for displacement mapping");
       RTX_OPTION("rtx.displacement", bool, enableIndirectHit, false, "Whether indirect ray hits account for displacement mapping (Enabling this is expensive.  Without it, non-perfect reflections of displaced objects will not show displacement.)");
       RTX_OPTION("rtx.displacement", bool, enablePSR, false, "Enable PSR (perfect reflections) for materials with displacement.  Rays that have been perfectly reflected off a POM surface will not collide correctly with other parts of that same surface.");
+      RTX_OPTION("rtx.displacement", bool, silhouettesBehindTranslucency, true, "POM surfaces seen through water or other thick translucency get their POM silhouette instead of the low poly one.");
       RTX_OPTION("rtx.displacement", float, displacementFactor, 1.0f, "Scaling factor for all displacement maps");
       RTX_OPTION("rtx.displacement", float, displacementInFactor, 1.0f, "Scale factor for inwards displacement");
       RTX_OPTION("rtx.displacement", float, displacementOutFactor, 1.0f, "Scale factor for outwards displacement");
@@ -1706,20 +1710,28 @@ namespace dxvk {
                       "Enable shader code for eye drawing (eyeball normals, iris blending).");
       RTX_OPTION("rtx.eye", bool, assumeViewTexgenModeAsEye, true,
                  "Used to detect eyes and its vectors, by assuming that a draw call with D3DTSS_TCI_CAMERASPACEPOSITION and specific texture transform is an eye draw call.");
-      RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.18F,
+      RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.5F,
                  "Radius of the sphere used to calculate eye normals on the whites, in world units. "
                  "The larger the value, the more pronounced the ambient shadowing is on an eyeball, to better ground the eyes on a face.");
-      RTX_OPTION("rtx.eye", float, corneaSphereOffset, 0.1F,
+      RTX_OPTION("rtx.eye", float, corneaSphereOffset, 0.4F,
                  "Radius of the sphere used to calculate eye normals on the cornea, in world units. "
                  "Larger values make the eye cornea appear more spherical.");
       RTX_OPTION("rtx.eye", float, eyeWhitesAlbedoScale, 0.5F, "Brightness multiplier for the eye whites.");
+      RTX_OPTION_ARGS("rtx.eye", float, roughness, 0.F,
+                      "Perceptual roughness of the eye surface; 0 is a mirror that reflects the scene but not analytic lights.",
+                      args.minValue = 0.F, args.maxValue = 1.F);
       RTX_OPTION("rtx.eye", float, irisRadius, 0.165F,
                  "Size of an iris in the iris texture. "
                  "If the iris texture is sampled outside of this radius, it's assumed that that area is a transition to the eye whites, "
                  "so iris depth gradually goes to 0.");
-      RTX_OPTION("rtx.eye", float, irisDepth, 0.06F,
-                 "How deep should the iris (colored part of an eye) be placed behind the cornea (eye lens). "
-                 "The larger the value the more distortion there is, because of the lens.");
+      RTX_OPTION_ARGS("rtx.eye", float, irisDepthScale, 1.F,
+                      "Scale of the iris' depth under the cornea, relative to a real eye's (3.78 mm under the cornea's apex). "
+                      "Larger values make the iris shift more with the view; 0 puts it at the cornea's apex.",
+                      args.minValue = 0.F);
+      RTX_OPTION_ARGS("rtx.eye", float, limbalRingScale, 1.F,
+                      "Strength of the limbal ring, the darker edge of the iris, which darkens and widens when an eye is seen at an angle. "
+                      "0 disables it.",
+                      args.minValue = 0.F, args.maxValue = 1.F);
     };
 
     // Automation Options

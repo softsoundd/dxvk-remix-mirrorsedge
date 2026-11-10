@@ -458,6 +458,7 @@ namespace dxvk {
       { InstanceCategories::DecalSingleOffset, &RtxOptions::singleOffsetDecalTextures() },
       { InstanceCategories::DecalNoOffset, &RtxOptions::nonOffsetDecalTextures() },
       { InstanceCategories::AnimatedWater, &RtxOptions::animatedWaterTextures() },
+      { InstanceCategories::Sludge, &RtxOptions::sludgeTextures() },
       { InstanceCategories::ThirdPersonPlayerModel, &RtxOptions::playerModelTextures() },
       { InstanceCategories::ThirdPersonPlayerBody, &RtxOptions::playerModelBodyTextures() },
       { InstanceCategories::Terrain, &RtxOptions::terrainTextures() },
@@ -527,6 +528,7 @@ namespace dxvk {
     setCategory(InstanceCategories::DecalNoOffset, matched(InstanceCategories::DecalNoOffset));
 
     setCategory(InstanceCategories::AnimatedWater, matched(InstanceCategories::AnimatedWater));
+    setCategory(InstanceCategories::Sludge, matched(InstanceCategories::Sludge));
 
     setCategory(InstanceCategories::ThirdPersonPlayerModel, matched(InstanceCategories::ThirdPersonPlayerModel));
     setCategory(InstanceCategories::ThirdPersonPlayerBody, matched(InstanceCategories::ThirdPersonPlayerBody));

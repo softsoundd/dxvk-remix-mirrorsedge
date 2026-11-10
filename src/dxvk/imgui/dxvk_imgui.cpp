@@ -213,6 +213,7 @@ namespace dxvk {
     {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
     {"terraintextures", "Terrain Texture", &RtxOptions::terrainTexturesObject()},
     {"watertextures", "Water Texture (optional)", &RtxOptions::animatedWaterTexturesObject()},
+    {"sludgetextures", "Sludge Texture (optional)", &RtxOptions::sludgeTexturesObject()},
     {"antiCullingTextures", "Anti-Culling Texture (optional)", &RtxOptions::antiCullingTexturesObject()},
     {"motionBlurMaskOutTextures", "Motion Blur Mask-Out Textures (optional)", &RtxOptions::motionBlurMaskOutTexturesObject()},
     {"playermodeltextures", "Player Model Texture (optional)", &RtxOptions::playerModelTexturesObject()},
@@ -3639,10 +3640,12 @@ namespace dxvk {
         ImGui::BeginDisabled(!RtxOptions::Eye::enable());
         RemixGui::Checkbox("Detect texture-generation draw call as Eye", &RtxOptions::Eye::assumeViewTexgenModeAsEyeObject());
         RemixGui::DragFloat("Eye Whites Albedo Scale", &RtxOptions::Eye::eyeWhitesAlbedoScaleObject(), 0.01F);
+        RemixGui::DragFloat("Roughness", &RtxOptions::Eye::roughnessObject(), 0.01F, 0.F, 1.F);
         RemixGui::DragFloat("Normals: Eyeball Offset", &RtxOptions::Eye::eyeballSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Normals: Cornea Offset", &RtxOptions::Eye::corneaSphereOffsetObject(), 0.001F);
         RemixGui::DragFloat("Iris Radius", &RtxOptions::Eye::irisRadiusObject(), 0.001F);
-        RemixGui::DragFloat("Iris Depth", &RtxOptions::Eye::irisDepthObject(), 0.001F);
+        RemixGui::DragFloat("Iris Depth Scale", &RtxOptions::Eye::irisDepthScaleObject(), 0.01F);
+        RemixGui::DragFloat("Limbal Ring Scale", &RtxOptions::Eye::limbalRingScaleObject(), 0.01F, 0.F, 1.F);
         ImGui::EndDisabled();
         ImGui::Unindent();
       }
@@ -5435,10 +5438,17 @@ namespace dxvk {
       RemixGui::Checkbox("Enable NEE Cache", &RtxOptions::Displacement::enableNEECacheObject());
       RemixGui::Checkbox("Enable ReSTIR_GI", &RtxOptions::Displacement::enableReSTIRGIObject());
       RemixGui::Checkbox("Enable PSR", &RtxOptions::Displacement::enablePSRObject());
+      RemixGui::Checkbox("Silhouettes Behind Translucency", &RtxOptions::Displacement::silhouettesBehindTranslucencyObject());
       RemixGui::DragFloat("Global Displacement Factor", &RtxOptions::Displacement::displacementFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragFloat("Displacement In Factor", &RtxOptions::Displacement::displacementInFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragFloat("Displacement Out Factor", &RtxOptions::Displacement::displacementOutFactorObject(), 0.01f, 0.0f, 20.0f);
       RemixGui::DragInt("Max Iterations", &RtxOptions::Displacement::maxIterationsObject(), 1.f, 1, 256, "%d", sliderFlags);
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Water Simulation [Experimental]", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      common->metaWaterSim().showImguiSettings();
       ImGui::Unindent();
     }
 

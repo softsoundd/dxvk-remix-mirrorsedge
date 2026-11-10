@@ -64,6 +64,7 @@
 #include "rtx_render/rtx_dust_particles.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
+#include "rtx_render/rtx_water_sim.h"
 #include "rtx_render/rtx_gpu_crash.h"
 #include "rtx_render/rtx_gpu_pass_timer.h"
 #include "rtx_render/rtx_dlss_neural_rendering.h"
@@ -348,13 +349,13 @@ namespace dxvk {
       return m_capturer;
     }
 
-    RtxDustParticles& metaDustParticles() {
-      return m_dustParticles.get(m_device);
-    }
+    RtxDustParticles& metaDustParticles();
 
     RtxParticleSystemManager& metaParticleSystem() {
       return m_particleSystem.get(m_device);
     }
+
+    RtxWaterSim& metaWaterSim();
 
     RtxPointInstancerSystem& metaPointInstancerSystem() {
       return m_pointInstancerSystem.get(m_device);
@@ -451,6 +452,7 @@ namespace dxvk {
     Lazy<RtxDustParticles>                  m_dustParticles;
     Lazy<RtxParticleSystemManager>          m_particleSystem;
     Lazy<RtxPointInstancerSystem>            m_pointInstancerSystem;
+    Lazy<RtxWaterSim>                       m_waterSim;
     Lazy<RtxGpuPassTimer>                   m_gpuPassTimer;
 
     std::atomic<HWND>                       m_lastKnownWindowHandle;

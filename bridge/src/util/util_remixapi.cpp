@@ -601,6 +601,7 @@ void InstanceInfoObjectPicking::_serialize(void*& pSerialize) const {
   fold_helper::serialize(pSerialize, InstanceInfoObjectPickingVars);
 }
 void InstanceInfoObjectPicking::_deserialize(void*& pDeserialize) {
+  sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
   pNext = nullptr;
   fold_helper::deserialize(pDeserialize, InstanceInfoObjectPickingVars);
 }
@@ -619,6 +620,36 @@ void InstanceInfoParticleSpawnDistribution::_deserialize(void*& pDeserialize) {
   fold_helper::deserialize(pDeserialize, InstanceInfoParticleSpawnDistributionVars);
 }
 void InstanceInfoParticleSpawnDistribution::_dtor() {
+}
+
+
+#define InstanceInfoParticleScreenSizeVars sType, minScreenSize, maxScreenSize, screenSizeCoverage
+uint32_t InstanceInfoParticleScreenSize::_calcSize() const {
+  return fold_helper::calcSize(InstanceInfoParticleScreenSizeVars);
+}
+void InstanceInfoParticleScreenSize::_serialize(void*& pSerialize) const {
+  fold_helper::serialize(pSerialize, InstanceInfoParticleScreenSizeVars);
+}
+void InstanceInfoParticleScreenSize::_deserialize(void*& pDeserialize) {
+  pNext = nullptr;
+  fold_helper::deserialize(pDeserialize, InstanceInfoParticleScreenSizeVars);
+}
+void InstanceInfoParticleScreenSize::_dtor() {
+}
+
+#define InstanceInfoParticleObjectPickingVars objectPickingValue
+uint32_t InstanceInfoParticleObjectPicking::_calcSize() const {
+  return fold_helper::calcSize(InstanceInfoParticleObjectPickingVars);
+}
+void InstanceInfoParticleObjectPicking::_serialize(void*& pSerialize) const {
+  fold_helper::serialize(pSerialize, InstanceInfoParticleObjectPickingVars);
+}
+void InstanceInfoParticleObjectPicking::_deserialize(void*& pDeserialize) {
+  sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT;
+  pNext = nullptr;
+  fold_helper::deserialize(pDeserialize, InstanceInfoParticleObjectPickingVars);
+}
+void InstanceInfoParticleObjectPicking::_dtor() {
 }
 
 

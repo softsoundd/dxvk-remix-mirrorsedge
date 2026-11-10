@@ -177,7 +177,7 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 832, "RtInstance size has changed. Fix the copy constructor above this message, then update the expected size.");
+      static_assert(RtInstanceSize == 840, "RtInstance size has changed. Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -196,6 +196,8 @@ namespace dxvk {
     surface.positionBufferIndex = geo.positionBufferIndex;
     surface.positionOffset      = geo.positionBuffer.offsetFromSlice();
     surface.positionStride      = geo.positionBuffer.stride();
+    surface.particlePickingBufferIndex = static_cast<uint16_t>(geo.particlePickingBufferIndex);
+    surface.particlePickingPrimitivesPerParticle = geo.particlePickingPrimitivesPerParticle;
     surface.normalBufferIndex   = geo.normalBufferIndex;
     surface.normalOffset        = geo.normalBuffer.offsetFromSlice();
     surface.normalStride        = geo.normalBuffer.stride();
@@ -1143,6 +1145,7 @@ namespace dxvk {
         currentInstance.surface.hasAnimatedVertexOpacity = drawCall.getMaterialData().ue3AnimatedVertexOpacity;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
+        currentInstance.surface.isSludge = currentInstance.testCategoryFlags(InstanceCategories::Sludge);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;

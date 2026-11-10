@@ -35,6 +35,7 @@
 #include "rtx/pass/sharc_args.h"
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/material_args.h"
+#include "rtx/pass/water_sim/water_sim_args.h"
 #include "rtx/pass/view_distance_args.h"
 #include "rtx/pass/atmosphere/atmosphere_args.h"
 #include "rtx/pass/clouds/cloud_args.h"
@@ -126,9 +127,9 @@ struct EyeArgs {
   float whitesAlbedoScale;
 
   float irisRadius;
-  float irisDepth;
-  uint  pad0;
-  uint  pad1;
+  float irisDepthScale;
+  float limbalRingScale;
+  float roughness;
 
   // One real viewmodel space and the single supported virtual portal space.
   EyeCorrectionArgs corrections[2];
@@ -171,6 +172,7 @@ struct RaytraceArgs {
   VolumeArgs volumeArgs;
   OpaqueMaterialArgs opaqueMaterialArgs;
   TranslucentMaterialArgs translucentMaterialArgs;
+  WaterSimArgs waterSimArgs;
   ViewDistanceArgs viewDistanceArgs;
 
   LightRangeInfo lightRanges[lightTypeCount];

@@ -517,11 +517,12 @@ void overrideMaterialInteractionForEye(
   const OpaqueSurfaceMaterial            opaqueSurfaceMaterial,
   inout SurfaceInteraction               surfaceInteraction,
   const vec2                            irisParallaxOffset,
+  const bool                            irisVisible,
+  const float                           viewCosine,
   const vec3                          whitesAlbedo
 )
 {
-  float2 uvIris = eyeCalcIrisUvParallaxed(surfaceInteraction.textureCoordinates,
-    irisParallaxOffset, cb.eyeArgs.irisRadius);
+  float2 uvIris = eyeCalcIrisUvParallaxed(surfaceInteraction.textureCoordinates, irisParallaxOffset);
 
   bool    irisLoaded;
   vec4 irisSample;
@@ -549,6 +550,9 @@ void overrideMaterialInteractionForEye(
   // automatically do this conversion.
   // Todo: Disable this for when a sRGB texture is the source of the albedo.
   irisSample.rgb = gammaToLinear(irisSample.rgb);
+  // Where the view ray does not reach the iris through the cornea, the whites show.
+  irisSample.a = irisVisible ? irisSample.a : 0.f;
+  irisSample.rgb *= eyeCalcLimbalRing(uvIris, viewCosine);
 
   // blend between whites and iris
   vec3 eyeAlbedo = mix(
@@ -558,7 +562,7 @@ void overrideMaterialInteractionForEye(
   );
   // NOTE: eye redness can be added here, if a game can provide such data
 
-  const float eyeRoughness  = 0.f;
+  const float eyeRoughness  = cb.eyeArgs.roughness;
   const float eyeMetallic   = 0.f;
   const float eyeOpacity    = 1.f;
   const float eyeAnisotropy = 0.f;
@@ -1126,11 +1130,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
     // Could potentially remove the need for the world to texture space transform if a faster way to calculate that z value is found.
     
     uint iterations = 0; // unused
-    const vec2 pomTextureCoordinates = pomCalculateTexcoord(
+    const float3 pomHit = pomCalculateTexcoord(
         opaqueSurfaceMaterial,
         surfaceInteraction,
         viewDirTextureSpace,
-        iterations).xy;
+        iterations);
+    const vec2 pomTextureCoordinates = pomHit.xy;
+
+    // Distance along the view ray from the low poly hit to the POM hit, for POM silhouettes behind translucency.
+    // The march passes the low poly hit at the height displaceIn / (displaceIn + displaceOut), in rawTangentScale world units.
+    // The quadtree returns the ray's height at its hit, the raymarch the depth below the top.
+    const float pomTotalHeight = opaqueSurfaceMaterial.displaceIn + opaqueSurfaceMaterial.displaceOut;
+    const float pomRayHeight = cb.pomMode == DisplacementMode::RaymarchPOM ? 1.0f - pomHit.z : pomHit.z;
+    const float pomCosView = dot(minimalRayInteraction.viewDirection, surfaceInteraction.geometryNormal);
+    surfaceInteraction.pomRayDistance = pomCosView > 0.01f ?
+      sanitize((opaqueSurfaceMaterial.displaceIn - pomRayHeight * pomTotalHeight) * surfaceInteraction.rawTangentScale / pomCosView, 0.0f) :
+      0.0f;
 
     // WAR for REMIX-3709 - POM sometimes produces NaNs.
     surfaceInteraction.textureCoordinates = sanitize(pomTextureCoordinates, surfaceInteraction.textureCoordinates);
@@ -1511,15 +1526,25 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   // For an eye, load a secondary texture (iris) and blend on top of primary texture (whites)
   if (cb.eyeArgs.enableEyes && surface.isEye)
   {
-    const vec2 irisParallaxOffset = eyeCalcParallaxOffset(
-      surface.eyeBasisU, surface.eyeBasisV, surfaceInteraction.geometryNormal,
-      surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent,
-      minimalRayInteraction.viewDirection, surface.eyeCorrectionIndex);
+    vec2 irisParallaxOffset;
+    const bool irisVisible = eyeCalcParallaxOffset(
+      surface.eyeBasisU, surface.eyeBasisV, surface.eyeOrigin, surfaceInteraction.position,
+      minimalRayInteraction.viewDirection, cb.eyeArgs.irisRadius + 0.04, surface.eyeCorrectionIndex, irisParallaxOffset);
+    float viewCosine = abs(dot(minimalRayInteraction.viewDirection, normalize(cross(surface.eyeBasisU, surface.eyeBasisV))));
+    if (surface.eyeCorrectionIndex != 0)
+    {
+      // Without the view model correction, as in eyeCalcParallaxOffset.
+      const float3x3 toShading = cb.eyeArgs.corrections[surface.eyeCorrectionIndex - 1].worldToShading;
+      viewCosine = abs(dot(normalize(mul(toShading, minimalRayInteraction.viewDirection)),
+        normalize(mul(toShading, cross(surface.eyeBasisU, surface.eyeBasisV)))));
+    }
     overrideMaterialInteractionForEye(
       opaqueSurfaceMaterialInteraction,
       opaqueSurfaceMaterial,
       surfaceInteraction,
       irisParallaxOffset,
+      irisVisible,
+      viewCosine,
       albedo
     );
   }

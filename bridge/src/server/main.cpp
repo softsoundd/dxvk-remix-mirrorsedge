@@ -3160,10 +3160,12 @@ void ProcessDeviceCommandQueue() {
         // supported at a time
         struct InstanceExtensions {
           serialize::InstanceInfoObjectPicking objectPicking;
+          serialize::InstanceInfoParticleObjectPicking particlePicking;
           serialize::InstanceInfoBlend blend;
           serialize::InstanceInfoTransforms boneXforms;
           serialize::InstanceInfoParticleSystem particleSystem;
           serialize::InstanceInfoParticleSpawnDistribution particleSpawnDistribution;
+          serialize::InstanceInfoParticleScreenSize particleScreenSize;
         } exts;
         memset(&exts, 0, sizeof(InstanceExtensions));
 
@@ -3192,6 +3194,14 @@ void ProcessDeviceCommandQueue() {
               deserializeFromQueue(exts.objectPicking);
               pInfoProto->pNext = &(exts.objectPicking);
               pInfoProto = &getInfoProto(exts.objectPicking);
+              break;
+            }
+            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT:
+            {
+              assert(!exts.particlePicking.pNext);
+              deserializeFromQueue(exts.particlePicking);
+              pInfoProto->pNext = &(exts.particlePicking);
+              pInfoProto = &getInfoProto(exts.particlePicking);
               break;
             }
             case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT:
@@ -3224,6 +3234,14 @@ void ProcessDeviceCommandQueue() {
               deserializeFromQueue(exts.particleSpawnDistribution);
               pInfoProto->pNext = &exts.particleSpawnDistribution;
               pInfoProto = &getInfoProto(exts.particleSpawnDistribution);
+              break;
+            }
+            case REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SCREEN_SIZE_EXT:
+            {
+              assert(!exts.particleScreenSize.pNext);
+              deserializeFromQueue(exts.particleScreenSize);
+              pInfoProto->pNext = &exts.particleScreenSize;
+              pInfoProto = &getInfoProto(exts.particleScreenSize);
               break;
             }
             default:
@@ -3379,6 +3397,32 @@ void ProcessDeviceCommandQueue() {
         std::string value_str((const char*) value_ptr, value_size);
 
         remixapi::g_remix.SetConfigVariable(var_str.c_str(), value_str.c_str());
+        break;
+      }
+
+      case RemixApi_SetWaterSim:
+      {
+        remixapi_WaterSimInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_WATER_SIM_INFO;
+        DeviceBridge::copy_data(info.clearAllDisturbances);
+        if (remixapi::g_remix.SetWaterSim) {
+          remixapi::g_remix.SetWaterSim(&info);
+        }
+        break;
+      }
+
+      case RemixApi_AddWaterDisturbance:
+      {
+        remixapi_WaterDisturbanceInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_WATER_DISTURBANCE_INFO;
+        DeviceBridge::copy_data(info.position.x);
+        DeviceBridge::copy_data(info.position.y);
+        DeviceBridge::copy_data(info.position.z);
+        DeviceBridge::copy_data(info.radius);
+        DeviceBridge::copy_data(info.strength);
+        if (remixapi::g_remix.AddWaterDisturbance) {
+          remixapi::g_remix.AddWaterDisturbance(&info);
+        }
         break;
       }
 
@@ -3753,7 +3797,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, 
   Logger::warn("Running in x86 mode! Are you sure this is what you want? RTX will not work this way, please run the 64-bit server instead!");
 #endif
 
-  BRIDGE_ASSERT_LOG((argCount >= 2), "Command line argument count received to launch server is not as expected");
+  if (argList == nullptr || argCount < 2) {
+    Logger::err("Server was invoked without the required GUID and version arguments. Unable to establish bridge, exiting...");
+    LocalFree(argList);
+    return 1;
+  }
   if (gUniqueIdentifier.setGuid(&argList[0])) {
     Logger::info("Launched server with GUID " + gUniqueIdentifier.toString());
   } else {

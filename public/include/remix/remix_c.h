@@ -62,7 +62,7 @@
 
 #define REMIXAPI_VERSION_MAJOR 0
 #define REMIXAPI_VERSION_MINOR 6
-#define REMIXAPI_VERSION_PATCH 8
+#define REMIXAPI_VERSION_PATCH 11
 
 
 // External
@@ -135,11 +135,15 @@ extern "C" {
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 25,
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT     = 26,
     REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO                   = 27,
-    // 28 is reserved for the particle emitter picking extension.
-    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SPAWN_DISTRIBUTION_EXT = 29
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT = 28,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SPAWN_DISTRIBUTION_EXT = 29,
+    REMIXAPI_STRUCT_TYPE_WATER_SIM_INFO                       = 30,
+    REMIXAPI_STRUCT_TYPE_WATER_DISTURBANCE_INFO               = 31,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SCREEN_SIZE_EXT = 32,
     // NOTE: if adding a new struct, register it in 'rtx_remix_specialization.inl'
     //       and only extend this enum by appending, never adjust the order of these 
     //       as that will break backwards compatibility.
+    //       Also, add ',' after the last entry so future diff-s won't touch unrelated lines
   } remixapi_StructType;
 
   typedef enum remixapi_ErrorCode {
@@ -434,6 +438,32 @@ extern "C" {
 
 
 
+  // GPU water simulation with parallax-rendered waves on water-tagged surfaces. See rtx.waterSim.* options
+  typedef struct remixapi_WaterSimInfo {
+    remixapi_StructType       sType;
+    void*                     pNext;
+    remixapi_Bool             clearAllDisturbances; // Reset the water simulation plane to flat and drop all disturbance requests
+  } remixapi_WaterSimInfo;
+
+  // Set the game state for the water simulation. Call on state changes (e.g. on a level load start).
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetWaterSim)(
+    const remixapi_WaterSimInfo* info);
+
+  // A round dent pressed into the simulated water plane; spreads out as waves.
+  typedef struct remixapi_WaterDisturbanceInfo {
+    remixapi_StructType       sType;
+    void*                     pNext;
+    remixapi_Float3D          position;
+    float                     radius;   // Radius of the dent in game units
+    float                     strength; // Depth of the dent in game units, a negative depth raises the surface
+  } remixapi_WaterDisturbanceInfo;
+
+  // Queues a disturbance for the water simulation plane.
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_AddWaterDisturbance)(
+    const remixapi_WaterDisturbanceInfo* info);
+
+
+
 #define REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT 256
 
   typedef struct remixapi_InstanceInfoBoneTransformsEXT {
@@ -475,6 +505,14 @@ extern "C" {
     uint32_t                       objectPickingValue;
   } remixapi_InstanceInfoObjectPickingEXT;
 
+  typedef struct remixapi_InstanceInfoParticleObjectPickingEXT {
+    remixapi_StructType            sType;
+    void*                         pNext;
+    // Overrides picking for generated particles without changing their emitter mesh's picking value.
+    // When absent, generated particles use remixapi_InstanceInfoObjectPickingEXT::objectPickingValue.
+    uint32_t                      objectPickingValue;
+  } remixapi_InstanceInfoParticleObjectPickingEXT;
+
   typedef enum remixapi_InstanceCategoryBit {
     REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI                  = 1 << 0,
     REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_MATTE               = 1 << 1,
@@ -504,7 +542,8 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
     REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS                = 1 << 25,
     REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL                = 1 << 26,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_CULL_BACKFACES_IN_SHADOWS = 1 << 27,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_SLUDGE                    = 1 << 27,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_CULL_BACKFACES_IN_SHADOWS = 1 << 28,
   } remixapi_InstanceCategoryBit;
 
   typedef uint32_t remixapi_InstanceCategoryFlags;
@@ -588,6 +627,14 @@ extern "C" {
     void* pNext;
     remixapi_ParticleSpawnDistribution spawnDistribution;
   } remixapi_InstanceInfoParticleSpawnDistributionEXT;
+  // Bounds are in internal render-resolution pixels, before upscaling.
+  typedef struct remixapi_InstanceInfoParticleScreenSizeEXT {
+    remixapi_StructType sType;
+    void* pNext;
+    float minScreenSize;
+    float maxScreenSize;
+    float screenSizeCoverage;
+  } remixapi_InstanceInfoParticleScreenSizeEXT;
 
   typedef struct remixapi_InstanceInfoGpuInstancingEXT {
     remixapi_StructType       sType;
@@ -847,8 +894,13 @@ extern "C" {
     PFN_remixapi_Present            Present;
 
     PFN_remixapi_SetCameraMediumMaterial SetCameraMediumMaterial;
+
+    PFN_remixapi_SetWaterSim             SetWaterSim;
+    PFN_remixapi_AddWaterDisturbance     AddWaterDisturbance;
   } remixapi_Interface;
 
+  // NOTE: Zero-initialize out_result before the call. A runtime older than this header writes
+  //       only the functions it knows, so the newer ones stay null only if they start null.
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
     const remixapi_InitializeLibraryInfo* info,
     remixapi_Interface*                   out_result);

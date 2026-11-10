@@ -184,6 +184,8 @@ namespace remix {
     Result< void >                    DestroyMesh(remixapi_MeshHandle handle);
     Result< void >                    SetupCamera(const remixapi_CameraInfo& info);
     Result< void >                    SetCameraMediumMaterial(remixapi_MaterialHandle medium);
+    Result< void >                    SetWaterSim(const remixapi_WaterSimInfo& info);
+    Result< void >                    AddWaterDisturbance(const remixapi_WaterDisturbanceInfo& info);
     Result< void >                    DrawInstance(const remixapi_InstanceInfo& info);
     Result< remixapi_LightHandle >    CreateLight(const remixapi_LightInfo& info);
     Result< void >                    DestroyLight(remixapi_LightHandle handle);
@@ -225,7 +227,7 @@ namespace remix {
         return status;
       }
 
-      static_assert(sizeof(remixapi_Interface) == 176,
+      static_assert(sizeof(remixapi_Interface) == 192,
                     "Change version, update C++ wrapper when adding new functions");
 
       remix::Interface interfaceInCpp = {};
@@ -733,6 +735,40 @@ namespace remix {
     return m_CInterface.SetCameraMediumMaterial(&info);
   }
 
+  struct WaterSimInfo : remixapi_WaterSimInfo {
+    WaterSimInfo() {
+      sType = REMIXAPI_STRUCT_TYPE_WATER_SIM_INFO;
+      pNext = nullptr;
+      clearAllDisturbances = false;
+      STATIC_ASSERT_SIZEOF(remixapi_WaterSimInfo, 24);
+    }
+  };
+
+  inline Result< void > Interface::SetWaterSim(const remixapi_WaterSimInfo& info) {
+    if (!m_CInterface.SetWaterSim) {
+      return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+    }
+    return m_CInterface.SetWaterSim(&info);
+  }
+
+  struct WaterDisturbanceInfo : remixapi_WaterDisturbanceInfo {
+    WaterDisturbanceInfo() {
+      sType = REMIXAPI_STRUCT_TYPE_WATER_DISTURBANCE_INFO;
+      pNext = nullptr;
+      position = { 0.f, 0.f, 0.f };
+      radius = 0.f;
+      strength = 0.f;
+      STATIC_ASSERT_SIZEOF(remixapi_WaterDisturbanceInfo, 40);
+    }
+  };
+
+  inline Result< void > Interface::AddWaterDisturbance(const remixapi_WaterDisturbanceInfo& info) {
+    if (!m_CInterface.AddWaterDisturbance) {
+      return REMIXAPI_ERROR_CODE_NOT_INITIALIZED;
+    }
+    return m_CInterface.AddWaterDisturbance(&info);
+  }
+
 
 
   struct InstanceInfoBoneTransformsEXT : remixapi_InstanceInfoBoneTransformsEXT {
@@ -778,6 +814,15 @@ namespace remix {
       sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
       pNext = nullptr;
       objectPickingValue = 0;
+    }
+  };
+
+  struct InstanceInfoParticleObjectPickingEXT : remixapi_InstanceInfoParticleObjectPickingEXT {
+    InstanceInfoParticleObjectPickingEXT() {
+      sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT;
+      pNext = nullptr;
+      objectPickingValue = 0;
+      STATIC_ASSERT_SIZEOF(remixapi_InstanceInfoParticleObjectPickingEXT, 24);
     }
   };
 
@@ -832,6 +877,16 @@ namespace remix {
       sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SPAWN_DISTRIBUTION_EXT;
       pNext = nullptr;
       spawnDistribution = REMIXAPI_PARTICLE_SPAWN_DISTRIBUTION_BY_TRIANGLE;
+    }
+  };
+
+  struct InstanceInfoParticleScreenSizeEXT : remixapi_InstanceInfoParticleScreenSizeEXT {
+    InstanceInfoParticleScreenSizeEXT() {
+      sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SCREEN_SIZE_EXT;
+      pNext = nullptr;
+      minScreenSize = 0.f;
+      maxScreenSize = 0.f;
+      screenSizeCoverage = 1.f;
     }
   };
 

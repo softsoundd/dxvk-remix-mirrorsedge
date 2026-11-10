@@ -160,6 +160,13 @@ struct Surface
     set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
   }
 
+  // Sludge floating on water (rtx.sludgeTextures), see water_sim_sludge.slangh.
+  property bool isSludge
+  {
+    get { return packedFlagGet(data2.w, 1u << 31); }
+    set { data2.w = newValue ? packedFlagSet(data2.w, 1u << 31) : packedFlagUnset(data2.w, 1u << 31); }
+  }
+
   // Matrices
 
   property mat4x3 prevObjectToWorld
@@ -309,12 +316,6 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
-  property bool colorTextureIsSrgb
-  {
-    get { return packedFlagGet(data0b.z, 1 << 2); }
-    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
-  }
-
   property bool cullBackfacesInShadows
   {
     get { return packedFlagGet(data0b.z, 1 << 3); }
@@ -325,6 +326,12 @@ struct Surface
   {
     get { return data0b.w; }
     set { data0b.w = newValue; }
+  }
+
+  property bool hasParticleObjectPickingValues
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
   }
 
   property uint positionOffset
@@ -521,6 +528,12 @@ struct Surface
     get { return packedFlagGet(data13.z, 1 << 23); }
   }
 
+  property bool colorTextureIsSrgb
+  {
+    get { return packedFlagGet(data13.z, 1 << 24); }
+    set { data13.z = newValue ? packedFlagSet(data13.z, 1 << 24) : packedFlagUnset(data13.z, 1 << 24); }
+  }
+
   // rtx.d3d9.ue3MaterialFades: how far the material parameters that fade this draw have faded it in.
   property bool hasFadeCoverage
   {
@@ -555,8 +568,20 @@ struct Surface
 
   property uint objectPickingValue
   {
-    get { return data2.x; }
+    // A particle batch has no single owner without a primitive index.
+    get { return hasParticleObjectPickingValues ? 0 : data2.x; }
     set { data2.x = newValue; }
+  }
+
+  // Generated particles use the picking word for their buffer index and triangle count.
+  property uint16_t particlePickingBufferIndex
+  {
+    get { return uint16_t(data2.x); }
+  }
+
+  property uint16_t particlePickingPrimitivesPerParticle
+  {
+    get { return uint16_t(data2.x >> 16); }
   }
 
   // See RtEyeParams::eyeballOrigin (rtx_materials.h) for what this is decoded from. Shared with the
@@ -617,12 +642,16 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   bool hasSecondaryTextureCoordinates = false;
   vec3 rawTangent = 0.f;
   vec3 rawBitangent = 0.f;
+  float rawTangentScale = 0.f;
   // Populated only for render-target motion, before material/POM tangent adjustments.
   vec3 previousTextureDpDu = 0.f;
   vec3 previousTextureDpDv = 0.f;
   bool previousTextureBasisValid = false;
   vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
+  // Distance along the view ray from the hit to the displaced surface (POM, or simulated water in the primary G-buffer pass).
+  // Positive where it lies behind the mesh, 0 without one.
+  float pomRayDistance = 0.f;
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

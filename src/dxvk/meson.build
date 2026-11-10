@@ -205,6 +205,7 @@ dxvk_src = files([
   'rtx_render/rtx_camera.h',
   'rtx_render/rtx_camera_manager.cpp',
   'rtx_render/rtx_camera_manager.h',
+  'rtx_render/rtx_capture_termination_guard.h',
   'rtx_render/rtx_cloud_optics_tables.h',
   'rtx_render/rtx_clouds.cpp',
   'rtx_render/rtx_clouds.h',
@@ -395,6 +396,8 @@ dxvk_src = files([
   'rtx_render/rtx_ue3_tone_mapping.cpp',
   'rtx_render/rtx_ue3_tone_mapping.h',
   'rtx_render/rtx_utils.h',
+  'rtx_render/rtx_water_sim.cpp',
+  'rtx_render/rtx_water_sim.h',
   'rtx_render/rtx_xess.cpp',
   'rtx_render/rtx_xess.h',
 
@@ -404,6 +407,7 @@ dxvk_src = files([
   'rtx_render/rtx_particle_spawn_cache.h',
   'rtx_render/rtx_particle_system.cpp',
   'rtx_render/rtx_particle_system.h',
+  'shaders/rtx/pass/particles/particle_screen_size.h',
 
   'rtx_render/rtx_point_instancer_system.cpp',
   'rtx_render/rtx_point_instancer_system.h',

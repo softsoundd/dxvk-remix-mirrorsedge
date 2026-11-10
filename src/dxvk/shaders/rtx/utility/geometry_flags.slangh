@@ -96,14 +96,6 @@ struct GeometryFlags
     set { _encodedFlags = (_encodedFlags & ~(1 << 10)) | (newValue ? (1 << 10) : 0); }
   }
 
-  // Mirrors GeometryResolverState::decalCandidateSeen for the deferred decal pass, which skips pixels where this is clear.
-  // Bit 15 sits above the dynamic object mask, which occupies bits 11 to 14.
-  property bool decalCandidateSeen
-  {
-    get { return (_encodedFlags & (1 << 15)) != 0; }
-    set { _encodedFlags = (_encodedFlags & ~(1 << 15)) | (newValue ? (1 << 15) : 0); }
-  }
-
 #if OBJECT_MASK_ALL_DYNAMIC_NUMBER_OF_ACTIVE_BITS > (16 - 12)
   "There is not enough bits in the encoded geometry flags for dynamic object mask."
 #endif   
@@ -119,6 +111,13 @@ struct GeometryFlags
       uint dynamicObjectMaskBits = (newValue & OBJECT_MASK_ALL_DYNAMIC) >> OBJECT_MASK_ALL_DYNAMIC_FIRST_ACTIVE_BIT_OFFSET;
       _encodedFlags = (_encodedFlags & ~(((1 << OBJECT_MASK_ALL_DYNAMIC_NUMBER_OF_ACTIVE_BITS) - 1) << 11)) | (dynamicObjectMaskBits << 11);
     }
+  }
+
+  // The primary hit lies under a water mesh but above the simulated water surface (water silhouettes, resolve.slangh).
+  property bool dryUnderWater
+  {
+    get { return (_encodedFlags & (1 << 15)) != 0; }
+    set { _encodedFlags = (_encodedFlags & ~(1 << 15)) | (newValue ? (1 << 15) : 0); }
   }
 
   // True if any PSR (reflection or transmission) was performed for this pixel.

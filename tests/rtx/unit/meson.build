@@ -28,6 +28,7 @@ test_env = environment({'MALLOC_PERTURB_': '0'})
 foreach external_dll : external_dll_paths
   test_env.append('PATH', external_dll)
 endforeach
+test_env.append('PATH', nrc_dll_path, nrd_lib_path, join_paths(usd_lib_path, 'bin'))
 
 tests = []
 
@@ -101,6 +102,10 @@ exe = executable('test_pending_slot_queues',  files('test_pending_slot_queues.cp
 test('test_pending_slot_queues', exe, env: test_env)
 tests += exe
 
+exe = executable('test_capture_termination_guard',  files('test_capture_termination_guard.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_capture_termination_guard', exe, env: test_env)
+tests += exe
+
 exe = executable('test_bindless_buffer_mirror',  files('test_bindless_buffer_mirror.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_bindless_buffer_mirror', exe, env: test_env)
 tests += exe
@@ -143,6 +148,10 @@ if get_option('particle_distribution_gpu_tests')
   test('test_particle_spawn_distribution_gpu', exe, args: particle_gpu_shaders, env: test_env, timeout: 120)
   tests += [exe] + particle_gpu_shaders
 endif
+
+exe = executable('test_particle_screen_size', files('test_particle_screen_size.cpp'), include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_particle_screen_size', exe, env: test_env)
+tests += exe
 
 exe = executable('test_particle_system_schema', files('test_particle_system_schema.cpp'), dependencies : usd_dep, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_particle_system_schema', exe, env: test_env, args: remix_particle_system_plugin.full_path(), depends: remix_particle_system_plugin)
@@ -315,5 +324,17 @@ exe = executable('test_particle_system_lookup', files('test_particle_system_look
   include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_particle_system_lookup', exe, env: test_env)
 tests += exe
+
+exe = executable('test_particle_object_picking', files('test_particle_object_picking.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_particle_object_picking', exe, env: test_env)
+tests += exe
+
+if fs.is_file('../../../nv-private/hdremix/particlePicking.h')
+  exe = executable('test_material_particle_picking', files('test_material_particle_picking.cpp'),
+    include_directories : [ test_include_path, include_directories('../../../src/lssusd') ], dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+  test('test_material_particle_picking', exe, env: test_env)
+  tests += exe
+endif
 
 alias_target('unit_tests', tests)

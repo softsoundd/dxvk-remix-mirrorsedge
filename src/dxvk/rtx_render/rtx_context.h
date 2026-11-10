@@ -35,6 +35,7 @@
 #include <array>
 #include <optional>
 #include "rtx_options.h"
+#include "rtx_capture_termination_guard.h"
 
 struct VolumeArgs;
 struct RaytraceArgs;
@@ -161,7 +162,6 @@ namespace dxvk {
     Resources& getResourceManager();
   
     static void triggerScreenshot() { s_triggerScreenshot = true; }
-    static void triggerUsdCapture() { s_triggerUsdCapture = true; }
 
     void bindCommonRayTracingResources(const Resources::RaytracingOutput& rtOutput);
 
@@ -324,7 +324,6 @@ namespace dxvk {
     bool shouldUseUpscaler() const { return shouldUseDLSS() || shouldUseNIS() || shouldUseTAA() || shouldUseXeSS(); }
 
     inline static bool s_triggerScreenshot = false;
-    inline static bool s_triggerUsdCapture = false;
     inline static const bool s_capturePrePresentTestScreenshot = env::getEnvVar("RTX_TAKE_PRE_PRESENT_SCREENSHOT_FRAME") != "";
 
     bool m_rayTracingSupported;
@@ -366,6 +365,7 @@ namespace dxvk {
     bool m_triggerDelayedTerminate = false;
     uint32_t m_screenshotFrameNum = -1;
     uint32_t m_terminateAppFrameNum = -1;
+    CaptureTerminationGuard m_captureTerminationGuard;
     uint32_t m_framesWithoutValidScene = 0;
     IntegrateIndirectMode m_prevIntegrateIndirectMode = IntegrateIndirectMode::Count;
     float m_prevSparseRenderingSamplingRate = 1.0f;

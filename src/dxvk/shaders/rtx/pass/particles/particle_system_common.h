@@ -60,6 +60,10 @@ struct GpuSpawnContext {
   uint16_t spawnMeshColorsIdx;
   uint16_t spawnMeshIndexIdx;
   uint16_t spawnMeshTexcoordsIdx;
+  uint emitterObjectPickingValue;
+  uint pad0;
+  uint pad1;
+  uint pad2;
 };
 
 struct ParticleSpawnDistributionConstants {
@@ -114,6 +118,11 @@ struct GpuParticleSystemDesc {
   uint8_t restrictVelocityY : 1;
   uint8_t restrictVelocityZ : 1;
   uint8_t spawnDistribution : 1;
+
+  float minScreenSize;
+  float maxScreenSize;
+  float screenSizeCoverage;
+  uint screenSizePad;
 
 // Note: Spatial fields (collisionThickness, attractorRadius, gravityForce,
   // initialVelocityFromNormal, attractorForce, turbulenceForce, turbulenceFrequency)
@@ -174,6 +183,9 @@ struct RtxParticleSystemDesc : GpuParticleSystemDesc {
     restrictVelocityY = 0;
     restrictVelocityZ = 0;
     spawnDistribution = ParticleSpawnDistribution::ByTriangle;
+    minScreenSize = 0.f;
+    maxScreenSize = 0.f;
+    screenSizeCoverage = 1.f;
   }
 
   XXH64_hash_t calcHash() const {
@@ -215,7 +227,7 @@ struct GpuParticleSystem {
   uint simulateParticleCount = 0;
   uint particleHeadOffset = 0;
   uint particleCount = 0;
-  uint pad = 0;
+  uint enableObjectPicking = 0;
 
 #ifndef __cplusplus
   float16_t varyTimeToLive(float rand) {
@@ -236,6 +248,7 @@ struct ParticleSystemConstants {
   mat4 viewToWorld;
 
   mat4 prevWorldToProjection;
+  mat4 worldToProjection;
 
   vec3 upDirection;
   float deltaTimeSecs;

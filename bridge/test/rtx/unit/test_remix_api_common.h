@@ -540,6 +540,34 @@ bool InstanceInfoParticleSpawnDistribution::compare(const RemixApiT& me, const R
   return compareVals(me, other, spawnDistribution);
 }
 
+using InstanceInfoParticleObjectPicking = Expected<remixapi_InstanceInfoParticleObjectPickingEXT>;
+static_assert(remixapi::util::ToRemixApiStructEnum<remixapi_InstanceInfoParticleObjectPickingEXT> ==
+              REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT);
+static_assert(REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT !=
+              REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT);
+void InstanceInfoParticleObjectPicking::init() {
+  sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_OBJECT_PICKING_EXT;
+  pNext = nullptr;
+  objectPickingValue = 0xfeabcdefu;
+}
+bool InstanceInfoParticleObjectPicking::compare(const RemixApiT& me, const RemixApiT& other) const {
+  return compareVals(me, other, sType, objectPickingValue);
+}
+
+
+using InstanceInfoParticleScreenSize = Expected<remixapi_InstanceInfoParticleScreenSizeEXT>;
+static_assert(remixapi::util::ToRemixApiStructEnum<remixapi_InstanceInfoParticleScreenSizeEXT> ==
+              REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SCREEN_SIZE_EXT);
+void InstanceInfoParticleScreenSize::init() {
+  sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SCREEN_SIZE_EXT;
+  pNext = nullptr;
+  minScreenSize = 0.f;
+  maxScreenSize = 0.f;
+  screenSizeCoverage = 1.f;
+}
+bool InstanceInfoParticleScreenSize::compare(const RemixApiT& me, const RemixApiT& other) const {
+  return compareVals(me, other, sType, minScreenSize, maxScreenSize, screenSizeCoverage);
+}
 
 #define InstanceInfoBlendVars alphaTestEnabled, \
                               alphaTestReferenceValue, \
@@ -869,6 +897,12 @@ MaterialInfoPortal matPortal;
 MeshInfo mesh;
 InstanceInfo inst;
 InstanceInfoObjectPicking instObjPick;
+InstanceInfoParticleObjectPicking instParticleObjPick;
+InstanceInfoParticleObjectPicking instParticleObjPickZero = [] {
+  InstanceInfoParticleObjectPicking value;
+  value.objectPickingValue = 0;
+  return value;
+}();
 InstanceInfoBlend instBlend;
 InstanceInfoTransforms instBoneXform;
 InstanceInfoGpuInstancing instGpuInstancing;
@@ -883,5 +917,31 @@ LightInfoUSD lightUSD;
 InstanceInfoParticleSystem instParticle;
 InstanceInfoParticleSpawnDistribution instParticleDistribution;
 InstanceInfoParticleSpawnDistribution instParticleDistributionArea;
+InstanceInfoParticleScreenSize instParticleScreenSize;
+InstanceInfoParticleScreenSize instParticleScreenSizeMinimum = [] {
+  InstanceInfoParticleScreenSize value;
+  value.minScreenSize = 0.8f;
+  value.screenSizeCoverage = 0.25f;
+  return value;
+}();
+InstanceInfoParticleScreenSize instParticleScreenSizeMaximum = [] {
+  InstanceInfoParticleScreenSize value;
+  value.maxScreenSize = 1.2f;
+  value.screenSizeCoverage = 0.f;
+  return value;
+}();
+InstanceInfoParticleScreenSize instParticleScreenSizeRange = [] {
+  InstanceInfoParticleScreenSize value;
+  value.minScreenSize = 0.8f;
+  value.maxScreenSize = 1.2f;
+  return value;
+}();
+InstanceInfoParticleScreenSize instParticleScreenSizeFixed = [] {
+  InstanceInfoParticleScreenSize value;
+  value.minScreenSize = 0.9f;
+  value.maxScreenSize = 0.9f;
+  value.screenSizeCoverage = 0.5f;
+  return value;
+}();
 
 }

@@ -232,7 +232,8 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
-    flags0 |= colorTextureIsSrgb ? (1 << 2) : 0;
+    const bool hasParticleObjectPickingValues = particlePickingBufferIndex != kSurfaceInvalidBufferIndex;
+    flags0 |= hasParticleObjectPickingValues ? (1 << 2) : 0;
     flags0 |= cullBackfacesInShadows ? (1 << 3) : 0;
     // The fade coverage is a 12 bit unorm above the flags, read only when textureFlags marks it present.
     if (fadeCoverage != 1.0f) {
@@ -253,7 +254,11 @@ struct RtSurface {
     writeGPUHelper(data, offset, normalOffset);
     writeGPUHelper(data, offset, texcoordOffset);
     writeGPUHelper(data, offset, color0Offset);
-    writeGPUHelper(data, offset, objectPickingValue);
+    assert(!hasParticleObjectPickingValues || particlePickingPrimitivesPerParticle > 0);
+    const uint32_t pickingData = hasParticleObjectPickingValues
+      ? uint32_t(particlePickingBufferIndex) | (uint32_t(particlePickingPrimitivesPerParticle) << 16)
+      : objectPickingValue;
+    writeGPUHelper(data, offset, pickingData);
 
     writeGPUHelperExplicit<1>(data, offset, positionStride);
     writeGPUHelperExplicit<1>(data, offset, normalStride);
@@ -290,6 +295,7 @@ struct RtSurface {
     flags1 |= isMotionBlurMaskOut ?           (1 << 28) : 0;
     flags1 |= skipSurfaceInteractionSpritesheetAdjustment ? (1 << 29) : 0;
     flags1 |= isPreservePath ?                (1u << 30) : 0;
+    flags1 |= isSludge ?                      (1u << 31) : 0;
 
     writeGPUHelper(data, offset, flags1);
 
@@ -408,7 +414,8 @@ struct RtSurface {
     textureFlags |= highlightGlowTextureIsLinear ? (1 << 20) : 0;
     textureFlags |= (static_cast<uint32_t>(highlightGlowTextureChannel) & 0x3) << 21;
     textureFlags |= color0IsTexcoord ? (1 << 23) : 0;
-    // textureFlags bits 24-30 unused
+    textureFlags |= colorTextureIsSrgb ? (1 << 24) : 0;
+    // textureFlags bits 25-30 unused
 
     writeGPUHelper(data, offset, textureFlags);
 
@@ -465,6 +472,9 @@ struct RtSurface {
 
   uint32_t surfaceMaterialIndex = kSurfaceInvalidSurfaceMaterialIndex;
 
+  uint16_t particlePickingBufferIndex = kSurfaceInvalidBufferIndex;
+  uint16_t particlePickingPrimitivesPerParticle = 0;
+
   bool isEmissive = false;
   bool isMatte = false;
   bool isStatic = false;
@@ -472,6 +482,7 @@ struct RtSurface {
   bool isPreservePath = false;
   bool hasMaterialChanged = false;
   bool isAnimatedWater = false;
+  bool isSludge = false; // Sludge floats and opens as water where disturbed (see rtx.sludgeTextures)
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
@@ -516,6 +527,8 @@ struct RtSurface {
         && texcoordOffset == surface.texcoordOffset
         && color0BufferIndex == surface.color0BufferIndex
         && color0Offset == surface.color0Offset
+        && particlePickingBufferIndex == surface.particlePickingBufferIndex
+        && particlePickingPrimitivesPerParticle == surface.particlePickingPrimitivesPerParticle
         && firstIndex == surface.firstIndex;
   }
 
@@ -559,6 +572,7 @@ struct RtSurface {
       "  isPreservePath: ", isPreservePath, "\n",
       "  hasMaterialChanged: ", hasMaterialChanged, "\n",
       "  isAnimatedWater: ", isAnimatedWater, "\n",
+      "  isSludge: ", isSludge, "\n",
       "  isClipPlaneEnabled: ", isClipPlaneEnabled, "\n",
       "  isTextureFactorBlend: ", isTextureFactorBlend, "\n",
       "  isMotionBlurMaskOut: ", isMotionBlurMaskOut, "\n",

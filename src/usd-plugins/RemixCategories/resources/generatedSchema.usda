@@ -134,6 +134,11 @@ class "RemixInstanceCategoryAPI" (
         displayGroup = "Remix Categories"
         displayName = "Hair Cards"
     )
+    bool remix_category:sludge = 0 (
+        doc = "Sludge textures: opaque until the water simulation clears them into water where disturbed (rtx.waterSim.sludge.enable).\nNeeds geometry beneath the layer; without it, the holes show empty space."
+        displayGroup = "Remix Categories"
+        displayName = "Sludge"
+    )
     bool remix_category:view_model = 0 (
         doc = "Textures / material hashes for first-person view-model draw calls (e.g. first-person arms and weapon).\nForces CameraType::ViewModel when rtx.viewModel.enable is true.\nPrefer rtx.viewModelGeometries when the same material is also used on the third-person body."
         displayGroup = "Remix Categories"

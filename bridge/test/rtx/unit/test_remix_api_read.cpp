@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <type_traits>
 #include <assert.h>
 
 using namespace remixapi::util::serialize;
@@ -11,7 +12,18 @@ bool read_deserialize_compare(char*& pDeserialize,
                               SerializableT& serializable,
                               const expected::Expected<BaseT>& expected,
                               const char* const typeName) {
+  if constexpr (std::is_same_v<BaseT, remixapi_InstanceInfoParticleScreenSizeEXT>) {
+    serializable.pNext = reinterpret_cast<void*>(uintptr_t(0xfeed));
+  }
   serializable.deserialize();
+  if constexpr (std::is_same_v<BaseT, remixapi_InstanceInfoParticleScreenSizeEXT> ||
+                std::is_same_v<BaseT, remixapi_InstanceInfoObjectPickingEXT> ||
+                std::is_same_v<BaseT, remixapi_InstanceInfoParticleObjectPickingEXT>) {
+    if (serializable.sType != expected.sType || serializable.pNext != nullptr) {
+      std::cout << typeName << " failed to reconstruct the extension header!" << std::endl;
+      return false;
+    }
+  }
   serializable.pNext = nullptr;
   pDeserialize += serializable.size();
   if(expected != serializable) {
@@ -54,6 +66,8 @@ int main(int argc, char * argv[]) {
   READ_DESERIALIZE_COMPARE(pDeserialize, MeshInfo, mesh);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfo, inst);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoObjectPicking, instObjPick);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleObjectPicking, instParticleObjPick);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleObjectPicking, instParticleObjPickZero);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoBlend, instBlend);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoTransforms, instBoneXform);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoGpuInstancing, instGpuInstancing);
@@ -68,6 +82,11 @@ int main(int argc, char * argv[]) {
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleSystem, instParticle);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleSpawnDistribution, instParticleDistribution);
   READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleSpawnDistribution, instParticleDistributionArea);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleScreenSize, instParticleScreenSize);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleScreenSize, instParticleScreenSizeMinimum);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleScreenSize, instParticleScreenSizeMaximum);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleScreenSize, instParticleScreenSizeRange);
+  READ_DESERIALIZE_COMPARE(pDeserialize, InstanceInfoParticleScreenSize, instParticleScreenSizeFixed);
 
   delete pDataBegin;
 
