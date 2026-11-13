@@ -222,6 +222,18 @@ namespace dxvk {
     void NotifyStretchRect(const Rc<DxvkImage>& sourceImage, const Rc<DxvkImage>& destImage);
 
     /**
+      * \brief: NGX passthrough mode: called from D3D9DeviceEx::SetShaderConstants for vertex shader
+      * float constants. Stamps each written register with the draw that will consume it, so the
+      * velocity capture can tell a skinned draw's own bone upload from registers left by earlier draws.
+      */
+    void NotifyVertexShaderFloatConstants(uint32_t startRegister, uint32_t count) {
+      const uint32_t endRegister = std::min(startRegister + count, uint32_t(m_ngxVsFloatWriteDraw.size()));
+      for (uint32_t reg = startRegister; reg < endRegister; reg++) {
+        m_ngxVsFloatWriteDraw[reg] = m_ngxDrawSerial + 1;
+      }
+    }
+
+    /**
       * \brief: NGX passthrough mode: one-time XeSS input-resolution sync once the display
       * size is known (preset sync runs earlier in RtxInitializer).
       */
@@ -432,6 +444,9 @@ namespace dxvk {
       // Frame this identity last contributed to the global transform offset measurement: it
       // gets one say per frame however many copies of it are on screen
       uint32_t lastOffsetVoteFrame = UINT32_MAX;
+      // Holds how many palette registers the last measured upload of this mesh section wrote.
+      // It stays zero until a draw of the section has been measured.
+      uint32_t uploadedBoneRegisters = 0;
     };
     fast_unordered_cache<NgxVelocityObjectState> m_ngxVelocityObjectCache;
     std::vector<NgxVelocityDraw> m_ngxVelocityDraws;
@@ -480,6 +495,9 @@ namespace dxvk {
     static constexpr uint32_t kNgxVelocityDumpMaxDynamicPerFrame = 20;
     static constexpr uint32_t kNgxVelocityDumpMaxRigidPerFrame = 12;
     uint32_t m_ngxVelocityDumpFramesLeft = 0;
+    // Marks a dump armed during this frame, usually at the start of EndFrame,
+    // so that frame end does not count as a dumped frame.
+    bool m_ngxVelocityDumpArmedThisFrame = false;
     uint32_t m_ngxVelocityDumpSkinnedThisFrame = 0;
     uint32_t m_ngxVelocityDumpDynamicThisFrame = 0;
     uint32_t m_ngxVelocityDumpRigidThisFrame = 0;
@@ -503,6 +521,7 @@ namespace dxvk {
       uint32_t missBeyondRotation = 0;
       uint32_t claimedWithoutVelocity = 0;
       uint32_t pairedBeyondBounds = 0;
+      uint32_t sharedSkinnedPlacements = 0;
       uint32_t skippedNoCamera = 0;
       uint32_t skippedBudget = 0;
       uint32_t skippedZDisabled = 0;
@@ -522,6 +541,12 @@ namespace dxvk {
     // reset per frame)
     uint32_t m_ngxVelocitySkinnedDraws = 0;
     uint32_t m_ngxVelocityDynamicDraws = 0;
+
+    // Advances with every draw and, unlike m_drawCallID, never resets.
+    uint32_t m_ngxDrawSerial = 0;
+    // Holds, per vertex shader float register, the m_ngxDrawSerial of the draw its last write was for.
+    // UE3 uploads only the bones a mesh section uses, so the rest of a declared palette is stale.
+    std::array<uint32_t, caps::MaxFloatConstantsVS> m_ngxVsFloatWriteDraw = {};
 
     // Self-triggering pairing-miss dump: when sightings fail to pair with their history,
     // a few lines with the exact comparison values go to the log (rate limited; the burst
@@ -1001,6 +1026,9 @@ namespace dxvk {
     // and on demand (rtx.ngxPassthrough.dumpPostChainFrames); validates the pre-post
     // injection against the game's real compositing
     uint32_t m_ngxPostChainDumpFramesLeft = 0;
+    // Marks an on-demand dump armed during this frame, usually at the start of EndFrame,
+    // so that frame end does not count as a dumped frame.
+    bool m_ngxPostChainDumpArmedThisFrame = false;
 
     // Session budget for the automatic dump. The on-demand option disarms itself after one use;
     // the automatic one is driven by scene target changes, which are not guaranteed to be rare.

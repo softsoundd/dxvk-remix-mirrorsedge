@@ -481,7 +481,7 @@ namespace dxvk {
                                             present.frameInterpolation.depth,
                                             interpolatedFrameIndex,
                                             present.frameInterpolation.interpolatedFrameCount,
-                                            false);
+                                            present.frameInterpolation.resetHistory);
 
     // The acquired image is still presented if FG fails.
     // Copy the rendered frame to provide valid contents.

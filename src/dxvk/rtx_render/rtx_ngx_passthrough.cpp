@@ -43,6 +43,7 @@
 #include "rtx_dlss_neural_rendering.h"
 #include "rtx_imgui.h"
 #include "rtx_initializer.h"
+#include "rtx_ngx_passthrough_helpers.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/ngx_passthrough/ngx_passthrough_args.h"
 #include "rtx/pass/post_fx/post_fx.h"
@@ -2129,8 +2130,7 @@ namespace dxvk {
     Rc<DxvkContext> dxvkCtx = ctx;
     const VkExtent3D renderExtent3D = { m_renderExtent.width, m_renderExtent.height, 1 };
     const VkExtent3D displayExtent3D = { m_displayExtent.width, m_displayExtent.height, 1 };
-    xess.beginPassthroughFrame(dxvkCtx, renderExtent3D, displayExtent3D, resetHistory,
-                               ctx->getSceneManager().getCamera().isCameraCut());
+    xess.beginPassthroughFrame(dxvkCtx, renderExtent3D, displayExtent3D, resetHistory, m_cameraCut);
 
     if (!xess.isActive()) {
       m_statusReason = "XeSS activation failed or is not supported on this system";
@@ -2246,6 +2246,21 @@ namespace dxvk {
     return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
   }
 
+  bool RtxNgxPassthrough::detectCameraCut(const RtCamera& camera) const {
+    if (camera.isCameraCut()) {
+      return true;
+    }
+
+    // Without a fresh camera, this frame would compare the same two cameras as the frame before it
+    if (!m_sceneCameraFresh) {
+      return false;
+    }
+
+    return ngxPassthrough::viewTurnedBeyond(Vector3{ camera.getViewToWorld()[2].xyz() },
+                                            Vector3{ camera.getPreviousViewToWorld()[2].xyz() },
+                                            cameraCutAngle());
+  }
+
   void RtxNgxPassthrough::dispatch(RtxContext* ctx,
                                    DxvkContextState& dxvkCtxState,
                                    DxvkBarrierSet& barriers,
@@ -2352,6 +2367,10 @@ namespace dxvk {
     // the two. Only the crossing resets, so the movie still accumulates across its own frames.
     resetHistory |= m_sceneCameraFresh != m_previousSceneCameraFresh;
     m_previousSceneCameraFresh = m_sceneCameraFresh;
+
+    // Nothing on either side of a cut reprojects onto the other, so every temporal consumer starts over
+    m_cameraCut = detectCameraCut(camera);
+    resetHistory |= m_cameraCut;
     m_lastResetHistory = resetHistory;
 
     const bool haveDepthMvInputs = generateMotionVectorsAndDepth(ctx, dxvkCtxState, barriers, sceneDepthImage, subrectOffset, camera,
@@ -2515,6 +2534,9 @@ namespace dxvk {
       // cuts here would directly explain a soft image
       m_statResetHistoryCount++;
     }
+    if (m_cameraCut) {
+      m_statCameraCutCount++;
+    }
     if (prePostProcess) {
       m_statPrePostCount++;
     }
@@ -2528,7 +2550,7 @@ namespace dxvk {
                                  m_statDispatchCount, " dispatches, ",
                                  m_statUpscalerActiveCount, " with upscaler active, ",
                                  m_statPrePostCount, " at the pre-post-process injection point, ",
-                                 m_statResetHistoryCount, " with history reset, ",
+                                 m_statResetHistoryCount, " with history reset (", m_statCameraCutCount, " at camera cuts), ",
                                  m_statDebugVisCount, " in debug visualization, ",
                                  m_statEvaluateFailedCount, " with failed upscaler evaluation, ",
                                  m_statNoInputsCount, " without depth/MV inputs, ",
@@ -2545,6 +2567,7 @@ namespace dxvk {
       m_statEvaluateFailedCount = 0;
       m_statDebugVisCount = 0;
       m_statResetHistoryCount = 0;
+      m_statCameraCutCount = 0;
       m_statPrePostCount = 0;
       m_statContentHdrFlips = 0;
       m_statReprojectionFromIdentityMax = 0.0f;
@@ -2603,7 +2626,7 @@ namespace dxvk {
       const Resources::Resource& depthInput = m_depthQueue.get();
       const Resources::Resource& motionVectorInput = m_motionVectorQueue.get();
 
-      // DLFG is not told about history resets here, and FSR is told about every one.
+      // Both backends are told about history resets, so neither interpolates across a camera cut.
       // FSR generates one frame for each rendered one.
       DxvkFrameInterpolationInfo frameGenInfo = {
         m_device->getCurrentFrameId(),
@@ -2612,7 +2635,7 @@ namespace dxvk {
         motionVectorInput.image->info().layout,
         depthInput.view,
         depthInput.image->info().layout,
-        dlfgEnabled ? false : resetHistory,
+        resetHistory,
         dlfgEnabled ? m_device->getCommon()->metaDLFG().getInterpolatedFrameCount() : 1u,
         nullptr,
         VK_IMAGE_LAYOUT_UNDEFINED,
@@ -2751,6 +2774,8 @@ namespace dxvk {
               "Paired, but the emission gate rejected the motion.");
       statRow("Paired beyond bounds", str::format(stats.pairedBeyondBounds),
               "Held for a confirming frame. A steady count means a real mover is waiting; a spike while turning is a refused swap.");
+      statRow("Shared skinned placements", str::format(stats.sharedSkinnedPlacements),
+              "Counts characters drawing the same mesh at the same spot, such as Matinee actors. Their poses keep each one paired with its own history.");
       statRow("Skipped, no camera", str::format(stats.skippedNoCamera));
       statRow("Skipped, budget", str::format(stats.skippedBudget),
               "The per-frame capture budget was exhausted.");

@@ -15,6 +15,7 @@
 #include "../dxso/dxso_tables.h"
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_ngx_passthrough.h"
+#include "../dxvk/rtx_render/rtx_ngx_passthrough_helpers.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_dlfg.h"
 #include "../dxvk/rtx_render/rtx_dlss_neural_rendering.h"
@@ -1011,12 +1012,14 @@ namespace dxvk {
     // On-demand post-chain dump (one-shot: consumed here, option resets itself)
     if (RtxNgxPassthrough::dumpPostChainFrames() > 0 && m_ngxPostChainDumpFramesLeft == 0) {
       m_ngxPostChainDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpPostChainFrames());
+      m_ngxPostChainDumpArmedThisFrame = true;
       RtxNgxPassthrough::dumpPostChainFramesObject().setDeferred(0);
       Logger::info(str::format("[RTX NGX Passthrough][dump] On-demand dump armed for ", m_ngxPostChainDumpFramesLeft, " frames."));
     }
 
     if (RtxNgxPassthrough::dumpVelocityCaptureFrames() > 0 && m_ngxVelocityDumpFramesLeft == 0) {
       m_ngxVelocityDumpFramesLeft = uint32_t(RtxNgxPassthrough::dumpVelocityCaptureFrames());
+      m_ngxVelocityDumpArmedThisFrame = true;
       RtxNgxPassthrough::dumpVelocityCaptureFramesObject().setDeferred(0);
       Logger::info(str::format("[RTX NGX Passthrough][velocity dump] Armed for ",
                                m_ngxVelocityDumpFramesLeft, " frames."));
@@ -1889,6 +1892,14 @@ namespace dxvk {
       }
     }
 
+    // Holds how many palette registers this draw's own upload wrote.
+    // It holds zero when the draw did not upload its palette again.
+    const uint32_t measuredBoneRegisters = skinned
+      ? ngxPassthrough::countUploadedBoneRegisters(m_ngxVsFloatWriteDraw.data(), uint32_t(m_ngxVsFloatWriteDraw.size()),
+                                                   ctabRegs.boneMatricesRegister, ctabRegs.boneMatricesRegisterCount,
+                                                   m_ngxDrawSerial)
+      : 0;
+
     const uint32_t l2wReg = ctabRegs.localToWorldRegister;
     if (l2wReg + 3 >= caps::MaxFloatConstantsSoftware) {
       return;
@@ -1928,11 +1939,14 @@ namespace dxvk {
 
     if (unlikely(dumpThisDraw)) {
       const D3DVIEWPORT9& vp = d3d9State().viewport;
-      Logger::info(str::format(
+      const Vector3 dumpTranslation =
+        extractUe3ObjectToWorld(l2wReg, hasWorldToLocal, ctabRegs.worldToLocalRegister, m_ngxFrameCameraUsedTranspose)[3].xyz();
+      std::string line = str::format(
         "[RTX NGX Passthrough][velocity dump] draw=", m_drawCallID,
         " prims=", drawContext.PrimitiveCount,
         " skinned=", skinned ? 1 : 0,
         " boneRegs=", skinned ? ctabRegs.boneMatricesRegisterCount : 0,
+        " uploadedBoneRegs=", measuredBoneRegisters,
         " vbDynamic=", vbDynamic ? 1 : 0, " ibDynamic=", ibDynamic ? 1 : 0,
         " vbBytes=", vertexBufferCommon->Desc()->Size,
         " streamOffset=", d3d9State().vertexBuffers[0].offset,
@@ -1941,7 +1955,14 @@ namespace dxvk {
         " vp=", vp.X, ",", vp.Y, " ", vp.Width, "x", vp.Height,
         " z=", vp.MinZ, "..", vp.MaxZ,
         " sceneVp=", m_ngxSceneViewport.X, ",", m_ngxSceneViewport.Y, " ",
-        m_ngxSceneViewport.Width, "x", m_ngxSceneViewport.Height));
+        m_ngxSceneViewport.Width, "x", m_ngxSceneViewport.Height,
+        " l2w=(", dumpTranslation.x, ",", dumpTranslation.y, ",", dumpTranslation.z, ")");
+      // Characters sharing a placement show the same l2w, and their root bones tell them apart
+      if (skinned) {
+        const Vector4* rootBone = &d3d9State().vsConsts.fConsts[ctabRegs.boneMatricesRegister];
+        line += str::format(" rootBone=(", rootBone[0].w, ",", rootBone[1].w, ",", rootBone[2].w, ")");
+      }
+      Logger::info(line);
     }
 
     // Vertex layout on stream 0: position always; skinned draws additionally need the
@@ -2063,6 +2084,29 @@ namespace dxvk {
 
     NgxVelocityObjectState& objectState = m_ngxVelocityObjectCache[identity];
 
+    // Palette comparisons cover only the registers the game uploads for this mesh section.
+    // A draw that did not upload its palette again reuses the extent measured for the section before.
+    // The whole declared palette is compared until a draw of the section has been measured.
+    // The replay receives whole palettes, so a wrong extent can only affect pairing.
+    if (measuredBoneRegisters != 0) {
+      objectState.uploadedBoneRegisters = measuredBoneRegisters;
+    }
+    const uint32_t comparedBoneRegisters = objectState.uploadedBoneRegisters != 0
+      ? std::min(objectState.uploadedBoneRegisters, boneRegisterCount)
+      : boneRegisterCount;
+
+    // Follows a dumped draw's gate record with how its sighting paired.
+    // The arguments are only formatted for dumped draws.
+    const auto dumpPairingOutcome = [&](const auto&... outcome) {
+      if (unlikely(dumpThisDraw)) {
+        Logger::info(str::format("[RTX NGX Passthrough][velocity dump] draw=", m_drawCallID,
+                                 " identity=0x", std::hex, identity, std::dec,
+                                 " instances=", objectState.instances.size(),
+                                 skinned ? str::format(" comparedBoneRegs=", comparedBoneRegisters) : std::string(),
+                                 " ", outcome...));
+      }
+    };
+
     // Shared draw construction for the emission sites below. previousBones is the
     // instance's cached palette; when unusable (first skinned sighting of the identity),
     // the current palette stands in for both sides - transform-only motion that frame.
@@ -2155,36 +2199,27 @@ namespace dxvk {
                          cachedPositions.size() * sizeof(Vector3)) != 0;
     };
 
-    // Bone palette delta against a cached palette, net of a translation the whole palette is
-    // expected to have taken. The palette holds bone-to-world matrices, so where that space
-    // shifts every frame every bone's translation shifts with it, and a skinned mesh that never
-    // moved reports its entire palette as animated - which emits velocity unconditionally,
-    // ahead of every motion gate. Destructible and instanced scenery is commonly drawn through
-    // skinned vertex factories, so that reads as level geometry moving under its own power.
-    // Only the translation is affected, which the palette carries in .w, one axis per row of
-    // each bone's three; the rotation rows are compared as they are.
+    // Returns true when this draw's palette differs from a cached one within the registers the mesh section uploads.
+    // UE3 skins in component space, so the palette of a mesh that did not move keeps its translations.
+    // A palette shifted by the scene-wide transform offset also counts as unchanged, for titles whose palettes take it.
+    // A static mesh read as animated emits velocity ahead of every motion gate,
+    // and destructible or instanced scenery is often drawn through skinned vertex factories.
     const auto bonesChangedFrom = [&](const std::vector<Vector4>& cachedBones,
                                       const Vector3& expectedTranslationShift) {
       if (!skinned || cachedBones.size() != boneRegisterCount) {
         return false;
       }
-      for (uint32_t reg = 0; reg < boneRegisterCount; reg++) {
-        const Vector4 delta = boneRegisters[reg] - cachedBones[reg];
-        if (std::abs(delta.x) > 1e-5f || std::abs(delta.y) > 1e-5f || std::abs(delta.z) > 1e-5f) {
-          return true;
-        }
+      return ngxPassthrough::bonePaletteChanged(boneRegisters, cachedBones.data(), comparedBoneRegisters,
+                                                expectedTranslationShift, kBoneTranslationTolerance);
+    };
 
-        const uint32_t axis = reg % 3;
-        const float axisShift = axis == 0 ? expectedTranslationShift.x
-                              : axis == 1 ? expectedTranslationShift.y
-                                          : expectedTranslationShift.z;
-        // Looser than the rotation rows: a bone's translation is a world position, and the
-        // shift being subtracted was itself measured to within a fraction of a unit
-        if (std::abs(delta.w - axisShift) > kBoneTranslationTolerance) {
-          return true;
-        }
+    // Returns the mean distance between this draw's bone translations and a cached palette's.
+    // Returns infinity when the palettes cannot be compared.
+    const auto poseDeltaFrom = [&](const std::vector<Vector4>& cachedBones) {
+      if (!skinned || cachedBones.size() != boneRegisterCount) {
+        return std::numeric_limits<float>::infinity();
       }
-      return false;
+      return ngxPassthrough::bonePoseDelta(boneRegisters, cachedBones.data(), comparedBoneRegisters);
     };
 
     // The furthest anything is credited with travelling in one frame, applied both to an
@@ -2287,99 +2322,143 @@ namespace dxvk {
     // Static placement re-uploading the same matrix every frame, or a repeat draw of an instance
     // already handled this frame (depth prepass + base pass, multi-pass lighting). Static
     // placements get no velocity draw - the camera reprojection is exact for them. Skinned
-    // instances with a changed palette are animation in place: same placement, no swap
-    // ambiguity, always emitted.
+    // instances with a changed palette are animation in place and always emitted.
+    //
+    // Rigid and CPU-modified draws continue the first instance at their placement. Characters can
+    // share a mesh and a placement, as Matinee actors placed at one spot do, so a skinned draw needs
+    // the pose as well. An instance claimed this frame is this draw repeated only when its palette
+    // matches, and a different palette belongs to another character. Among the instances seen last
+    // frame, the one with the nearest pose is the same character.
+    NgxVelocityObjectInstance* samePlacementInstance = nullptr;
+    float samePlacementPoseDelta = std::numeric_limits<float>::infinity();
+    uint32_t samePlacementCandidates = 0;
+    bool sharedSkinnedPlacement = false;
     for (NgxVelocityObjectInstance& instance : objectState.instances) {
-      if (isSamePlacement(instance)) {
-        // Static placement, but the content may animate in place: skinned palettes or
-        // CPU-modified positions changing under an unchanged LocalToWorld - no swap
-        // ambiguity, always emitted
-        // A repeat draw within the frame has taken no shift; one carried over from the previous
-        // frame has taken the scene's, exactly as isSamePlacement judged its transform
-        const Vector3 expectedBoneShift = instance.lastSeenFrame == m_ue3FrameCounter
-                                            ? Vector3(0.0f, 0.0f, 0.0f)
-                                            : m_ngxGlobalTransformOffset;
-        const bool contentAnimated = (skinned && bonesChangedFrom(instance.bones, expectedBoneShift)) ||
-                                     (dynamicMesh && dynamicPositionsChangedFrom(instance.dynamicPositions));
-
-        if (contentAnimated) {
-          appendVelocityDraw(sightingObjectToWorld, instance.worldToProjection, instance.objectToWorld,
-                             instance.bones, instance.dynamicPositions);
-          instance.lastEmitFrame = m_ue3FrameCounter;
-          instance.lastEmitDrawIndex = uint32_t(m_ngxVelocityDraws.size() - 1);
-          instance.lastEmitPrevObjectToWorld = instance.objectToWorld;
-          instance.lastEmitPrevWorldToProjection = instance.worldToProjection;
-        }
-
-        if (skinned) {
-          instance.bones.assign(boneRegisters, boneRegisters + boneRegisterCount);
-        }
-        if (dynamicMesh) {
-          // Last use of the snapshot (appendVelocityDraw above copied what it needed)
-          instance.dynamicPositions = std::move(currentPositions);
-        }
-
-        // Same-frame repeat draw in the other scene phase: re-emit this frame's draw for
-        // this phase so both velocity targets receive the object, with both clip
-        // transforms recomposed for this phase's projection (the foreground DPG renders
-        // with its own first-person projection; each target depth-tests against its own
-        // phase's depth, discarding any copy that does not belong)
-        if (instance.lastEmitFrame == m_ue3FrameCounter &&
-            instance.lastPhaseDuplicateFrame != m_ue3FrameCounter &&
-            instance.lastEmitDrawIndex < m_ngxVelocityDraws.size() &&
-            m_ngxVelocityDraws.size() < kMaxVelocityDrawsPerFrame) {
-          const NgxVelocityDraw& emittedDraw = m_ngxVelocityDraws[instance.lastEmitDrawIndex];
-
-          if (emittedDraw.foregroundPhase != foregroundPhase &&
-              (emittedDraw.bonesCurrent.empty() || m_ngxVelocitySkinnedDraws < kNgxVelocityMaxSkinnedDraws) &&
-              (emittedDraw.previousPositions.empty() || m_ngxVelocityDynamicDraws < kNgxVelocityMaxDynamicDraws)) {
-            NgxVelocityDraw duplicateDraw = emittedDraw;
-            duplicateDraw.foregroundPhase = foregroundPhase;
-            duplicateDraw.clipFromLocal = drawWorldToProjection * instance.objectToWorld;
-            duplicateDraw.prevClipFromLocal = instance.lastEmitPrevWorldToProjection * instance.lastEmitPrevObjectToWorld;
-            duplicateDraw.viewportMinZ = d3d9State().viewport.MinZ;
-            duplicateDraw.viewportMaxZ = d3d9State().viewport.MaxZ;
-
-            if (!duplicateDraw.bonesCurrent.empty()) {
-              m_ngxVelocitySkinnedDraws++;
-              m_ngxVelocityStats.capturedSkinned++;
-            }
-            if (!duplicateDraw.previousPositions.empty()) {
-              m_ngxVelocityDynamicDraws++;
-              m_ngxVelocityStats.capturedDynamic++;
-            }
-            if (duplicateDraw.foregroundPhase) {
-              m_ngxVelocityStats.capturedForeground++;
-            }
-
-            m_ngxVelocityDraws.push_back(std::move(duplicateDraw));
-            m_ngxVelocityStats.captured++;
-            instance.lastPhaseDuplicateFrame = m_ue3FrameCounter;
-          }
-        }
-
-        // The placement is the same one, but where LocalToWorld carries a global offset its
-        // matrix is not: it has to be carried forward, or the stored transform ages by a frame
-        // every frame and the offset the next sighting has to reproduce compounds out of reach
-        if (instance.lastSeenFrame != m_ue3FrameCounter) {
-          voteForGlobalTransformOffset(sightingObjectToWorld[3].xyz() - instance.objectToWorld[3].xyz());
-        }
-        instance.objectToWorld = sightingObjectToWorld;
-        instance.lastSeenFrame = m_ue3FrameCounter;
-        instance.worldToProjection = drawWorldToProjection;
-
-        // Confirmed-mover status decays after a couple seconds at rest: a stale latch
-        // is an instant-emit backdoor for visibility swaps pairing against this
-        // instance, while a real mover restarting re-confirms through the gentle-onset
-        // path with zero frames lost (motion from rest is always gentle at first)
-        constexpr uint32_t kWasMovingDecayFrames = 120;
-        if (instance.wasMoving && m_ue3FrameCounter - instance.lastEmitFrame > kWasMovingDecayFrames) {
-          instance.wasMoving = false;
-        }
-
-        m_ngxVelocityStats.exactMatches++;
-        return;
+      if (!isSamePlacement(instance)) {
+        continue;
       }
+      if (!skinned) {
+        samePlacementInstance = &instance;
+        samePlacementPoseDelta = 0.0f;
+        samePlacementCandidates = 1;
+        break;
+      }
+      if (instance.lastSeenFrame == m_ue3FrameCounter) {
+        if (!bonesChangedFrom(instance.bones, Vector3(0.0f, 0.0f, 0.0f))) {
+          samePlacementInstance = &instance;
+          samePlacementPoseDelta = 0.0f;
+          break;
+        }
+        sharedSkinnedPlacement = true;
+        continue;
+      }
+      samePlacementCandidates++;
+      const float poseDelta = poseDeltaFrom(instance.bones);
+      if (samePlacementInstance == nullptr || poseDelta < samePlacementPoseDelta) {
+        samePlacementInstance = &instance;
+        samePlacementPoseDelta = poseDelta;
+      }
+    }
+
+    if (sharedSkinnedPlacement) {
+      m_ngxVelocityStats.sharedSkinnedPlacements++;
+    }
+
+    if (samePlacementInstance != nullptr) {
+      NgxVelocityObjectInstance& instance = *samePlacementInstance;
+      const bool repeatDraw = instance.lastSeenFrame == m_ue3FrameCounter;
+
+      // Static placement, but the content may animate in place: skinned palettes or
+      // CPU-modified positions changing under an unchanged LocalToWorld - no swap
+      // ambiguity, always emitted
+      // A repeat draw within the frame has taken no shift; one carried over from the previous
+      // frame has taken the scene's, exactly as isSamePlacement judged its transform
+      const Vector3 expectedBoneShift = instance.lastSeenFrame == m_ue3FrameCounter
+                                          ? Vector3(0.0f, 0.0f, 0.0f)
+                                          : m_ngxGlobalTransformOffset;
+      const bool contentAnimated = (skinned && bonesChangedFrom(instance.bones, expectedBoneShift)) ||
+                                   (dynamicMesh && dynamicPositionsChangedFrom(instance.dynamicPositions));
+
+      if (contentAnimated) {
+        appendVelocityDraw(sightingObjectToWorld, instance.worldToProjection, instance.objectToWorld,
+                           instance.bones, instance.dynamicPositions);
+        instance.lastEmitFrame = m_ue3FrameCounter;
+        instance.lastEmitDrawIndex = uint32_t(m_ngxVelocityDraws.size() - 1);
+        instance.lastEmitPrevObjectToWorld = instance.objectToWorld;
+        instance.lastEmitPrevWorldToProjection = instance.worldToProjection;
+      }
+
+      if (skinned) {
+        instance.bones.assign(boneRegisters, boneRegisters + boneRegisterCount);
+      }
+      if (dynamicMesh) {
+        // Last use of the snapshot (appendVelocityDraw above copied what it needed)
+        instance.dynamicPositions = std::move(currentPositions);
+      }
+
+      // Same-frame repeat draw in the other scene phase: re-emit this frame's draw for
+      // this phase so both velocity targets receive the object, with both clip
+      // transforms recomposed for this phase's projection (the foreground DPG renders
+      // with its own first-person projection; each target depth-tests against its own
+      // phase's depth, discarding any copy that does not belong)
+      if (instance.lastEmitFrame == m_ue3FrameCounter &&
+          instance.lastPhaseDuplicateFrame != m_ue3FrameCounter &&
+          instance.lastEmitDrawIndex < m_ngxVelocityDraws.size() &&
+          m_ngxVelocityDraws.size() < kMaxVelocityDrawsPerFrame) {
+        const NgxVelocityDraw& emittedDraw = m_ngxVelocityDraws[instance.lastEmitDrawIndex];
+
+        if (emittedDraw.foregroundPhase != foregroundPhase &&
+            (emittedDraw.bonesCurrent.empty() || m_ngxVelocitySkinnedDraws < kNgxVelocityMaxSkinnedDraws) &&
+            (emittedDraw.previousPositions.empty() || m_ngxVelocityDynamicDraws < kNgxVelocityMaxDynamicDraws)) {
+          NgxVelocityDraw duplicateDraw = emittedDraw;
+          duplicateDraw.foregroundPhase = foregroundPhase;
+          duplicateDraw.clipFromLocal = drawWorldToProjection * instance.objectToWorld;
+          duplicateDraw.prevClipFromLocal = instance.lastEmitPrevWorldToProjection * instance.lastEmitPrevObjectToWorld;
+          duplicateDraw.viewportMinZ = d3d9State().viewport.MinZ;
+          duplicateDraw.viewportMaxZ = d3d9State().viewport.MaxZ;
+
+          if (!duplicateDraw.bonesCurrent.empty()) {
+            m_ngxVelocitySkinnedDraws++;
+            m_ngxVelocityStats.capturedSkinned++;
+          }
+          if (!duplicateDraw.previousPositions.empty()) {
+            m_ngxVelocityDynamicDraws++;
+            m_ngxVelocityStats.capturedDynamic++;
+          }
+          if (duplicateDraw.foregroundPhase) {
+            m_ngxVelocityStats.capturedForeground++;
+          }
+
+          m_ngxVelocityDraws.push_back(std::move(duplicateDraw));
+          m_ngxVelocityStats.captured++;
+          instance.lastPhaseDuplicateFrame = m_ue3FrameCounter;
+        }
+      }
+
+      // The placement is the same one, but where LocalToWorld carries a global offset its
+      // matrix is not: it has to be carried forward, or the stored transform ages by a frame
+      // every frame and the offset the next sighting has to reproduce compounds out of reach
+      if (instance.lastSeenFrame != m_ue3FrameCounter) {
+        voteForGlobalTransformOffset(sightingObjectToWorld[3].xyz() - instance.objectToWorld[3].xyz());
+      }
+      instance.objectToWorld = sightingObjectToWorld;
+      instance.lastSeenFrame = m_ue3FrameCounter;
+      instance.worldToProjection = drawWorldToProjection;
+
+      // Confirmed-mover status decays after a couple seconds at rest: a stale latch
+      // is an instant-emit backdoor for visibility swaps pairing against this
+      // instance, while a real mover restarting re-confirms through the gentle-onset
+      // path with zero frames lost (motion from rest is always gentle at first)
+      constexpr uint32_t kWasMovingDecayFrames = 120;
+      if (instance.wasMoving && m_ue3FrameCounter - instance.lastEmitFrame > kWasMovingDecayFrames) {
+        instance.wasMoving = false;
+      }
+
+      m_ngxVelocityStats.exactMatches++;
+      dumpPairingOutcome("outcome=", repeatDraw ? "repeat draw" : "same placement",
+                         " candidates=", samePlacementCandidates, " poseDelta=", samePlacementPoseDelta,
+                         " sharedPlacement=", sharedSkinnedPlacement ? 1 : 0, " emitted=", contentAnimated ? 1 : 0);
+      return;
     }
 
     // Disambiguated transform in the same convention the camera reconstruction uses;
@@ -2397,6 +2476,7 @@ namespace dxvk {
     float matchedScore = 0.0f;
     float matchedTranslationDelta = 0.0f;
     float matchedRotScaleDelta = 0.0f;
+    float matchedPoseDelta = 0.0f;
 
     // Nearest last-frame candidate regardless of bounds: consumed by the single-candidate
     // acceptance below and by the pairing-miss diagnostics
@@ -2404,6 +2484,7 @@ namespace dxvk {
     float nearestScore = 0.0f;
     float nearestTranslationDelta = 0.0f;
     float nearestRotScaleDelta = 0.0f;
+    float nearestPoseDelta = 0.0f;
     uint32_t lastFrameCandidates = 0;
 
     // Placements sighted within the last couple frames: the cache also holds stale
@@ -2452,13 +2533,17 @@ namespace dxvk {
         voteForGlobalTransformOffset(rawTranslationDelta);
       }
 
-      const float score = translationDelta / kMaxFrameTranslation + rotScaleDelta / kMaxFrameRotScaleL1;
+      // Characters that share a mesh can also share a placement that moves, and then only the pose tells them apart
+      const float poseDelta = skinned ? poseDeltaFrom(instance.bones) : 0.0f;
+      const float score = translationDelta / kMaxFrameTranslation + rotScaleDelta / kMaxFrameRotScaleL1 +
+                          std::min(poseDelta, kMaxFrameTranslation) / kMaxFrameTranslation;
 
       if (nearestCandidate == nullptr || score < nearestScore) {
         nearestCandidate = &instance;
         nearestScore = score;
         nearestTranslationDelta = translationDelta;
         nearestRotScaleDelta = rotScaleDelta;
+        nearestPoseDelta = poseDelta;
       }
 
       if (translationDelta > kMaxFrameTranslation || rotScaleDelta > kMaxFrameRotScaleL1) {
@@ -2470,6 +2555,7 @@ namespace dxvk {
         matchedScore = score;
         matchedTranslationDelta = translationDelta;
         matchedRotScaleDelta = rotScaleDelta;
+        matchedPoseDelta = poseDelta;
       }
     }
 
@@ -2482,6 +2568,7 @@ namespace dxvk {
       matchedInstance = nearestCandidate;
       matchedTranslationDelta = nearestTranslationDelta;
       matchedRotScaleDelta = nearestRotScaleDelta;
+      matchedPoseDelta = nearestPoseDelta;
       pairedBeyondBounds = matchedInstance != nullptr;
       if (pairedBeyondBounds) {
         m_ngxVelocityStats.pairedBeyondBounds++;
@@ -2598,6 +2685,10 @@ namespace dxvk {
         matchedInstance->lastEmitFrame = m_ue3FrameCounter;
         matchedInstance->lastEmitDrawIndex = uint32_t(m_ngxVelocityDraws.size() - 1);
       }
+      dumpPairingOutcome("outcome=", pairedBeyondBounds ? "paired by elimination" : "moved",
+                         " candidates=", lastFrameCandidates, " dPos=", matchedTranslationDelta,
+                         " dRotScale=", matchedRotScaleDelta, " poseDelta=", matchedPoseDelta,
+                         " sharedPlacement=", sharedSkinnedPlacement ? 1 : 0, " emitted=", emitVelocity ? 1 : 0);
       return;
     }
 
@@ -2640,6 +2731,9 @@ namespace dxvk {
               " nearest: dPos=", nearestTranslationDelta,
               " dRotScale=", nearestRotScaleDelta,
               " pos=(", nearestTranslation.x, ",", nearestTranslation.y, ",", nearestTranslation.z, ")");
+            if (skinned) {
+              line += str::format(" dPose=", nearestPoseDelta);
+            }
           } else {
             line += " nearest: none seen last frame";
           }
@@ -2677,6 +2771,7 @@ namespace dxvk {
 
       if (targetInstance == nullptr) {
         m_ngxVelocityStats.skippedInstanceCap++;
+        dumpPairingOutcome("outcome=over the instance cap");
         return;
       }
     } else {
@@ -2714,13 +2809,19 @@ namespace dxvk {
     // Why the sighting had nothing to pair with. A one-frame velocity dropout is exactly this
     // outcome, so the population behind it has to be readable as a breakdown - the per-sighting
     // miss lines are rate limited to a burst every couple of seconds and cannot characterise it.
+    const char* missReason = nullptr;
     if (lastFrameCandidates == 0) {
       m_ngxVelocityStats.missNoLastFrameSighting++;
+      missReason = "unseen last frame";
     } else if (nearestTranslationDelta > kMaxFrameTranslation) {
       m_ngxVelocityStats.missBeyondTranslation++;
+      missReason = "beyond translation";
     } else {
       m_ngxVelocityStats.missBeyondRotation++;
+      missReason = "beyond rotation";
     }
+
+    dumpPairingOutcome("outcome=registered anew reason=", missReason, " sharedPlacement=", sharedSkinnedPlacement ? 1 : 0);
   }
 
   namespace {
@@ -5036,6 +5137,7 @@ namespace dxvk {
     m_ngxVelocityWindow.missBeyondRotation += m_ngxVelocityStats.missBeyondRotation;
     m_ngxVelocityWindow.claimedWithoutVelocity += m_ngxVelocityStats.claimedWithoutVelocity;
     m_ngxVelocityWindow.pairedBeyondBounds += m_ngxVelocityStats.pairedBeyondBounds;
+    m_ngxVelocityWindow.sharedSkinnedPlacements += m_ngxVelocityStats.sharedSkinnedPlacements;
     m_ngxVelocityWindow.skippedNoCamera += m_ngxVelocityStats.skippedNoCamera;
     m_ngxVelocityWindow.skippedBudget += m_ngxVelocityStats.skippedBudget;
     m_ngxVelocityWindow.skippedZDisabled += m_ngxVelocityStats.skippedZDisabled;
@@ -5060,7 +5162,8 @@ namespace dxvk {
         m_ngxVelocityWindow.missBeyondTranslation, " beyond translation / ",
         m_ngxVelocityWindow.missBeyondRotation, " beyond rotation), ",
         m_ngxVelocityWindow.claimedWithoutVelocity, " claimed without velocity, ",
-        m_ngxVelocityWindow.pairedBeyondBounds, " paired beyond the motion bounds, skipped: ",
+        m_ngxVelocityWindow.pairedBeyondBounds, " paired beyond the motion bounds, ",
+        m_ngxVelocityWindow.sharedSkinnedPlacements, " skinned sightings shared a placement with another pose, skipped: ",
         m_ngxVelocityWindow.skippedNoCamera, " no camera / ",
         m_ngxVelocityWindow.skippedBudget, " over budget / ",
         m_ngxVelocityWindow.skippedZDisabled, " depth test off / ",
@@ -7103,6 +7206,7 @@ namespace dxvk {
 
     // Per-frame draw index for the diagnostics (nothing else advances it in this mode)
     m_drawCallID++;
+    m_ngxDrawSerial++;
 
     if (unlikely(m_ngxPostChainDumpFramesLeft > 0)) {
       dumpNgxPostChainDraw(drawContext);
@@ -8084,11 +8188,19 @@ namespace dxvk {
     m_ngxVelocityDumpDynamicThisFrame = 0;
     m_ngxVelocityDumpRigidThisFrame = 0;
     if (m_ngxVelocityDumpFramesLeft > 0) {
-      m_ngxVelocityDumpFramesLeft--;
+      if (m_ngxVelocityDumpArmedThisFrame) {
+        m_ngxVelocityDumpArmedThisFrame = false;
+      } else {
+        m_ngxVelocityDumpFramesLeft--;
+      }
     }
     if (m_ngxPostChainDumpFramesLeft > 0) {
-      m_ngxPostChainDumpFramesLeft--;
-      Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));
+      if (m_ngxPostChainDumpArmedThisFrame) {
+        m_ngxPostChainDumpArmedThisFrame = false;
+      } else {
+        m_ngxPostChainDumpFramesLeft--;
+        Logger::info(str::format("[RTX NGX Passthrough][dump] ---- end of frame ", m_ue3FrameCounter, " ----"));
+      }
     }
     m_ngxPostChainDumpLinesThisFrame = 0;
     // Drop scene target references when unseen for a while (level transitions recreate them)

@@ -77,6 +77,10 @@ exe = executable('test_fsr_helpers',  files('test_fsr_helpers.cpp'),  include_di
 test('test_fsr_helpers', exe, env: test_env)
 tests += exe
 
+exe = executable('test_ngx_passthrough_helpers',  files('test_ngx_passthrough_helpers.cpp'),  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_ngx_passthrough_helpers', exe, env: test_env)
+tests += exe
+
 exe = executable('test_gpu_profile', files('test_gpu_profile.cpp'),
   include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_gpu_profile', exe, env: test_env)

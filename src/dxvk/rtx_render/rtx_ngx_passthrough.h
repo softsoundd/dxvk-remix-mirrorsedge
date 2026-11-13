@@ -175,6 +175,10 @@ namespace dxvk {
     // A steady nonzero count while something moves means a real mover is waiting.
     // A spike as the camera turns is a swap being refused.
     uint32_t pairedBeyondBounds = 0;
+    // Counts skinned sightings whose placement another pose of the same mesh had already claimed this frame.
+    // Those are characters sharing a mesh and a placement, as Matinee actors placed at one spot do.
+    // Pairing tells them apart by pose.
+    uint32_t sharedSkinnedPlacements = 0;
     // Goes untracked because every instance slot for that identity was already in use.
     // Static geometry past kMaxInstancesPerIdentity is harmless.
     // A mover in that set gets no velocity.
@@ -472,6 +476,12 @@ namespace dxvk {
                "Escape hatch for titles where GSystemSettings cannot be located automatically: the RVA of\n"
                "FSystemSettings::ScreenPercentage within the game's main module. 0 leaves discovery\n"
                "automatic. The value is still proven by the behavioural probe before it is used.");
+    RTX_OPTION_ARGS("rtx.ngxPassthrough", float, cameraCutAngle, 45.0f,
+                    "Treats a frame whose view direction turned by more than this many degrees since the previous frame as a\n"
+                    "camera cut. A cut resets the upscaler and frame generation history and skips Remix motion blur for that\n"
+                    "frame, as a camera jump beyond rtx.uniqueObjectDistance does. Cutscene cuts often turn the camera without\n"
+                    "moving it far. 0 disables the rotation test.",
+                    args.minValue = 0.0f, args.maxValue = 180.0f);
     RTX_OPTION("rtx.ngxPassthrough", bool, objectVelocityDebugFreeze, false,
                "Diagnostic: replays captured objects with zero motion and no depth test. Coverage that hugs each silhouette "
                "in the debug views means their transforms and skinning are correct.");
@@ -500,9 +510,10 @@ namespace dxvk {
                "Diagnostic: when set to a value N > 0, every scene draw the object velocity capture examines over the\n"
                "next N frames is written to the log with the state its gates decide on - primitive count, bone palette\n"
                "size, buffer usage, depth write and compare, and the viewport against the scene's - then the value\n"
-               "resets to 0 automatically. The developer menu has a button for this. Arm it while the object under\n"
-               "investigation is on screen: an object whose velocity never reaches the screen is told from one whose\n"
-               "does by which gate its draw fails.")
+               "resets to 0 automatically. A draw that passes the gates gets a second line saying which previous\n"
+               "sighting it paired with and whether it emitted velocity. The developer menu has a button for this.\n"
+               "Arm it while the object under investigation is on screen: an object whose velocity never reaches the\n"
+               "screen is told from one whose does by which gate its draw fails.")
     RTX_OPTION("rtx.ngxPassthrough", int, dumpPostChainFrames, 0,
                "Diagnostic: when set to a value N > 0, the non-scene draw flow (post-process passes, composites, UI, resolve\n"
                "copies, render state) of the next N frames is written to the log, then the value resets to 0 automatically.\n"
@@ -511,6 +522,9 @@ namespace dxvk {
 
   private:
     void showImguiDiagnostics();
+
+    // Returns true when the camera jumped beyond rtx.uniqueObjectDistance or turned beyond rtx.ngxPassthrough.cameraCutAngle.
+    bool detectCameraCut(const RtCamera& camera) const;
 
     void createResources(Rc<DxvkContext> ctx, const VkExtent2D& renderExtent, const VkExtent2D& displayExtent);
     bool generateMotionVectorsAndDepth(RtxContext* ctx,
@@ -695,6 +709,8 @@ namespace dxvk {
     uint32_t m_statEvaluateFailedCount = 0;
     uint32_t m_statDebugVisCount = 0;
     uint32_t m_statResetHistoryCount = 0;
+    // Counts the frames detected as camera cuts, which tells cut resets apart from the other kinds.
+    uint32_t m_statCameraCutCount = 0;
     uint32_t m_statPrePostCount = 0;
     // How often the colour source changed between HDR and LDR within the window. Not the same as
     // the injection point moving, which is what m_statPrePostCount against m_statDispatchCount
@@ -782,6 +798,8 @@ namespace dxvk {
     double m_sceneTransformOffsetSum[3] = { 0.0, 0.0, 0.0 };
     bool m_sceneCameraFresh = false;
     bool m_previousSceneCameraFresh = false;
+    // Holds whether dispatch detected a camera cut this frame, for the upscaler evaluation.
+    bool m_cameraCut = false;
     NgxSceneDepthLayout m_sceneDepthLayout;
 
     Rc<DxvkBuffer> m_constantsBuffer;

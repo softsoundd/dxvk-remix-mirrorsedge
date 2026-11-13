@@ -218,6 +218,7 @@ dxvk_src = files([
   'rtx_render/rtx_matrix_helpers.h',
   'rtx_render/rtx_ngx_passthrough.cpp',
   'rtx_render/rtx_ngx_passthrough.h',
+  'rtx_render/rtx_ngx_passthrough_helpers.h',
   'rtx_render/rtx_ngx_wrapper.cpp',
   'rtx_render/rtx_ngx_wrapper.h',
   'rtx_render/rtx_nis.cpp',
