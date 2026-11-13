@@ -54,6 +54,15 @@ namespace dxvk {
     VkPhysicalDeviceDiagnosticsConfigFeaturesNV               nvDeviceDiagnosticsConfig;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR            khrBufferDeviceAddress;
     VkPhysicalDeviceSynchronization2FeaturesKHR               khrSynchronization2;
+    // NV-DXVK start: AMD FSR
+    // The FSR runtime compiles shaders that need these.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR              khrCooperativeMatrix;
+    VkPhysicalDeviceShaderFloat8FeaturesEXT                   extShaderFloat8;
+    VkPhysicalDeviceShaderIntegerDotProductFeatures           khrShaderIntegerDotProduct;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR       khrComputeShaderDerivatives;
+    VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT         extShaderImageAtomicInt64;
+    VkPhysicalDeviceSubgroupSizeControlFeatures               extSubgroupSizeControl;
+    // NV-DXVK end
   };
 
 }

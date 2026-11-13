@@ -27,6 +27,23 @@
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #include <vulkan/vulkan.h>
 
+// NV-DXVK start: AMD FSR
+// The Vulkan headers in this repository predate VK_EXT_shader_float8, which the FSR 4 upscaler uses.
+#ifndef VK_EXT_shader_float8
+#define VK_EXT_shader_float8 1
+#define VK_EXT_SHADER_FLOAT8_SPEC_VERSION 1
+#define VK_EXT_SHADER_FLOAT8_EXTENSION_NAME "VK_EXT_shader_float8"
+#define VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT (static_cast<VkStructureType>(1000567000))
+
+typedef struct VkPhysicalDeviceShaderFloat8FeaturesEXT {
+  VkStructureType sType;
+  void*           pNext;
+  VkBool32        shaderFloat8;
+  VkBool32        shaderFloat8CooperativeMatrix;
+} VkPhysicalDeviceShaderFloat8FeaturesEXT;
+#endif
+// NV-DXVK end
+
 #define VULKAN_FN(name) \
   ::PFN_ ## name name = reinterpret_cast<::PFN_ ## name>(sym(#name))
 

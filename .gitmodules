@@ -39,3 +39,7 @@
 [submodule "submodules/dlss"]
 	path = submodules/dlss
 	url = https://github.com/NVIDIA/DLSS.git
+[submodule "submodules/FidelityFX-SDK"]
+	path = submodules/FidelityFX-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git
+	shallow = true

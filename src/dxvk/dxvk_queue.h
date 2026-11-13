@@ -84,6 +84,15 @@ namespace dxvk {
     // interpolator separate UI from scene exactly instead of heuristically detecting it
     Rc<DxvkImageView> hudless;
     VkImageLayout     hudlessLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    // Only AMD FSR frame generation reads these three.
+    // frameTimeMs is the time since the previous frame in milliseconds, and stays zero while that is not known.
+    // depthReversed is set when the depth maps the near plane to 1 and the far plane to 0.
+    // cameraPosition is in a space that stays put from frame to frame.
+    // The camera's own matrices can be relative to an origin that moves with it.
+    float             frameTimeMs = 0.0f;
+    bool              depthReversed = false;
+    Vector3           cameraPosition = Vector3(0.0f, 0.0f, 0.0f);
     
     bool valid() const {
       return motionVectors.ptr() &&

@@ -18,6 +18,8 @@
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_dlfg.h"
 #include "../dxvk/rtx_render/rtx_dlss_neural_rendering.h"
+#include "../dxvk/rtx_render/rtx_fsr.h"
+#include "../dxvk/rtx_render/rtx_fsr_framegen.h"
 #include "../dxvk/rtx_render/rtx_camera.h"
 // NV-DXVK start: draw disposition statistics
 #include "../dxvk/rtx_render/rtx_gpu_pass_timer.h"
@@ -992,13 +994,19 @@ namespace dxvk {
     o.sequenceTrackedLockWaits = sequenceTrackedLockWaitsObject().get();
     o.ngxPassthroughJitter = RtxNgxPassthrough::enableJitter();
     o.ngxPrePostProcess = RtxNgxPassthrough::prePostProcess();
-    o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && DxvkDLFG::enable() &&
-                       m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
+    // Either frame generation backend takes the HUD-less copy.
+    const bool dlfgInUse = DxvkDLFG::enable() && m_parent->GetDXVKDevice()->getCommon()->metaNGXContext().supportsDLFG();
+    const bool fsrFrameGenInUse = m_parent->GetDXVKDevice()->getCommon()->metaFSRFrameGen().isActive();
+    o.ngxDlfgHudless = RtxNgxPassthrough::dlfgHudlessInput() && (dlfgInUse || fsrFrameGenInUse);
     o.ngxDlfgHudlessPreview = RtxNgxPassthrough::dlfgHudlessPreview();
     o.ngxNeuralRendering = DlssNeuralRendering::enable() &&
                            m_parent->GetDXVKDevice()->getCommon()->metaDlssNeuralRendering().supportsDlssNeuralRendering();
     o.ngxObjectVelocities = RtxNgxPassthrough::objectVelocities();
     o.ngxDebugVisualization = RtxNgxPassthrough::debugVisualization();
+
+    const bool fsrInUse = RtxOptions::isFSREnabled() && !RtxNgxPassthrough::bypassUpscaler() &&
+                          m_parent->GetDXVKDevice()->getCommon()->metaFSR().isAvailable();
+    o.ngxFsrMipBiasOffset = fsrInUse ? DxvkFSR::mipBiasOffset() : 0.0f;
 
     // On-demand post-chain dump (one-shot: consumed here, option resets itself)
     if (RtxNgxPassthrough::dumpPostChainFrames() > 0 && m_ngxPostChainDumpFramesLeft == 0) {
@@ -5549,17 +5557,21 @@ namespace dxvk {
     if (renderTargetTexture == nullptr || renderTargetTexture->GetImage().ptr() != m_ngxSceneColorImage.ptr())
       return 0.0f;
 
-    // Bias only for a ScreenPercentage subrect.
-    // One short axis is letterboxing, and full resolution needs no bias.
+    // AMD recommends a bias of log2(render / display) - 1 for FSR.
+    // The offset carries that last term, which applies at full resolution as well.
+    const float fsrOffset = m_frameOptions.ngxFsrMipBiasOffset;
+
+    // The resolution term applies only to a ScreenPercentage subrect.
+    // One short axis is letterboxing, and full resolution has no such term.
     const uint32_t backBufferWidth = m_activePresentParams->BackBufferWidth;
     const uint32_t backBufferHeight = m_activePresentParams->BackBufferHeight;
 
     if (!ngxSceneViewportIsSubrect(m_ngxSceneViewport, backBufferWidth, backBufferHeight))
-      return 0.0f;
+      return fsrOffset;
 
     // The standard DLSS integration bias: mip selection matches the upscaled output's
     // texel density instead of the reduced render resolution
-    const float bias = std::log2(float(m_ngxSceneViewport.Width) / float(backBufferWidth));
+    const float bias = fsr::mipBias(m_ngxSceneViewport.Width, backBufferWidth, fsrOffset);
     return std::clamp(bias, -4.0f, 0.0f);
   }
 

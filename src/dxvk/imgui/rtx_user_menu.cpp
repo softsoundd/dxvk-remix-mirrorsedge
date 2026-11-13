@@ -30,6 +30,8 @@
 #include "rtx_render/rtx_dlss.h"
 #include "rtx_render/rtx_dlss_neural_rendering.h"
 #include "rtx_render/rtx_dlfg.h"
+#include "rtx_render/rtx_fsr.h"
+#include "rtx_render/rtx_fsr_framegen.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
 #include "rtx_render/rtx_reflex.h"
 #include "rtx_render/rtx_xess.h"
@@ -48,6 +50,7 @@ namespace dxvk {
   extern RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo;
   extern RemixGui::ComboWithKey<DxvkDLSS::DLSSPreset> dlssRenderPresetCombo;
   extern RemixGui::ComboWithKey<XeSSPreset> xessPresetCombo;
+  extern RemixGui::ComboWithKey<FSRPreset> fsrPresetCombo;
 
   // Combo boxes used only by the user menu
   static RemixGui::ComboWithKey<DlssPreset> dlssPresetCombo{
@@ -81,7 +84,7 @@ namespace dxvk {
   };
 
   // Helper functions defined in dxvk_imgui.cpp
-  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss);
+  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkFSR& fsr);
 
   void ImGUI::showUserMenu(const Rc<DxvkContext>& ctx) {
     // Target user.conf layer for user menu changes
@@ -249,11 +252,13 @@ namespace dxvk {
     auto common = ctx->getCommonObjects();
     DxvkDLSS& dlss = common->metaDLSS();
     DxvkDLFG& dlfg = common->metaDLFG();
+    DxvkFSR& fsr = common->metaFSR();
     DlssNeuralRendering& dlssNeuralRendering = common->metaDlssNeuralRendering();
     const RtxReflex& reflex = m_device->getCommon()->metaReflex();
 
     const bool dlssSupported = dlss.supportsDLSS();
     const bool dlfgSupported = dlfg.supportsDLFG();
+    const bool fsrFrameGenSupported = common->metaFSRFrameGen().isSupported();
     const bool dlssNeuralRenderingSupported = dlssNeuralRendering.supportsDlssNeuralRendering();
     const bool reflexInitialized = reflex.reflexInitialized();
 
@@ -305,14 +310,14 @@ namespace dxvk {
 
       // Note: Use a different combo box without DLSS's upscaler listed if DLSS overall is unsupported.
       if (dlss.supportsDLSS()) {
-        getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
+        getUpscalerCombo(dlss, fsr).getKey(&RtxOptions::upscalerTypeObject());
       }
       
       ImGui::PushItemWidth(static_cast<float>(subItemWidth));
       ImGui::Indent(static_cast<float>(subItemIndent));
 
       if (!dlss.supportsDLSS()) {
-        getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
+        getUpscalerCombo(dlss, fsr).getKey(&RtxOptions::upscalerTypeObject());
       }
 
       // Upscaler Preset
@@ -372,6 +377,14 @@ namespace dxvk {
 
           break;
         }
+        case UpscalerType::FSR: {
+          fsrPresetCombo.getKey(&DxvkFSR::presetObject());
+          // AMD recommends a sharpening slider next to the quality mode.
+          RemixGui::SliderFloat("Sharpness", &DxvkFSR::sharpnessObject(), 0.0f, 1.0f, "%.2f");
+          common->metaNgxPassthrough().showImguiStatusLine();
+
+          break;
+        }
         case UpscalerType::None: {
           // No custom UI here.
           break;
@@ -403,12 +416,15 @@ namespace dxvk {
       }
     }
 
-    // Latency Reduction Settings
-    if (dlfgSupported) {
+    // Frame Generation Settings
+
+    if (dlfgSupported || fsrFrameGenSupported) {
       ImGui::Dummy(ImVec2(0.0f, 3.0f));
       ImGui::TextSeparator("Frame Generation Settings");
-      showDLFGOptions(ctx);
+      showFrameGenerationOptions(ctx);
     }
+
+    // Latency Reduction Settings
 
     if (reflexInitialized) {
       ImGui::Dummy(ImVec2(0.0f, 3.0f));

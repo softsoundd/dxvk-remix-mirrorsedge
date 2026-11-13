@@ -36,7 +36,7 @@ cd _CompDebugOptimized_x64; meson compile -v
 
 ### Step 2: Deploy to a Game Target
 
-Deploy built artifacts (d3d9.dll, the DLSS/DLFG/DLSS-NR, Reflex and XeSS libraries, etc.) to a game's `.trex` folder:
+Deploy built artifacts (d3d9.dll, the DLSS/DLFG/DLSS-NR, Reflex, XeSS and AMD FSR libraries, etc.) to a game's `.trex` folder:
 
 ```powershell
 meson install -C _CompDebugOptimized_x64 --tags <GameTarget> --only-changed

@@ -492,6 +492,15 @@ reflex_lib = dxvk_compiler.find_library('NvLowLatencyVk', dirs : reflex_lib_path
 
 xess_dll_path = join_paths(global_src_root_norm, 'submodules/xess/bin/')
 
+# AMD ships the FSR runtime as signed x64 binaries: a loader plus one DLL per effect.
+# The runtime loads them from its own directory on first use, so nothing links against them.
+fsr_dll_path = join_paths(global_src_root_norm, 'submodules/FidelityFX-SDK/Kits/FidelityFX/signedbin/')
+fsr_dlls = [
+  'amd_fidelityfx_loader_vk.dll',
+  'amd_fidelityfx_upscaler_vk.dll',
+  'amd_fidelityfx_framegeneration_vk.dll',
+]
+
 # Build meson dependency types
 reflex_dep = declare_dependency(
   dependencies : [ reflex_lib ],
@@ -608,6 +617,10 @@ if dxvk_is_ninja or dxvk_is_woa_ec
 
     if not dxvk_is_woa
       install_data(join_paths(xess_dll_path, 'libxess.dll'), install_dir : output_path, install_tag: target_suffix)
+
+      foreach fsr_dll : fsr_dlls
+        install_data(join_paths(fsr_dll_path, fsr_dll), install_dir : output_path, install_tag: target_suffix)
+      endforeach
     endif
 
     install_data(join_paths(dlss_bin_path, 'nvngx_dlss.dll'), install_dir : output_path, install_tag: target_suffix) 

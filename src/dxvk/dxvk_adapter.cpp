@@ -34,6 +34,10 @@
 // NV-DXVK start: Remix message box utilities
 #include "rtx_render/rtx_env.h"
 // NV-DXVK end:
+// NV-DXVK start: AMD FSR
+#include "rtx_render/rtx_fsr.h"
+#include "rtx_render/rtx_fsr_framegen.h"
+// NV-DXVK end
 // NV-DXVK start: Provide error code on exception
 #include <remix/remix_c.h>
 // NV-DXVK end
@@ -458,6 +462,63 @@ namespace dxvk {
       extensionsEnabled);
     // NV-DXVK end
 
+    // NV-DXVK start: AMD FSR
+    // The FSR runtime compiles shaders that need features nothing else here uses.
+    // Its FSR 3 shaders declare compute shader derivatives, on any GPU.
+    // The machine learning models of FSR 4 need the rest, and run on AMD GPUs only, so those stay off elsewhere.
+    const bool enableFsrShaderFeatures = DxvkFSR::hasRuntimeFiles() || DxvkFSRFrameGen::hasRuntimeFiles();
+    const bool enableFsrMlShaderFeatures = enableFsrShaderFeatures &&
+      m_deviceInfo.core.properties.vendorID == static_cast<uint32_t>(DxvkGpuVendor::Amd);
+
+    if (enableFsrShaderFeatures) {
+      // Each feature is enabled as far as the GPU supports it, and its extension only along with it.
+      enabledFeatures.khrComputeShaderDerivatives.computeDerivativeGroupQuads = m_deviceFeatures.khrComputeShaderDerivatives.computeDerivativeGroupQuads;
+      enabledFeatures.khrComputeShaderDerivatives.computeDerivativeGroupLinear = m_deviceFeatures.khrComputeShaderDerivatives.computeDerivativeGroupLinear;
+
+      if (enableFsrMlShaderFeatures) {
+        enabledFeatures.khrCooperativeMatrix.cooperativeMatrix = m_deviceFeatures.khrCooperativeMatrix.cooperativeMatrix;
+        enabledFeatures.extShaderFloat8.shaderFloat8 = m_deviceFeatures.extShaderFloat8.shaderFloat8;
+        enabledFeatures.extShaderFloat8.shaderFloat8CooperativeMatrix = m_deviceFeatures.extShaderFloat8.shaderFloat8CooperativeMatrix;
+        enabledFeatures.khrShaderIntegerDotProduct.shaderIntegerDotProduct = m_deviceFeatures.khrShaderIntegerDotProduct.shaderIntegerDotProduct;
+        enabledFeatures.extShaderImageAtomicInt64.shaderImageInt64Atomics = m_deviceFeatures.extShaderImageAtomicInt64.shaderImageInt64Atomics;
+        enabledFeatures.extSubgroupSizeControl.subgroupSizeControl = m_deviceFeatures.extSubgroupSizeControl.subgroupSizeControl;
+        enabledFeatures.extSubgroupSizeControl.computeFullSubgroups = m_deviceFeatures.extSubgroupSizeControl.computeFullSubgroups;
+      }
+
+      std::vector<DxvkExt*> devFsrExtensions;
+
+      if (enabledFeatures.khrCooperativeMatrix.cooperativeMatrix) {
+        devFsrExtensions.push_back(&devExtensions.khrCooperativeMatrix);
+      }
+
+      if (enabledFeatures.extShaderFloat8.shaderFloat8) {
+        devFsrExtensions.push_back(&devExtensions.extShaderFloat8);
+      }
+
+      if (enabledFeatures.khrShaderIntegerDotProduct.shaderIntegerDotProduct) {
+        devFsrExtensions.push_back(&devExtensions.khrShaderIntegerDotProduct);
+      }
+
+      if (enabledFeatures.khrComputeShaderDerivatives.computeDerivativeGroupQuads ||
+          enabledFeatures.khrComputeShaderDerivatives.computeDerivativeGroupLinear) {
+        devFsrExtensions.push_back(&devExtensions.khrComputeShaderDerivatives);
+      }
+
+      if (enabledFeatures.extShaderImageAtomicInt64.shaderImageInt64Atomics) {
+        devFsrExtensions.push_back(&devExtensions.extShaderImageAtomicInt64);
+      }
+
+      if (enabledFeatures.extSubgroupSizeControl.subgroupSizeControl) {
+        devFsrExtensions.push_back(&devExtensions.extSubgroupSizeControl);
+      }
+
+      m_deviceExtensions.enableExtensions(
+        devFsrExtensions.size(),
+        devFsrExtensions.data(),
+        extensionsEnabled);
+    }
+    // NV-DXVK end
+
     // Enable additional extensions if necessary
     extensionsEnabled.merge(m_extraExtensions);
     DxvkNameList extensionNameList = extensionsEnabled.toNameList();
@@ -591,6 +652,38 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK start: AMD FSR
+    if (devExtensions.khrCooperativeMatrix) {
+      enabledFeatures.khrCooperativeMatrix.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+      enabledFeatures.khrCooperativeMatrix.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrCooperativeMatrix);
+    }
+
+    if (devExtensions.extShaderFloat8) {
+      enabledFeatures.extShaderFloat8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+      enabledFeatures.extShaderFloat8.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extShaderFloat8);
+    }
+
+    if (devExtensions.khrShaderIntegerDotProduct) {
+      enabledFeatures.khrShaderIntegerDotProduct.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+      enabledFeatures.khrShaderIntegerDotProduct.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrShaderIntegerDotProduct);
+    }
+
+    if (devExtensions.khrComputeShaderDerivatives) {
+      enabledFeatures.khrComputeShaderDerivatives.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+      enabledFeatures.khrComputeShaderDerivatives.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrComputeShaderDerivatives);
+    }
+
+    if (devExtensions.extShaderImageAtomicInt64) {
+      enabledFeatures.extShaderImageAtomicInt64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT;
+      enabledFeatures.extShaderImageAtomicInt64.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extShaderImageAtomicInt64);
+    }
+
+    if (devExtensions.extSubgroupSizeControl) {
+      enabledFeatures.extSubgroupSizeControl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+      enabledFeatures.extSubgroupSizeControl.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extSubgroupSizeControl);
+    }
+    // NV-DXVK end
+
     // NV-DXVK start: Moved logging to where it is on more recent DXVK to properly show enabled features, also added more information to be logged
     // (Still needs driver version from latest DXVK though at the time of writing this, but we can wait on that since it needs larger changes)
 
@@ -619,6 +712,19 @@ namespace dxvk {
     Logger::info("Enabled device extensions:");
     this->logNameList(extensionNameList);
     this->logFeatures(enabledFeatures);
+
+    if (enableFsrShaderFeatures) {
+      Logger::info(str::format("Device features for AMD FSR:",
+        "\n  cooperativeMatrix                      : ", (devExtensions.khrCooperativeMatrix && enabledFeatures.khrCooperativeMatrix.cooperativeMatrix) ? "1" : "0",
+        "\n  shaderFloat8                           : ", (devExtensions.extShaderFloat8 && enabledFeatures.extShaderFloat8.shaderFloat8) ? "1" : "0",
+        "\n  shaderFloat8CooperativeMatrix          : ", (devExtensions.extShaderFloat8 && enabledFeatures.extShaderFloat8.shaderFloat8CooperativeMatrix) ? "1" : "0",
+        "\n  shaderIntegerDotProduct                : ", (devExtensions.khrShaderIntegerDotProduct && enabledFeatures.khrShaderIntegerDotProduct.shaderIntegerDotProduct) ? "1" : "0",
+        "\n  computeDerivativeGroupQuads            : ", (devExtensions.khrComputeShaderDerivatives && enabledFeatures.khrComputeShaderDerivatives.computeDerivativeGroupQuads) ? "1" : "0",
+        "\n  computeDerivativeGroupLinear           : ", (devExtensions.khrComputeShaderDerivatives && enabledFeatures.khrComputeShaderDerivatives.computeDerivativeGroupLinear) ? "1" : "0",
+        "\n  shaderImageInt64Atomics                : ", (devExtensions.extShaderImageAtomicInt64 && enabledFeatures.extShaderImageAtomicInt64.shaderImageInt64Atomics) ? "1" : "0",
+        "\n  subgroupSizeControl                    : ", (devExtensions.extSubgroupSizeControl && enabledFeatures.extSubgroupSizeControl.subgroupSizeControl) ? "1" : "0",
+        "\n  computeFullSubgroups                   : ", (devExtensions.extSubgroupSizeControl && enabledFeatures.extSubgroupSizeControl.computeFullSubgroups) ? "1" : "0"));
+    }
 
     // NV-DXVK end
 
@@ -733,6 +839,52 @@ namespace dxvk {
 
     if (queueFamilies.present != VK_QUEUE_FAMILY_IGNORED) {
       handleQueueFamily(queueFamilies.present, queueInfos.present);
+    }
+
+    // AMD FSR frame generation presents from threads of its own, on queues nothing else may submit to.
+    // The queue indices above wrap around when a family runs out, which makes two roles share a queue.
+    // These queues are therefore taken only from what a family still has to spare, and are left out otherwise.
+    if (DxvkFSRFrameGen::hasRuntimeFiles()) {
+      const auto takeSpareQueue = [this, &desiredQueueCounts, &maxDesiredQueueIndex](
+        std::uint32_t queueFamily
+      ) -> std::optional<DxvkAdapterQueueInfo> {
+        if (desiredQueueCounts[queueFamily] >= m_queueFamilies[queueFamily].queueCount) {
+          return std::nullopt;
+        }
+
+        const auto queueIndex = desiredQueueCounts[queueFamily]++;
+
+        maxDesiredQueueIndex = std::max(maxDesiredQueueIndex, queueIndex);
+
+        return DxvkAdapterQueueInfo{ queueFamily, queueIndex };
+      };
+
+      // A second queue of the graphics family can both compose and present the generated frames,
+      // which is the mode AMD recommends.
+      queueInfos.fsrPresent = takeSpareQueue(queueFamilies.graphics);
+
+      std::vector<fsr::QueueFamily> spareQueues(m_queueFamilies.size());
+
+      for (std::uint32_t queueFamily = 0; queueFamily < m_queueFamilies.size(); ++queueFamily) {
+        const auto queueCount = m_queueFamilies[queueFamily].queueCount;
+
+        spareQueues[queueFamily].flags = m_queueFamilies[queueFamily].queueFlags;
+        spareQueues[queueFamily].queueCount = queueCount - std::min(desiredQueueCounts[queueFamily], queueCount);
+      }
+
+      const auto imageAcquireFamilies = fsr::imageAcquireFamilyPreference(spareQueues);
+
+      if (!imageAcquireFamilies.empty()) {
+        queueInfos.imageAcquire = takeSpareQueue(imageAcquireFamilies.front());
+      }
+
+      if (queueInfos.fsrPresent.has_value()) {
+        Logger::info(str::format("  FSR Present : ", queueInfos.fsrPresent->queueFamilyIndex, " (queue ", queueInfos.fsrPresent->queueIndex, ")"));
+      }
+
+      if (queueInfos.imageAcquire.has_value()) {
+        Logger::info(str::format("  FSR Image Acquire : ", queueInfos.imageAcquire->queueFamilyIndex, " (queue ", queueInfos.imageAcquire->queueIndex, ")"));
+      }
     }
 
     // Create the requested queues
@@ -1134,6 +1286,38 @@ namespace dxvk {
       m_deviceFeatures.extShaderAtomicFloat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
       m_deviceFeatures.extShaderAtomicFloat.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderAtomicFloat);
     }
+
+    // NV-DXVK start: AMD FSR
+    if (m_deviceExtensions.supports(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+      m_deviceFeatures.khrCooperativeMatrix.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+      m_deviceFeatures.khrCooperativeMatrix.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrCooperativeMatrix);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+      m_deviceFeatures.extShaderFloat8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+      m_deviceFeatures.extShaderFloat8.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderFloat8);
+    }
+
+    if (m_deviceExtensions.supports(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+      m_deviceFeatures.khrShaderIntegerDotProduct.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
+      m_deviceFeatures.khrShaderIntegerDotProduct.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrShaderIntegerDotProduct);
+    }
+
+    if (m_deviceExtensions.supports(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+      m_deviceFeatures.khrComputeShaderDerivatives.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR;
+      m_deviceFeatures.khrComputeShaderDerivatives.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrComputeShaderDerivatives);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME)) {
+      m_deviceFeatures.extShaderImageAtomicInt64.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT;
+      m_deviceFeatures.extShaderImageAtomicInt64.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderImageAtomicInt64);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+      m_deviceFeatures.extSubgroupSizeControl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES;
+      m_deviceFeatures.extSubgroupSizeControl.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extSubgroupSizeControl);
+    }
+    // NV-DXVK end
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);
   }

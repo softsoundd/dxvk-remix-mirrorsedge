@@ -39,6 +39,10 @@
 #include "../dxvk/rtx_render/rtx_dlfg.h"
 // NV-DXVK end
 
+// NV-DXVK start: AMD FSR frame generation
+#include "../dxvk/rtx_render/rtx_fsr_framegen.h"
+// NV-DXVK end
+
 namespace dxvk {
   // NV-DXVK start: App Controlled FSE
   enum FSEState {
@@ -449,22 +453,33 @@ namespace dxvk {
       if (m_dlfgPresenter == nullptr) {
         return true;
       }
+    } else if (m_context->isFSRFGEnabled()) {
+      if (m_fsrfgPresenter == nullptr) {
+        return true;
+      }
     } else {
       if (m_presenter == nullptr) {
         return true;
       }
     }
 
-    // one must be null, one must be non-null
-    assert(m_presenter != nullptr || m_dlfgPresenter != nullptr);
-    assert(m_presenter == nullptr || m_dlfgPresenter == nullptr);
+    // Exactly one of the three presenters is non-null.
+    assert(int(m_presenter != nullptr) + int(m_dlfgPresenter != nullptr) + int(m_fsrfgPresenter != nullptr) == 1);
     return false;
   }
 
   vk::Presenter* D3D9SwapChainEx::GetPresenter() const {
-    const auto presenter = m_presenter != nullptr ? m_presenter.ptr() : m_dlfgPresenter.ptr();
+    vk::Presenter* presenter = m_presenter.ptr();
 
-    // Note: The returned presenter must be non-null as one of the two presenters must be non-null at all times,
+    if (presenter == nullptr) {
+      presenter = m_dlfgPresenter.ptr();
+    }
+
+    if (presenter == nullptr) {
+      presenter = m_fsrfgPresenter.ptr();
+    }
+
+    // Note: The returned presenter must be non-null as one of the presenters must be non-null at all times,
     // and because code will blindly dereference this returned pointer.
     assert(presenter != nullptr);
 
@@ -1028,6 +1043,14 @@ namespace dxvk {
       m_blitter->setGammaRamp(NumControlPoints, cp.data());
     else
       m_blitter->setGammaRamp(0, nullptr);
+
+    // NV-DXVK start: AMD FSR frame generation
+    m_gammaRampApplied = !isIdentity && !m_presentParams.Windowed;
+
+    if (m_fsrfgPresenter != nullptr) {
+      m_fsrfgPresenter->setPresentAltersColor(m_gammaRampApplied);
+    }
+    // NV-DXVK end
   }
 
 
@@ -1056,9 +1079,19 @@ namespace dxvk {
         assert(m_presenter == nullptr);
         m_dlfgPresenter = nullptr;
       }
+      // NV-DXVK end
 
       m_device->waitForSubmission(&m_presentStatus);
       m_device->waitForIdle();
+
+      // NV-DXVK start: AMD FSR frame generation
+      // The FSR presenter is released once the device is idle, because destroying its swapchain requires that.
+      // The views wrap images that it owns, so they go before it does.
+      if (m_fsrfgPresenter != nullptr) {
+        m_imageViews.clear();
+        m_fsrfgPresenter = nullptr;
+      }
+      // NV-DXVK end
     }
   }
 
@@ -1358,6 +1391,8 @@ namespace dxvk {
       if (cHud != nullptr && !cFrameId) {
         if (m_dlfgPresenter != nullptr) {
           cHud->update(m_dlfgPresenter->getPresentFrameCount());
+        } else if (m_fsrfgPresenter != nullptr) {
+          cHud->update(m_fsrfgPresenter->getPresentFrameCount());
         } else {
           cHud->update(1);
         }
@@ -1449,12 +1484,21 @@ namespace dxvk {
 
     m_device->waitForIdle();
 
+    // NV-DXVK start: AMD FSR frame generation
+    // The views wrap images that the FSR presenter owns, so they go before it does.
+    if (m_fsrfgPresenter != nullptr) {
+      m_imageViews.clear();
+      m_fsrfgPresenter = nullptr;
+    }
+    // NV-DXVK end
+
     m_presenter = nullptr;
     m_presentStatus.result = VK_SUCCESS;
 
     // NV-DXVK start: DLFG integration
     m_dlfgPresenter = nullptr;
     const bool dlfgEnabled = m_context->isDLFGEnabled();
+    const bool fsrfgEnabled = m_context->isFSRFGEnabled();
     DxvkDeviceQueue presentQueue = dlfgEnabled ? m_device->queues().present : m_device->queues().graphics;
     
     vk::PresenterDevice presenterDevice;
@@ -1483,6 +1527,15 @@ namespace dxvk {
                                               m_device->vkd(),
                                               presenterDevice,
                                               presenterDesc);
+    } else if (fsrfgEnabled) {
+      // FSR presents from queues of its own, and this queue is the one the game's frames are rendered on.
+      m_fsrfgPresenter = new DxvkFSRFGPresenter(m_device.ptr(),
+                                                m_window,
+                                                m_device->adapter()->vki(),
+                                                m_device->vkd(),
+                                                presenterDevice,
+                                                presenterDesc);
+      m_fsrfgPresenter->setPresentAltersColor(m_gammaRampApplied);
     } else {
       m_presenter = new vk::Presenter(m_window,
         m_device->adapter()->vki(),
@@ -1519,7 +1572,9 @@ namespace dxvk {
     imageInfo.stages      = 0;
     imageInfo.access      = 0;
     imageInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.layout      = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    // NV-DXVK start: AMD FSR frame generation
+    imageInfo.layout      = GetPresenter()->presentLayout();
+    // NV-DXVK end
     imageInfo.shared      = VK_TRUE;
 
     DxvkImageViewCreateInfo viewInfo;

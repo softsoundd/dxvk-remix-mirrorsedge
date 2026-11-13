@@ -359,6 +359,15 @@ namespace dxvk {
     // NV-DXVK start:
     DxvkExt extShaderAtomicFloat              = { VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,                DxvkExtMode::Optional };
     // NV-DXVK end
+
+    // NV-DXVK start: AMD FSR
+    DxvkExt khrCooperativeMatrix              = { VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,                 DxvkExtMode::Optional };
+    DxvkExt extShaderFloat8                   = { VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,                      DxvkExtMode::Optional };
+    DxvkExt khrShaderIntegerDotProduct        = { VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,         DxvkExtMode::Optional };
+    DxvkExt khrComputeShaderDerivatives       = { VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,         DxvkExtMode::Optional };
+    DxvkExt extShaderImageAtomicInt64         = { VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,          DxvkExtMode::Optional };
+    DxvkExt extSubgroupSizeControl            = { VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,              DxvkExtMode::Optional };
+    // NV-DXVK end
   };
   
   /**

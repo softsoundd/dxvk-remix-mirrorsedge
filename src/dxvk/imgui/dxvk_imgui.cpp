@@ -54,6 +54,8 @@
 #include "rtx_render/rtx_options.h"
 #include "rtx_render/rtx_nsight_capture.h"
 #include "rtx_render/rtx_xess.h"
+#include "rtx_render/rtx_fsr.h"
+#include "rtx_render/rtx_fsr_framegen.h"
 #include "rtx_render/rtx_ngx_passthrough.h"
 #include "dxvk_image.h"
 #include "../util/rc/util_rc_ptr.h"
@@ -164,6 +166,37 @@ namespace dxvk {
       {UpscalerType::XeSS, "XeSS"},
   } });
 
+  // The names and descriptions of the AMD FSR entries follow AMD's naming guidelines.
+  // Those ask for a single entry per feature, without a version number.
+  constexpr char kFsrUpscalingName[] = "AMD FSR Upscaling";
+  constexpr char kFsrUpscalingDescription[] = "AMD FSR Upscaling reconstructs crisp, high-quality visuals from low-resolution frames.";
+  constexpr char kFsrFrameGenerationName[] = "AMD FSR Frame Generation";
+  constexpr char kFsrFrameGenerationDescription[] =
+    "AMD FSR Frame Generation predicts and inserts new frames between rendered ones, delivering smoother and higher frame rate gaming.";
+  constexpr char kDlssFrameGenerationName[] = "DLSS Frame Generation";
+
+  // The AMD FSR entry is only offered while its runtime is installed.
+  static auto upscalerNoDLSSWithFSRCombo = RemixGui::ComboWithKey<UpscalerType>(
+    "Upscaler Type",
+    { {
+      {UpscalerType::None, "None"},
+      {UpscalerType::NIS, "NIS"},
+      {UpscalerType::TAAU, "TAA-U"},
+      {UpscalerType::XeSS, "XeSS"},
+      {UpscalerType::FSR, kFsrUpscalingName, kFsrUpscalingDescription},
+  } });
+
+  static auto upscalerDLSSWithFSRCombo = RemixGui::ComboWithKey<UpscalerType>(
+    "Upscaler Type",
+    { {
+      {UpscalerType::None, "None"},
+      {UpscalerType::DLSS, "DLSS"},
+      {UpscalerType::NIS, "NIS"},
+      {UpscalerType::TAAU, "TAA-U"},
+      {UpscalerType::XeSS, "XeSS"},
+      {UpscalerType::FSR, kFsrUpscalingName, kFsrUpscalingDescription},
+  } });
+
   RemixGui::ComboWithKey<DLSSProfile> dlssProfileCombo{
     "DLSS Mode",
     RemixGui::ComboWithKey<DLSSProfile>::ComboEntries{ {
@@ -202,6 +235,58 @@ namespace dxvk {
         {XeSSPreset::Custom, "Custom"},
     } }
   };
+
+  // The quality modes are listed from the highest quality to the lowest, with AMD's descriptions.
+  RemixGui::ComboWithKey<FSRPreset> fsrPresetCombo{
+    "AMD FSR Quality Mode",
+    RemixGui::ComboWithKey<FSRPreset>::ComboEntries{ {
+        {FSRPreset::NativeAA, "Native AA",
+         "Native AA mode provides an image quality superior to native rendering with a modest performance cost."},
+        {FSRPreset::Quality, "Quality",
+         "Quality mode provides an image quality equal or superior to native rendering with a significant performance gain."},
+        {FSRPreset::Balanced, "Balanced",
+         "Balanced mode offers an ideal compromise between image quality and performance gains."},
+        {FSRPreset::Performance, "Performance",
+         "Performance mode provides an image quality similar to native rendering with a major performance gain."},
+        {FSRPreset::UltraPerformance, "Ultra Performance",
+         "Ultra Performance mode provides the highest performance gain while still maintaining an image quality representative of native rendering."},
+    } }
+  };
+
+  // Only one frame generation backend can present at a time, so one combo picks between them.
+  enum class FrameGenBackend : int {
+    Off = 0,
+    DLSS,
+    FSR,
+  };
+
+  static auto frameGenBackendCombo = RemixGui::ComboWithKey<FrameGenBackend>(
+    "Frame Generation",
+    { {
+      {FrameGenBackend::Off, "Off"},
+      {FrameGenBackend::DLSS, kDlssFrameGenerationName},
+      {FrameGenBackend::FSR, kFsrFrameGenerationName, kFsrFrameGenerationDescription},
+  } });
+
+  static auto frameGenBackendDLSSCombo = RemixGui::ComboWithKey<FrameGenBackend>(
+    "Frame Generation",
+    { {
+      {FrameGenBackend::Off, "Off"},
+      {FrameGenBackend::DLSS, kDlssFrameGenerationName},
+  } });
+
+  static auto frameGenBackendFSRCombo = RemixGui::ComboWithKey<FrameGenBackend>(
+    "Frame Generation",
+    { {
+      {FrameGenBackend::Off, "Off"},
+      {FrameGenBackend::FSR, kFsrFrameGenerationName, kFsrFrameGenerationDescription},
+  } });
+
+  static auto frameGenBackendOffCombo = RemixGui::ComboWithKey<FrameGenBackend>(
+    "Frame Generation",
+    { {
+      {FrameGenBackend::Off, "Off"},
+  } });
 
   RemixGui::ComboWithKey<int> dlfgMfgModeCombo {
     "DLSS Frame Generation Mode",
@@ -246,13 +331,88 @@ namespace dxvk {
   constexpr ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_AlwaysVerticalScrollbar;
   constexpr ImGuiWindowFlags popupWindowFlags = ImGuiWindowFlags_NoSavedSettings;
 
-  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss) {
+  RemixGui::ComboWithKey<UpscalerType>& getUpscalerCombo(DxvkDLSS& dlss, DxvkFSR& fsr) {
+    const bool fsrAvailable = fsr.isAvailable();
+
     if (dlss.supportsDLSS()) {
-      return upscalerDLSSCombo;
+      return fsrAvailable ? upscalerDLSSWithFSRCombo : upscalerDLSSCombo;
     } else {
       // Drop DLSS item if unsupported.
-      return upscalerNoDLSSCombo;
+      return fsrAvailable ? upscalerNoDLSSWithFSRCombo : upscalerNoDLSSCombo;
     }
+  }
+
+  // Shows the versions the FSR runtime offers for one of its effects, after an entry that leaves the choice to the runtime.
+  static void showFsrVersionCombo(const char* label, RtxOption<std::string>* versionOption, const std::vector<std::string>& versions) {
+    RemixGui::RtxOptionUxWrapper wrapper(versionOption);
+
+    const std::string current = versionOption->get();
+
+    // The option holds an empty string while the choice is the runtime's.
+    std::vector<const char*> items = { "Automatic" };
+    int selected = 0;
+
+    for (const std::string& version : versions) {
+      if (version == current) {
+        selected = int(items.size());
+      }
+
+      items.push_back(version.c_str());
+    }
+
+    // A version the runtime does not offer on this GPU is listed as well, since it is what the option holds.
+    if (selected == 0 && !current.empty()) {
+      selected = int(items.size());
+      items.push_back(current.c_str());
+    }
+
+    if (RemixGui::Combo(label, &selected, items.data(), int(items.size()))) {
+      RemixGui::CheckRtxOptionPopups(versionOption);
+      versionOption->setDeferred(selected == 0 ? std::string() : std::string(items[selected]));
+    }
+  }
+
+  // Shows the developer settings of AMD FSR Upscaling.
+  // AMD asks for the version choice to stay out of the menu players use.
+  static void showFsrUpscalerSettings(DxvkFSR& fsr) {
+    const std::string activeVersion = fsr.activeVersion();
+
+    ImGui::TextWrapped("Version In Use: %s", activeVersion.empty() ? "None" : activeVersion.c_str());
+
+    showFsrVersionCombo("Version", &DxvkFSR::upscalerVersionObject(), fsr.versionNames());
+    RemixGui::DragFloat("Texture LOD Bias Offset", &DxvkFSR::mipBiasOffsetObject(), 0.01f, -2.0f, 0.0f, "%.2f", sliderFlags);
+    RemixGui::DragFloat("View Space To Meters", &DxvkFSR::viewSpaceToMetersFactorObject(), 0.0001f, 0.0001f, 100.0f, "%.4f", sliderFlags);
+    RemixGui::Checkbox("Debug Checker", &DxvkFSR::enableDebugCheckerObject());
+
+    // Only the FSR 3.1 upscaler reads these. A version without them ignores them.
+    ImGui::TextSeparator("FSR 3.1 Tuning");
+
+    RemixGui::DragFloat("Velocity Factor", &DxvkFSR::velocityFactorObject(), 0.01f, 0.0f, 1.0f, "%.2f", sliderFlags);
+    RemixGui::DragFloat("Reactiveness Scale", &DxvkFSR::reactivenessScaleObject(), 0.01f, 0.0f, 8.0f, "%.2f", sliderFlags);
+    RemixGui::DragFloat("Shading Change Scale", &DxvkFSR::shadingChangeScaleObject(), 0.01f, 0.0f, 8.0f, "%.2f", sliderFlags);
+    RemixGui::DragFloat("Accumulation Per Frame", &DxvkFSR::accumulationAddedPerFrameObject(), 0.001f, 0.0f, 1.0f, "%.3f", sliderFlags);
+    RemixGui::DragFloat("Min Disocclusion Accumulation", &DxvkFSR::minDisocclusionAccumulationObject(), 0.001f, -1.0f, 1.0f, "%.3f", sliderFlags);
+  }
+
+  // Shows the developer settings of AMD FSR Frame Generation.
+  static void showFsrFrameGenerationSettings(DxvkFSRFrameGen& frameGen) {
+    const std::string activeVersion = frameGen.activeVersion();
+
+    if (frameGen.hasFailed()) {
+      ImGui::TextWrapped("Status: Stopped after an error");
+    } else if (activeVersion.empty()) {
+      // The context is created by the first frame that brings depth and motion vectors.
+      ImGui::TextWrapped("Status: Waiting for a scene frame");
+    } else {
+      ImGui::TextWrapped("Status: %s", frameGen.isGenerating() ? "Generating" : "Paused");
+    }
+
+    ImGui::TextWrapped("Version In Use: %s", activeVersion.empty() ? "None" : activeVersion.c_str());
+
+    showFsrVersionCombo("Version", &DxvkFSRFrameGen::frameGenerationVersionObject(), frameGen.versionNames());
+    RemixGui::Checkbox("Allow Async Workloads", &DxvkFSRFrameGen::allowAsyncWorkloadsObject());
+    RemixGui::Checkbox("Debug Checker", &DxvkFSRFrameGen::enableDebugCheckerObject());
+    RemixGui::Checkbox("Debug Overlay", &DxvkFSRFrameGen::debugOverlayObject());
   }
 
   ImGUI::ImGUI(DxvkDevice* device)
@@ -1566,52 +1726,124 @@ namespace dxvk {
     
     if (enableDLFGGuard && DxvkDLFG::enable()) {
       ImGui::Indent();
-      ImGui::TextWrapped("When Frame Generation is active, V-Sync is automatically disabled.");
+      ImGui::TextWrapped("When DLSS Frame Generation is active, V-Sync is automatically disabled.");
       ImGui::Unindent();
 
       ImGui::EndDisabled();
     }
   }
 
-  void ImGUI::showDLFGOptions(const Rc<DxvkContext>& ctx) {
-    const bool supportsDLFG = ctx->getCommonObjects()->metaNGXContext().supportsDLFG() && !ctx->getCommonObjects()->metaDLFG().hasDLFGFailed();
-    const uint32_t maxInterpolatedFrames = ctx->getCommonObjects()->metaNGXContext().dlfgMaxInterpolatedFrames();
-    const bool supportsMultiFrame = maxInterpolatedFrames > 1;
+  void ImGUI::showFrameGenerationOptions(const Rc<DxvkContext>& ctx) {
+    auto common = ctx->getCommonObjects();
+    NGXContext& ngx = common->metaNGXContext();
+    DxvkFSRFrameGen& fsrFrameGen = common->metaFSRFrameGen();
 
-    if (!supportsDLFG) {
-      ImGui::BeginDisabled();
+    const bool dlfgSupported = ngx.supportsDLFG();
+    const bool fsrSupported = fsrFrameGen.isSupported();
+    const bool advancedUi = RtxOptions::showUI() == UIType::Advanced;
+
+    // DLSS Frame Generation presents when both options are set, which is the order DxvkContext::isFSRFGEnabled uses.
+    FrameGenBackend backend = FrameGenBackend::Off;
+
+    if (dlfgSupported && DxvkDLFG::enable()) {
+      backend = FrameGenBackend::DLSS;
+    } else if (fsrSupported && DxvkFSRFrameGen::enable()) {
+      backend = FrameGenBackend::FSR;
     }
 
-    const bool dlfgChanged = RemixGui::Checkbox("Enable DLSS Frame Generation", &DxvkDLFG::enableObject());
-    if (supportsMultiFrame) {
-      dlfgMfgModeCombo.getKey(&DxvkDLFG::maxInterpolatedFramesObject());
-    }
+    const FrameGenBackend previousBackend = backend;
 
-    const auto& reason = ctx->getCommonObjects()->metaNGXContext().getDLFGNotSupportedReason();
-    if (reason.size()) {
-      RemixGui::SetTooltipToLastWidgetOnHover(reason.c_str());
-      ImGui::TextWrapped(reason.c_str());
-    }
+    {
+      // The row stands for the option of the backend it shows, so its reset button switches that backend off.
+      RtxOption<bool>* rowOption = backend == FrameGenBackend::FSR || !dlfgSupported
+        ? &DxvkFSRFrameGen::enableObject()
+        : &DxvkDLFG::enableObject();
 
-    if (!supportsDLFG) {
+      RemixGui::RtxOptionUxWrapper wrapper(rowOption);
+
+      RemixGui::ComboWithKey<FrameGenBackend>& combo = dlfgSupported
+        ? (fsrSupported ? frameGenBackendCombo : frameGenBackendDLSSCombo)
+        : (fsrSupported ? frameGenBackendFSRCombo : frameGenBackendOffCombo);
+
+      // The combo gets what the label column leaves of the row, and the usual even split clips the longest backend name.
+      // The label column gives up just enough for that name to fit.
+      const char* longestName = fsrSupported ? kFsrFrameGenerationName : kDlssFrameGenerationName;
+      const ImGuiStyle& style = ImGui::GetStyle();
+      const ImGuiWindow* window = ImGui::GetCurrentWindow();
+      const float rowWidth = window->WorkRect.Max.x - window->DC.CursorPos.x;
+      const float comboWidth = ImGui::CalcTextSize(longestName).x + ImGui::GetFrameHeight() + style.FramePadding.x * 3.0f;
+      const float evenSplit = ImFloor(ImGui::GetContentRegionAvail().x * 0.5f);
+      const float labelWidth = std::min(evenSplit, rowWidth - comboWidth - style.ItemInnerSpacing.x - style.FramePadding.x * 2.0f);
+
+      RemixGui::PushLabelColumnFixedWidth(labelWidth);
+      ImGui::BeginDisabled(!dlfgSupported && !fsrSupported);
+      combo.getKey(&backend);
       ImGui::EndDisabled();
+      RemixGui::PopLabelColumnFixedWidth();
     }
 
-    // Keep FG preset recovery available after a feature failure.
-    if (RtxOptions::showUI() == UIType::Advanced && ctx->getCommonObjects()->metaNGXContext().supportsDLFG()) {
-      dlfgPresetCombo.getKey(&DxvkDLFG::litePresetObject());
-    }
+    if (backend != previousBackend) {
+      const bool enableDlfg = backend == FrameGenBackend::DLSS;
+      const bool enableFsr = backend == FrameGenBackend::FSR;
 
-    // Need to change Reflex in sync with DLFG, not on the next frame.
-    if (dlfgChanged) {
-      if (!supportsDLFG) {
-        DxvkDLFG::enable.setDeferred(false);
-      } else if (!DxvkDLFG::enable()){
+      if (DxvkDLFG::enable() != enableDlfg) {
+        RemixGui::CheckRtxOptionPopups(&DxvkDLFG::enableObject());
+        DxvkDLFG::enable.setDeferred(enableDlfg);
+      }
+
+      if (DxvkFSRFrameGen::enable() != enableFsr) {
+        RemixGui::CheckRtxOptionPopups(&DxvkFSRFrameGen::enableObject());
+        DxvkFSRFrameGen::enable.setDeferred(enableFsr);
+      }
+
+      // Need to change Reflex in sync with frame generation, not on the next frame.
+      if (enableDlfg) {
         // DLFG was just enabled.  force Reflex to Low Latency.
+        RtxOptions::reflexMode.setDeferred(ReflexMode::LowLatency);
+      } else if (enableFsr && common->metaReflex().reflexInitialized() && RtxOptions::reflexMode() == ReflexMode::None) {
+        // AMD FSR Frame Generation does not need Reflex, but Reflex takes back some of the latency it adds.
+        // A mode the user picked is left alone.
         RtxOptions::reflexMode.setDeferred(ReflexMode::LowLatency);
       }
     }
 
+    if (backend == FrameGenBackend::DLSS) {
+      if (ngx.dlfgMaxInterpolatedFrames() > 1) {
+        dlfgMfgModeCombo.getKey(&DxvkDLFG::maxInterpolatedFramesObject());
+      }
+
+      // Keep FG preset recovery available after a feature failure.
+      if (advancedUi) {
+        dlfgPresetCombo.getKey(&DxvkDLFG::litePresetObject());
+      }
+
+      if (common->metaDLFG().hasDLFGFailed()) {
+        ImGui::TextWrapped(advancedUi
+          ? "DLSS Frame Generation stopped after an error. Changing its preset restarts it."
+          : "DLSS Frame Generation stopped after an error.");
+      }
+    } else if (backend == FrameGenBackend::FSR) {
+      if (fsrFrameGen.hasFailed()) {
+        ImGui::TextWrapped("AMD FSR Frame Generation stopped after an error. Switch it off and on again to retry.");
+      }
+
+      if (advancedUi && RemixGui::CollapsingHeader("AMD FSR Frame Generation", collapsingHeaderClosedFlags)) {
+        ImGui::Indent();
+        showFsrFrameGenerationSettings(fsrFrameGen);
+        ImGui::Unindent();
+      }
+    }
+
+    // Say why a backend is missing from the list when there is something the user can do about it.
+    const std::string& dlfgReason = ngx.getDLFGNotSupportedReason();
+
+    if (!dlfgSupported && !dlfgReason.empty()) {
+      ImGui::TextWrapped("%s", dlfgReason.c_str());
+    }
+
+    if (!fsrSupported && DxvkFSRFrameGen::hasRuntimeFiles()) {
+      ImGui::TextWrapped("AMD FSR Frame Generation is unavailable. %s", fsrFrameGen.unsupportedReason());
+    }
   }
 
   void ImGUI::showReflexOptions(const Rc<DxvkContext>& ctx, bool displayStatsWindowToggle) {
@@ -2015,13 +2247,14 @@ namespace dxvk {
 
     if (RemixGui::CollapsingHeader("General", collapsingHeaderFlags)) {
       auto& dlss = common->metaDLSS();
+      auto& fsr = common->metaFSR();
       ImGui::Indent();
 
       common->metaNgxPassthrough().showImguiSettings();
 
       RemixGui::Separator();
 
-      showDLFGOptions(ctx);
+      showFrameGenerationOptions(ctx);
 
       RemixGui::Separator();
 
@@ -2029,7 +2262,7 @@ namespace dxvk {
 
       RemixGui::Separator();
 
-      getUpscalerCombo(dlss).getKey(&RtxOptions::upscalerTypeObject());
+      getUpscalerCombo(dlss, fsr).getKey(&RtxOptions::upscalerTypeObject());
 
       RtxOptions::updatePresetFromUpscaler();
 
@@ -2060,6 +2293,16 @@ namespace dxvk {
         ImGui::TextWrapped(str::format("Render Resolution: ", inputWidth, "x", inputHeight).c_str());
       } else if (RtxOptions::upscalerType() == UpscalerType::TAAU) {
         RemixGui::SliderFloat("Resolution scale", &RtxOptions::resolutionScaleObject(), 0.5f, 1.0f);
+      } else if (RtxOptions::upscalerType() == UpscalerType::FSR) {
+        fsrPresetCombo.getKey(&DxvkFSR::presetObject());
+        RemixGui::SliderFloat("Sharpness", &DxvkFSR::sharpnessObject(), 0.0f, 1.0f, "%.2f");
+        common->metaNgxPassthrough().showImguiStatusLine();
+
+        if (RemixGui::CollapsingHeader("AMD FSR Upscaling", collapsingHeaderClosedFlags)) {
+          ImGui::Indent();
+          showFsrUpscalerSettings(fsr);
+          ImGui::Unindent();
+        }
       }
 
       auto& dlssNeuralRendering = common->metaDlssNeuralRendering();

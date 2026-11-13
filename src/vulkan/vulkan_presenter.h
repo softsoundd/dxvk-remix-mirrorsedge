@@ -285,6 +285,18 @@ namespace dxvk::vk {
     }
     // NV-DXVK end
 
+    // NV-DXVK start: AMD FSR frame generation
+    /**
+     * \brief Layout an image has to be in when it is presented
+     *
+     * A presenter that hands out images of its own instead of
+     * the swap chain's can need a layout other than the default.
+     */
+    virtual VkImageLayout presentLayout() const {
+      return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    }
+    // NV-DXVK end
+
   // NV-DXVK start: DLFG integration
     virtual void synchronize() { }
 

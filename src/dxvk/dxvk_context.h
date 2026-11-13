@@ -69,6 +69,22 @@ namespace dxvk {
      */
     uint32_t dlfgMaxSupportedInterpolatedFrameCount() const;
     // NV-DXVK end
+
+    // NV-DXVK start: AMD FSR frame generation
+    /**
+     * \brief Returns true if AMD FSR Frame Generation presents the frames
+     *
+     * This requires the setting, a device that supports it, and DLFG being off.
+     */
+    bool isFSRFGEnabled() const;
+
+    /**
+     * \brief Returns the number of frames generated for each rendered frame
+     *
+     * Returns 0 if neither DLFG nor AMD FSR Frame Generation is enabled
+     */
+    uint32_t frameGenInterpolatedFrameCount() const;
+    // NV-DXVK end
     
     /**
      * \brief Begins command buffer recording

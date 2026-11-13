@@ -55,7 +55,8 @@ namespace dxvk {
     DLSS,
     NIS,
     TAAU,
-    XeSS
+    XeSS,
+    FSR
   };
 
   enum class DlssPreset : int {
@@ -192,7 +193,8 @@ namespace dxvk {
                "The near plane value to use for the Camera when the near plane override is enabled.\n"
                "Only takes effect when rtx.enableNearPlaneOverride is enabled, see that option for more information about why this is useful.");
 
-    RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.",
+    RTX_OPTION_ARGS("rtx", UpscalerType, upscalerType, UpscalerType::DLSS, "Upscaling boosts performance with varying degrees of image quality tradeoff depending on the type of upscaler and the quality mode/preset.\n"
+                    "0: None, 1: DLSS, 2: NIS, 3: TAA-U, 4: XeSS, 5: AMD FSR.",
                     args.environment = "DXVK_UPSCALER_TYPE",
                     args.flags = RtxOptionFlags::UserSetting);
 
@@ -425,6 +427,7 @@ namespace dxvk {
     static bool isNISEnabled() { return upscalerType() == UpscalerType::NIS; }
     static bool isTAAEnabled() { return upscalerType() == UpscalerType::TAAU; }
     static bool isXeSSEnabled() { return upscalerType() == UpscalerType::XeSS; }
+    static bool isFSREnabled() { return upscalerType() == UpscalerType::FSR; }
     
     static float getUniqueObjectDistanceSqr() { return uniqueObjectDistance() * uniqueObjectDistance(); }
 

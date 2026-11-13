@@ -45,6 +45,10 @@ namespace dxvk {
 
   class D3D9Surface;
 
+  // NV-DXVK start: AMD FSR frame generation
+  class DxvkFSRFGPresenter;
+  // NV-DXVK end
+
   using D3D9SwapChainExBase = D3D9DeviceChild<IDirect3DSwapChain9Ex>;
   class D3D9SwapChainEx : public D3D9SwapChainExBase {
     static constexpr uint32_t NumControlPoints = 256;
@@ -168,6 +172,13 @@ namespace dxvk {
 
     // NV-DXVK begin: DLFG integration
     Rc <DxvkDLFGPresenter>    m_dlfgPresenter;
+    // NV-DXVK end
+
+    // NV-DXVK start: AMD FSR frame generation
+    // At most one of the three presenters exists at a time.
+    Rc<DxvkFSRFGPresenter>    m_fsrfgPresenter;
+    // Set while the blitter applies the gamma ramp, which makes the presented colours differ from the back buffer's.
+    bool                      m_gammaRampApplied = false;
     // NV-DXVK end
 
     Rc<hud::Hud>              m_hud;

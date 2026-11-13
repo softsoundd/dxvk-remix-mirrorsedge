@@ -4,7 +4,7 @@ This file provides context for AI coding agents working in this repository.
 
 ## Project Overview
 
-dxvk-remix is a fork of DXVK. On this branch (`mirrors-edge-ngx`) the runtime is an NGX passthrough: it presents the game's own rasterised frame and runs DLSS, DLSS Frame Generation, Reflex and Remix post effects on top of it. There is no path tracer.
+dxvk-remix is a fork of DXVK. On this branch (`mirrors-edge-ngx`) the runtime is an NGX passthrough: it presents the game's own rasterised frame and runs DLSS, DLSS Frame Generation, AMD FSR Upscaling and Frame Generation, Reflex and Remix post effects on top of it. There is no path tracer.
 
 The top-level runtime is built from the repo root and does **not** support x86 builds. Support for 32-bit games lives in `bridge/`, which contains the 32-bit bridge client plus the 64-bit bridge server/runtime handoff.
 

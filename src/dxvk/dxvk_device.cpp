@@ -24,6 +24,10 @@
 #include "rtx_render/rtx_context.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_xess.h"
+// NV-DXVK start: AMD FSR
+#include "rtx_render/rtx_fsr.h"
+#include "rtx_render/rtx_fsr_framegen.h"
+// NV-DXVK end
 
 namespace dxvk {
 
@@ -61,6 +65,14 @@ namespace dxvk {
 
     if (adapterQueueInfos.present.has_value()) {
       m_queues.present = getQueue(adapterQueueInfos.present->queueFamilyIndex, adapterQueueInfos.present->queueIndex);
+    }
+
+    if (adapterQueueInfos.fsrPresent.has_value()) {
+      m_queues.fsrPresent = getQueue(adapterQueueInfos.fsrPresent->queueFamilyIndex, adapterQueueInfos.fsrPresent->queueIndex);
+    }
+
+    if (adapterQueueInfos.imageAcquire.has_value()) {
+      m_queues.imageAcquire = getQueue(adapterQueueInfos.imageAcquire->queueFamilyIndex, adapterQueueInfos.imageAcquire->queueIndex);
     }
 
     if (__DLFG_QUEUE_INFO_CHECK(adapterQueueInfos)) {
@@ -459,7 +471,7 @@ namespace dxvk {
     
     // NV-DXVK start: DLFG integration
     // idle DLFG so we can call vkDeviceWaitIdle safely
-    synchronizePresenter();
+    synchronizePresenterLocked();
     // NV-DXVK end
 
     if (m_vkd->vkDeviceWaitIdle(m_vkd->device()) != VK_SUCCESS)
@@ -519,6 +531,10 @@ namespace dxvk {
     m_nis(device),
     m_taa(device),
     m_xess(device),
+    // NV-DXVK start: AMD FSR
+    m_fsr(device),
+    m_fsrFrameGen(device),
+    // NV-DXVK end
     m_gpuCrash(device),
     m_autoExposure(device),
     m_bloom(device),
@@ -534,6 +550,10 @@ namespace dxvk {
     m_dlss.get().onDestroy();
     m_dlfg.get().onDestroy();
     m_ngxPassthrough.get().onDestroy();
+    // NV-DXVK start: AMD FSR
+    m_fsrFrameGen.get().onDestroy();
+    m_fsr.get().onDestroy();
+    // NV-DXVK end
     // NV-DXVK start: Shut down NGX after releasing its features
     m_device->waitForIdle();
     m_ngxContext.get().shutdown();

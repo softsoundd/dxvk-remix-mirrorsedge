@@ -32,6 +32,8 @@
 #include "rtx_asset_exporter.h"
 #include "rtx_options.h"
 #include "rtx_xess.h"
+#include "rtx_fsr.h"
+#include "rtx_fsr_framegen.h"
 #include "rtx_ngx_passthrough.h"
 #include "rtx_scene_manager.h"
 
@@ -287,6 +289,16 @@ namespace dxvk {
 
     if (DxvkDLFG::enable() && !common->metaDLFG().supportsDLFG()) {
       DxvkDLFG::enable.setDeferred(false);
+    }
+
+    if (RtxOptions::isFSREnabled() && !common->metaFSR().isAvailable()) {
+      // DLSS is the upscaler the option defaults to, so it takes over where the GPU supports it.
+      const UpscalerType fallback = common->metaDLSS().supportsDLSS() ? UpscalerType::DLSS : UpscalerType::TAAU;
+      RtxOptions::upscalerType.setDeferred(fallback);
+    }
+
+    if (DxvkFSRFrameGen::enable() && !common->metaFSRFrameGen().isSupported()) {
+      DxvkFSRFrameGen::enable.setDeferred(false);
     }
     
 #ifdef REMIX_DEVELOPMENT

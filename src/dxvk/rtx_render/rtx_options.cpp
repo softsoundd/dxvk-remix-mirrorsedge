@@ -105,7 +105,7 @@ namespace dxvk {
         reflexMode.setImmediately(ReflexMode::None);
         break;
       case DlssPreset::On:
-        // NGX passthrough selects the upscaler via rtx.upscalerType (NIS/TAA-U/XeSS/DLSS).
+        // NGX passthrough selects the upscaler via rtx.upscalerType (NIS/TAA-U/XeSS/AMD FSR/DLSS).
         // The bundled DLSS preset must not stomp a user-configured non-DLSS upscaler at launch.
         if (RtxOptions::upscalerType() != UpscalerType::DLSS) {
           dlssPreset.setImmediately(DlssPreset::Custom);

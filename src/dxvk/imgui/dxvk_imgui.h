@@ -231,7 +231,8 @@ namespace dxvk {
     void showRenderingSettings(const Rc<DxvkContext>& ctx);
     void showGpuOverrides(const Rc<DxvkContext>& ctx);
 
-    void showDLFGOptions(const Rc<DxvkContext>& ctx);
+    // Shows the selector for DLSS Frame Generation and AMD FSR Frame Generation, and the settings of the selected one.
+    void showFrameGenerationOptions(const Rc<DxvkContext>& ctx);
     void showReflexOptions(const Rc<DxvkContext>& ctx, bool displayStatsWindowToggle);
     void showReflexLatencyStats();
 

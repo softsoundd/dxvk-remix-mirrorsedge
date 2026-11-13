@@ -679,9 +679,8 @@ namespace dxvk {
     const uint32_t tileCountX = (imageExtent.width + tileSize - 1) / tileSize;
     const uint32_t tileCountY = (imageExtent.height + tileSize - 1) / tileSize;
 
-    const float dlfgDeduction = ctx->isDLFGEnabled()
-      ? 1.0f / static_cast<float>(ctx->dlfgInterpolatedFrameCount() + 1)
-      : 1.0f;
+    // Either frame generation backend shortens the time each frame stays on screen.
+    const float dlfgDeduction = 1.0f / static_cast<float>(ctx->frameGenInterpolatedFrameCount() + 1);
 
     const float invWidth = 1.0f / static_cast<float>(imageExtent.width);
     const float invHeight = 1.0f / static_cast<float>(imageExtent.height);
@@ -818,8 +817,8 @@ namespace dxvk {
     postFxArgs.motionBlurMinimumVelocityThresholdInPixel = motionBlurMinimumVelocityThresholdInPixel();
     postFxArgs.motionBlurDynamicDeduction = motionBlurDynamicDeduction();
     postFxArgs.jitterStrength = motionBlurJitterStrength();
-    postFxArgs.motionBlurDlfgDeduction = ctx->isDLFGEnabled() ?
-      1.0f / static_cast<float>(ctx->dlfgInterpolatedFrameCount() + 1) : 1.0f;
+    // Either frame generation backend shortens the time each frame stays on screen.
+    postFxArgs.motionBlurDlfgDeduction = 1.0f / static_cast<float>(ctx->frameGenInterpolatedFrameCount() + 1);
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 

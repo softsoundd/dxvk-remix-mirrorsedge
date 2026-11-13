@@ -100,6 +100,11 @@ namespace dxvk {
     DxvkAdapterQueueInfo transfer{};
     std::optional<DxvkAdapterQueueInfo> asyncCompute{};
     std::optional<DxvkAdapterQueueInfo> present{};
+
+    // AMD FSR frame generation is the only thing that submits to these queues.
+    // Each one exists only where a queue family has a queue that no role above uses.
+    std::optional<DxvkAdapterQueueInfo> fsrPresent{};
+    std::optional<DxvkAdapterQueueInfo> imageAcquire{};
   };
   // NV-DXVK end
   

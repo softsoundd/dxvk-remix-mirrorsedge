@@ -63,6 +63,10 @@ namespace dxvk {
   class DxvkPostFx;
   class ImGUI;
   class DxvkXeSS;
+  // NV-DXVK start: AMD FSR
+  class DxvkFSR;
+  class DxvkFSRFrameGen;
+  // NV-DXVK end
 
   class NGXContext;
 
@@ -147,6 +151,16 @@ namespace dxvk {
     DxvkXeSS& metaXeSS() {
       return m_xess.get();
     }
+
+    // NV-DXVK start: AMD FSR
+    DxvkFSR& metaFSR() {
+      return m_fsr.get();
+    }
+
+    DxvkFSRFrameGen& metaFSRFrameGen() {
+      return m_fsrFrameGen.get();
+    }
+    // NV-DXVK end
 
     GpuCrashPass& metaGpuCrash() {
       return m_gpuCrash.get();
@@ -237,6 +251,10 @@ namespace dxvk {
     Active<DxvkNIS>                         m_nis;
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
+    // NV-DXVK start: AMD FSR
+    Active<DxvkFSR>                         m_fsr;
+    Active<DxvkFSRFrameGen>                 m_fsrFrameGen;
+    // NV-DXVK end
     Active<GpuCrashPass>                    m_gpuCrash;
     Active<DxvkAutoExposure>                m_autoExposure;
     Active<DxvkBloom>                       m_bloom;

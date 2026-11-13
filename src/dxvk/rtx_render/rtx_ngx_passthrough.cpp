@@ -35,6 +35,8 @@
 #ifndef _M_ARM64
 #include "rtx_xess.h"
 #endif
+#include "rtx_fsr.h"
+#include "rtx_fsr_framegen.h"
 #include "rtx_postFx.h"
 #include "rtx_auto_exposure.h"
 #include "rtx_bloom.h"
@@ -44,6 +46,7 @@
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/ngx_passthrough/ngx_passthrough_args.h"
 #include "rtx/pass/post_fx/post_fx.h"
+#include "../util/util_global_time.h"
 
 #include <rtx_shaders/ngx_passthrough_mv.h>
 #include <rtx_shaders/ngx_passthrough_alpha_merge.h>
@@ -1177,6 +1180,8 @@ namespace dxvk {
     case UpscalerType::XeSS:
       return DxvkXeSS::calcScreenPercentageForPreset(DxvkXeSS::XessOptions::preset());
 #endif
+    case UpscalerType::FSR:
+      return DxvkFSR::calcScreenPercentageForPreset(DxvkFSR::preset());
     default:
       return 100.0f;
     }
@@ -1188,6 +1193,7 @@ namespace dxvk {
     case UpscalerType::NIS:  return "NIS";
     case UpscalerType::TAAU: return "TAA-U";
     case UpscalerType::XeSS: return "XeSS";
+    case UpscalerType::FSR:  return "AMD FSR";
     default:                 return "None";
     }
   }
@@ -1205,6 +1211,8 @@ namespace dxvk {
     case UpscalerType::TAAU:
     case UpscalerType::XeSS:
       return true;
+    case UpscalerType::FSR:
+      return device != nullptr && device->getCommon()->metaFSR().isAvailable();
     default:
       return false;
     }
@@ -2152,6 +2160,92 @@ namespace dxvk {
   }
 #endif
 
+  bool RtxNgxPassthrough::evaluateFsr(RtxContext* ctx,
+                                      DxvkBarrierSet& barriers,
+                                      const Rc<DxvkImage>& colorSourceImage,
+                                      const VkOffset2D& colorSourceOffset,
+                                      const Rc<DxvkImage>& targetImage,
+                                      const VkOffset2D& targetOffset,
+                                      bool preserveTargetAlpha,
+                                      const float jitter[2],
+                                      bool resetHistory) {
+    DxvkFSR& fsr = m_device->getCommon()->metaFSR();
+
+    if (!fsr.isAvailable()) {
+      m_statusReason = "AMD FSR runtime not found";
+      ONCE(Logger::warn("[RTX NGX Passthrough] AMD FSR is selected, but its runtime could not be loaded from the Remix runtime folder."));
+      return false;
+    }
+
+    snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
+
+    // FSR takes linear colour.
+    // Float scene colour ahead of the game's post chain is linear already, and so is the input of a composite the merge pass applies afterwards.
+    // The late uber composite is display-encoded with a curve the merge pass knows.
+    // Any other 8-bit colour is display-encoded with a curve nothing reports, which is taken to be gamma 2.2.
+    const bool floatSource = isHdrColorFormat(colorSourceImage->info().format);
+    const bool engineEncoded = m_outputTransform.linearizeInput && m_outputTransform.enabled;
+    const bool assumedEncoded = !engineEncoded && !floatSource && !m_outputTransform.enabled;
+
+    if (assumedEncoded) {
+      m_outputTransform = NgxOutputTransform();
+      m_outputTransform.inverseGamma = 1.0f / 2.2f;
+      m_outputTransform.enabled = true;
+      m_outputTransform.linearizeInput = true;
+    }
+
+    if (engineEncoded || assumedEncoded) {
+      linearizeLateColorInput(ctx, barriers);
+      ONCE(Logger::info(str::format(
+        "[RTX NGX Passthrough] Display-encoded input is linearized before AMD FSR (inverse gamma ",
+        m_outputTransform.inverseGamma, ") and re-encoded afterwards.")));
+    }
+
+    // Colour that was display-encoded stays within 0 to 1 once it is linear.
+    const bool colorIsHdr = floatSource && !engineEncoded;
+
+    if (m_dlssLastContentHDR != int(colorIsHdr)) {
+      m_dlssLastContentHDR = int(colorIsHdr);
+      m_statContentHdrFlips++;
+    }
+
+    const RtCamera& camera = ctx->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+    const Matrix4d& projection = camera.getViewToProjection();
+
+    DxvkFSR::DispatchInputs inputs;
+    inputs.pColor = &m_colorInput;
+    inputs.pDepth = &m_depthQueue.get();
+    inputs.pMotionVectors = &m_motionVectorQueue.get();
+    inputs.pOutput = &m_dlssOutput;
+    inputs.renderExtent = m_renderExtent;
+    inputs.displayExtent = m_displayExtent;
+    inputs.jitter[0] = jitter[0];
+    inputs.jitter[1] = jitter[1];
+    inputs.colorIsHdr = colorIsHdr;
+    // The depth keeps the game's convention, and the planes are read from the projection that produced it.
+    inputs.depthParameters = fsr::depthParametersFromProjection(
+      float(projection[2][2]), float(projection[3][2]), float(projection[2][3]),
+      m_sceneDepthLayout.reversed, camera.calculateNearFarPlanes().first);
+    inputs.verticalFov = camera.getFov();
+    inputs.frameTimeMs = GlobalTime::get().realDeltaTimeMs();
+    inputs.resetHistory = resetHistory;
+
+    bool success;
+
+    {
+      ScopedGpuProfileZone(ctx, "AMD FSR (NGX Passthrough)");
+      success = fsr.dispatch(ctx, barriers, inputs);
+    }
+
+    if (!success) {
+      m_statusReason = "AMD FSR upscaling failed";
+      ONCE(Logger::err("[RTX NGX Passthrough] AMD FSR upscaling failed; presenting the game's unmodified output."));
+      return false;
+    }
+
+    return applyPostFxAndWriteback(ctx, barriers, targetImage, targetOffset, preserveTargetAlpha, resetHistory);
+  }
+
   void RtxNgxPassthrough::dispatch(RtxContext* ctx,
                                    DxvkContextState& dxvkCtxState,
                                    DxvkBarrierSet& barriers,
@@ -2184,15 +2278,25 @@ namespace dxvk {
       m_nrConfiguredExtent = { 0, 0 };
     }
 
-    const bool dlfgSupported = m_device->getCommon()->metaNGXContext().supportsDLFG();
+    // The FSR contexts hold several display-sized images each, so they are released while another upscaler is selected.
+    if (!RtxOptions::isFSREnabled()) {
+      m_device->getCommon()->metaFSR().releaseContexts();
+    }
 
-    // Advance the DLFG input queues once per frame so the present thread can still read the
+    const bool frameGenSupported = m_device->getCommon()->metaNGXContext().supportsDLFG() ||
+                                   m_device->getCommon()->metaFSRFrameGen().isSupported();
+
+    // Advance the frame generation input queues once per frame so the present thread can still read the
     // previous frames' depth/motion vectors while this frame writes new ones
-    if (dlfgSupported) {
+    if (frameGenSupported) {
       m_depthQueue.next();
       m_motionVectorQueue.next();
       m_hudlessQueue.next();
     }
+
+    m_sceneTransformOffsetSum[0] += double(m_sceneTransformOffset.x);
+    m_sceneTransformOffsetSum[1] += double(m_sceneTransformOffset.y);
+    m_sceneTransformOffsetSum[2] += double(m_sceneTransformOffset.z);
 
     const VkExtent2D targetExtent = { targetImage->info().extent.width, targetImage->info().extent.height };
     const bool subrectValid = sourceSubrect.extent.width > 0 && sourceSubrect.extent.height > 0;
@@ -2274,7 +2378,8 @@ namespace dxvk {
 #else
     const bool canRunXess = false;
 #endif
-    const bool canRunUpscaler = canRunNis || canRunTaau || canRunDlss || canRunXess;
+    const bool canRunFsr = RtxOptions::isFSREnabled() && haveDepthMvInputs;
+    const bool canRunUpscaler = canRunNis || canRunTaau || canRunDlss || canRunXess || canRunFsr;
 
     // The MV pass rendered an interpretable view of the synthesized inputs into the output image
     // (motion vectors centered at neutral gray, log-scale depth). Held back for the present-time
@@ -2364,6 +2469,15 @@ namespace dxvk {
         m_statEvaluateFailedCount++;
       }
 #endif
+    } else if (canRunFsr) {
+      upscalerActive = evaluateFsr(ctx, barriers, colorSourceImage, colorOffset, targetImage,
+                                   writebackOffset, preserveTargetAlpha, jitter, resetHistory);
+      wroteOutputToTarget = upscalerActive;
+      if (upscalerActive) {
+        m_statusReason = "active (AMD FSR)";
+      } else {
+        m_statEvaluateFailedCount++;
+      }
     } else if (canRunDlss) {
       upscalerActive = evaluateDlss(ctx, barriers, colorSourceImage, colorOffset, targetImage,
                                     writebackOffset, preserveTargetAlpha, jitter, resetHistory);
@@ -2467,12 +2581,21 @@ namespace dxvk {
       applyNeuralRendering(ctx, barriers, targetImage);
     }
 
-    // Frame generation: hand this frame's camera + depth/motion vectors to the DLFG
-    // presenter. The synthesized pair carries true object motion (foreground included),
+    // Hands this frame's camera, depth and motion vectors to the presenter of whichever frame generation backend is enabled.
+    // The synthesized pair carries true object motion, foreground included,
     // so the interpolator moves dynamic objects and first person meshes geometrically.
-    if (haveDepthMvInputs && ctx->isDLFGEnabled()) {
-      // Force vsync off if DLFG is enabled, as FG + vsync is not properly supported
-      if (RtxOptions::enableVsyncState != EnableVsync::Off) {
+    const bool dlfgEnabled = ctx->isDLFGEnabled();
+    const bool fsrFrameGenEnabled = ctx->isFSRFGEnabled();
+
+    if (fsrFrameGenEnabled) {
+      // The FSR presenter runs on the submission thread, and reads its options from this snapshot.
+      m_device->getCommon()->metaFSRFrameGen().updateSettings();
+    }
+
+    if (haveDepthMvInputs && (dlfgEnabled || fsrFrameGenEnabled)) {
+      // Force vsync off if DLFG is enabled, as FG + vsync is not properly supported.
+      // AMD FSR Frame Generation paces its frames with vsync on as well, so it leaves the setting alone.
+      if (dlfgEnabled && RtxOptions::enableVsyncState != EnableVsync::Off) {
         RtxOptions::enableVsync.setDeferred(EnableVsync::Off);
         RtxOptions::enableVsyncState = EnableVsync::Off;
       }
@@ -2480,18 +2603,28 @@ namespace dxvk {
       const Resources::Resource& depthInput = m_depthQueue.get();
       const Resources::Resource& motionVectorInput = m_motionVectorQueue.get();
 
-      DxvkFrameInterpolationInfo dlfgInfo = {
+      // DLFG is not told about history resets here, and FSR is told about every one.
+      // FSR generates one frame for each rendered one.
+      DxvkFrameInterpolationInfo frameGenInfo = {
         m_device->getCurrentFrameId(),
         camera,
         motionVectorInput.view,
         motionVectorInput.image->info().layout,
         depthInput.view,
         depthInput.image->info().layout,
-        false,
-        m_device->getCommon()->metaDLFG().getInterpolatedFrameCount(),
+        dlfgEnabled ? false : resetHistory,
+        dlfgEnabled ? m_device->getCommon()->metaDLFG().getInterpolatedFrameCount() : 1u,
         nullptr,
         VK_IMAGE_LAYOUT_UNDEFINED,
       };
+
+      const Vector3 cameraPosition = camera.getPosition();
+
+      frameGenInfo.frameTimeMs = GlobalTime::get().realDeltaTimeMs();
+      frameGenInfo.depthReversed = m_sceneDepthLayout.reversed;
+      frameGenInfo.cameraPosition = Vector3(float(double(cameraPosition.x) - m_sceneTransformOffsetSum[0]),
+                                            float(double(cameraPosition.y) - m_sceneTransformOffsetSum[1]),
+                                            float(double(cameraPosition.z) - m_sceneTransformOffsetSum[2]));
 
       // The view is recorded here, before present reads it.
       // Pre-post injection fills that same slot later in the frame.
@@ -2503,12 +2636,12 @@ namespace dxvk {
 
         const Resources::Resource& hudlessSlot = m_hudlessQueue.get();
         if (hudlessSlot.view != nullptr) {
-          dlfgInfo.hudless = hudlessSlot.view;
-          dlfgInfo.hudlessLayout = hudlessSlot.image->info().layout;
+          frameGenInfo.hudless = hudlessSlot.view;
+          frameGenInfo.hudlessLayout = hudlessSlot.image->info().layout;
         }
       }
 
-      m_device->setupFrameInterpolation(dlfgInfo);
+      m_device->setupFrameInterpolation(frameGenInfo);
     }
   }
 

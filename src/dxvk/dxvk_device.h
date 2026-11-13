@@ -98,6 +98,14 @@ namespace dxvk {
     // NV-DXVK start: DLFG integration
     DxvkDeviceQueue present;  // we run DLFG + presents in this queue
     // NV-DXVK end
+
+    // NV-DXVK start: AMD FSR frame generation
+    // AMD FSR frame generation is the only thing that submits to these queues.
+    // A queue the device does not have keeps a null handle.
+    // fsrPresent is a second queue of the graphics family, and imageAcquire only ever waits on and signals semaphores.
+    DxvkDeviceQueue fsrPresent;
+    DxvkDeviceQueue imageAcquire;
+    // NV-DXVK end
   };
   
   /**
@@ -623,15 +631,27 @@ namespace dxvk {
 
     // NV-DXVK start: DLFG integration
     // release the current presenter stashed in the device
+    // A presenter can wait on queues that the submission thread also uses, so the device queue is held while it does.
     void synchronizePresenter() {
+      if (m_presenterInFlight != nullptr) {
+        m_submissionQueue.lockDeviceQueue();
+        synchronizePresenterLocked();
+        m_submissionQueue.unlockDeviceQueue();
+      }
+    }
+    // NV-DXVK end
+
+  private:
+
+    // NV-DXVK start: Frame generation presenter synchronization
+    // Synchronizes the presenter for a caller that already holds the device queue.
+    void synchronizePresenterLocked() {
       if (m_presenterInFlight != nullptr) {
         m_presenterInFlight->synchronize();
         m_presenterInFlight = nullptr;
       }
     }
     // NV-DXVK end
-
-  private:
     
     DxvkOptions                 m_options;
 

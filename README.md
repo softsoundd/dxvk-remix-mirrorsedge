@@ -12,7 +12,7 @@ dxvk-remix also contains a subproject in the `bridge` folder, which enables 32 b
 
 ## NGX passthrough branch (`mirrors-edge-ngx`)
 
-Mirror's Edge renders through its own raster pipeline on this branch (no path tracing). The runtime adds DLSS Super Resolution/DLAA, DLSS Frame Generation, DLSS 3D-Guided Neural Rendering (DLSS-NR), Reflex, and Remix post effects (motion blur, chromatic aberration, vignette) on top. NIS, TAA-U, and XeSS are available as alternative upscalers. Like the rest of this fork, NGX passthrough may work in other UE3 titles, but support is not guaranteed.
+Mirror's Edge renders through its own raster pipeline on this branch (no path tracing). The runtime adds DLSS Super Resolution/DLAA, DLSS Frame Generation, DLSS 3D-Guided Neural Rendering (DLSS-NR), Reflex, and Remix post effects (motion blur, chromatic aberration, vignette) on top. NIS, TAA-U, XeSS, and AMD FSR Upscaling are available as alternative upscalers, and AMD FSR Frame Generation as an alternative to DLSS Frame Generation. Like the rest of this fork, NGX passthrough may work in other UE3 titles, but support is not guaranteed.
 
 ### Setup
 
@@ -24,7 +24,7 @@ How it works:
 
 - The upscaler runs on the game's HDR scene colour before its post-processing, so bloom, tonemapping, and depth of field work on the anti-aliased image. If the runtime can't find a post-process pass, it upscales the finished frame before the UI is drawn.
 - The runtime rebuilds depth and motion vectors from the game's depth buffer and camera, and adds true motion for moving objects, including skinned and CPU-animated meshes. DLSS, Frame Generation, DLSS-NR, and motion blur all use them.
-- The upscaler's quality mode sets the game's render resolution through UE3's ScreenPercentage. Full Resolution with DLSS is DLAA.
+- The upscaler's quality mode sets the game's render resolution through UE3's ScreenPercentage. Full Resolution with DLSS is DLAA, and AMD FSR calls it Native AA.
 - Frame Generation gets a copy of each frame without the UI, which reduces HUD warping. DLSS-NR runs on the finished frame before the UI.
 
 Known issues:

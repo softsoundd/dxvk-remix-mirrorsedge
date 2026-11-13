@@ -422,7 +422,7 @@ namespace dxvk {
     };
 
     RTX_OPTION("rtx.ngxPassthrough", bool, enableJitter, true,
-               "Offsets the game's viewport by a sub-pixel amount each frame. Temporal upscalers (DLSS, TAA-U, XeSS) need this "
+               "Offsets the game's viewport by a sub-pixel amount each frame. Temporal upscalers (DLSS, TAA-U, XeSS, AMD FSR) need this "
                "to anti-alias; disable only for debugging.");
     RTX_OPTION("rtx.ngxPassthrough", bool, prePostProcess, true,
                "Runs the upscaler on the game's scene colour before its post-processing, so bloom, tonemapping and depth of field "
@@ -446,9 +446,9 @@ namespace dxvk {
                "Requires Frame Generation and rtx.ngxPassthrough.dlfgHudlessInput.");
     RTX_OPTION("rtx.ngxPassthrough", bool, driveGameScreenPercentage, true,
                "Lets the Remix upscaler quality preset choose the game's effective render resolution.\n"
-               "Full Resolution renders natively (DLAA for DLSS, 100% for NIS/TAA-U/XeSS); other tiers use the upscaler's\n"
-               "standard scaling factors. In-memory only (saved game settings unchanged); when disabled, follows live\n"
-               "game values. Requires locatable game readers.");
+               "Full Resolution renders natively (DLAA for DLSS, Native AA for AMD FSR, 100% for NIS/TAA-U/XeSS);\n"
+               "other tiers use the upscaler's standard scaling factors. In-memory only (saved game settings unchanged);\n"
+               "when disabled, follows live game values. Requires locatable game readers.");
     RTX_OPTION("rtx.ngxPassthrough", bool, disableGameMsaa, true,
                "Reports multisampling as unsupported to the game and creates every surface single-sampled, so no\n"
                "multisampled resource can exist. Required because multisampled depth cannot be resolved for NGX inputs.\n"
@@ -592,6 +592,17 @@ namespace dxvk {
                       bool preserveTargetAlpha,
                       bool resetHistory);
 #endif
+
+    // FSR takes linear colour, so display-encoded input is linearized first and encoded again by the merge pass.
+    bool evaluateFsr(RtxContext* ctx,
+                     DxvkBarrierSet& barriers,
+                     const Rc<DxvkImage>& colorSourceImage,
+                     const VkOffset2D& colorSourceOffset,
+                     const Rc<DxvkImage>& targetImage,
+                     const VkOffset2D& targetOffset,
+                     bool preserveTargetAlpha,
+                     const float jitter[2],
+                     bool resetHistory);
 
     void snapshotColorInput(RtxContext* ctx,
                             const Rc<DxvkImage>& colorSourceImage,
@@ -766,6 +777,9 @@ namespace dxvk {
     uint32_t m_lastVelocityDrawCount = 0;
     NgxVelocityCaptureStats m_lastCaptureStats;
     Vector3 m_sceneTransformOffset = Vector3(0.0f, 0.0f, 0.0f);
+    // Sums m_sceneTransformOffset over the dispatched frames.
+    // A position minus this sum is in a space that stays put, which AMD FSR Frame Generation wants the camera position in.
+    double m_sceneTransformOffsetSum[3] = { 0.0, 0.0, 0.0 };
     bool m_sceneCameraFresh = false;
     bool m_previousSceneCameraFresh = false;
     NgxSceneDepthLayout m_sceneDepthLayout;

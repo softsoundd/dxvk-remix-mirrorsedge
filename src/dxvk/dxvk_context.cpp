@@ -29,6 +29,9 @@
 #include "dxvk_objects.h"
 #include "rtx_render/rtx_gpu_pass_timer.h"
 // NV-DXVK end
+// NV-DXVK start: AMD FSR frame generation
+#include "rtx_render/rtx_fsr_framegen.h"
+// NV-DXVK end
 #include "../d3d9/d3d9_state.h"
 #include "../d3d9/d3d9_spec_constants.h"
 
@@ -71,6 +74,22 @@ namespace dxvk {
 
   uint32_t DxvkContext::dlfgMaxSupportedInterpolatedFrameCount() const {
     return m_common->metaNGXContext().supportsDLFG() ? m_common->metaNGXContext().dlfgMaxInterpolatedFrames() : 0;
+  }
+  // NV-DXVK end
+
+  // NV-DXVK start: AMD FSR frame generation
+  bool DxvkContext::isFSRFGEnabled() const {
+    // Only one of the two can own the swapchain, and DLSS Frame Generation comes first.
+    return !isDLFGEnabled() && m_common->metaFSRFrameGen().isActive();
+  }
+
+  uint32_t DxvkContext::frameGenInterpolatedFrameCount() const {
+    if (isDLFGEnabled()) {
+      return m_common->metaDLFG().getInterpolatedFrameCount();
+    }
+
+    // FSR generates one frame for every rendered one.
+    return isFSRFGEnabled() ? 1 : 0;
   }
   // NV-DXVK end
 

@@ -200,6 +200,7 @@ namespace dxvk {
       * log2(render / display) to match the upscaled output's texel density (the standard
       * DLSS integration bias). Scene-color draws during the pre-injection phase only; UI
       * and post passes sample unbiased. Called from D3D9DeviceEx::CreateSamplerKey.
+      * AMD FSR adds rtx.fsr.mipBiasOffset to that bias, at full resolution as well.
       */
     float GetNgxPassthroughSamplerLodBias() const;
 
@@ -1086,6 +1087,9 @@ namespace dxvk {
       bool ngxNeuralRendering = false;
       bool ngxObjectVelocities = false;
       int ngxDebugVisualization = 0;
+      // Holds rtx.fsr.mipBiasOffset while AMD FSR is the upscaler in use.
+      // Holds zero otherwise.
+      float ngxFsrMipBiasOffset = 0.0f;
 
       const fast_unordered_set* uiTextures = nullptr;
     };
