@@ -771,12 +771,14 @@ namespace dxvk {
     bool m_ngxFrameCameraMatricesValid = false;
 
     // Cache of the current vertex-shader camera constants so repeated draws skip re-extraction.
+    // outReverseZ reports whether the projection maps near to 1 and far to 0.
     bool tryGetUe3CameraFromConstantsCached(uint32_t viewProjReg,
                                             uint32_t viewOriginReg,
                                             Matrix4& outWorldToView,
                                             Matrix4& outViewToProjection,
                                             bool& outUsedTranspose,
                                             float& outReconstructionError,
+                                            bool& outReverseZ,
                                             XXH64_hash_t* outConstantsHash = nullptr);
 
     struct Ue3CameraConstantsCache {
@@ -788,6 +790,7 @@ namespace dxvk {
       // failure can never mask a would-be success.
       bool extractionFailed = false;
       bool usedTranspose = false;
+      bool reverseZ = false;
       Matrix4 worldToView;
       Matrix4 viewToProjection;
       float reconstructionError = 0.0f;
@@ -842,6 +845,8 @@ namespace dxvk {
     // RTX injection trigger at scene end.
     PrepareDrawFlags prepareDrawForNgxPassthrough(const DrawContext& drawContext);
     void tryNgxPassthroughCameraCapture(uint32_t primitiveCount);
+    // Records the viewport depth range of a scene depth write after the mid-scene clear.
+    void noteNgxForegroundDepthRange();
     void rememberNgxReducedSceneDraw(uint32_t primitiveCount, XXH64_hash_t vertexShaderHash);
     bool ngxFullSurfaceDrawReplaysReducedScene(uint32_t primitiveCount, XXH64_hash_t vertexShaderHash) const;
     void emitNgxPassthroughFrameData();
@@ -861,6 +866,9 @@ namespace dxvk {
     // engage from the first draw of a frame; dropped when unseen for a while.
     Rc<DxvkImage> m_ngxSceneColorImage;
     Rc<DxvkImage> m_ngxSceneDepthImage;
+    // Set when the draws writing the scene depth project near to 1 and far to 0.
+    // It persists across frames, because the game's executable decides it.
+    bool m_ngxSceneDepthReversed = false;
     // Holds a buffer's screen-percentage subrect while it is scaled onto the whole image.
     Rc<DxvkImage> m_ngxSubrectStretchCopy;
     uint32_t m_ngxSceneTargetsLastSeenFrame = 0;
@@ -874,6 +882,13 @@ namespace dxvk {
     // Qualifying mid-scene depth clears seen this frame (first = foreground DPG boundary,
     // second = occlusion query pass wiping the foreground depth)
     uint32_t m_ngxDepthClearsThisFrame = 0;
+
+    // These hold the viewport depth range of the scene depth writes since the last qualifying clear.
+    // The passthrough needs it to compare a reversed foreground buffer with the world depth,
+    // because the foreground DPG can render into a squashed range.
+    float m_ngxForegroundDepthMinZ = 0.0f;
+    float m_ngxForegroundDepthMaxZ = 1.0f;
+
     // The late upscale runs after the uber pass is queued, before the HUD.
     bool m_ngxDeferLateSubrectUpscale = false;
 

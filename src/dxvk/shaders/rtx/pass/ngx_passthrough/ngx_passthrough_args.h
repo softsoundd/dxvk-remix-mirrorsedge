@@ -30,6 +30,7 @@ struct NgxPassthroughArgs {
   // Maps unjittered current-frame NDC (x, y in [-1,1], z = hardware depth in [0,1], w = 1)
   // to previous-frame clip space:
   //   prevViewToProjection * prevWorldToView * viewToWorld * projectionToView
+  // The camera follows the scene depth's convention, so reversed depth needs no remapping here.
   mat4 reprojectToPrevClip;
 
   vec2 resolution;         // output resolution in pixels
@@ -74,9 +75,14 @@ struct NgxPassthroughArgs {
   // 1 undoes outputColorScaleAndGamma on colour that is already encoded.
   // The merge pass applies that curve again on the way out.
   uint linearizeInput;
-  uint linearizePad0;
-  uint linearizePad1;
-  uint linearizePad2;
+  // Set when the scene depth maps near to 1 and far to 0, so the nearer of two depths is the larger.
+  uint depthReversed;
+  // A reversed depth patch leaves a squashed viewport range at the far end of the buffer.
+  // Adding this to a written foreground depth gives the mirror image of the standard value.
+  // Holds 1 - minZ - maxZ of the foreground DPG's range when the foreground binding is the live buffer.
+  // Holds zero for standard depth, and when the foreground binding aliases the world snapshot.
+  float foregroundDepthMirrorOffset;
+  uint depthPad;
 };
 
 // Push constants for the object velocity raster pass: clip transforms composed from the
@@ -105,6 +111,9 @@ struct NgxVelocityRasterArgs {
   // Diagnostic (rtx.ngxPassthrough.objectVelocityDepthTolerance): widens the depth match so an
   // object whose velocity is being discarded can be bisected for how far off its depth actually is
   float depthToleranceScale;
-  uint pad0;
-  uint pad1;
+  // Set when the depth being matched maps near to 1 and far to 0.
+  uint depthReversed;
+  // Holds NgxPassthroughArgs::foregroundDepthMirrorOffset during the foreground pass, for the tolerance.
+  // Holds zero during the world pass.
+  float depthMirrorOffset;
 };

@@ -41,6 +41,9 @@ namespace dxvk {
     VkPhysicalDevice4444FormatsFeaturesEXT                    ext4444Formats;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT              extCustomBorderColor;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT                extDepthClipEnable;
+    // NV-DXVK start: depth bias representation control
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT               extDepthBiasControl;
+    // NV-DXVK end
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT           extExtendedDynamicState;
     VkPhysicalDeviceMemoryPriorityFeaturesEXT                 extMemoryPriority;
     VkPhysicalDeviceRobustness2FeaturesEXT                    extRobustness2;

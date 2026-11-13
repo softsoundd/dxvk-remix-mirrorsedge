@@ -129,6 +129,11 @@ namespace dxvk {
     /// Support D32
     bool supportD32;
 
+    // NV-DXVK start: optional D32F storage for D24 formats
+    /// Use D32f for D24
+    bool useD32forD24;
+    // NV-DXVK end
+
     /// SWVP Constant Limits
     int32_t swvpFloatCount;
     int32_t swvpIntCount;

@@ -307,6 +307,16 @@ namespace dxvk {
                 || !required.extCustomBorderColor.customBorderColorWithoutFormat)
         && (m_deviceFeatures.extDepthClipEnable.depthClipEnable
                 || !required.extDepthClipEnable.depthClipEnable)
+        // NV-DXVK start: depth bias representation control
+        && (m_deviceFeatures.extDepthBiasControl.depthBiasControl
+                || !required.extDepthBiasControl.depthBiasControl)
+        && (m_deviceFeatures.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation
+                || !required.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation)
+        && (m_deviceFeatures.extDepthBiasControl.floatRepresentation
+                || !required.extDepthBiasControl.floatRepresentation)
+        && (m_deviceFeatures.extDepthBiasControl.depthBiasExact
+                || !required.extDepthBiasControl.depthBiasExact)
+        // NV-DXVK end
         && (m_deviceFeatures.extExtendedDynamicState.extendedDynamicState
                 || !required.extExtendedDynamicState.extendedDynamicState)
         && (m_deviceFeatures.extMemoryPriority.memoryPriority
@@ -342,13 +352,18 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 36> devExtensionList = {{
+    // NV-DXVK start: depth bias representation control
+    std::array<DxvkExt*, 37> devExtensionList = {{
+    // NV-DXVK end
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
       &devExtensions.extConservativeRasterization,
       &devExtensions.extCustomBorderColor,
       &devExtensions.extDepthClipEnable,
+      // NV-DXVK start: depth bias representation control
+      &devExtensions.extDepthBiasControl,
+      // NV-DXVK end
       &devExtensions.extExtendedDynamicState,
       &devExtensions.extFullScreenExclusive,
       &devExtensions.extMemoryBudget,
@@ -511,6 +526,13 @@ namespace dxvk {
       enabledFeatures.extDepthClipEnable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT;
       enabledFeatures.extDepthClipEnable.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extDepthClipEnable);
     }
+
+    // NV-DXVK start: depth bias representation control
+    if (devExtensions.extDepthBiasControl) {
+      enabledFeatures.extDepthBiasControl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT;
+      enabledFeatures.extDepthBiasControl.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extDepthBiasControl);
+    }
+    // NV-DXVK end
 
     if (devExtensions.extExtendedDynamicState) {
       enabledFeatures.extExtendedDynamicState.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
@@ -1066,6 +1088,13 @@ namespace dxvk {
       m_deviceFeatures.extDepthClipEnable.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extDepthClipEnable);
     }
 
+    // NV-DXVK start: depth bias representation control
+    if (m_deviceExtensions.supports(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME)) {
+      m_deviceFeatures.extDepthBiasControl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT;
+      m_deviceFeatures.extDepthBiasControl.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extDepthBiasControl);
+    }
+    // NV-DXVK end
+
     if (m_deviceExtensions.supports(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
       m_deviceFeatures.extExtendedDynamicState.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
       m_deviceFeatures.extExtendedDynamicState.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extExtendedDynamicState);
@@ -1185,6 +1214,13 @@ namespace dxvk {
       "\n  customBorderColorWithoutFormat         : ", features.extCustomBorderColor.customBorderColorWithoutFormat ? "1" : "0",
       "\n", VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
       "\n  depthClipEnable                        : ", features.extDepthClipEnable.depthClipEnable ? "1" : "0",
+      // NV-DXVK start: depth bias representation control
+      "\n", VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,
+      "\n  depthBiasControl                       : ", features.extDepthBiasControl.depthBiasControl ? "1" : "0",
+      "\n  leastRepresentableValueForceUnorm      : ", features.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation ? "1" : "0",
+      "\n  floatRepresentation                    : ", features.extDepthBiasControl.floatRepresentation ? "1" : "0",
+      "\n  depthBiasExact                         : ", features.extDepthBiasControl.depthBiasExact ? "1" : "0",
+      // NV-DXVK end
       "\n", VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
       "\n  extendedDynamicState                   : ", features.extExtendedDynamicState.extendedDynamicState ? "1" : "0",
       "\n", VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,

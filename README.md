@@ -29,10 +29,14 @@ How it works:
 
 Known issues:
 
-- Ghosting issues with particles and textures on transparent planes (chain link fences). Will investigate solutions for this in the future.
-- Separate existing issue with Mirror's Edge where sub-native render resolutions offset the position of some effects like sun haze and first person self-shadowing. This is not Remix's doing.
+- Ghosting issues with particles and textures on transparent planes (chain link fences). DLSS Presets L/M can help reduce this.
+- Separate existing issue with Mirror's Edge where sub-native render resolutions offset the position of some effects like sun haze and first person self-shadowing. This is not Remix's doing; this requires the render target fix in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks).
 
 [RtxOptions.md](/RtxOptions.md) lists the passthrough options under `rtx.ngxPassthrough.*`. In the developer menu, Rendering > General has debug views for depth and motion vectors, plus a Diagnostics section.
+
+### Reversed depth
+
+This branch supports the Reversed Depth setting in [Mirror's Edge Tweaks](https://github.com/softsoundd/MirrorsEdgeTweaks), which reduces Z-fighting on distant surfaces. The setting patches the game to store depth from far to near, which gains precision only when the depth buffer is 32-bit float. The runtime stores depth buffers as 32-bit float by default (`d3d9.useD32forD24`), and detects reversed depth from the game's projection.
 
 ## Build instructions
 

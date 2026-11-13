@@ -81,12 +81,13 @@ namespace dxvk {
     void endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage = nullptr, bool callInjectRtx = true);
 
     // NGX passthrough mode: per-frame data handed over from the D3D9 layer - the game's scene
-    // depth image, the pre-post-process color target (the game's scene color when the
-    // injection point is before the game's post chain, null when DLSS runs on the final
-    // output), the suppressed ScreenPercentage-upscale source (null when the game renders
+    // depth image and its encoding, the pre-post-process color target (the game's scene color
+    // when the injection point is before the game's post chain, null when DLSS runs on the
+    // final output), the suppressed ScreenPercentage-upscale source (null when the game renders
     // at full resolution), the scene subrect, the captured dynamic object draws with their
     // capture diagnostics, and the sub-pixel viewport jitter the frame was rasterized with
     void setNgxPassthroughFrameData(const Rc<DxvkImage>& sceneDepthImage,
+                                    const NgxSceneDepthLayout& sceneDepthLayout,
                                     const Rc<DxvkImage>& colorTargetImage,
                                     const Rc<DxvkImage>& colorMirrorImage,
                                     const Rc<DxvkImage>& upscaleSourceImage,

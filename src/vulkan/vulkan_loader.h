@@ -351,6 +351,12 @@ namespace dxvk::vk {
     VULKAN_FN(vkCmdEndConditionalRenderingEXT);
     #endif
 
+    // NV-DXVK start: depth bias representation control
+    #ifdef VK_EXT_depth_bias_control
+    VULKAN_FN(vkCmdSetDepthBias2EXT);
+    #endif
+    // NV-DXVK end
+
     #ifdef VK_EXT_extended_dynamic_state
     VULKAN_FN(vkCmdBindVertexBuffers2EXT);
     VULKAN_FN(vkCmdSetCullModeEXT);

@@ -307,6 +307,8 @@ namespace dxvk {
 
     struct NGXNeuralRenderingSettings {
       bool resetAccumulation;
+      // Set when the depth maps near to 1 and far to 0.
+      bool depthInverted;
       float jitterOffset[2];
       float motionVectorScale[2];
       float intensity;

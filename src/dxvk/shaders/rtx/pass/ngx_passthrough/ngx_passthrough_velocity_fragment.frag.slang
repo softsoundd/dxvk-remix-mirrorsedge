@@ -63,7 +63,14 @@ float4 main(float4 svPosition : SV_Position,
   // seeping their motion through walls). The raster replays the game's packed clip
   // transform verbatim, so the residual error is float rounding - 0.1% of view distance
   // absorbs it with a wide margin while keeping occlusion strict.
-  const float depthTolerance = max(1e-3f * (1.0f - sceneDepth), 1e-6f) * cb.depthToleranceScale;
+  //
+  // Reversed depth measures that distance from its far end at 0, so both conventions accept the same fragments.
+  // The mirror offset maps a squashed foreground range the way the motion vector pass does.
+  // The reversed clear value stays at zero distance from the far end, as 1.0 does in standard depth.
+  const float depthTowardFar = cb.depthReversed
+    ? (sceneDepth > 0.0f ? sceneDepth + cb.depthMirrorOffset : 0.0f)
+    : 1.0f - sceneDepth;
+  const float depthTolerance = max(1e-3f * depthTowardFar, 1e-6f) * cb.depthToleranceScale;
 
   if (cb.debugSkipDepthTest == 0 && abs(svPosition.z - sceneDepth) > depthTolerance) {
     discard;

@@ -85,7 +85,8 @@ namespace dxvk {
       const Resources::Resource& controlMask,
       bool resetHistory,
       float motionVectorScaleX,
-      float motionVectorScaleY) {
+      float motionVectorScaleY,
+      bool depthInverted) {
     ScopedGpuProfileZone(ctx, "DlssNeuralRendering");
 
     if (!isEnabled()) {
@@ -170,6 +171,7 @@ namespace dxvk {
       settings.motionVectorScale[0] = motionVectorScale[0];
       settings.motionVectorScale[1] = motionVectorScale[1];
       settings.resetAccumulation = resetHistory;
+      settings.depthInverted = depthInverted;
       settings.intensity             = DlssNeuralRendering::intensity();
       settings.toneStrength          = DlssNeuralRendering::toneStrength();
       settings.structuralStrength    = DlssNeuralRendering::structuralStrength();

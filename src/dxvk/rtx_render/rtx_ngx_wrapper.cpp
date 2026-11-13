@@ -922,7 +922,8 @@ namespace dxvk
 
     //consts.numberOfFramesToGenerate = 1;  // xxxnsubtil: this doesn't do anything, each eval call always generates one frame only
     consts.colorBuffersHDR = false;
-    consts.depthInverted = false;
+    // The depth is rasterized with this camera's projection, so it shares the projection's convention.
+    consts.depthInverted = isReverseZ;
     consts.cameraMotionIncluded = true;
     consts.reset = resetHistory;
     consts.notRenderingGameFrames = false;
@@ -1210,7 +1211,7 @@ namespace dxvk
     neuralRenderingEvalParams.pInDepth = &depthResource;
     neuralRenderingEvalParams.pInControlMask = &controlMaskResource;
     neuralRenderingEvalParams.InReset = settings.resetAccumulation ? 1 : 0;
-    neuralRenderingEvalParams.InDepthInverted = 0;
+    neuralRenderingEvalParams.InDepthInverted = settings.depthInverted ? 1 : 0;
     neuralRenderingEvalParams.InEnabled = 1;
     neuralRenderingEvalParams.InIntensity = settings.intensity;
     neuralRenderingEvalParams.InLocalToneStrength = settings.toneStrength;

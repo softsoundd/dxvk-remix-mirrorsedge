@@ -224,7 +224,8 @@ namespace dxvk {
       Matrix4& outWorldToView,
       Matrix4& outViewToProjection,
       bool* outUsedTranspose = nullptr,
-      float* outReconstructionError = nullptr) {
+      float* outReconstructionError = nullptr,
+      bool* outReverseZ = nullptr) {
 
       // UE3 uploads ViewProjectionMatrix via SetVertexShaderConstantF as 4 consecutive float4 registers
       // These values are the raw shader constants and in UE3/HLSL this matrix is typically treated as column-major
@@ -290,7 +291,8 @@ namespace dxvk {
         return err;
       };
 
-      auto tryBuild = [&](const Matrix4& candidateWorldToProjection, Matrix4& outWorldToViewLocal, Matrix4& outViewToProjectionLocal) -> bool {
+      auto tryBuild = [&](const Matrix4& candidateWorldToProjection, Matrix4& outWorldToViewLocal, Matrix4& outViewToProjectionLocal,
+                          bool& outReverseZLocal) -> bool {
         // avoid attempting to invert singular matrices
         {
           constexpr double kDetEps = 1e-24;
@@ -369,6 +371,7 @@ namespace dxvk {
         // yields a valid projection on decomposition and best reconstructs the original matrix
         Matrix4 bestViewToProjection;
         float bestErr = std::numeric_limits<float>::infinity();
+        bool bestReverseZ = false;
         bool found = false;
 
         {
@@ -380,6 +383,7 @@ namespace dxvk {
             if (err < bestErr) {
               bestErr = err;
               bestViewToProjection = viewToProjection;
+              bestReverseZ = projParams.isReverseZ;
               found = true;
             }
           }
@@ -394,6 +398,7 @@ namespace dxvk {
             if (err < bestErr) {
               bestErr = err;
               bestViewToProjection = viewToProjection;
+              bestReverseZ = projParams.isReverseZ;
               found = true;
             }
           }
@@ -404,12 +409,14 @@ namespace dxvk {
 
         outWorldToViewLocal = worldToView;
         outViewToProjectionLocal = bestViewToProjection;
+        outReverseZLocal = bestReverseZ;
         return true;
       };
 
       // try both the raw matrix and its transpose, prefer the one that best reconstructs the original world to projection
       struct CandidateResult {
         bool ok = false;
+        bool reverseZ = false;
         float error = std::numeric_limits<float>::infinity();
         Matrix4 worldToView;
         Matrix4 viewToProjection;
@@ -419,9 +426,11 @@ namespace dxvk {
         CandidateResult r;
         Matrix4 w2v;
         Matrix4 v2p;
-        if (!tryBuild(candidateWorldToProjection, w2v, v2p))
+        bool reverseZ = false;
+        if (!tryBuild(candidateWorldToProjection, w2v, v2p, reverseZ))
           return r;
         r.ok = true;
+        r.reverseZ = reverseZ;
         r.worldToView = w2v;
         r.viewToProjection = v2p;
         r.error = matrixL1Error(v2p * w2v, candidateWorldToProjection);
@@ -448,6 +457,8 @@ namespace dxvk {
         *outUsedTranspose = (best == &transposed);
       if (outReconstructionError != nullptr)
         *outReconstructionError = best->error;
+      if (outReverseZ != nullptr)
+        *outReverseZ = best->reverseZ;
       return true;
     }
   }
@@ -1019,6 +1030,7 @@ namespace dxvk {
                                                    Matrix4& outViewToProjection,
                                                    bool& outUsedTranspose,
                                                    float& outReconstructionError,
+                                                   bool& outReverseZ,
                                                    XXH64_hash_t* outConstantsHash) {
     if (viewProjReg + 3 >= caps::MaxFloatConstantsSoftware || viewOriginReg >= caps::MaxFloatConstantsSoftware)
       return false;
@@ -1054,6 +1066,7 @@ namespace dxvk {
         outViewToProjection = slot.viewToProjection;
         outUsedTranspose = slot.usedTranspose;
         outReconstructionError = slot.reconstructionError;
+        outReverseZ = slot.reverseZ;
         return true;
       }
     }
@@ -1062,8 +1075,10 @@ namespace dxvk {
     Matrix4 ue3ViewToProjection;
     bool usedTranspose = false;
     float reconstructionError = 0.0f;
+    bool reverseZ = false;
     const bool extracted = tryExtractUe3WorldToViewAndProjectionFromShaderConstants(
-        d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError);
+        d3d9State().vsConsts, viewProjReg, viewOriginReg, ue3WorldToView, ue3ViewToProjection, &usedTranspose, &reconstructionError,
+        &reverseZ);
 
     Ue3CameraConstantsCache& slot = m_ue3CameraConstantsCache[m_ue3CameraConstantsCacheNextSlot];
     m_ue3CameraConstantsCacheNextSlot = (m_ue3CameraConstantsCacheNextSlot + 1u) % kUe3CameraConstantsCacheSlots;
@@ -1071,6 +1086,7 @@ namespace dxvk {
     slot.valid = true;
     slot.extractionFailed = !extracted;
     slot.usedTranspose = usedTranspose;
+    slot.reverseZ = reverseZ;
     slot.worldToView = ue3WorldToView;
     slot.viewToProjection = ue3ViewToProjection;
     slot.reconstructionError = reconstructionError;
@@ -1083,6 +1099,7 @@ namespace dxvk {
     outViewToProjection = ue3ViewToProjection;
     outUsedTranspose = usedTranspose;
     outReconstructionError = reconstructionError;
+    outReverseZ = reverseZ;
     return true;
   }
 
@@ -1597,10 +1614,11 @@ namespace dxvk {
     Matrix4 viewToProjection;
     bool usedTranspose = false;
     float reconstructionError = 0.0f;
+    bool reverseZ = false;
     XXH64_hash_t constantsHash = 0;
 
     if (!tryGetUe3CameraFromConstantsCached(viewProjReg, viewOriginReg, worldToView, viewToProjection,
-                                            usedTranspose, reconstructionError, &constantsHash))
+                                            usedTranspose, reconstructionError, reverseZ, &constantsHash))
       return;
 
     // Record the scene color/depth targets from depth-writing scene draws: the depth image
@@ -1629,6 +1647,7 @@ namespace dxvk {
 
         m_ngxSceneColorImage = renderTargetTexture->GetImage();
         m_ngxSceneDepthImage = depthStencilTexture->GetImage();
+        m_ngxSceneDepthReversed = reverseZ;
         m_ngxSceneTargetsLastSeenFrame = m_ue3FrameCounter;
 
         // The viewport of the scene draws is the subrect the game renders into; when the
@@ -1661,6 +1680,12 @@ namespace dxvk {
           m_parent->m_flags.set(D3D9DeviceFlag::DirtyViewportScissor);
         }
       }
+    }
+
+    // A reversed depth patch can restore the standard projection while another kind of depth surface is bound.
+    // Such a draw's camera does not describe the depth the scene draws wrote.
+    if (reverseZ != m_ngxSceneDepthReversed) {
+      return;
     }
 
     // Feed the main camera once per unique constants; RtCamera keeps the first update per frame
@@ -5043,7 +5068,13 @@ namespace dxvk {
       m_ngxVelocityWindow = NgxVelocityWindowTotals();
     }
 
+    NgxSceneDepthLayout sceneDepthLayout;
+    sceneDepthLayout.reversed = m_ngxSceneDepthReversed;
+    sceneDepthLayout.foregroundMinZ = m_ngxForegroundDepthMinZ;
+    sceneDepthLayout.foregroundMaxZ = m_ngxForegroundDepthMaxZ;
+
     m_parent->EmitCs([cSceneDepth = sceneDepth,
+                      cSceneDepthLayout = sceneDepthLayout,
                       cColorTarget = m_ngxColorTargetImage,
                       cColorMirror = m_ngxColorMirrorImage,
                       cUpscaleSource = m_ngxUpscaleSourceImage,
@@ -5058,7 +5089,7 @@ namespace dxvk {
                       cCameraMatricesValid = m_ngxFrameCameraMatricesValid,
                       cWorldToView = m_ngxFrameWorldToView,
                       cViewToProjection = m_ngxFrameViewToProjection](DxvkContext* ctx) mutable {
-      static_cast<RtxContext*>(ctx)->setNgxPassthroughFrameData(cSceneDepth, cColorTarget, cColorMirror, cUpscaleSource, cSubrect,
+      static_cast<RtxContext*>(ctx)->setNgxPassthroughFrameData(cSceneDepth, cSceneDepthLayout, cColorTarget, cColorMirror, cUpscaleSource, cSubrect,
                                                                 cColorSubrectOffset, cOutputTransform,
                                                                 std::move(cVelocityDraws), cVelocityStats, cSceneTransformOffset,
                                                                 cJitterX, cJitterY,
@@ -5419,6 +5450,8 @@ namespace dxvk {
     m_ngxDepthClearsThisFrame++;
     m_ngxMidSceneClearSeen = true;
     m_ngxLastMidSceneClearFrame = m_ue3FrameCounter;
+    m_ngxForegroundDepthMinZ = 0.0f;
+    m_ngxForegroundDepthMaxZ = 1.0f;
 
     if (m_ngxFrameClearCount < kNgxFrameShapeSlots) {
       m_ngxFrameClearDraws[m_ngxFrameClearCount++] = m_drawCallID;
@@ -5435,6 +5468,25 @@ namespace dxvk {
     m_parent->EmitCs([cSceneDepth = m_ngxSceneDepthImage](DxvkContext* ctx) {
       static_cast<RtxContext*>(ctx)->snapshotNgxPassthroughDepth(cSceneDepth);
     });
+  }
+
+  void D3D9Rtx::noteNgxForegroundDepthRange() {
+    if (!m_ngxDepthSnapshotTakenThisFrame || m_ngxSceneDepthImage == nullptr || d3d9State().depthStencil == nullptr) {
+      return;
+    }
+
+    if (d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_FALSE ||
+        d3d9State().renderStates[D3DRS_ZWRITEENABLE] == FALSE) {
+      return;
+    }
+
+    D3D9CommonTexture* depthStencilTexture = d3d9State().depthStencil->GetCommonTexture();
+    if (depthStencilTexture == nullptr || depthStencilTexture->GetImage().ptr() != m_ngxSceneDepthImage.ptr()) {
+      return;
+    }
+
+    m_ngxForegroundDepthMinZ = d3d9State().viewport.MinZ;
+    m_ngxForegroundDepthMaxZ = d3d9State().viewport.MaxZ;
   }
 
   bool D3D9Rtx::GetNgxPassthroughViewportJitter(float* pJitterX, float* pJitterY) const {
@@ -7284,6 +7336,8 @@ namespace dxvk {
     // Dynamic object capture for the velocity raster pass
     tryCaptureNgxVelocityDraw(drawContext);
 
+    noteNgxForegroundDepthRange();
+
     learnNgxDrawResolve(drawContext);
     noteNgxUberEncode(drawContext);
 
@@ -7909,6 +7963,8 @@ namespace dxvk {
     m_ngxFrameDataEmitted = false;
     m_ngxDepthSnapshotTakenThisFrame = false;
     m_ngxDepthClearsThisFrame = 0;
+    m_ngxForegroundDepthMinZ = 0.0f;
+    m_ngxForegroundDepthMaxZ = 1.0f;
     m_ngxDiagSawPostQuad = false;
     m_ngxDiagSceneColorReady = false;
     m_ngxBackbufferDrawSeenThisFrame = false;

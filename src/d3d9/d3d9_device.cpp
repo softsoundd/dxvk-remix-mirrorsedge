@@ -147,6 +147,29 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK start: depth bias representation control
+    // FLOAT applies D3DRS_DEPTHBIAS as an absolute depth offset on every format, as D3D9 does.
+    // The other representations still need the per-format r-value from SetDepthStencilSurface.
+    if (dxvkDevice->features().extDepthBiasControl.depthBiasControl) {
+      if (dxvkDevice->features().extDepthBiasControl.depthBiasExact) {
+        m_depthBiasRepresentation.depthBiasExact = VK_TRUE;
+      }
+
+      if (dxvkDevice->features().extDepthBiasControl.floatRepresentation) {
+        m_depthBiasRepresentation.depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_FLOAT_EXT;
+        m_depthBiasScale = 1.0f;
+      } else if (dxvkDevice->features().extDepthBiasControl.leastRepresentableValueForceUnormRepresentation) {
+        m_depthBiasRepresentation.depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+      }
+    }
+
+    EmitCs([
+      cRepresentation = m_depthBiasRepresentation
+    ] (DxvkContext* ctx) {
+      ctx->setDepthBiasRepresentation(cRepresentation);
+    });
+    // NV-DXVK end
+
     CreateConstantBuffers();
 
     m_availableMemory = DetermineInitialTextureMemory();
@@ -1521,13 +1544,18 @@ namespace dxvk {
     ConsiderFlush(GpuFlushType::ImplicitWeakHint);
     m_flags.set(D3D9DeviceFlag::DirtyFramebuffer);
 
-    if (ds != nullptr) {
-      float rValue = GetDepthBufferRValue(ds->GetCommonTexture()->GetFormatMapping().FormatColor);
+    // NV-DXVK start: depth bias representation control
+    if (ds != nullptr && m_depthBiasRepresentation.depthBiasRepresentation != VK_DEPTH_BIAS_REPRESENTATION_FLOAT_EXT) {
+      const int32_t vendorId = m_dxvkDevice->adapter()->deviceProperties().vendorID;
+      const bool exact = m_depthBiasRepresentation.depthBiasExact;
+      const bool forceUnorm = m_depthBiasRepresentation.depthBiasRepresentation == VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+      const float rValue = GetDepthBufferRValue(ds->GetCommonTexture()->GetFormatMapping().FormatColor, vendorId, exact, forceUnorm);
       if (m_depthBiasScale != rValue) {
         m_depthBiasScale = rValue;
         m_flags.set(D3D9DeviceFlag::DirtyDepthBias);
       }
     }
+    // NV-DXVK end
 
     m_state.depthStencil = ds;
 
@@ -4383,6 +4411,17 @@ namespace dxvk {
 
     // Enable depth bounds test if we support it.
     enabled.core.features.depthBounds = supported.core.features.depthBounds;
+
+    // NV-DXVK start: depth bias representation control
+    enabled.extDepthBiasControl.depthBiasControl = supported.extDepthBiasControl.depthBiasControl;
+    enabled.extDepthBiasControl.depthBiasExact = supported.extDepthBiasControl.depthBiasExact;
+
+    if (supported.extDepthBiasControl.floatRepresentation) {
+      enabled.extDepthBiasControl.floatRepresentation = VK_TRUE;
+    } else if (supported.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation) {
+      enabled.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
+    }
+    // NV-DXVK end
 
     if (supported.extCustomBorderColor.customBorderColorWithoutFormat) {
       enabled.extCustomBorderColor.customBorderColors             = VK_TRUE;

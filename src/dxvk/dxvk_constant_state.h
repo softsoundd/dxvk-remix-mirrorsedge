@@ -53,6 +53,29 @@ namespace dxvk {
   };
 
 
+  // NV-DXVK start: depth bias representation control
+  /**
+   * \brief Depth bias representation
+   * 
+   * Stores depth bias representation info.
+   */
+  struct DxvkDepthBiasRepresentation {
+    VkDepthBiasRepresentationEXT depthBiasRepresentation;
+    VkBool32                     depthBiasExact;
+
+    bool operator == (const DxvkDepthBiasRepresentation& other) const {
+      return depthBiasRepresentation == other.depthBiasRepresentation
+          && depthBiasExact          == other.depthBiasExact;
+    }
+
+    bool operator != (const DxvkDepthBiasRepresentation& other) const {
+      return depthBiasRepresentation != other.depthBiasRepresentation
+          || depthBiasExact          != other.depthBiasExact;
+    }
+  };
+  // NV-DXVK end
+
+
   /**
    * \brief Depth bounds
    * 

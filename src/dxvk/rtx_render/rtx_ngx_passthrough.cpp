@@ -408,7 +408,8 @@ namespace dxvk {
                                                         const Rc<DxvkImageView>& worldDepthView,
                                                         const Rc<DxvkImageView>& foregroundDepthView,
                                                         const VkOffset2D& subrectOffset,
-                                                        const float jitter[2]) {
+                                                        const float jitter[2],
+                                                        float foregroundDepthMirrorOffset) {
     m_lastVelocityDrawCount = uint32_t(velocityDraws.size());
 
     if (velocityDraws.empty() || worldDepthView == nullptr || m_objectVelocity.image == nullptr) {
@@ -508,6 +509,8 @@ namespace dxvk {
     // exploding proves a geometry problem
     rasterArgs.debugSkipDepthTest = freezePrevious ? 1u : 0u;
     rasterArgs.foregroundPass = 0u;
+    rasterArgs.depthReversed = m_sceneDepthLayout.reversed;
+    rasterArgs.depthMirrorOffset = 0.0f;
     ctx->updateBuffer(m_velocityRasterConstants, 0, sizeof(rasterArgs), &rasterArgs);
 
     // Save the game's context state; the raster below rebinds most of it
@@ -750,6 +753,7 @@ namespace dxvk {
       // draws on the CS timeline). Rendering last, the foreground meshes win overlapping
       // pixels - they are the nearest content by definition.
       rasterArgs.foregroundPass = 1u;
+      rasterArgs.depthMirrorOffset = foregroundDepthMirrorOffset;
       ctx->updateBuffer(m_velocityRasterConstants, 0, sizeof(rasterArgs), &rasterArgs);
 
       drawPass(true, foregroundDepthView);
@@ -768,7 +772,7 @@ namespace dxvk {
                                                         const RtCamera& camera,
                                                         const std::vector<NgxVelocityDraw>& velocityDraws,
                                                         const float jitter[2]) {
-    // Two depth sources, merged per pixel by the shader (min): the first-clear snapshot
+    // Two depth sources, merged per pixel by the shader (nearer value): the first-clear snapshot
     // holds the world + intermediate DPG depth (UE3 clears depth mid-scene ahead of its
     // foreground DPG; with occlusion culling enabled an extra clear precedes that one),
     // the live buffer at the injection point holds the foreground DPG (camera-locked first
@@ -786,6 +790,19 @@ namespace dxvk {
       m_statusReason = "no scene depth identified";
       ONCE(Logger::warn("[RTX NGX Passthrough] No scene depth buffer identified this frame; DLSS/DLFG inputs unavailable."));
       return false;
+    }
+
+    m_lastSceneDepthFormat = sceneDepthImage->info().format;
+
+    if (m_sceneDepthLayout.reversed) {
+      ONCE(Logger::info("[RTX NGX Passthrough] Scene depth is reversed (near 1, far 0). "
+                        "The upscalers and Frame Generation are told the depth is inverted."));
+
+      if (m_lastSceneDepthFormat != VK_FORMAT_D32_SFLOAT && m_lastSceneDepthFormat != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        ONCE(Logger::warn(str::format("[RTX NGX Passthrough] Scene depth is reversed but stored as ", m_lastSceneDepthFormat,
+                                      ", so it gains no precision. Remove d3d9.useD32forD24 = False from dxvk.conf "
+                                      "and rtx.conf to store it as 32-bit float.")));
+      }
     }
 
     // Validate that the live buffer can be sampled; the snapshot (always shader-readable)
@@ -848,11 +865,17 @@ namespace dxvk {
       return false;
     }
 
+    // Only the live buffer holds the foreground's own viewport range.
+    // The world snapshot that the foreground binding can alias is full range.
+    const float foregroundDepthMirrorOffset = m_sceneDepthLayout.reversed && separateForeground
+      ? 1.0f - m_sceneDepthLayout.foregroundMinZ - m_sceneDepthLayout.foregroundMaxZ
+      : 0.0f;
+
     // Rasterize the dynamic objects' true motion before the motion vector pass consumes it
     // (context-managed synchronization: the raster is regular bound-state drawing)
     const uint32_t velocityTargets = rasterizeObjectVelocities(ctx, dxvkCtxState, velocityDraws,
                                                                worldDepthView, foregroundDepthView,
-                                                               subrectOffset, jitter);
+                                                               subrectOffset, jitter, foregroundDepthMirrorOffset);
 
     // Constants: map current-frame unjittered NDC to previous-frame clip space. Computed in
     // double precision from the camera matrix cache; the view-to-previous-view leg keeps the
@@ -916,9 +939,22 @@ namespace dxvk {
     m_motionBlurCurves = m_sceneCameraFresh
       ? buildMotionBlurCurveMatrices(camera, previousSpaceFromCurrent)
       : DxvkPostFx::MotionBlurCurveMatrices();
+
+    // The motion blur setup rebuilds a standard depth from linear view Z.
+    // These matrices come from a reversed projection, so they take 1 - depth instead.
+    if (m_sceneDepthLayout.reversed && m_motionBlurCurves.valid) {
+      Matrix4 reversedFromStandardNdc;
+      reversedFromStandardNdc[2] = Vector4(0.0f, 0.0f, -1.0f, 0.0f);
+      reversedFromStandardNdc[3] = Vector4(0.0f, 0.0f, 1.0f, 1.0f);
+      m_motionBlurCurves.toPrevHalfClip = m_motionBlurCurves.toPrevHalfClip * reversedFromStandardNdc;
+      m_motionBlurCurves.toNextHalfClip = m_motionBlurCurves.toNextHalfClip * reversedFromStandardNdc;
+    }
+
     args.motionBlurFirstPerson = motionBlurFirstPerson() ? 1u : 0u;
     args.objectVelocityValid = (velocityTargets & 1u) != 0 ? 1u : 0u;
     args.foregroundVelocityValid = (velocityTargets & 2u) != 0 ? 1u : 0u;
+    args.depthReversed = m_sceneDepthLayout.reversed;
+    args.foregroundDepthMirrorOffset = foregroundDepthMirrorOffset;
 
     args.outputResolution = vec2(float(m_displayExtent.width), float(m_displayExtent.height));
     args.outputTransformEnabled = m_outputTransform.enabled ? 1u : 0u;
@@ -1689,7 +1725,7 @@ namespace dxvk {
     const float motionScaleY = m_renderExtent.height > 0
       ? float(m_displayExtent.height) / float(m_renderExtent.height) : 1.0f;
     if (neuralRendering.dispatch(ctx, barriers, m_nrInput, m_nrOutput, m_nrMotionVectors, m_nrDepth, m_nrControlMask,
-                                 m_lastResetHistory, motionScaleX, motionScaleY)) {
+                                 m_lastResetHistory, motionScaleX, motionScaleY, m_sceneDepthLayout.reversed)) {
       blitToTargetRect(ctx, m_nrOutput.image, m_displayExtent, backbufferImage, VkOffset2D { 0, 0 });
       ONCE(Logger::info("[RTX NGX Passthrough] DLSS-NR runs on the finished pre-UI image."));
     }
@@ -1823,9 +1859,11 @@ namespace dxvk {
 
     const DxvkDLSS::DLSSPreset selectedPreset = DxvkDLSS::preset();
     const int selectedPresetValue = static_cast<int>(selectedPreset);
+    const bool depthInverted = m_sceneDepthLayout.reversed;
     if (feature.initializedRenderPreset != selectedPresetValue ||
         feature.initializedContentHDR != contentHDR ||
         feature.initializedAutoExposure != useAutoExposure ||
+        feature.initializedDepthInverted != depthInverted ||
         feature.initializedInput[0] != m_renderExtent.width ||
         feature.initializedInput[1] != m_renderExtent.height ||
         feature.initializedOutput[0] != m_displayExtent.width ||
@@ -1838,6 +1876,7 @@ namespace dxvk {
       feature.initializedRenderPreset = selectedPresetValue;
       feature.initializedContentHDR = contentHDR;
       feature.initializedAutoExposure = useAutoExposure;
+      feature.initializedDepthInverted = depthInverted;
       feature.initializedInput[0] = m_renderExtent.width;
       feature.initializedInput[1] = m_renderExtent.height;
       feature.initializedOutput[0] = m_displayExtent.width;
@@ -1855,12 +1894,12 @@ namespace dxvk {
       const NVSDK_NGX_DLSS_Hint_Render_Preset renderPreset =
         DxvkDLSS::presetToHint<NVSDK_NGX_DLSS_Hint_Render_Preset>(selectedPreset);
 
-      // Conventional depth, not inverted.
+      // The depth keeps the game's convention.
       // Linear HDR uses NGX auto-exposure.
       // A linearized late grade and display-encoded LDR leave auto-exposure off.
       feature.context->initialize(ctx, inputSize, outputSize,
                                   contentHDR,
-                                  /* depthInverted = */ false,
+                                  depthInverted,
                                   /* autoExposure = */ useAutoExposure,
                                   /* sharpening = */ false,
                                   renderPreset,
@@ -1875,7 +1914,8 @@ namespace dxvk {
                                ", render preset ", renderPresetToString(renderPreset),
                                (linearizeLateInput ? ", linearized grade"
                                                    : contentHDR ? ", linear HDR input"
-                                                                 : ", LDR input")));
+                                                                 : ", LDR input"),
+                               (depthInverted ? ", inverted depth" : "")));
     }
 
     if (m_dlssLastContentHDR != int(contentHDR)) {
@@ -2090,6 +2130,7 @@ namespace dxvk {
       return false;
     }
 
+    xess.setDepthInverted(m_sceneDepthLayout.reversed);
     snapshotColorInput(ctx, colorSourceImage, colorSourceOffset);
 
     uint32_t displaySize[2] = { m_displayExtent.width, m_displayExtent.height };
@@ -2524,6 +2565,14 @@ namespace dxvk {
       statRow("Injection", m_lastDispatchPrePost ? "Pre-post-process" : "Late injection",
               "Pre-post-process reads linear scene colour before the game's post chain. "
               "Late injection reads the post-processed output.");
+      statRow("Depth convention", m_sceneDepthLayout.reversed ? "Reversed (near 1, far 0)" : "Standard (near 0, far 1)",
+              "Read from the scene's projection. Mirror's Edge Tweaks' Reversed Depth setting makes it reversed.");
+      statRow("Depth format", str::format(m_lastSceneDepthFormat),
+              "Reversed depth gains precision only from a 32-bit float format, which d3d9.useD32forD24 selects.");
+      statRow("Foreground depth range",
+              str::format("[", m_sceneDepthLayout.foregroundMinZ, ", ", m_sceneDepthLayout.foregroundMaxZ, "]"),
+              "The viewport depth range of the depth writes after the mid-scene clear. A range narrower than [0, 1] "
+              "keeps first-person meshes in front of the world, and reversed depth mirrors it before the depth merge.");
       statRow("Last dispatch frame", str::format(m_lastDispatchFrameId),
               "A value behind the current frame means that dispatch was skipped.");
       statRow("Current frame", str::format(currentFrameId));

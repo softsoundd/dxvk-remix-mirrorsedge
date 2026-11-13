@@ -447,9 +447,12 @@ namespace dxvk {
 
     // AMD do not support 24-bit depth buffers on Vulkan,
     // so we have to fall back to a 32-bit depth format.
-    m_d24s8Support = CheckImageFormatSupport(adapter, VK_FORMAT_D24_UNORM_S8_UINT,
+    // NV-DXVK start: optional D32F storage for D24 formats
+    m_d24s8Support = !options.useD32forD24 &&
+                     CheckImageFormatSupport(adapter, VK_FORMAT_D24_UNORM_S8_UINT,
       VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+    // NV-DXVK end
 
     // NVIDIA do not support 16-bit depth buffers with stencil on Vulkan,
     // so we have to fall back to a 32-bit depth format.
@@ -491,8 +494,10 @@ namespace dxvk {
     if (Format == D3D9Format::D32 && !m_d32supportFinal)
       return D3D9_VK_FORMAT_MAPPING();
     
+    // NV-DXVK start: D24 formats without a stencil aspect fall back to D32F without stencil
     if (!m_d24s8Support && mapping.FormatColor == VK_FORMAT_D24_UNORM_S8_UINT)
-      mapping.FormatColor = VK_FORMAT_D32_SFLOAT_S8_UINT;
+      mapping.FormatColor = (mapping.Aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT;
+    // NV-DXVK end
 
     if (!m_d16s8Support && mapping.FormatColor == VK_FORMAT_D16_UNORM_S8_UINT)
       mapping.FormatColor = m_d24s8Support ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;

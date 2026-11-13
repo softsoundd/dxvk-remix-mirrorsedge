@@ -38,6 +38,10 @@
 // not this classification. When no mid-scene clear occurred, both bindings alias the same
 // buffer and the merge is an identity. One output pair serves DLSS Super Resolution and
 // Frame Generation alike.
+//
+// Reversed depth (cb.depthReversed, near 1 and far 0) mirrors every depth decision below,
+// so both conventions classify each pixel the same way.
+// The depth output stays reversed, and its consumers are told so.
 
 #include "rtx/pass/ngx_passthrough/ngx_passthrough_args.h"
 #include "rtx/pass/post_fx/post_fx_motion_blur_geometry_flags.slangh"
@@ -89,18 +93,32 @@ void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
   const uint2 sourceCoordinate = pixelCoordinate + uint2(cb.subrectOffset);
 
   const float sceneDepth = SceneDepth[sourceCoordinate];
-  const float foregroundDepth = ForegroundDepth[sourceCoordinate];
+  float foregroundDepth = ForegroundDepth[sourceCoordinate];
 
-  const float depth = min(sceneDepth, foregroundDepth);
-  const bool isCameraLocked = foregroundDepth < sceneDepth;
+  // A reversed depth patch leaves a squashed foreground range at the far end of the buffer,
+  // and the offset moves it to the mirror image of the standard value.
+  // Zero is the reversed clear value, which marks a pixel the foreground did not write.
+  if (cb.depthReversed && foregroundDepth > 0.0f) {
+    foregroundDepth += cb.foregroundDepthMirrorOffset;
+  }
+
+  const float depth = cb.depthReversed
+    ? max(sceneDepth, foregroundDepth)
+    : min(sceneDepth, foregroundDepth);
+  const bool isCameraLocked = cb.depthReversed
+    ? foregroundDepth > sceneDepth
+    : foregroundDepth < sceneDepth;
 
   OutDepth[pixelCoordinate] = depth;
 
-  // Remix post-processing input: linear view-space Z from the hardware depth (standard
-  // D3D projection; depth 1.0 lands exactly on the far plane). The surface flags are
-  // written below, after the velocity overrides resolve the first person coverage.
-  OutLinearViewZ[pixelCoordinate] =
-    (cb.nearPlane * cb.farPlane) / max(cb.farPlane - depth * (cb.farPlane - cb.nearPlane), 1e-6f);
+  // Linear view-space Z feeds Remix post-processing.
+  // Hardware depth 1.0 lands exactly on the far plane, or 0.0 when the depth is reversed.
+  // The reversed form is the same function of the mirrored depth, without the cancellation of computing 1 - depth.
+  // The surface flags are written below, after the velocity overrides resolve the first person coverage.
+  const float linearViewZDenominator = cb.depthReversed
+    ? cb.nearPlane + depth * (cb.farPlane - cb.nearPlane)
+    : cb.farPlane - depth * (cb.farPlane - cb.nearPlane);
+  OutLinearViewZ[pixelCoordinate] = (cb.nearPlane * cb.farPlane) / max(linearViewZDenominator, 1e-6f);
 
   // Unjittered NDC for the pixel center (y up), matching cameraPixelCoordinateToNDC. The depth
   // here was rasterized through a viewport displaced by cb.jitter, so the surface this pixel
@@ -189,7 +207,8 @@ void main(uint2 pixelCoordinate : SV_DispatchThreadID) {
       motionSourceBlue,
       1.0f);
   } else if (cb.debugMode == 2) {
-    const float logFar = -log2(max(1.0f - depth, exp2(-24.0f))) / 24.0f;
+    const float depthTowardFar = cb.depthReversed ? depth : 1.0f - depth;
+    const float logFar = -log2(max(depthTowardFar, exp2(-24.0f))) / 24.0f;
     DebugOutput[pixelCoordinate] = float4(1.0f - logFar, 1.0f - logFar, 1.0f - logFar, 1.0f);
   } else if (cb.debugMode == 3) {
     // Object velocity coverage: the raw velocity raster output. Green = world-phase

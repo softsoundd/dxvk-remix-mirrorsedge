@@ -128,6 +128,16 @@ namespace dxvk {
     bool linearizeInput = false;
   };
 
+  // Describes how the game encodes the scene depth, as the D3D9 capture measures it.
+  struct NgxSceneDepthLayout {
+    // Set when the scene's projection maps near to 1 and far to 0, as a reversed depth patch makes it.
+    bool reversed = false;
+    // Holds the viewport depth range of the scene depth writes since the last mid-scene clear.
+    // The foreground DPG can squash its range, and a reversed buffer holds that range at its far end.
+    float foregroundMinZ = 0.0f;
+    float foregroundMaxZ = 1.0f;
+  };
+
   // Holds the per-frame counters from the D3D9 dynamic-draw capture.
   // The Diagnostics section shows them.
   // Captured tracks how many movers are on screen.
@@ -358,6 +368,10 @@ namespace dxvk {
       m_sceneCameraFresh = fresh;
     }
 
+    void setSceneDepthLayout(const NgxSceneDepthLayout& layout) {
+      m_sceneDepthLayout = layout;
+    }
+
     // Shows the upscaler state and resolution in the user menu.
     void showImguiStatusLine();
 
@@ -516,13 +530,15 @@ namespace dxvk {
     // subrectOffset/jitter: where the scene subrect sits in the depth buffer, and the
     // sub-pixel viewport jitter the game's own rasterization carried this frame - both are
     // replicated so the raster lands on the exact pixels (and depths) the game produced.
+    // The foreground pass measures its depth tolerance with foregroundDepthMirrorOffset, as NgxPassthroughArgs describes.
     uint32_t rasterizeObjectVelocities(RtxContext* ctx,
                                        DxvkContextState& dxvkCtxState,
                                        const std::vector<NgxVelocityDraw>& velocityDraws,
                                        const Rc<DxvkImageView>& worldDepthView,
                                        const Rc<DxvkImageView>& foregroundDepthView,
                                        const VkOffset2D& subrectOffset,
-                                       const float jitter[2]);
+                                       const float jitter[2],
+                                       float foregroundDepthMirrorOffset);
     // preserveTargetAlpha: combine the DLSS RGB output with the color source's original
     // alpha before writing back (pre-post-process injection: UE3's D3D9 path stores the
     // scene depth in the scene color alpha channel, which shadow projection and depth-based
@@ -631,6 +647,9 @@ namespace dxvk {
       // Stored in the created feature.
       // A mismatch rebuilds it.
       bool initializedAutoExposure = false;
+      // Holds the depth convention the feature was created with.
+      // A mismatch rebuilds it.
+      bool initializedDepthInverted = false;
     };
     DlssFeature m_dlssFeatures[2];
     int m_dlssLastContentHDR = -1;
@@ -646,6 +665,7 @@ namespace dxvk {
     // Written on the CS thread and read by the menus.
     const char* m_statusReason = "not dispatched yet";
     uint32_t m_lastDispatchFrameId = 0;
+    VkFormat m_lastSceneDepthFormat = VK_FORMAT_UNDEFINED;
     // Counts every DLSS feature rebuild.
     // The HDR and LDR features are counted separately.
     uint32_t m_dlssInitCount = 0;
@@ -748,6 +768,7 @@ namespace dxvk {
     Vector3 m_sceneTransformOffset = Vector3(0.0f, 0.0f, 0.0f);
     bool m_sceneCameraFresh = false;
     bool m_previousSceneCameraFresh = false;
+    NgxSceneDepthLayout m_sceneDepthLayout;
 
     Rc<DxvkBuffer> m_constantsBuffer;
     Rc<DxvkBuffer> m_velocityRasterConstants;

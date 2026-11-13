@@ -142,6 +142,13 @@ namespace dxvk {
     onFrameBegin(ctx, frameBeginCtx);
   }
 
+  void DxvkXeSS::setDepthInverted(bool depthInverted) {
+    if (m_depthInverted != depthInverted) {
+      m_depthInverted = depthInverted;
+      m_recreate = true;
+    }
+  }
+
   bool DxvkXeSS::isXeSSLibraryAvailable() {
     // Try to get XeSS version to test if library is available
     xess_version_t version;
@@ -275,7 +282,8 @@ namespace dxvk {
     if (m_initialized && 
         m_targetExtent.width == targetExtent.width &&
         m_targetExtent.height == targetExtent.height &&
-        m_currentPreset == currentPreset) {
+        m_currentPreset == currentPreset &&
+        m_initializedDepthInverted == m_depthInverted) {
       return; // Already initialized with correct settings
     }
 
@@ -286,6 +294,7 @@ namespace dxvk {
 
     m_targetExtent = targetExtent;
     m_currentPreset = currentPreset;
+    m_initializedDepthInverted = m_depthInverted;
 
     createXeSSContext(targetExtent);
     m_initialized = true;
@@ -312,10 +321,11 @@ namespace dxvk {
     }
     
     xess_quality_settings_t quality = presetToQuality(m_currentPreset);
-    xess_init_flags_t preFlags = XESS_INIT_FLAG_NONE;
+    // xessVKBuildPipelines must be given the same flags as xessVKInit.
+    const xess_init_flags_t initFlags = m_initializedDepthInverted ? XESS_INIT_FLAG_INVERTED_DEPTH : XESS_INIT_FLAG_NONE;
     
     // Trigger pre-build in background to reduce later initialization stalls
-    result = xessVKBuildPipelines(m_xessContext, VK_NULL_HANDLE, false, preFlags);
+    result = xessVKBuildPipelines(m_xessContext, VK_NULL_HANDLE, false, initFlags);
     if (result != XESS_RESULT_SUCCESS) {
       Logger::debug(str::format("XeSS: Pipeline pre-build failed, will compile during init: ", xessResultToString(result)));
     }
@@ -350,7 +360,7 @@ namespace dxvk {
     initParams.qualitySetting = presetToQuality(m_currentPreset);
 
     // Set initialization flags based on renderer state and user options
-    initParams.initFlags = XESS_INIT_FLAG_NONE;
+    initParams.initFlags = initFlags;
     
     initParams.creationNodeMask = 1;
     initParams.visibleNodeMask = 1;

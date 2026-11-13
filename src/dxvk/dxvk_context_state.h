@@ -148,6 +148,9 @@ namespace dxvk {
   struct DxvkDynamicState {
     DxvkBlendConstants  blendConstants    = { 0.0f, 0.0f, 0.0f, 0.0f };
     DxvkDepthBias       depthBias         = { 0.0f, 0.0f, 0.0f };
+    // NV-DXVK start: depth bias representation control
+    DxvkDepthBiasRepresentation depthBiasRepresentation = { VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT, VK_FALSE };
+    // NV-DXVK end
     DxvkDepthBounds     depthBounds       = { false, 0.0f, 1.0f };
     uint32_t            stencilReference  = 0;
   };

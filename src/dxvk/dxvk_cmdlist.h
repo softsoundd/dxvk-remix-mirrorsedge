@@ -778,6 +778,14 @@ namespace dxvk {
     }
 
 
+    // NV-DXVK start: depth bias representation control
+    void cmdSetDepthBias2(
+      const VkDepthBiasInfoEXT*     depthBiasInfo) {
+      m_vkd->vkCmdSetDepthBias2EXT(m_execBuffer, depthBiasInfo);
+    }
+    // NV-DXVK end
+
+
     void cmdSetDepthBounds(
             float                   minDepthBounds,
             float                   maxDepthBounds) {

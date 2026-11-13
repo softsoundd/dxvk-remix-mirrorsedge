@@ -120,9 +120,12 @@ namespace dxvk {
     { R"(\\MirrorsEdgeCatalyst(Trial)?\.exe$)", {{
       { "dxgi.customVendorId",              "10de" },
     }} },
-    /* Mirror's Edge (2008)                       */
+    /* Mirror's Edge (2008): invariant position,  *
+     * so depth matches between passes with       *
+     * float depth                                */
     { R"(\\MirrorsEdge\.exe$)", {{
       { "rtx.d3d9.ue3EngineMode",                                    "True" },
+      { "d3d9.invariantPosition",                                    "True" },
     }} },
     /* Star Wars Battlefront (2015)               */
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{

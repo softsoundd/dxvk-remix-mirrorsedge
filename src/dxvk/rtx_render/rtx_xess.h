@@ -98,6 +98,10 @@ namespace dxvk {
                                bool resetHistory,
                                bool isCameraCut);
 
+    // Depth that maps near to 1 and far to 0 needs a context created for it.
+    // A change recreates the context at the next dispatch.
+    void setDepthInverted(bool depthInverted);
+
   protected:
 
     // RtxPass interface
@@ -133,6 +137,9 @@ namespace dxvk {
     VkExtent2D m_xessOutputSize;
     bool m_recreate;
     float m_lastResolutionScale; // Track resolution scale changes for Custom preset
+    bool m_depthInverted = false;
+    // Holds the depth convention the live context was created with.
+    bool m_initializedDepthInverted = false;
 
 #else
 
@@ -161,6 +168,9 @@ namespace dxvk {
     void setSetting(const uint32_t displaySize[2], const XeSSPreset preset, uint32_t outRenderSize[2]) {
     }
     void getInputSize(uint32_t& width, uint32_t& height) const {
+    }
+
+    void setDepthInverted(bool depthInverted) {
     }
 
     // XeSS 2.1 public helper methods

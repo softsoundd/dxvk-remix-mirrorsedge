@@ -82,6 +82,11 @@ namespace dxvk {
     this->supportDFFormats              = config.getOption<bool>        ("d3d9.supportDFFormats",              true);
     this->supportX4R4G4B4               = config.getOption<bool>        ("d3d9.supportX4R4G4B4",               true);
     this->supportD32                    = config.getOption<bool>        ("d3d9.supportD32",                    true);
+    // NV-DXVK start: optional D32F storage for D24 formats
+    // Unlike DXVK, this runtime stores D24 formats as D32F by default, which a reversed depth patch needs.
+    // The app defaults in config.cpp override dxvk.conf, so the default lives here, where dxvk.conf can still turn it off.
+    this->useD32forD24                  = config.getOption<bool>        ("d3d9.useD32forD24",                  true);
+    // NV-DXVK end
     this->disableA8RT                   = config.getOption<bool>        ("d3d9.disableA8RT",                   false);
     this->invariantPosition             = config.getOption<bool>        ("d3d9.invariantPosition",             false);
     this->memoryTrackTest               = config.getOption<bool>        ("d3d9.memoryTrackTest",               false);

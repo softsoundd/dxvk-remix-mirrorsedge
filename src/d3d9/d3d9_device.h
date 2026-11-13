@@ -1275,6 +1275,9 @@ namespace dxvk {
     bool                            m_nvATOC          = false;
     bool                            m_ffZTest         = false;
 
+    // NV-DXVK start: depth bias representation control
+    DxvkDepthBiasRepresentation     m_depthBiasRepresentation = { VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT, VK_FALSE };
+    // NV-DXVK end
     float                           m_depthBiasScale  = 0.0f;
 
     uint32_t                        m_robustSSBOAlignment     = 1;

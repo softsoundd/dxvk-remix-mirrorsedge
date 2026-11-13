@@ -39,6 +39,7 @@ namespace dxvk {
     // Returns true when NGX produced a valid output image.
     // Color, depth, and motion vectors must share the output resolution. motionVectorScale
     // converts stored motion-vector units into that resolution's pixels.
+    // depthInverted reports a depth that maps near to 1 and far to 0.
     bool dispatch(
       Rc<RtxContext> ctx,
       DxvkBarrierSet& barriers,
@@ -49,7 +50,8 @@ namespace dxvk {
       const Resources::Resource& controlMask,
       bool resetHistory,
       float motionVectorScaleX,
-      float motionVectorScaleY);
+      float motionVectorScaleY,
+      bool depthInverted);
 
     void release();
 

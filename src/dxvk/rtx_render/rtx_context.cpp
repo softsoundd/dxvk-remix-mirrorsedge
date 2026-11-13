@@ -459,6 +459,7 @@ namespace dxvk {
 
 
   void RtxContext::setNgxPassthroughFrameData(const Rc<DxvkImage>& sceneDepthImage,
+                                              const NgxSceneDepthLayout& sceneDepthLayout,
                                               const Rc<DxvkImage>& colorTargetImage,
                                               const Rc<DxvkImage>& colorMirrorImage,
                                               const Rc<DxvkImage>& upscaleSourceImage,
@@ -491,6 +492,7 @@ namespace dxvk {
     m_common->metaNgxPassthrough().setVelocityCaptureStats(velocityStats);
     m_common->metaNgxPassthrough().setSceneTransformOffset(sceneTransformOffset);
     m_common->metaNgxPassthrough().setSceneCameraFresh(cameraMatricesValid);
+    m_common->metaNgxPassthrough().setSceneDepthLayout(sceneDepthLayout);
   }
 
   void RtxContext::dispatchNgxPassthrough(Rc<DxvkImage> targetImage) {
