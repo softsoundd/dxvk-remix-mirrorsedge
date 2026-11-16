@@ -536,10 +536,11 @@ namespace dxvk {
                "aspect ratio) instead of the top mip. UE3 texture streaming creates a new D3D9 texture object per "
                "mip-count change, so a top-mip hash differs per streamed variant of one logical texture and everything "
                "keyed on texture hashes (replacements, categories, tags, material identity) stops matching while a "
-               "lower-mip variant is bound. The tail mips are present in every variant and copied byte-identically "
-               "between them by the engine, so this hash is stable across streaming and texture LOD settings by "
-               "construction - stateless and deterministic, no runtime learning. Unmipped textures and render targets "
-               "keep the standard top-mip hash. "
+               "lower-mip variant is bound. The tail is present in every variant. A texture with 8-bit channels is "
+               "hashed as its top tail mip and the mips the engine derives from it, since a reduced variant's own mips "
+               "can differ from the cooked ones. The hash is therefore stable across streaming and texture LOD settings "
+               "by construction - stateless and deterministic, no runtime learning. Unmipped textures and render "
+               "targets keep the standard top-mip hash. "
                "Note: the two schemes produce different hashes, so texture tags and replacements only match under the "
                "setting they were authored with. "
                "Only active when rtx.d3d9.ue3EngineMode is enabled.");
@@ -1509,8 +1510,9 @@ namespace dxvk {
 
     // The members below implement rtx.d3d9.ue3FlowLayers. See "Flow layers" in UE3Compatibility.md.
     const DxsoUe3FlowShaderInfo& getOrAnalyzeUe3FlowShader(XXH64_hash_t psHash, const D3D9CommonShader* pixelShader);
-    // Attaches the draw's flow layer to its material data. `compositePeriod` is the repeat of the bake the surface renders,
-    // whose texture coordinates are the interpolant over it, or null when it renders no bake.
+    // Attaches the draw's flow layer to its material data. `compositePeriod` is the span of the interpolant that one unit
+    // of the surface's texture coordinates covers while it renders a bake (Ue3CompositeDomain::surfacePeriod), or null
+    // when it renders no bake.
     void resolveUe3FlowLayers(const Ue3TextureState& ue3, const Vector2* compositePeriod);
     // Is the IA texcoord set the draw's flow layer reads besides the surface's own, or UINT32_MAX.
     // resolveUe3FlowLayers decides it from the shaders alone, so a geometry carries the set from its first draw.

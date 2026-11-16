@@ -207,6 +207,11 @@ exe = executable('test_ue3_view_layout',  files('test_ue3_view_layout.cpp'),
 test('test_ue3_view_layout', exe, env: test_env)
 tests += exe
 
+exe = executable('test_ue3_texture_tail',  files('test_ue3_texture_tail.cpp'),
+  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_ue3_texture_tail', exe, env: test_env)
+tests += exe
+
 exe = executable('test_f16tof32',  files('test_f16tof32.cpp'),  include_directories : test_include_path, dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_f16tof32', exe, env: test_env)
 tests += exe

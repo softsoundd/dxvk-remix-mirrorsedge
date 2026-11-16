@@ -696,7 +696,10 @@ namespace dxvk {
       Vector2(1.f), Vector2(0.f), // FlowMaskScale, FlowMaskOffset
       Vector2(1.f), Vector2(0.f), 0.f, // FlowTextureScale, FlowTextureOffset, FlowTextureRotation
       0.f, 0.f, // FlowTextureScrollRate, FlowTextureScrollAngle
-      1.f, -1.f // FlowNormalStrength, FlowRoughness
+      1.f, -1.f, // FlowNormalStrength, FlowRoughness
+      false, false, // AlbedoOpacityGameTiling, NormalGameTiling
+      false, false, // HeightGameTiling, RoughnessGameTiling
+      false, false // MetallicGameTiling, EmissiveColorGameTiling
     ));
 
     m_hasInitializedMaterialDataThisFrame = true;

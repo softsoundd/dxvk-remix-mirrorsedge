@@ -39,10 +39,12 @@
 #include "rtx_texture_manager.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx/pass/ue3_composite/ue3_composite_encode.h"
+#include "rtx/pass/ue3_composite/ue3_composite_flatten.h"
 #include "../../d3d9/d3d9_rtx.h"
 #include "../../d3d9/d3d9_spec_constants.h"
 
 #include <rtx_shaders/ue3_composite_encode.h>
+#include <rtx_shaders/ue3_composite_flatten.h>
 
 namespace dxvk {
 
@@ -61,6 +63,21 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(Ue3CompositeEncodeShader);
+
+    // Only a capture runs this one, so it is not prewarmed.
+    class Ue3CompositeFlattenShader : public ManagedShader {
+      SHADER_SOURCE(Ue3CompositeFlattenShader, VK_SHADER_STAGE_COMPUTE_BIT, ue3_composite_flatten)
+
+      PUSH_CONSTANTS(Ue3CompositeFlattenArgs)
+
+      BEGIN_PARAMETER()
+        SAMPLER2D(UE3_COMPOSITE_FLATTEN_SOURCE_INPUT)
+        SAMPLER2D(UE3_COMPOSITE_FLATTEN_MASKED_INPUT)
+        SAMPLER2D(UE3_COMPOSITE_FLATTEN_MASKED_HALF_INPUT)
+        SAMPLER2D(UE3_COMPOSITE_FLATTEN_MASK_INPUT)
+        RW_TEXTURE2D(UE3_COMPOSITE_FLATTEN_OUTPUT)
+      END_PARAMETER()
+    };
 
     // A bake still in a surface's material when it is released keeps its memory until the surface
     // rebinds, so only bakes no draw has used for a while are released.
@@ -102,6 +119,11 @@ namespace dxvk {
         h = std::max(h / 2, 1u);
       }
       return bytes;
+    }
+
+    // A one-level resource has no per-mip views, and its own view is mip 0.
+    const Rc<DxvkImageView>& mip0(const RtxMipmap::Resource& resource) {
+      return resource.views.empty() ? resource.view : resource.views[0];
     }
 
   }
@@ -453,10 +475,12 @@ namespace dxvk {
 
   namespace {
 
-    // A replacement that authors its own albedo was authored over the composite's repeat, so the
-    // surface only needs that repeat. The tiers are the ones SceneManager::determineMaterialData
-    // resolves, in its order.
-    bool replacementAuthorsAlbedo(SceneManager& sceneManager, const LegacyMaterialData& material) {
+    // Returns whether the replacement the draw resolves to authors an albedo that leaves the bake unused. Its albedo
+    // was authored over the composite's repeat, so the surface only needs that repeat, unless it repeats at the game's
+    // tiling under a lifted mask, which blends into it from the bake. The tiers are the ones
+    // SceneManager::determineMaterialData resolves, in its order.
+    bool replacementLeavesBakeUnused(SceneManager& sceneManager, const LegacyMaterialData& material,
+                                     const Ue3CompositeBakeRequest& request) {
       const std::unique_ptr<AssetReplacer>& replacer = sceneManager.getAssetReplacer();
       if (replacer == nullptr) {
         return false;
@@ -471,10 +495,15 @@ namespace dxvk {
           continue;
         }
         const std::shared_ptr<MaterialData> replacement = replacer->getReplacementMaterial(hash);
-        if (replacement != nullptr) {
-          return replacement->getType() == MaterialDataType::Opaque &&
-                 replacement->getOpaqueMaterialData().getAlbedoOpacityTexture().isValid();
+        if (replacement == nullptr) {
+          continue;
         }
+        if (replacement->getType() != MaterialDataType::Opaque) {
+          return false;
+        }
+        const OpaqueMaterialData& opaque = replacement->getOpaqueMaterialData();
+        return opaque.getAlbedoOpacityTexture().isValid() &&
+               !(opaque.getAlbedoOpacityGameTiling() && request.mask.has_value());
       }
       return false;
     }
@@ -482,8 +511,10 @@ namespace dxvk {
     // Moves the surface onto the bake's UVs. The game's own Runner Vision glow texture does not tile with them,
     // so a highlight glows the surface colour instead.
     void useBakeUvs(DrawCallState& drawCallState, const Ue3CompositeBakeRequest& request) {
-      drawCallState.modifyTransformData().textureTransform = request.domainTransform;
-      drawCallState.modifyMaterialData().ue3HighlightGlowTexture = TextureRef();
+      drawCallState.modifyTransformData().textureTransform = request.surfaceTransform;
+      LegacyMaterialData& material = drawCallState.modifyMaterialData();
+      material.ue3HighlightGlowTexture = TextureRef();
+      material.ue3CompositeMaskCaptureRepeat = request.mask.has_value() ? request.mask->captureRepeat : Vector2i(0, 0);
     }
 
   }
@@ -498,7 +529,7 @@ namespace dxvk {
     Ue3CompositeBaker& baker = getSceneManager().getUe3CompositeBaker();
     const uint32_t frame = m_device->getCurrentFrameId();
 
-    if (replacementAuthorsAlbedo(getSceneManager(), drawCallState.getMaterialData())) {
+    if (replacementLeavesBakeUnused(getSceneManager(), drawCallState.getMaterialData(), *request)) {
       useBakeUvs(drawCallState, *request);
       baker.markSettled(request->key);
       return;
@@ -534,6 +565,7 @@ namespace dxvk {
     material.ue3CompositeSampler = entry->sampler;
     material.ue3CompositeIdentity = entry->identity;
     material.ue3CompositeEmissiveIntensity = baker.emissiveIntensity(frame);
+    material.ue3CompositeCoverage = entry->coverage;
     if (entry->mask.has_value() && entry->maskedAlbedo.isValid()) {
       material.ue3CompositeMaskedAlbedo = TextureRef(entry->maskedAlbedo.view);
       material.ue3CompositeMaskedHalfAlbedo =
@@ -735,10 +767,6 @@ namespace dxvk {
       DxvkContext::draw(kUe3CompositeBakeVertexCount, 1, 0, 0);
     };
 
-    // A one-level resource has no per-mip views, and its own view is mip 0.
-    auto mip0 = [](const RtxMipmap::Resource& resource) {
-      return resource.views.empty() ? resource.view : resource.views[0];
-    };
     auto encode = [&](const RtxMipmap::Resource& albedo, const bool storeEmission) {
       Ue3CompositeEncodeArgs args = {};
       args.resolution = { request.width, request.height };
@@ -836,6 +864,7 @@ namespace dxvk {
     entry.height = request.height;
     entry.period = request.period;
     entry.alphaBlend = request.multiplyScale > 0.0f;
+    entry.coverage = request.coverageFromAlpha;
     entry.live = request.live;
     if (request.live) {
       entry.passTarget = passTarget;
@@ -857,6 +886,73 @@ namespace dxvk {
 
     baker.store(request.key, std::move(entry));
     return true;
+  }
+
+  Rc<DxvkImage> RtxContext::flattenUe3CompositeForCapture(const LegacyMaterialData& material, const bool emission) {
+    const Vector2i& repeat = material.ue3CompositeMaskCaptureRepeat;
+    DxvkImageView* const source =
+      emission ? material.ue3CompositeEmissive.getImageView() : material.ue3CompositeAlbedo.getImageView();
+    DxvkImageView* const maskedAlbedo = material.ue3CompositeMaskedAlbedo.getImageView();
+    DxvkImageView* const maskedHalfAlbedo = material.ue3CompositeMaskedHalfAlbedo.getImageView();
+    DxvkImageView* const mask = material.ue3CompositeMask.getImageView();
+    if (repeat.x <= 0 || repeat.y <= 0 || source == nullptr || maskedAlbedo == nullptr || mask == nullptr ||
+        material.ue3CompositeSampler.ptr() == nullptr) {
+      return nullptr;
+    }
+
+    ScopedGpuProfileZone(this, "UE3 Composite Capture Flatten");
+    Rc<DxvkContext> ctx = this;
+
+    // Each axis keeps the bake's density over the repeats it covers, up to the size a bake can have.
+    const uint64_t maxSize = std::max(D3D9Rtx::ue3CompositeMaxResolution(), 1u);
+    auto outputSize = [maxSize](const uint32_t bakeSize, const int32_t repeats) {
+      const uint64_t wanted = uint64_t(bakeSize) * uint64_t(repeats);
+      uint64_t size = 1;
+      while (size < wanted && size < maxSize) {
+        size *= 2;
+      }
+      return uint32_t(std::min(size, maxSize));
+    };
+    const VkExtent3D sourceExtent = source->image()->info().extent;
+    const VkExtent3D extent = { outputSize(sourceExtent.width, repeat.x), outputSize(sourceExtent.height, repeat.y), 1 };
+    const VkClearColorValue clear = { 0.0f, 0.0f, 0.0f, 0.0f };
+    RtxMipmap::Resource output = RtxMipmap::createResource(
+      ctx, emission ? "UE3 composite capture emission" : "UE3 composite capture albedo", extent, source->info().format, 0,
+      clear, mipLevelCount(extent.width, extent.height));
+
+    Ue3CompositeFlattenArgs args = {};
+    args.resolution = { extent.width, extent.height };
+    args.repeat = vec2(float(repeat.x), float(repeat.y));
+    args.maskTransform = material.ue3CompositeMaskTransform;
+    args.maskChannel = material.ue3CompositeMaskChannel;
+    if (!emission) {
+      args.flags = UE3_COMPOSITE_FLATTEN_FLAG_MASK |
+                   (maskedHalfAlbedo != nullptr ? UE3_COMPOSITE_FLATTEN_FLAG_QUADRATIC : 0u) |
+                   (material.ue3CompositeMaskIsSrgb ? UE3_COMPOSITE_FLATTEN_FLAG_MASK_SRGB : 0u);
+    }
+    setPushConstantBank(DxvkPushConstantBank::RTX);
+    pushConstants(0, sizeof(args), &args);
+
+    auto bindInput = [&](const uint32_t slot, DxvkImageView* const view) {
+      bindResourceView(slot, Rc<DxvkImageView>(view), nullptr);
+      bindResourceSampler(slot, material.ue3CompositeSampler);
+    };
+    bindInput(UE3_COMPOSITE_FLATTEN_SOURCE_INPUT, source);
+    bindInput(UE3_COMPOSITE_FLATTEN_MASKED_INPUT, maskedAlbedo);
+    // Every input needs a view, though a linear mask never reads this one.
+    bindInput(UE3_COMPOSITE_FLATTEN_MASKED_HALF_INPUT, maskedHalfAlbedo != nullptr ? maskedHalfAlbedo : maskedAlbedo);
+    bindInput(UE3_COMPOSITE_FLATTEN_MASK_INPUT, mask);
+    bindResourceView(UE3_COMPOSITE_FLATTEN_OUTPUT, mip0(output), nullptr);
+    bindShader(VK_SHADER_STAGE_COMPUTE_BIT, Ue3CompositeFlattenShader::getShader());
+    const VkExtent3D workgroups = util::computeBlockCount(extent, VkExtent3D { 16, 16, 1 });
+    dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    // The albedo of an alpha blend, which a multiply is baked as, has mips that weight colour by opacity, as its bake's do.
+    const bool alphaBlend = !emission && material.blendMode.enableBlending &&
+                            material.blendMode.colorSrcFactor == VK_BLEND_FACTOR_SRC_ALPHA &&
+                            material.blendMode.colorDstFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    RtxMipmap::updateMipmap(this, output, alphaBlend ? MipmapMethod::AlphaWeighted : MipmapMethod::Simple);
+    return output.image;
   }
 
 }

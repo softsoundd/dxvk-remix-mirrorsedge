@@ -46,6 +46,7 @@ namespace dxvk {
   class SceneManager;
   class TerrainBaker;
   struct ExternalDrawState;
+  struct LegacyMaterialData;
   struct Ue3CompositeBakeRequest;
   struct Ue3ToneMapCapture;
 
@@ -194,6 +195,11 @@ namespace dxvk {
     Rc<DxvkImageView> getAtmosphereSkyViewLutView() const;
 
     RtxClouds& getClouds() const { return *m_clouds; }
+
+    // Lays the material's composite bake (rtx.ue3CompositeMaterialTextures) out over the repeats a capture bakes its
+    // mask in over, as the albedo with the mask blended in or as the emission repeated to line up with it.
+    // Returns null when the bake has no mask a capture can bake in, or no emission to repeat.
+    Rc<DxvkImage> flattenUe3CompositeForCapture(const LegacyMaterialData& material, bool emission);
 
 #ifdef REMIX_DEVELOPMENT
     /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */

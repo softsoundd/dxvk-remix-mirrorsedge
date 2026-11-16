@@ -383,6 +383,13 @@ private:
     HWND hwnd;
   };
   std::unique_ptr<Capture> m_pCap;
+  // Holds the draw that each material new to a pass of captureInstances is captured from, chosen among all the draws
+  // the pass sees.
+  struct PendingMaterial {
+    const LegacyMaterialData* material = nullptr;
+    bool bEnableOpacity = false;
+  };
+  std::unordered_map<XXH64_hash_t, PendingMaterial> m_pendingMaterials;
 };
 
 }

@@ -60,6 +60,15 @@
   X(FlowNormalStrength,     flow_normal_strength,      float,   0.f,               16.f,             1.f) \
   X(FlowRoughness,          flow_roughness,            float,   -1.f,              1.f,              -1.f)
 
+// See "Game tiling" in UE3Compatibility.md.
+#define LIST_GAME_TILING_CONSTANTS(X) \
+  X(AlbedoOpacityGameTiling, diffuse_texture_game_tiling,             bool, false, true, false) \
+  X(NormalGameTiling,        normalmap_texture_game_tiling,           bool, false, true, false) \
+  X(HeightGameTiling,        height_texture_game_tiling,              bool, false, true, false) \
+  X(RoughnessGameTiling,     reflectionroughness_texture_game_tiling, bool, false, true, false) \
+  X(MetallicGameTiling,      metallic_texture_game_tiling,            bool, false, true, false) \
+  X(EmissiveColorGameTiling, emissive_mask_texture_game_tiling,       bool, false, true, false)
+
 #define LIST_OPAQUE_MATERIAL_TEXTURES(X) \
   /*Parameter Name,                          USD Token String,                     Type,       UNUSED...   Default Value */ \
   X(AlbedoOpacityTexture,                    diffuse_texture,                      TextureRef, void, void, {}) \
@@ -124,7 +133,8 @@
   X(DLSSControlMaskToneStrength,      dlss_control_mask_tone_strength,        float,          0.f,                        1.f,                        0.3f) \
   X(DLSSControlMaskStructuralStrength, dlss_control_mask_structural_strength, float,          0.f,                        1.f,                        0.7f) \
   LIST_TEXTURE_TRANSFORM_CONSTANTS(X) \
-  LIST_FLOW_LAYER_CONSTANTS(X)
+  LIST_FLOW_LAYER_CONSTANTS(X) \
+  LIST_GAME_TILING_CONSTANTS(X)
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \
@@ -419,6 +429,7 @@ namespace dxvk {
 
 #undef LIST_TEXTURE_TRANSFORM_CONSTANTS
 #undef LIST_FLOW_LAYER_CONSTANTS
+#undef LIST_GAME_TILING_CONSTANTS
 #undef LIST_OPAQUE_MATERIAL_TEXTURES
 #undef LIST_OPAQUE_MATERIAL_CONSTANTS
 #undef LIST_OPAQUE_MATERIAL_PARAMS

@@ -356,7 +356,13 @@ namespace {
           src.getFlowTextureScrollRate(),
           src.getFlowTextureScrollAngle(),
           src.getFlowNormalStrength(),
-          src.getFlowRoughness()
+          src.getFlowRoughness(),
+          src.getAlbedoOpacityGameTiling(),
+          src.getNormalGameTiling(),
+          src.getHeightGameTiling(),
+          src.getRoughnessGameTiling(),
+          src.getMetallicGameTiling(),
+          src.getEmissiveColorGameTiling()
         } };
       }
       case MaterialDataType::Translucent: 
@@ -472,13 +478,16 @@ namespace {
           hasTextureTransform && extOpaque->textureScale_hasvalue ? tovec2(extOpaque->textureScale_value) : Vector2(1.f),
           hasTextureTransform ? tovec2(extOpaque->textureOffset) : Vector2(0.f),
           hasTextureTransform ? extOpaque->textureRotation : 0.f,
-          // The API has no flow layer parameters, so these are the defaults.
+          // The API has no flow layer or game tiling parameters, so these are the defaults.
           true, // EnableFlowLayer
           0, 0, // FlowNormalEncoding, FlowMaskChannel
           Vector2(1.f), Vector2(0.f), // FlowMaskScale, FlowMaskOffset
           Vector2(1.f), Vector2(0.f), 0.f, // FlowTextureScale, FlowTextureOffset, FlowTextureRotation
           0.f, 0.f, // FlowTextureScrollRate, FlowTextureScrollAngle
           1.f, -1.f, // FlowNormalStrength, FlowRoughness
+          false, false, // AlbedoOpacityGameTiling, NormalGameTiling
+          false, false, // HeightGameTiling, RoughnessGameTiling
+          false, false, // MetallicGameTiling, EmissiveColorGameTiling
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {

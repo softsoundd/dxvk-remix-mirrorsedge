@@ -1,0 +1,55 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+#include "rtx/utility/color.slangh"
+
+// Blends a UE3 composite bake (rtx.ue3CompositeMaterialTextures) by the mask it leaves out of its repeat. A surface
+// blends per hit, and a capture bakes the blend into the albedo it exports. See "Masks" in UE3Compatibility.md.
+
+// Returns the mask's value from one channel of its texel, decoded as the game samples it.
+// The alpha channel is never decoded.
+float maskLayerDecode(vec4 maskSample, uint channel, bool srgb)
+{
+  float mask = maskSample[channel];
+  if (srgb && channel != 3)
+  {
+    mask = pow(mask, kSRGBGamma);
+  }
+  return saturate(mask);
+}
+
+// Returns the albedo at a mask value from the albedos baked with the mask at 0 and 1, and at 1/2 for a quadratic mask.
+// The bakes are gamma encoded as legacy albedo is, and the game computes in linear.
+vec3 maskLayerBlendAlbedo(vec3 albedo, vec3 maskedAlbedo, vec3 maskedHalfAlbedo, bool quadratic, float mask)
+{
+  if (quadratic)
+  {
+    // Lagrange interpolation through the bakes at 0, 1/2 and 1 is exact for a colour quadratic in the mask.
+    const vec3 interpolated = gammaToLinear(albedo) * ((1.0f - mask) * (1.0f - 2.0f * mask)) +
+                              gammaToLinear(maskedHalfAlbedo) * (4.0f * mask * (1.0f - mask)) +
+                              gammaToLinear(maskedAlbedo) * (mask * (2.0f * mask - 1.0f));
+    return linearToGamma(saturate(interpolated));
+  }
+
+  return linearToGamma(mix(gammaToLinear(albedo), gammaToLinear(maskedAlbedo), mask));
+}

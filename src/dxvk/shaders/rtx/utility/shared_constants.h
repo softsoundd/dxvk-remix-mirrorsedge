@@ -84,6 +84,15 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // Is set when the colour is quadratic in the mask, so the surface interpolates through the bake at 1/2.
 #define MASK_LAYER_MATERIAL_FLAG_QUADRATIC (1 << 3)
 
+// MaskLayerMaterial::bakeTextures holds a bit for each of the surface's textures read at MaskLayerMaterial::surfaceRepeats:
+// the bake's own, and those a replacement reads at the game's tiling.
+#define MASK_LAYER_MATERIAL_BAKE_ALBEDO (1 << 0)
+#define MASK_LAYER_MATERIAL_BAKE_NORMAL (1 << 1)
+#define MASK_LAYER_MATERIAL_BAKE_HEIGHT (1 << 2)
+#define MASK_LAYER_MATERIAL_BAKE_ROUGHNESS (1 << 3)
+#define MASK_LAYER_MATERIAL_BAKE_METALLIC (1 << 4)
+#define MASK_LAYER_MATERIAL_BAKE_EMISSIVE (1 << 5)
+
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER (1 << 1)

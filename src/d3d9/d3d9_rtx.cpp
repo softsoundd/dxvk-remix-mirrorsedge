@@ -2100,7 +2100,7 @@ namespace dxvk {
       if (m_frameOptions.ue3FlowLayers) {
         const auto compositeState = composite ? m_ue3CompositeMaterials.find(m_activeDrawCallState.materialData.getHash())
                                               : m_ue3CompositeMaterials.end();
-        resolveUe3FlowLayers(ue3, compositeState != m_ue3CompositeMaterials.end() ? &compositeState->second.period : nullptr);
+        resolveUe3FlowLayers(ue3, compositeState != m_ue3CompositeMaterials.end() ? &compositeState->second.surfacePeriod : nullptr);
       }
     }
 

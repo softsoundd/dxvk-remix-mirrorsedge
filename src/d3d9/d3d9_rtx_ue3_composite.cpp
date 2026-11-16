@@ -654,9 +654,12 @@ namespace dxvk {
     }
 
     if (liftMask) {
+      const float maskScaleU = maskCandidate->scaleU * periodU;
+      const float maskScaleV = maskCandidate->scaleV * periodV;
       domain.mask = Ue3CompositeDomain::LiftedMask {
         maskCandidate->stage, maskCandidate->channel, maskCandidate->degree,
-        Vector4(maskCandidate->scaleU * periodU, maskCandidate->scaleV * periodV, maskCandidate->offsetU, maskCandidate->offsetV) };
+        Vector4(maskScaleU, maskScaleV, maskCandidate->offsetU, maskCandidate->offsetV),
+        Vector2i(int(solveUe3CompositeMaskCaptureRepeat(maskScaleU)), int(solveUe3CompositeMaskCaptureRepeat(maskScaleV))) };
     }
 
     domain.neededWidth = neededResolution(std::move(texelsU), periodU);
@@ -776,7 +779,7 @@ namespace dxvk {
     request->width = domain.width;
     request->height = domain.height;
     request->period = domain.period;
-    request->domainTransform = domain.transform;
+    request->surfaceTransform = domain.surfaceTransform();
     // A multiplying draw multiplies by its whole output, emission included.
     request->emissivePass = info.hasEmissive && info.lighting != DxsoUe3CompositeLighting::Unlit && domain.multiplyScale == 0.0f;
     request->storeEmission = domain.storeEmission;
@@ -844,6 +847,7 @@ namespace dxvk {
       mask.channel = domain.mask->channel;
       mask.degree = domain.mask->degree;
       mask.transform = domain.mask->transform;
+      mask.captureRepeat = domain.mask->captureRepeat;
       request->mask = std::move(mask);
     }
 
@@ -1106,18 +1110,20 @@ namespace dxvk {
     record.constantsHash = state.live ? kEmptyHash : constantsHash;
     const XXH64_hash_t key = XXH3_64bits(&record, sizeof(record));
 
+    const Vector2 surfacePeriod = domain.surfacePeriod();
+    const Matrix4 surfaceTransform = domain.surfaceTransform();
     if (!state.hasDomain) {
       state.hasDomain = true;
-      state.period = domain.period;
-      state.domainTransform = domain.transform;
+      state.surfacePeriod = surfacePeriod;
+      state.surfaceTransform = surfaceTransform;
     } else if (!state.domainConflictWarned &&
-               (state.period.x != domain.period.x || state.period.y != domain.period.y ||
-                state.domainTransform != domain.transform)) {
+               (state.surfacePeriod.x != surfacePeriod.x || state.surfacePeriod.y != surfacePeriod.y ||
+                state.surfaceTransform != surfaceTransform)) {
       state.domainConflictWarned = true;
       Logger::warn(str::format(
         "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash, std::dec,
-        " is drawn with two UV repeats, (", state.period.x, ",", state.period.y, ") and (", domain.period.x, ",",
-        domain.period.y, "): a replacement authored over one of them is misaligned on the other. Material identity "
+        " is drawn with two UV repeats, (", state.surfacePeriod.x, ",", state.surfacePeriod.y, ") and (", surfacePeriod.x, ",",
+        surfacePeriod.y, "): a replacement authored over one of them is misaligned on the other. Material identity "
         "leaves tiling parameters out, so these are materials that differ only by their tiling."));
     }
 
@@ -1146,6 +1152,13 @@ namespace dxvk {
         const char* blendNote = domain.multiplyScale > 0.0f
           ? " baked as an alpha blend"
           : domain.opacityAlpha ? " baked with its opacity" : "";
+        std::string maskCapture;
+        if (request->mask.has_value()) {
+          const Vector2i& captureRepeat = request->mask->captureRepeat;
+          maskCapture = captureRepeat.x > 0 && captureRepeat.y > 0
+            ? str::format(" captured with the mask over ", captureRepeat.x, "x", captureRepeat.y, " repeats")
+            : std::string(" captured with the mask at 0");
+        }
         Logger::info(str::format(
           "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash,
           " textureSetShader=0x", textureSetShaderHash, " pick=0x", pickHash, " key=0x", key, std::dec,
@@ -1160,9 +1173,9 @@ namespace dxvk {
           info.viewDependent ? " view-dependent terms baked face-on" : "",
           state.live ? " re-baked every frame" : "",
           " layers=[", described.description, "] constants=[", constants, "] repeat=(", domain.period.x, ",", domain.period.y, ")",
-          " bake=", formatBakeSize(domain), " (~", megabytes, " MB)",
-          " uvTransform=(", domain.transform[0].x, ",", domain.transform[1].y, ",",
-          domain.transform[3].x, ",", domain.transform[3].y, ")"));
+          maskCapture, " bake=", formatBakeSize(domain), " (~", megabytes, " MB)",
+          " uvTransform=(", request->surfaceTransform[0].x, ",", request->surfaceTransform[1].y, ",",
+          request->surfaceTransform[3].x, ",", request->surfaceTransform[3].y, ")"));
       }
     }
 

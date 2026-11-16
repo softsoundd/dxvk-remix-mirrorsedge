@@ -22,6 +22,7 @@
 #pragma once
 
 #include "opaque_surface_material_blending.slangh"
+#include "mask_layer_blend.slangh"
 
 // Opaque Surface Material Interaction Constants
 
@@ -39,6 +40,56 @@ static const float roughnessThreshold = float(0.001f);
 #define OPAQUE_MATERIAL_USE_BOUNDED_VNDF_SAMPLING 1
 
 // Opaque Surface Material Interaction Helper Functions
+
+// Describes the textures a surface with a UE3 composite's lifted mask (rtx.ue3CompositeMaterialTextures) reads at
+// surfaceRepeats times its texture coordinates, which a capture lays the mask out over: the bake's own, and those a
+// replacement reads at the game's tiling. See "Game tiling" in UE3Compatibility.md.
+struct OpaqueSurfaceMaterialBakeSpace
+{
+  // Holds the MASK_LAYER_MATERIAL_BAKE_* bits of those textures.
+  uint textures;
+  vec2 surfaceRepeats;
+};
+
+// Returns the surface's bake space.
+// Returns one that holds no textures when the surface has no mask layer.
+OpaqueSurfaceMaterialBakeSpace opaqueSurfaceMaterialBakeSpaceCreate(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  OpaqueSurfaceMaterialBakeSpace bakeSpace;
+  bakeSpace.textures = 0u;
+  bakeSpace.surfaceRepeats = vec2(1.0f);
+
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER) != 0)
+  {
+    const MaskLayerMaterial maskLayer = maskLayerMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.maskLayerIndex]);
+    bakeSpace.textures = maskLayer.bakeTextures;
+    bakeSpace.surfaceRepeats = maskLayer.surfaceRepeats;
+  }
+
+  return bakeSpace;
+}
+
+// Returns the interaction that reads at `repeats` times the surface's texture coordinates.
+SurfaceInteraction opaqueSurfaceMaterialRepeatInteraction(SurfaceInteraction surfaceInteraction, vec2 repeats)
+{
+  SurfaceInteraction repeatInteraction = surfaceInteraction;
+  repeatInteraction.textureCoordinates = surfaceInteraction.textureCoordinates * repeats;
+  repeatInteraction.textureGradientX = surfaceInteraction.textureGradientX * repeats;
+  repeatInteraction.textureGradientY = surfaceInteraction.textureGradientY * repeats;
+  return repeatInteraction;
+}
+
+// Returns the interaction the texture with the MASK_LAYER_MATERIAL_BAKE_* bit `texture` reads with.
+// Returns bakeInteraction when the bake space holds the texture.
+// Returns surfaceInteraction otherwise.
+SurfaceInteraction opaqueSurfaceMaterialBakeSpaceTextureInteraction(
+  OpaqueSurfaceMaterialBakeSpace bakeSpace,
+  uint texture,
+  SurfaceInteraction surfaceInteraction,
+  SurfaceInteraction bakeInteraction)
+{
+  return (bakeSpace.textures & texture) != 0 ? bakeInteraction : surfaceInteraction;
+}
 
 #ifdef OPAQUE_MATERIAL_USE_POM
 // Parallax Occlusion Mapping Helper Functions
@@ -340,6 +391,47 @@ float pomSampleVisibility(
   return saturate(visibility);
 }
 
+// Returns how many times per unit of the surface's texture coordinates its height map repeats. Displacement is measured
+// in widths of the height map's own texture coordinates, so it marches over them.
+// Returns the bake space's surfaceRepeats when the height map is at the game's tiling.
+// Returns 1 otherwise.
+vec2 opaqueSurfaceMaterialHeightRepeats(OpaqueSurfaceMaterial opaqueSurfaceMaterial)
+{
+  const OpaqueSurfaceMaterialBakeSpace bakeSpace = opaqueSurfaceMaterialBakeSpaceCreate(opaqueSurfaceMaterial);
+  return (bakeSpace.textures & MASK_LAYER_MATERIAL_BAKE_HEIGHT) != 0 ? bakeSpace.surfaceRepeats : vec2(1.0f);
+}
+
+// Returns the world length of the longer axis of texture coordinates that repeat `repeats` times as often as the
+// surface's, as a fraction of the surface's longer axis. The raw tangent lengths are the surface's, the longer of them 1.
+float pomRepeatsTangentScale(vec2 repeats, float rawTangentLength, float rawBitangentLength)
+{
+  return max(rawTangentLength / repeats.x, rawBitangentLength / repeats.y);
+}
+
+// Returns a texture space direction relative to texture coordinates that repeat `repeats` times as often as the
+// surface's, given pomRepeatsTangentScale's tangentScale for them.
+vec3 pomRepeatsDirection(vec3 direction, vec2 repeats, float tangentScale)
+{
+  return normalize(vec3(direction.xy * repeats * tangentScale, direction.z));
+}
+
+// Returns pomCalculateTexcoord's hit, in the height map's own texture coordinates, for a view direction in the surface's
+// normalized tangent frame, which counts the surface's texture coordinates as equally long on both axes.
+float3 pomCalculateTexcoordAtHeightRepeats(
+  OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  SurfaceInteraction surfaceInteraction,
+  vec3 viewDirTangentSpace,
+  inout uint iterations)
+{
+  const vec2 heightRepeats = opaqueSurfaceMaterialHeightRepeats(opaqueSurfaceMaterial);
+  if (any(heightRepeats != vec2(1.0f)))
+  {
+    surfaceInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, heightRepeats);
+    viewDirTangentSpace = pomRepeatsDirection(viewDirTangentSpace, heightRepeats, pomRepeatsTangentScale(heightRepeats, 1.0f, 1.0f));
+  }
+  return pomCalculateTexcoord(opaqueSurfaceMaterial, surfaceInteraction, viewDirTangentSpace, iterations);
+}
+
 float opaqueSurfaceMaterialInteractionCalcHeightThroughput(
   MinimalSurfaceInteraction minimalSurfaceInteraction,
   vec3 rayDirection,
@@ -351,7 +443,15 @@ float opaqueSurfaceMaterialInteractionCalcHeightThroughput(
     minimalSurfaceInteraction.geometryTangent,
     minimalSurfaceInteraction.geometryBitangent,
     minimalSurfaceInteraction.geometryNormal);
-  const vec3 lightDirTangentSpace = normalize(mul(worldToTangent, rayDirection));
+  vec3 lightDirTangentSpace = normalize(mul(worldToTangent, rayDirection));
+
+  // The tangent frame is normalized, so the surface's texture coordinates count as equally long on both axes.
+  const vec2 heightRepeats = opaqueSurfaceMaterialHeightRepeats(opaqueSurfaceMaterial);
+  if (any(heightRepeats != vec2(1.0f)))
+  {
+    texcoord *= heightRepeats;
+    lightDirTangentSpace = pomRepeatsDirection(lightDirTangentSpace, heightRepeats, pomRepeatsTangentScale(heightRepeats, 1.0f, 1.0f));
+  }
   return pomSampleVisibility(opaqueSurfaceMaterial, texcoord, lightDirTangentSpace);
 }
 #endif
@@ -674,10 +774,10 @@ vec3 opaqueSurfaceMaterialHighlightGlow(Surface surface, vec3 albedo, vec4 emiss
 
 // Blends the albedo towards the bake with a lifted mask at 1 (rtx.ue3CompositeMaterialTextures),
 // or interpolates through the bakes at 0, 1/2 and 1 when the colour is quadratic in the mask.
-// The game computes in linear, and the bakes are gamma encoded as legacy albedo is.
+// bakeInteraction reads at the bake space's surfaceRepeats. A surface the mask does not blend into has no mask textures.
 void opaqueSurfaceMaterialApplyMaskLayer(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
-  SurfaceInteraction surfaceInteraction,
+  SurfaceInteraction bakeInteraction,
   float lodBias,
   inout vec3 albedo)
 {
@@ -688,43 +788,29 @@ void opaqueSurfaceMaterialApplyMaskLayer(
 
   const MaskLayerMaterial maskLayer = maskLayerMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.maskLayerIndex]);
   vec4 maskedAlbedoSample;
-  if (!surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, maskedAlbedoSample, lodBias))
+  if (!surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, bakeInteraction, maskedAlbedoSample, lodBias))
   {
     return;
   }
 
-  SurfaceInteraction maskInteraction = surfaceInteraction;
-  maskInteraction.textureCoordinates = surfaceInteraction.textureCoordinates * maskLayer.maskScale + maskLayer.maskOffset;
-  maskInteraction.textureGradientX = surfaceInteraction.textureGradientX * maskLayer.maskScale;
-  maskInteraction.textureGradientY = surfaceInteraction.textureGradientY * maskLayer.maskScale;
+  SurfaceInteraction maskInteraction = bakeInteraction;
+  maskInteraction.textureCoordinates = bakeInteraction.textureCoordinates * maskLayer.maskScale + maskLayer.maskOffset;
+  maskInteraction.textureGradientX = bakeInteraction.textureGradientX * maskLayer.maskScale;
+  maskInteraction.textureGradientY = bakeInteraction.textureGradientY * maskLayer.maskScale;
   vec4 maskSample;
   if (!surfaceMaterialInteractionTextureReadHelper(maskLayer.maskTextureIndex, opaqueSurfaceMaterial.samplerIndex, maskInteraction, maskSample, lodBias))
   {
     return;
   }
 
-  // The mask is decoded as the game samples it. Alpha never is.
   const uint channel = maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_CHANNEL_MASK;
-  float mask = maskSample[channel];
-  if ((maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_SRGB) != 0 && channel != 3)
-  {
-    mask = pow(mask, kSRGBGamma);
-  }
-  mask = saturate(mask);
+  const float mask = maskLayerDecode(maskSample, channel, (maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_SRGB) != 0);
 
-  vec4 maskedHalfAlbedoSample;
-  if ((maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_QUADRATIC) != 0 &&
-      surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedHalfAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, maskedHalfAlbedoSample, lodBias))
-  {
-    // Lagrange interpolation through the bakes at 0, 1/2 and 1 is exact for a colour quadratic in the mask.
-    const vec3 interpolated = gammaToLinear(albedo) * ((1.0f - mask) * (1.0f - 2.0f * mask)) +
-                              gammaToLinear(maskedHalfAlbedoSample.rgb) * (4.0f * mask * (1.0f - mask)) +
-                              gammaToLinear(maskedAlbedoSample.rgb) * (mask * (2.0f * mask - 1.0f));
-    albedo = linearToGamma(saturate(interpolated));
-    return;
-  }
-
-  albedo = linearToGamma(mix(gammaToLinear(albedo), gammaToLinear(maskedAlbedoSample.rgb), mask));
+  vec4 maskedHalfAlbedoSample = vec4(0.0f);
+  const bool quadratic =
+    (maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_QUADRATIC) != 0 &&
+    surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedHalfAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, bakeInteraction, maskedHalfAlbedoSample, lodBias);
+  albedo = maskLayerBlendAlbedo(albedo, maskedAlbedoSample.rgb, maskedHalfAlbedoSample.rgb, quadratic, mask);
 }
 
 // Scrolls one of a flow layer's reads to (dot(r0, uv), dot(r1, uv)) + offset + velocity * time, from the surface's texture
@@ -1003,13 +1089,22 @@ OpaqueSurfaceMaterialParticleSamples opaqueSurfaceMaterialParticleSamplesRead(
   const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
   const float materialLodBias = isHairCardMaterial ? cb.hairCardMipBias : 0.0f;
 
+  const OpaqueSurfaceMaterialBakeSpace bakeSpace = opaqueSurfaceMaterialBakeSpaceCreate(opaqueSurfaceMaterial);
+  const SurfaceInteraction bakeInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, bakeSpace.surfaceRepeats);
+  const SurfaceInteraction albedoInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_ALBEDO, surfaceInteraction, bakeInteraction);
+  const SurfaceInteraction emissiveInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_EMISSIVE, surfaceInteraction, bakeInteraction);
+  const SurfaceInteraction metallicInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_METALLIC, surfaceInteraction, bakeInteraction);
+
   OpaqueSurfaceMaterialParticleSamples samples;
   samples.albedoOpacity = vec4(0.0f);
   samples.emissiveColor = vec4(0.0f);
   samples.metallic = vec4(0.0f);
-  samples.albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, samples.albedoOpacity, materialLodBias);
-  samples.emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, samples.emissiveColor, materialLodBias);
-  samples.metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, samples.metallic, materialLodBias);
+  samples.albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, albedoInteraction, samples.albedoOpacity, materialLodBias);
+  samples.emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, emissiveInteraction, samples.emissiveColor, materialLodBias);
+  samples.metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, metallicInteraction, samples.metallic, materialLodBias);
 
   return samples;
 }
@@ -1036,7 +1131,9 @@ void opaqueSurfaceMaterialParticleResolve(
   {
     albedo = samples.albedoOpacity.rgb;
     const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
-    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, surfaceInteraction, isHairCardMaterial ? cb.hairCardMipBias : 0.0f, albedo);
+    const OpaqueSurfaceMaterialBakeSpace bakeSpace = opaqueSurfaceMaterialBakeSpaceCreate(opaqueSurfaceMaterial);
+    const SurfaceInteraction bakeInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, bakeSpace.surfaceRepeats);
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, bakeInteraction, isHairCardMaterial ? cb.hairCardMipBias : 0.0f, albedo);
     opacity = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS) ? float(1.0f) : samples.albedoOpacity.a;
   }
 
@@ -1111,6 +1208,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
 
   opaqueSurfaceMaterialInteraction.flags |= thinFilmEnabled ? OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER : 0;
 
+  const OpaqueSurfaceMaterialBakeSpace bakeSpace = opaqueSurfaceMaterialBakeSpaceCreate(opaqueSurfaceMaterial);
+
 #ifdef OPAQUE_MATERIAL_USE_POM
   if (EnablePom && cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
   {
@@ -1128,23 +1227,36 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
       basisDeterminant);
     // Note: -1.f * TextureGradientX has the same x,y direction as viewDirTextureSpace, but calculating the correct z value is non-obvious.
     // Could potentially remove the need for the world to texture space transform if a faster way to calculate that z value is found.
-    
+
+    // A height map at the game's tiling marches over its own repeats, in whose widths its displacement is measured.
+    SurfaceInteraction heightInteraction = surfaceInteraction;
+    vec2 heightRepeats = vec2(1.0f);
+    float heightTangentScale = 1.0f;
+    if ((bakeSpace.textures & MASK_LAYER_MATERIAL_BAKE_HEIGHT) != 0)
+    {
+      heightRepeats = bakeSpace.surfaceRepeats;
+      heightTangentScale = pomRepeatsTangentScale(heightRepeats, length(surfaceInteraction.rawTangent), length(surfaceInteraction.rawBitangent));
+      heightInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, heightRepeats);
+      viewDirTextureSpace = pomRepeatsDirection(viewDirTextureSpace, heightRepeats, heightTangentScale);
+    }
+
     uint iterations = 0; // unused
     const float3 pomHit = pomCalculateTexcoord(
         opaqueSurfaceMaterial,
-        surfaceInteraction,
+        heightInteraction,
         viewDirTextureSpace,
         iterations);
-    const vec2 pomTextureCoordinates = pomHit.xy;
+    const vec2 pomTextureCoordinates = pomHit.xy / heightRepeats;
 
     // Distance along the view ray from the low poly hit to the POM hit, for POM silhouettes behind translucency.
-    // The march passes the low poly hit at the height displaceIn / (displaceIn + displaceOut), in rawTangentScale world units.
+    // The march passes the low poly hit at the height displaceIn / (displaceIn + displaceOut), in rawTangentScale world units
+    // for the height map's texture coordinates.
     // The quadtree returns the ray's height at its hit, the raymarch the depth below the top.
     const float pomTotalHeight = opaqueSurfaceMaterial.displaceIn + opaqueSurfaceMaterial.displaceOut;
     const float pomRayHeight = cb.pomMode == DisplacementMode::RaymarchPOM ? 1.0f - pomHit.z : pomHit.z;
     const float pomCosView = dot(minimalRayInteraction.viewDirection, surfaceInteraction.geometryNormal);
     surfaceInteraction.pomRayDistance = pomCosView > 0.01f ?
-      sanitize((opaqueSurfaceMaterial.displaceIn - pomRayHeight * pomTotalHeight) * surfaceInteraction.rawTangentScale / pomCosView, 0.0f) :
+      sanitize((opaqueSurfaceMaterial.displaceIn - pomRayHeight * pomTotalHeight) * surfaceInteraction.rawTangentScale * heightTangentScale / pomCosView, 0.0f) :
       0.0f;
 
     // WAR for REMIX-3709 - POM sometimes produces NaNs.
@@ -1163,14 +1275,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   vec4 roughnessSample;
   vec4 metallicSample;
 
+  const SurfaceInteraction bakeInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, bakeSpace.surfaceRepeats);
+  const SurfaceInteraction albedoInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_ALBEDO, surfaceInteraction, bakeInteraction);
+  const SurfaceInteraction normalInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_NORMAL, surfaceInteraction, bakeInteraction);
+  const SurfaceInteraction roughnessInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_ROUGHNESS, surfaceInteraction, bakeInteraction);
+  const SurfaceInteraction metallicInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_METALLIC, surfaceInteraction, bakeInteraction);
+  const SurfaceInteraction emissiveInteraction =
+    opaqueSurfaceMaterialBakeSpaceTextureInteraction(bakeSpace, MASK_LAYER_MATERIAL_BAKE_EMISSIVE, surfaceInteraction, bakeInteraction);
+
   // NV-DXVK start: Trace the camera image while preserving the raster fallback and authored masks.
   const bool isRaytracedRenderTarget = cb.enableRaytracedRenderTarget &&
     (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET);
   const bool useCameraTexture = isRaytracedRenderTarget &&
     (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_RENDER_TARGET);
-  const bool albedoOpacityLoaded = !useCameraTexture && surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, materialLodBias);
+  const bool albedoOpacityLoaded = !useCameraTexture && surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, albedoInteraction, albedoOpacitySample, materialLodBias);
   // NV-DXVK end
-  const bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample, materialLodBias);
+  const bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, normalInteraction, normalSample, materialLodBias);
 
   bool secondNormalLoaded = false;
   if (cb.opaqueMaterialArgs.layeredWaterNormalEnable && surface.isAnimatedWater)
@@ -1190,8 +1314,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   }
 
   const bool tangentLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.tangentTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, tangentSample, materialLodBias);
-  const bool roughnessLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.roughnessTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, roughnessSample, materialLodBias);
-  const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, metallicSample, materialLodBias);
+  const bool roughnessLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.roughnessTextureIndex, opaqueSurfaceMaterial.samplerIndex, roughnessInteraction, roughnessSample, materialLodBias);
+  const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, metallicInteraction, metallicSample, materialLodBias);
 
   // Load Albedo/Opacity
   // Note: opaqueSurfaceMaterialParticleResolve mirrors the albedo, opacity and emissive rules from here on; keep them in step.
@@ -1225,7 +1349,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   if (albedoOpacityLoaded)
   {
     albedo = albedoOpacitySample.rgb;
-    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, surfaceInteraction, materialLodBias, albedo);
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, bakeInteraction, materialLodBias, albedo);
 
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
@@ -1261,7 +1385,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
 
   if (cb.debugView == DEBUG_VIEW_OPAQUE_RAW_ALBEDO_RESOLUTION_CHECKERS) 
   {
-    storeColorOverlayedWithTextureResolutionCheckersInDebugView(albedo.xyz, opaqueSurfaceMaterial.albedoOpacityTextureIndex, surfaceInteraction);
+    storeColorOverlayedWithTextureResolutionCheckersInDebugView(albedo.xyz, opaqueSurfaceMaterial.albedoOpacityTextureIndex, albedoInteraction);
   } 
 
   storeSamplerFeedback(opaqueSurfaceMaterial.samplerFeedbackStamp, surfaceInteraction);
@@ -1415,7 +1539,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
 #if defined(RAY_TRACING_PRIMARY_RAY)
   if (cb.debugView == DEBUG_VIEW_OPAQUE_NORMAL_RESOLUTION_CHECKERS) 
   {
-    storeColorOverlayedWithTextureResolutionCheckersInDebugView(normal, opaqueSurfaceMaterial.normalTextureIndex, surfaceInteraction);
+    storeColorOverlayedWithTextureResolutionCheckersInDebugView(normal, opaqueSurfaceMaterial.normalTextureIndex, normalInteraction);
   }
 #endif
   // Load Tangent
@@ -1439,7 +1563,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
 #if defined(RAY_TRACING_PRIMARY_RAY)
   if (cb.debugView == DEBUG_VIEW_OPAQUE_ROUGHNESS_RESOLUTION_CHECKERS) 
   {
-    storeColorOverlayedWithTextureResolutionCheckersInDebugView(roughness.xxx, opaqueSurfaceMaterial.roughnessTextureIndex, surfaceInteraction);
+    storeColorOverlayedWithTextureResolutionCheckersInDebugView(roughness.xxx, opaqueSurfaceMaterial.roughnessTextureIndex, roughnessInteraction);
   }
 #endif  
   // Apply material modifiers
@@ -1486,7 +1610,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   if (opaqueSurfaceMaterial.emissiveIntensity != 0.0 ||
       (surface.hasHighlightTint && surface.highlightGlowFromEmissiveTexture))
   {
-    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample, materialLodBias);
+    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, emissiveInteraction, emissiveColorSample, materialLodBias);
   }
 
   if (opaqueSurfaceMaterial.emissiveIntensity != 0.0)

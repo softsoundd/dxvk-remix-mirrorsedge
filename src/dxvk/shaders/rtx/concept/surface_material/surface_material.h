@@ -190,23 +190,30 @@ struct SubsurfaceMaterial
 
 // Describes a mask a UE3 composite bake leaves out of its repeat. The albedo blends towards the bake with the
 // mask at 1 by one channel of the mask, read at its own tiling, and through the bake at 1/2 for a quadratic mask.
+// A surface the mask does not blend into has no mask textures.
 struct MaskLayerMaterial
 {
-  uint16_t flags;
+  // Holds the MASK_LAYER_MATERIAL_BAKE_* bits of the textures read at surfaceRepeats.
+  uint16_t bakeTextures;
 
   uint16_t maskedAlbedoTextureIndex;
   uint16_t maskTextureIndex;
   // Holds the mask channel and the MASK_LAYER_MATERIAL_FLAG_* bits.
   uint16_t maskChannelAndFlags;
 
-  // These map the surface's texture coordinates to the mask's, as coordinates * maskScale + maskOffset.
+  // These map the bake's texture coordinates to the mask's, as coordinates * maskScale + maskOffset.
   vec2 maskScale;
   vec2 maskOffset;
 
   uint16_t maskedHalfAlbedoTextureIndex;
+  uint16_t pad[3];
+
+  // Is how many of the bake's repeats the surface's texture coordinates span per unit, which a capture lays the mask out
+  // over. The textures bakeTextures names are read at the surface's coordinates times this.
+  vec2 surfaceRepeats;
 
   // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[19];
+  uint16_t data[12];
 };
 
 // Describes the normal maps a flow layer scrolls over an opaque surface, blended into its normal by a mask.

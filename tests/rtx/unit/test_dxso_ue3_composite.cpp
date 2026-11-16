@@ -684,6 +684,17 @@ namespace {
     check(solveUe3CompositePeriod(nullptr, 0) == 0.0f, "no layers, no repeat");
   }
 
+  void testMaskCaptureRepeat() {
+    // The corridor carpet's border mask tiles 0.1 times per repeat of its 1 UV pattern.
+    check(solveUe3CompositeMaskCaptureRepeat(0.1f) == 10, "a 0.1 mask repeats over 10 of the bake's repeats");
+    check(solveUe3CompositeMaskCaptureRepeat(0.85f) == 20, "the deck's 0.85 stripes repeat over 20");
+    check(solveUe3CompositeMaskCaptureRepeat(2.5f) == 2, "a mask tiling 2.5 times per repeat repeats over 2");
+    check(solveUe3CompositeMaskCaptureRepeat(-0.25f) == 4, "a mirrored mask repeats as it would unmirrored");
+    check(solveUe3CompositeMaskCaptureRepeat(0.025f) == 0, "a 0.025 mask would need 40 repeats, more than 32");
+    check(solveUe3CompositeMaskCaptureRepeat(1.37f) == 0, "no whole repeat within 32");
+    check(solveUe3CompositeMaskCaptureRepeat(0.0f) == 0, "a zero tiling does not repeat");
+  }
+
   void testResolution() {
     auto resolution = [](std::initializer_list<float> texels, uint32_t maxResolution) {
       const std::vector<float> v(texels);
@@ -844,6 +855,7 @@ int main(int argc, char** argv) {
     testLayerReadAtSeveralTilings();
     testRefusals();
     testPeriod();
+    testMaskCaptureRepeat();
     testResolution();
   }
   catch (const std::exception& e) {

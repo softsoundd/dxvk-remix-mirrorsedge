@@ -346,6 +346,49 @@ export material AperturePBR_Opacity(
     anno::in_group("Flow Layer"),
     anno::unused()
   ]],
+  // -------------------- GAME TILING ----------------------
+  uniform bool diffuse_texture_game_tiling = false
+  [[
+    anno::display_name("Albedo/Opacity Map at Game Tiling"),
+    anno::description("On a UE3 composite whose capture spreads the game's mask over several repeats of its material, repeats the Albedo/Opacity Map once per repeat of the game's material instead of spanning the captured UVs once, and blends the game's mask into it. The Toolkit's viewport shows the map spanning the captured UVs either way. Used by the Runtime."),
+    anno::in_group("Game Tiling"),
+    anno::unused()
+  ]],
+  uniform bool normalmap_texture_game_tiling = false
+  [[
+    anno::display_name("Normal Map at Game Tiling"),
+    anno::description("On a UE3 composite whose capture spreads the game's mask over several repeats of its material, repeats the Normal Map once per repeat of the game's material instead of spanning the captured UVs once. The Toolkit's viewport shows the map spanning the captured UVs either way. Used by the Runtime."),
+    anno::in_group("Game Tiling"),
+    anno::unused()
+  ]],
+  uniform bool height_texture_game_tiling = false
+  [[
+    anno::display_name("Height Map at Game Tiling"),
+    anno::description("On a UE3 composite whose capture spreads the game's mask over several repeats of its material, repeats the Height Map once per repeat of the game's material instead of spanning the captured UVs once. Inwards and Outwards Displacement are then relative to one repeat. The Toolkit's viewport shows the map spanning the captured UVs either way. Used by the Runtime."),
+    anno::in_group("Game Tiling"),
+    anno::unused()
+  ]],
+  uniform bool reflectionroughness_texture_game_tiling = false
+  [[
+    anno::display_name("Roughness Map at Game Tiling"),
+    anno::description("On a UE3 composite whose capture spreads the game's mask over several repeats of its material, repeats the Roughness Map once per repeat of the game's material instead of spanning the captured UVs once. The Toolkit's viewport shows the map spanning the captured UVs either way. Used by the Runtime."),
+    anno::in_group("Game Tiling"),
+    anno::unused()
+  ]],
+  uniform bool metallic_texture_game_tiling = false
+  [[
+    anno::display_name("Metallic Map at Game Tiling"),
+    anno::description("On a UE3 composite whose capture spreads the game's mask over several repeats of its material, repeats the Metallic Map once per repeat of the game's material instead of spanning the captured UVs once. The Toolkit's viewport shows the map spanning the captured UVs either way. Used by the Runtime."),
+    anno::in_group("Game Tiling"),
+    anno::unused()
+  ]],
+  uniform bool emissive_mask_texture_game_tiling = false
+  [[
+    anno::display_name("Emissive Mask Map at Game Tiling"),
+    anno::description("On a UE3 composite whose capture spreads the game's mask over several repeats of its material, repeats the Emissive Mask Map once per repeat of the game's material instead of spanning the captured UVs once. The Toolkit's viewport shows the map spanning the captured UVs either way. Used by the Runtime."),
+    anno::in_group("Game Tiling"),
+    anno::unused()
+  ]],
   // -------------------- REMIX FLAGS ----------------------
   uniform bool preload_textures = false
   [[

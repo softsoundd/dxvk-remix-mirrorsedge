@@ -522,6 +522,21 @@ namespace dxvk {
     return 0.f;
   }
 
+  uint32_t solveUe3CompositeMaskCaptureRepeat(const float maskScale, const uint32_t maxRepeats, const float tolerance) {
+    const double scale = std::abs(double(maskScale));
+    if (!std::isfinite(scale) || scale < 1e-6) {
+      return 0;
+    }
+    for (uint32_t k = 1; k <= maxRepeats; k++) {
+      const double repeats = scale * double(k);
+      const double nearest = std::round(repeats);
+      if (nearest >= 1.0 && std::abs(repeats - nearest) <= double(tolerance)) {
+        return k;
+      }
+    }
+    return 0;
+  }
+
   uint32_t solveUe3CompositeResolution(const float* texelsPerPeriod, const uint32_t count,
                                        const uint32_t minResolution, const uint32_t maxResolution) {
     double needed = double(std::max(minResolution, 1u));

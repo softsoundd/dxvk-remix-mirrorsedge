@@ -91,6 +91,9 @@ d3d9_src = [
   'd3d9_rtx_geometry.cpp',
   'd3d9_rtx_ue3.h',
   'd3d9_rtx_ue3_helpers.h',
+  # NV-DXVK start: UE3 streaming-stable texture hashes of 8-bit channel tails
+  'd3d9_rtx_ue3_texture_tail.h',
+  # NV-DXVK end
   'd3d9_rtx_ue3_view_layout.h',
   'd3d9_rtx_ue3_albedo.cpp',
   'd3d9_rtx_ue3_camera.cpp',

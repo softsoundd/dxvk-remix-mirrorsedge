@@ -37,6 +37,11 @@ The flow layer's controls work like the ones above, applied to the flow normal m
 The flow layer is only rendered on opaque surfaces. In UE3 games the runtime also renders the normal detail the game's own material moves, unless a material authors its own flow normal map or turns the layer off.
 See [Flow layers](UE3Compatibility.md#flow-layers) for how the layers combine and how captures export them.
 
+### Game tiling
+
+On a UE3 composite whose capture spreads the game's mask over several repeats of its material, `AperturePBR_Opacity`'s `*_game_tiling` switches read a map once per repeat of the game's material, instead of once over the captured UVs, on top of the material's own transform.
+See [Game tiling](UE3Compatibility.md#game-tiling).
+
 ### How the controls combine
 
 The texture is scaled, then rotated, then offset and scrolled.

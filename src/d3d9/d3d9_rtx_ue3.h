@@ -692,8 +692,36 @@ namespace dxvk {
       uint8_t degree = 1;
       // Maps bake UV to the mask's UV as (scale U, scale V, offset U, offset V).
       Vector4 transform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
+      // Holds how many of the bake's repeats a capture bakes the mask in over along each axis, the fewest that hold a
+      // whole number of the mask's repeats (solveUe3CompositeMaskCaptureRepeat).
+      // Holds 0 on an axis where no such number of repeats exists.
+      Vector2i captureRepeat = Vector2i(0, 0);
     };
     std::optional<LiftedMask> mask;
+
+    // Returns how many of the bake's repeats the surface's texture coordinates span per unit while it renders the bake.
+    // These are the repeats a capture lays a lifted mask out over, so the capture and anything authored over it share the
+    // surface's texture coordinates. See "Masks" in UE3Compatibility.md.
+    // Returns 1 on both axes when there is no lifted mask a capture can lay out.
+    Vector2 surfaceRepeats() const {
+      return mask.has_value() && mask->captureRepeat.x > 0 && mask->captureRepeat.y > 0
+        ? Vector2(float(mask->captureRepeat.x), float(mask->captureRepeat.y))
+        : Vector2(1.0f, 1.0f);
+    }
+    // Is the span of the interpolant UV that one unit of the surface's texture coordinates covers.
+    Vector2 surfacePeriod() const {
+      return period * surfaceRepeats();
+    }
+    // Maps mesh UV to the surface's texture coordinates while it renders the bake.
+    Matrix4 surfaceTransform() const {
+      const Vector2 repeats = surfaceRepeats();
+      Matrix4 result = transform;
+      for (Vector4& column : result.data) {
+        column.x /= repeats.x;
+        column.y /= repeats.y;
+      }
+      return result;
+    }
     // Lists the absolute tilings of the draw's lighting-only layers, such as normal maps, on the surface's UV set.
     std::vector<Vector2> lightingScales;
     // Hashes the bound layer textures and their sampler states.
@@ -725,10 +753,15 @@ namespace dxvk {
     // Is set when the constants vary per draw and take more values than a bake for each allows, which one live bake
     // cannot show either. The material renders its albedo pick from then on.
     bool refused = false;
+
+    // These hold the texture coordinates of the material's first bake (Ue3CompositeDomain::surfacePeriod and
+    // surfaceTransform), which its flow layer and any replacement are placed in. A material drawn with others too is
+    // warned about once.
     bool hasDomain = false;
-    Vector2 period = Vector2(1.0f, 1.0f);
-    Matrix4 domainTransform;
+    Vector2 surfacePeriod = Vector2(1.0f, 1.0f);
+    Matrix4 surfaceTransform;
     bool domainConflictWarned = false;
+
     // Untagged materials are checked for the candidate log once.
     bool candidateChecked = false;
     XXH64_hash_t loggedRefusal = kEmptyHash;

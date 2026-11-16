@@ -2431,20 +2431,45 @@ namespace dxvk {
         subsurfaceMaterialIndex = m_surfaceMaterialExtensionCache.track(subsurfaceMaterial);
       }
 
-      // A UE3 composite's mask layer only applies over its own bake, not over an albedo a replacement authored.
+      // A UE3 composite's lifted mask spreads over several of its bake's repeats on the surface's texture coordinates.
+      // The bake's own textures lie over those repeats, and so does any texture a replacement reads at the game's tiling.
+      // The mask blends into an albedo that does, not into one a replacement authored over the captured coordinates.
       uint32_t maskLayerIndex = SURFACE_INDEX_INVALID;
       const LegacyMaterialData& legacyMaterial = drawCallState.getMaterialData();
-      if (!RtxOptions::useWhiteMaterialMode() && legacyMaterial.ue3CompositeMaskedAlbedo.isValid() &&
-          legacyMaterial.ue3CompositeMask.isValid() &&
-          opaqueMaterialData.getAlbedoOpacityTexture().getImageHash() == legacyMaterial.ue3CompositeAlbedo.getImageHash()) {
+      auto isBake = [](const TextureRef& texture, const TextureRef& bake) {
+        return bake.isValid() && texture.getImageHash() == bake.getImageHash();
+      };
+      uint32_t bakeTextures = 0;
+      if (isBake(opaqueMaterialData.getAlbedoOpacityTexture(), legacyMaterial.ue3CompositeAlbedo) ||
+          opaqueMaterialData.getAlbedoOpacityGameTiling()) {
+        bakeTextures |= MASK_LAYER_MATERIAL_BAKE_ALBEDO;
+      }
+      if (isBake(opaqueMaterialData.getEmissiveColorTexture(), legacyMaterial.ue3CompositeEmissive) ||
+          opaqueMaterialData.getEmissiveColorGameTiling()) {
+        bakeTextures |= MASK_LAYER_MATERIAL_BAKE_EMISSIVE;
+      }
+      bakeTextures |= opaqueMaterialData.getNormalGameTiling() ? MASK_LAYER_MATERIAL_BAKE_NORMAL : 0;
+      bakeTextures |= opaqueMaterialData.getHeightGameTiling() ? MASK_LAYER_MATERIAL_BAKE_HEIGHT : 0;
+      bakeTextures |= opaqueMaterialData.getRoughnessGameTiling() ? MASK_LAYER_MATERIAL_BAKE_ROUGHNESS : 0;
+      bakeTextures |= opaqueMaterialData.getMetallicGameTiling() ? MASK_LAYER_MATERIAL_BAKE_METALLIC : 0;
+
+      const Vector2 surfaceRepeats = legacyMaterial.getUe3CompositeSurfaceRepeats();
+      const bool blendsMask = !RtxOptions::useWhiteMaterialMode() && (bakeTextures & MASK_LAYER_MATERIAL_BAKE_ALBEDO) != 0 &&
+                              legacyMaterial.ue3CompositeMaskedAlbedo.isValid() && legacyMaterial.ue3CompositeMask.isValid();
+      if (surfaceRepeats == Vector2(1.0f)) {
+        bakeTextures = 0;
+      }
+      if (blendsMask || bakeTextures) {
         uint32_t maskedAlbedoTextureIndex = kSurfaceMaterialInvalidTextureIndex;
         uint32_t maskedHalfAlbedoTextureIndex = kSurfaceMaterialInvalidTextureIndex;
         uint32_t maskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
-        trackTexture(legacyMaterial.ue3CompositeMaskedAlbedo, maskedAlbedoTextureIndex, hasTexcoords, true);
-        if (legacyMaterial.ue3CompositeMaskedHalfAlbedo.isValid()) {
-          trackTexture(legacyMaterial.ue3CompositeMaskedHalfAlbedo, maskedHalfAlbedoTextureIndex, hasTexcoords, true);
+        if (blendsMask) {
+          trackTexture(legacyMaterial.ue3CompositeMaskedAlbedo, maskedAlbedoTextureIndex, hasTexcoords, true);
+          if (legacyMaterial.ue3CompositeMaskedHalfAlbedo.isValid()) {
+            trackTexture(legacyMaterial.ue3CompositeMaskedHalfAlbedo, maskedHalfAlbedoTextureIndex, hasTexcoords, true);
+          }
+          trackTexture(legacyMaterial.ue3CompositeMask, maskTextureIndex, hasTexcoords, true);
         }
-        trackTexture(legacyMaterial.ue3CompositeMask, maskTextureIndex, hasTexcoords, true);
         const RtMaskLayerMaterial maskLayerMaterial {
           maskedAlbedoTextureIndex,
           maskedHalfAlbedoTextureIndex,
@@ -2452,6 +2477,8 @@ namespace dxvk {
           legacyMaterial.ue3CompositeMaskTransform,
           legacyMaterial.ue3CompositeMaskChannel,
           legacyMaterial.ue3CompositeMaskIsSrgb,
+          surfaceRepeats,
+          bakeTextures,
         };
         if (maskLayerMaterial.validate()) {
           maskLayerIndex = m_surfaceMaterialExtensionCache.track(maskLayerMaterial);

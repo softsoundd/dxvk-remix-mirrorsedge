@@ -1724,6 +1724,10 @@ private:
 // Describes a mask a UE3 composite bake (rtx.ue3CompositeMaterialTextures) leaves out of its repeat.
 // The surface blends its albedo towards the bake rendered with the mask at 1, by one channel of the mask read
 // at its own tiling. For a quadratic mask it interpolates through the bake with the mask at 1/2 as well.
+// The surface's texture coordinates span surfaceRepeats of the bake's repeats per unit, as a capture lays them out,
+// so the textures bakeTextures names (MASK_LAYER_MATERIAL_BAKE_*) are read at that multiple of them: the bake's own,
+// and those a replacement reads at the game's tiling. The mask blends into the albedo only where it is one of them,
+// and a surface it does not blend into has invalid mask texture indices.
 struct RtMaskLayerMaterial {
   RtMaskLayerMaterial(
     const uint32_t maskedAlbedoTextureIndex,
@@ -1731,13 +1735,17 @@ struct RtMaskLayerMaterial {
     const uint32_t maskTextureIndex,
     const Vector4& maskTransform,
     const uint32_t maskChannel,
-    const bool maskIsSrgb)
+    const bool maskIsSrgb,
+    const Vector2& surfaceRepeats,
+    const uint32_t bakeTextures)
     : m_maskedAlbedoTextureIndex { maskedAlbedoTextureIndex },
       m_maskedHalfAlbedoTextureIndex { maskedHalfAlbedoTextureIndex },
       m_maskTextureIndex { maskTextureIndex },
       m_maskTransform { maskTransform },
       m_maskChannel { maskChannel & MASK_LAYER_MATERIAL_CHANNEL_MASK },
-      m_maskIsSrgb { maskIsSrgb ? 1u : 0u } {
+      m_maskIsSrgb { maskIsSrgb ? 1u : 0u },
+      m_surfaceRepeats { surfaceRepeats },
+      m_bakeTextures { bakeTextures } {
     updateCachedHash();
   }
 
@@ -1748,8 +1756,7 @@ struct RtMaskLayerMaterial {
     // this data is accessed from uint16_t data[32], so data[n] refers to a pair of bytes.
 
     // data[0]
-    const uint16_t flags = 0;
-    writeGPUHelperExplicit<2>(data, offset, flags);
+    writeGPUHelperExplicit<2>(data, offset, m_bakeTextures);
 
     // data[1 - 2]
     writeGPUHelperExplicit<2>(data, offset, m_maskedAlbedoTextureIndex);
@@ -1771,8 +1778,15 @@ struct RtMaskLayerMaterial {
     // data[12]
     writeGPUHelperExplicit<2>(data, offset, m_maskedHalfAlbedoTextureIndex);
 
-    // data[13 - 31]
-    writeGPUPadding<38>(data, offset);
+    // data[13 - 15]
+    writeGPUPadding<6>(data, offset);
+
+    // data[16 - 19]
+    writeGPUHelper(data, offset, m_surfaceRepeats.x);
+    writeGPUHelper(data, offset, m_surfaceRepeats.y);
+
+    // data[20 - 31]
+    writeGPUPadding<24>(data, offset);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -1781,8 +1795,9 @@ struct RtMaskLayerMaterial {
   }
 
   bool validate() const {
-    return m_maskedAlbedoTextureIndex != kSurfaceMaterialInvalidTextureIndex &&
-           m_maskTextureIndex != kSurfaceMaterialInvalidTextureIndex;
+    const bool blendsMask = m_maskedAlbedoTextureIndex != kSurfaceMaterialInvalidTextureIndex &&
+                            m_maskTextureIndex != kSurfaceMaterialInvalidTextureIndex;
+    return blendsMask || m_bakeTextures;
   }
 
   XXH64_hash_t getHash() const {
@@ -1799,7 +1814,7 @@ struct RtMaskLayerMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 48,
+      sizeof(*this) == 56,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -1809,6 +1824,8 @@ private:
       Vector4 maskTransform;
       uint32_t maskChannel;
       uint32_t maskIsSrgb;
+      Vector2 surfaceRepeats;
+      uint32_t bakeTextures;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1819,6 +1836,8 @@ private:
       m_maskTransform,
       m_maskChannel,
       m_maskIsSrgb,
+      m_surfaceRepeats,
+      m_bakeTextures,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1830,6 +1849,8 @@ private:
   Vector4 m_maskTransform;
   uint32_t m_maskChannel;
   uint32_t m_maskIsSrgb;
+  Vector2 m_surfaceRepeats;
+  uint32_t m_bakeTextures;
 
   XXH64_hash_t m_cachedHash;
 };
@@ -2589,6 +2610,8 @@ struct LegacyMaterialData {
   // Hashes the bake's key and generation, so the preserve path rebinds when a bake lands or lands again.
   XXH64_hash_t ue3CompositeIdentity = kEmptyHash;
   float ue3CompositeEmissiveIntensity = 1.0f;
+  // Is set when the bake's alpha holds the coverage of a material that clip()s, which a capture prefers to export.
+  bool ue3CompositeCoverage = false;
   // These describe a mask the bake leaves out of its repeat. The surface blends towards the albedo baked with
   // the mask at 1, or interpolates through the one baked at 1/2 as well for a quadratic mask. It reads one
   // channel of the mask, a unorm view decoded when the game samples it as sRGB, through the bake UV to mask UV
@@ -2599,6 +2622,19 @@ struct LegacyMaterialData {
   Vector4 ue3CompositeMaskTransform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
   uint8_t ue3CompositeMaskChannel = 0;
   bool ue3CompositeMaskIsSrgb = false;
+  // Holds how many of the bake's repeats a capture bakes the mask in over along each axis.
+  // Holds 0 on an axis without such a number of repeats, and on both without a lifted mask.
+  Vector2i ue3CompositeMaskCaptureRepeat = Vector2i(0, 0);
+
+  // Returns how many of the bake's repeats the surface's texture coordinates span per unit, the repeats a capture bakes
+  // the mask in over.
+  // Returns 1 on both axes when a capture cannot bake the mask in.
+  Vector2 getUe3CompositeSurfaceRepeats() const {
+    const Vector2i& repeat = ue3CompositeMaskCaptureRepeat;
+    return repeat.x > 0 && repeat.y > 0
+      ? Vector2(float(repeat.x), float(repeat.y))
+      : Vector2(1.0f, 1.0f);
+  }
   // Holds the material's flow layer (rtx.d3d9.ue3FlowLayers), which layers over whichever material renders the surface.
   // It never reaches getHash(), so the preserve path rebinds through its identity.
   Ue3FlowLayer ue3FlowLayer;

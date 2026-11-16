@@ -179,6 +179,12 @@ namespace dxvk {
   float solveUe3CompositePeriod(const float* scales, uint32_t count, uint32_t maxMultiple = kUe3CompositeMaxPeriodMultiple,
                                 float tolerance = 1e-3f);
 
+  // Returns the smallest number of a bake's repeats, k = 1..maxRepeats, over which a lifted mask that repeats
+  // maskScale times per bake repeat also repeats a whole number of times. A capture bakes the mask in over them.
+  // Returns 0 when there is none.
+  uint32_t solveUe3CompositeMaskCaptureRepeat(float maskScale, uint32_t maxRepeats = kUe3CompositeMaxPeriodMultiple,
+                                              float tolerance = 1e-3f);
+
   // Returns the axis resolution of a bake, the largest number of texels any layer spans over one period,
   // rounded up to a power of two and clamped to [minResolution, maxResolution].
   uint32_t solveUe3CompositeResolution(const float* texelsPerPeriod, uint32_t count, uint32_t minResolution, uint32_t maxResolution);

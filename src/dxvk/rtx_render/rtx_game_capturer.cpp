@@ -23,6 +23,7 @@
 #include "rtx_game_capturer.h"
 
 #include "rtx_context.h"
+#include "rtx_image_utils.h"
 #include "rtx_types.h"
 #include "rtx_camera.h"
 #include "rtx_options.h"
@@ -107,6 +108,23 @@ namespace dxvk {
     static std::string getBakedSkyProbeName(const std::string& captureName) {
       const std::string bakedSkyProbeSuffix("_T_SkyProbe" + lss::ext::dds);
       return captureName + bakedSkyProbeSuffix;
+    }
+
+    // Ranks the draws of one material for its capture, which takes the first draw of the highest rank.
+    // Returns 2 for a draw whose composite bake (rtx.ue3CompositeMaterialTextures) keeps a clip()'s coverage in its alpha.
+    // Returns 1 for a draw that renders any other bake.
+    // Returns 0 for a draw that renders its pick.
+    static int capturePreference(const LegacyMaterialData& material) {
+      if (material.ue3CompositeAlbedo.getImageView() == nullptr || material.ue3CompositeSampler.ptr() == nullptr) {
+        return 0;
+      }
+      return material.ue3CompositeCoverage ? 2 : 1;
+    }
+
+    // Returns the image a texture's view presents to shaders, which is what a capture exports.
+    static Rc<DxvkImage> sampledImage(const Rc<DxvkContext>& ctx, DxvkImageView* view) {
+      Rc<DxvkContext> context = ctx;
+      return context->getCommonObjects()->metaImageUtils().copyAsSampled(context, Rc<DxvkImageView>(view));
     }
 
     // Splits a flow sample's transform into the flow_texture_* parameters, T(offset) * R(rotation) * S(scale).
@@ -535,6 +553,11 @@ namespace dxvk {
       instance.lssData.isSky = (pRtInstance->getBlas()->input.cameraType == CameraType::Sky);
       instance.lssData.metadata = createDrawCallMetadata(*pRtInstance);
     }
+
+    for (const auto& [matHash, pending] : m_pendingMaterials) {
+      captureMaterial(ctx, *pending.material, matHash, pending.bEnableOpacity);
+    }
+    m_pendingMaterials.clear();
   }
 
   void GameCapturer::newInstance(const Rc<DxvkContext> ctx, const RtInstance& rtInstance) {
@@ -566,7 +589,11 @@ namespace dxvk {
       // to export - a render-target-only or evicted texture, or a UE3 draw whose whole sampler set
       // was lightmaps. Skipping one leaves the mesh bound to a prim the stage never declares, which
       // the Toolkit can neither select nor author.
-      captureMaterial(ctx, material, matHash, !rtInstance.surface.alphaState.isFullyOpaque);
+      PendingMaterial& pending = m_pendingMaterials[matHash];
+      if (pending.material == nullptr || capturePreference(material) > capturePreference(*pending.material)) {
+        pending.material = &material;
+        pending.bEnableOpacity = !rtInstance.surface.alphaState.isFullyOpaque;
+      }
     }
 
     bool bIsNewMesh = false;
@@ -636,6 +663,7 @@ namespace dxvk {
     // Resolve material name
     const std::string matName = dxvk::hashToString(materialHash);
     lssMat.matName = matName;
+    const std::string logPrefix = "[GameCapturer][" + m_pCap->idStr + "][Mat:" + matName + "] ";
     // A UE3 composite bake (rtx.ue3CompositeMaterialTextures) is what the surface renders, and the
     // captured UVs already span its repeat, so it is what the stage shows.
     const bool composite =
@@ -645,17 +673,42 @@ namespace dxvk {
     // Export Textures
     const bool hasColorTexture = albedoTexture.getImageView() != nullptr && albedoSampler.ptr() != nullptr;
     if (hasColorTexture) {
+      Rc<DxvkImage> albedoImage = sampledImage(ctx, albedoTexture.getImageView());
+      Rc<DxvkImage> emissiveImage;
+      if (composite && materialData.ue3CompositeEmissive.getImageView() != nullptr) {
+        emissiveImage = materialData.ue3CompositeEmissive.getImageView()->image();
+      }
+      // The stage's material has one albedo and no mask layer. The surface's texture coordinates span as many of the
+      // bake's repeats as the mask takes to repeat a whole number of times, and the mask is blended in over them.
+      if (composite && materialData.ue3CompositeMaskedAlbedo.getImageView() != nullptr) {
+        RtxContext* const rtxContext = static_cast<RtxContext*>(ctx.ptr());
+        const Rc<DxvkImage> flattenedAlbedo = rtxContext->flattenUe3CompositeForCapture(materialData, false);
+        if (flattenedAlbedo != nullptr) {
+          albedoImage = flattenedAlbedo;
+          // A uniform emission is one texel, which lines up with any albedo.
+          if (emissiveImage != nullptr && (emissiveImage->info().extent.width > 1 || emissiveImage->info().extent.height > 1)) {
+            emissiveImage = rtxContext->flattenUe3CompositeForCapture(materialData, true);
+          }
+          const Vector2i& repeat = materialData.ue3CompositeMaskCaptureRepeat;
+          Logger::info(str::format(logPrefix, "The UE3 composite bake's mask is blended into the albedo over the ", repeat.x, "x",
+                                   repeat.y, " repeats of the bake that the surface's texture coordinates span."));
+        } else {
+          Logger::info(logPrefix + "The UE3 composite bake's mask does not line up with a whole number of the bake's repeats, "
+                       "so the albedo is exported with the mask at 0.");
+        }
+      }
+
       const std::string albedoTexFilename(matName + lss::ext::dds);
       m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
                                  albedoTexFilename,
-                                 albedoTexture.getImageView()->image());
+                                 albedoImage);
       const std::string albedoTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, albedoTexFilename);
       lssMat.albedoTexPath = albedoTexPath;
-      if (composite && materialData.ue3CompositeEmissive.getImageView() != nullptr) {
+      if (emissiveImage != nullptr) {
         const std::string emissiveTexFilename(matName + "_emissive" + lss::ext::dds);
         m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
                                    emissiveTexFilename,
-                                   materialData.ue3CompositeEmissive.getImageView()->image());
+                                   emissiveImage);
         lssMat.emissiveTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, emissiveTexFilename);
         lssMat.emissiveIntensity = materialData.ue3CompositeEmissiveIntensity;
       }
@@ -689,7 +742,6 @@ namespace dxvk {
     if (flowLayer.isValid() && flowLayer.samples[0].texture.getImageView() != nullptr) {
       const Ue3FlowLayer::Sample& sample = flowLayer.samples[0];
       lss::Material::FlowLayer& flowOut = lssMat.flowLayer;
-      const std::string logPrefix = "[GameCapturer][" + m_pCap->idStr + "][Mat:" + matName + "] ";
       if (flowLayer.blend) {
         Logger::info(logPrefix + "The flow layer blends the surface's normal towards another by a scrolling weight, which the "
                      "flow_* parameters cannot describe, so the flow layer is not exported.");
@@ -705,7 +757,7 @@ namespace dxvk {
       } else {
         const std::string flowTexFilename(matName + "_flow" + lss::ext::dds);
         m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir, flowTexFilename,
-                                   sample.texture.getImageView()->image());
+                                   sampledImage(ctx, sample.texture.getImageView()));
         flowOut.normalTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, flowTexFilename);
         flowOut.scrollRate = length(sample.velocity);
         flowOut.scrollAngle = flowOut.scrollRate > 0.f
@@ -725,7 +777,7 @@ namespace dxvk {
           } else {
             const std::string flowMaskFilename(matName + "_flowmask" + lss::ext::dds);
             m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir, flowMaskFilename,
-                                       flowLayer.mask.getImageView()->image());
+                                       sampledImage(ctx, flowLayer.mask.getImageView()));
             flowOut.maskTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, flowMaskFilename);
             flowOut.maskChannel = flowLayer.maskChannel;
             flowOut.maskScale = pxr::GfVec2f(flowLayer.maskTransform.x, flowLayer.maskTransform.y);

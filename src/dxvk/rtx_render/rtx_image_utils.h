@@ -50,5 +50,13 @@ namespace dxvk {
      */
     void cubemapToLatLong(Rc<DxvkContext>& ctx, Rc<DxvkImageView>& cube,
                           Rc<DxvkImageView>& latlong, LatLongTransform transform) const;
+
+    /**
+     * \brief Returns a 2D view's image as shaders sample it through the view
+     *
+     * A swizzled view, such as a D3D9 L8 or X8R8G8B8 texture's, is copied with its mips into
+     * an RGBA8 image that carries the swizzle. Any other view returns its own image.
+     */
+    Rc<DxvkImage> copyAsSampled(Rc<DxvkContext>& ctx, const Rc<DxvkImageView>& view) const;
   };
 }

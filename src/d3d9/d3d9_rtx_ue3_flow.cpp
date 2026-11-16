@@ -431,7 +431,7 @@ namespace dxvk {
     }
 
     // A read on the surface's interpolant has its own affine of it, so its coordinate is one of the surface's coordinates
-    // too. A bake's coordinates are the interpolant over the bake's repeat.
+    // too. Over a bake, the surface's coordinates are the interpolant over compositePeriod.
     bool readsSurface = info.mask.present && maskTrace == nullptr;
     for (uint32_t i = 0; i < readCount; i++) {
       readsSurface |= readTraces[i] == nullptr;

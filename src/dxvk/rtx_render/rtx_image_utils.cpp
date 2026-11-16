@@ -24,12 +24,15 @@
 #include "rtx_render/rtx_shader_manager.h"
 
 #include <rtx_shaders/cube_to_latlong.h>
+#include <rtx_shaders/sampled_copy.h>
 #include "dxvk_scoped_annotation.h"
 
 #include "rtx_context.h"
+#include "rtx_mipmap.h"
 #include "rtx_options.h"
 
 #include "rtx/pass/image_utils/cube_to_latlong.h"
+#include "rtx/pass/image_utils/sampled_copy.h"
 
 namespace dxvk {
 
@@ -49,6 +52,26 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(CubeToLatLongShader);
+
+    // Only captures run this one, so it is not prewarmed.
+    class SampledCopyShader : public ManagedShader {
+      SHADER_SOURCE(SampledCopyShader, VK_SHADER_STAGE_COMPUTE_BIT, sampled_copy)
+
+      PUSH_CONSTANTS(SampledCopyArgs)
+
+      BEGIN_PARAMETER()
+        TEXTURE2D(SAMPLED_COPY_INPUT)
+        RW_TEXTURE2D(SAMPLED_COPY_OUTPUT)
+      END_PARAMETER()
+    };
+
+    bool isIdentitySwizzle(const VkComponentMapping& swizzle) {
+      auto keeps = [](const VkComponentSwizzle component, const VkComponentSwizzle own) {
+        return component == VK_COMPONENT_SWIZZLE_IDENTITY || component == own;
+      };
+      return keeps(swizzle.r, VK_COMPONENT_SWIZZLE_R) && keeps(swizzle.g, VK_COMPONENT_SWIZZLE_G) &&
+             keeps(swizzle.b, VK_COMPONENT_SWIZZLE_B) && keeps(swizzle.a, VK_COMPONENT_SWIZZLE_A);
+    }
   }
 
   RtxImageUtils::RtxImageUtils(DxvkDevice* pDevice) {
@@ -81,5 +104,39 @@ namespace dxvk {
     auto workgroups = util::computeBlockCount(latlongExt,
                                               CubeToLatLongShader::groupSize);
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+  }
+
+  Rc<DxvkImage> RtxImageUtils::copyAsSampled(Rc<DxvkContext>& ctx, const Rc<DxvkImageView>& view) const {
+    const DxvkImageViewCreateInfo& viewInfo = view->info();
+    if (viewInfo.type != VK_IMAGE_VIEW_TYPE_2D || isIdentitySwizzle(viewInfo.swizzle)) {
+      return view->image();
+    }
+
+    // The image's own format reads the stored values, where an sRGB view would decode them.
+    DxvkImageViewCreateInfo inputInfo = viewInfo;
+    inputInfo.format = view->image()->info().format;
+    inputInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    const Rc<DxvkImageView> input = ctx->getDevice()->createImageView(view->image(), inputInfo);
+
+    const VkExtent3D extent = view->mipLevelExtent(0);
+    const VkClearColorValue clear = {};
+    RtxMipmap::Resource output = RtxMipmap::createResource(ctx, "sampled copy", extent, VK_FORMAT_R8G8B8A8_UNORM, 0, clear,
+                                                           viewInfo.numLevels);
+
+    ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
+    ctx->bindResourceView(SAMPLED_COPY_INPUT, input, nullptr);
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, SampledCopyShader::getShader());
+    for (uint32_t level = 0; level < viewInfo.numLevels; level++) {
+      const VkExtent3D levelExtent = util::computeMipLevelExtent(extent, level);
+      SampledCopyArgs args = {};
+      args.resolution = { levelExtent.width, levelExtent.height };
+      args.mipLevel = level;
+      ctx->pushConstants(0, sizeof(args), &args);
+      // A one-level resource has no per-mip views, and its own view is mip 0.
+      ctx->bindResourceView(SAMPLED_COPY_OUTPUT, output.views.empty() ? output.view : output.views[level], nullptr);
+      const VkExtent3D workgroups = util::computeBlockCount(levelExtent, VkExtent3D { 16, 16, 1 });
+      ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+    }
+    return output.image;
   }
 }

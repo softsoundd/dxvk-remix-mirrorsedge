@@ -58,8 +58,9 @@ namespace dxvk {
     uint32_t height = 0;
     // Spans one repeat of every layer, in the interpolant UV the pixel shader reads.
     Vector2 period = Vector2(1.0f, 1.0f);
-    // Is the surface's texture transform while it renders the bake, which maps mesh UV to bake UV.
-    Matrix4 domainTransform;
+    // Is the surface's texture transform while it renders the bake. It maps mesh UV to bake UV, divided by a lifted mask's
+    // capture repeat (Mask::captureRepeat), so a capture's texture coordinates are the surface's.
+    Matrix4 surfaceTransform;
     // Is set when a pass renders the emission alone, which is taken out of the Emissive + Diffuse the main pass renders.
     bool emissivePass = false;
     // Is set when the emission is also kept as the emissive texture, rather than only taken out of the albedo
@@ -106,6 +107,9 @@ namespace dxvk {
       uint8_t degree = 1;
       // Maps bake UV to the mask's UV as (scale U, scale V, offset U, offset V).
       Vector4 transform = Vector4(1.0f, 1.0f, 0.0f, 0.0f);
+      // Holds how many of the bake's repeats a capture bakes the mask in over along each axis.
+      // Holds 0 on an axis without such a number of repeats.
+      Vector2i captureRepeat = Vector2i(0, 0);
     };
     std::optional<Mask> mask;
     Rc<DxvkShader> vertexShader;
@@ -129,6 +133,8 @@ namespace dxvk {
       std::optional<Ue3CompositeBakeRequest::Mask> mask;
       // Is set when the albedo holds a multiply as a colour and opacity, which the surface alpha blends.
       bool alphaBlend = false;
+      // Is Ue3CompositeBakeRequest::coverageFromAlpha.
+      bool coverage = false;
       // Is Ue3CompositeBakeRequest::live.
       bool live = false;
       // These hold a live bake's pass targets, which it renders into again every frame.
