@@ -158,6 +158,14 @@ export material AperturePBR_Opacity(
     anno::description("Intensity of the emission"),
     anno::in_group("Emission")
   ]],
+  uniform bool emissive_from_composite_bake = false
+  [[
+    anno::enable_if("enable_emission == true"),
+    anno::display_name("Emission from Composite Bake"),
+    anno::description("On a UE3 composite, takes the emission from the Runtime's bake of the game's material in place of Emissive Color and Emissive Mask Map, so it follows the material's animation, such as scrolling text. An unlit material's whole bake is emission. A lit material's bake holds its emissive term only with rtx.d3d9.ue3CompositeEmission on. Emissive Intensity scales the emission, and at 1 the surface emits the bake's colour. Where the bake holds no emission, the surface emits Emissive Color or Emissive Mask Map, which the Toolkit's viewport shows either way. Used by the Runtime."),
+    anno::in_group("Emission"),
+    anno::unused()
+  ]],
 
   // -------------------- SPRITE SHEET ----------------------
   uniform int sprite_sheet_fps = 0

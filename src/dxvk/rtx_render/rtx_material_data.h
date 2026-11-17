@@ -69,6 +69,10 @@
   X(MetallicGameTiling,      metallic_texture_game_tiling,            bool, false, true, false) \
   X(EmissiveColorGameTiling, emissive_mask_texture_game_tiling,       bool, false, true, false)
 
+// See "Emission from the bake" in UE3Compatibility.md.
+#define LIST_COMPOSITE_EMISSION_CONSTANTS(X) \
+  X(EmissiveFromCompositeBake, emissive_from_composite_bake, bool, false, true, false)
+
 #define LIST_OPAQUE_MATERIAL_TEXTURES(X) \
   /*Parameter Name,                          USD Token String,                     Type,       UNUSED...   Default Value */ \
   X(AlbedoOpacityTexture,                    diffuse_texture,                      TextureRef, void, void, {}) \
@@ -134,7 +138,8 @@
   X(DLSSControlMaskStructuralStrength, dlss_control_mask_structural_strength, float,          0.f,                        1.f,                        0.7f) \
   LIST_TEXTURE_TRANSFORM_CONSTANTS(X) \
   LIST_FLOW_LAYER_CONSTANTS(X) \
-  LIST_GAME_TILING_CONSTANTS(X)
+  LIST_GAME_TILING_CONSTANTS(X) \
+  LIST_COMPOSITE_EMISSION_CONSTANTS(X)
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \
@@ -430,6 +435,7 @@ namespace dxvk {
 #undef LIST_TEXTURE_TRANSFORM_CONSTANTS
 #undef LIST_FLOW_LAYER_CONSTANTS
 #undef LIST_GAME_TILING_CONSTANTS
+#undef LIST_COMPOSITE_EMISSION_CONSTANTS
 #undef LIST_OPAQUE_MATERIAL_TEXTURES
 #undef LIST_OPAQUE_MATERIAL_CONSTANTS
 #undef LIST_OPAQUE_MATERIAL_PARAMS

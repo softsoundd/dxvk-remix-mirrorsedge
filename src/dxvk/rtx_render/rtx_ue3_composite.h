@@ -69,6 +69,9 @@ namespace dxvk {
     // Is set when no texture layer emits, so the emission is the same over the whole bake and one texel of it
     // is rendered and kept.
     bool uniformEmission = false;
+    // Is set when the albedo is the material's whole emission, as an unlit material's output is in UE3.
+    // An unlit draw that multiplies keeps an alpha blend in its albedo instead.
+    bool albedoIsEmission = false;
     // Is set when the main pass's alpha marks the texels the shader did not clip.
     bool coverageFromAlpha = false;
     // Is Ue3CompositeDomain::multiplyScale. A multiplying draw's albedo is encoded as an alpha blend.
@@ -135,6 +138,8 @@ namespace dxvk {
       bool alphaBlend = false;
       // Is Ue3CompositeBakeRequest::coverageFromAlpha.
       bool coverage = false;
+      // Is Ue3CompositeBakeRequest::albedoIsEmission.
+      bool albedoIsEmission = false;
       // Is Ue3CompositeBakeRequest::live.
       bool live = false;
       // These hold a live bake's pass targets, which it renders into again every frame.

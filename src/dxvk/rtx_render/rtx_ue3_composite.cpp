@@ -475,10 +475,11 @@ namespace dxvk {
 
   namespace {
 
-    // Returns whether the replacement the draw resolves to authors an albedo that leaves the bake unused. Its albedo
-    // was authored over the composite's repeat, so the surface only needs that repeat, unless it repeats at the game's
-    // tiling under a lifted mask, which blends into it from the bake. The tiers are the ones
-    // SceneManager::determineMaterialData resolves, in its order.
+    // Returns whether the replacement the draw resolves to authors an albedo that leaves the bake unused.
+    // Its albedo was authored over the composite's repeat, so the surface only needs that repeat,
+    // unless it repeats at the game's tiling under a lifted mask, which blends into it from the bake.
+    // A replacement that emits the bake needs it too.
+    // The tiers are the ones SceneManager::determineMaterialData resolves, in its order.
     bool replacementLeavesBakeUnused(SceneManager& sceneManager, const LegacyMaterialData& material,
                                      const Ue3CompositeBakeRequest& request) {
       const std::unique_ptr<AssetReplacer>& replacer = sceneManager.getAssetReplacer();
@@ -502,7 +503,9 @@ namespace dxvk {
           return false;
         }
         const OpaqueMaterialData& opaque = replacement->getOpaqueMaterialData();
-        return opaque.getAlbedoOpacityTexture().isValid() &&
+        const bool emitsBake = opaque.getEnableEmission() && opaque.getEmissiveFromCompositeBake() &&
+                               (request.albedoIsEmission || request.storeEmission);
+        return opaque.getAlbedoOpacityTexture().isValid() && !emitsBake &&
                !(opaque.getAlbedoOpacityGameTiling() && request.mask.has_value());
       }
       return false;
@@ -566,6 +569,7 @@ namespace dxvk {
     material.ue3CompositeIdentity = entry->identity;
     material.ue3CompositeEmissiveIntensity = baker.emissiveIntensity(frame);
     material.ue3CompositeCoverage = entry->coverage;
+    material.ue3CompositeAlbedoIsEmission = entry->albedoIsEmission;
     if (entry->mask.has_value() && entry->maskedAlbedo.isValid()) {
       material.ue3CompositeMaskedAlbedo = TextureRef(entry->maskedAlbedo.view);
       material.ue3CompositeMaskedHalfAlbedo =
@@ -865,6 +869,7 @@ namespace dxvk {
     entry.period = request.period;
     entry.alphaBlend = request.multiplyScale > 0.0f;
     entry.coverage = request.coverageFromAlpha;
+    entry.albedoIsEmission = request.albedoIsEmission;
     entry.live = request.live;
     if (request.live) {
       entry.passTarget = passTarget;

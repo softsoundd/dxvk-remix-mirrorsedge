@@ -772,14 +772,16 @@ vec3 opaqueSurfaceMaterialHighlightGlow(Surface surface, vec3 albedo, vec4 emiss
   return surface.highlightGlow * albedo;
 }
 
-// Blends the albedo towards the bake with a lifted mask at 1 (rtx.ue3CompositeMaterialTextures),
-// or interpolates through the bakes at 0, 1/2 and 1 when the colour is quadratic in the mask.
-// bakeInteraction reads at the bake space's surfaceRepeats. A surface the mask does not blend into has no mask textures.
+// Blends a colour towards the bake with a lifted mask at 1 (rtx.ue3CompositeMaterialTextures),
+// or interpolates it through the bakes at 0, 1/2 and 1 when the colour is quadratic in the mask.
+// texture is the colour's MASK_LAYER_MATERIAL_BAKE_* bit. A colour the mask does not blend into is left as it is.
+// bakeInteraction reads at the bake space's surfaceRepeats.
 void opaqueSurfaceMaterialApplyMaskLayer(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
+  uint texture,
   SurfaceInteraction bakeInteraction,
   float lodBias,
-  inout vec3 albedo)
+  inout vec3 color)
 {
   if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_MASK_LAYER) == 0)
   {
@@ -787,6 +789,11 @@ void opaqueSurfaceMaterialApplyMaskLayer(
   }
 
   const MaskLayerMaterial maskLayer = maskLayerMaterialCreate(surfaceMaterialExtensions[opaqueSurfaceMaterial.maskLayerIndex]);
+  if ((uint(maskLayer.maskedTextures) & texture) == 0u)
+  {
+    return;
+  }
+
   vec4 maskedAlbedoSample;
   if (!surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, bakeInteraction, maskedAlbedoSample, lodBias))
   {
@@ -810,7 +817,7 @@ void opaqueSurfaceMaterialApplyMaskLayer(
   const bool quadratic =
     (maskLayer.maskChannelAndFlags & MASK_LAYER_MATERIAL_FLAG_QUADRATIC) != 0 &&
     surfaceMaterialInteractionTextureReadHelper(maskLayer.maskedHalfAlbedoTextureIndex, opaqueSurfaceMaterial.samplerIndex, bakeInteraction, maskedHalfAlbedoSample, lodBias);
-  albedo = maskLayerBlendAlbedo(albedo, maskedAlbedoSample.rgb, maskedHalfAlbedoSample.rgb, quadratic, mask);
+  color = maskLayerBlendAlbedo(color, maskedAlbedoSample.rgb, maskedHalfAlbedoSample.rgb, quadratic, mask);
 }
 
 // Scrolls one of a flow layer's reads to (dot(r0, uv), dot(r1, uv)) + offset + velocity * time, from the surface's texture
@@ -1116,11 +1123,17 @@ void opaqueSurfaceMaterialParticleResolve(
   OpaqueSurfaceMaterialParticleSamples samples,
   out vec3 albedo, out float opacity, out vec3 emissiveRadiance)
 {
+  const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
+  const float materialLodBias = isHairCardMaterial ? cb.hairCardMipBias : 0.0f;
+  const OpaqueSurfaceMaterialBakeSpace bakeSpace = opaqueSurfaceMaterialBakeSpaceCreate(opaqueSurfaceMaterial);
+  const SurfaceInteraction bakeInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, bakeSpace.surfaceRepeats);
+
   vec3 emissiveColor = opaqueSurfaceMaterial.emissiveColorConstant;
 
   if (samples.emissiveColorLoaded)
   {
     emissiveColor = samples.emissiveColor.xyz;
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, MASK_LAYER_MATERIAL_BAKE_EMISSIVE, bakeInteraction, materialLodBias, emissiveColor);
   }
 
   albedo = opaqueSurfaceMaterial.albedoOpacityConstant.rgb;
@@ -1130,10 +1143,7 @@ void opaqueSurfaceMaterialParticleResolve(
   if (samples.albedoOpacityLoaded)
   {
     albedo = samples.albedoOpacity.rgb;
-    const bool isHairCardMaterial = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_IS_HAIR_CARD;
-    const OpaqueSurfaceMaterialBakeSpace bakeSpace = opaqueSurfaceMaterialBakeSpaceCreate(opaqueSurfaceMaterial);
-    const SurfaceInteraction bakeInteraction = opaqueSurfaceMaterialRepeatInteraction(surfaceInteraction, bakeSpace.surfaceRepeats);
-    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, bakeInteraction, isHairCardMaterial ? cb.hairCardMipBias : 0.0f, albedo);
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, MASK_LAYER_MATERIAL_BAKE_ALBEDO, bakeInteraction, materialLodBias, albedo);
     opacity = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_IS_THIN_FILM_THICKNESS) ? float(1.0f) : samples.albedoOpacity.a;
   }
 
@@ -1349,7 +1359,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
   if (albedoOpacityLoaded)
   {
     albedo = albedoOpacitySample.rgb;
-    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, bakeInteraction, materialLodBias, albedo);
+    opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, MASK_LAYER_MATERIAL_BAKE_ALBEDO, bakeInteraction, materialLodBias, albedo);
 
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
@@ -1620,6 +1630,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreateImpl<let 
     if (emissiveColorLoaded)
     {
       emissiveColor = emissiveColorSample.xyz;
+      opaqueSurfaceMaterialApplyMaskLayer(opaqueSurfaceMaterial, MASK_LAYER_MATERIAL_BAKE_EMISSIVE, bakeInteraction, materialLodBias, emissiveColor);
     }
 
     // Fixed function texture stage setting (emissive)

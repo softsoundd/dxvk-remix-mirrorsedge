@@ -86,6 +86,7 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 
 // MaskLayerMaterial::bakeTextures holds a bit for each of the surface's textures read at MaskLayerMaterial::surfaceRepeats:
 // the bake's own, and those a replacement reads at the game's tiling.
+// MaskLayerMaterial::maskedTextures holds the albedo's and emissive texture's bits when the mask blends into them.
 #define MASK_LAYER_MATERIAL_BAKE_ALBEDO (1 << 0)
 #define MASK_LAYER_MATERIAL_BAKE_NORMAL (1 << 1)
 #define MASK_LAYER_MATERIAL_BAKE_HEIGHT (1 << 2)

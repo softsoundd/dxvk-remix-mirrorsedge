@@ -362,7 +362,8 @@ namespace {
           src.getHeightGameTiling(),
           src.getRoughnessGameTiling(),
           src.getMetallicGameTiling(),
-          src.getEmissiveColorGameTiling()
+          src.getEmissiveColorGameTiling(),
+          src.getEmissiveFromCompositeBake()
         } };
       }
       case MaterialDataType::Translucent: 
@@ -478,7 +479,7 @@ namespace {
           hasTextureTransform && extOpaque->textureScale_hasvalue ? tovec2(extOpaque->textureScale_value) : Vector2(1.f),
           hasTextureTransform ? tovec2(extOpaque->textureOffset) : Vector2(0.f),
           hasTextureTransform ? extOpaque->textureRotation : 0.f,
-          // The API has no flow layer or game tiling parameters, so these are the defaults.
+          // The API has no flow layer, game tiling or composite emission parameters, so these are the defaults.
           true, // EnableFlowLayer
           0, 0, // FlowNormalEncoding, FlowMaskChannel
           Vector2(1.f), Vector2(0.f), // FlowMaskScale, FlowMaskOffset
@@ -488,6 +489,7 @@ namespace {
           false, false, // AlbedoOpacityGameTiling, NormalGameTiling
           false, false, // HeightGameTiling, RoughnessGameTiling
           false, false, // MetallicGameTiling, EmissiveColorGameTiling
+          false, // EmissiveFromCompositeBake
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {

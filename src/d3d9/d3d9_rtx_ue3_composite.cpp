@@ -787,6 +787,7 @@ namespace dxvk {
     request->opacityAlpha = domain.opacityAlpha;
     request->uniformEmission = request->emissivePass &&
       std::none_of(info.layers.begin(), info.layers.end(), [](const DxsoUe3CompositeLayer& layer) { return layer.emissive; });
+    request->albedoIsEmission = info.lighting == DxsoUe3CompositeLighting::Unlit && domain.multiplyScale == 0.0f;
     request->coverageFromAlpha = info.hasTexkill;
 
     auto setRegisters = [&](const int32_t reg, const uint32_t count, const Vector4& diffusePass, const Vector4& emissivePass) {
@@ -1159,11 +1160,17 @@ namespace dxvk {
             ? str::format(" captured with the mask over ", captureRepeat.x, "x", captureRepeat.y, " repeats")
             : std::string(" captured with the mask at 0");
         }
+        const char* emission = "none";
+        if (request->albedoIsEmission) {
+          emission = "albedo";
+        } else if (request->emissivePass) {
+          emission = request->uniformEmission ? "uniform" : "textured";
+        }
         Logger::info(str::format(
           "[RTX-Compatibility][UE3-Composite] materialHash=0x", std::hex, materialHash,
           " textureSetShader=0x", textureSetShaderHash, " pick=0x", pickHash, " key=0x", key, std::dec,
           " lighting=", describeDxsoUe3CompositeLighting(info.lighting),
-          " emission=", !request->emissivePass ? "none" : request->uniformEmission ? "uniform" : "textured",
+          " emission=", emission,
           request->emissivePass && !request->storeEmission ? " (taken out of the albedo only)" : "",
           " coverage=", request->coverageFromAlpha ? 1 : 0,
           d3d9State().renderStates[D3DRS_ALPHABLENDENABLE]

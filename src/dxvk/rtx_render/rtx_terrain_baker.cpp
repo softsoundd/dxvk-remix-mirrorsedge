@@ -699,7 +699,8 @@ namespace dxvk {
       1.f, -1.f, // FlowNormalStrength, FlowRoughness
       false, false, // AlbedoOpacityGameTiling, NormalGameTiling
       false, false, // HeightGameTiling, RoughnessGameTiling
-      false, false // MetallicGameTiling, EmissiveColorGameTiling
+      false, false, // MetallicGameTiling, EmissiveColorGameTiling
+      false // EmissiveFromCompositeBake
     ));
 
     m_hasInitializedMaterialDataThisFrame = true;

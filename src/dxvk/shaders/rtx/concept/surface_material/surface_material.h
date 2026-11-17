@@ -188,8 +188,9 @@ struct SubsurfaceMaterial
   uint16_t data[19];
 };
 
-// Describes a mask a UE3 composite bake leaves out of its repeat. The albedo blends towards the bake with the
-// mask at 1 by one channel of the mask, read at its own tiling, and through the bake at 1/2 for a quadratic mask.
+// Describes a mask a UE3 composite bake leaves out of its repeat.
+// The textures it blends into blend towards the bake with the mask at 1, by one channel of the mask
+// read at its own tiling, and through the bake at 1/2 for a quadratic mask.
 // A surface the mask does not blend into has no mask textures.
 struct MaskLayerMaterial
 {
@@ -206,7 +207,9 @@ struct MaskLayerMaterial
   vec2 maskOffset;
 
   uint16_t maskedHalfAlbedoTextureIndex;
-  uint16_t pad[3];
+  // Holds the MASK_LAYER_MATERIAL_BAKE_* bits of the textures the mask blends into.
+  uint16_t maskedTextures;
+  uint16_t pad[2];
 
   // Is how many of the bake's repeats the surface's texture coordinates span per unit, which a capture lays the mask out
   // over. The textures bakeTextures names are read at the surface's coordinates times this.

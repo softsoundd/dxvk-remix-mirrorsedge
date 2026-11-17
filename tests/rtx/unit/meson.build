@@ -231,6 +231,11 @@ exe = executable('test_texture_transform', files('test_texture_transform.cpp'),
 test('test_texture_transform', exe, env: test_env)
 tests += exe
 
+exe = executable('test_ue3_composite_emission', files('test_ue3_composite_emission.cpp'),
+  include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_ue3_composite_emission', exe, env: test_env)
+tests += exe
+
 exe = executable('test_remix_api_version', files('test_remix_api_version.cpp'),
   include_directories : [ test_include_path, remix_api_include_path ], dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll, dxvk_lib ], win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_remix_api_version', exe, env: test_env)
